@@ -121,7 +121,7 @@ class ManifestScanner(BaseScanner):
             else:
                 result.add_issue(
                     f"Unable to parse file as a manifest or configuration: {path}",
-                    severity=IssueSeverity.INFO,
+                    severity=IssueSeverity.DEBUG,
                     location=path
                 )
                 

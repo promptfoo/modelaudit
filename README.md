@@ -77,7 +77,7 @@ ModelAudit includes specialized scanners for different model formats:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ianxwebster/modelaudit.git
+git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
 # Install dependencies
