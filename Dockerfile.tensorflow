@@ -1,0 +1,22 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install Poetry
+RUN pip install poetry==1.5.1
+
+# Copy Poetry configuration files
+COPY pyproject.toml poetry.lock* ./
+
+# Configure Poetry to not create a virtual environment inside the container
+RUN poetry config virtualenvs.create false
+
+# Install dependencies with TensorFlow extras
+RUN poetry install --no-dev --no-interaction --extras "tensorflow"
+
+# Copy project code
+COPY . .
+
+# Set entrypoint
+ENTRYPOINT ["modelaudit"]
+CMD ["--help"] 

@@ -1,0 +1,197 @@
+import os
+import json
+import pytest
+from modelaudit.scanners.manifest_scanner import ManifestScanner
+from modelaudit.scanners.base import IssueSeverity
+
+def test_manifest_scanner_json():
+    """Test the manifest scanner with a JSON file."""
+    # Create a temporary JSON file
+    test_file = "test_manifest.json"
+    manifest_content = {
+        "model_name": "test_model",
+        "version": "1.0.0",
+        "description": "A test model",
+        "config": {
+            "input_shape": [224, 224, 3],
+            "output_shape": [1000],
+            "file_path": "/path/to/model/weights.h5",
+            "api_key": "secret_key_12345"
+        }
+    }
+    
+    try:
+        with open(test_file, "w") as f:
+            json.dump(manifest_content, f)
+        
+        # Create scanner with blacklist patterns
+        scanner = ManifestScanner(config={"blacklist_patterns": ["unsafe", "malicious"]})
+        
+        # Test can_handle
+        assert scanner.can_handle(test_file) is True
+        
+        # Test scan
+        result = scanner.scan(test_file)
+        
+        # Verify scan completed successfully
+        assert result.success is True
+        
+        # Check that suspicious keys were detected
+        suspicious_keys = [issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details")]
+        assert any("file_path" in key for key in suspicious_keys)
+        assert any("api_key" in key for key in suspicious_keys)
+        
+    finally:
+        # Clean up
+        if os.path.exists(test_file):
+            os.remove(test_file)
+
+def test_manifest_scanner_blacklist():
+    """Test the manifest scanner with blacklisted terms."""
+    # Create a temporary JSON file with a blacklisted term
+    test_file = "test_unsafe_manifest.json"
+    manifest_content = {
+        "model_name": "test_model",
+        "version": "1.0.0",
+        "description": "This is an UNSAFE model that should be flagged"
+    }
+    
+    try:
+        with open(test_file, "w") as f:
+            json.dump(manifest_content, f)
+        
+        # Create scanner with blacklist patterns
+        scanner = ManifestScanner(config={"blacklist_patterns": ["unsafe", "malicious"]})
+        
+        # Test scan
+        result = scanner.scan(test_file)
+        
+        # Verify scan completed successfully
+        assert result.success is True
+        
+        # Check that blacklisted term was detected
+        blacklist_issues = [issue for issue in result.issues 
+                           if hasattr(issue, "message") and "Blacklisted term" in issue.message]
+        assert len(blacklist_issues) > 0
+        assert any(issue.severity == IssueSeverity.ERROR for issue in blacklist_issues)
+        
+        # Verify the specific blacklisted term was identified
+        blacklisted_terms = [issue.details.get("blacklisted_term", "") 
+                            for issue in blacklist_issues if hasattr(issue, "details")]
+        assert "unsafe" in blacklisted_terms
+        
+    finally:
+        # Clean up
+        if os.path.exists(test_file):
+            os.remove(test_file)
+
+def test_manifest_scanner_case_insensitive_blacklist():
+    """Test that blacklist matching is case-insensitive."""
+    # Create a temporary file with mixed-case blacklisted term
+    test_file = "test_case_manifest.txt"
+    
+    try:
+        with open(test_file, "w") as f:
+            f.write('{"model": "This is a MaLiCiOuS model"}')
+        
+        # Create scanner with lowercase blacklist pattern
+        scanner = ManifestScanner(config={"blacklist_patterns": ["malicious"]})
+        
+        # Test scan
+        result = scanner.scan(test_file)
+        
+        # Check that the mixed-case term was detected
+        blacklist_issues = [issue for issue in result.issues 
+                           if hasattr(issue, "message") and "Blacklisted term" in issue.message]
+        assert len(blacklist_issues) > 0
+        
+    finally:
+        # Clean up
+        if os.path.exists(test_file):
+            os.remove(test_file)
+
+def test_manifest_scanner_yaml():
+    """Test the manifest scanner with a YAML file."""
+    # Skip if yaml is not installed
+    pytest.importorskip("yaml")
+    
+    # Create a temporary YAML file
+    test_file = "test_manifest.yaml"
+    yaml_content = """
+    model:
+      name: test_yaml_model
+      version: 1.0.0
+    execution:
+      command: python train.py
+      environment: production
+    """
+    
+    try:
+        with open(test_file, "w") as f:
+            f.write(yaml_content)
+        
+        # Create scanner
+        scanner = ManifestScanner()
+        
+        # Test can_handle
+        assert scanner.can_handle(test_file) is True
+        
+        # Test scan
+        result = scanner.scan(test_file)
+        
+        # Verify scan completed successfully
+        assert result.success is True
+        
+        # Check that suspicious keys were detected (execution.command)
+        suspicious_keys = [issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details")]
+        assert any("execution" in key for key in suspicious_keys)
+        
+    finally:
+        # Clean up
+        if os.path.exists(test_file):
+            os.remove(test_file)
+
+def test_manifest_scanner_nested_structures():
+    """Test the manifest scanner with nested structures."""
+    # Create a temporary JSON file with nested structures
+    test_file = "test_nested_manifest.json"
+    manifest_content = {
+        "model": {
+            "name": "nested_model",
+            "config": {
+                "layers": [
+                    {"name": "layer1", "type": "conv2d"},
+                    {"name": "layer2", "type": "lambda", "code": "x => x * 2"}
+                ]
+            }
+        },
+        "deployment": {
+            "environments": [
+                {"name": "prod", "url": "https://api.example.com/models"},
+                {"name": "dev", "url": "http://localhost:8000"}
+            ]
+        }
+    }
+    
+    try:
+        with open(test_file, "w") as f:
+            json.dump(manifest_content, f)
+        
+        # Create scanner
+        scanner = ManifestScanner()
+        
+        # Test scan
+        result = scanner.scan(test_file)
+        
+        # Verify scan completed successfully
+        assert result.success is True
+        
+        # Check that suspicious keys were detected in nested structures
+        suspicious_keys = [issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details")]
+        assert any("url" in key for key in suspicious_keys)
+        assert any("code" in key for key in suspicious_keys)
+        
+    finally:
+        # Clean up
+        if os.path.exists(test_file):
+            os.remove(test_file) 
