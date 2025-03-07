@@ -1,6 +1,8 @@
 # ModelAudit
 
-A security scanner for machine learning models. Quickly check your AIML models for potential security risks before deployment.
+A security scanner for AI models. Quickly check your AIML models for potential security risks before deployment.
+
+<img width="989" alt="image" src="https://github.com/user-attachments/assets/9de32c99-b1c1-4a04-a913-e6031b30024a" />
 
 ## 🔍 What It Does
 
