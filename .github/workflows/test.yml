@@ -40,7 +40,6 @@ jobs:
       - name: Install dependencies
         run: |
           poetry install --with dev --extras "all"
-          poetry add ruff
 
       - name: Lint and format with ruff
         run: |
