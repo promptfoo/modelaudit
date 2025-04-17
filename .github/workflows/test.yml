@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.9, 3.10, 3.11, 3.12, 3.13]
-    
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -81,4 +81,4 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: dist
-          path: dist/ 
+          path: dist/
