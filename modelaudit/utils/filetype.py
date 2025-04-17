@@ -5,13 +5,11 @@ import zipfile
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
-    if not os.path.isfile(path):
-        return False
     try:
         with open(path, "rb") as f:
             signature = f.read(4)
         return signature in [b"PK\x03\x04", b"PK\x05\x06"]
-    except:
+    except Exception:
         return False
 
 def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
