@@ -205,3 +205,39 @@ def test_format_text_output():
     assert "Test issue" in output
     assert "warning" in output.lower()
     # Verbose might include details, but we can't guarantee it
+
+def test_exit_code_clean_scan(tmp_path):
+    """Test exit code 0 when scan is clean with no issues."""
+    # Create a clean file that won't trigger any security issues
+    test_file = tmp_path / "clean_file.txt"
+    test_file.write_text("This is just a text file with no security issues")
+    
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file)])
+    
+    # Should exit with code 0 for clean scan
+    assert result.exit_code == 0
+    assert "No issues found" in result.output
+
+def test_exit_code_security_issues():
+    """Test exit code 1 when security issues are found."""
+    runner = CliRunner()
+    # Use the evil.pickle file from tests directory
+    evil_pickle_path = os.path.join(os.path.dirname(__file__), "evil.pickle")
+    
+    result = runner.invoke(cli, ["scan", evil_pickle_path])
+    
+    # Should exit with code 1 for security findings
+    assert result.exit_code == 1
+    assert "issue" in result.output.lower() or "warning" in result.output.lower()
+
+def test_exit_code_scan_errors(tmp_path):
+    """Test exit code 2 when errors occur during scanning."""
+    runner = CliRunner()
+    
+    # Try to scan a non-existent file
+    result = runner.invoke(cli, ["scan", "/path/that/does/not/exist/file.pkl"])
+    
+    # Should exit with code 2 for scan errors
+    assert result.exit_code == 2
+    assert "Error" in result.output
