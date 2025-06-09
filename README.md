@@ -51,6 +51,21 @@ modelaudit scan model.pkl --max-file-size 1073741824  # 1GB limit
 modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
 ```
 
+### Exit Codes
+
+ModelAudit uses different exit codes to indicate scan results:
+
+- **0**: Success - No security issues found
+- **1**: Security issues found (scan completed successfully)
+- **2**: Errors occurred during scanning (e.g., file not found, scan failures)
+
+This allows for easy integration with CI/CD pipelines:
+
+```bash
+# Example: Stop deployment if security issues are found
+modelaudit scan model.pkl || exit 1
+```
+
 ## ✨ Features
 
 - **Multiple Format Support**: Scans PyTorch, TensorFlow, Keras, and pickle models
