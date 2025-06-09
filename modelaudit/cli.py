@@ -43,6 +43,11 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
       --timeout, -t      Set scan timeout in seconds
       --verbose, -v      Show detailed information during scanning
       --max-file-size    Maximum file size to scan in bytes
+    
+    Exit codes:
+      0 - Success, no security issues found
+      1 - Security issues found (scan completed successfully)
+      2 - Errors occurred during scanning
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
@@ -171,10 +176,16 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         click.echo(output_text)
         
     # Exit with appropriate error code
-    if aggregated_results.get("has_errors", False) or aggregated_results.get("issues", []):
-        sys.exit(1)
+    # Exit codes:
+    # 0 - Success, no issues found
+    # 1 - Security issues found (but scan completed successfully)
+    # 2 - Errors occurred during scanning
+    if aggregated_results.get("has_errors", False):
+        sys.exit(2)  # Scan errors
+    elif aggregated_results.get("issues", []):
+        sys.exit(1)  # Security findings
     else:
-        sys.exit(0)
+        sys.exit(0)  # Clean scan
 
 def format_text_output(results, verbose=False):
     """Format scan results as human-readable text with colors"""
