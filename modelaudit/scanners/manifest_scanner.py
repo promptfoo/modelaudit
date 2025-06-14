@@ -1,60 +1,110 @@
-import os
 import json
-import re
-from typing import Optional, Dict, Any, List
-from .base import BaseScanner, ScanResult, IssueSeverity
+import os
+from typing import Any, Dict, Optional
+
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import the name policies module
 try:
     from modelaudit.name_policies.blacklist import check_model_name_policies
+
     HAS_NAME_POLICIES = True
 except ImportError:
     HAS_NAME_POLICIES = False
+
     # Create a placeholder function when the module is not available
     def check_model_name_policies(model_name, additional_patterns=None):
         return False, ""
 
+
 # Try to import yaml, but handle the case where it's not installed
 try:
     import yaml
+
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
 
 # Common manifest and config file formats
 MANIFEST_EXTENSIONS = [
-    ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".cfg", ".config",
-    ".manifest", ".model", ".metadata"
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".config",
+    ".manifest",
+    ".model",
+    ".metadata",
 ]
 
 # Keys that might contain model names
 MODEL_NAME_KEYS = [
-    "name", "model_name", "model", "model_id", "id", "title",
-    "artifact_name", "artifact_id", "package_name"
+    "name",
+    "model_name",
+    "model",
+    "model_id",
+    "id",
+    "title",
+    "artifact_name",
+    "artifact_id",
+    "package_name",
 ]
 
 # Suspicious configuration patterns
 SUSPICIOUS_CONFIG_PATTERNS = {
     "network_access": [
-        "url", "endpoint", "server", "host", "callback", "webhook",
-        "http", "https", "ftp", "socket"
+        "url",
+        "endpoint",
+        "server",
+        "host",
+        "callback",
+        "webhook",
+        "http",
+        "https",
+        "ftp",
+        "socket",
     ],
     "file_access": [
-        "file", "path", "directory", "folder", "output", "input", "save",
-        "load", "write", "read"
+        "file",
+        "path",
+        "directory",
+        "folder",
+        "output",
+        "input",
+        "save",
+        "load",
+        "write",
+        "read",
     ],
     "execution": [
-        "exec", "eval", "execute", "run", "command", "script", "shell",
-        "subprocess", "system"
+        "exec",
+        "eval",
+        "execute",
+        "run",
+        "command",
+        "script",
+        "shell",
+        "subprocess",
+        "system",
+        "code",
     ],
     "credentials": [
-        "password", "secret", "credential", "auth",
-        "authentication", "api_key"
-    ]
+        "password",
+        "secret",
+        "credential",
+        "auth",
+        "authentication",
+        "api_key",
+    ],
 }
+
 
 class ManifestScanner(BaseScanner):
     """Scanner for model manifest and configuration files"""
+
     name = "manifest"
     description = "Scans model manifest and configuration files for suspicious content and blacklisted names"
     supported_extensions = MANIFEST_EXTENSIONS
@@ -122,7 +172,7 @@ class ManifestScanner(BaseScanner):
                 result.add_issue(
                     f"Unable to parse file as a manifest or configuration: {path}",
                     severity=IssueSeverity.DEBUG,
-                    location=path
+                    location=path,
                 )
 
         except Exception as e:
@@ -130,7 +180,7 @@ class ManifestScanner(BaseScanner):
                 f"Error scanning manifest file: {str(e)}",
                 severity=IssueSeverity.ERROR,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__}
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
             result.finish(success=False)
             return result
@@ -145,7 +195,9 @@ class ManifestScanner(BaseScanner):
 
         try:
             with open(path, "r", encoding="utf-8") as f:
-                content = f.read().lower()  # Convert to lowercase for case-insensitive matching
+                content = (
+                    f.read().lower()
+                )  # Convert to lowercase for case-insensitive matching
 
                 for pattern in self.blacklist_patterns:
                     pattern_lower = pattern.lower()
@@ -154,17 +206,14 @@ class ManifestScanner(BaseScanner):
                             f"Blacklisted term '{pattern}' found in file",
                             severity=IssueSeverity.ERROR,
                             location=self.current_file_path,
-                            details={
-                                "blacklisted_term": pattern,
-                                "file_path": path
-                            }
+                            details={"blacklisted_term": pattern, "file_path": path},
                         )
         except Exception as e:
             result.add_issue(
                 f"Error checking file for blacklist: {str(e)}",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__}
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
     def _parse_file(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
@@ -174,11 +223,18 @@ class ManifestScanner(BaseScanner):
                 content = f.read()
 
                 # Try JSON format first
-                if ext in [".json", ".manifest", ".model", ".metadata"] or content.strip().startswith(("{", "[")):
+                if ext in [
+                    ".json",
+                    ".manifest",
+                    ".model",
+                    ".metadata",
+                ] or content.strip().startswith(("{", "[")):
                     return json.loads(content)
 
                 # Try YAML format if available
-                if HAS_YAML and (ext in [".yaml", ".yml"] or content.strip().startswith("---")):
+                if HAS_YAML and (
+                    ext in [".yaml", ".yml"] or content.strip().startswith("---")
+                ):
                     return yaml.safe_load(content)
 
                 # For other formats, try JSON and then YAML if available
@@ -197,7 +253,9 @@ class ManifestScanner(BaseScanner):
 
         return None
 
-    def _check_suspicious_patterns(self, content: Dict[str, Any], result: ScanResult) -> None:
+    def _check_suspicious_patterns(
+        self, content: Dict[str, Any], result: ScanResult
+    ) -> None:
         """Check for suspicious patterns in the configuration"""
         suspicious_keys = []
 
@@ -211,11 +269,18 @@ class ManifestScanner(BaseScanner):
                 # Check each category of suspicious patterns
                 for category, patterns in SUSPICIOUS_CONFIG_PATTERNS.items():
                     if any(pattern in key_lower for pattern in patterns):
-                        suspicious_keys.append({
-                            "key": f"{prefix}.{key}" if prefix else key,
-                            "value": str(value)[:100] + ("..." if isinstance(value, str) and len(value) > 100 else ""),
-                            "category": category
-                        })
+                        suspicious_keys.append(
+                            {
+                                "key": f"{prefix}.{key}" if prefix else key,
+                                "value": str(value)[:100]
+                                + (
+                                    "..."
+                                    if isinstance(value, str) and len(value) > 100
+                                    else ""
+                                ),
+                                "category": category,
+                            }
+                        )
 
                 # Recursively check nested structures
                 if isinstance(value, dict):
@@ -223,7 +288,10 @@ class ManifestScanner(BaseScanner):
                 elif isinstance(value, list):
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
-                            check_dict(item, f"{prefix}.{key}[{i}]" if prefix else f"{key}[{i}]")
+                            check_dict(
+                                item,
+                                f"{prefix}.{key}[{i}]" if prefix else f"{key}[{i}]",
+                            )
 
         check_dict(content)
 
@@ -236,6 +304,6 @@ class ManifestScanner(BaseScanner):
                 details={
                     "key": item["key"],
                     "value": item["value"],
-                    "category": item["category"]
-                }
+                    "category": item["category"],
+                },
             )
