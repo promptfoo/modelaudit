@@ -4,6 +4,15 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 
 <img width="989" alt="image" src="https://github.com/user-attachments/assets/9de32c99-b1c1-4a04-a913-e6031b30024a" />
 
+## Table of Contents
+
+- [What It Does](#what-it-does)
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Scanners](#scanners)
+- [Development](#development)
+- [License](#license)
+
 ## 🔍 What It Does
 
 ModelAudit scans ML model files for:
@@ -90,19 +99,49 @@ ModelAudit includes specialized scanners for different model formats:
 
 ## 🛠️ Development
 
-### Using Poetry
+### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
-
-# Install dependencies
 poetry install
-
-# Install with extras
+# Optional extras
 poetry install --extras "all"
 ```
+
+### Running Tests
+
+```bash
+pytest
+# With coverage
+pytest --cov
+```
+
+### Code Style
+
+```bash
+black .
+isort .
+flake8 .
+mypy
+```
+
+### Development Workflow
+
+```bash
+git checkout -b feature/your-feature-name
+# Make your changes...
+git add .
+git commit -m "feat: description"
+git push origin feature/your-feature-name
+```
+
+### Pull Requests
+
+- Create PR against `main` branch
+- Follow Conventional Commits format (`feat:`, `fix:`, `docs:`, etc.)
+- All PRs are squash-merged with a conventional commit message
+- Keep changes small and focused
 
 ## 📝 License
 
