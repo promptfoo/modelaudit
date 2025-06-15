@@ -1,4 +1,6 @@
 import logging
+import pickle
+import zipfile
 
 import pytest
 
@@ -63,9 +65,18 @@ def temp_model_dir(tmp_path):
     model_dir = tmp_path / "models"
     model_dir.mkdir()
 
-    # Create various model files
-    (model_dir / "model1.pkl").write_bytes(b"pickle model content")
-    (model_dir / "model2.pt").write_bytes(b"pytorch model content")
+    # Create a real pickle file
+    pickle_data = {"weights": [1, 2, 3], "bias": [0.1]}
+    with open(model_dir / "model1.pkl", "wb") as f:
+        pickle.dump(pickle_data, f)
+
+    # Create a real PyTorch ZIP file
+    zip_path = model_dir / "model2.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Add a real pickle inside
+        pickled_data = pickle.dumps({"model": "data"})
+        zipf.writestr("data.pkl", pickled_data)
 
     # Create a TensorFlow SavedModel directory
     tf_dir = model_dir / "tf_model"

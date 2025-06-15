@@ -5,12 +5,19 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 
 
-def test_pytorch_zip_scanner_can_handle():
+def test_pytorch_zip_scanner_can_handle(tmp_path):
     """Test the can_handle method of PyTorchZipScanner."""
-    assert PyTorchZipScanner.can_handle("model.pt") is True
-    assert PyTorchZipScanner.can_handle("model.pth") is True
-    assert PyTorchZipScanner.can_handle("model.pkl") is False
-    assert PyTorchZipScanner.can_handle("model.h5") is False
+    # Test with actual PyTorch file
+    model_path = create_pytorch_zip(tmp_path)
+    assert PyTorchZipScanner.can_handle(str(model_path)) is True
+
+    # Test with non-existent file
+    assert PyTorchZipScanner.can_handle("nonexistent.pt") is False
+
+    # Test with wrong extension
+    test_file = tmp_path / "model.h5"
+    test_file.write_bytes(b"not a pytorch file")
+    assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
 def create_pytorch_zip(tmp_path, malicious=False):
@@ -116,17 +123,19 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
 
-        # Create data with a function name that will match our blacklist
-        data = {"weights": [1, 2, 3], "custom_function": lambda x: x}
+        # Create data with a string that will match our blacklist
+        data = {"weights": [1, 2, 3], "custom_function": "suspicious_function"}
         pickled_data = pickle.dumps(data)
         zipf.writestr("data.pkl", pickled_data)
 
     # Create scanner with custom blacklist
-    scanner = PyTorchZipScanner(config={"blacklist_patterns": ["custom_function"]})
+    scanner = PyTorchZipScanner(config={"blacklist_patterns": ["suspicious_function"]})
     result = scanner.scan(str(zip_path))
 
-    # Should detect our blacklisted function
+    # Should detect our blacklisted pattern
     blacklist_issues = [
-        issue for issue in result.issues if "custom_function" in issue.message.lower()
+        issue
+        for issue in result.issues
+        if "suspicious_function" in issue.message.lower()
     ]
     assert len(blacklist_issues) > 0

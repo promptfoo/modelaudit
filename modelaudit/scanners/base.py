@@ -76,11 +76,15 @@ class ScanResult:
         issue = Issue(message, severity, location, details)
         self.issues.append(issue)
         logger.log(
-            logging.ERROR
-            if severity == IssueSeverity.ERROR
-            else logging.WARNING
-            if severity == IssueSeverity.WARNING
-            else logging.INFO,
+            (
+                logging.ERROR
+                if severity == IssueSeverity.ERROR
+                else (
+                    logging.WARNING
+                    if severity == IssueSeverity.WARNING
+                    else logging.INFO
+                )
+            ),
             str(issue),
         )
 

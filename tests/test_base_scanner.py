@@ -3,8 +3,8 @@ import os
 from modelaudit.scanners.base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 
-class TestScanner(BaseScanner):
-    """Test scanner implementation for testing the BaseScanner class."""
+class MockScanner(BaseScanner):
+    """Mock scanner implementation for testing the BaseScanner class."""
 
     name = "test_scanner"
     description = "Test scanner for unit tests"
@@ -36,7 +36,7 @@ class TestScanner(BaseScanner):
 
 def test_base_scanner_can_handle():
     """Test the can_handle method of BaseScanner."""
-    scanner = TestScanner()
+    scanner = MockScanner()
 
     assert scanner.can_handle("file.test") is True
     assert scanner.can_handle("file.tst") is True
@@ -47,18 +47,18 @@ def test_base_scanner_can_handle():
 def test_base_scanner_init():
     """Test BaseScanner initialization."""
     # Test with default config
-    scanner = TestScanner()
+    scanner = MockScanner()
     assert scanner.config == {}
 
     # Test with custom config
     custom_config = {"option1": "value1", "option2": 123}
-    scanner = TestScanner(config=custom_config)
+    scanner = MockScanner(config=custom_config)
     assert scanner.config == custom_config
 
 
 def test_base_scanner_create_result():
     """Test the _create_result method."""
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner._create_result()
 
     assert isinstance(result, ScanResult)
@@ -70,7 +70,7 @@ def test_base_scanner_create_result():
 
 def test_base_scanner_check_path_nonexistent():
     """Test _check_path with nonexistent file."""
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner._check_path("nonexistent_file.test")
 
     assert isinstance(result, ScanResult)
@@ -95,7 +95,7 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "access", mock_access)
 
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner._check_path(str(test_file))
 
     assert isinstance(result, ScanResult)
@@ -115,7 +115,7 @@ def test_base_scanner_check_path_directory(tmp_path):
     # Some implementations might return a ScanResult with an error
     # Others might return None and handle directories in the scan method
 
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner._check_path(str(test_dir))
 
     # If result is not None, it should be a ScanResult with an error about directories
@@ -133,7 +133,7 @@ def test_base_scanner_check_path_valid(tmp_path):
     test_file = tmp_path / "test.test"
     test_file.write_bytes(b"test content")
 
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner._check_path(str(test_file))
 
     # Should return None for valid files
@@ -147,7 +147,7 @@ def test_base_scanner_get_file_size(tmp_path):
     content = b"test content"
     test_file.write_bytes(content)
 
-    scanner = TestScanner()
+    scanner = MockScanner()
     size = scanner.get_file_size(str(test_file))
 
     assert size == len(content)
@@ -159,7 +159,7 @@ def test_scanner_implementation(tmp_path):
     test_file = tmp_path / "test.test"
     test_file.write_bytes(b"test content")
 
-    scanner = TestScanner()
+    scanner = MockScanner()
     result = scanner.scan(str(test_file))
 
     assert isinstance(result, ScanResult)

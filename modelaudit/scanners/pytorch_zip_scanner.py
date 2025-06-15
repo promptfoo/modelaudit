@@ -109,6 +109,59 @@ class PyTorchZipScanner(BaseScanner):
                             details={"file": name},
                         )
 
+                # Check for missing data.pkl (common in PyTorch models)
+                if not pickle_files or "data.pkl" not in [
+                    os.path.basename(f) for f in pickle_files
+                ]:
+                    result.add_issue(
+                        "PyTorch model missing data.pkl file - unusual for standard PyTorch models",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={"pickle_files": pickle_files},
+                    )
+
+                # Check for blacklist patterns in all files
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                ):
+                    blacklist_patterns = self.config["blacklist_patterns"]
+                    for name in z.namelist():
+                        try:
+                            file_data = z.read(name)
+                            
+                            # For pickled files, check for patterns in the binary data
+                            if name.endswith('.pkl'):
+                                for pattern in blacklist_patterns:
+                                    # Convert pattern to bytes for binary search
+                                    pattern_bytes = pattern.encode('utf-8')
+                                    if pattern_bytes in file_data:
+                                        result.add_issue(
+                                            f"Blacklisted pattern '{pattern}' found in pickled file {name}",
+                                            severity=IssueSeverity.WARNING,
+                                            location=f"{path}:{name}",
+                                            details={"pattern": pattern, "file": name},
+                                        )
+                            else:
+                                # For text files, decode and search as text
+                                try:
+                                    content = file_data.decode("utf-8")
+                                    for pattern in blacklist_patterns:
+                                        if pattern in content:
+                                            result.add_issue(
+                                                f"Blacklisted pattern '{pattern}' found in file {name}",
+                                                severity=IssueSeverity.WARNING,
+                                                location=f"{path}:{name}",
+                                                details={"pattern": pattern, "file": name},
+                                            )
+                                except UnicodeDecodeError:
+                                    # Skip blacklist checking for binary files that can't be decoded as text
+                                    pass
+                        except Exception:
+                            # Skip files we can't read
+                            pass
+
                 result.bytes_scanned = bytes_scanned
 
         except zipfile.BadZipFile:

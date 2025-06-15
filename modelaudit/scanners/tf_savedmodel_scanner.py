@@ -60,7 +60,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return False
 
         if os.path.isfile(path):
-            # For single file, check extension
+            # Handle any .pb file (protobuf format)
             ext = os.path.splitext(path)[1].lower()
             return ext == ".pb"
         elif os.path.isdir(path):
@@ -158,14 +158,52 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check for other suspicious files in the directory
         for root, dirs, files in os.walk(dir_path):
             for file in files:
+                file_path = os.path.join(root, file)
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):
                     result.add_issue(
-                        f"Found Python file in SavedModel directory: {os.path.join(root, file)}",
+                        f"Found Python file in SavedModel directory: {file_path}",
                         severity=IssueSeverity.WARNING,
-                        location=os.path.join(root, file),
+                        location=file_path,
                         details={"file_type": "python"},
                     )
+
+                # Check for blacklist patterns in text files
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                ):
+                    blacklist_patterns = self.config["blacklist_patterns"]
+                    try:
+                        # Only check text files
+                        if file.endswith(
+                            (
+                                ".txt",
+                                ".md",
+                                ".json",
+                                ".yaml",
+                                ".yml",
+                                ".py",
+                                ".cfg",
+                                ".conf",
+                            )
+                        ):
+                            with open(
+                                file_path, "r", encoding="utf-8", errors="ignore"
+                            ) as f:
+                                content = f.read()
+                                for pattern in blacklist_patterns:
+                                    if pattern in content:
+                                        result.add_issue(
+                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            severity=IssueSeverity.WARNING,
+                                            location=file_path,
+                                            details={"pattern": pattern, "file": file},
+                                        )
+                    except Exception:
+                        # Skip files we can't read
+                        pass
 
         result.finish(success=True)
         return result
@@ -196,9 +234,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         details={
                             "op_type": node.op,
                             "node_name": node.name,
-                            "meta_graph": meta_graph.meta_info_def.tags[0]
-                            if meta_graph.meta_info_def.tags
-                            else "unknown",
+                            "meta_graph": (
+                                meta_graph.meta_info_def.tags[0]
+                                if meta_graph.meta_info_def.tags
+                                else "unknown"
+                            ),
                         },
                     )
 
