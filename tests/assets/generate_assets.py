@@ -6,7 +6,6 @@ import zipfile
 from pathlib import Path
 
 import h5py
-import torch
 
 # Optional: TensorFlow is only needed to regenerate these protobufs if you want
 # to build them from scratch. Here we embed the minimal bytes directly.

@@ -1,17 +1,15 @@
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
-from modelaudit.core import scan_model_directory_or_file, determine_exit_code
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
 
 class TestAssetIntegration:
@@ -206,7 +204,6 @@ class TestAssetIntegration:
     def test_concurrent_scanning_safety(self, safe_assets):
         """Test that concurrent scanning doesn't cause issues."""
         import concurrent.futures
-        import threading
 
         def scan_asset(asset_path):
             """Scan a single asset and return results."""
@@ -264,7 +261,7 @@ class TestAssetIntegration:
             try:
                 os.chmod(temp_path, 0o644)
                 temp_path.unlink()
-            except:
+            except (OSError, FileNotFoundError):
                 pass
 
     def test_regression_no_false_positives(self, safe_assets):
@@ -382,7 +379,7 @@ class TestAssetIntegration:
         # Either succeeds quickly or times out
         if not results_short["success"]:
             # Should have timeout-related error
-            timeout_errors = [
+            _timeout_errors = [
                 issue
                 for issue in results_short["issues"]
                 if "timeout" in issue.get("message", "").lower()

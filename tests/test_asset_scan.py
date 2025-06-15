@@ -1,7 +1,8 @@
-import pytest
 from pathlib import Path
 
-from modelaudit.core import scan_model_directory_or_file, determine_exit_code
+import pytest
+
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
 ASSETS = [
     ("evil_pickle.pkl", 1),

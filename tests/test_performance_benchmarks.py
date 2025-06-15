@@ -1,12 +1,12 @@
 import json
-import time
 import statistics
+import time
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any, Dict
 
 import pytest
 
-from modelaudit.core import scan_model_directory_or_file, determine_exit_code
+from modelaudit.core import scan_model_directory_or_file
 
 
 class TestPerformanceBenchmarks:
@@ -144,8 +144,8 @@ class TestPerformanceBenchmarks:
             pytest.skip("Assets directory does not exist")
 
         # Test different subsets of files to see scaling behavior
-        import tempfile
         import shutil
+        import tempfile
 
         # Get list of asset files
         asset_files = [
@@ -194,8 +194,9 @@ class TestPerformanceBenchmarks:
             pytest.skip("Assets directory does not exist")
 
         try:
-            import psutil
             import os
+
+            import psutil
         except ImportError:
             pytest.skip("psutil not available for memory testing")
 
@@ -219,7 +220,6 @@ class TestPerformanceBenchmarks:
             pytest.skip("Assets directory does not exist")
 
         import concurrent.futures
-        import threading
 
         def scan_directory():
             """Scan the directory and return performance metrics."""
