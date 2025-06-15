@@ -57,6 +57,7 @@ poetry run mypy modelaudit/                # Type checking
 - Unsafe Lambda layers (Keras/TensorFlow)
 - Executable files in archives
 - Blacklisted model names
+- Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 
 ## Exit Codes
 - 0: No security issues found

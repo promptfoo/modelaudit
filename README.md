@@ -237,9 +237,18 @@ modelaudit scan model.pkl || exit 1
 
 - **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
 - **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
-- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
-- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
-- **Resource limits**: Configurable max depth, max entries, and max file size protections
+
+### Weight Distribution Scanner
+
+**Detects anomalous weight patterns that may indicate trojaned models:**
+
+- **Outlier detection**: Uses Z-score analysis to find neurons with abnormal weight magnitudes
+- **Dissimilarity analysis**: Identifies weight vectors that are significantly different from others using cosine similarity
+- **Extreme value detection**: Flags neurons with unusually large weight values
+- **Multi-format support**: Works with PyTorch, Keras/TensorFlow H5, ONNX, and SafeTensors models
+- **Focus on classification models**: Designed for models with <10k output classes
+
+**Note**: This scanner is disabled by default for LLMs (models with >10k vocabulary size) as the detection methods are not effective for large language models. To enable experimental LLM scanning, use `--config '{"enable_llm_checks": true}'`.
 
 ## 🛠️ Development
 

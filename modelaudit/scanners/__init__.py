@@ -5,6 +5,7 @@ from . import (
     pickle_scanner,
     pytorch_zip_scanner,
     tf_savedmodel_scanner,
+    weight_distribution_scanner,
 )
 
 # Import scanner classes for direct use
@@ -14,6 +15,7 @@ from .manifest_scanner import ManifestScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from .weight_distribution_scanner import WeightDistributionScanner
 
 # Create a registry of all available scanners
 SCANNER_REGISTRY = [
@@ -22,6 +24,7 @@ SCANNER_REGISTRY = [
     KerasH5Scanner,
     PyTorchZipScanner,
     ManifestScanner,
+    WeightDistributionScanner,
     # Add new scanners here as they are implemented
 ]
 
@@ -32,6 +35,7 @@ __all__ = [
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
     "manifest_scanner",
+    "weight_distribution_scanner",
     "BaseScanner",
     "ScanResult",
     "IssueSeverity",
@@ -41,5 +45,6 @@ __all__ = [
     "KerasH5Scanner",
     "PyTorchZipScanner",
     "ManifestScanner",
+    "WeightDistributionScanner",
     "SCANNER_REGISTRY",
 ]
