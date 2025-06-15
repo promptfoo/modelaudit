@@ -233,6 +233,8 @@ class PickleScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            result.finish(success=False)
+            return result
 
         result.finish(success=True)
         return result
