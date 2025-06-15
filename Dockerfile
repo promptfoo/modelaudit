@@ -1,18 +1,19 @@
+# Lightweight build for CI testing and basic functionality
 FROM python:3.9-slim
 
 WORKDIR /app
 
 # Install Poetry
-RUN pip install poetry==1.5.1
+RUN pip install --no-cache-dir poetry==1.5.1
 
 # Copy Poetry configuration files
 COPY pyproject.toml poetry.lock* ./
 
-# Configure Poetry to not create a virtual environment inside the container
+# Configure Poetry
 RUN poetry config virtualenvs.create false
 
-# Install dependencies (base only by default)
-RUN poetry install --no-dev --no-interaction
+# Install only main dependencies (no heavy ML extras)
+RUN poetry install --only main --no-interaction
 
 # Copy project code
 COPY . .
