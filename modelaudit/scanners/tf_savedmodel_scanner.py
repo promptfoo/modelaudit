@@ -60,9 +60,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return False
 
         if os.path.isfile(path):
-            # Only handle files named "saved_model.pb" (not just any .pb file)
-            filename = os.path.basename(path)
-            return filename == "saved_model.pb"
+            # Handle any .pb file (protobuf format)
+            ext = os.path.splitext(path)[1].lower()
+            return ext == ".pb"
         elif os.path.isdir(path):
             # For directory, check if saved_model.pb exists
             return os.path.exists(os.path.join(path, "saved_model.pb"))

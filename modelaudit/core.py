@@ -219,6 +219,41 @@ def scan_model_directory_or_file(
     return results
 
 
+def determine_exit_code(results: Dict[str, Any]) -> int:
+    """
+    Determine the appropriate exit code based on scan results.
+
+    Exit codes:
+    - 0: Success, no security issues found
+    - 1: Security issues found (scan completed successfully)
+    - 2: Operational errors occurred during scanning
+
+    Args:
+        results: Dictionary with scan results
+
+    Returns:
+        Exit code (0, 1, or 2)
+    """
+    # Check for operational errors first (highest priority)
+    if results.get("has_errors", False):
+        return 2
+
+    # Check for any security findings (warnings, errors, or info issues)
+    issues = results.get("issues", [])
+    if issues:
+        # Filter out DEBUG level issues for exit code determination
+        non_debug_issues = [
+            issue
+            for issue in issues
+            if isinstance(issue, dict) and issue.get("severity") != "debug"
+        ]
+        if non_debug_issues:
+            return 1
+
+    # No issues found
+    return 0
+
+
 def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.

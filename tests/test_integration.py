@@ -4,7 +4,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
 
 def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callback):
@@ -44,14 +44,36 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     # At least some files should be mentioned in issues (or have debug info)
     assert len(results["issues"]) >= 0  # Could be 0 for completely clean models
 
+    # Validate exit code behavior
+    expected_exit_code = determine_exit_code(results)
+    if results.get("has_errors", False):
+        assert expected_exit_code == 2, (
+            f"Should return exit code 2 for operational errors, got {expected_exit_code}"
+        )
+    elif any(
+        isinstance(issue, dict) and issue.get("severity") != "debug"
+        for issue in results.get("issues", [])
+    ):
+        assert expected_exit_code == 1, (
+            f"Should return exit code 1 for security issues, got {expected_exit_code}"
+        )
+    else:
+        assert expected_exit_code == 0, (
+            f"Should return exit code 0 for clean scan, got {expected_exit_code}"
+        )
+
 
 def test_cli_scan_directory(temp_model_dir):
     """Test scanning a directory with multiple models using the CLI."""
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(temp_model_dir)])
 
-    # Should exit with 0 for clean models, or 1 if any issues are found
-    assert result.exit_code in [0, 1]  # Both are valid depending on what's found
+    # Exit code should be deterministic based on content
+    # The temp_model_dir contains real models that should be clean
+    # But the scan might find warnings or info messages
+    assert result.exit_code in [0, 1], (
+        f"Unexpected exit code {result.exit_code}. Output: {result.output}"
+    )
     assert str(temp_model_dir) in result.output
 
     # Should mention the number of files scanned

@@ -21,7 +21,9 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
 
     assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
     assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-    assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+    assert (
+        TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+    )  # Now accepts any .pb file
 
 
 def create_tf_savedmodel(tmp_path, malicious=False):
