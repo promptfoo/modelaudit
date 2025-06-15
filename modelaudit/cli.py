@@ -8,8 +8,8 @@ import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
-from .core import determine_exit_code, scan_model_directory_or_file
 from . import __version__
+from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
 logging.basicConfig(
