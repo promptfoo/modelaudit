@@ -10,7 +10,7 @@ def is_zipfile(path: str) -> bool:
         with open(path, "rb") as f:
             signature = f.read(4)
         return signature in [b"PK\x03\x04", b"PK\x05\x06"]
-    except:
+    except (OSError, IOError):
         return False
 
 
@@ -22,7 +22,8 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
 def detect_file_format(path: str) -> str:
     """
     Attempt to identify the format:
-     - If directory, return "tensorflow_directory" if saved_model.pb found, else "directory"
+     - If directory, return "tensorflow_directory" if saved_model.pb found,
+       else "directory"
      - If is ZIP, return "zip_archive"
      - If is HDF5 from magic
      - If extension indicates pickle/pt/h5/pb, etc.

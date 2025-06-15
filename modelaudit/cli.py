@@ -60,7 +60,8 @@ def cli():
 )
 def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
     """
-    Scan one or more model files or directories for malicious content or suspicious references.
+    Scan one or more model files or directories for malicious content or
+    suspicious references.
 
     Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
 
@@ -93,7 +94,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
             click.echo(
-                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}"
+                f"Additional blacklist patterns: "
+                f"{click.style(', '.join(blacklist), fg='yellow')}"
             )
         click.echo("─" * 80)
         click.echo("")

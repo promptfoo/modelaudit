@@ -108,10 +108,10 @@ class KerasH5Scanner(BaseScanner):
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
                     result.add_issue(
-                        "File does not appear to be a Keras model (no model_config attribute)",
+                        "File does not appear to be a Keras model "
+                        "(no model_config attribute)",
                         severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"path": path},
+                        location=self.current_file_path,
                     )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
@@ -126,10 +126,11 @@ class KerasH5Scanner(BaseScanner):
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
                     result.add_issue(
-                        "Model contains custom objects which could contain arbitrary code",
+                        "Model contains custom objects which could contain "
+                        "arbitrary code",
                         severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"attribute": "custom_objects"},
+                        location=f"{self.current_file_path} (model_config)",
+                        details={"custom_objects": list(f.attrs["custom_objects"])},
                     )
 
                 # Check for custom metrics
@@ -145,9 +146,10 @@ class KerasH5Scanner(BaseScanner):
                                 "BinaryAccuracy",
                             ]:
                                 result.add_issue(
-                                    f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
+                                    f"Model contains custom metric: "
+                                    f"{metric.get('class_name', 'unknown')}",
                                     severity=IssueSeverity.WARNING,
-                                    location=path,
+                                    location=f"{self.current_file_path} (metrics)",
                                     details={"metric": metric},
                                 )
 
@@ -241,14 +243,13 @@ class KerasH5Scanner(BaseScanner):
                 for suspicious_term in self.suspicious_config_props:
                     if suspicious_term in value.lower():
                         result.add_issue(
-                            f"Suspicious configuration string found in {context}: '{suspicious_term}'",
+                            f"Suspicious configuration string found in {context}: "
+                            f"'{suspicious_term}'",
                             severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
+                            location=f"{self.current_file_path} ({context})",
                             details={
-                                "context": context,
-                                "config_key": key,
                                 "suspicious_term": suspicious_term,
-                                "config_value": value,
+                                "context": context,
                             },
                         )
             elif isinstance(value, dict):

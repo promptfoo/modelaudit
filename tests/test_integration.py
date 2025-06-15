@@ -48,20 +48,20 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     # Validate exit code behavior
     expected_exit_code = determine_exit_code(results)
     if results.get("has_errors", False):
-        assert expected_exit_code == 2, (
-            f"Should return exit code 2 for operational errors, got {expected_exit_code}"
-        )
+        assert (
+            expected_exit_code == 2
+        ), f"Should return exit code 2 for operational errors, got {expected_exit_code}"
     elif any(
         isinstance(issue, dict) and issue.get("severity") != "debug"
         for issue in results.get("issues", [])
     ):
-        assert expected_exit_code == 1, (
-            f"Should return exit code 1 for security issues, got {expected_exit_code}"
-        )
+        assert (
+            expected_exit_code == 1
+        ), f"Should return exit code 1 for security issues, got {expected_exit_code}"
     else:
-        assert expected_exit_code == 0, (
-            f"Should return exit code 0 for clean scan, got {expected_exit_code}"
-        )
+        assert (
+            expected_exit_code == 0
+        ), f"Should return exit code 0 for clean scan, got {expected_exit_code}"
 
 
 def test_cli_scan_directory(temp_model_dir):
@@ -72,9 +72,10 @@ def test_cli_scan_directory(temp_model_dir):
     # Exit code should be deterministic based on content
     # The temp_model_dir contains real models that should be clean
     # But the scan might find warnings or info messages
-    assert result.exit_code in [0, 1], (
-        f"Unexpected exit code {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code in [
+        0,
+        1,
+    ], f"Unexpected exit code {result.exit_code}. Output: {result.output}"
     assert str(temp_model_dir) in result.output
 
     # Should mention the number of files scanned
