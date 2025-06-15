@@ -1,5 +1,5 @@
 import json
-import os
+from pathlib import Path
 
 import pytest
 
@@ -24,12 +24,12 @@ def test_manifest_scanner_json():
     }
 
     try:
-        with open(test_file, "w") as f:
+        with Path(test_file).open("w") as f:
             json.dump(manifest_content, f)
 
         # Create scanner with blacklist patterns
         scanner = ManifestScanner(
-            config={"blacklist_patterns": ["unsafe", "malicious"]}
+            config={"blacklist_patterns": ["unsafe", "malicious"]},
         )
 
         # Test can_handle
@@ -45,15 +45,16 @@ def test_manifest_scanner_json():
         suspicious_keys = [
             issue.details.get("key", "")
             for issue in result.issues
-            if hasattr(issue, "details")
+            if hasattr(issue, "details") and "key" in issue.details
         ]
         assert any("file_path" in key for key in suspicious_keys)
         assert any("api_key" in key for key in suspicious_keys)
 
     finally:
         # Clean up
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
 
 
 def test_manifest_scanner_blacklist():
@@ -67,12 +68,12 @@ def test_manifest_scanner_blacklist():
     }
 
     try:
-        with open(test_file, "w") as f:
+        with Path(test_file).open("w") as f:
             json.dump(manifest_content, f)
 
         # Create scanner with blacklist patterns
         scanner = ManifestScanner(
-            config={"blacklist_patterns": ["unsafe", "malicious"]}
+            config={"blacklist_patterns": ["unsafe", "malicious"]},
         )
 
         # Test scan
@@ -100,8 +101,9 @@ def test_manifest_scanner_blacklist():
 
     finally:
         # Clean up
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
 
 
 def test_manifest_scanner_case_insensitive_blacklist():
@@ -110,7 +112,7 @@ def test_manifest_scanner_case_insensitive_blacklist():
     test_file = "test_case_manifest.txt"
 
     try:
-        with open(test_file, "w") as f:
+        with Path(test_file).open("w") as f:
             f.write('{"model": "This is a MaLiCiOuS model"}')
 
         # Create scanner with lowercase blacklist pattern
@@ -129,8 +131,9 @@ def test_manifest_scanner_case_insensitive_blacklist():
 
     finally:
         # Clean up
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
 
 
 def test_manifest_scanner_yaml():
@@ -150,7 +153,7 @@ def test_manifest_scanner_yaml():
     """
 
     try:
-        with open(test_file, "w") as f:
+        with Path(test_file).open("w") as f:
             f.write(yaml_content)
 
         # Create scanner
@@ -175,8 +178,9 @@ def test_manifest_scanner_yaml():
 
     finally:
         # Clean up
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
 
 
 def test_manifest_scanner_nested_structures():
@@ -190,19 +194,19 @@ def test_manifest_scanner_nested_structures():
                 "layers": [
                     {"name": "layer1", "type": "conv2d"},
                     {"name": "layer2", "type": "lambda", "code": "x => x * 2"},
-                ]
+                ],
             },
         },
         "deployment": {
             "environments": [
                 {"name": "prod", "url": "https://api.example.com/models"},
                 {"name": "dev", "url": "http://localhost:8000"},
-            ]
+            ],
         },
     }
 
     try:
-        with open(test_file, "w") as f:
+        with Path(test_file).open("w") as f:
             json.dump(manifest_content, f)
 
         # Create scanner
@@ -225,5 +229,6 @@ def test_manifest_scanner_nested_structures():
 
     finally:
         # Clean up
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()

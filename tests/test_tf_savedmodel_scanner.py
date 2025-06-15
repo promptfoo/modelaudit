@@ -26,7 +26,7 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
     )  # Now accepts any .pb file
 
 
-def create_tf_savedmodel(tmp_path, malicious=False):
+def create_tf_savedmodel(tmp_path, *, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
@@ -55,7 +55,7 @@ def create_tf_savedmodel(tmp_path, malicious=False):
         suspicious_node.op = "PyFunc"  # This is in our suspicious ops list
 
     # Write the protobuf to file
-    with open(model_dir / "saved_model.pb", "wb") as f:
+    with (model_dir / "saved_model.pb").open("wb") as f:
         f.write(saved_model.SerializeToString())
 
     # Create variables directory
@@ -151,12 +151,12 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
 
     # Create a file with content that matches our blacklist
     (model_dir / "custom_file.txt").write_bytes(
-        b"This file contains suspicious_function"
+        b"This file contains suspicious_function",
     )
 
     # Create scanner with custom blacklist
     scanner = TensorFlowSavedModelScanner(
-        config={"blacklist_patterns": ["suspicious_function"]}
+        config={"blacklist_patterns": ["suspicious_function"]},
     )
     result = scanner.scan(str(model_dir))
 

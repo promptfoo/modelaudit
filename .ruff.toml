@@ -1,0 +1,5 @@
+# Local Ruff configuration for development convenience
+# This extends the configuration in pyproject.toml
+
+# Show fixes that would be applied
+show-fixes = true 

@@ -67,7 +67,7 @@ def temp_model_dir(tmp_path):
 
     # Create a real pickle file
     pickle_data = {"weights": [1, 2, 3], "bias": [0.1]}
-    with open(model_dir / "model1.pkl", "wb") as f:
+    with (model_dir / "model1.pkl").open("wb") as f:
         pickle.dump(pickle_data, f)
 
     # Create a real PyTorch ZIP file

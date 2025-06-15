@@ -1,0 +1,51 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Sequential Command Execution Rule
+
+## Core Requirement
+
+**ALWAYS execute terminal commands one at a time.** Never run multiple commands simultaneously unless explicitly requested by the user.
+
+## Implementation
+
+When using terminal commands:
+
+1. **Execute ONE command**
+2. **Wait for completion** (exit code and full output)
+3. **Verify the result** before proceeding
+4. **Only then execute the next command**
+
+## Examples
+
+### ✅ Correct - Sequential Execution
+```bash
+# Command 1
+poetry install
+
+# Wait for completion, then command 2
+poetry run ruff check .
+
+# Wait for completion, then command 3  
+poetry run ruff format .
+```
+
+### ❌ Incorrect - Simultaneous Commands
+```bash
+# DON'T DO THIS
+poetry install && poetry run ruff check . && poetry run ruff format .
+```
+
+## Exceptions
+
+The only exception is when the user explicitly requests parallel execution or background processes.
+
+## Rationale
+
+Sequential execution ensures:
+- Clear visibility of each step's success/failure
+- Proper error handling and debugging
+- Predictable workflow progression
+- Better user experience with step-by-step feedback

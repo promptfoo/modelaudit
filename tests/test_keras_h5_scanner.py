@@ -21,7 +21,7 @@ def test_keras_h5_scanner_can_handle(tmp_path):
     assert KerasH5Scanner.can_handle(str(test_file)) is False
 
 
-def create_mock_h5_file(tmp_path, malicious=False):
+def create_mock_h5_file(tmp_path, *, malicious=False):
     """Create a mock HDF5 file for testing."""
     h5_path = tmp_path / "model.h5"
 
@@ -35,20 +35,23 @@ def create_mock_h5_file(tmp_path, malicious=False):
                     {
                         "class_name": "Dense",
                         "config": {"units": 10, "activation": "relu"},
-                    }
+                    },
                 ],
             },
         }
 
         if malicious:
-            # Add a malicious layer
+            # Add a malicious layer - split the long line
+            malicious_function = (
+                'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
+            )
             model_config["config"]["layers"].append(
                 {
                     "class_name": "Lambda",
                     "config": {
-                        "function": 'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
+                        "function": malicious_function,
                     },
-                }
+                },
             )
 
         # Add model_config attribute (required for Keras models)
@@ -90,7 +93,7 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
 
     # The scanner should detect suspicious patterns
     assert any(
-        issue.severity == IssueSeverity.ERROR or issue.severity == IssueSeverity.WARNING
+        issue.severity in (IssueSeverity.ERROR, IssueSeverity.WARNING)
         for issue in result.issues
     )
     assert any(
@@ -105,8 +108,7 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     """Test scanning an invalid H5 file."""
     # Create an invalid H5 file (without magic bytes)
     invalid_path = tmp_path / "invalid.h5"
-    with open(invalid_path, "wb") as f:
-        f.write(b"This is not a valid HDF5 file")
+    invalid_path.write_bytes(b"This is not a valid HDF5 file")
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(invalid_path))
@@ -136,9 +138,9 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
                     {
                         "class_name": "Lambda",
                         "config": {
-                            "function": "suspicious_function(x)"  # This matches our blacklist
+                            "function": "suspicious_function(x)",  # This matches our blacklist
                         },
-                    }
+                    },
                 ],
             },
         }
@@ -166,8 +168,7 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
 def test_keras_h5_scanner_empty_file(tmp_path):
     """Test scanning an empty file."""
     empty_path = tmp_path / "empty.h5"
-    with open(empty_path, "wb") as f:
-        pass  # Create empty file
+    empty_path.write_bytes(b"")  # Create empty file
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(empty_path))

@@ -1,7 +1,7 @@
 import io
 import os
 import zipfile
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
@@ -14,7 +14,7 @@ class PyTorchZipScanner(BaseScanner):
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
     supported_extensions = [".pt", ".pth"]
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner = PickleScanner(config)
@@ -70,7 +70,8 @@ class PyTorchZipScanner(BaseScanner):
                     file_like = io.BytesIO(data)
                     # Use the pickle scanner directly
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        file_like, len(data)
+                        file_like,
+                        len(data),
                     )
 
                     # Include the pickle filename in each issue
