@@ -68,6 +68,16 @@ extend-select = ["I"]
 [tool.ruff.format]
 # Black-compatible formatting
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
 [tool.mypy]
 python_version = "3.9"
 warn_return_any = false

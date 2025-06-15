@@ -371,6 +371,7 @@ class TestPerformanceBenchmarks:
         )
         # More lenient threshold for CI environments
         import os
+
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
         overhead_threshold = 1.0 if is_ci else 0.1
         assert timeout_overhead < overhead_threshold, (
