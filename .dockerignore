@@ -1,0 +1,50 @@
+# Large directories that shouldn't be in the Docker image
+scratch/
+models/
+
+# Development files
+.git/
+.github/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.cursor/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test files and outputs
+tests/
+test_*.py
+*_test.py
+*.log
+*.pkl
+analysis.json
+*.json
+enhanced_yolo_results.json
+yolo_warnings.json
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Documentation
+*.md
+!README.md
+
+# Config files not needed in container
+setup-poetry.sh
+setup.cfg
+docker-compose.yml 
