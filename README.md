@@ -127,7 +127,7 @@ Files scanned: 1
 Scanned 156 bytes
 Issues found: 2 errors, 1 warnings
 
-1. suspicious_model.pkl (pos 28): [ERROR] Suspicious module reference found: posix.system
+1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
 
 ────────────────────────────────────────────────────────────────────────────────
