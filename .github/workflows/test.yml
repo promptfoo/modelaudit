@@ -38,11 +38,11 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          poetry run ruff check modelaudit/
+          poetry run ruff check .
 
       - name: Check formatting with Ruff
         run: |
-          poetry run ruff format --check modelaudit/
+          poetry run ruff format --check .
 
   type-check:
     name: Type Check
