@@ -34,11 +34,10 @@ The ModelAudit project has been successfully migrated from Poetry to Rye. This d
   - Linting and formatting commands
 
 ### Scripts and Automation
-- **`setup-rye.sh`** - New setup script for Rye (replaces `setup-poetry.sh`)
-  - Interactive Rye installation
-  - Dependency syncing
-  - Optional dependency selection
-  - Usage examples
+- **Setup process** - Simplified to use standard Rye commands (removed custom setup scripts)
+  - Installation: `curl -sSf https://rye-up.com/get | bash`
+  - Dependencies: `rye sync --features all`
+  - No interactive scripts needed
 
 - **`.github/workflows/test.yml`** - Updated CI/CD pipeline
   - Replaced Poetry installation with Rye setup

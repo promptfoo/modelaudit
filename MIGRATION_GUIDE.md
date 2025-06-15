@@ -34,10 +34,10 @@ We've migrated from Poetry to Rye to take advantage of:
 | `poetry add package` | `rye add package` |
 | `poetry add --group dev package` | `rye add --dev package` |
 
-### Setup Scripts
+### Setup Commands
 
 - **Old**: `./setup-poetry.sh`
-- **New**: `./setup-rye.sh`
+- **New**: `rye sync --features all` (simple and direct)
 
 ## Installation & Setup
 
@@ -56,10 +56,7 @@ source ~/.profile  # or restart your terminal
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Use the setup script
-./setup-rye.sh
-
-# Or manually:
+# Install dependencies with all features
 rye sync --features all
 ```
 

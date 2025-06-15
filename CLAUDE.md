@@ -10,7 +10,6 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 
 ```bash
 # Setup
-./setup-rye.sh                 # Interactive setup script
 rye sync --features all        # Install all dependencies
 
 # Running the scanner
