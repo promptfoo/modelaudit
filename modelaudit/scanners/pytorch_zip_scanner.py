@@ -19,6 +19,15 @@ class PyTorchZipScanner(BaseScanner):
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner = PickleScanner(config)
 
+    @staticmethod
+    def _read_header(path: str, length: int = 4) -> bytes:
+        """Return the first few bytes of a file."""
+        try:
+            with open(path, "rb") as f:
+                return f.read(length)
+        except Exception:
+            return b""
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -30,15 +39,7 @@ class PyTorchZipScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
-        # Verify it's a zip file
-        try:
-            with zipfile.ZipFile(path, "r") as _:
-                pass
-            return True
-        except zipfile.BadZipFile:
-            return False
-        except Exception:
-            return False
+        return True
 
     def scan(self, path: str) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
@@ -50,6 +51,17 @@ class PyTorchZipScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+
+        header = self._read_header(path)
+        if not header.startswith(b"PK"):
+            result.add_issue(
+                f"Not a valid zip file: {path}",
+                severity=IssueSeverity.ERROR,
+                location=path,
+                details={"path": path},
+            )
+            result.finish(success=False)
+            return result
 
         try:
             # Store the file path for use in issue locations

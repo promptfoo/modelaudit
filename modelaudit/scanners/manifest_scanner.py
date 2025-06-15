@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, Optional
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Try to import the name policies module
 try:
@@ -169,7 +169,7 @@ class ManifestScanner(BaseScanner):
 
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
-            content = self._parse_file(path, ext)
+            content = self._parse_file(path, ext, result)
 
             if content:
                 result.bytes_scanned = file_size
@@ -225,7 +225,9 @@ class ManifestScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
-    def _parse_file(self, path: str, ext: str) -> Optional[dict[str, Any]]:
+    def _parse_file(
+        self, path: str, ext: str, result: Optional[ScanResult] = None
+    ) -> Optional[dict[str, Any]]:
         """Parse the file based on its extension"""
         try:
             with open(path, encoding="utf-8") as f:
@@ -258,7 +260,14 @@ class ManifestScanner(BaseScanner):
 
         except Exception as e:
             # Log the error but don't raise, as we want to continue scanning
-            print(f"Error parsing file {path}: {str(e)}")
+            logger.warning(f"Error parsing file {path}: {str(e)}")
+            if result is not None:
+                result.add_issue(
+                    f"Error parsing file: {path}",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
 
         return None
 
