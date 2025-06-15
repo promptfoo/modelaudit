@@ -56,6 +56,9 @@ MODEL_NAME_KEYS = [
     "package_name",
 ]
 
+# Pre-compute lowercase versions for faster checks
+MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
+
 # Suspicious configuration patterns
 SUSPICIOUS_CONFIG_PATTERNS = {
     "network_access": [
@@ -273,6 +276,23 @@ class ManifestScanner(BaseScanner):
 
             for key, value in d.items():
                 key_lower = key.lower()
+
+                # Check for blacklisted model names
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value), self.blacklist_patterns
+                    )
+                    if blocked:
+                        result.add_issue(
+                            f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.ERROR,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": f"{prefix}.{key}" if prefix else key,
+                            },
+                        )
 
                 # Check each category of suspicious patterns
                 for category, patterns in SUSPICIOUS_CONFIG_PATTERNS.items():
