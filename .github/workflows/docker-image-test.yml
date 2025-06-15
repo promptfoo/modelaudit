@@ -31,6 +31,6 @@ jobs:
         run: |
           docker run --rm modelaudit:full --help
           
-      - name: Test container version command
+      - name: Test container scan help
         run: |
-          docker run --rm modelaudit:full --version || echo "Version command not available"
+          docker run --rm modelaudit:full scan --help
