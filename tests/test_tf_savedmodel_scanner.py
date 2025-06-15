@@ -112,7 +112,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
 
     # The scanner should detect errors from:
     # 1. Malicious pickle files in the directory, OR
-    # 2. Suspicious TensorFlow operations (e.g. PyFunc), OR  
+    # 2. Suspicious TensorFlow operations (e.g. PyFunc), OR
     # 3. Both malicious files and suspicious operations
     assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
     assert any(
