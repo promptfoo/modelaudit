@@ -1,12 +1,11 @@
 import os
 import pickletools
 import time
-from typing import Any, BinaryIO, Optional
+from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Type definitions for better type checking
-MLFrameworkPattern = dict[str, Any]
 MLContextDict = dict[str, Any]
 
 # Dictionary of suspicious references.
@@ -65,7 +64,7 @@ SUSPICIOUS_STRING_PATTERNS = [
 # ============================================================================
 
 # ML Framework Detection Patterns
-ML_FRAMEWORK_PATTERNS = {
+ML_FRAMEWORK_PATTERNS: Dict[str, Dict[str, Union[List[str], float]]] = {
     "pytorch": {
         "modules": [
             "torch",
@@ -124,7 +123,7 @@ ML_FRAMEWORK_PATTERNS = {
 }
 
 # Safe ML-specific global patterns
-ML_SAFE_GLOBALS = {
+ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     # PyTorch safe patterns
     "torch": ["*"],  # All torch functions are generally safe
     "torch.nn": ["*"],
@@ -255,28 +254,20 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> MLContextDic
             confidence_boost = patterns.get("confidence_boost", 1.0)
             if isinstance(confidence_boost, (int, float)):
                 confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
-                frameworks = context.get("frameworks", {})
-                if isinstance(frameworks, dict):
-                    frameworks[framework] = {
-                        "confidence": confidence,
-                        "matches": matches,
-                        "raw_score": framework_score,
-                    }
-                detected_patterns = context.get("detected_patterns", [])
-                if isinstance(detected_patterns, list):
-                    detected_patterns.extend(matches)
+                context["frameworks"][framework] = {
+                    "confidence": confidence,
+                    "matches": matches,
+                    "raw_score": framework_score,
+                }
+                context["detected_patterns"].extend(matches)
 
     # Calculate overall ML confidence - highest framework confidence plus filename boost
-    frameworks = context.get("frameworks", {})
-    if isinstance(frameworks, dict) and frameworks:
-        confidences = []
-        for fw_data in frameworks.values():
-            if isinstance(fw_data, dict) and "confidence" in fw_data:
-                confidences.append(fw_data["confidence"])
-        if confidences:
-            max_confidence = max(confidences)
-            # Apply filename boost
-            context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
+    if context["frameworks"]:
+        max_confidence = max(
+            fw["confidence"] for fw in context["frameworks"].values()
+        )
+        # Apply filename boost
+        context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
     else:
         # If no framework detected but we have filename indicators
         context["overall_confidence"] = filename_boost
@@ -287,9 +278,7 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> MLContextDic
     return context
 
 
-def _is_actually_dangerous_global(
-    mod: str, func: str, ml_context: MLContextDict
-) -> bool:
+def _is_actually_dangerous_global(mod: str, func: str, ml_context: MLContextDict) -> bool:
     """
     Smart global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
@@ -518,15 +507,6 @@ def check_opcode_sequence(
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
 
-    # SMART DETECTION: Analyze opcode legitimacy and calculate adaptive threshold
-    opcode_analysis = _analyze_opcode_legitimacy(opcodes, ml_context)
-
-    # For highly legitimate models, skip detailed opcode counting entirely
-    if opcode_analysis.get("legitimacy_score", 0) > 0.7:
-        return suspicious_patterns  # Trust the legitimacy analysis for proven ML models
-
-    threshold = _calculate_adaptive_threshold(ml_context, opcode_analysis)
-
     # Count dangerous opcodes with ML context awareness
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
@@ -541,6 +521,15 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
+        # SMART DETECTION: Much higher threshold for ML content
+        ml_confidence = ml_context.get("overall_confidence", 0)
+        if ml_confidence > 0.7:
+            threshold = 100  # Very high threshold for high-confidence ML
+        elif ml_confidence > 0.4:
+            threshold = 50  # Higher threshold for medium-confidence ML
+        else:
+            threshold = 20  # Still higher than original 5 for unknown content
+
         # If we see too many dangerous opcodes AND it's not clearly ML content
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -548,10 +537,7 @@ def check_opcode_sequence(
                     "pattern": "MANY_DANGEROUS_OPCODES",
                     "count": dangerous_opcode_count,
                     "max_consecutive": max_consecutive,
-                    "threshold_used": threshold,
-                    "ml_confidence": ml_context.get("overall_confidence", 0),
-                    "legitimacy_score": opcode_analysis.get("legitimacy_score", 0),
-                    "complexity_score": opcode_analysis.get("complexity_score", 0),
+                    "ml_confidence": ml_confidence,
                     "position": pos,
                     "opcode": opcode.name,
                 },
@@ -907,11 +893,12 @@ class PickleScanner(BaseScanner):
             # Check for STACK_GLOBAL patterns (rebuild from opcodes to get proper context)
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
-                    # Find the two most recent STRING-like opcodes before this position
-                    recent_strings = []
+                    # Find the two immediately preceding STRING-like opcodes
+                    # STACK_GLOBAL expects exactly two strings on the stack: module and function
+                    recent_strings: list[str] = []
                     for j in range(
-                        i - 1, max(-1, i - 20), -1
-                    ):  # Look back up to 20 opcodes, starting from most recent
+                        i - 1, max(-1, i - 10), -1
+                    ):  # Look back at most 10 opcodes, going backwards
                         if j < 0:
                             break
                         prev_opcode, prev_arg, prev_pos = opcodes[j]
@@ -922,16 +909,15 @@ class PickleScanner(BaseScanner):
                             "SHORT_BINUNICODE",
                             "UNICODE",
                         ] and isinstance(prev_arg, str):
-                            recent_strings.append(prev_arg)
+                            recent_strings.append(prev_arg)  # Most recent first
                             if len(recent_strings) >= 2:
                                 break
 
                     if len(recent_strings) >= 2:
-                        # The strings are in reverse order of appearance, so:
-                        # recent_strings[0] is the function (most recent)
-                        # recent_strings[1] is the module (second most recent)
-                        func = recent_strings[0]
-                        mod = recent_strings[1]
+                        # recent_strings[0] is the most recent (function)
+                        # recent_strings[1] is the second most recent (module)
+                        func = recent_strings[0]  # Most recent string (function)
+                        mod = recent_strings[1]   # Second most recent string (module)
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
