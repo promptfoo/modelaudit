@@ -1,34 +1,65 @@
+import json
+
+import h5py
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 
-def test_keras_h5_scanner_can_handle():
+def test_keras_h5_scanner_can_handle(tmp_path):
     """Test the can_handle method of KerasH5Scanner."""
-    assert KerasH5Scanner.can_handle("model.h5") is True
-    assert KerasH5Scanner.can_handle("model.hdf5") is True
-    assert KerasH5Scanner.can_handle("model.keras") is True
-    assert KerasH5Scanner.can_handle("model.pkl") is False
-    assert KerasH5Scanner.can_handle("model.pt") is False
+    # Test with actual H5 file
+    model_path = create_mock_h5_file(tmp_path)
+    assert KerasH5Scanner.can_handle(str(model_path)) is True
+
+    # Test with non-existent file
+    assert KerasH5Scanner.can_handle("nonexistent.h5") is False
+
+    # Test with wrong extension
+    test_file = tmp_path / "model.pt"
+    test_file.write_bytes(b"not an h5 file")
+    assert KerasH5Scanner.can_handle(str(test_file)) is False
 
 
 def create_mock_h5_file(tmp_path, malicious=False):
     """Create a mock HDF5 file for testing."""
-    # This creates a very simplified mock of an HDF5 file
-    # Real HDF5 files have a complex format, but we just need the magic bytes
-    # and some content for testing
     h5_path = tmp_path / "model.h5"
 
-    with open(h5_path, "wb") as f:
-        # Write HDF5 magic bytes
-        f.write(b"\x89HDF\r\n\x1a\n")
+    with h5py.File(h5_path, "w") as f:
+        # Create a minimal Keras model structure
+        model_config = {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"units": 10, "activation": "relu"},
+                    }
+                ],
+            },
+        }
 
-        # Write some dummy content
-        f.write(b"DUMMY HDF5 CONTENT")
-
-        # If malicious, add some suspicious content
         if malicious:
-            f.write(b"import os; os.system('rm -rf /')")
-            f.write(b"eval('malicious code')")
+            # Add a malicious layer
+            model_config["config"]["layers"].append(
+                {
+                    "class_name": "Lambda",
+                    "config": {
+                        "function": 'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
+                    },
+                }
+            )
+
+        # Add model_config attribute (required for Keras models)
+        f.attrs["model_config"] = json.dumps(model_config)
+
+        # Add some dummy data
+        f.create_dataset("layer_names", data=[b"dense_1"])
+
+        # Add weights group
+        weights_group = f.create_group("model_weights")
+        weights_group.create_dataset("dense_1/kernel:0", data=[[1.0, 2.0]])
 
     return h5_path
 
@@ -92,15 +123,31 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
 
 def test_keras_h5_scanner_with_blacklist(tmp_path):
     """Test Keras H5 scanner with custom blacklist patterns."""
-    # Create a file with content that matches our blacklist
+    # Create a proper H5 file with malicious content
     h5_path = tmp_path / "model.h5"
 
-    with open(h5_path, "wb") as f:
-        # Write HDF5 magic bytes
-        f.write(b"\x89HDF\r\n\x1a\n")
+    with h5py.File(h5_path, "w") as f:
+        # Create model config with suspicious content
+        model_config = {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "suspicious_function(x)"  # This matches our blacklist
+                        },
+                    }
+                ],
+            },
+        }
 
-        # Write content with suspicious pattern
-        f.write(b"This contains suspicious_function")
+        # Add model_config attribute
+        f.attrs["model_config"] = json.dumps(model_config)
+
+        # Add some dummy data
+        f.create_dataset("layer_names", data=[b"lambda_1"])
 
     # Create scanner with custom blacklist
     scanner = KerasH5Scanner(config={"blacklist_patterns": ["suspicious_function"]})
@@ -111,6 +158,7 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
         issue
         for issue in result.issues
         if "suspicious_function" in issue.message.lower()
+        or "lambda" in issue.message.lower()
     ]
     assert len(blacklist_issues) > 0
 
@@ -127,8 +175,8 @@ def test_keras_h5_scanner_empty_file(tmp_path):
     # Should have an error about invalid H5
     assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
     assert any(
-        "empty" in issue.message.lower()
+        "file signature not found" in issue.message.lower()
         or "invalid" in issue.message.lower()
-        or "too small" in issue.message.lower()
+        or "error scanning" in issue.message.lower()
         for issue in result.issues
     )

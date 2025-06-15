@@ -89,6 +89,7 @@ SUSPICIOUS_CONFIG_PATTERNS = {
         "shell",
         "subprocess",
         "system",
+        "code",
     ],
     "credentials": [
         "password",

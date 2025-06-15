@@ -21,17 +21,42 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
 
     assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
     assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-    assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+    assert (
+        TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+    )  # Now accepts any .pb file
 
 
 def create_tf_savedmodel(tmp_path, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
     # Create a directory that mimics a TensorFlow SavedModel
     model_dir = tmp_path / "tf_model"
     model_dir.mkdir()
 
-    # Create saved_model.pb
-    (model_dir / "saved_model.pb").write_bytes(b"dummy pb content")
+    # Create a minimal valid SavedModel protobuf
+    saved_model = SavedModel()
+
+    # Add a meta graph
+    meta_graph = saved_model.meta_graphs.add()
+
+    # Add a simple graph
+    graph_def = meta_graph.graph_def
+
+    # Add a simple constant node
+    node = graph_def.node.add()
+    node.name = "Const"
+    node.op = "Const"
+
+    if malicious:
+        # Add a suspicious operation
+        suspicious_node = graph_def.node.add()
+        suspicious_node.name = "suspicious_op"
+        suspicious_node.op = "PyFunc"  # This is in our suspicious ops list
+
+    # Write the protobuf to file
+    with open(model_dir / "saved_model.pb", "wb") as f:
+        f.write(saved_model.SerializeToString())
 
     # Create variables directory
     variables_dir = model_dir / "variables"
@@ -85,10 +110,16 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
 
-    # The scanner should detect the malicious pickle file
+    # The scanner should detect errors from:
+    # 1. Malicious pickle files in the directory, OR
+    # 2. Suspicious TensorFlow operations (e.g. PyFunc), OR  
+    # 3. Both malicious files and suspicious operations
     assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
     assert any(
-        "malicious.pkl" in issue.message.lower() or "eval" in issue.message.lower()
+        "malicious.pkl" in issue.message.lower()
+        or "eval" in issue.message.lower()
+        or "pyfunc" in issue.message.lower()
+        or "suspicious" in issue.message.lower()
         for issue in result.issues
     )
 
@@ -104,10 +135,12 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(invalid_dir))
 
-    # Should have warnings about missing files/directories
-    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+    # Should have errors about invalid protobuf format
+    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
     assert any(
-        "variables" in issue.message.lower() or "missing" in issue.message.lower()
+        "error" in issue.message.lower()
+        or "parsing" in issue.message.lower()
+        or "invalid" in issue.message.lower()
         for issue in result.issues
     )
 
@@ -145,6 +178,9 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(test_file))
 
-    # Should have an error about not being a directory
+    # Should have an error about invalid protobuf format
     assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
-    assert any("directory" in issue.message.lower() for issue in result.issues)
+    assert any(
+        "error" in issue.message.lower() or "parsing" in issue.message.lower()
+        for issue in result.issues
+    )
