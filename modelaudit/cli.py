@@ -12,7 +12,8 @@ from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("modelaudit")
 
@@ -60,7 +61,8 @@ def cli():
 )
 def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
     """
-    Scan one or more model files or directories for malicious content or suspicious references.
+    Scan one or more model files or directories for malicious content or
+    suspicious references.
 
     Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
 
@@ -85,7 +87,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
             "─" * 80,
             click.style("ModelAudit Security Scanner", fg="blue", bold=True),
             click.style(
-                "Scanning for potential security issues in ML model files", fg="cyan"
+                "Scanning for potential security issues in ML model files",
+                fg="cyan",
             ),
             "─" * 80,
         ]
@@ -93,7 +96,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
             click.echo(
-                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}"
+                f"Additional blacklist patterns: "
+                f"{click.style(', '.join(blacklist), fg='yellow')}",
             )
         click.echo("─" * 80)
         click.echo("")
@@ -165,7 +169,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
             aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
             aggregated_results["issues"].extend(results.get("issues", []))
             aggregated_results["files_scanned"] += results.get(
-                "files_scanned", 1
+                "files_scanned",
+                1,
             )  # Count each file scanned
             if results.get("has_errors", False):
                 aggregated_results["has_errors"] = True
@@ -195,8 +200,10 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                     if issue_count > 0:
                         spinner.ok(
                             click.style(
-                                f"✓ Found {issue_count} issues!", fg="yellow", bold=True
-                            )
+                                f"✓ Found {issue_count} issues!",
+                                fg="yellow",
+                                bold=True,
+                            ),
                         )
                     else:
                         spinner.ok(click.style("✓", fg="green", bold=True))
@@ -249,23 +256,28 @@ def format_text_output(results, verbose=False):
         scanner_names = results["scanner_names"]
         if len(scanner_names) == 1:
             output_lines.append(
-                click.style(f"Active Scanner: {scanner_names[0]}", fg="blue", bold=True)
+                click.style(
+                    f"Active Scanner: {scanner_names[0]}", fg="blue", bold=True
+                ),
             )
         else:
             output_lines.append(
                 click.style(
-                    f"Active Scanners: {', '.join(scanner_names)}", fg="blue", bold=True
-                )
+                    f"Active Scanners: {', '.join(scanner_names)}",
+                    fg="blue",
+                    bold=True,
+                ),
             )
     if "duration" in results:
         output_lines.append(
             click.style(
-                f"Scan completed in {results['duration']:.2f} seconds", fg="cyan"
-            )
+                f"Scan completed in {results['duration']:.2f} seconds",
+                fg="cyan",
+            ),
         )
     if "files_scanned" in results:
         output_lines.append(
-            click.style(f"Files scanned: {results['files_scanned']}", fg="cyan")
+            click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
         )
     if "bytes_scanned" in results:
         # Format bytes in a more readable way
@@ -282,16 +294,14 @@ def format_text_output(results, verbose=False):
 
     # Add issue details with color-coded severity
     issues = results.get("issues", [])
-    if issues:
-        # Filter out DEBUG severity issues when not in verbose mode
-        visible_issues = [
-            issue
-            for issue in issues
-            if verbose
-            or not isinstance(issue, dict)
-            or issue.get("severity") != "debug"
-        ]
+    # Filter out DEBUG severity issues when not in verbose mode
+    visible_issues = [
+        issue
+        for issue in issues
+        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+    ]
 
+    if visible_issues:
         # Count issues by severity (excluding DEBUG when not in verbose mode)
         error_count = sum(
             1
@@ -318,7 +328,7 @@ def format_text_output(results, verbose=False):
         issue_summary = []
         if error_count:
             issue_summary.append(
-                click.style(f"{error_count} errors", fg="red", bold=True)
+                click.style(f"{error_count} errors", fg="red", bold=True),
             )
         if warning_count:
             issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
@@ -329,7 +339,7 @@ def format_text_output(results, verbose=False):
 
         if issue_summary:
             output_lines.append(
-                click.style("Issues found: ", fg="white") + ", ".join(issue_summary)
+                click.style("Issues found: ", fg="white") + ", ".join(issue_summary),
             )
 
         # Only display visible issues
@@ -345,43 +355,45 @@ def format_text_output(results, verbose=False):
 
             # Color-code based on severity
             if severity == "error":
-                severity_style = click.style("[ERROR]", fg="red", bold=True)
+                severity_style = click.style("[CRITICAL]", fg="red", bold=True)
             elif severity == "warning":
                 severity_style = click.style("[WARNING]", fg="yellow")
             elif severity == "info":
                 severity_style = click.style("[INFO]", fg="blue")
             elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="gray")
+                severity_style = click.style("[DEBUG]", fg="bright_black")
 
             # Format the issue line
             issue_num = click.style(f"{i}.", fg="white", bold=True)
             if location:
                 location_str = click.style(f"{location}", fg="cyan", bold=True)
                 output_lines.append(
-                    f"{issue_num} {location_str}: {severity_style} {message}"
+                    f"{issue_num} {location_str}: {severity_style} {message}",
                 )
             else:
                 output_lines.append(f"{issue_num} {severity_style} {message}")
 
             # Add a small separator between issues for readability
-            if i < len(issues):
+            if i < len(visible_issues):
                 output_lines.append("")
     else:
         output_lines.append(
-            "\n" + click.style("✓ No issues found", fg="green", bold=True)
+            "\n" + click.style("✓ No issues found", fg="green", bold=True),
         )
 
     # Add a footer
     output_lines.append("─" * 80)
-    if issues:
+    if visible_issues:
         if any(
             isinstance(issue, dict) and issue.get("severity") == "error"
-            for issue in issues
+            for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with errors", fg="red", bold=True)
         else:
             status = click.style(
-                "⚠ Scan completed with warnings", fg="yellow", bold=True
+                "⚠ Scan completed with warnings",
+                fg="yellow",
+                bold=True,
             )
     else:
         status = click.style("✓ Scan completed successfully", fg="green", bold=True)

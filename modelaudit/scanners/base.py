@@ -4,7 +4,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Optional
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -27,7 +27,7 @@ class Issue:
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
+        details: Optional[dict[str, Any]] = None,
     ):
         self.message = message
         self.severity = severity
@@ -35,7 +35,7 @@ class Issue:
         self.details = details or {}
         self.timestamp = time.time()
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization"""
         return {
             "message": self.message,
@@ -58,19 +58,19 @@ class ScanResult:
 
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
-        self.issues: List[Issue] = []
+        self.issues: list[Issue] = []
         self.start_time = time.time()
         self.end_time: Optional[float] = None
         self.bytes_scanned: int = 0
         self.success: bool = True
-        self.metadata: Dict[str, Any] = {}
+        self.metadata: dict[str, Any] = {}
 
     def add_issue(
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
+        details: Optional[dict[str, Any]] = None,
     ) -> None:
         """Add an issue to the result"""
         issue = Issue(message, severity, location, details)
@@ -125,7 +125,7 @@ class ScanResult:
         """Return True if there are any warning-level issues"""
         return any(issue.severity == IssueSeverity.WARNING for issue in self.issues)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
         return {
             "scanner": self.scanner_name,
@@ -157,10 +157,11 @@ class ScanResult:
         result = []
         result.append(f"Scan completed in {self.duration:.2f}s")
         result.append(
-            f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'"
+            f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, {warning_count} warnings, {info_count} info)"
+            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"{warning_count} warnings, {info_count} info)",
         )
 
         # If there are any issues, show them
@@ -181,15 +182,16 @@ class BaseScanner(ABC):
 
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
-    supported_extensions: ClassVar[List[str]] = []
+    supported_extensions: ClassVar[list[str]] = []
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
         self.timeout = self.config.get("timeout", 300)  # Default 5 minutes
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
-            "chunk_size", 10 * 1024 * 1024
+            "chunk_size",
+            10 * 1024 * 1024,
         )  # Default: 10MB chunks
 
     @classmethod

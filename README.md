@@ -67,7 +67,6 @@ cd modelaudit
 
 # Using Poetry (recommended)
 poetry install --all-extras
-poetry shell
 
 # Or using pip
 pip install -e .[all]
@@ -127,7 +126,7 @@ Files scanned: 1
 Scanned 156 bytes
 Issues found: 2 errors, 1 warnings
 
-1. suspicious_model.pkl (pos 28): [ERROR] Suspicious module reference found: posix.system
+1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -237,6 +236,9 @@ modelaudit scan model.pkl || exit 1
 
 - **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
 - **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
+- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
+- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
+- **Resource limits**: Configurable max depth, max entries, and max file size protections
 
 ### Weight Distribution Scanner
 
@@ -261,10 +263,40 @@ cd modelaudit
 
 # Install with Poetry (recommended)
 poetry install --all-extras
-poetry shell
 
 # Or with pip
 pip install -e .[all]
+```
+
+### Testing with Development Version
+
+**Install and test your local development version:**
+
+```bash
+# Option 1: Install in development mode with pip
+pip install -e .[all]
+
+# Then test the CLI directly
+modelaudit scan test_model.pkl
+
+# Option 2: Use Poetry (recommended)
+poetry install --all-extras
+
+# Test with Poetry run (no shell activation needed)
+poetry run modelaudit scan test_model.pkl
+
+# Test with Python import
+poetry run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+```
+
+**Create test models for development:**
+
+```bash
+# Create a simple test pickle file
+python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+
+# Test scanning it
+modelaudit scan test_model.pkl
 ```
 
 ### Running Tests
@@ -288,13 +320,10 @@ poetry run pytest
 ### Development Workflow
 
 ```bash
-# Install pre-commit hooks
-poetry run pre-commit install
-
-# Run linting and formatting
-poetry run black modelaudit/
-poetry run isort modelaudit/
-poetry run flake8 modelaudit/
+# Run linting and formatting with Ruff
+poetry run ruff check modelaudit/          # Check for linting issues
+poetry run ruff check --fix modelaudit/    # Fix auto-fixable issues
+poetry run ruff format modelaudit/         # Format code
 
 # Type checking
 poetry run mypy modelaudit/
@@ -305,6 +334,13 @@ poetry build
 # Publish (maintainers only)
 poetry publish
 ```
+
+**Code Quality Tools:**
+
+This project uses modern Python tooling for maintaining code quality:
+
+- **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
+- **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
 
 ### Contributing
 

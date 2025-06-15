@@ -15,7 +15,7 @@ def test_exit_code_clean_scan_with_debug_issues():
         "success": True,
         "has_errors": False,
         "issues": [
-            {"message": "Debug info", "severity": "debug", "location": "test.pkl"}
+            {"message": "Debug info", "severity": "debug", "location": "test.pkl"},
         ],
     }
     assert determine_exit_code(results) == 0
@@ -31,7 +31,7 @@ def test_exit_code_security_issues():
                 "message": "Suspicious operation",
                 "severity": "warning",
                 "location": "test.pkl",
-            }
+            },
         ],
     }
     assert determine_exit_code(results) == 1
@@ -47,7 +47,7 @@ def test_exit_code_security_errors():
                 "message": "Malicious code detected",
                 "severity": "error",
                 "location": "test.pkl",
-            }
+            },
         ],
     }
     assert determine_exit_code(results) == 1
@@ -63,7 +63,7 @@ def test_exit_code_operational_errors():
                 "message": "Error during scan: File not found",
                 "severity": "error",
                 "location": "test.pkl",
-            }
+            },
         ],
     }
     assert determine_exit_code(results) == 2
@@ -120,7 +120,7 @@ def test_exit_code_info_level_issues():
                 "message": "Information about model",
                 "severity": "info",
                 "location": "test.pkl",
-            }
+            },
         ],
     }
     assert determine_exit_code(results) == 1

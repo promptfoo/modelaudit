@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -44,7 +44,7 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions = [".h5", ".hdf5", ".keras"]
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
@@ -108,10 +108,10 @@ class KerasH5Scanner(BaseScanner):
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
                     result.add_issue(
-                        "File does not appear to be a Keras model (no model_config attribute)",
+                        "File does not appear to be a Keras model "
+                        "(no model_config attribute)",
                         severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"path": path},
+                        location=self.current_file_path,
                     )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
@@ -126,10 +126,11 @@ class KerasH5Scanner(BaseScanner):
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
                     result.add_issue(
-                        "Model contains custom objects which could contain arbitrary code",
+                        "Model contains custom objects which could contain "
+                        "arbitrary code",
                         severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"attribute": "custom_objects"},
+                        location=f"{self.current_file_path} (model_config)",
+                        details={"custom_objects": list(f.attrs["custom_objects"])},
                     )
 
                 # Check for custom metrics
@@ -138,16 +139,17 @@ class KerasH5Scanner(BaseScanner):
                     if "metrics" in training_config:
                         for metric in training_config["metrics"]:
                             if isinstance(metric, dict) and metric.get(
-                                "class_name"
+                                "class_name",
                             ) not in [
                                 "Accuracy",
                                 "CategoricalAccuracy",
                                 "BinaryAccuracy",
                             ]:
                                 result.add_issue(
-                                    f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
+                                    f"Model contains custom metric: "
+                                    f"{metric.get('class_name', 'unknown')}",
                                     severity=IssueSeverity.WARNING,
-                                    location=path,
+                                    location=f"{self.current_file_path} (metrics)",
                                     details={"metric": metric},
                                 )
 
@@ -165,7 +167,9 @@ class KerasH5Scanner(BaseScanner):
         return result
 
     def _scan_model_config(
-        self, model_config: Dict[str, Any], result: ScanResult
+        self,
+        model_config: dict[str, Any],
+        result: ScanResult,
     ) -> None:
         """Scan the model configuration for suspicious elements"""
         if not isinstance(model_config, dict):
@@ -186,7 +190,7 @@ class KerasH5Scanner(BaseScanner):
             layers = model_config["config"]["layers"]
 
         # Count of each layer type
-        layer_counts: Dict[str, int] = {}
+        layer_counts: dict[str, int] = {}
 
         # Check each layer
         for layer in layers:
@@ -213,7 +217,9 @@ class KerasH5Scanner(BaseScanner):
 
             # Check layer configuration for suspicious strings
             self._check_config_for_suspicious_strings(
-                layer.get("config", {}), result, layer_class
+                layer.get("config", {}),
+                result,
+                layer_class,
             )
 
             # If there are nested models, scan them recursively
@@ -228,7 +234,10 @@ class KerasH5Scanner(BaseScanner):
         result.metadata["layer_counts"] = layer_counts
 
     def _check_config_for_suspicious_strings(
-        self, config: Dict[str, Any], result: ScanResult, context: str = ""
+        self,
+        config: dict[str, Any],
+        result: ScanResult,
+        context: str = "",
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
         if not isinstance(config, dict):
@@ -241,25 +250,28 @@ class KerasH5Scanner(BaseScanner):
                 for suspicious_term in self.suspicious_config_props:
                     if suspicious_term in value.lower():
                         result.add_issue(
-                            f"Suspicious configuration string found in {context}: '{suspicious_term}'",
+                            f"Suspicious configuration string found in {context}: "
+                            f"'{suspicious_term}'",
                             severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
+                            location=f"{self.current_file_path} ({context})",
                             details={
-                                "context": context,
-                                "config_key": key,
                                 "suspicious_term": suspicious_term,
-                                "config_value": value,
+                                "context": context,
                             },
                         )
             elif isinstance(value, dict):
                 # Recursively check nested dictionaries
                 self._check_config_for_suspicious_strings(
-                    value, result, f"{context}.{key}"
+                    value,
+                    result,
+                    f"{context}.{key}",
                 )
             elif isinstance(value, list):
                 # Check each item in the list
                 for i, item in enumerate(value):
                     if isinstance(item, dict):
                         self._check_config_for_suspicious_strings(
-                            item, result, f"{context}.{key}[{i}]"
+                            item,
+                            result,
+                            f"{context}.{key}[{i}]",
                         )

@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -13,7 +13,10 @@ except ImportError:
     HAS_NAME_POLICIES = False
 
     # Create a placeholder function when the module is not available
-    def check_model_name_policies(model_name, additional_patterns=None):
+    def check_model_name_policies(
+        model_name: str,
+        additional_patterns: Optional[list[str]] = None,
+    ) -> tuple[bool, str]:
         return False, ""
 
 
@@ -52,6 +55,9 @@ MODEL_NAME_KEYS = [
     "artifact_id",
     "package_name",
 ]
+
+# Pre-compute lowercase versions for faster checks
+MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
 
 # Suspicious configuration patterns
 SUSPICIOUS_CONFIG_PATTERNS = {
@@ -106,10 +112,13 @@ class ManifestScanner(BaseScanner):
     """Scanner for model manifest and configuration files"""
 
     name = "manifest"
-    description = "Scans model manifest and configuration files for suspicious content and blacklisted names"
+    description = (
+        "Scans model manifest and configuration files for suspicious content "
+        "and blacklisted names"
+    )
     supported_extensions = MANIFEST_EXTENSIONS
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])
@@ -127,7 +136,7 @@ class ManifestScanner(BaseScanner):
 
         # For files without a recognized extension, try to peek at the content
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 first_line = f.readline().strip()
                 # Check for JSON format
                 if first_line.startswith("{") or first_line.startswith("["):
@@ -135,7 +144,7 @@ class ManifestScanner(BaseScanner):
                 # Check for YAML format if yaml is available
                 if HAS_YAML and (first_line.startswith("---") or ":" in first_line):
                     return True
-        except (UnicodeDecodeError, IOError):
+        except (OSError, UnicodeDecodeError):
             pass
 
         return False
@@ -194,7 +203,7 @@ class ManifestScanner(BaseScanner):
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = (
                     f.read().lower()
                 )  # Convert to lowercase for case-insensitive matching
@@ -216,10 +225,10 @@ class ManifestScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
-    def _parse_file(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
+    def _parse_file(self, path: str, ext: str) -> Optional[dict[str, Any]]:
         """Parse the file based on its extension"""
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = f.read()
 
                 # Try JSON format first
@@ -254,7 +263,9 @@ class ManifestScanner(BaseScanner):
         return None
 
     def _check_suspicious_patterns(
-        self, content: Dict[str, Any], result: ScanResult
+        self,
+        content: dict[str, Any],
+        result: ScanResult,
     ) -> None:
         """Check for suspicious patterns in the configuration"""
         suspicious_keys = []
@@ -265,6 +276,23 @@ class ManifestScanner(BaseScanner):
 
             for key, value in d.items():
                 key_lower = key.lower()
+
+                # Check for blacklisted model names
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value), self.blacklist_patterns
+                    )
+                    if blocked:
+                        result.add_issue(
+                            f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.ERROR,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": f"{prefix}.{key}" if prefix else key,
+                            },
+                        )
 
                 # Check each category of suspicious patterns
                 for category, patterns in SUSPICIOUS_CONFIG_PATTERNS.items():
@@ -279,7 +307,7 @@ class ManifestScanner(BaseScanner):
                                     else ""
                                 ),
                                 "category": category,
-                            }
+                            },
                         )
 
                 # Recursively check nested structures
@@ -298,12 +326,10 @@ class ManifestScanner(BaseScanner):
         # Report suspicious keys
         for item in suspicious_keys:
             result.add_issue(
-                f"Suspicious configuration key found: {item['key']} (category: {item['category']})",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={
-                    "key": item["key"],
-                    "value": item["value"],
-                    "category": item["category"],
-                },
+                f"Suspicious configuration key found: {item['key']} "
+                f"(category: {item['category']})",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} "
+                f"(line {item.get('line', 'unknown')})",
+                details=item,
             )

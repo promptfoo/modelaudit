@@ -134,7 +134,7 @@ def test_scan_output_file(tmp_path):
     output_file = tmp_path / "output.txt"
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
+    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
 
     # The file should be created regardless of the exit code
     assert output_file.exists()
@@ -149,7 +149,9 @@ def test_scan_verbose_mode(tmp_path):
     runner = CliRunner()
     # Use catch_exceptions=True to handle any errors in the CLI
     result = runner.invoke(
-        cli, ["scan", str(test_file), "--verbose"], catch_exceptions=True
+        cli,
+        ["scan", str(test_file), "--verbose"],
+        catch_exceptions=True,
     )
 
     # In verbose mode, we should see more output
@@ -197,7 +199,7 @@ def test_format_text_output():
                 "severity": "warning",
                 "location": "test.pkl",
                 "details": {"test": "value"},
-            }
+            },
         ],
         "has_errors": False,
     }
@@ -216,6 +218,23 @@ def test_format_text_output():
     # Verbose might include details, but we can't guarantee it
 
 
+def test_format_text_output_only_debug_issues():
+    """Ensure debug-only issues result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Debug info", "severity": "debug", "location": "file.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    assert "No issues found" in output
+    assert "Scan completed successfully" in output
+
+
 def test_exit_code_clean_scan(tmp_path):
     """Test exit code 0 when scan is clean with no issues."""
     import pickle
@@ -227,7 +246,7 @@ def test_exit_code_clean_scan(tmp_path):
         "biases": [0.1, 0.2, 0.3],
         "model_name": "clean_model",
     }
-    with open(test_file, "wb") as f:
+    with (test_file).open("wb") as f:
         pickle.dump(data, f)
 
     runner = CliRunner()
@@ -255,7 +274,7 @@ def test_exit_code_security_issues(tmp_path):
         def __reduce__(self):
             return (os.system, ('echo "This is a malicious pickle"',))
 
-    with open(evil_pickle_path, "wb") as f:
+    with evil_pickle_path.open("wb") as f:
         pickle.dump(MaliciousClass(), f)
 
     runner = CliRunner()

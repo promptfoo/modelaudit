@@ -32,12 +32,14 @@ poetry run mypy modelaudit/                # Type checking
 ## Architecture
 
 ### Scanner System
+
 - All scanners inherit from `BaseScanner` in `modelaudit/scanners/base.py`
 - Scanners implement `can_handle(file_path)` and `scan(file_path, timeout)` methods
 - Scanner registration happens via `SCANNER_REGISTRY` in `modelaudit/scanners/__init__.py`
 - Each scanner returns a `ScanResult` containing `Issue` objects
 
 ### Core Components
+
 - `cli.py`: Click-based CLI interface
 - `core.py`: Main scanning logic and file traversal
 - `risk_scoring.py`: Normalizes issues to 0.0-1.0 risk scores
@@ -45,12 +47,14 @@ poetry run mypy modelaudit/                # Type checking
 - `utils/filetype.py`: File type detection utilities
 
 ### Adding New Scanners
+
 1. Create scanner class inheriting from `BaseScanner`
 2. Implement `can_handle()` and `scan()` methods
 3. Register in `SCANNER_REGISTRY`
 4. Add tests in `tests/test_<scanner_name>.py`
 
 ### Security Detection Focus
+
 - Dangerous imports (os, sys, subprocess, eval, exec)
 - Pickle opcodes (REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL)
 - Encoded payloads (base64, hex)
@@ -60,6 +64,7 @@ poetry run mypy modelaudit/                # Type checking
 - Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 
 ## Exit Codes
+
 - 0: No security issues found
 - 1: Security issues detected
 - 2: Scan errors occurred

@@ -11,7 +11,8 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     """Test scanning a directory with multiple model types."""
     # Scan the directory with all models
     results = scan_model_directory_or_file(
-        str(temp_model_dir), progress_callback=mock_progress_callback
+        str(temp_model_dir),
+        progress_callback=mock_progress_callback,
     )
 
     # Check basic results
@@ -26,7 +27,7 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     assert 100.0 in mock_progress_callback.percentages  # Should reach 100%
 
     # Check that issues were found for each model type
-    model_paths = [
+    [
         str(temp_model_dir / "model1.pkl"),
         str(temp_model_dir / "model2.pt"),
         str(temp_model_dir / "tf_model"),
@@ -72,9 +73,10 @@ def test_cli_scan_directory(temp_model_dir):
     # Exit code should be deterministic based on content
     # The temp_model_dir contains real models that should be clean
     # But the scan might find warnings or info messages
-    assert result.exit_code in [0, 1], (
-        f"Unexpected exit code {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code in [
+        0,
+        1,
+    ], f"Unexpected exit code {result.exit_code}. Output: {result.output}"
     assert str(temp_model_dir) in result.output
 
     # Should mention the number of files scanned
@@ -191,5 +193,5 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
         >= results1["bytes_scanned"] + results2["bytes_scanned"]
     )
     assert len(combined_results["issues"]) >= len(results1["issues"]) + len(
-        results2["issues"]
+        results2["issues"],
     )

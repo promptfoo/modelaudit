@@ -140,7 +140,8 @@ def test_progress_callback(tmp_path):
 
     # Scan with progress callback
     results = scan_model_directory_or_file(
-        str(test_file), progress_callback=progress_callback
+        str(test_file),
+        progress_callback=progress_callback,
     )
 
     assert results["success"] is True
@@ -219,7 +220,8 @@ def test_blacklist_patterns(tmp_path):
 
     # Scan with blacklist patterns
     results = scan_model_directory_or_file(
-        str(test_file), blacklist_patterns=["malicious_pattern", "evil_function"]
+        str(test_file),
+        blacklist_patterns=["malicious_pattern", "evil_function"],
     )
 
     # Just verify the scan completes successfully
