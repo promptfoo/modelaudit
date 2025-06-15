@@ -41,8 +41,9 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     print(f"Debug: Found {len(results['issues'])} total issues")
     print(f"Debug: Issues locations: {scanned_files}")
 
-    # At least some files should be mentioned in issues (or have debug info)
-    assert len(results["issues"]) >= 0  # Could be 0 for completely clean models
+    # Verify that the scan found and processed files
+    assert results["files_scanned"] > 0, "Should have scanned at least one file"
+    assert results["bytes_scanned"] >= 0, "Should have scanned some bytes"
 
     # Validate exit code behavior
     expected_exit_code = determine_exit_code(results)

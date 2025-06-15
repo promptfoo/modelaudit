@@ -130,20 +130,34 @@ class PyTorchZipScanner(BaseScanner):
                     for name in z.namelist():
                         try:
                             file_data = z.read(name)
-                            # Convert bytes to string for text-based files
-                            try:
-                                content = file_data.decode("utf-8", errors="ignore")
+                            
+                            # For pickled files, check for patterns in the binary data
+                            if name.endswith('.pkl'):
                                 for pattern in blacklist_patterns:
-                                    if pattern in content:
+                                    # Convert pattern to bytes for binary search
+                                    pattern_bytes = pattern.encode('utf-8')
+                                    if pattern_bytes in file_data:
                                         result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' found in file {name}",
+                                            f"Blacklisted pattern '{pattern}' found in pickled file {name}",
                                             severity=IssueSeverity.WARNING,
                                             location=f"{path}:{name}",
                                             details={"pattern": pattern, "file": name},
                                         )
-                            except:
-                                # If we can't decode as text, skip blacklist checking for this file
-                                pass
+                            else:
+                                # For text files, decode and search as text
+                                try:
+                                    content = file_data.decode("utf-8")
+                                    for pattern in blacklist_patterns:
+                                        if pattern in content:
+                                            result.add_issue(
+                                                f"Blacklisted pattern '{pattern}' found in file {name}",
+                                                severity=IssueSeverity.WARNING,
+                                                location=f"{path}:{name}",
+                                                details={"pattern": pattern, "file": name},
+                                            )
+                                except UnicodeDecodeError:
+                                    # Skip blacklist checking for binary files that can't be decoded as text
+                                    pass
                         except Exception:
                             # Skip files we can't read
                             pass

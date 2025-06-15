@@ -193,14 +193,36 @@ def scan_model_directory_or_file(
     # has_errors should only be True for operational errors (scanner crashes, file not found, etc.)
     # not for security findings detected in models
     operational_error_indicators = [
+        # Scanner execution errors
         "Error during scan",
-        "Error checking file size",
+        "Error checking file size", 
         "Error scanning file",
+        "Scanner crashed",
+        "Scan timeout",
+        
+        # File system errors
         "Path does not exist",
         "Path is not readable",
-        "not installed, cannot scan",  # Missing dependencies
-        "Scan timeout",
-        "not a valid",  # Invalid file format
+        "Permission denied",
+        "File not found",
+        
+        # Dependency/environment errors
+        "not installed, cannot scan",
+        "Missing dependency",
+        "Import error",
+        "Module not found",
+        
+        # File format/corruption errors
+        "not a valid",
+        "Invalid file format",
+        "Corrupted file",
+        "Bad file signature",
+        "Unable to parse",
+        
+        # Resource/system errors
+        "Out of memory",
+        "Disk space",
+        "Too many open files",
     ]
 
     results["has_errors"] = (
