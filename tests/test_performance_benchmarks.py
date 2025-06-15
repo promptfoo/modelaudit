@@ -20,12 +20,18 @@ class TestPerformanceBenchmarks:
     @pytest.fixture
     def performance_thresholds(self):
         """Define performance thresholds for different operations."""
+        import os
+
+        # More lenient thresholds for CI environments
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        multiplier = 3.0 if is_ci else 1.0
+
         return {
-            "single_file_scan_max_time": 5.0,  # seconds
-            "directory_scan_max_time": 30.0,  # seconds
+            "single_file_scan_max_time": 5.0 * multiplier,  # seconds
+            "directory_scan_max_time": 30.0 * multiplier,  # seconds
             "memory_growth_max_mb": 100,  # MB
-            "files_per_second_min": 1.0,  # files/second minimum
-            "bytes_per_second_min": 1024,  # bytes/second minimum
+            "files_per_second_min": 1.0 / multiplier,  # files/second minimum
+            "bytes_per_second_min": 1024 / multiplier,  # bytes/second minimum
         }
 
     def measure_scan_performance(self, path: str, runs: int = 3) -> Dict[str, Any]:
@@ -110,7 +116,12 @@ class TestPerformanceBenchmarks:
                 cv = (
                     metrics["duration_stdev"] / metrics["duration_avg"]
                 )  # Coefficient of variation
-                assert cv < 0.5, (
+                # More lenient CV threshold for CI environments
+                import os
+
+                is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+                cv_threshold = 1.0 if is_ci else 0.5
+                assert cv < cv_threshold, (
                     f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
                 )
 
@@ -254,7 +265,12 @@ class TestPerformanceBenchmarks:
         concurrency_overhead = avg_duration / single_result["duration"]
 
         # Allow some overhead but not excessive
-        assert concurrency_overhead < 3.0, (
+        # More lenient threshold for CI environments
+        import os
+
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        overhead_threshold = 10.0 if is_ci else 3.0
+        assert concurrency_overhead < overhead_threshold, (
             f"Concurrency overhead too high: {concurrency_overhead:.2f}x"
         )
 
@@ -353,7 +369,11 @@ class TestPerformanceBenchmarks:
         timeout_overhead = abs(duration_long - duration_short) / min(
             duration_long, duration_short
         )
-        assert timeout_overhead < 0.1, (
+        # More lenient threshold for CI environments
+        import os
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        overhead_threshold = 1.0 if is_ci else 0.1
+        assert timeout_overhead < overhead_threshold, (
             f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
         )
 
@@ -384,7 +404,14 @@ class TestPerformanceBenchmarks:
 
         # Check that performance remains consistent
         cv = statistics.stdev(durations) / statistics.mean(durations)
-        assert cv < 0.3, f"Performance too inconsistent over time (CV={cv:.2f})"
+        # More lenient CV threshold for CI environments
+        import os
+
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        cv_threshold = 1.0 if is_ci else 0.3
+        assert cv < cv_threshold, (
+            f"Performance too inconsistent over time (CV={cv:.2f})"
+        )
 
     def benchmark_and_save_results(
         self, assets_dir, output_file: str = "benchmark_results.json"
