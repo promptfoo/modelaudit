@@ -5,20 +5,21 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
 try:
+    import tensorflow as tf  # noqa: F401
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     HAS_TENSORFLOW = True
+    SavedModelType: type = SavedModel
 except ImportError:
     HAS_TENSORFLOW = False
 
     # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModelPlaceholder:
+    class SavedModel:  # type: ignore[no-redef]
         """Placeholder for SavedModel when TensorFlow is not installed"""
 
         meta_graphs: list = []
 
-    SavedModel = SavedModelPlaceholder
-
+    SavedModelType = SavedModel
 
 # List of suspicious TensorFlow operations that could be security risks
 SUSPICIOUS_OPS = {
@@ -45,155 +46,121 @@ SUSPICIOUS_OPS = {
 class TensorFlowSavedModelScanner(BaseScanner):
     """Scanner for TensorFlow SavedModel format"""
 
-    name = "tensorflow_savedmodel"
+    name = "tf_savedmodel"
     description = "Scans TensorFlow SavedModel for suspicious operations"
-    supported_extensions = []  # Directory-based format
+    supported_extensions = [".pb", ""]  # Empty string for directories
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        # Additional TensorFlow-specific configuration
-        self.check_ops = self.config.get("check_ops", True)
-        self.check_pickle_files = self.config.get("check_pickle_files", True)
+        # Additional scanner-specific configuration
+        self.suspicious_ops = set(self.config.get("suspicious_ops", SUSPICIOUS_OPS))
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Check if the path is a TensorFlow SavedModel directory"""
-        if not os.path.isdir(path):
+        """Check if this scanner can handle the given path"""
+        if not HAS_TENSORFLOW:
             return False
 
-        # Check for required SavedModel files
-        saved_model_pb = os.path.join(path, "saved_model.pb")
-        variables_dir = os.path.join(path, "variables")
-
-        return os.path.isfile(saved_model_pb) and os.path.isdir(variables_dir)
+        if os.path.isfile(path):
+            # Handle any .pb file (protobuf format)
+            ext = os.path.splitext(path)[1].lower()
+            return ext == ".pb"
+        elif os.path.isdir(path):
+            # For directory, check if saved_model.pb exists
+            return os.path.exists(os.path.join(path, "saved_model.pb"))
+        return False
 
     def scan(self, path: str) -> ScanResult:
-        """Scan a TensorFlow SavedModel directory for suspicious content"""
+        """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
 
-        result = self._create_result()
+        # Store the file path for use in issue locations
+        self.current_file_path = path
 
+        # Check if TensorFlow is installed
         if not HAS_TENSORFLOW:
+            result = self._create_result()
             result.add_issue(
-                "TensorFlow not available - cannot analyze SavedModel operations",
-                severity=IssueSeverity.WARNING,
+                "TensorFlow not installed, cannot scan SavedModel.",
+                severity=IssueSeverity.ERROR,
                 location=path,
-                details={"missing_dependency": "tensorflow"},
+                details={"path": path},
             )
-        else:
-            # Scan the SavedModel protobuf for suspicious operations
-            if self.check_ops:
-                self._scan_saved_model_ops(path, result)
+            result.finish(success=False)
+            return result
 
-        # Check for suspicious files
-        if self.check_pickle_files:
-            self._scan_pickle_files(path, result)
+        # Determine if path is file or directory
+        if os.path.isfile(path):
+            return self._scan_saved_model_file(path)
+        elif os.path.isdir(path):
+            return self._scan_saved_model_directory(path)
+        else:
+            result = self._create_result()
+            result.add_issue(
+                f"Path is neither a file nor a directory: {path}",
+                severity=IssueSeverity.ERROR,
+                location=path,
+                details={"path": path},
+            )
+            result.finish(success=False)
+            return result
+
+    def _scan_saved_model_file(self, path: str) -> ScanResult:
+        """Scan a single SavedModel protobuf file"""
+        result = self._create_result()
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
+
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+                result.bytes_scanned = len(content)
+
+                saved_model = SavedModelType()
+                saved_model.ParseFromString(content)
+
+                self._analyze_saved_model(saved_model, result)
+
+        except Exception as e:
+            result.add_issue(
+                f"Error scanning TF SavedModel file: {str(e)}",
+                severity=IssueSeverity.ERROR,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            result.finish(success=False)
+            return result
 
         result.finish(success=True)
         return result
 
-    def _scan_saved_model_ops(self, path: str, result: ScanResult) -> None:
-        """Scan SavedModel protobuf for suspicious operations"""
-        saved_model_path = os.path.join(path, "saved_model.pb")
+    def _scan_saved_model_directory(self, dir_path: str) -> ScanResult:
+        """Scan a SavedModel directory"""
+        result = self._create_result()
 
-        try:
-            with open(saved_model_path, "rb") as f:
-                saved_model = SavedModel()
-                saved_model.ParseFromString(f.read())
-
-            # Analyze the graph for suspicious operations
-            for meta_graph in saved_model.meta_graphs:
-                graph_def = meta_graph.graph_def
-                for node in graph_def.node:
-                    if node.op in SUSPICIOUS_OPS:
-                        result.add_issue(
-                            f"Suspicious TensorFlow operation: {node.op}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{path}/saved_model.pb",
-                            details={
-                                "operation": node.op,
-                                "node_name": node.name,
-                                "node_input": list(node.input),
-                            },
-                        )
-
-                    # Check for PyFunc operations specifically
-                    if node.op == "PyFunc":
-                        # PyFunc can execute arbitrary Python code
-                        result.add_issue(
-                            "PyFunc operation found - can execute arbitrary Python code",
-                            severity=IssueSeverity.ERROR,
-                            location=f"{path}/saved_model.pb",
-                            details={
-                                "operation": node.op,
-                                "node_name": node.name,
-                                "attributes": dict(node.attr),
-                            },
-                        )
-
-                    # Check for file I/O operations
-                    if node.op in ["ReadFile", "WriteFile"]:
-                        result.add_issue(
-                            f"File I/O operation found: {node.op}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{path}/saved_model.pb",
-                            details={
-                                "operation": node.op,
-                                "node_name": node.name,
-                                "node_input": list(node.input),
-                            },
-                        )
-
-        except Exception as e:
+        # Look for saved_model.pb in the directory
+        saved_model_path = os.path.join(dir_path, "saved_model.pb")
+        if not os.path.exists(saved_model_path):
             result.add_issue(
-                f"Error reading SavedModel protobuf: {str(e)}",
+                "No saved_model.pb found in directory.",
                 severity=IssueSeverity.ERROR,
-                location=saved_model_path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                location=dir_path,
+                details={"directory": dir_path},
             )
+            result.finish(success=False)
+            return result
 
-    def _scan_pickle_files(self, path: str, result: ScanResult) -> None:
-        """Scan for pickle files and other suspicious content"""
-        from .pickle_scanner import PickleScanner
+        # Scan the saved_model.pb file
+        file_scan_result = self._scan_saved_model_file(saved_model_path)
+        result.merge(file_scan_result)
 
-        pickle_scanner = PickleScanner(self.config)
-
-        # Recursively search for files
-        for root, dirs, files in os.walk(path):
+        # Check for other suspicious files in the directory
+        for root, dirs, files in os.walk(dir_path):
             for file in files:
                 file_path = os.path.join(root, file)
-
-                # Scan pickle files specifically
-                if file.endswith((".pkl", ".pickle")):
-                    try:
-                        # Scan the pickle file
-                        pickle_result = pickle_scanner.scan(file_path)
-
-                        # Add context that this was found in a SavedModel
-                        for issue in pickle_result.issues:
-                            if issue.details:
-                                issue.details["found_in_savedmodel"] = path
-                            else:
-                                issue.details = {"found_in_savedmodel": path}
-
-                        # Merge the results
-                        result.merge(pickle_result)
-
-                    except Exception as e:
-                        result.add_issue(
-                            f"Error scanning pickle file {file}: {str(e)}",
-                            severity=IssueSeverity.ERROR,
-                            location=file_path,
-                            details={
-                                "exception": str(e),
-                                "exception_type": type(e).__name__,
-                                "found_in_savedmodel": path,
-                            },
-                        )
-
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):
                     result.add_issue(
@@ -231,7 +198,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 for pattern in blacklist_patterns:
                                     if pattern in content:
                                         result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            f"Blacklisted pattern '{pattern}' "
+                                            f"found in file {file}",
                                             severity=IssueSeverity.WARNING,
                                             location=file_path,
                                             details={"pattern": pattern, "file": file},
@@ -239,3 +207,44 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     except Exception:
                         # Skip files we can't read
                         pass
+
+        result.finish(success=True)
+        return result
+
+    def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
+        """Analyze the saved model for suspicious operations"""
+        suspicious_op_found = False
+        op_counts: Dict[str, int] = {}
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+
+            # Scan all nodes in the graph for suspicious operations
+            for node in graph_def.node:
+                # Count all operation types
+                if node.op in op_counts:
+                    op_counts[node.op] += 1
+                else:
+                    op_counts[node.op] = 1
+
+                # Check if the operation is suspicious
+                if node.op in self.suspicious_ops:
+                    suspicious_op_found = True
+                    result.add_issue(
+                        f"Suspicious TensorFlow operation: {node.op}",
+                        severity=IssueSeverity.ERROR,
+                        location=f"{self.current_file_path} (node: {node.name})",
+                        details={
+                            "op_type": node.op,
+                            "node_name": node.name,
+                            "meta_graph": (
+                                meta_graph.meta_info_def.tags[0]
+                                if meta_graph.meta_info_def.tags
+                                else "unknown"
+                            ),
+                        },
+                    )
+
+        # Add operation counts to metadata
+        result.metadata["op_counts"] = op_counts
+        result.metadata["suspicious_op_found"] = suspicious_op_found

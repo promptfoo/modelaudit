@@ -10,7 +10,7 @@ def is_zipfile(path: str) -> bool:
         with open(path, "rb") as f:
             signature = f.read(4)
         return signature in [b"PK\x03\x04", b"PK\x05\x06"]
-    except (IOError, OSError):
+    except (OSError, IOError):
         return False
 
 

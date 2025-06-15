@@ -43,9 +43,8 @@ jobs:
           poetry run flake8 modelaudit/
 
   type-check:
-    name: Type Check (Optional)
+    name: Type Check
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -69,7 +68,7 @@ jobs:
 
       - name: Type checking
         run: |
-          poetry run mypy modelaudit/ || true
+          poetry run mypy modelaudit/
 
   test:
     name: Test Python ${{ matrix.python-version }}

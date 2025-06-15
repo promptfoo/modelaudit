@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 BLACKLIST_PATTERNS = [
     # Examples of patterns you might want to blacklist
@@ -9,15 +9,15 @@ BLACKLIST_PATTERNS = [
 
 
 def check_model_name_policies(
-    model_name: str, additional_patterns: Optional[list] = None
+    model_name: str, additional_patterns: Optional[List[str]] = None
 ) -> Tuple[bool, str]:
     """
-    Return (blocked:boolean, reason:str) if model_name matches any pattern
-    in the blacklist.
+    Return (blocked:boolean, reason:str) if model_name matches any pattern in
+    the blacklist.
 
     Args:
         model_name: The name of the model to check
-        additional_patterns: Optional list of additional patterns to check
+        additional_patterns: Optional list of additional patterns to check against
     """
     name_lower = model_name.lower()
 

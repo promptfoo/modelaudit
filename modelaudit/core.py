@@ -2,7 +2,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
@@ -24,12 +24,11 @@ def scan_model_directory_or_file(
 
     Args:
         path: Path to the model file or directory
-        blacklist_patterns: Additional blacklist patterns to check against
-            model names
+        blacklist_patterns: Additional blacklist patterns to check against model names
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
         progress_callback: Optional callback function to report progress
-            (message, percentage)
+                          (message, percentage)
         **kwargs: Additional arguments to pass to scanners
 
     Returns:
@@ -38,8 +37,8 @@ def scan_model_directory_or_file(
     # Start timer for timeout
     start_time = time.time()
 
-    # Initialize results
-    results = {
+    # Initialize results with proper type hints
+    results: Dict[str, Any] = {
         "start_time": start_time,
         "path": path,
         "bytes_scanned": 0,
@@ -81,38 +80,43 @@ def scan_model_directory_or_file(
 
                     # Check timeout
                     if time.time() - start_time > timeout:
-                        msg = f"Scan timeout after {timeout} seconds"
-                        raise TimeoutError(msg)
+                        raise TimeoutError(f"Scan timeout after {timeout} seconds")
 
                     # Update progress
                     if progress_callback and total_files > 0:
                         processed_files += 1
-                        msg = (
-                            f"Scanning file {processed_files}/{total_files}: " f"{file}"
-                        )
                         progress_callback(
-                            msg,
+                            f"Scanning file {processed_files}/{total_files}: {file}",
                             processed_files / total_files * 100,
                         )
 
                     # Scan the file
                     try:
                         file_result = scan_file(file_path, config)
-                        results["bytes_scanned"] += file_result.bytes_scanned
-                        results["files_scanned"] += 1  # Increment file count
+                        # Use cast to help mypy understand the types
+                        results["bytes_scanned"] = (
+                            cast(int, results["bytes_scanned"])
+                            + file_result.bytes_scanned
+                        )
+                        results["files_scanned"] = (
+                            cast(int, results["files_scanned"]) + 1
+                        )  # Increment file count
 
                         # Track scanner name
                         scanner_name = file_result.scanner_name
-                        if scanner_name and scanner_name not in results["scanners"]:
-                            results["scanners"].append(scanner_name)
+                        scanners_list = cast(List[str], results["scanners"])
+                        if scanner_name and scanner_name not in scanners_list:
+                            scanners_list.append(scanner_name)
 
                         # Add issues from file scan
+                        issues_list = cast(List[Dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
-                            results["issues"].append(issue.to_dict())
+                            issues_list.append(issue.to_dict())
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
-                        results["issues"].append(
+                        issues_list = cast(List[Dict[str, Any]], results["issues"])
+                        issues_list.append(
                             {
                                 "message": f"Error scanning file: {str(e)}",
                                 "severity": IssueSeverity.WARNING.value,
@@ -130,34 +134,38 @@ def scan_model_directory_or_file(
             results["files_scanned"] = 1  # Single file scan
 
             # Create a wrapper for the file to report progress
-            if progress_callback and file_size > 0:
-                original_open = open
+            if progress_callback is not None and file_size > 0:
+                from typing import IO
+                import builtins
 
-                def progress_open(file_path, mode="r", *args, **kwargs):
-                    file = original_open(file_path, mode, *args, **kwargs)
+                original_builtins_open = builtins.open
+
+                def progress_open(
+                    file_path: str, mode: str = "r", *args, **kwargs
+                ) -> IO[Any]:
+                    file = original_builtins_open(file_path, mode, *args, **kwargs)
                     file_pos = 0
 
                     # Override read method to report progress
                     original_read = file.read
 
-                    def progress_read(size=-1):
+                    def progress_read(size: int = -1) -> Any:
                         nonlocal file_pos
                         data = original_read(size)
-                        file_pos += len(data)
-                        progress_callback(
-                            f"Reading file: {os.path.basename(file_path)}",
-                            min(file_pos / file_size * 100, 100),
-                        )
+                        if isinstance(data, (str, bytes)):
+                            file_pos += len(data)
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"Reading file: {os.path.basename(file_path)}",
+                                min(file_pos / file_size * 100, 100),
+                            )
                         return data
 
-                    file.read = progress_read
+                    file.read = progress_read  # type: ignore[method-assign]
                     return file
 
                 # Monkey patch open temporarily
-                import builtins
-
-                original_builtins_open = builtins.open
-                builtins.open = progress_open
+                builtins.open = progress_open  # type: ignore
 
                 try:
                     file_result = scan_file(path, config)
@@ -167,16 +175,20 @@ def scan_model_directory_or_file(
             else:
                 file_result = scan_file(path, config)
 
-            results["bytes_scanned"] += file_result.bytes_scanned
+            results["bytes_scanned"] = (
+                cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+            )
 
             # Track scanner name
             scanner_name = file_result.scanner_name
-            if scanner_name and scanner_name not in results["scanners"]:
-                results["scanners"].append(scanner_name)
+            scanners_list = cast(List[str], results["scanners"])
+            if scanner_name and scanner_name not in scanners_list:
+                scanners_list.append(scanner_name)
 
             # Add issues from file scan
+            issues_list = cast(List[Dict[str, Any]], results["issues"])
             for issue in file_result.issues:
-                results["issues"].append(issue.to_dict())
+                issues_list.append(issue.to_dict())
 
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
@@ -184,20 +196,23 @@ def scan_model_directory_or_file(
     except Exception as e:
         logger.exception(f"Error during scan: {str(e)}")
         results["success"] = False
-        issue = {
+        issue_dict = {
             "message": f"Error during scan: {str(e)}",
             "severity": IssueSeverity.ERROR.value,
             "details": {"exception_type": type(e).__name__},
         }
-        results["issues"].append(issue)
+        issues_list = cast(List[Dict[str, Any]], results["issues"])
+        issues_list.append(issue_dict)
 
     # Add final timing information
     results["finish_time"] = time.time()
-    results["duration"] = results["finish_time"] - results["start_time"]
+    results["duration"] = cast(float, results["finish_time"]) - cast(
+        float, results["start_time"]
+    )
 
     # Determine if there were operational scan errors vs security findings
-    # has_errors should only be True for operational errors (scanner crashes, file not found, etc.)
-    # not for security findings detected in models
+    # has_errors should only be True for operational errors (scanner crashes,
+    # file not found, etc.) not for security findings detected in models
     operational_error_indicators = [
         # Scanner execution errors
         "Error during scan",
@@ -227,13 +242,14 @@ def scan_model_directory_or_file(
         "Too many open files",
     ]
 
+    issues_list = cast(List[Dict[str, Any]], results["issues"])
     results["has_errors"] = (
         any(
             any(
                 indicator in issue.get("message", "")
                 for indicator in operational_error_indicators
             )
-            for issue in results["issues"]
+            for issue in issues_list
             if isinstance(issue, dict)
             and issue.get("severity") == IssueSeverity.ERROR.value
         )
@@ -298,11 +314,8 @@ def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
         file_size = os.path.getsize(path)
         if max_file_size > 0 and file_size > max_file_size:
             sr = ScanResult(scanner_name="size_check")
-            msg = (
-                f"File too large to scan: {file_size} bytes " f"(max: {max_file_size})"
-            )
             sr.add_issue(
-                msg,
+                f"File too large to scan: {file_size} bytes (max: {max_file_size})",
                 severity=IssueSeverity.WARNING,
                 details={
                     "file_size": file_size,
@@ -324,9 +337,10 @@ def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
 
     # Try to use scanners from the registry
     for scanner_class in SCANNER_REGISTRY:
+        # These are concrete scanner classes, not the abstract BaseScanner
         if scanner_class.can_handle(path):
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)
+            scanner = scanner_class(config=config)  # type: ignore[abstract]
             return scanner.scan(path)
 
     # If no scanner could handle the file, create a default unknown format result
@@ -360,11 +374,14 @@ def merge_scan_result(
         scan_dict = scan_result
 
     # Merge issues
+    issues_list = cast(List[Dict[str, Any]], results["issues"])
     for issue in scan_dict.get("issues", []):
-        results["issues"].append(issue)
+        issues_list.append(issue)
 
     # Update bytes scanned
-    results["bytes_scanned"] += scan_dict.get("bytes_scanned", 0)
+    results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + scan_dict.get(
+        "bytes_scanned", 0
+    )
 
     # Update scanner info if not already set
     if "scanner_name" not in results and "scanner" in scan_dict:

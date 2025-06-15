@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -14,7 +14,7 @@ except ImportError:
 
     # Create a placeholder function when the module is not available
     def check_model_name_policies(
-        model_name: str, additional_patterns: Optional[list] = None
+        model_name: str, additional_patterns: Optional[List[str]] = None
     ) -> Tuple[bool, str]:
         return False, ""
 
@@ -108,7 +108,10 @@ class ManifestScanner(BaseScanner):
     """Scanner for model manifest and configuration files"""
 
     name = "manifest"
-    description = "Scans model manifest and configuration files for suspicious content and blacklisted names"
+    description = (
+        "Scans model manifest and configuration files for suspicious content "
+        "and blacklisted names"
+    )
     supported_extensions = MANIFEST_EXTENSIONS
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -300,12 +303,10 @@ class ManifestScanner(BaseScanner):
         # Report suspicious keys
         for item in suspicious_keys:
             result.add_issue(
-                f"Suspicious configuration key found: {item['key']} (category: {item['category']})",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={
-                    "key": item["key"],
-                    "value": item["value"],
-                    "category": item["category"],
-                },
+                f"Suspicious configuration key found: {item['key']} "
+                f"(category: {item['category']})",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} "
+                f"(line {item.get('line', 'unknown')})",
+                details=item,
             )
