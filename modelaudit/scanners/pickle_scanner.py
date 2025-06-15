@@ -5,6 +5,10 @@ from typing import Any, BinaryIO, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+# Type definitions for better type checking
+MLFrameworkPattern = dict[str, Any]
+MLContextDict = dict[str, Any]
+
 # Dictionary of suspicious references.
 # You can expand as needed.
 SUSPICIOUS_GLOBALS = {
@@ -156,13 +160,13 @@ ACTUAL_DANGEROUS_STRING_PATTERNS = [
 ]
 
 
-def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, Any]:
+def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> MLContextDict:
     """
     Detect ML framework context from opcodes with confidence scoring.
     Uses improved scoring that focuses on presence and diversity of ML patterns
     rather than their proportion of total opcodes.
     """
-    context = {
+    context: MLContextDict = {
         "frameworks": {},
         "overall_confidence": 0.0,
         "is_ml_content": False,
@@ -175,13 +179,17 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, An
         filename_lower = filename.lower()
         # Check for any ML framework patterns in filename
         for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
-            for module in patterns["modules"]:
-                if module.lower() in filename_lower:
-                    filename_boost = (
-                        0.2  # Moderate boost for any ML framework in filename
-                    )
-                    context["detected_patterns"].append(f"filename:{framework}")
-                    break
+            modules = patterns.get("modules", [])
+            if isinstance(modules, list):
+                for module in modules:
+                    if isinstance(module, str) and module.lower() in filename_lower:
+                        filename_boost = (
+                            0.2  # Moderate boost for any ML framework in filename
+                        )
+                        detected_patterns = context.get("detected_patterns", [])
+                        if isinstance(detected_patterns, list):
+                            detected_patterns.append(f"filename:{framework}")
+                        break
             if filename_boost > 0:
                 break
 
@@ -198,7 +206,7 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, An
         return context
 
     # Analyze GLOBAL opcodes for ML patterns
-    global_refs = {}
+    global_refs: dict[str, int] = {}
     total_global_opcodes = 0
 
     for opcode, arg, pos in opcodes:
@@ -217,46 +225,58 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, An
     # Check each framework with improved scoring
     for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
         framework_score = 0.0
-        matches = []
+        matches: list[str] = []
 
         # Check module matches with improved scoring
-        for module in patterns["modules"]:
-            if module in global_refs:
-                # Score based on presence and frequency, not proportion of total opcodes
-                ref_count = global_refs[module]
+        modules = patterns.get("modules", [])
+        if isinstance(modules, list):
+            for module in modules:
+                if isinstance(module, str) and module in global_refs:
+                    # Score based on presence and frequency, not proportion of total opcodes
+                    ref_count = global_refs[module]
 
-                # Base score for presence
-                module_score = 10.0  # Base score for any ML module presence
+                    # Base score for presence
+                    module_score = 10.0  # Base score for any ML module presence
 
-                # Bonus for frequency (up to 20 more points)
-                if ref_count >= 5:
-                    module_score += 20.0
-                elif ref_count >= 2:
-                    module_score += 10.0
-                elif ref_count >= 1:
-                    module_score += 5.0
+                    # Bonus for frequency (up to 20 more points)
+                    if ref_count >= 5:
+                        module_score += 20.0
+                    elif ref_count >= 2:
+                        module_score += 10.0
+                    elif ref_count >= 1:
+                        module_score += 5.0
 
-                framework_score += module_score
-                matches.append(f"module:{module}({ref_count})")
+                    framework_score += module_score
+                    matches.append(f"module:{module}({ref_count})")
 
         # Store framework detection with much lower threshold
         if framework_score > 5.0:  # Much lower threshold - any ML module presence
             # Normalize confidence to 0-1 range
-            confidence = min(
-                framework_score / 100.0 * patterns["confidence_boost"], 1.0
-            )
-            context["frameworks"][framework] = {
-                "confidence": confidence,
-                "matches": matches,
-                "raw_score": framework_score,
-            }
-            context["detected_patterns"].extend(matches)
+            confidence_boost = patterns.get("confidence_boost", 1.0)
+            if isinstance(confidence_boost, (int, float)):
+                confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
+                frameworks = context.get("frameworks", {})
+                if isinstance(frameworks, dict):
+                    frameworks[framework] = {
+                        "confidence": confidence,
+                        "matches": matches,
+                        "raw_score": framework_score,
+                    }
+                detected_patterns = context.get("detected_patterns", [])
+                if isinstance(detected_patterns, list):
+                    detected_patterns.extend(matches)
 
     # Calculate overall ML confidence - highest framework confidence plus filename boost
-    if context["frameworks"]:
-        max_confidence = max(fw["confidence"] for fw in context["frameworks"].values())
-        # Apply filename boost
-        context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
+    frameworks = context.get("frameworks", {})
+    if isinstance(frameworks, dict) and frameworks:
+        confidences = []
+        for fw_data in frameworks.values():
+            if isinstance(fw_data, dict) and "confidence" in fw_data:
+                confidences.append(fw_data["confidence"])
+        if confidences:
+            max_confidence = max(confidences)
+            # Apply filename boost
+            context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
     else:
         # If no framework detected but we have filename indicators
         context["overall_confidence"] = filename_boost
@@ -267,7 +287,9 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, An
     return context
 
 
-def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
+def _is_actually_dangerous_global(
+    mod: str, func: str, ml_context: MLContextDict
+) -> bool:
     """
     Smart global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
@@ -280,14 +302,15 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         # Check if this is a known safe ML global
         if mod in ML_SAFE_GLOBALS:
             safe_funcs = ML_SAFE_GLOBALS[mod]
-            if safe_funcs == ["*"] or func in safe_funcs:
-                return False
+            if isinstance(safe_funcs, list):
+                if safe_funcs == ["*"] or func in safe_funcs:
+                    return False
 
     # Use original suspicious global check for genuinely suspicious patterns
     return is_suspicious_global(mod, func)
 
 
-def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
+def _is_actually_dangerous_string(s: str, ml_context: MLContextDict) -> Optional[str]:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
     """
@@ -324,7 +347,9 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     return None
 
 
-def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bool:
+def _should_ignore_opcode_sequence(
+    opcodes: list[tuple], ml_context: MLContextDict
+) -> bool:
     """
     Determine if an opcode sequence should be ignored based on ML context.
     """
@@ -349,7 +374,7 @@ def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bo
 
 
 def _get_context_aware_severity(
-    base_severity: IssueSeverity, ml_context: dict
+    base_severity: IssueSeverity, ml_context: MLContextDict
 ) -> IssueSeverity:
     """
     Adjust severity based on ML context confidence.
@@ -481,13 +506,13 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
 
 
 def check_opcode_sequence(
-    opcodes: list[tuple], ml_context: dict
+    opcodes: list[tuple], ml_context: MLContextDict
 ) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns with ML context awareness.
     Returns a list of suspicious patterns found.
     """
-    suspicious_patterns = []
+    suspicious_patterns: list[dict[str, Any]] = []
 
     # SMART DETECTION: Check if we should ignore this sequence based on ML context
     if _should_ignore_opcode_sequence(opcodes, ml_context):
@@ -539,7 +564,7 @@ def check_opcode_sequence(
 
 
 def _analyze_opcode_legitimacy(
-    opcodes: list[tuple], ml_context: dict
+    opcodes: list[tuple], ml_context: MLContextDict
 ) -> dict[str, Any]:
     """
     Analyze the legitimacy of opcodes based on ML context and patterns.
@@ -611,7 +636,9 @@ def _analyze_opcode_legitimacy(
     return analysis
 
 
-def _calculate_adaptive_threshold(ml_context: dict, opcode_analysis: dict) -> int:
+def _calculate_adaptive_threshold(
+    ml_context: MLContextDict, opcode_analysis: dict
+) -> int:
     """
     Calculate an adaptive threshold based on ML context and opcode analysis.
     This replaces hardcoded framework-specific thresholds.

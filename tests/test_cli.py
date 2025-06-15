@@ -4,8 +4,8 @@ import os
 import pytest
 from click.testing import CliRunner
 
-from modelaudit.cli import cli, format_text_output
 from modelaudit import __version__
+from modelaudit.cli import cli, format_text_output
 
 
 def test_cli_help():
