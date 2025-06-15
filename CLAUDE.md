@@ -10,23 +10,22 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 
 ```bash
 # Setup
-./setup-poetry.sh              # Interactive setup script
-poetry install --extras all    # Install all dependencies
+./setup-rye.sh                 # Interactive setup script
+rye sync --features all        # Install all dependencies
 
 # Running the scanner
-poetry run modelaudit scan model.pkl
-poetry run modelaudit scan --format json --output results.json model.pkl
+rye run modelaudit scan model.pkl
+rye run modelaudit scan --format json --output results.json model.pkl
 
 # Testing
-poetry run pytest                          # Run all tests
-poetry run pytest tests/test_pickle_scanner.py  # Run specific test file
-poetry run pytest -k "test_pickle"         # Run tests matching pattern
+rye run pytest                          # Run all tests
+rye run pytest tests/test_pickle_scanner.py  # Run specific test file
+rye run pytest -k "test_pickle"         # Run tests matching pattern
 
 # Linting and Formatting
-poetry run black modelaudit/ tests/        # Format code (ALWAYS run before committing)
-poetry run isort modelaudit/ tests/        # Sort imports
-poetry run flake8 modelaudit/ tests/       # Check style
-poetry run mypy modelaudit/                # Type checking
+rye run ruff format modelaudit/ tests/   # Format code (ALWAYS run before committing)
+rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
+rye run mypy modelaudit/                 # Type checking
 ```
 
 ## Architecture

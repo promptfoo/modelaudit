@@ -1,22 +1,30 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Poetry
-RUN pip install poetry==1.5.1
+# Install Rye
+RUN pip install rye
 
-# Copy Poetry configuration files
-COPY pyproject.toml poetry.lock* ./
+# Copy project configuration files
+COPY pyproject.toml ./
 
-# Configure Poetry to not create a virtual environment inside the container
-RUN poetry config virtualenvs.create false
+# Configure Rye to not create a virtual environment inside the container
+ENV RYE_NO_AUTO_INSTALL=1
+ENV RYE_USE_UV=1
 
-# Install dependencies (base only by default)
-RUN poetry install --no-dev --no-interaction
+# Install dependencies
+RUN rye sync --no-dev
 
-# Copy project code
+# Copy the rest of the application
 COPY . .
 
-# Set entrypoint
+# Install the application
+RUN rye install
+
+# Create a non-root user
+RUN useradd -m appuser
+USER appuser
+
+# Set the entrypoint
 ENTRYPOINT ["modelaudit"]
 CMD ["--help"] 

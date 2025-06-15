@@ -138,3 +138,10 @@ test_*.pkl
 # Ruff cache
 .ruff_cache/
 
+# Rye
+.python-version
+.venv/
+requirements.lock
+requirements-dev.lock
+.rye/
+

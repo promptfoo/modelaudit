@@ -65,9 +65,8 @@ pip install modelaudit[all]
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Using Poetry (recommended)
-poetry install --all-extras
-poetry shell
+# Using Rye (recommended)
+rye sync --features all
 
 # Or using pip
 pip install -e .[all]
@@ -151,7 +150,7 @@ modelaudit scan model.pkl || exit 1
 # In GitHub Actions
 - name: Security scan models
   run: |
-    poetry run modelaudit scan models/ --format json --output scan-results.json
+    rye run modelaudit scan models/ --format json --output scan-results.json
     if [ $? -eq 1 ]; then
       echo "Security issues found in models!"
       exit 1
@@ -250,9 +249,8 @@ modelaudit scan model.pkl || exit 1
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Poetry (recommended)
-poetry install --all-extras
-poetry shell
+# Install with Rye (recommended)
+rye sync --features all
 
 # Or with pip
 pip install -e .[all]
@@ -262,36 +260,36 @@ pip install -e .[all]
 
 ```bash
 # Run all tests
-poetry run pytest
+rye run pytest
 
 # Run with coverage
-poetry run pytest --cov=modelaudit
+rye run pytest --cov=modelaudit
 
 # Run specific test categories
-poetry run pytest tests/test_pickle_scanner.py -v
-poetry run pytest tests/test_integration.py -v
+rye run pytest tests/test_pickle_scanner.py -v
+rye run pytest tests/test_integration.py -v
 
 # Run tests with all optional dependencies
-poetry install --all-extras
-poetry run pytest
+rye sync --features all
+rye run pytest
 ```
 
 ### Development Workflow
 
 ```bash
 # Run linting and formatting with Ruff
-poetry run ruff check modelaudit/          # Check for linting issues
-poetry run ruff check --fix modelaudit/    # Fix auto-fixable issues
-poetry run ruff format modelaudit/         # Format code
+rye run ruff check modelaudit/          # Check for linting issues
+rye run ruff check --fix modelaudit/    # Fix auto-fixable issues
+rye run ruff format modelaudit/         # Format code
 
 # Type checking
-poetry run mypy modelaudit/
+rye run mypy modelaudit/
 
 # Build package
-poetry build
+rye build
 
 # Publish (maintainers only)
-poetry publish
+rye publish
 ```
 
 **Code Quality Tools:**

@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Python dependencies managed by Poetry
+  # Python dependencies managed by Rye
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
