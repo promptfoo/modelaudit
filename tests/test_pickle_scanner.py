@@ -6,6 +6,8 @@ from pathlib import Path
 # Add the parent directory to sys.path to allow importing modelaudit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from modelaudit.scanners.base import IssueSeverity
+
 # Import only what we need for the pickle scanner test
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.evil_pickle import EvilClass
@@ -49,9 +51,17 @@ class TestPickleScanner(unittest.TestCase):
                 has_os_system_detection = True
 
         assert has_reduce_detection, "Failed to detect REDUCE opcode"
-        assert has_os_system_detection, (
-            "Failed to detect os.system/posix.system reference"
-        )
+        assert (
+            has_os_system_detection
+        ), "Failed to detect os.system/posix.system reference"
+
+    def test_scan_nonexistent_file(self):
+        """Scanner returns failure and error issue for missing file"""
+        scanner = PickleScanner()
+        result = scanner.scan("nonexistent_file.pkl")
+
+        assert result.success is False
+        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
 
 
 if __name__ == "__main__":
