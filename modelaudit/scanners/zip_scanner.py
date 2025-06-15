@@ -1,7 +1,8 @@
-import zipfile
 import os
-from typing import Optional, Dict, Any
-from .base import BaseScanner, ScanResult, IssueSeverity
+import zipfile
+from typing import Any, Dict, Optional
+
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 
 class ZipScanner(BaseScanner):
@@ -98,7 +99,8 @@ class ZipScanner(BaseScanner):
             # Check number of entries
             if len(z.namelist()) > self.max_entries:
                 result.add_issue(
-                    f"ZIP file contains too many entries ({len(z.namelist())} > {self.max_entries})",
+                    f"ZIP file contains too many entries "
+                    f"({len(z.namelist())} > {self.max_entries})",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={
@@ -114,7 +116,11 @@ class ZipScanner(BaseScanner):
 
                 # Check for directory traversal attempts
                 normalized_path = os.path.normpath(name)
-                if not normalized_path or normalized_path.startswith("..") or os.path.isabs(normalized_path):
+                if (
+                    not normalized_path
+                    or normalized_path.startswith("..")
+                    or os.path.isabs(normalized_path)
+                ):
                     result.add_issue(
                         f"Potential directory traversal in ZIP entry: {name}",
                         severity=IssueSeverity.ERROR,
@@ -132,7 +138,8 @@ class ZipScanner(BaseScanner):
                     compression_ratio = info.file_size / info.compress_size
                     if compression_ratio > 100:
                         result.add_issue(
-                            f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
+                            f"Suspicious compression ratio ({compression_ratio:.1f}x) "
+                            f"in entry: {name}",
                             severity=IssueSeverity.WARNING,
                             location=f"{path}:{name}",
                             details={
@@ -145,7 +152,9 @@ class ZipScanner(BaseScanner):
 
                 # Extract and scan the file
                 try:
-                    max_entry_size = self.config.get("max_entry_size", 10485760)  # 10 MB default
+                    max_entry_size = self.config.get(
+                        "max_entry_size", 10485760
+                    )  # 10 MB default
                     data = b""
                     with z.open(name) as entry:
                         while True:
@@ -155,7 +164,10 @@ class ZipScanner(BaseScanner):
                             data += chunk
                             result.bytes_scanned += len(chunk)
                             if len(data) > max_entry_size:
-                                raise ValueError(f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes")
+                                raise ValueError(
+                                    f"ZIP entry {name} exceeds maximum size of "
+                                    f"{max_entry_size} bytes"
+                                )
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
                         # Write to temporary file and scan recursively
