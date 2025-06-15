@@ -67,7 +67,6 @@ cd modelaudit
 
 # Using Poetry (recommended)
 poetry install --all-extras
-poetry shell
 
 # Or using pip
 pip install -e .[all]
@@ -252,10 +251,40 @@ cd modelaudit
 
 # Install with Poetry (recommended)
 poetry install --all-extras
-poetry shell
 
 # Or with pip
 pip install -e .[all]
+```
+
+### Testing with Development Version
+
+**Install and test your local development version:**
+
+```bash
+# Option 1: Install in development mode with pip
+pip install -e .[all]
+
+# Then test the CLI directly
+modelaudit scan test_model.pkl
+
+# Option 2: Use Poetry (recommended)
+poetry install --all-extras
+
+# Test with Poetry run (no shell activation needed)
+poetry run modelaudit scan test_model.pkl
+
+# Test with Python import
+poetry run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+```
+
+**Create test models for development:**
+
+```bash
+# Create a simple test pickle file
+python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+
+# Test scanning it
+modelaudit scan test_model.pkl
 ```
 
 ### Running Tests
