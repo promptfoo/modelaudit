@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.manifest_scanner import ManifestScanner
