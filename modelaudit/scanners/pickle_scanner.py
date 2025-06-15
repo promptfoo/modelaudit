@@ -909,7 +909,11 @@ class PickleScanner(BaseScanner):
                 if opcode.name == "STACK_GLOBAL":
                     # Find the two most recent STRING-like opcodes before this position
                     recent_strings = []
-                    for j in range(max(0, i - 20), i):  # Look back up to 20 opcodes
+                    for j in range(
+                        i - 1, max(-1, i - 20), -1
+                    ):  # Look back up to 20 opcodes, starting from most recent
+                        if j < 0:
+                            break
                         prev_opcode, prev_arg, prev_pos = opcodes[j]
                         if prev_opcode.name in [
                             "STRING",
@@ -923,9 +927,11 @@ class PickleScanner(BaseScanner):
                                 break
 
                     if len(recent_strings) >= 2:
-                        # Last two strings should be module and function
-                        func = recent_strings[-1]
-                        mod = recent_strings[-2]
+                        # The strings are in reverse order of appearance, so:
+                        # recent_strings[0] is the function (most recent)
+                        # recent_strings[1] is the module (second most recent)
+                        func = recent_strings[0]
+                        mod = recent_strings[1]
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
