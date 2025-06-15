@@ -1,6 +1,6 @@
 import os
-from typing import Any, Optional
 from pathlib import Path
+from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
