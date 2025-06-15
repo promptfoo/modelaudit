@@ -9,6 +9,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 # You can expand as needed.
 SUSPICIOUS_GLOBALS = {
     "os": "*",
+    "posix": "*",  # posix.system is equivalent to os.system on Unix
     "sys": "*",
     "subprocess": "*",
     "runpy": "*",
@@ -246,22 +247,23 @@ class PickleScanner(BaseScanner):
 
             # Store opcodes for pattern analysis
             opcodes = []
-            # Track strings for STACK_GLOBAL analysis
+            # Track strings on the stack for STACK_GLOBAL opcode analysis
             string_stack = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 opcodes.append((opcode, arg, pos))
                 opcode_count += 1
 
-                # Track strings on the stack for STACK_GLOBAL analysis
+                # Track strings for STACK_GLOBAL analysis
                 if opcode.name in [
                     "STRING",
                     "BINSTRING",
                     "SHORT_BINSTRING",
+                    "SHORT_BINUNICODE",
                     "UNICODE",
                 ] and isinstance(arg, str):
                     string_stack.append(arg)
-                    # Keep only last 10 strings to avoid memory issues
+                    # Keep only the last 10 strings to avoid memory issues
                     if len(string_stack) > 10:
                         string_stack.pop(0)
 

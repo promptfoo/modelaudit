@@ -194,18 +194,92 @@ def scan_model_directory_or_file(
     # Add final timing information
     results["finish_time"] = time.time()
     results["duration"] = results["finish_time"] - results["start_time"]
-    error_issues = [
-        issue
-        for issue in results["issues"]
-        if (
-            isinstance(issue, dict)
-            and "severity" in issue
+
+    # Determine if there were operational scan errors vs security findings
+    # has_errors should only be True for operational errors (scanner crashes, file not found, etc.)
+    # not for security findings detected in models
+    operational_error_indicators = [
+        # Scanner execution errors
+        "Error during scan",
+        "Error checking file size", 
+        "Error scanning file",
+        "Scanner crashed",
+        "Scan timeout",
+        
+        # File system errors
+        "Path does not exist",
+        "Path is not readable",
+        "Permission denied",
+        "File not found",
+        
+        # Dependency/environment errors
+        "not installed, cannot scan",
+        "Missing dependency",
+        "Import error",
+        "Module not found",
+        
+        # File format/corruption errors
+        "not a valid",
+        "Invalid file format",
+        "Corrupted file",
+        "Bad file signature",
+        "Unable to parse",
+        
+        # Resource/system errors
+        "Out of memory",
+        "Disk space",
+        "Too many open files",
+    ]
+
+    results["has_errors"] = (
+        any(
+            any(
+                indicator in issue.get("message", "")
+                for indicator in operational_error_indicators
+            )
+            for issue in results["issues"]
+            if isinstance(issue, dict)
             and issue.get("severity") == IssueSeverity.ERROR.value
         )
-    ]
-    results["has_errors"] = len(error_issues) > 0
+        or not results["success"]
+    )
 
     return results
+
+
+def determine_exit_code(results: Dict[str, Any]) -> int:
+    """
+    Determine the appropriate exit code based on scan results.
+
+    Exit codes:
+    - 0: Success, no security issues found
+    - 1: Security issues found (scan completed successfully)
+    - 2: Operational errors occurred during scanning
+
+    Args:
+        results: Dictionary with scan results
+
+    Returns:
+        Exit code (0, 1, or 2)
+    """
+    # Check for operational errors first (highest priority)
+    if results.get("has_errors", False):
+        return 2
+
+    # Check for any security findings (warnings, errors, or info issues)
+    issues = results.get("issues", [])
+    if issues:
+        # Filter out DEBUG level issues for exit code determination
+        non_debug_issues = [
+            issue
+            for issue in issues
+            if isinstance(issue, dict) and issue.get("severity") != "debug"
+        ]
+        if non_debug_issues:
+            return 1
+
+    # No issues found
+    return 0
 
 
 def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:

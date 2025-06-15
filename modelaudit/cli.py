@@ -8,7 +8,7 @@ import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
-from .core import scan_model_directory_or_file
+from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
 logging.basicConfig(
@@ -234,17 +234,9 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
             click.echo("\n" + "─" * 80)
         click.echo(output_text)
 
-    # Exit with appropriate error code
-    # Exit codes:
-    # 0 - Success, no issues found
-    # 1 - Security issues found (but scan completed successfully)
-    # 2 - Errors occurred during scanning
-    if aggregated_results.get("has_errors", False):
-        sys.exit(2)  # Scan errors
-    elif aggregated_results.get("issues", []):
-        sys.exit(1)  # Security findings
-    else:
-        sys.exit(0)  # Clean scan
+    # Exit with appropriate error code based on scan results
+    exit_code = determine_exit_code(aggregated_results)
+    sys.exit(exit_code)
 
 
 def format_text_output(results, verbose=False):

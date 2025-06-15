@@ -88,7 +88,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             if self.check_ops:
                 self._scan_saved_model_ops(path, result)
 
-        # Check for suspicious pickle files
+        # Check for suspicious files
         if self.check_pickle_files:
             self._scan_pickle_files(path, result)
 
@@ -156,19 +156,21 @@ class TensorFlowSavedModelScanner(BaseScanner):
             )
 
     def _scan_pickle_files(self, path: str, result: ScanResult) -> None:
-        """Scan for pickle files that might contain malicious code"""
+        """Scan for pickle files and other suspicious content"""
         from .pickle_scanner import PickleScanner
 
         pickle_scanner = PickleScanner(self.config)
 
-        # Recursively search for pickle files
+        # Recursively search for files
         for root, dirs, files in os.walk(path):
             for file in files:
+                file_path = os.path.join(root, file)
+
+                # Scan pickle files specifically
                 if file.endswith((".pkl", ".pickle")):
-                    pickle_path = os.path.join(root, file)
                     try:
                         # Scan the pickle file
-                        pickle_result = pickle_scanner.scan(pickle_path)
+                        pickle_result = pickle_scanner.scan(file_path)
 
                         # Add context that this was found in a SavedModel
                         for issue in pickle_result.issues:
@@ -184,10 +186,56 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         result.add_issue(
                             f"Error scanning pickle file {file}: {str(e)}",
                             severity=IssueSeverity.ERROR,
-                            location=pickle_path,
+                            location=file_path,
                             details={
                                 "exception": str(e),
                                 "exception_type": type(e).__name__,
                                 "found_in_savedmodel": path,
                             },
                         )
+
+                # Look for potentially suspicious Python files
+                if file.endswith(".py"):
+                    result.add_issue(
+                        f"Found Python file in SavedModel directory: {file_path}",
+                        severity=IssueSeverity.WARNING,
+                        location=file_path,
+                        details={"file_type": "python"},
+                    )
+
+                # Check for blacklist patterns in text files
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                ):
+                    blacklist_patterns = self.config["blacklist_patterns"]
+                    try:
+                        # Only check text files
+                        if file.endswith(
+                            (
+                                ".txt",
+                                ".md",
+                                ".json",
+                                ".yaml",
+                                ".yml",
+                                ".py",
+                                ".cfg",
+                                ".conf",
+                            )
+                        ):
+                            with open(
+                                file_path, "r", encoding="utf-8", errors="ignore"
+                            ) as f:
+                                content = f.read()
+                                for pattern in blacklist_patterns:
+                                    if pattern in content:
+                                        result.add_issue(
+                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            severity=IssueSeverity.WARNING,
+                                            location=file_path,
+                                            details={"pattern": pattern, "file": file},
+                                        )
+                    except Exception:
+                        # Skip files we can't read
+                        pass

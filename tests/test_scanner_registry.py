@@ -33,9 +33,9 @@ def test_scanner_registry_unique_names():
     scanner_names = [cls.name for cls in SCANNER_REGISTRY]
 
     # Check for duplicates
-    assert len(scanner_names) == len(
-        set(scanner_names)
-    ), "Duplicate scanner names found"
+    assert len(scanner_names) == len(set(scanner_names)), (
+        "Duplicate scanner names found"
+    )
 
 
 def test_scanner_registry_file_extension_coverage():
