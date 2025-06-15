@@ -357,7 +357,7 @@ def format_text_output(results, verbose=False):
 
             # Color-code based on severity
             if severity == "error":
-                severity_style = click.style("[ERROR]", fg="red", bold=True)
+                severity_style = click.style("[CRITICAL]", fg="red", bold=True)
             elif severity == "warning":
                 severity_style = click.style("[WARNING]", fg="yellow")
             elif severity == "info":
