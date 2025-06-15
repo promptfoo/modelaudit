@@ -114,7 +114,11 @@ class ZipScanner(BaseScanner):
 
                 # Check for directory traversal attempts
                 normalized_path = os.path.normpath(name)
-                if not normalized_path or normalized_path.startswith("..") or os.path.isabs(normalized_path):
+                if (
+                    not normalized_path
+                    or normalized_path.startswith("..")
+                    or os.path.isabs(normalized_path)
+                ):
                     result.add_issue(
                         f"Potential directory traversal in ZIP entry: {name}",
                         severity=IssueSeverity.ERROR,
@@ -145,7 +149,9 @@ class ZipScanner(BaseScanner):
 
                 # Extract and scan the file
                 try:
-                    max_entry_size = self.config.get("max_entry_size", 10485760)  # 10 MB default
+                    max_entry_size = self.config.get(
+                        "max_entry_size", 10485760
+                    )  # 10 MB default
                     data = b""
                     with z.open(name) as entry:
                         while True:
@@ -155,7 +161,9 @@ class ZipScanner(BaseScanner):
                             data += chunk
                             result.bytes_scanned += len(chunk)
                             if len(data) > max_entry_size:
-                                raise ValueError(f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes")
+                                raise ValueError(
+                                    f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes"
+                                )
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
                         # Write to temporary file and scan recursively
