@@ -36,11 +36,13 @@ jobs:
         run: |
           poetry install --with dev --extras "all"
 
-      - name: Lint and format
+      - name: Lint with Ruff
         run: |
-          poetry run black --check modelaudit/
-          poetry run isort --check-only modelaudit/
-          poetry run flake8 modelaudit/
+          poetry run ruff check modelaudit/
+
+      - name: Check formatting with Ruff
+        run: |
+          poetry run ruff format --check modelaudit/
 
   type-check:
     name: Type Check

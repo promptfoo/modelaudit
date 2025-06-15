@@ -1,7 +1,7 @@
 import os
 import pickletools
 import time
-from typing import Any, BinaryIO, Dict, List, Optional
+from typing import Any, BinaryIO, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -87,7 +87,7 @@ def is_suspicious_string(s: str) -> Optional[str]:
     return None
 
 
-def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]]:
+def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]]:
     """
     Check for patterns that indicate a dangerous __reduce__ method
     Returns details about the dangerous pattern if found, None otherwise
@@ -104,7 +104,9 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
                 parts = (
                     arg.split(" ", 1)
                     if " " in arg
-                    else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                    else arg.rsplit(".", 1)
+                    if "." in arg
+                    else [arg, ""]
                 )
                 if len(parts) == 2:
                     mod, func = parts
@@ -158,7 +160,7 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
     return None
 
 
-def check_opcode_sequence(opcodes: List[tuple]) -> List[Dict[str, Any]]:
+def check_opcode_sequence(opcodes: list[tuple]) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns
     Returns a list of suspicious patterns found
@@ -181,7 +183,7 @@ def check_opcode_sequence(opcodes: List[tuple]) -> List[Dict[str, Any]]:
                     "count": dangerous_opcode_count,
                     "position": pos,
                     "opcode": opcode.name,
-                }
+                },
             )
             # Reset counter to avoid multiple alerts
             dangerous_opcode_count = 0
@@ -196,7 +198,7 @@ class PickleScanner(BaseScanner):
     description = "Scans Python pickle files for suspicious code references"
     supported_extensions = [".pkl", ".pickle"]
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
@@ -297,7 +299,9 @@ class PickleScanner(BaseScanner):
                         parts = (
                             arg.split(" ", 1)
                             if " " in arg
-                            else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                            else arg.rsplit(".", 1)
+                            if "." in arg
+                            else [arg, ""]
                         )
 
                         if len(parts) == 2:
@@ -412,8 +416,7 @@ class PickleScanner(BaseScanner):
             for sequence in suspicious_sequences:
                 suspicious_count += 1
                 result.add_issue(
-                    f"Suspicious opcode sequence: "
-                    f"{sequence.get('pattern', 'unknown')}",
+                    f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown')}",
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} "
                     f"(pos {sequence.get('position', 0)})",
@@ -424,7 +427,7 @@ class PickleScanner(BaseScanner):
             end_pos = file_obj.tell()
             result.bytes_scanned = end_pos - start_pos
             result.metadata.update(
-                {"opcode_count": opcode_count, "suspicious_count": suspicious_count}
+                {"opcode_count": opcode_count, "suspicious_count": suspicious_count},
             )
 
         except Exception as e:

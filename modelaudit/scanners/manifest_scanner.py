@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -14,8 +14,9 @@ except ImportError:
 
     # Create a placeholder function when the module is not available
     def check_model_name_policies(
-        model_name: str, additional_patterns: Optional[List[str]] = None
-    ) -> Tuple[bool, str]:
+        model_name: str,
+        additional_patterns: Optional[list[str]] = None,
+    ) -> tuple[bool, str]:
         return False, ""
 
 
@@ -114,7 +115,7 @@ class ManifestScanner(BaseScanner):
     )
     supported_extensions = MANIFEST_EXTENSIONS
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])
@@ -132,7 +133,7 @@ class ManifestScanner(BaseScanner):
 
         # For files without a recognized extension, try to peek at the content
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 first_line = f.readline().strip()
                 # Check for JSON format
                 if first_line.startswith("{") or first_line.startswith("["):
@@ -140,7 +141,7 @@ class ManifestScanner(BaseScanner):
                 # Check for YAML format if yaml is available
                 if HAS_YAML and (first_line.startswith("---") or ":" in first_line):
                     return True
-        except (UnicodeDecodeError, IOError):
+        except (OSError, UnicodeDecodeError):
             pass
 
         return False
@@ -199,7 +200,7 @@ class ManifestScanner(BaseScanner):
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = (
                     f.read().lower()
                 )  # Convert to lowercase for case-insensitive matching
@@ -221,10 +222,10 @@ class ManifestScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
-    def _parse_file(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
+    def _parse_file(self, path: str, ext: str) -> Optional[dict[str, Any]]:
         """Parse the file based on its extension"""
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = f.read()
 
                 # Try JSON format first
@@ -259,7 +260,9 @@ class ManifestScanner(BaseScanner):
         return None
 
     def _check_suspicious_patterns(
-        self, content: Dict[str, Any], result: ScanResult
+        self,
+        content: dict[str, Any],
+        result: ScanResult,
     ) -> None:
         """Check for suspicious patterns in the configuration"""
         suspicious_keys = []
@@ -284,7 +287,7 @@ class ManifestScanner(BaseScanner):
                                     else ""
                                 ),
                                 "category": category,
-                            }
+                            },
                         )
 
                 # Recursively check nested structures

@@ -134,7 +134,7 @@ def test_scan_output_file(tmp_path):
     output_file = tmp_path / "output.txt"
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
+    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
 
     # The file should be created regardless of the exit code
     assert output_file.exists()
@@ -149,7 +149,9 @@ def test_scan_verbose_mode(tmp_path):
     runner = CliRunner()
     # Use catch_exceptions=True to handle any errors in the CLI
     result = runner.invoke(
-        cli, ["scan", str(test_file), "--verbose"], catch_exceptions=True
+        cli,
+        ["scan", str(test_file), "--verbose"],
+        catch_exceptions=True,
     )
 
     # In verbose mode, we should see more output
@@ -197,7 +199,7 @@ def test_format_text_output():
                 "severity": "warning",
                 "location": "test.pkl",
                 "details": {"test": "value"},
-            }
+            },
         ],
         "has_errors": False,
     }
@@ -227,16 +229,16 @@ def test_exit_code_clean_scan(tmp_path):
         "biases": [0.1, 0.2, 0.3],
         "model_name": "clean_model",
     }
-    with open(test_file, "wb") as f:
+    with (test_file).open("wb") as f:
         pickle.dump(data, f)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert (
-        result.exit_code == 0
-    ), f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
+    assert result.exit_code == 0, (
+        f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
+    )
     # The output might not say "No issues found" if there are debug messages, so let's be less strict
     assert (
         "scan completed successfully" in result.output.lower()
@@ -255,16 +257,16 @@ def test_exit_code_security_issues(tmp_path):
         def __reduce__(self):
             return (os.system, ('echo "This is a malicious pickle"',))
 
-    with open(evil_pickle_path, "wb") as f:
+    with evil_pickle_path.open("wb") as f:
         pickle.dump(MaliciousClass(), f)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert (
-        result.exit_code == 1
-    ), f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert result.exit_code == 1, (
+        f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    )
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 

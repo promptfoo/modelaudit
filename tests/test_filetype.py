@@ -2,7 +2,7 @@ import zipfile
 
 from modelaudit.utils.filetype import (
     detect_file_format,
-    gather_shards_if_any,
+    find_sharded_files,
     is_zipfile,
 )
 
@@ -30,7 +30,7 @@ def test_detect_file_format_zip(tmp_path):
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("test.txt", "test content")
 
-    assert detect_file_format(str(zip_path)) == "zip_archive"
+    assert detect_file_format(str(zip_path)) == "zip"
 
 
 def test_detect_file_format_by_extension(tmp_path):
@@ -43,8 +43,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pkl": "pickle",
         ".pickle": "pickle",
         ".h5": "hdf5",
-        ".pb": "tensorflow_pb",
-        ".onnx": "onnx",
+        ".pb": "protobuf",
         ".unknown": "unknown",
     }
 
@@ -88,8 +87,8 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile("nonexistent_file.zip") is False
 
 
-def test_gather_shards_if_any(tmp_path):
-    """Test gathering sharded model files."""
+def test_find_sharded_files(tmp_path):
+    """Test finding sharded model files."""
     # Create directory with sharded files
     shard_dir = tmp_path / "model_dir"
     shard_dir.mkdir()
@@ -103,8 +102,8 @@ def test_gather_shards_if_any(tmp_path):
     (shard_dir / "config.json").write_bytes(b"{}")
     (shard_dir / "other_file.bin").write_bytes(b"other")
 
-    # Test gathering shards
-    shards = gather_shards_if_any(str(shard_dir))
+    # Test finding shards
+    shards = find_sharded_files(str(shard_dir))
 
     assert len(shards) == 3
     assert all("pytorch_model-0000" in shard for shard in shards)

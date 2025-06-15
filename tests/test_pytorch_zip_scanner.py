@@ -20,7 +20,7 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
-def create_pytorch_zip(tmp_path, malicious=False):
+def create_pytorch_zip(tmp_path, *, malicious=False):
     """Create a mock PyTorch ZIP file for testing."""
     # Create a ZIP file that mimics a PyTorch model
     zip_path = tmp_path / "model.pt"
@@ -83,8 +83,7 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     """Test scanning an invalid ZIP file."""
     # Create an invalid ZIP file
     invalid_path = tmp_path / "invalid.pt"
-    with open(invalid_path, "wb") as f:
-        f.write(b"This is not a valid ZIP file")
+    invalid_path.write_bytes(b"This is not a valid ZIP file")
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(invalid_path))
