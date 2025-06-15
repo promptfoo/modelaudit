@@ -1,7 +1,9 @@
 import os
+import pickle
 import pickletools
 import time
-from typing import Any, BinaryIO, Optional
+from io import BytesIO
+from typing import Any, BinaryIO, Optional, Dict, List, Union
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -61,7 +63,7 @@ SUSPICIOUS_STRING_PATTERNS = [
 # ============================================================================
 
 # ML Framework Detection Patterns
-ML_FRAMEWORK_PATTERNS = {
+ML_FRAMEWORK_PATTERNS: Dict[str, Dict[str, Union[List[str], float]]] = {
     "pytorch": {
         "modules": [
             "torch",
@@ -120,7 +122,7 @@ ML_FRAMEWORK_PATTERNS = {
 }
 
 # Safe ML-specific global patterns
-ML_SAFE_GLOBALS = {
+ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     # PyTorch safe patterns
     "torch": ["*"],  # All torch functions are generally safe
     "torch.nn": ["*"],
@@ -162,7 +164,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     Uses improved scoring that focuses on presence and diversity of ML patterns
     rather than their proportion of total opcodes.
     """
-    context = {
+    context: dict[str, Any] = {
         "frameworks": {},
         "overall_confidence": 0.0,
         "is_ml_content": False,
@@ -174,7 +176,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         return context
 
     # Analyze GLOBAL opcodes for ML patterns
-    global_refs = {}
+    global_refs: dict[str, int] = {}
     total_global_opcodes = 0
 
     for opcode, arg, pos in opcodes:
@@ -193,40 +195,42 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     # Check each framework with improved scoring
     for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
         framework_score = 0.0
-        matches = []
+        matches: list[str] = []
 
         # Check module matches with improved scoring
-        for module in patterns["modules"]:
-            if module in global_refs:
-                # Score based on presence and frequency, not proportion of total opcodes
-                ref_count = global_refs[module]
+        modules = patterns["modules"]
+        if isinstance(modules, list):
+            for module in modules:
+                if module in global_refs:
+                    # Score based on presence and frequency, not proportion of total opcodes
+                    ref_count = global_refs[module]
 
-                # Base score for presence
-                module_score = 10.0  # Base score for any ML module presence
+                    # Base score for presence
+                    module_score = 10.0  # Base score for any ML module presence
 
-                # Bonus for frequency (up to 20 more points)
-                if ref_count >= 5:
-                    module_score += 20.0
-                elif ref_count >= 2:
-                    module_score += 10.0
-                elif ref_count >= 1:
-                    module_score += 5.0
+                    # Bonus for frequency (up to 20 more points)
+                    if ref_count >= 5:
+                        module_score += 20.0
+                    elif ref_count >= 2:
+                        module_score += 10.0
+                    elif ref_count >= 1:
+                        module_score += 5.0
 
-                framework_score += module_score
-                matches.append(f"module:{module}({ref_count})")
+                    framework_score += module_score
+                    matches.append(f"module:{module}({ref_count})")
 
         # Store framework detection with much lower threshold
         if framework_score > 5.0:  # Much lower threshold - any ML module presence
             # Normalize confidence to 0-1 range
-            confidence = min(
-                framework_score / 100.0 * patterns["confidence_boost"], 1.0
-            )
-            context["frameworks"][framework] = {
-                "confidence": confidence,
-                "matches": matches,
-                "raw_score": framework_score,
-            }
-            context["detected_patterns"].extend(matches)
+            confidence_boost = patterns["confidence_boost"]
+            if isinstance(confidence_boost, (int, float)):
+                confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
+                context["frameworks"][framework] = {
+                    "confidence": confidence,
+                    "matches": matches,
+                    "raw_score": framework_score,
+                }
+                context["detected_patterns"].extend(matches)
 
     # Calculate overall ML confidence - highest framework confidence
     if context["frameworks"]:
@@ -459,7 +463,7 @@ def check_opcode_sequence(
     Analyze the full sequence of opcodes for suspicious patterns with ML context awareness.
     Returns a list of suspicious patterns found.
     """
-    suspicious_patterns = []
+    suspicious_patterns: list[dict[str, Any]] = []
 
     # SMART DETECTION: Check if we should ignore this sequence based on ML context
     if _should_ignore_opcode_sequence(opcodes, ml_context):
