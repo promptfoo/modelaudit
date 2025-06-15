@@ -1,9 +1,9 @@
-import pytest
-import zipfile
-import tempfile
 import os
-from modelaudit.scanners.zip_scanner import ZipScanner
+import tempfile
+import zipfile
+
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.zip_scanner import ZipScanner
 
 
 class TestZipScanner:
@@ -206,8 +206,8 @@ class TestZipScanner:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             with zipfile.ZipFile(tmp.name, "w") as z:
                 # Create a pickle with suspicious content
-                import pickle
                 import os as os_module
+                import pickle
 
                 class DangerousClass:
                     def __reduce__(self):

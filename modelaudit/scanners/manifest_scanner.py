@@ -56,6 +56,9 @@ MODEL_NAME_KEYS = [
     "package_name",
 ]
 
+# Pre-compute lowercase versions for faster checks
+MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
+
 # Suspicious configuration patterns
 SUSPICIOUS_CONFIG_PATTERNS = {
     "network_access": [
@@ -265,10 +268,10 @@ class ManifestScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Smart pattern detection with value analysis and ML context awareness"""
-        
+
         # STEP 1: Detect ML context for smart filtering
         ml_context = self._detect_ml_context(content)
-        
+
         def check_dict(d, prefix=""):
             if not isinstance(d, dict):
                 return
@@ -276,7 +279,24 @@ class ManifestScanner(BaseScanner):
             for key, value in d.items():
                 key_lower = key.lower()
                 full_key = f"{prefix}.{key}" if prefix else key
-                
+
+                # STEP 1.5: Check for blacklisted model names (integrated from original)
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value), self.blacklist_patterns
+                    )
+                    if blocked:
+                        result.add_issue(
+                            f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.ERROR,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": full_key,
+                            },
+                        )
+
                 # STEP 2: Value-based analysis - check for actually dangerous content
                 if self._is_actually_dangerous_value(key, value):
                     result.add_issue(
@@ -287,16 +307,18 @@ class ManifestScanner(BaseScanner):
                             "key": full_key,
                             "analysis": "value_based",
                             "danger": "executable_content",
-                            "value": self._format_value(value)
-                        }
+                            "value": self._format_value(value),
+                        },
                     )
                     # Don't continue here - still check for patterns and recurse
-                
+
                 # STEP 3: Smart pattern matching
                 matches = self._find_suspicious_matches(key_lower)
                 if matches:
                     # STEP 4: Context-aware filtering
-                    if not self._should_ignore_in_context(key, value, matches, ml_context):
+                    if not self._should_ignore_in_context(
+                        key, value, matches, ml_context
+                    ):
                         # STEP 5: Report with context-aware severity
                         severity = self._get_context_aware_severity(matches, ml_context)
                         result.add_issue(
@@ -308,8 +330,8 @@ class ManifestScanner(BaseScanner):
                                 "value": self._format_value(value),
                                 "categories": matches,
                                 "ml_context": ml_context,
-                                "analysis": "pattern_based"
-                            }
+                                "analysis": "pattern_based",
+                            },
                         )
 
                 # ALWAYS recursively check nested structures, regardless of pattern matches
@@ -326,16 +348,16 @@ class ManifestScanner(BaseScanner):
         """Check if value content is actually dangerous executable code"""
         if not isinstance(value, str):
             return False
-        
+
         value_lower = value.lower().strip()
-        
+
         # Look for ACTUAL executable content patterns
         dangerous_patterns = [
             "import os",
             "subprocess.",
             "eval(",
             "exec(",
-            "os.system", 
+            "os.system",
             "__import__",
             "runpy",
             "shell=true",
@@ -346,9 +368,9 @@ class ManifestScanner(BaseScanner):
             "exec('",
             'exec("',
             "eval('",
-            'eval("'
+            'eval("',
         ]
-        
+
         return any(pattern in value_lower for pattern in dangerous_patterns)
 
     def _detect_ml_context(self, content: dict) -> dict:
@@ -358,67 +380,86 @@ class ManifestScanner(BaseScanner):
             "model_type": None,
             "confidence": 0,
             "is_tokenizer": False,
-            "is_model_config": False
+            "is_model_config": False,
         }
-        
+
         # Framework detection patterns
         framework_patterns = {
             "huggingface": [
-                "tokenizer_class", "transformers_version", "model_type",
-                "architectures", "auto_map", "_name_or_path"
+                "tokenizer_class",
+                "transformers_version",
+                "model_type",
+                "architectures",
+                "auto_map",
+                "_name_or_path",
             ],
             "pytorch": [
-                "torch", "state_dict", "pytorch_model",
-                "model.pt", "torch_dtype"
+                "torch",
+                "state_dict",
+                "pytorch_model",
+                "model.pt",
+                "torch_dtype",
             ],
             "tensorflow": [
-                "tensorflow", "saved_model", "model.h5",
-                "tf_version", "keras"
+                "tensorflow",
+                "saved_model",
+                "model.h5",
+                "tf_version",
+                "keras",
             ],
-            "sklearn": [
-                "sklearn", "pickle_module", "scikit"
-            ]
+            "sklearn": ["sklearn", "pickle_module", "scikit"],
         }
-        
+
         # Model type indicators
         tokenizer_indicators = [
-            "tokenizer_class", "added_tokens_decoder", "model_input_names",
-            "special_tokens_map", "bos_token", "eos_token", "pad_token"
+            "tokenizer_class",
+            "added_tokens_decoder",
+            "model_input_names",
+            "special_tokens_map",
+            "bos_token",
+            "eos_token",
+            "pad_token",
         ]
-        
+
         model_config_indicators = [
-            "hidden_size", "num_attention_heads", "num_hidden_layers",
-            "vocab_size", "max_position_embeddings", "architectures"
+            "hidden_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "vocab_size",
+            "max_position_embeddings",
+            "architectures",
         ]
-        
+
         def check_indicators(d):
             if not isinstance(d, dict):
                 return
-                
+
             for key, val in d.items():
                 key_str = str(key).lower()
                 val_str = str(val).lower()
-                
+
                 # Check framework patterns
                 for framework, patterns in framework_patterns.items():
-                    if any(pattern in key_str or pattern in val_str for pattern in patterns):
+                    if any(
+                        pattern in key_str or pattern in val_str for pattern in patterns
+                    ):
                         indicators["framework"] = framework
                         indicators["confidence"] += 1
-                
+
                 # Check tokenizer indicators
                 if any(indicator in key_str for indicator in tokenizer_indicators):
                     indicators["is_tokenizer"] = True
                     indicators["confidence"] += 1
-                
-                # Check model config indicators  
+
+                # Check model config indicators
                 if any(indicator in key_str for indicator in model_config_indicators):
                     indicators["is_model_config"] = True
                     indicators["confidence"] += 1
-                
+
                 # Recursive check
                 if isinstance(val, dict):
                     check_indicators(val)
-        
+
         check_indicators(content)
         return indicators
 
@@ -430,92 +471,130 @@ class ManifestScanner(BaseScanner):
                 matches.append(category)
         return matches
 
-    def _should_ignore_in_context(self, key: str, value: Any, matches: list[str], ml_context: dict) -> bool:
+    def _should_ignore_in_context(
+        self, key: str, value: Any, matches: list[str], ml_context: dict
+    ) -> bool:
         """Context-aware ignore logic combining smart patterns with value analysis"""
         key_lower = key.lower()
-        
+
         # High-confidence ML context gets more lenient treatment
         if ml_context.get("confidence", 0) >= 2:
-            
             # File access patterns in ML context
             if "file_access" in matches:
                 # First check if this is an actual file path - never ignore those
-                if key_lower.endswith(("_dir", "_path", "_file")) and self._is_file_path_value(value):
+                if key_lower.endswith(
+                    ("_dir", "_path", "_file")
+                ) and self._is_file_path_value(value):
                     return False  # Don't ignore actual file paths
-                
+
                 # Common ML config patterns that aren't actual file access
                 safe_ml_patterns = [
-                    "_input", "input_", "_output", "output_", "_size", "_dim",
-                    "hidden_", "attention_", "embedding_", "_token_", "vocab_",
-                    "_names", "model_input_names", "model_output_names"
+                    "_input",
+                    "input_",
+                    "_output",
+                    "output_",
+                    "_size",
+                    "_dim",
+                    "hidden_",
+                    "attention_",
+                    "embedding_",
+                    "_token_",
+                    "vocab_",
+                    "_names",
+                    "model_input_names",
+                    "model_output_names",
                 ]
-                
+
                 if any(pattern in key_lower for pattern in safe_ml_patterns):
                     return True
-            
+
             # Credentials in ML context
             if "credentials" in matches:
                 # Token IDs and model tokens are not credentials in ML context
-                if any(pattern in key_lower for pattern in ["_token_id", "token_id_", "_token", "token_type"]):
+                if any(
+                    pattern in key_lower
+                    for pattern in ["_token_id", "token_id_", "_token", "token_type"]
+                ):
                     return True
-        
+
         # Special case for tokenizer configs
         if ml_context.get("is_tokenizer"):
             tokenizer_safe_keys = [
-                "added_tokens_decoder", "model_input_names", "special_tokens_map",
-                "tokenizer_class", "model_max_length"
+                "added_tokens_decoder",
+                "model_input_names",
+                "special_tokens_map",
+                "tokenizer_class",
+                "model_max_length",
             ]
             if any(safe_key in key_lower for safe_key in tokenizer_safe_keys):
                 return True
-        
+
         return False
 
     def _is_file_path_value(self, value: Any) -> bool:
         """Check if value appears to be an actual file system path"""
         if not isinstance(value, str):
             return False
-        
+
         # Absolute paths
         if value.startswith(("/", "\\", "C:", "D:")):
             return True
-        
+
         # Relative paths with separators
         if "/" in value or "\\" in value:
             return True
-        
+
         # File extensions that suggest actual files (using endswith for better matching)
         file_extensions = [
-            ".json", ".h5", ".pt", ".onnx", ".pkl", ".model",
-            ".txt", ".log", ".csv", ".xml", ".yaml", ".yml",
-            ".py", ".js", ".html", ".css", ".sql", ".md"
+            ".json",
+            ".h5",
+            ".pt",
+            ".onnx",
+            ".pkl",
+            ".model",
+            ".txt",
+            ".log",
+            ".csv",
+            ".xml",
+            ".yaml",
+            ".yml",
+            ".py",
+            ".js",
+            ".html",
+            ".css",
+            ".sql",
+            ".md",
         ]
         if any(value.lower().endswith(ext) for ext in file_extensions):
             return True
-        
+
         # Common path indicators
-        if any(indicator in value.lower() for indicator in [
-            "/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"
-        ]):
+        if any(
+            indicator in value.lower()
+            for indicator in ["/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"]
+        ):
             return True
-        
+
         return False
 
-    def _get_context_aware_severity(self, matches: list[str], ml_context: dict) -> IssueSeverity:
+    def _get_context_aware_severity(
+        self, matches: list[str], ml_context: dict
+    ) -> IssueSeverity:
         """Determine severity based on context and match types"""
         # Execution patterns are always ERROR (highest priority)
         if "execution" in matches:
             return IssueSeverity.ERROR
-        
+
         # In high-confidence ML context, downgrade some warnings
         if ml_context.get("confidence", 0) >= 2:
             # In ML context, file_access and network_access are less concerning
             if all(match in ["file_access", "network_access"] for match in matches):
                 return IssueSeverity.INFO
-        
+
         # Credentials are high priority
         if "credentials" in matches:
             return IssueSeverity.WARNING
-        
+
         return IssueSeverity.WARNING
 
     def _format_value(self, value: Any) -> str:
