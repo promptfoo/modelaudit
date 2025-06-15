@@ -32,7 +32,9 @@ def make_keras(out_dir: Path) -> None:
         "class_name": "Sequential",
         "config": {
             "name": "seq",
-            "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: eval('1')"}}],
+            "layers": [
+                {"class_name": "Lambda", "config": {"function": "lambda x: eval('1')"}}
+            ],
         },
     }
 
