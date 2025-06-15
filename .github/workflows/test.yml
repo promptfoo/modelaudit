@@ -30,7 +30,9 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: |
+          poetry install --with dev --extras "all" --no-interaction
+          poetry sync --no-interaction
 
       - name: Lint with Ruff
         run: |
@@ -58,7 +60,9 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: |
+          poetry install --with dev --extras "all" --no-interaction
+          poetry sync --no-interaction
 
       - name: Type checking
         run: poetry run mypy modelaudit/
@@ -84,7 +88,9 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: |
+          poetry install --with dev --extras "all" --no-interaction
+          poetry sync --no-interaction
 
       - name: Run tests with pytest
         run: poetry run pytest -v --cov=modelaudit
@@ -109,7 +115,8 @@ jobs:
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
+          poetry install --no-interaction
+          poetry sync --no-interaction
           poetry build
 
       - name: Upload artifacts
