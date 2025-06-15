@@ -2,7 +2,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
@@ -13,12 +13,12 @@ logger = logging.getLogger("modelaudit.core")
 
 def scan_model_directory_or_file(
     path: str,
-    blacklist_patterns: Optional[List[str]] = None,
+    blacklist_patterns: Optional[list[str]] = None,
     timeout: int = 300,
     max_file_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     **kwargs,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Scan a model file or directory for malicious content.
 
@@ -38,7 +38,7 @@ def scan_model_directory_or_file(
     start_time = time.time()
 
     # Initialize results with proper type hints
-    results: Dict[str, Any] = {
+    results: dict[str, Any] = {
         "start_time": start_time,
         "path": path,
         "bytes_scanned": 0,
@@ -104,25 +104,25 @@ def scan_model_directory_or_file(
 
                         # Track scanner name
                         scanner_name = file_result.scanner_name
-                        scanners_list = cast(List[str], results["scanners"])
+                        scanners_list = cast(list[str], results["scanners"])
                         if scanner_name and scanner_name not in scanners_list:
                             scanners_list.append(scanner_name)
 
                         # Add issues from file scan
-                        issues_list = cast(List[Dict[str, Any]], results["issues"])
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
-                        issues_list = cast(List[Dict[str, Any]], results["issues"])
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
                         issues_list.append(
                             {
                                 "message": f"Error scanning file: {str(e)}",
                                 "severity": IssueSeverity.WARNING.value,
                                 "location": file_path,
                                 "details": {"exception_type": type(e).__name__},
-                            }
+                            },
                         )
         else:
             # Scan a single file
@@ -141,7 +141,10 @@ def scan_model_directory_or_file(
                 original_builtins_open = builtins.open
 
                 def progress_open(
-                    file_path: str, mode: str = "r", *args, **kwargs
+                    file_path: str,
+                    mode: str = "r",
+                    *args,
+                    **kwargs,
                 ) -> IO[Any]:
                     file = original_builtins_open(file_path, mode, *args, **kwargs)
                     file_pos = 0
@@ -181,12 +184,12 @@ def scan_model_directory_or_file(
 
             # Track scanner name
             scanner_name = file_result.scanner_name
-            scanners_list = cast(List[str], results["scanners"])
+            scanners_list = cast(list[str], results["scanners"])
             if scanner_name and scanner_name not in scanners_list:
                 scanners_list.append(scanner_name)
 
             # Add issues from file scan
-            issues_list = cast(List[Dict[str, Any]], results["issues"])
+            issues_list = cast(list[dict[str, Any]], results["issues"])
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
 
@@ -201,13 +204,14 @@ def scan_model_directory_or_file(
             "severity": IssueSeverity.ERROR.value,
             "details": {"exception_type": type(e).__name__},
         }
-        issues_list = cast(List[Dict[str, Any]], results["issues"])
+        issues_list = cast(list[dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
 
     # Add final timing information
     results["finish_time"] = time.time()
     results["duration"] = cast(float, results["finish_time"]) - cast(
-        float, results["start_time"]
+        float,
+        results["start_time"],
     )
 
     # Determine if there were operational scan errors vs security findings
@@ -242,7 +246,7 @@ def scan_model_directory_or_file(
         "Too many open files",
     ]
 
-    issues_list = cast(List[Dict[str, Any]], results["issues"])
+    issues_list = cast(list[dict[str, Any]], results["issues"])
     results["has_errors"] = (
         any(
             any(
@@ -259,7 +263,7 @@ def scan_model_directory_or_file(
     return results
 
 
-def determine_exit_code(results: Dict[str, Any]) -> int:
+def determine_exit_code(results: dict[str, Any]) -> int:
     """
     Determine the appropriate exit code based on scan results.
 
@@ -294,7 +298,7 @@ def determine_exit_code(results: Dict[str, Any]) -> int:
     return 0
 
 
-def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
+def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -355,8 +359,9 @@ def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
 
 
 def merge_scan_result(
-    results: Dict[str, Any], scan_result: ScanResult
-) -> Dict[str, Any]:
+    results: dict[str, Any],
+    scan_result: ScanResult,
+) -> dict[str, Any]:
     """
     Merge a ScanResult object into the results dictionary.
 
@@ -374,13 +379,14 @@ def merge_scan_result(
         scan_dict = scan_result
 
     # Merge issues
-    issues_list = cast(List[Dict[str, Any]], results["issues"])
+    issues_list = cast(list[dict[str, Any]], results["issues"])
     for issue in scan_dict.get("issues", []):
         issues_list.append(issue)
 
     # Update bytes scanned
     results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + scan_dict.get(
-        "bytes_scanned", 0
+        "bytes_scanned",
+        0,
     )
 
     # Update scanner info if not already set

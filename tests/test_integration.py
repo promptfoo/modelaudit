@@ -11,7 +11,8 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     """Test scanning a directory with multiple model types."""
     # Scan the directory with all models
     results = scan_model_directory_or_file(
-        str(temp_model_dir), progress_callback=mock_progress_callback
+        str(temp_model_dir),
+        progress_callback=mock_progress_callback,
     )
 
     # Check basic results
@@ -26,7 +27,7 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     assert 100.0 in mock_progress_callback.percentages  # Should reach 100%
 
     # Check that issues were found for each model type
-    model_paths = [
+    [
         str(temp_model_dir / "model1.pkl"),
         str(temp_model_dir / "model2.pt"),
         str(temp_model_dir / "tf_model"),
@@ -48,20 +49,20 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     # Validate exit code behavior
     expected_exit_code = determine_exit_code(results)
     if results.get("has_errors", False):
-        assert (
-            expected_exit_code == 2
-        ), f"Should return exit code 2 for operational errors, got {expected_exit_code}"
+        assert expected_exit_code == 2, (
+            f"Should return exit code 2 for operational errors, got {expected_exit_code}"
+        )
     elif any(
         isinstance(issue, dict) and issue.get("severity") != "debug"
         for issue in results.get("issues", [])
     ):
-        assert (
-            expected_exit_code == 1
-        ), f"Should return exit code 1 for security issues, got {expected_exit_code}"
+        assert expected_exit_code == 1, (
+            f"Should return exit code 1 for security issues, got {expected_exit_code}"
+        )
     else:
-        assert (
-            expected_exit_code == 0
-        ), f"Should return exit code 0 for clean scan, got {expected_exit_code}"
+        assert expected_exit_code == 0, (
+            f"Should return exit code 0 for clean scan, got {expected_exit_code}"
+        )
 
 
 def test_cli_scan_directory(temp_model_dir):
@@ -192,5 +193,5 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
         >= results1["bytes_scanned"] + results2["bytes_scanned"]
     )
     assert len(combined_results["issues"]) >= len(results1["issues"]) + len(
-        results2["issues"]
+        results2["issues"],
     )

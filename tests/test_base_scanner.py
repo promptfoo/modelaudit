@@ -89,9 +89,7 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
 
     # Mock os.access to simulate unreadable file
     def mock_access(path, mode):
-        if mode == os.R_OK:
-            return False
-        return True
+        return mode != os.R_OK
 
     monkeypatch.setattr(os, "access", mock_access)
 
