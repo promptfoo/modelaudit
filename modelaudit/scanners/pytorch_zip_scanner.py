@@ -130,12 +130,12 @@ class PyTorchZipScanner(BaseScanner):
                     for name in z.namelist():
                         try:
                             file_data = z.read(name)
-                            
+
                             # For pickled files, check for patterns in the binary data
-                            if name.endswith('.pkl'):
+                            if name.endswith(".pkl"):
                                 for pattern in blacklist_patterns:
                                     # Convert pattern to bytes for binary search
-                                    pattern_bytes = pattern.encode('utf-8')
+                                    pattern_bytes = pattern.encode("utf-8")
                                     if pattern_bytes in file_data:
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' found in pickled file {name}",
@@ -153,7 +153,10 @@ class PyTorchZipScanner(BaseScanner):
                                                 f"Blacklisted pattern '{pattern}' found in file {name}",
                                                 severity=IssueSeverity.WARNING,
                                                 location=f"{path}:{name}",
-                                                details={"pattern": pattern, "file": name},
+                                                details={
+                                                    "pattern": pattern,
+                                                    "file": name,
+                                                },
                                             )
                                 except UnicodeDecodeError:
                                     # Skip blacklist checking for binary files that can't be decoded as text
