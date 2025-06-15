@@ -8,6 +8,7 @@ import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
+from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
@@ -19,6 +20,7 @@ logger = logging.getLogger("modelaudit")
 
 
 @click.group()
+@click.version_option(__version__)
 def cli():
     """My Model Scanner CLI."""
     pass
@@ -60,26 +62,29 @@ def cli():
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
 def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
-    """
-    Scan one or more model files or directories for malicious content or
-    suspicious references.
+    """Scan files or directories for malicious content.
 
-    Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
+    \b
+    Usage:
+        modelaudit scan /path/to/model1 /path/to/model2 ...
 
-    You can specify additional blacklist patterns with --blacklist or -b option:
-    modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+    You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
+        modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+
+    \b
     Advanced options:
-      --format, -f       Output format (text or json)
-      --output, -o       Write results to a file instead of stdout
-      --timeout, -t      Set scan timeout in seconds
-      --verbose, -v      Show detailed information during scanning
-      --max-file-size    Maximum file size to scan in bytes
+        --format, -f       Output format (text or json)
+        --output, -o       Write results to a file instead of stdout
+        --timeout, -t      Set scan timeout in seconds
+        --verbose, -v      Show detailed information during scanning
+        --max-file-size    Maximum file size to scan in bytes
 
+    \b
     Exit codes:
-      0 - Success, no security issues found
-      1 - Security issues found (scan completed successfully)
-      2 - Errors occurred during scanning
+        0 - Success, no security issues found
+        1 - Security issues found (scan completed successfully)
+        2 - Errors occurred during scanning
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
@@ -294,16 +299,14 @@ def format_text_output(results, verbose=False):
 
     # Add issue details with color-coded severity
     issues = results.get("issues", [])
-    if issues:
-        # Filter out DEBUG severity issues when not in verbose mode
-        visible_issues = [
-            issue
-            for issue in issues
-            if verbose
-            or not isinstance(issue, dict)
-            or issue.get("severity") != "debug"
-        ]
+    # Filter out DEBUG severity issues when not in verbose mode
+    visible_issues = [
+        issue
+        for issue in issues
+        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+    ]
 
+    if visible_issues:
         # Count issues by severity (excluding DEBUG when not in verbose mode)
         error_count = sum(
             1
@@ -363,7 +366,7 @@ def format_text_output(results, verbose=False):
             elif severity == "info":
                 severity_style = click.style("[INFO]", fg="blue")
             elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="gray")
+                severity_style = click.style("[DEBUG]", fg="bright_black")
 
             # Format the issue line
             issue_num = click.style(f"{i}.", fg="white", bold=True)
@@ -376,7 +379,7 @@ def format_text_output(results, verbose=False):
                 output_lines.append(f"{issue_num} {severity_style} {message}")
 
             # Add a small separator between issues for readability
-            if i < len(issues):
+            if i < len(visible_issues):
                 output_lines.append("")
     else:
         output_lines.append(
@@ -385,10 +388,10 @@ def format_text_output(results, verbose=False):
 
     # Add a footer
     output_lines.append("─" * 80)
-    if issues:
+    if visible_issues:
         if any(
             isinstance(issue, dict) and issue.get("severity") == "error"
-            for issue in issues
+            for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with errors", fg="red", bold=True)
         else:

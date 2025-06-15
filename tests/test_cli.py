@@ -4,6 +4,7 @@ import os
 import pytest
 from click.testing import CliRunner
 
+from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
 
 
@@ -14,6 +15,14 @@ def test_cli_help():
     assert result.exit_code == 0
     assert "Usage:" in result.output
     assert "scan" in result.output  # Should list the scan command
+
+
+def test_cli_version():
+    """Test the CLI version command."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
 
 
 def test_scan_command_help():
@@ -216,6 +225,23 @@ def test_format_text_output():
     assert "Test issue" in output
     assert "warning" in output.lower()
     # Verbose might include details, but we can't guarantee it
+
+
+def test_format_text_output_only_debug_issues():
+    """Ensure debug-only issues result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Debug info", "severity": "debug", "location": "file.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    assert "No issues found" in output
+    assert "Scan completed successfully" in output
 
 
 def test_exit_code_clean_scan(tmp_path):
