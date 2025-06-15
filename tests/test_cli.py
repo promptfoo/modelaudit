@@ -218,6 +218,23 @@ def test_format_text_output():
     # Verbose might include details, but we can't guarantee it
 
 
+def test_format_text_output_only_debug_issues():
+    """Ensure debug-only issues result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Debug info", "severity": "debug", "location": "file.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    assert "No issues found" in output
+    assert "Scan completed successfully" in output
+
+
 def test_exit_code_clean_scan(tmp_path):
     """Test exit code 0 when scan is clean with no issues."""
     import pickle

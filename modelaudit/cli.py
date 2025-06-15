@@ -294,16 +294,14 @@ def format_text_output(results, verbose=False):
 
     # Add issue details with color-coded severity
     issues = results.get("issues", [])
-    if issues:
-        # Filter out DEBUG severity issues when not in verbose mode
-        visible_issues = [
-            issue
-            for issue in issues
-            if verbose
-            or not isinstance(issue, dict)
-            or issue.get("severity") != "debug"
-        ]
+    # Filter out DEBUG severity issues when not in verbose mode
+    visible_issues = [
+        issue
+        for issue in issues
+        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+    ]
 
+    if visible_issues:
         # Count issues by severity (excluding DEBUG when not in verbose mode)
         error_count = sum(
             1
@@ -376,7 +374,7 @@ def format_text_output(results, verbose=False):
                 output_lines.append(f"{issue_num} {severity_style} {message}")
 
             # Add a small separator between issues for readability
-            if i < len(issues):
+            if i < len(visible_issues):
                 output_lines.append("")
     else:
         output_lines.append(
@@ -385,10 +383,10 @@ def format_text_output(results, verbose=False):
 
     # Add a footer
     output_lines.append("─" * 80)
-    if issues:
+    if visible_issues:
         if any(
             isinstance(issue, dict) and issue.get("severity") == "error"
-            for issue in issues
+            for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with errors", fg="red", bold=True)
         else:
