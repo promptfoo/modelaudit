@@ -363,7 +363,7 @@ def format_text_output(results, verbose=False):
             elif severity == "info":
                 severity_style = click.style("[INFO]", fg="blue")
             elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="gray")
+                severity_style = click.style("[DEBUG]", fg="bright_black")
 
             # Format the issue line
             issue_num = click.style(f"{i}.", fg="white", bold=True)
