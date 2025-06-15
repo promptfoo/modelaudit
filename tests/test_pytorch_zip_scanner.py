@@ -138,3 +138,21 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
         if "suspicious_function" in issue.message.lower()
     ]
     assert len(blacklist_issues) > 0
+
+
+def test_pytorch_pickle_file_unsupported(tmp_path):
+    """Raw pickle files with .pt extension should be unsupported."""
+    from tests.evil_pickle import EvilClass
+
+    file_path = tmp_path / "raw_pickle.pt"
+    with file_path.open("wb") as f:
+        pickle.dump(EvilClass(), f)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        "zip" in issue.message.lower() or "pytorch" in issue.message.lower()
+        for issue in result.issues
+    )
