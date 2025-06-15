@@ -32,7 +32,7 @@ yaspin = "^2.3.0"
 tensorflow = { version = ">=2.6", optional = true }
 h5py = { version = ">=3.1", optional = true }
 torch = { version = ">=1.6", optional = true }
-pyyaml = { version = ">=5.1,<7.0", optional = true }
+pyyaml = { version = "^6.0", optional = true }
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0.0"
@@ -41,7 +41,6 @@ mypy = "^1.4.1"
 black = "^24.3.0"
 isort = "^5.12.0"
 flake8 = "^6.0.0"
-ruff = "^0.11.6"
 
 [tool.poetry.extras]
 tensorflow = ["tensorflow"]
@@ -67,16 +66,3 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
-
-[tool.ruff]
-line-length = 88
-target-version = "py39"
-
-[tool.ruff.lint]
-select = ["E", "F", "I"]
-ignore = ["E501"]  # Ignore line length errors
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
-line-ending = "auto"
