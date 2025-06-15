@@ -1,9 +1,7 @@
 import os
-import pickle
 import pickletools
 import time
-from io import BytesIO
-from typing import Any, BinaryIO, Optional, Dict, List, Union
+from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
