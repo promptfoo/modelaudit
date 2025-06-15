@@ -1,20 +1,23 @@
 import os
-import struct
 import re
-import zipfile
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
+    if not os.path.isfile(path):
+        return False
     try:
         with open(path, "rb") as f:
             signature = f.read(4)
         return signature in [b"PK\x03\x04", b"PK\x05\x06"]
-    except Exception:
+    except:
         return False
+
 
 def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
     with open(path, "rb") as f:
         return f.read(num_bytes)
+
 
 def detect_file_format(path: str) -> str:
     """
@@ -59,6 +62,7 @@ def detect_file_format(path: str) -> str:
         return "onnx"
 
     return "unknown"
+
 
 def gather_shards_if_any(directory: str):
     """
