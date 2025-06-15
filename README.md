@@ -72,6 +72,20 @@ rye sync --features all
 pip install -e .[all]
 ```
 
+**Docker installation:**
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/promptfoo/modelaudit:latest
+
+# Use specific variants
+docker pull ghcr.io/promptfoo/modelaudit:latest-full        # All ML frameworks
+docker pull ghcr.io/promptfoo/modelaudit:latest-tensorflow  # TensorFlow only
+
+# Run with Docker
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
+```
+
 ### Basic Usage
 
 **Scan individual files:**
@@ -272,6 +286,9 @@ rye run pytest tests/test_integration.py -v
 # Run tests with all optional dependencies
 rye sync --features all
 rye run pytest
+
+# Run comprehensive migration test (tests everything including Docker)
+./test_migration.sh
 ```
 
 ### Development Workflow
