@@ -9,6 +9,7 @@ from yaspin import yaspin
 from yaspin.spinners import Spinners
 
 from .core import determine_exit_code, scan_model_directory_or_file
+from . import __version__
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +20,7 @@ logger = logging.getLogger("modelaudit")
 
 
 @click.group()
+@click.version_option(__version__)
 def cli():
     """My Model Scanner CLI."""
     pass
