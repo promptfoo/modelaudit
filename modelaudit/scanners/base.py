@@ -76,11 +76,15 @@ class ScanResult:
         issue = Issue(message, severity, location, details)
         self.issues.append(issue)
         logger.log(
-            logging.ERROR
-            if severity == IssueSeverity.ERROR
-            else logging.WARNING
-            if severity == IssueSeverity.WARNING
-            else logging.INFO,
+            (
+                logging.ERROR
+                if severity == IssueSeverity.ERROR
+                else (
+                    logging.WARNING
+                    if severity == IssueSeverity.WARNING
+                    else logging.INFO
+                )
+            ),
             str(issue),
         )
 
@@ -152,12 +156,15 @@ class ScanResult:
 
         result = []
         result.append(f"Scan completed in {self.duration:.2f}s")
-        result.append(
-            f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'"
+        bytes_msg = (
+            f"Scanned {self.bytes_scanned} bytes with scanner " f"'{self.scanner_name}'"
         )
-        result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, {warning_count} warnings, {info_count} info)"
+        result.append(bytes_msg)
+        issues_msg = (
+            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"{warning_count} warnings, {info_count} info)"
         )
+        result.append(issues_msg)
 
         # If there are any issues, show them
         if self.issues:
@@ -184,9 +191,8 @@ class BaseScanner(ABC):
         self.config = config or {}
         self.timeout = self.config.get("timeout", 300)  # Default 5 minutes
         self.current_file_path = ""  # Track the current file being scanned
-        self.chunk_size = self.config.get(
-            "chunk_size", 10 * 1024 * 1024
-        )  # Default: 10MB chunks
+        # Default: 10MB chunks
+        self.chunk_size = self.config.get("chunk_size", 10 * 1024 * 1024)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:

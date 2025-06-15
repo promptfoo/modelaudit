@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -13,7 +13,9 @@ except ImportError:
     HAS_NAME_POLICIES = False
 
     # Create a placeholder function when the module is not available
-    def check_model_name_policies(model_name, additional_patterns=None):
+    def check_model_name_policies(
+        model_name: str, additional_patterns: Optional[list] = None
+    ) -> Tuple[bool, str]:
         return False, ""
 
 

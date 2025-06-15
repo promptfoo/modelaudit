@@ -84,7 +84,8 @@ class PyTorchZipScanner(BaseScanner):
                         if not issue.location:
                             issue.location = f"{path}:{name}"
                         elif "pos" in issue.location:
-                            # If it's a position from the pickle scanner, prepend the file path
+                            # If it's a position from the pickle scanner,
+                            # prepend the file path
                             issue.location = f"{path}:{name} {issue.location}"
 
                     # Merge results

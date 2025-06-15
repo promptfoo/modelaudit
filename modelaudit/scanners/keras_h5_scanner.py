@@ -137,13 +137,15 @@ class KerasH5Scanner(BaseScanner):
                     training_config = json.loads(f.attrs["training_config"])
                     if "metrics" in training_config:
                         for metric in training_config["metrics"]:
-                            if isinstance(metric, dict) and metric.get(
-                                "class_name"
-                            ) not in [
+                            standard_metrics = [
                                 "Accuracy",
                                 "CategoricalAccuracy",
                                 "BinaryAccuracy",
-                            ]:
+                            ]
+                            if (
+                                isinstance(metric, dict)
+                                and metric.get("class_name") not in standard_metrics
+                            ):
                                 result.add_issue(
                                     f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
                                     severity=IssueSeverity.WARNING,

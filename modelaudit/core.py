@@ -24,10 +24,12 @@ def scan_model_directory_or_file(
 
     Args:
         path: Path to the model file or directory
-        blacklist_patterns: Additional blacklist patterns to check against model names
+        blacklist_patterns: Additional blacklist patterns to check against
+            model names
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
-        progress_callback: Optional callback function to report progress (message, percentage)
+        progress_callback: Optional callback function to report progress
+            (message, percentage)
         **kwargs: Additional arguments to pass to scanners
 
     Returns:
@@ -79,13 +81,17 @@ def scan_model_directory_or_file(
 
                     # Check timeout
                     if time.time() - start_time > timeout:
-                        raise TimeoutError(f"Scan timeout after {timeout} seconds")
+                        msg = f"Scan timeout after {timeout} seconds"
+                        raise TimeoutError(msg)
 
                     # Update progress
                     if progress_callback and total_files > 0:
                         processed_files += 1
+                        msg = (
+                            f"Scanning file {processed_files}/{total_files}: " f"{file}"
+                        )
                         progress_callback(
-                            f"Scanning file {processed_files}/{total_files}: {file}",
+                            msg,
                             processed_files / total_files * 100,
                         )
 
@@ -188,11 +194,16 @@ def scan_model_directory_or_file(
     # Add final timing information
     results["finish_time"] = time.time()
     results["duration"] = results["finish_time"] - results["start_time"]
-    results["has_errors"] = any(
-        issue.get("severity") == IssueSeverity.ERROR.value
+    error_issues = [
+        issue
         for issue in results["issues"]
-        if isinstance(issue, dict) and "severity" in issue
-    )
+        if (
+            isinstance(issue, dict)
+            and "severity" in issue
+            and issue.get("severity") == IssueSeverity.ERROR.value
+        )
+    ]
+    results["has_errors"] = len(error_issues) > 0
 
     return results
 
@@ -217,8 +228,11 @@ def scan_file(path: str, config: Dict[str, Any] = None) -> ScanResult:
         file_size = os.path.getsize(path)
         if max_file_size > 0 and file_size > max_file_size:
             sr = ScanResult(scanner_name="size_check")
+            msg = (
+                f"File too large to scan: {file_size} bytes " f"(max: {max_file_size})"
+            )
             sr.add_issue(
-                f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+                msg,
                 severity=IssueSeverity.WARNING,
                 details={
                     "file_size": file_size,

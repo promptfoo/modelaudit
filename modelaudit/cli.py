@@ -65,7 +65,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
 
     You can specify additional blacklist patterns with --blacklist or -b option:
-    modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+            modelaudit scan /path/to/model1 /path/to/model2 -b pattern1 -b pattern2
 
     Advanced options:
       --format, -f       Output format (text or json)
@@ -92,9 +92,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         click.echo("\n".join(header))
         click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
-            click.echo(
-                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}"
-            )
+            patterns_str = click.style(", ".join(blacklist), fg="yellow")
+            click.echo(f"Additional blacklist patterns: {patterns_str}")
         click.echo("─" * 80)
         click.echo("")
 
