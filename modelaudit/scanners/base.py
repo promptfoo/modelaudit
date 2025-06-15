@@ -160,7 +160,8 @@ class ScanResult:
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'"
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, {warning_count} warnings, {info_count} info)"
+            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"{warning_count} warnings, {info_count} info)"
         )
 
         # If there are any issues, show them

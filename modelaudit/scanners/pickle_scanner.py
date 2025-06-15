@@ -104,9 +104,7 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
                 parts = (
                     arg.split(" ", 1)
                     if " " in arg
-                    else arg.rsplit(".", 1)
-                    if "." in arg
-                    else [arg, ""]
+                    else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                 )
                 if len(parts) == 2:
                     mod, func = parts
@@ -166,10 +164,6 @@ def check_opcode_sequence(opcodes: List[tuple]) -> List[Dict[str, Any]]:
     Returns a list of suspicious patterns found
     """
     suspicious_patterns = []
-
-    # Track the stack depth for each opcode
-    stack_depth = 0
-    stack_history = []
 
     # Count dangerous opcodes
     dangerous_opcode_count = 0
@@ -303,9 +297,7 @@ class PickleScanner(BaseScanner):
                         parts = (
                             arg.split(" ", 1)
                             if " " in arg
-                            else arg.rsplit(".", 1)
-                            if "." in arg
-                            else [arg, ""]
+                            else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                         )
 
                         if len(parts) == 2:
@@ -368,7 +360,8 @@ class PickleScanner(BaseScanner):
                             },
                         )
 
-                # Check for STACK_GLOBAL which uses the last two strings as module and function
+                # Check for STACK_GLOBAL which uses the last two strings as
+                # module and function
                 if opcode.name == "STACK_GLOBAL":
                     if len(string_stack) >= 2:
                         # Last two strings should be module and function
@@ -389,7 +382,8 @@ class PickleScanner(BaseScanner):
                             )
                     else:
                         result.add_issue(
-                            "STACK_GLOBAL opcode found without sufficient string context",
+                            "STACK_GLOBAL opcode found without sufficient "
+                            "string context",
                             severity=IssueSeverity.WARNING,
                             location=f"{self.current_file_path} (pos {pos})",
                             details={
@@ -404,9 +398,12 @@ class PickleScanner(BaseScanner):
             if dangerous_pattern:
                 suspicious_count += 1
                 result.add_issue(
-                    f"Detected dangerous __reduce__ pattern with {dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
+                    f"Detected dangerous __reduce__ pattern with "
+                    f"{dangerous_pattern.get('module', '')}."
+                    f"{dangerous_pattern.get('function', '')}",
                     severity=IssueSeverity.ERROR,
-                    location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
+                    location=f"{self.current_file_path} "
+                    f"(pos {dangerous_pattern.get('position', 0)})",
                     details=dangerous_pattern,
                 )
 
@@ -415,9 +412,11 @@ class PickleScanner(BaseScanner):
             for sequence in suspicious_sequences:
                 suspicious_count += 1
                 result.add_issue(
-                    f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown')}",
+                    f"Suspicious opcode sequence: "
+                    f"{sequence.get('pattern', 'unknown')}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (pos {sequence.get('position', 0)})",
+                    location=f"{self.current_file_path} "
+                    f"(pos {sequence.get('position', 0)})",
                     details=sequence,
                 )
 

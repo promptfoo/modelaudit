@@ -5,19 +5,21 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
 try:
-    import tensorflow as tf
+    import tensorflow as tf  # noqa: F401
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     HAS_TENSORFLOW = True
+    SavedModelType: type = SavedModel
 except ImportError:
     HAS_TENSORFLOW = False
 
     # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModel:
+    class SavedModel:  # type: ignore[no-redef]
         """Placeholder for SavedModel when TensorFlow is not installed"""
 
-        meta_graphs = []
+        meta_graphs: list = []
 
+    SavedModelType = SavedModel
 
 # List of suspicious TensorFlow operations that could be security risks
 SUSPICIOUS_OPS = {
@@ -117,7 +119,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 content = f.read()
                 result.bytes_scanned = len(content)
 
-                saved_model = SavedModel()
+                saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
 
                 self._analyze_saved_model(saved_model, result)
@@ -196,7 +198,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 for pattern in blacklist_patterns:
                                     if pattern in content:
                                         result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            f"Blacklisted pattern '{pattern}' "
+                                            f"found in file {file}",
                                             severity=IssueSeverity.WARNING,
                                             location=file_path,
                                             details={"pattern": pattern, "file": file},
@@ -208,7 +211,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    def _analyze_saved_model(self, saved_model: SavedModel, result: ScanResult) -> None:
+    def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
         suspicious_op_found = False
         op_counts: Dict[str, int] = {}

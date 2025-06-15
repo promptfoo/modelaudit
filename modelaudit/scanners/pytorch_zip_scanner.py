@@ -84,7 +84,8 @@ class PyTorchZipScanner(BaseScanner):
                         if not issue.location:
                             issue.location = f"{path}:{name}"
                         elif "pos" in issue.location:
-                            # If it's a position from the pickle scanner, prepend the file path
+                            # If it's a position from the pickle scanner,
+                            # prepend the file path
                             issue.location = f"{path}:{name} {issue.location}"
 
                     # Merge results
@@ -114,10 +115,11 @@ class PyTorchZipScanner(BaseScanner):
                     os.path.basename(f) for f in pickle_files
                 ]:
                     result.add_issue(
-                        "PyTorch model missing data.pkl file - unusual for standard PyTorch models",
+                        "PyTorch model missing data.pkl file - unusual for "
+                        "standard PyTorch models",
                         severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"pickle_files": pickle_files},
+                        location=self.current_file_path,
+                        details={"missing_file": "data.pkl"},
                     )
 
                 # Check for blacklist patterns in all files
@@ -130,18 +132,24 @@ class PyTorchZipScanner(BaseScanner):
                     for name in z.namelist():
                         try:
                             file_data = z.read(name)
-                            
+
                             # For pickled files, check for patterns in the binary data
-                            if name.endswith('.pkl'):
+                            if name.endswith(".pkl"):
                                 for pattern in blacklist_patterns:
                                     # Convert pattern to bytes for binary search
-                                    pattern_bytes = pattern.encode('utf-8')
+                                    pattern_bytes = pattern.encode("utf-8")
                                     if pattern_bytes in file_data:
                                         result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' found in pickled file {name}",
+                                            f"Blacklisted pattern '{pattern}' "
+                                            f"found in pickled file {name}",
                                             severity=IssueSeverity.WARNING,
-                                            location=f"{path}:{name}",
-                                            details={"pattern": pattern, "file": name},
+                                            location=f"{self.current_file_path} "
+                                            f"({name})",
+                                            details={
+                                                "pattern": pattern,
+                                                "file": name,
+                                                "file_type": "pickle",
+                                            },
                                         )
                             else:
                                 # For text files, decode and search as text
@@ -150,13 +158,20 @@ class PyTorchZipScanner(BaseScanner):
                                     for pattern in blacklist_patterns:
                                         if pattern in content:
                                             result.add_issue(
-                                                f"Blacklisted pattern '{pattern}' found in file {name}",
+                                                f"Blacklisted pattern '{pattern}' "
+                                                f"found in file {name}",
                                                 severity=IssueSeverity.WARNING,
-                                                location=f"{path}:{name}",
-                                                details={"pattern": pattern, "file": name},
+                                                location=f"{self.current_file_path} "
+                                                f"({name})",
+                                                details={
+                                                    "pattern": pattern,
+                                                    "file": name,
+                                                    "file_type": "text",
+                                                },
                                             )
                                 except UnicodeDecodeError:
-                                    # Skip blacklist checking for binary files that can't be decoded as text
+                                    # Skip blacklist checking for binary files
+                                    # that can't be decoded as text
                                     pass
                         except Exception:
                             # Skip files we can't read
