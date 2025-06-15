@@ -135,8 +135,8 @@ def scan_model_directory_or_file(
 
             # Create a wrapper for the file to report progress
             if progress_callback is not None and file_size > 0:
-                from typing import IO
                 import builtins
+                from typing import IO
 
                 original_builtins_open = builtins.open
 
