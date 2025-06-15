@@ -25,6 +25,17 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],
     "ctypes": ["*"],
     "socket": ["*"],
+    # dill's load helpers can execute arbitrary code when unpickling
+    # so we specifically flag those functions
+    "dill": [
+        "load",
+        "loads",
+        "load_module",
+        "load_module_asdict",
+        "load_session",
+    ],
+    # references to the private dill._dill module are also suspicious
+    "dill._dill": "*",
 }
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
@@ -36,6 +47,7 @@ DANGEROUS_OPCODES = [
     "INST",
     "OBJ",
     "NEWOBJ",
+    "NEWOBJ_EX",
     "GLOBAL",
     "BUILD",
     "STACK_GLOBAL",
@@ -104,9 +116,7 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
                 parts = (
                     arg.split(" ", 1)
                     if " " in arg
-                    else arg.rsplit(".", 1)
-                    if "." in arg
-                    else [arg, ""]
+                    else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                 )
                 if len(parts) == 2:
                     mod, func = parts
@@ -301,9 +311,7 @@ class PickleScanner(BaseScanner):
                         parts = (
                             arg.split(" ", 1)
                             if " " in arg
-                            else arg.rsplit(".", 1)
-                            if "." in arg
-                            else [arg, ""]
+                            else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                         )
 
                         if len(parts) == 2:
