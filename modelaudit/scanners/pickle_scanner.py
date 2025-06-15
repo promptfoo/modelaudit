@@ -732,9 +732,10 @@ class PickleScanner(BaseScanner):
             # Check for STACK_GLOBAL patterns (rebuild from opcodes to get proper context)
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
-                    # Find the two most recent STRING-like opcodes before this position
-                    recent_strings = []
-                    for j in range(max(0, i - 20), i):  # Look back up to 20 opcodes
+                    # Find the two immediately preceding STRING-like opcodes
+                    # STACK_GLOBAL expects exactly two strings on the stack: module and function
+                    recent_strings: list[str] = []
+                    for j in range(i - 1, max(0, i - 10), -1):  # Look back at most 10 opcodes
                         prev_opcode, prev_arg, prev_pos = opcodes[j]
                         if prev_opcode.name in [
                             "STRING",
@@ -743,14 +744,14 @@ class PickleScanner(BaseScanner):
                             "SHORT_BINUNICODE",
                             "UNICODE",
                         ] and isinstance(prev_arg, str):
-                            recent_strings.append(prev_arg)
+                            recent_strings.insert(0, prev_arg)  # Insert at beginning to maintain order
                             if len(recent_strings) >= 2:
                                 break
 
                     if len(recent_strings) >= 2:
-                        # Last two strings should be module and function
-                        func = recent_strings[-1]
-                        mod = recent_strings[-2]
+                        # The two strings are module and function in that order
+                        mod = recent_strings[0]  # First string pushed (module)
+                        func = recent_strings[1]  # Second string pushed (function)
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
