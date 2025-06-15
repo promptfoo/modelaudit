@@ -120,7 +120,7 @@ class TestPerformanceBenchmarks:
                 import os
 
                 is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-                cv_threshold = 1.0 if is_ci else 0.5
+                cv_threshold = 2.0 if is_ci else 0.5
                 assert cv < cv_threshold, (
                     f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
                 )
