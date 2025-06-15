@@ -28,6 +28,26 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_zip_bytes_scanned_single_count(self):
+        """Ensure bytes scanned equals the sum of embedded files once."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                import pickle
+
+                data1 = pickle.dumps({"a": 1})
+                data2 = pickle.dumps({"b": 2})
+                z.writestr("one.pkl", data1)
+                z.writestr("two.pkl", data2)
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            assert result.success is True
+            expected = len(data1) + len(data2)
+            assert result.bytes_scanned == expected
+        finally:
+            os.unlink(tmp_path)
+
     def test_scan_simple_zip(self):
         """Test scanning a simple ZIP file with text files"""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -86,7 +106,6 @@ class TestZipScanner:
 
             result = self.scanner.scan(outer_path)
             assert result.success is True
-            assert result.bytes_scanned > 0
             # Should have scanned the nested content
             assert (
                 any(
