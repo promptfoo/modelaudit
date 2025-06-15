@@ -28,6 +28,7 @@ ModelAudit scans ML model files for:
 - **Risky configurations** in model architectures
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
+- **Malicious content in ZIP archives** including nested archives and zip bombs
 
 ## 🚀 Quick Start
 
@@ -161,9 +162,10 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
+- **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently
 - **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
 
@@ -179,6 +181,7 @@ modelaudit scan model.pkl || exit 1
 - **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
 - **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
+- **Archive Security**: Directory traversal attacks, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
 ## 🛡️ Security Scanners
@@ -227,6 +230,16 @@ modelaudit scan model.pkl || exit 1
 - Credential exposure: passwords, API keys, secrets
 - Blacklisted model names and patterns
 - Supports JSON, YAML, XML, TOML formats
+
+### ZIP Scanner
+
+**Scans ZIP archives and their contents:**
+
+- **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
+- **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
+- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
+- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
+- **Resource limits**: Configurable max depth, max entries, and max file size protections
 
 ## 🛠️ Development
 
