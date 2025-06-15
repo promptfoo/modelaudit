@@ -51,9 +51,9 @@ class TestPickleScanner(unittest.TestCase):
                 has_os_system_detection = True
 
         assert has_reduce_detection, "Failed to detect REDUCE opcode"
-        assert (
-            has_os_system_detection
-        ), "Failed to detect os.system/posix.system reference"
+        assert has_os_system_detection, (
+            "Failed to detect os.system/posix.system reference"
+        )
 
     def test_scan_nonexistent_file(self):
         """Scanner returns failure and error issue for missing file"""
