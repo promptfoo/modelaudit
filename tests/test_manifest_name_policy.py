@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.manifest_scanner import ManifestScanner
@@ -16,4 +15,7 @@ def test_manifest_scanner_model_name_blacklist(tmp_path):
     result = scanner.scan(str(test_file))
 
     assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
-    assert any("model" in issue.message.lower() and "blocked" in issue.message.lower() for issue in result.issues)
+    assert any(
+        "model" in issue.message.lower() and "blocked" in issue.message.lower()
+        for issue in result.issues
+    )
