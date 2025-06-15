@@ -2,27 +2,27 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Rye
-RUN pip install rye
+# Copy requirements lock file and install dependencies
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
-# Copy project configuration files
-COPY pyproject.toml ./
-
-# Configure Rye to not create a virtual environment inside the container
-ENV RYE_NO_AUTO_INSTALL=1
-ENV RYE_USE_UV=1
-
-# Install dependencies
-RUN rye sync --no-dev
-
-# Copy the rest of the application
+# Copy source code
 COPY . .
 
-# Install the application
-RUN rye install
+# Install the application using pip
+RUN pip install --no-cache-dir .
 
 # Create a non-root user
-RUN useradd -m appuser
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
+
 USER appuser
 
 # Set the entrypoint

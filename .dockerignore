@@ -1,0 +1,41 @@
+# Rye
+.venv/
+.python-version
+.rye/
+
+# Development files
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Testing
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Scratch/development
+scratch/
+llm_context.txt
+
+# CI/CD
+.github/ 

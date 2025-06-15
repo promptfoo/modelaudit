@@ -141,19 +141,23 @@ The GitHub Actions workflow has been updated to use Rye:
 
 ### Docker
 
-All Dockerfiles have been updated:
+All Dockerfiles have been updated to follow **Rye best practices**:
 
 ```dockerfile
-# Install Rye
-RUN pip install rye
+# Copy requirements lock file and install dependencies
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
-# Configure Rye for containers
-ENV RYE_NO_AUTO_INSTALL=1
-ENV RYE_USE_UV=1
-
-# Install dependencies
-RUN rye sync --no-dev --features all
+# Copy source code and install application
+COPY . .
+RUN pip install --no-cache-dir .[all]
 ```
+
+**Key changes:**
+- **No Rye installation** in containers (following official recommendations)
+- Use `requirements.lock` + `pip install` for faster, smaller builds  
+- Added comprehensive `.dockerignore` file
+- Simpler, more reliable container builds
 
 ## Compatibility
 
