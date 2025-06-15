@@ -8,7 +8,7 @@ repos:
         name: ruff-lint
         args: [--fix, --exit-non-zero-on-fix]
         types_or: [python, pyi, jupyter]
-      
+
       # Run the formatter
       - id: ruff-format
         name: ruff-format
@@ -22,4 +22,4 @@ repos:
         name: mypy-type-check
         additional_dependencies: [types-PyYAML, types-tensorflow]
         args: [--ignore-missing-imports, --no-error-summary]
-        exclude: ^(tests/|examples/) 
+        exclude: ^(tests/|examples/)
