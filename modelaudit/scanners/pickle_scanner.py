@@ -735,7 +735,9 @@ class PickleScanner(BaseScanner):
                     # Find the two immediately preceding STRING-like opcodes
                     # STACK_GLOBAL expects exactly two strings on the stack: module and function
                     recent_strings: list[str] = []
-                    for j in range(i - 1, max(0, i - 10), -1):  # Look back at most 10 opcodes
+                    for j in range(
+                        i - 1, max(0, i - 10), -1
+                    ):  # Look back at most 10 opcodes
                         prev_opcode, prev_arg, prev_pos = opcodes[j]
                         if prev_opcode.name in [
                             "STRING",
@@ -744,7 +746,9 @@ class PickleScanner(BaseScanner):
                             "SHORT_BINUNICODE",
                             "UNICODE",
                         ] and isinstance(prev_arg, str):
-                            recent_strings.insert(0, prev_arg)  # Insert at beginning to maintain order
+                            recent_strings.insert(
+                                0, prev_arg
+                            )  # Insert at beginning to maintain order
                             if len(recent_strings) >= 2:
                                 break
 
