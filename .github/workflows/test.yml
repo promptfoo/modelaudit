@@ -33,10 +33,12 @@ jobs:
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Lint with Ruff
-        run: poetry run ruff check modelaudit/
+        run: |
+          poetry run ruff check .
 
       - name: Check formatting with Ruff
-        run: poetry run ruff format --check modelaudit/
+        run: |
+          poetry run ruff format --check .
 
   type-check:
     name: Type Check
