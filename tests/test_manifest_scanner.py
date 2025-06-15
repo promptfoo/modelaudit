@@ -1,9 +1,10 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
 
@@ -232,3 +233,20 @@ def test_manifest_scanner_nested_structures():
         test_file_path = Path(test_file)
         if test_file_path.exists():
             test_file_path.unlink()
+
+
+def test_parse_file_logs_warning(caplog, capsys):
+    """Ensure parsing errors log warnings without stdout output."""
+    scanner = ManifestScanner()
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        result = ScanResult(scanner.name)
+        content = scanner._parse_file("nonexistent.json", ".json", result)
+
+    assert content is None
+    assert any(
+        "Error parsing file nonexistent.json" in record.getMessage()
+        for record in caplog.records
+    )
+    assert capsys.readouterr().out == ""
+    assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
