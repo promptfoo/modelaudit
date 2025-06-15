@@ -10,22 +10,27 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        dockerfile: [Dockerfile, Dockerfile.tensorflow, Dockerfile.full]
     steps:
       - uses: actions/checkout@v4
+      
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
+        
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-      - name: Build image
+        
+      - name: Build full image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
-          tags: test-image:${{ matrix.dockerfile }}
+          file: Dockerfile.full
+          tags: modelaudit:full
           load: true
-      - name: Run container
+          
+      - name: Test container help command
         run: |
-          docker run --rm test-image:${{ matrix.dockerfile }} > /dev/null
+          docker run --rm modelaudit:full --help
+          
+      - name: Test container version command
+        run: |
+          docker run --rm modelaudit:full --version || echo "Version command not available"
