@@ -279,10 +279,6 @@ poetry run pytest
 ### Development Workflow
 
 ```bash
-# Install pre-commit (first time setup)
-poetry add --group dev pre-commit
-poetry run pre-commit install
-
 # Run linting and formatting with Ruff
 poetry run ruff check modelaudit/          # Check for linting issues
 poetry run ruff check --fix modelaudit/    # Fix auto-fixable issues
@@ -290,9 +286,6 @@ poetry run ruff format modelaudit/         # Format code
 
 # Type checking
 poetry run mypy modelaudit/
-
-# Run all checks (as pre-commit would)
-poetry run pre-commit run --all-files
 
 # Build package
 poetry build
@@ -307,7 +300,6 @@ This project uses modern Python tooling for maintaining code quality:
 
 - **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
 - **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
-- **[pre-commit](https://pre-commit.com/)**: Git hooks for automated quality checks
 
 ### Contributing
 

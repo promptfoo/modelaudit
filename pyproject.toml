@@ -43,7 +43,6 @@ ruff = ">=0.10.0"
 types-PyYAML = "^6.0.12.20250516"
 types-tensorflow = "^2.18.0.20250516"
 pytest-cov = "^6.2.1"
-pre-commit = "^4.2.0"
 
 [tool.poetry.extras]
 tensorflow = ["tensorflow"]
@@ -55,68 +54,19 @@ all = ["tensorflow", "h5py", "torch", "pyyaml"]
 [tool.poetry.scripts]
 modelaudit = "modelaudit.cli:main"
 
-# Alternative: Community "ALL" approach
-# [tool.ruff]
-# line-length = 88
-# target-version = "py39"
-
-# [tool.ruff.lint]
-# select = ["ALL"]  # Enable everything
-# ignore = [
-#     # Docstrings (adjust based on your needs)
-#     "D",
-#     # Annotations (gradually enable as you add type hints)
-#     "ANN",
-#     # Some overly strict rules
-#     "FBT",  # Boolean traps
-#     "EM",   # Exception messages
-#     "COM",  # Commas (formatter handles this)
-# ]
-
-# [tool.ruff.lint.per-file-ignores]
-# "__init__.py" = ["F401"]
-# "tests/**/*.py" = ["S101", "D", "ANN"]
-
-# [tool.ruff.format]
-# # Use defaults
-
-# Alternative: Hatch-inspired balanced approach
-# [tool.ruff]
-# line-length = 88
-# target-version = "py39"
-
-# [tool.ruff.lint]
-# select = [
-#     "E", "W",  # pycodestyle
-#     "F",       # pyflakes  
-#     "I",       # isort
-#     "UP",      # pyupgrade
-#     "B",       # bugbear
-#     "C4",      # comprehensions
-#     "PTH",     # pathlib
-#     "SIM",     # simplify
-#     "RUF",     # ruff-specific
-# ]
-
-# [tool.ruff.lint.per-file-ignores]
-# "__init__.py" = ["F401"]
-# "tests/**/*.py" = ["S101"]
-
-# Ruff configuration - Ultra-minimal approach
 [tool.ruff]
-line-length = 88  # Match Black
+line-length = 88
 target-version = "py39"
 
 [tool.ruff.lint]
-# Just add import sorting to the defaults (F + subset of E)
-extend-select = ["I"]  # Add isort
+extend-select = ["I"]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]  # Unused imports OK in __init__.py
-"tests/**/*.py" = ["S101"]  # assert statements OK in tests
+"__init__.py" = ["F401"]
+"tests/**/*.py" = ["S101"]
 
 [tool.ruff.format]
-# Use defaults (Black-compatible)
+# Black-compatible formatting
 
 [tool.mypy]
 python_version = "3.9"
