@@ -156,7 +156,7 @@ ACTUAL_DANGEROUS_STRING_PATTERNS = [
 ]
 
 
-def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
+def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> dict[str, Any]:
     """
     Detect ML framework context from opcodes with confidence scoring.
     Uses improved scoring that focuses on presence and diversity of ML patterns
@@ -168,6 +168,30 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         "is_ml_content": False,
         "detected_patterns": [],
     }
+
+    # Generalizable filename-based ML detection
+    filename_boost = 0.0
+    if filename:
+        filename_lower = filename.lower()
+        # Check for any ML framework patterns in filename
+        for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
+            for module in patterns["modules"]:
+                if module.lower() in filename_lower:
+                    filename_boost = (
+                        0.2  # Moderate boost for any ML framework in filename
+                    )
+                    context["detected_patterns"].append(f"filename:{framework}")
+                    break
+            if filename_boost > 0:
+                break
+
+        # Check for common ML file extensions
+        if any(
+            ext in filename_lower for ext in [".pt", ".pth", ".h5", ".pkl", ".pickle"]
+        ):
+            filename_boost = max(
+                filename_boost, 0.1
+            )  # Small boost for ML file extensions
 
     total_opcodes = len(opcodes)
     if total_opcodes == 0:
@@ -228,13 +252,17 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
             }
             context["detected_patterns"].extend(matches)
 
-    # Calculate overall ML confidence - highest framework confidence
+    # Calculate overall ML confidence - highest framework confidence plus filename boost
     if context["frameworks"]:
-        context["overall_confidence"] = max(
-            fw["confidence"] for fw in context["frameworks"].values()
-        )
-        # Much more lenient threshold - any significant ML pattern detection
-        context["is_ml_content"] = context["overall_confidence"] > 0.15  # Was 0.3
+        max_confidence = max(fw["confidence"] for fw in context["frameworks"].values())
+        # Apply filename boost
+        context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
+    else:
+        # If no framework detected but we have filename indicators
+        context["overall_confidence"] = filename_boost
+
+    # Much more lenient threshold - any significant ML pattern detection
+    context["is_ml_content"] = context["overall_confidence"] > 0.15  # Was 0.3
 
     return context
 
@@ -465,6 +493,15 @@ def check_opcode_sequence(
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
 
+    # SMART DETECTION: Analyze opcode legitimacy and calculate adaptive threshold
+    opcode_analysis = _analyze_opcode_legitimacy(opcodes, ml_context)
+
+    # For highly legitimate models, skip detailed opcode counting entirely
+    if opcode_analysis.get("legitimacy_score", 0) > 0.7:
+        return suspicious_patterns  # Trust the legitimacy analysis for proven ML models
+
+    threshold = _calculate_adaptive_threshold(ml_context, opcode_analysis)
+
     # Count dangerous opcodes with ML context awareness
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
@@ -479,15 +516,6 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
-        # SMART DETECTION: Much higher threshold for ML content
-        ml_confidence = ml_context.get("overall_confidence", 0)
-        if ml_confidence > 0.7:
-            threshold = 100  # Very high threshold for high-confidence ML
-        elif ml_confidence > 0.4:
-            threshold = 50  # Higher threshold for medium-confidence ML
-        else:
-            threshold = 20  # Still higher than original 5 for unknown content
-
         # If we see too many dangerous opcodes AND it's not clearly ML content
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -495,7 +523,10 @@ def check_opcode_sequence(
                     "pattern": "MANY_DANGEROUS_OPCODES",
                     "count": dangerous_opcode_count,
                     "max_consecutive": max_consecutive,
-                    "ml_confidence": ml_confidence,
+                    "threshold_used": threshold,
+                    "ml_confidence": ml_context.get("overall_confidence", 0),
+                    "legitimacy_score": opcode_analysis.get("legitimacy_score", 0),
+                    "complexity_score": opcode_analysis.get("complexity_score", 0),
                     "position": pos,
                     "opcode": opcode.name,
                 },
@@ -505,6 +536,125 @@ def check_opcode_sequence(
             max_consecutive = 0
 
     return suspicious_patterns
+
+
+def _analyze_opcode_legitimacy(
+    opcodes: list[tuple], ml_context: dict
+) -> dict[str, Any]:
+    """
+    Analyze the legitimacy of opcodes based on ML context and patterns.
+    Returns a legitimacy score and analysis.
+    """
+    analysis = {
+        "total_opcodes": len(opcodes),
+        "ml_opcodes": 0,
+        "suspicious_opcodes": 0,
+        "ml_global_refs": 0,
+        "suspicious_global_refs": 0,
+        "legitimacy_score": 0.0,
+        "complexity_score": 0.0,
+    }
+
+    if not opcodes:
+        return analysis
+
+    # Categorize opcodes by their purpose in ML vs suspicious contexts
+    ml_construction_opcodes = {"REDUCE", "BUILD", "TUPLE", "LIST", "DICT", "SETITEM"}
+    genuinely_suspicious_opcodes = {"INST", "OBJ", "NEWOBJ"}
+
+    # Analyze opcode patterns
+    for opcode, arg, pos in opcodes:
+        if opcode.name == "GLOBAL" and isinstance(arg, str):
+            # Analyze global references
+            parts = (
+                arg.split(" ", 1)
+                if " " in arg
+                else arg.rsplit(".", 1)
+                if "." in arg
+                else [arg, ""]
+            )
+            if len(parts) == 2:
+                mod, func = parts
+                if mod in ML_SAFE_GLOBALS:
+                    analysis["ml_global_refs"] += 1
+                elif is_suspicious_global(mod, func):
+                    analysis["suspicious_global_refs"] += 1
+
+        elif opcode.name in ml_construction_opcodes:
+            analysis["ml_opcodes"] += 1
+        elif opcode.name in genuinely_suspicious_opcodes:
+            analysis["suspicious_opcodes"] += 1
+
+    # Calculate complexity score based on model structure indicators
+    total_construction = analysis["ml_opcodes"] + analysis["suspicious_opcodes"]
+    if total_construction > 0:
+        # Models with high ML global references are likely legitimate
+        ml_ratio = analysis["ml_global_refs"] / max(
+            1, analysis["ml_global_refs"] + analysis["suspicious_global_refs"]
+        )
+        analysis["complexity_score"] = min(
+            total_construction / 100.0, 1.0
+        )  # Normalize complexity
+
+        # Legitimacy score combines ML confidence, ML ratio, and low suspicious activity
+        ml_confidence = ml_context.get("overall_confidence", 0)
+        suspicious_ratio = analysis["suspicious_global_refs"] / max(
+            1, analysis["total_opcodes"]
+        )
+
+        analysis["legitimacy_score"] = (
+            ml_confidence * 0.4  # 40% from ML framework detection
+            + ml_ratio * 0.3  # 30% from ML vs suspicious global ratio
+            + (1.0 - suspicious_ratio) * 0.3  # 30% from low suspicious activity
+        )
+
+    return analysis
+
+
+def _calculate_adaptive_threshold(ml_context: dict, opcode_analysis: dict) -> int:
+    """
+    Calculate an adaptive threshold based on ML context and opcode analysis.
+    This replaces hardcoded framework-specific thresholds.
+    """
+    # Base threshold for unknown content
+    base_threshold = 5
+
+    # Get legitimacy and complexity scores
+    legitimacy = opcode_analysis.get("legitimacy_score", 0.0)
+    complexity = opcode_analysis.get("complexity_score", 0.0)
+    ml_confidence = ml_context.get("overall_confidence", 0.0)
+
+    # Adaptive threshold calculation prioritizing legitimacy score
+    # Higher legitimacy and complexity allow more opcodes
+    # This scales naturally with model complexity rather than being framework-specific
+    if legitimacy > 0.7:
+        # High legitimacy - very permissive regardless of ML confidence
+        threshold = base_threshold + int(
+            complexity * 1000
+        )  # Up to 1005 for complex, legitimate models
+    elif legitimacy > 0.5:
+        # Moderate legitimacy - still quite permissive
+        threshold = base_threshold + int(
+            complexity * 500
+        )  # Up to 505 for moderately legitimate models
+    elif legitimacy > 0.3:
+        # Some legitimacy indicators
+        threshold = base_threshold + int(complexity * 200)  # Up to 205
+    elif ml_confidence > 0.15:
+        # Rely on ML confidence when legitimacy is low
+        threshold = base_threshold + int(complexity * 100)  # Up to 105
+    elif ml_confidence > 0.1:
+        # Some ML indicators present
+        threshold = base_threshold + int(complexity * 50)  # Up to 55
+    else:
+        # Unknown content - stick close to base threshold
+        threshold = base_threshold + int(complexity * 10)  # Up to 15
+
+    # Add a small buffer for edge cases (models that are just barely over the calculated threshold)
+    if legitimacy > 0.6:
+        threshold = int(threshold * 1.1)  # 10% buffer for legitimate models
+
+    return max(threshold, base_threshold)  # Never go below base threshold
 
 
 class PickleScanner(BaseScanner):
@@ -611,7 +761,7 @@ class PickleScanner(BaseScanner):
                     break
 
             # SMART DETECTION: Analyze ML context once for the entire pickle
-            ml_context = _detect_ml_context(opcodes)
+            ml_context = _detect_ml_context(opcodes, self.current_file_path)
 
             # Add ML context to metadata for debugging
             result.metadata.update(
