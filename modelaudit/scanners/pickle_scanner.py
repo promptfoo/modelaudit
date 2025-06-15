@@ -1,13 +1,15 @@
-import pickletools
 import os
+import pickletools
 import time
-from typing import Optional, Dict, Any, BinaryIO, List
-from .base import ScanResult, BaseScanner, IssueSeverity
+from typing import Any, BinaryIO, Dict, List, Optional
+
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Dictionary of suspicious references.
 # You can expand as needed.
 SUSPICIOUS_GLOBALS = {
     "os": "*",
+    "posix": "*",  # posix.system is equivalent to os.system on Unix
     "sys": "*",
     "subprocess": "*",
     "runpy": "*",
@@ -26,13 +28,17 @@ SUSPICIOUS_GLOBALS = {
 }
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
-DANGEROUS_BUILTINS = [
-    "eval", "exec", "compile", "open", "input", "__import__"
-]
+DANGEROUS_BUILTINS = ["eval", "exec", "compile", "open", "input", "__import__"]
 
 # Dangerous opcodes that can lead to code execution
 DANGEROUS_OPCODES = [
-    "REDUCE", "INST", "OBJ", "NEWOBJ", "GLOBAL", "BUILD", "STACK_GLOBAL"
+    "REDUCE",
+    "INST",
+    "OBJ",
+    "NEWOBJ",
+    "GLOBAL",
+    "BUILD",
+    "STACK_GLOBAL",
 ]
 
 # Suspicious string patterns that might indicate encoded payloads
@@ -50,6 +56,7 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"\\x[0-9a-fA-F]{2}",  # Hex encoded characters
 ]
 
+
 def is_suspicious_global(mod: str, func: str) -> bool:
     """Check if a module.function reference is suspicious"""
     if mod in SUSPICIOUS_GLOBALS:
@@ -59,6 +66,7 @@ def is_suspicious_global(mod: str, func: str) -> bool:
         if isinstance(val, list) and func in val:
             return True
     return False
+
 
 def is_suspicious_string(s: str) -> Optional[str]:
     """Check if a string contains suspicious patterns"""
@@ -73,10 +81,11 @@ def is_suspicious_string(s: str) -> Optional[str]:
             return pattern
 
     # Check for base64-like strings (long strings with base64 charset)
-    if len(s) > 40 and re.match(r'^[A-Za-z0-9+/=]+$', s):
+    if len(s) > 40 and re.match(r"^[A-Za-z0-9+/=]+$", s):
         return "potential_base64"
 
     return None
+
 
 def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]]:
     """
@@ -86,9 +95,19 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Check for GLOBAL followed by REDUCE - common in exploits
-        if opcode.name == "GLOBAL" and i+1 < len(opcodes) and opcodes[i+1][0].name == "REDUCE":
+        if (
+            opcode.name == "GLOBAL"
+            and i + 1 < len(opcodes)
+            and opcodes[i + 1][0].name == "REDUCE"
+        ):
             if isinstance(arg, str):
-                parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                parts = (
+                    arg.split(" ", 1)
+                    if " " in arg
+                    else arg.rsplit(".", 1)
+                    if "." in arg
+                    else [arg, ""]
+                )
                 if len(parts) == 2:
                     mod, func = parts
                     return {
@@ -96,7 +115,7 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
                         "module": mod,
                         "function": func,
                         "position": pos,
-                        "opcode": opcode.name
+                        "opcode": opcode.name,
                     }
 
         # Check for INST or OBJ opcodes which can also be used for code execution
@@ -105,20 +124,29 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
                 "pattern": f"{opcode.name}_EXECUTION",
                 "argument": arg,
                 "position": pos,
-                "opcode": opcode.name
+                "opcode": opcode.name,
             }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
-        if opcode.name == "GETATTR" and i+1 < len(opcodes) and opcodes[i+1][0].name == "CALL":
+        if (
+            opcode.name == "GETATTR"
+            and i + 1 < len(opcodes)
+            and opcodes[i + 1][0].name == "CALL"
+        ):
             return {
                 "pattern": "GETATTR+CALL",
                 "attribute": arg,
                 "position": pos,
-                "opcode": opcode.name
+                "opcode": opcode.name,
             }
 
         # Check for suspicious strings in STRING or BINSTRING opcodes
-        if opcode.name in ["STRING", "BINSTRING", "SHORT_BINSTRING", "UNICODE"] and isinstance(arg, str):
+        if opcode.name in [
+            "STRING",
+            "BINSTRING",
+            "SHORT_BINSTRING",
+            "UNICODE",
+        ] and isinstance(arg, str):
             suspicious_pattern = is_suspicious_string(arg)
             if suspicious_pattern:
                 return {
@@ -126,10 +154,11 @@ def is_dangerous_reduce_pattern(opcodes: List[tuple]) -> Optional[Dict[str, Any]
                     "string_pattern": suspicious_pattern,
                     "string_preview": arg[:50] + ("..." if len(arg) > 50 else ""),
                     "position": pos,
-                    "opcode": opcode.name
+                    "opcode": opcode.name,
                 }
 
     return None
+
 
 def check_opcode_sequence(opcodes: List[tuple]) -> List[Dict[str, Any]]:
     """
@@ -152,19 +181,23 @@ def check_opcode_sequence(opcodes: List[tuple]) -> List[Dict[str, Any]]:
 
         # If we see too many dangerous opcodes, that's suspicious
         if dangerous_opcode_count > 5:
-            suspicious_patterns.append({
-                "pattern": "MANY_DANGEROUS_OPCODES",
-                "count": dangerous_opcode_count,
-                "position": pos,
-                "opcode": opcode.name
-            })
+            suspicious_patterns.append(
+                {
+                    "pattern": "MANY_DANGEROUS_OPCODES",
+                    "count": dangerous_opcode_count,
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
+            )
             # Reset counter to avoid multiple alerts
             dangerous_opcode_count = 0
 
     return suspicious_patterns
 
+
 class PickleScanner(BaseScanner):
     """Scanner for Python Pickle files"""
+
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
     supported_extensions = [".pkl", ".pickle"]
@@ -202,7 +235,7 @@ class PickleScanner(BaseScanner):
                 f"Error opening pickle file: {str(e)}",
                 severity=IssueSeverity.ERROR,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__}
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
         result.finish(success=True)
@@ -220,10 +253,25 @@ class PickleScanner(BaseScanner):
 
             # Store opcodes for pattern analysis
             opcodes = []
+            # Track strings on the stack for STACK_GLOBAL opcode analysis
+            string_stack = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 opcodes.append((opcode, arg, pos))
                 opcode_count += 1
+
+                # Track strings for STACK_GLOBAL analysis
+                if opcode.name in [
+                    "STRING",
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                    "SHORT_BINUNICODE",
+                    "UNICODE",
+                ] and isinstance(arg, str):
+                    string_stack.append(arg)
+                    # Keep only the last 10 strings to avoid memory issues
+                    if len(string_stack) > 10:
+                        string_stack.pop(0)
 
                 # Check for too many opcodes
                 if opcode_count > self.max_opcodes:
@@ -231,7 +279,10 @@ class PickleScanner(BaseScanner):
                         f"Too many opcodes in pickle (> {self.max_opcodes})",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
-                        details={"opcode_count": opcode_count, "max_opcodes": self.max_opcodes}
+                        details={
+                            "opcode_count": opcode_count,
+                            "max_opcodes": self.max_opcodes,
+                        },
                     )
                     break
 
@@ -241,7 +292,7 @@ class PickleScanner(BaseScanner):
                         f"Scanning timed out after {self.timeout} seconds",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
-                        details={"opcode_count": opcode_count, "timeout": self.timeout}
+                        details={"opcode_count": opcode_count, "timeout": self.timeout},
                     )
                     break
 
@@ -249,7 +300,13 @@ class PickleScanner(BaseScanner):
                 if opcode.name == "GLOBAL":
                     if isinstance(arg, str):
                         # Handle both "module function" and "module.function" formats
-                        parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                        parts = (
+                            arg.split(" ", 1)
+                            if " " in arg
+                            else arg.rsplit(".", 1)
+                            if "." in arg
+                            else [arg, ""]
+                        )
 
                         if len(parts) == 2:
                             mod, func = parts
@@ -263,8 +320,8 @@ class PickleScanner(BaseScanner):
                                         "module": mod,
                                         "function": func,
                                         "position": pos,
-                                        "opcode": opcode.name
-                                    }
+                                        "opcode": opcode.name,
+                                    },
                                 )
 
                 # Check for REDUCE opcode which is often used in exploits
@@ -273,10 +330,7 @@ class PickleScanner(BaseScanner):
                         "Found REDUCE opcode - potential __reduce__ method execution",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (pos {pos})",
-                        details={
-                            "position": pos,
-                            "opcode": opcode.name
-                        }
+                        details={"position": pos, "opcode": opcode.name},
                     )
 
                 # Check for other dangerous opcodes
@@ -288,12 +342,17 @@ class PickleScanner(BaseScanner):
                         details={
                             "position": pos,
                             "opcode": opcode.name,
-                            "argument": str(arg)
-                        }
+                            "argument": str(arg),
+                        },
                     )
 
                 # Check for suspicious strings
-                if opcode.name in ["STRING", "BINSTRING", "SHORT_BINSTRING", "UNICODE"] and isinstance(arg, str):
+                if opcode.name in [
+                    "STRING",
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                    "UNICODE",
+                ] and isinstance(arg, str):
                     suspicious_pattern = is_suspicious_string(arg)
                     if suspicious_pattern:
                         result.add_issue(
@@ -304,8 +363,9 @@ class PickleScanner(BaseScanner):
                                 "position": pos,
                                 "opcode": opcode.name,
                                 "pattern": suspicious_pattern,
-                                "string_preview": arg[:50] + ("..." if len(arg) > 50 else "")
-                            }
+                                "string_preview": arg[:50]
+                                + ("..." if len(arg) > 50 else ""),
+                            },
                         )
 
                 # Check for STACK_GLOBAL which uses the last two strings as module and function
@@ -324,8 +384,8 @@ class PickleScanner(BaseScanner):
                                     "module": mod,
                                     "function": func,
                                     "position": pos,
-                                    "opcode": opcode.name
-                                }
+                                    "opcode": opcode.name,
+                                },
                             )
                     else:
                         result.add_issue(
@@ -335,8 +395,8 @@ class PickleScanner(BaseScanner):
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
-                                "stack_size": len(string_stack)
-                            }
+                                "stack_size": len(string_stack),
+                            },
                         )
 
             # Check for dangerous patterns in the opcodes
@@ -347,7 +407,7 @@ class PickleScanner(BaseScanner):
                     f"Detected dangerous __reduce__ pattern with {dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
                     severity=IssueSeverity.ERROR,
                     location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
-                    details=dangerous_pattern
+                    details=dangerous_pattern,
                 )
 
             # Check for suspicious opcode sequences
@@ -358,22 +418,21 @@ class PickleScanner(BaseScanner):
                     f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown')}",
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (pos {sequence.get('position', 0)})",
-                    details=sequence
+                    details=sequence,
                 )
 
             # Update metadata
             end_pos = file_obj.tell()
             result.bytes_scanned = end_pos - start_pos
-            result.metadata.update({
-                "opcode_count": opcode_count,
-                "suspicious_count": suspicious_count
-            })
+            result.metadata.update(
+                {"opcode_count": opcode_count, "suspicious_count": suspicious_count}
+            )
 
         except Exception as e:
             result.add_issue(
                 f"Error analyzing pickle ops: {e}",
                 severity=IssueSeverity.ERROR,
-                details={"exception": str(e), "exception_type": type(e).__name__}
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
         return result
