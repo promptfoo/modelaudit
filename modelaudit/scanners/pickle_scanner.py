@@ -263,9 +263,7 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> MLContextDic
 
     # Calculate overall ML confidence - highest framework confidence plus filename boost
     if context["frameworks"]:
-        max_confidence = max(
-            fw["confidence"] for fw in context["frameworks"].values()
-        )
+        max_confidence = max(fw["confidence"] for fw in context["frameworks"].values())
         # Apply filename boost
         context["overall_confidence"] = min(max_confidence + filename_boost, 1.0)
     else:
@@ -278,7 +276,9 @@ def _detect_ml_context(opcodes: list[tuple], filename: str = "") -> MLContextDic
     return context
 
 
-def _is_actually_dangerous_global(mod: str, func: str, ml_context: MLContextDict) -> bool:
+def _is_actually_dangerous_global(
+    mod: str, func: str, ml_context: MLContextDict
+) -> bool:
     """
     Smart global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
@@ -984,7 +984,7 @@ class PickleScanner(BaseScanner):
                         # recent_strings[0] is the most recent (function)
                         # recent_strings[1] is the second most recent (module)
                         func = recent_strings[0]  # Most recent string (function)
-                        mod = recent_strings[1]   # Second most recent string (module)
+                        mod = recent_strings[1]  # Second most recent string (module)
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
