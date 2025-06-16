@@ -321,7 +321,7 @@ def format_text_output(results, verbose=False):
         error_count = sum(
             1
             for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "error"
+            if isinstance(issue, dict) and issue.get("severity") == "critical"
         )
         warning_count = sum(
             1
@@ -343,7 +343,7 @@ def format_text_output(results, verbose=False):
         issue_summary = []
         if error_count:
             issue_summary.append(
-                click.style(f"{error_count} findings", fg="red", bold=True),
+                click.style(f"{error_count} critical", fg="red", bold=True),
             )
         if warning_count:
             issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
@@ -369,7 +369,7 @@ def format_text_output(results, verbose=False):
             location = issue.get("location", "")
 
             # Color-code based on severity
-            if severity == "error":
+            if severity == "critical":
                 severity_style = click.style("[CRITICAL]", fg="red", bold=True)
             elif severity == "warning":
                 severity_style = click.style("[WARNING]", fg="yellow")
@@ -400,7 +400,7 @@ def format_text_output(results, verbose=False):
     output_lines.append("─" * 80)
     if visible_issues:
         if any(
-            isinstance(issue, dict) and issue.get("severity") == "error"
+            isinstance(issue, dict) and issue.get("severity") == "critical"
             for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with findings", fg="red", bold=True)

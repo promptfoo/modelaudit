@@ -83,7 +83,7 @@ def test_keras_h5_scanner_safe_model(tmp_path):
 
     # Check for issues - a safe model might still have some informational issues
     error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.ERROR
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
     assert len(error_issues) == 0
 
@@ -97,7 +97,7 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
 
     # The scanner should detect suspicious patterns
     assert any(
-        issue.severity in (IssueSeverity.ERROR, IssueSeverity.WARNING)
+        issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING)
         for issue in result.issues
     )
     assert any(
@@ -118,7 +118,7 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     result = scanner.scan(str(invalid_path))
 
     # Should have an error about invalid H5
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower()
         or "not an hdf5" in issue.message.lower()
@@ -179,7 +179,7 @@ def test_keras_h5_scanner_empty_file(tmp_path):
     result = scanner.scan(str(empty_path))
 
     # Should have an error about invalid H5
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "file signature not found" in issue.message.lower()
         or "invalid" in issue.message.lower()
