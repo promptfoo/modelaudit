@@ -144,7 +144,7 @@ class WeightDistributionScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error analyzing weight distributions: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

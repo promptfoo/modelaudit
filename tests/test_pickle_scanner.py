@@ -62,7 +62,7 @@ class TestPickleScanner(unittest.TestCase):
         result = scanner.scan("nonexistent_file.pkl")
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
     def test_scan_bin_file_with_suspicious_binary_content(self):
         """Test scanning .bin file with suspicious code patterns in binary data"""
@@ -124,7 +124,10 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Add binary content with executable signatures
                 f.write(b"some_padding")
+                # For Windows PE, we need to include the DOS stub for validation
                 f.write(b"MZ")  # Windows PE executable signature
+                f.write(b"\x00" * 60)  # Padding to reach DOS stub area
+                f.write(b"This program cannot be run in DOS mode")  # DOS stub message
                 f.write(b"more_padding")
                 f.write(b"\x7fELF")  # Linux ELF executable signature
                 f.write(b"end_padding")
@@ -150,7 +153,7 @@ class TestPickleScanner(unittest.TestCase):
                 error_issues = [
                     issue
                     for issue in executable_issues
-                    if issue.severity == IssueSeverity.ERROR
+                    if issue.severity == IssueSeverity.CRITICAL
                 ]
                 assert len(error_issues) >= 2
 

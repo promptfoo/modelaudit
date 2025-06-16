@@ -62,7 +62,7 @@ class ZipScanner(BaseScanner):
         except zipfile.BadZipFile:
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -71,7 +71,7 @@ class ZipScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning zip file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -123,7 +123,7 @@ class ZipScanner(BaseScanner):
                 ):
                     result.add_issue(
                         f"Potential directory traversal in ZIP entry: {name}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=f"{path}:{name}",
                         details={"entry": name, "normalized_path": normalized_path},
                     )
