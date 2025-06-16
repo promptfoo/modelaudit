@@ -63,7 +63,7 @@ def test_directory_scan(tmp_path):
         if "Unknown or unhandled format" in issue["message"]
     ]
     assert len(unknown_format_issues) == 2  # .txt and .dat files
-    
+
     # The .bin file should be handled by PyTorchBinaryScanner
     assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))
 
