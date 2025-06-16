@@ -62,7 +62,7 @@ class TestPickleScanner(unittest.TestCase):
         result = scanner.scan("nonexistent_file.pkl")
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
     def test_scan_bin_file_with_suspicious_binary_content(self):
         """Test scanning .bin file with suspicious code patterns in binary data"""
@@ -153,7 +153,7 @@ class TestPickleScanner(unittest.TestCase):
                 error_issues = [
                     issue
                     for issue in executable_issues
-                    if issue.severity == IssueSeverity.ERROR
+                    if issue.severity == IssueSeverity.CRITICAL
                 ]
                 assert len(error_issues) >= 2
 

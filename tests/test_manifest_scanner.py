@@ -90,7 +90,9 @@ def test_manifest_scanner_blacklist():
             if hasattr(issue, "message") and "Blacklisted term" in issue.message
         ]
         assert len(blacklist_issues) > 0
-        assert any(issue.severity == IssueSeverity.ERROR for issue in blacklist_issues)
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL for issue in blacklist_issues
+        )
 
         # Verify the specific blacklisted term was identified
         blacklisted_terms = [
