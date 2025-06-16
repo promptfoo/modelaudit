@@ -9,7 +9,6 @@ from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-
 # Map SafeTensors dtypes to byte sizes for integrity checking
 _DTYPE_SIZES = {
     "F16": 2,

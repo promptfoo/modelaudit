@@ -6,7 +6,6 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
-from modelaudit.scanners.base import IssueSeverity
 
 
 def create_safetensors_file(path: Path) -> None:
