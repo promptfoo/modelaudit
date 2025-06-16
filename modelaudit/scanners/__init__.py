@@ -6,6 +6,7 @@ from . import (
     pytorch_binary_scanner,
     pytorch_zip_scanner,
     tf_savedmodel_scanner,
+    weight_distribution_scanner,
     zip_scanner,
 )
 
@@ -17,6 +18,7 @@ from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from .weight_distribution_scanner import WeightDistributionScanner
 from .zip_scanner import ZipScanner
 
 # Create a registry of all available scanners
@@ -28,6 +30,7 @@ SCANNER_REGISTRY = [
     KerasH5Scanner,
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
     ManifestScanner,
+    WeightDistributionScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -40,6 +43,7 @@ __all__ = [
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
     "manifest_scanner",
+    "weight_distribution_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
@@ -51,6 +55,7 @@ __all__ = [
     "KerasH5Scanner",
     "PyTorchZipScanner",
     "ManifestScanner",
+    "WeightDistributionScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
 ]

@@ -22,7 +22,7 @@ logger = logging.getLogger("modelaudit")
 @click.group()
 @click.version_option(__version__)
 def cli():
-    """My Model Scanner CLI."""
+    """Static scanner for ML models"""
     pass
 
 
