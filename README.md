@@ -29,6 +29,7 @@ ModelAudit scans ML model files for:
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **Container-delivered models** in OCI/Docker layers and manifest files
 
 ## 🚀 Quick Start
 
@@ -161,7 +162,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip), Container layers (.manifest + .tar.gz)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -228,6 +229,17 @@ modelaudit scan model.pkl || exit 1
 - Parses header metadata and verifies tensor offsets
 - Checks dtype and shape sizes against byte ranges
 - Flags suspicious or malformed metadata entries
+
+### OCI Layer Scanner
+
+**Scans container-delivered models in OCI/Docker layers:**
+
+- **Supported formats**: `.manifest` files that reference `.tar.gz` layers
+- **Container model scanning**: Extracts and scans model files embedded in container layers
+- **Recursive analysis**: Each model file found in layers is scanned with appropriate scanners
+- **Container supply chain security**: Detects malicious models delivered via container images
+- **Location tracking**: Reports issues with full path: `manifest:layer:modelfile`
+- **Supports both JSON and YAML manifest formats**
 
 ### Manifest Scanner
 
@@ -379,6 +391,7 @@ modelaudit/
 │   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
 │   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
 │   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
+│   │   ├── oci_layer_scanner.py   # Container layer scanner
 │   │   └── manifest_scanner.py    # Config/manifest scanner
 │   ├── utils/             # Utility modules
 │   ├── cli.py            # Command-line interface
