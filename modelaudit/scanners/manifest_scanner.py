@@ -128,23 +128,52 @@ class ManifestScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        # Check file extension
-        ext = os.path.splitext(path)[1].lower()
-        if ext in cls.supported_extensions:
+        filename = os.path.basename(path).lower()
+        
+        # Whitelist: Only scan files that are unique to AI/ML models 
+        aiml_specific_patterns = [
+            # HuggingFace/Transformers specific configuration files
+            "config.json",  # Model architecture config (when in ML model context)
+            "generation_config.json",  # Text generation parameters
+            "preprocessor_config.json",  # Data preprocessing config
+            "feature_extractor_config.json",  # Feature extraction config
+            "image_processor_config.json",  # Image processing config
+            "scheduler_config.json",  # Learning rate scheduler config
+            
+            # Model metadata and manifest files specific to ML
+            "model_index.json",  # Diffusion model index
+            "model_card.json",  # Model card metadata
+            "pytorch_model.bin.index.json",  # PyTorch model shard index
+            "model.safetensors.index.json",  # SafeTensors model index
+            "tf_model.h5.index.json",  # TensorFlow model index
+            
+            # ML-specific execution and deployment configs
+            "inference_config.json",  # Model inference configuration
+            "deployment_config.json",  # Model deployment configuration
+            "serving_config.json",  # Model serving configuration
+            
+            # ONNX model specific
+            "onnx_config.json",  # ONNX export configuration
+            
+            # Custom model configs that might contain execution parameters
+            "custom_config.json",  # Custom model configurations
+            "runtime_config.json",  # Runtime execution parameters
+        ]
+        
+        # Check if filename matches any AI/ML specific pattern
+        if any(pattern in filename for pattern in aiml_specific_patterns):
             return True
-
-        # For files without a recognized extension, try to peek at the content
-        try:
-            with open(path, encoding="utf-8") as f:
-                first_line = f.readline().strip()
-                # Check for JSON format
-                if first_line.startswith("{") or first_line.startswith("["):
-                    return True
-                # Check for YAML format if yaml is available
-                if HAS_YAML and (first_line.startswith("---") or ":" in first_line):
-                    return True
-        except (OSError, UnicodeDecodeError):
-            pass
+            
+        # Additional check: files with "config" in name that are in ML model context
+        # (but exclude tokenizer configs and general software configs)
+        if ("config" in filename and 
+            "tokenizer" not in filename and
+            filename not in ["config.py", "config.yaml", "config.yml", "config.ini", "config.cfg"]):
+            # Only if it's likely an ML model config (has model-related terms in path or specific extensions)
+            path_lower = path.lower()
+            if (any(ml_term in path_lower for ml_term in ["model", "checkpoint", "huggingface", "transformers"]) or
+                os.path.splitext(path)[1].lower() in [".json"]):
+                return True
 
         return False
 
@@ -589,6 +618,8 @@ class ManifestScanner(BaseScanner):
         self, matches: list[str], ml_context: dict
     ) -> IssueSeverity:
         """Determine severity based on context and match types"""
+        # TODO(ian): For now, avoid false positives by defaulting to INFO
+        """
         # Execution patterns are always WARNING
         if "execution" in matches:
             return IssueSeverity.WARNING
@@ -604,6 +635,9 @@ class ManifestScanner(BaseScanner):
             return IssueSeverity.WARNING
 
         return IssueSeverity.WARNING
+        """
+
+        return IssueSeverity.INFO
 
     def _format_value(self, value: Any) -> str:
         """Format a value for display, truncating if necessary"""
