@@ -104,6 +104,9 @@ modelaudit scan large_model.pkl --timeout 300
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
+
+# Attempt to rewrite unsafe pickle files
+modelaudit scan malicious.pkl --rewrite
 ```
 
 **Example output:**

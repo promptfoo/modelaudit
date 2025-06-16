@@ -10,6 +10,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .utils.rewrite import safe_rewrite_pickle
 
 # Configure logging
 logging.basicConfig(
@@ -61,7 +62,15 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+@click.option(
+    "--rewrite",
+    is_flag=True,
+    default=False,
+    help="Attempt to rewrite unsafe pickle files using Fickling",
+)
+def scan_command(
+    paths, blacklist, format, output, timeout, verbose, max_file_size, rewrite
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -169,6 +178,20 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 max_file_size=max_file_size,
                 progress_callback=progress_callback,
             )
+
+            if rewrite:
+                has_error = any(
+                    isinstance(issue, dict) and issue.get("severity") == "error"
+                    for issue in results.get("issues", [])
+                )
+                if has_error:
+                    try:
+                        new_file, diff = safe_rewrite_pickle(path)
+                        click.echo(f"Rewritten file saved to {new_file}")
+                        if diff:
+                            click.echo(diff)
+                    except Exception as e:  # pragma: no cover - best effort
+                        logger.error(f"Failed to rewrite {path}: {e}")
 
             # Aggregate results
             aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
