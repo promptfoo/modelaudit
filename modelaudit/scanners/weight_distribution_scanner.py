@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from scipy import stats
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Try to import format-specific libraries
 try:
@@ -144,7 +144,7 @@ class WeightDistributionScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error analyzing weight distributions: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -202,7 +202,8 @@ class WeightDistributionScanner(BaseScanner):
                         # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
                         weights_info[key] = value.detach().cpu().numpy().T
 
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to extract weights from {path}: {e}")
             # Try loading as a zip file (newer PyTorch format)
             try:
                 with zipfile.ZipFile(path, "r") as z:
@@ -211,8 +212,8 @@ class WeightDistributionScanner(BaseScanner):
                         # We can't easily extract weights from pickle without executing it
                         # This is a limitation we should document
                         pass
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to extract weights from {path}: {e}")
 
         return weights_info
 
@@ -234,8 +235,8 @@ class WeightDistributionScanner(BaseScanner):
 
                 f.visititems(extract_weights)
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to extract weights from {path}: {e}")
 
         return weights_info
 
@@ -276,8 +277,8 @@ class WeightDistributionScanner(BaseScanner):
                         initializer
                     )
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to extract weights from {path}: {e}")
 
         return weights_info
 
@@ -301,8 +302,8 @@ class WeightDistributionScanner(BaseScanner):
                     if "weight" in key.lower():
                         weights_info[key] = f.get_tensor(key)
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to extract weights from {path}: {e}")
 
         return weights_info
 
@@ -390,7 +391,7 @@ class WeightDistributionScanner(BaseScanner):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with abnormal weight magnitudes",
-                        "severity": IssueSeverity.WARNING,
+                        "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
                             "outlier_neurons": outlier_indices.tolist()[
@@ -435,7 +436,7 @@ class WeightDistributionScanner(BaseScanner):
                     anomalies.append(
                         {
                             "description": f"Layer '{layer_name}' output neuron {neuron_idx} has unusually dissimilar weights",
-                            "severity": IssueSeverity.WARNING,
+                            "severity": IssueSeverity.INFO,
                             "details": {
                                 "layer": layer_name,
                                 "neuron_index": neuron_idx,
@@ -461,7 +462,7 @@ class WeightDistributionScanner(BaseScanner):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
-                        "severity": IssueSeverity.WARNING,
+                        "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
                             "affected_neurons": neurons_with_extreme_weights.tolist()[
