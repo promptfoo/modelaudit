@@ -23,7 +23,6 @@ poetry run pytest tests/test_pickle_scanner.py  # Run specific test file
 poetry run pytest -k "test_pickle"         # Run tests matching pattern
 
 # Linting and Formatting (run ALL before committing)
-poetry run black modelaudit/ tests/        # Format code with Black
 poetry run ruff format .                   # Format code with Ruff (alternative formatter)
 poetry run isort modelaudit/ tests/        # Sort imports
 poetry run flake8 modelaudit/ tests/       # Check style with Flake8
@@ -33,7 +32,6 @@ poetry run mypy modelaudit/                # Type checking
 poetry run ruff format --check .           # Check if Ruff formatting is needed
 
 # Recommended order before committing:
-# 1. poetry run black modelaudit/ tests/
 # 2. poetry run ruff format .
 # 3. poetry run isort modelaudit/ tests/
 # 4. poetry run flake8 modelaudit/ tests/
