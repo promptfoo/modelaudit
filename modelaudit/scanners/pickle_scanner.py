@@ -518,7 +518,16 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle", ".joblib", ".dill", ".bin", ".pt", ".pth", ".ckpt"]
+    supported_extensions = [
+        ".pkl",
+        ".pickle",
+        ".joblib",
+        ".dill",
+        ".bin",
+        ".pt",
+        ".pth",
+        ".ckpt",
+    ]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
