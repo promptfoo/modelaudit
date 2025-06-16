@@ -1,7 +1,6 @@
-import json
 import os
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from scipy import stats
@@ -24,7 +23,7 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    import tensorflow as tf
+    import tensorflow as tf  # noqa: F401
 
     HAS_TENSORFLOW = True
 except ImportError:
@@ -160,7 +159,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_TORCH:
             return {}
 
-        weights_info = {}
+        weights_info: Dict[str, np.ndarray] = {}
 
         try:
             # Load model with map_location to CPU to avoid GPU requirements
@@ -206,7 +205,7 @@ class WeightDistributionScanner(BaseScanner):
                         # We can't easily extract weights from pickle without executing it
                         # This is a limitation we should document
                         pass
-            except:
+            except Exception:
                 pass
 
         return weights_info
@@ -216,7 +215,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_H5PY:
             return {}
 
-        weights_info = {}
+        weights_info: Dict[str, np.ndarray] = {}
 
         try:
             with h5py.File(path, "r") as f:
@@ -239,7 +238,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_TENSORFLOW:
             return {}
 
-        weights_info = {}
+        weights_info: Dict[str, np.ndarray] = {}
 
         # TensorFlow SavedModel weight extraction is complex and would require
         # loading the full graph. For now, we'll return empty.
@@ -259,7 +258,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_ONNX:
             return {}
 
-        weights_info = {}
+        weights_info: Dict[str, np.ndarray] = {}
 
         try:
             model = onnx.load(path)
@@ -288,7 +287,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_SAFETENSORS:
             return {}
 
-        weights_info = {}
+        weights_info: Dict[str, np.ndarray] = {}
 
         try:
             with safe_open(path, framework="numpy") as f:
@@ -336,7 +335,7 @@ class WeightDistributionScanner(BaseScanner):
         self, layer_name: str, weights: np.ndarray
     ) -> List[Dict[str, Any]]:
         """Analyze a single layer's weights for anomalies"""
-        anomalies = []
+        anomalies: List[Dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers
         if len(weights.shape) != 2:

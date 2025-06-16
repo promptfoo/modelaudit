@@ -1,12 +1,10 @@
-import io
 import os
 import tempfile
-import pytest
+
 import numpy as np
+import pytest
 
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
-from modelaudit.scanners.base import IssueSeverity
-
 
 # Skip tests if required libraries are not available
 try:
@@ -318,7 +316,7 @@ class TestWeightDistributionScanner:
 
         # Should return no anomalies since LLM checks are disabled by default
         assert len(anomalies) == 0
-        
+
     def test_llm_checks_can_be_enabled(self):
         """Test that LLM checks can be explicitly enabled via config"""
         config = {"enable_llm_checks": True}
@@ -336,7 +334,7 @@ class TestWeightDistributionScanner:
         # With LLM checks enabled, might detect extreme outliers with strict thresholds
         # We made 2 extreme neurons, so could get up to 2 anomaly types (outlier + extreme)
         assert len(anomalies) <= 2
-        
+
         # Should only flag the 2 neurons we made extreme
         for anomaly in anomalies:
             if "outlier_neurons" in anomaly["details"]:
