@@ -399,7 +399,9 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
                 parts = (
                     arg.split(" ", 1)
                     if " " in arg
-                    else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                    else arg.rsplit(".", 1)
+                    if "." in arg
+                    else [arg, ""]
                 )
                 if len(parts) == 2:
                     mod, func = parts
@@ -633,7 +635,9 @@ class PickleScanner(BaseScanner):
                         parts = (
                             arg.split(" ", 1)
                             if " " in arg
-                            else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                            else arg.rsplit(".", 1)
+                            if "." in arg
+                            else [arg, ""]
                         )
 
                         if len(parts) == 2:
