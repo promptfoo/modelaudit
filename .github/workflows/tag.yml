@@ -1,0 +1,93 @@
+name: Auto-tag releases
+run-name: Auto-tag release for version change by @${{ github.actor }}
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for git tags
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Get package version from pyproject.toml
+        id: get_version
+        run: |
+          VERSION=$(poetry version --short)
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Package version: ${VERSION}"
+
+      - name: Check if git tag exists
+        id: check_tag
+        run: |
+          git fetch --tags
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Git tag v${VERSION} already exists"
+            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "Git tag v${VERSION} does not exist"
+            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create git tag
+        if: env.TAG_EXISTS == 'false'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag "v${VERSION}" -m "Release version ${VERSION}"
+          echo "Created tag: v${VERSION}"
+
+      - name: Push git tag
+        if: env.TAG_EXISTS == 'false'
+        run: |
+          git push origin "v${VERSION}"
+          echo "Pushed tag: v${VERSION}"
+
+      - name: Create GitHub Release
+        if: env.TAG_EXISTS == 'false'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.VERSION }}
+          release_name: Release v${{ env.VERSION }}
+          body: |
+            ## Changes
+
+            See the [CHANGELOG](https://github.com/promptfoo/modelaudit/compare/v${{ env.VERSION }}) for details.
+
+            ## Installation
+
+            ```bash
+            pip install modelaudit==${{ env.VERSION }}
+            ```
+
+            ## Usage
+
+            ```bash
+            modelaudit scan your_model.pkl
+            ```
+          draft: false
+          prerelease: false
