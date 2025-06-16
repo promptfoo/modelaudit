@@ -173,9 +173,9 @@ class TestAssetIntegration:
         assert results["files_scanned"] > 0
 
         # Should have both types of files scanned
-        locations = {issue.get("location", "") for issue in results["issues"]}
+        locations = {issue.get("location") or "" for issue in results["issues"]}
         has_malicious_locations = any(
-            "malicious" in loc or "evil" in loc for loc in locations
+            "malicious" in loc or "evil" in loc for loc in locations if loc
         )
         assert has_malicious_locations, (
             "Should detect malicious assets in mixed directory"
