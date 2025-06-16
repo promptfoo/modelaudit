@@ -75,18 +75,16 @@ class ScanResult:
         """Add an issue to the result"""
         issue = Issue(message, severity, location, details)
         self.issues.append(issue)
-        logger.log(
-            (
-                logging.ERROR
-                if severity == IssueSeverity.ERROR
-                else (
-                    logging.WARNING
-                    if severity == IssueSeverity.WARNING
-                    else logging.INFO
-                )
-            ),
-            str(issue),
+        log_level = (
+            logging.ERROR
+            if severity == IssueSeverity.ERROR
+            else (
+                logging.WARNING
+                if severity == IssueSeverity.WARNING
+                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+            )
         )
+        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
