@@ -2,6 +2,11 @@ import json
 import os
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_CONFIG_PROPERTIES,
+    SUSPICIOUS_LAYER_TYPES,
+)
+
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
@@ -11,30 +16,6 @@ try:
     HAS_H5PY = True
 except ImportError:
     HAS_H5PY = False
-
-# Suspicious Keras layer types that might contain executable code
-SUSPICIOUS_LAYER_TYPES = {
-    "Lambda": "Can contain arbitrary Python code",
-    "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
-    "PyFunc": "Can execute Python code",
-    "CallbackLambda": "Can execute callbacks at runtime",
-}
-
-# Suspicious config properties that might indicate security issues
-SUSPICIOUS_CONFIG_PROPERTIES = [
-    "function",
-    "module",
-    "code",
-    "eval",
-    "exec",
-    "import",
-    "subprocess",
-    "os.",
-    "system",
-    "popen",
-    "shell",
-]
 
 
 class KerasH5Scanner(BaseScanner):

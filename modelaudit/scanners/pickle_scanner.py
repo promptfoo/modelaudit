@@ -3,29 +3,12 @@ import pickletools
 import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_GLOBALS,
+    SUSPICIOUS_STRING_PATTERNS,
+)
 
-# Dictionary of suspicious references.
-# You can expand as needed.
-SUSPICIOUS_GLOBALS = {
-    "os": "*",
-    "posix": "*",  # posix.system is equivalent to os.system on Unix
-    "sys": "*",
-    "subprocess": "*",
-    "runpy": "*",
-    "builtins": ["eval", "exec", "__import__"],
-    "operator": ["attrgetter"],
-    "importlib": ["import_module"],
-    "pickle": ["loads", "load"],
-    "base64": ["b64decode", "b64encode", "decode"],
-    "codecs": ["decode", "encode"],
-    "shutil": ["rmtree", "copy", "move"],
-    "tempfile": ["mktemp"],
-    "pty": ["spawn"],
-    "platform": ["system", "popen"],
-    "ctypes": ["*"],
-    "socket": ["*"],
-}
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
 DANGEROUS_BUILTINS = ["eval", "exec", "compile", "open", "input", "__import__"]
@@ -41,20 +24,6 @@ DANGEROUS_OPCODES = [
     "STACK_GLOBAL",
 ]
 
-# Suspicious string patterns that might indicate encoded payloads
-SUSPICIOUS_STRING_PATTERNS = [
-    r"__[\w]+__",  # Magic methods
-    r"base64\.b64decode",
-    r"eval\(",
-    r"exec\(",
-    r"os\.system",
-    r"subprocess\.(?:Popen|call|check_output)",
-    r"import ",
-    r"importlib",
-    r"__import__",
-    r"lambda",
-    r"\\x[0-9a-fA-F]{2}",  # Hex encoded characters
-]
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness

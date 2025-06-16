@@ -2,6 +2,8 @@ import json
 import os
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
+
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Try to import the name policies module
@@ -58,53 +60,6 @@ MODEL_NAME_KEYS = [
 
 # Pre-compute lowercase versions for faster checks
 MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
-
-# Suspicious configuration patterns
-SUSPICIOUS_CONFIG_PATTERNS = {
-    "network_access": [
-        "url",
-        "endpoint",
-        "server",
-        "host",
-        "callback",
-        "webhook",
-        "http",
-        "https",
-        "ftp",
-        "socket",
-    ],
-    "file_access": [
-        "file",
-        "path",
-        "directory",
-        "folder",
-        "output",
-        "save",
-        "load",
-        "write",
-        "read",
-    ],
-    "execution": [
-        "exec",
-        "eval",
-        "execute",
-        "run",
-        "command",
-        "script",
-        "shell",
-        "subprocess",
-        "system",
-        "code",
-    ],
-    "credentials": [
-        "password",
-        "secret",
-        "credential",
-        "auth",
-        "authentication",
-        "api_key",
-    ],
-}
 
 
 class ManifestScanner(BaseScanner):
