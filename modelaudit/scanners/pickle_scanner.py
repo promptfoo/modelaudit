@@ -516,7 +516,7 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle"]
+    supported_extensions = [".pkl", ".pickle", ".bin", ".pt", ".pth", ".ckpt"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -525,9 +525,26 @@ class PickleScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Check if the file is a pickle based on extension"""
+        """Check if the file is a pickle based on extension and content"""
         file_ext = os.path.splitext(path)[1].lower()
-        return file_ext in cls.supported_extensions
+
+        # For known pickle extensions, always handle
+        if file_ext in [".pkl", ".pickle"]:
+            return True
+
+        # For ambiguous extensions, check the actual file format
+        if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
+            try:
+                # Import here to avoid circular dependency
+                from modelaudit.utils.filetype import detect_file_format
+
+                file_format = detect_file_format(path)
+                return file_format == "pickle"
+            except Exception:
+                # If detection fails, fall back to extension check
+                return file_ext in cls.supported_extensions
+
+        return False
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""

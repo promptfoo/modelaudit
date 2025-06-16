@@ -34,7 +34,7 @@ def test_detect_file_format_by_extension(tmp_path):
     extensions = {
         ".pt": "pickle",
         ".pth": "pickle",
-        ".bin": "pickle",
+        ".bin": "pytorch_binary",  # .bin files with generic content are now pytorch_binary
         ".ckpt": "pickle",
         ".pkl": "pickle",
         ".pickle": "pickle",
