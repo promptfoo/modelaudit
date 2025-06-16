@@ -30,6 +30,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Lint with Ruff
@@ -58,6 +59,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Type checking
@@ -84,6 +86,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Run tests with pytest
