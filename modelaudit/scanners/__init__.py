@@ -2,10 +2,10 @@ from . import (
     base,
     keras_h5_scanner,
     manifest_scanner,
+    onnx_scanner,
     pickle_scanner,
     pytorch_binary_scanner,
     pytorch_zip_scanner,
-    onnx_scanner,
     safetensors_scanner,
     tf_savedmodel_scanner,
     weight_distribution_scanner,
@@ -16,10 +16,10 @@ from . import (
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
+from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
-from .onnx_scanner import OnnxScanner
 from .safetensors_scanner import SafeTensorsScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
 from .weight_distribution_scanner import WeightDistributionScanner
