@@ -55,6 +55,10 @@ pip install modelaudit[pytorch]
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
+# For enhanced pickle support (dill, joblib, scikit-learn)
+pip install modelaudit[dill]
+pip install modelaudit[joblib]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -161,7 +165,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl, .joblib, .dill), NumPy (.npy, .npz), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -187,12 +191,15 @@ modelaudit scan model.pkl || exit 1
 
 ### Pickle Scanner
 
-**Detects malicious code in Python pickle files:**
+**Detects malicious code in Python pickle files with enhanced ML library support:**
 
-- Dangerous opcodes: `REDUCE`, `INST`, `OBJ`, `STACK_GLOBAL`
-- Suspicious imports: `os`, `subprocess`, `eval`, `exec`
-- Encoded payloads and obfuscated code
-- `__reduce__` method exploits
+- **Supported formats**: `.pkl`, `.pickle`, `.joblib`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`
+- **Dangerous opcodes**: `REDUCE`, `INST`, `OBJ`, `STACK_GLOBAL`
+- **Suspicious imports**: `os`, `subprocess`, `eval`, `exec`
+- **Encoded payloads** and obfuscated code
+- **`__reduce__` method exploits**
+- **ML-aware detection**: Reduces false positives for legitimate ML libraries (joblib, dill, scikit-learn)
+- **Smart context analysis**: Distinguishes between legitimate ML operations and actual threats
 
 ### TensorFlow Scanner
 
@@ -228,6 +235,16 @@ modelaudit scan model.pkl || exit 1
 - Parses header metadata and verifies tensor offsets
 - Checks dtype and shape sizes against byte ranges
 - Flags suspicious or malformed metadata entries
+
+### NumPy Scanner
+
+**Analyzes NumPy array files for security risks:**
+
+- **Supported formats**: `.npy`, `.npz` (NumPy archive files)
+- **Header validation**: Verifies proper NumPy magic headers
+- **Compression analysis**: Detects suspicious compression ratios that may indicate zip bombs
+- **Array integrity**: Validates array metadata and structure
+- **No pickle execution**: Uses `allow_pickle=False` to prevent code execution
 
 ### Manifest Scanner
 
