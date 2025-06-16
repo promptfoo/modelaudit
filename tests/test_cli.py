@@ -150,6 +150,23 @@ def test_scan_output_file(tmp_path):
     assert output_file.read_text()  # Should not be empty
 
 
+def test_scan_sbom_output(tmp_path):
+    """Test scanning with SBOM output."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    sbom_file = tmp_path / "sbom.json"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)])
+
+    assert sbom_file.exists()
+    try:
+        json.loads(sbom_file.read_text())
+    except json.JSONDecodeError:
+        pytest.fail("SBOM output is not valid JSON")
+
+
 def test_scan_verbose_mode(tmp_path):
     """Test scanning in verbose mode."""
     test_file = tmp_path / "test_file.dat"

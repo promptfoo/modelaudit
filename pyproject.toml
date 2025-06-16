@@ -28,6 +28,7 @@ classifiers = [
 python = ">=3.9,<4.0"
 click = "^8.1.3"
 yaspin = "^2.3.0"
+cyclonedx-python-lib = "^10.2.0"
 
 # Optional dependencies for specific scanners
 tensorflow = { version = ">=2.6", optional = true }

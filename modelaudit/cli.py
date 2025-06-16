@@ -48,6 +48,11 @@ def cli():
     help="Output file path (prints to stdout if not specified)",
 )
 @click.option(
+    "--sbom",
+    type=click.Path(),
+    help="Write CycloneDX SBOM to the specified file",
+)
+@click.option(
     "--timeout",
     "-t",
     type=int,
@@ -61,7 +66,9 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+def scan_command(
+    paths, blacklist, format, output, sbom, timeout, verbose, max_file_size
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -76,6 +83,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     Advanced options:
         --format, -f       Output format (text or json)
         --output, -o       Write results to a file instead of stdout
+        --sbom             Write CycloneDX SBOM to file
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
@@ -236,6 +244,14 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     else:
         # Text format
         output_text = format_text_output(aggregated_results, verbose)
+
+    # Generate SBOM if requested
+    if sbom:
+        from .sbom import generate_sbom
+
+        sbom_text = generate_sbom(paths, aggregated_results)
+        with open(sbom, "w") as f:
+            f.write(sbom_text)
 
     # Send output to the specified destination
     if output:

@@ -46,6 +46,7 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "file_metadata": {},  # Per-file metadata
     }
 
     # Configure scan options
@@ -112,6 +113,10 @@ def scan_model_directory_or_file(
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
+
+                        # Save metadata for SBOM generation
+                        file_meta = cast(dict[str, Any], results["file_metadata"])
+                        file_meta[file_path] = file_result.metadata
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
@@ -192,6 +197,10 @@ def scan_model_directory_or_file(
             issues_list = cast(list[dict[str, Any]], results["issues"])
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
+
+            # Save metadata for SBOM generation
+            file_meta = cast(dict[str, Any], results["file_metadata"])
+            file_meta[path] = file_result.metadata
 
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
