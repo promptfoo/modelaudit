@@ -1,7 +1,4 @@
 import struct
-from pathlib import Path
-
-import pytest
 
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 
@@ -16,15 +13,15 @@ def test_pytorch_binary_scanner_can_handle(tmp_path):
     binary_file.write_bytes(b"\x00\x01\x02\x03" * 100)
 
     # Should handle .bin files that are not pickle format
-    assert scanner.can_handle(str(binary_file)) == True
+    assert scanner.can_handle(str(binary_file))
 
     # Should not handle directories
-    assert scanner.can_handle(str(tmp_path)) == False
+    assert not scanner.can_handle(str(tmp_path))
 
     # Should not handle other extensions
     other_file = tmp_path / "model.txt"
     other_file.write_text("not a binary file")
-    assert scanner.can_handle(str(other_file)) == False
+    assert not scanner.can_handle(str(other_file))
 
 
 def test_pytorch_binary_scanner_basic_scan(tmp_path):
@@ -197,7 +194,7 @@ def test_pickle_scanner_handles_pickle_bin_files(tmp_path):
         pickle.dump(data, f)
 
     # Should handle pickle .bin files
-    assert scanner.can_handle(str(pickle_bin)) == True
+    assert scanner.can_handle(str(pickle_bin))
 
     # Scan should work
     result = scanner.scan(str(pickle_bin))
