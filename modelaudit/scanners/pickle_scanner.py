@@ -912,6 +912,7 @@ class PickleScanner(BaseScanner):
             result.add_issue(
                 f"Error analyzing pickle ops: {e}",
                 severity=IssueSeverity.ERROR,
+                location=self.current_file_path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 

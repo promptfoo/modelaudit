@@ -14,10 +14,13 @@ RUN pip install --no-cache-dir poetry==1.5.1
 # Copy Poetry configuration files
 COPY pyproject.toml poetry.lock* ./
 
+# Copy project code (needed for editable install)
+COPY . .
+
 # Configure Poetry
 RUN poetry config virtualenvs.create false
 
-# Install dependencies in builder stage
+# Install dependencies and package in builder stage
 RUN poetry install --only main --no-interaction --extras "all"
 
 # Production stage

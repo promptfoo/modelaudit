@@ -12,11 +12,11 @@ COPY pyproject.toml poetry.lock* ./
 # Configure Poetry
 RUN poetry config virtualenvs.create false
 
-# Install only main dependencies (no heavy ML extras)
-RUN poetry install --only main --no-interaction
-
-# Copy project code
+# Copy project code first (needed for editable install)
 COPY . .
+
+# Install the package and main dependencies (no heavy ML extras)
+RUN poetry install --only main --no-interaction
 
 # Set entrypoint
 ENTRYPOINT ["modelaudit"]
