@@ -4,6 +4,7 @@ import os
 import pytest
 from click.testing import CliRunner
 
+from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
 
 
@@ -14,6 +15,14 @@ def test_cli_help():
     assert result.exit_code == 0
     assert "Usage:" in result.output
     assert "scan" in result.output  # Should list the scan command
+
+
+def test_cli_version():
+    """Test the CLI version command."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
 
 
 def test_scan_command_help():

@@ -321,9 +321,9 @@ poetry run pytest
 
 ```bash
 # Run linting and formatting with Ruff
-poetry run ruff check modelaudit/          # Check for linting issues
-poetry run ruff check --fix modelaudit/    # Fix auto-fixable issues
-poetry run ruff format modelaudit/         # Format code
+poetry run ruff check .          # Check entire codebase (including tests)
+poetry run ruff check --fix .    # Automatically fix lint issues
+poetry run ruff format .         # Format code
 
 # Type checking
 poetry run mypy modelaudit/

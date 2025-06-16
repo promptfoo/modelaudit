@@ -162,7 +162,6 @@ class ZipScanner(BaseScanner):
                             if not chunk:
                                 break
                             data += chunk
-                            result.bytes_scanned += len(chunk)
                             if len(data) > max_entry_size:
                                 raise ValueError(
                                     f"ZIP entry {name} exceeds maximum size of "

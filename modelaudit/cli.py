@@ -8,6 +8,7 @@ import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
+from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
@@ -19,6 +20,7 @@ logger = logging.getLogger("modelaudit")
 
 
 @click.group()
+@click.version_option(__version__)
 def cli():
     """Static scanner for ML models"""
     pass
@@ -60,26 +62,29 @@ def cli():
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
 def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
-    """
-    Scan one or more model files or directories for malicious content or
-    suspicious references.
+    """Scan files or directories for malicious content.
 
-    Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
+    \b
+    Usage:
+        modelaudit scan /path/to/model1 /path/to/model2 ...
 
-    You can specify additional blacklist patterns with --blacklist or -b option:
-    modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+    You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
+        modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+
+    \b
     Advanced options:
-      --format, -f       Output format (text or json)
-      --output, -o       Write results to a file instead of stdout
-      --timeout, -t      Set scan timeout in seconds
-      --verbose, -v      Show detailed information during scanning
-      --max-file-size    Maximum file size to scan in bytes
+        --format, -f       Output format (text or json)
+        --output, -o       Write results to a file instead of stdout
+        --timeout, -t      Set scan timeout in seconds
+        --verbose, -v      Show detailed information during scanning
+        --max-file-size    Maximum file size to scan in bytes
 
+    \b
     Exit codes:
-      0 - Success, no security issues found
-      1 - Security issues found (scan completed successfully)
-      2 - Errors occurred during scanning
+        0 - Success, no security issues found
+        1 - Security issues found (scan completed successfully)
+        2 - Errors occurred during scanning
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
