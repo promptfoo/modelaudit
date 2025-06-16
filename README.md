@@ -8,6 +8,7 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 
 - [What It Does](#-what-it-does)
 - [Quick Start](#-quick-start)
+- [Authentication](#-authentication)
 - [Features](#-features)
 - [Security Scanners](#️-security-scanners)
 - [Development](#️-development)
@@ -74,7 +75,16 @@ pip install -e .[all]
 
 ### Basic Usage
 
-**Scan individual files:**
+**Using with Promptfoo (Recommended):**
+
+```bash
+# Scan models through promptfoo (automatic authentication)
+promptfoo scan-model model.pkl
+promptfoo scan-model model1.pkl model2.h5 model3.pt
+promptfoo scan-model ./models/
+```
+
+**Standalone Usage:**
 
 ```bash
 # Scan a single model
@@ -157,6 +167,51 @@ modelaudit scan model.pkl || exit 1
     fi
 ```
 
+## 🔐 Authentication
+
+ModelAudit supports authentication that seamlessly integrates with promptfoo's authentication system.
+
+### Seamless Integration with Promptfoo
+
+If you're using modelaudit through promptfoo's `scan-model` command, authentication is automatic:
+
+```bash
+# First, authenticate with promptfoo
+promptfoo auth login --api-key YOUR_API_KEY
+
+# Then modelaudit automatically uses your credentials
+promptfoo scan-model /path/to/your/model
+```
+
+### Standalone Authentication
+
+You can also authenticate modelaudit directly for standalone use:
+
+```bash
+# Login with your API key
+modelaudit auth login --api-key YOUR_API_KEY
+
+# Check current authentication status
+modelaudit auth whoami
+
+# Logout when done
+modelaudit auth logout
+```
+
+### Getting Your API Key
+
+1. Sign up or log in at [promptfoo.app](https://promptfoo.app)
+2. Get your API key from [promptfoo.app/welcome](https://promptfoo.app/welcome)
+3. Use it with either promptfoo or modelaudit authentication
+
+### Authentication Commands
+
+- `modelaudit auth login --api-key <key>` - Login with API key
+- `modelaudit auth whoami` - Show current user info
+- `modelaudit auth logout` - Clear stored credentials
+
+For detailed authentication documentation, see [AUTH.md](AUTH.md).
+
 ## ✨ Features
 
 ### Core Capabilities
@@ -174,6 +229,7 @@ modelaudit scan model.pkl || exit 1
 - **Multiple Output Formats**: Human-readable text and machine-readable JSON
 - **Severity Levels**: ERROR, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Ready**: Clear exit codes for automated pipeline integration
+- **Promptfoo Integration**: Seamless authentication and usage through `promptfoo scan-model`
 
 ### Security Detection
 

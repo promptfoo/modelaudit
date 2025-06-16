@@ -1,6 +1,6 @@
 # ModelAudit Authentication System
 
-ModelAudit now supports authentication that seamlessly integrates with promptfoo's authentication system.
+ModelAudit supports authentication that seamlessly integrates with promptfoo's authentication system, providing a unified authentication experience across both tools.
 
 ## Overview
 
@@ -165,6 +165,64 @@ export MODELAUDIT_USER_EMAIL="test@example.com"
   "app_url": "https://www.promptfoo.app"
 }
 ```
+
+## Best Practices
+
+### For Teams Using Promptfoo
+- Set up authentication once with promptfoo: `promptfoo auth login --api-key <key>`
+- Use `promptfoo scan-model` for seamless integration
+- Team members can share the same authentication workflow
+
+### For CI/CD Pipelines
+```bash
+# Set environment variables in your CI system
+export MODELAUDIT_API_KEY="${PROMPTFOO_API_KEY}"
+export MODELAUDIT_API_HOST="https://api.promptfoo.app"
+
+# Then run scans without explicit login
+modelaudit scan /path/to/models/
+```
+
+### For Standalone Development
+```bash
+# Login once per development environment
+modelaudit auth login --api-key YOUR_KEY
+
+# Verify authentication
+modelaudit auth whoami
+
+# Run scans
+modelaudit scan test_model.pkl
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**Authentication commands not showing up in CLI:**
+This may occur due to Python package caching issues. Try:
+```bash
+pip uninstall modelaudit -y
+pip install modelaudit
+```
+
+**"Command 'auth' not found":**
+Ensure you have the latest version of modelaudit installed:
+```bash
+pip install --upgrade modelaudit
+```
+
+**Environment variables not being read:**
+Make sure environment variable names are exactly:
+- `MODELAUDIT_API_KEY` (not `MODELAUDIT_API_TOKEN`)
+- `MODELAUDIT_API_HOST`
+- `MODELAUDIT_USER_EMAIL`
+- `MODELAUDIT_APP_URL`
+
+**API validation failures:**
+- Check your API key is valid at [promptfoo.app/welcome](https://promptfoo.app/welcome)
+- Verify network connectivity to `https://api.promptfoo.app`
+- Try with verbose logging for more details
 
 ## Migration
 
