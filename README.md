@@ -161,7 +161,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -220,6 +220,14 @@ modelaudit scan model.pkl || exit 1
 - Missing standard files (data.pkl warnings)
 - Suspicious additional files (Python scripts, executables)
 - Custom blacklist pattern matching
+
+### SafeTensors Scanner
+
+**Validates SafeTensors model files for integrity:**
+
+- Parses header metadata and verifies tensor offsets
+- Checks dtype and shape sizes against byte ranges
+- Flags suspicious or malformed metadata entries
 
 ### Manifest Scanner
 
