@@ -7,8 +7,8 @@ from pathlib import Path
 # Add the parent directory to sys.path to allow importing modelaudit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import (
+from modelaudit.scanners.base import IssueSeverity  # noqa: E402
+from modelaudit.scanners.pickle_scanner import (  # noqa: E402
     PickleScanner,
     _detect_ml_context,
     _is_actually_dangerous_global,
@@ -88,12 +88,15 @@ class TestPickleSmartDetection(unittest.TestCase):
             # Should complete successfully
             self.assertTrue(result.success)
 
-            # Should detect ML context (relaxed expectation since collections.OrderedDict alone may not trigger high ML confidence)
+            # Should detect ML context (relaxed expectation since
+            # collections.OrderedDict alone may not trigger high ML confidence)
             ml_context = result.metadata.get("ml_context", {})
-            # Check if it's detected as ML content OR has very few issues (indicating smart filtering worked)
+            # Check if it's detected as ML content OR has very few issues
+            # (indicating smart filtering worked)
             self.assertTrue(
                 ml_context.get("is_ml_content", False) or len(result.issues) < 5,
-                f"Expected ML detection or low issue count, got {len(result.issues)} issues",
+                f"Expected ML detection or low issue count, "
+                f"got {len(result.issues)} issues",
             )
 
         finally:
@@ -193,7 +196,8 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertLess(
                 len(result.issues),
                 50,
-                f"Expected < 50 issues, got {len(result.issues)}. Issues: {[i.message for i in result.issues]}",
+                f"Expected < 50 issues, got {len(result.issues)}. "
+                f"Issues: {[i.message for i in result.issues]}",
             )
 
             # Check ML context was detected or smart filtering worked
@@ -229,7 +233,8 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertEqual(
                 len(error_issues),
                 0,
-                f"Should not have ERROR level issues for ML content. Got: {[i.message for i in error_issues]}",
+                f"Should not have ERROR level issues for ML content. "
+                f"Got: {[i.message for i in error_issues]}",
             )
 
         finally:

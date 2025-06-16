@@ -200,7 +200,8 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if isinstance(modules, list):
             for module in modules:
                 if module in global_refs:
-                    # Score based on presence and frequency, not proportion of total opcodes
+                    # Score based on presence and frequency,
+                    # not proportion of total opcodes
                     ref_count = global_refs[module]
 
                     # Base score for presence
@@ -458,7 +459,8 @@ def check_opcode_sequence(
     opcodes: list[tuple], ml_context: dict
 ) -> list[dict[str, Any]]:
     """
-    Analyze the full sequence of opcodes for suspicious patterns with ML context awareness.
+    Analyze the full sequence of opcodes for suspicious patterns
+    with ML context awareness.
     Returns a list of suspicious patterns found.
     """
     suspicious_patterns: list[dict[str, Any]] = []
@@ -514,7 +516,7 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle"]
+    supported_extensions = [".pkl", ".pickle", ".bin", ".pt", ".pth", ".ckpt"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -523,9 +525,26 @@ class PickleScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Check if the file is a pickle based on extension"""
+        """Check if the file is a pickle based on extension and content"""
         file_ext = os.path.splitext(path)[1].lower()
-        return file_ext in cls.supported_extensions
+
+        # For known pickle extensions, always handle
+        if file_ext in [".pkl", ".pickle"]:
+            return True
+
+        # For ambiguous extensions, check the actual file format
+        if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
+            try:
+                # Import here to avoid circular dependency
+                from modelaudit.utils.filetype import detect_file_format
+
+                file_format = detect_file_format(path)
+                return file_format == "pickle"
+            except Exception:
+                # If detection fails, fall back to extension check
+                return file_ext in cls.supported_extensions
+
+        return False
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
@@ -680,7 +699,8 @@ class PickleScanner(BaseScanner):
                         },
                     )
 
-                # SMART DETECTION: Only flag other dangerous opcodes if not clearly ML content
+                # SMART DETECTION: Only flag other dangerous opcodes
+                # if not clearly ML content
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
                     "is_ml_content", False
                 ):
@@ -729,11 +749,13 @@ class PickleScanner(BaseScanner):
                             },
                         )
 
-            # Check for STACK_GLOBAL patterns (rebuild from opcodes to get proper context)
+            # Check for STACK_GLOBAL patterns
+            # (rebuild from opcodes to get proper context)
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
                     # Find the two immediately preceding STRING-like opcodes
-                    # STACK_GLOBAL expects exactly two strings on the stack: module and function
+                    # STACK_GLOBAL expects exactly two strings on the stack:
+                    # module and function
                     recent_strings: list[str] = []
                     for j in range(
                         i - 1, max(0, i - 10), -1
@@ -779,7 +801,8 @@ class PickleScanner(BaseScanner):
                         # Only warn about insufficient context if not ML content
                         if not ml_context.get("is_ml_content", False):
                             result.add_issue(
-                                "STACK_GLOBAL opcode found without sufficient string context",
+                                "STACK_GLOBAL opcode found without "
+                                "sufficient string context",
                                 severity=IssueSeverity.WARNING,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
