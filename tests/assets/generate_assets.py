@@ -74,8 +74,8 @@ def make_manifests(out_dir: Path) -> None:
         "name": "evil_model",
         "config": {"api_key": "SECRET", "url": "http://malicious.example.com"},
     }
-    (out_dir / "safe_manifest.json").write_text(json.dumps(safe))
-    (out_dir / "malicious_manifest.json").write_text(json.dumps(mal))
+    (out_dir / "safe_config.json").write_text(json.dumps(safe))
+    (out_dir / "config.json").write_text(json.dumps(mal))
 
 
 def make_zips(out_dir: Path) -> None:

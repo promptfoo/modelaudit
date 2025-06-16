@@ -28,7 +28,7 @@ class TestAssetIntegration:
             assets_dir / "malicious_keras.h5",
             assets_dir / "malicious_pytorch.pt",
             assets_dir / "malicious_tf",
-            assets_dir / "malicious_manifest.json",
+            assets_dir / "config.json",
             assets_dir / "malicious_zip.zip",
         ]
 
@@ -40,7 +40,7 @@ class TestAssetIntegration:
             assets_dir / "safe_keras.h5",
             assets_dir / "safe_pytorch.pt",
             assets_dir / "safe_tf",
-            assets_dir / "safe_manifest.json",
+            assets_dir / "safe_config.json",
             assets_dir / "safe_zip.zip",
         ]
 
@@ -324,13 +324,13 @@ class TestAssetIntegration:
             "malicious_keras.h5",
             "malicious_pytorch.pt",
             "malicious_tf",
-            "malicious_manifest.json",
+            "config.json",
             "malicious_zip.zip",
             "safe_pickle.pkl",
             "safe_keras.h5",
             "safe_pytorch.pt",
             "safe_tf",
-            "safe_manifest.json",
+            "safe_config.json",
             "safe_zip.zip",
             "README.md",
             "generate_assets.py",

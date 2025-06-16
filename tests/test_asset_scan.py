@@ -9,13 +9,13 @@ ASSETS = [
     ("malicious_keras.h5", 1),
     ("malicious_pytorch.pt", 1),
     ("malicious_tf", 1),
-    ("malicious_manifest.json", 1),
+    ("config.json", 1),
     ("malicious_zip.zip", 1),
     ("safe_pickle.pkl", 0),
     ("safe_keras.h5", 0),
     ("safe_pytorch.pt", 0),
     ("safe_tf", 0),
-    ("safe_manifest.json", 0),
+    ("safe_config.json", 0),
     ("safe_zip.zip", 0),
 ]
 

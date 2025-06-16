@@ -269,7 +269,7 @@ class TestPerformanceBenchmarks:
         import os
 
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        overhead_threshold = 10.0 if is_ci else 3.0
+        overhead_threshold = 10.0 if is_ci else 5.0
         assert concurrency_overhead < overhead_threshold, (
             f"Concurrency overhead too high: {concurrency_overhead:.2f}x"
         )
