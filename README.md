@@ -180,7 +180,7 @@ modelaudit scan model.pkl || exit 1
 - **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
 - **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
-- **Archive Security**: Directory traversal attacks, zip bombs, malicious nested files
+- **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
 ## 🛡️ Security Scanners

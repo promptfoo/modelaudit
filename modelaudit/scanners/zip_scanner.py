@@ -2,6 +2,8 @@ import os
 import zipfile
 from typing import Any, Dict, Optional
 
+from ..utils import sanitize_archive_path
+
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -114,18 +116,13 @@ class ZipScanner(BaseScanner):
             for name in z.namelist():
                 info = z.getinfo(name)
 
-                # Check for directory traversal attempts
-                normalized_path = os.path.normpath(name)
-                if (
-                    not normalized_path
-                    or normalized_path.startswith("..")
-                    or os.path.isabs(normalized_path)
-                ):
+                _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                if not is_safe:
                     result.add_issue(
-                        f"Potential directory traversal in ZIP entry: {name}",
+                        f"Archive entry {name} attempted path traversal outside the archive",
                         severity=IssueSeverity.ERROR,
                         location=f"{path}:{name}",
-                        details={"entry": name, "normalized_path": normalized_path},
+                        details={"entry": name},
                     )
                     continue
 
