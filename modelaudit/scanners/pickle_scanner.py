@@ -1010,7 +1010,7 @@ class PickleScanner(BaseScanner):
                         search_end = min(pos + 512, len(chunk))
                         if dos_stub_msg in chunk[pos:search_end]:
                             result.add_issue(
-                                f"Executable signature found in binary data: Windows executable (PE)",
+                                "Executable signature found in binary data: Windows executable (PE)",
                                 severity=IssueSeverity.CRITICAL,
                                 location=f"{self.current_file_path} (offset: {current_offset + pos})",
                                 details={
