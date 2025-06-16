@@ -29,6 +29,7 @@ ModelAudit scans ML model files for:
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **GGUF/GGML file integrity** and tensor alignment validation
 
 ## 🚀 Quick Start
 
@@ -81,7 +82,7 @@ pip install -e .[all]
 modelaudit scan model.pkl
 
 # Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf
 
 # Scan a directory
 modelaudit scan ./models/
@@ -161,7 +162,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -228,6 +229,26 @@ modelaudit scan model.pkl || exit 1
 - Parses header metadata and verifies tensor offsets
 - Checks dtype and shape sizes against byte ranges
 - Flags suspicious or malformed metadata entries
+
+### GGUF/GGML Scanner
+
+**Analyzes GGUF and GGML model files for structural integrity:**
+
+- **File format validation**: Verifies GGUF magic bytes and version compatibility
+- **Tensor consistency checks**: Validates tensor dimensions, types, and data offsets
+- **Alignment verification**: Ensures proper tensor alignment according to format specifications
+- **Size validation**: Detects oversized tensors that could indicate corruption or attacks
+- **Metadata parsing**: Analyzes model metadata for consistency and suspicious values
+- **Quantization validation**: Verifies quantized tensor formats and block alignments
+
+**Supported formats:**
+- GGUF (.gguf) - Modern unified format for quantized models
+- GGML (.ggml) - Legacy format (basic validation)
+
+**Use cases:**
+- Validating llama.cpp compatible models
+- Detecting corrupted or tampered quantized models
+- Ensuring model integrity before deployment
 
 ### Manifest Scanner
 
@@ -379,6 +400,9 @@ modelaudit/
 │   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
 │   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
 │   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
+│   │   ├── gguf_scanner.py        # GGUF/GGML format validator
+│   │   ├── safetensors_scanner.py # SafeTensors integrity scanner
+│   │   ├── weight_distribution_scanner.py # Weight anomaly detection
 │   │   └── manifest_scanner.py    # Config/manifest scanner
 │   ├── utils/             # Utility modules
 │   ├── cli.py            # Command-line interface
