@@ -56,13 +56,16 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results["bytes_scanned"] > 0
 
-    # Each file should have an issue about unknown format
+    # Check for unknown format issues (only .txt and .dat should be unknown)
     unknown_format_issues = [
         issue
         for issue in results["issues"]
         if "Unknown or unhandled format" in issue["message"]
     ]
-    assert len(unknown_format_issues) == 3
+    assert len(unknown_format_issues) == 2  # .txt and .dat files
+
+    # The .bin file should be handled by PyTorchBinaryScanner
+    assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))
 
 
 def test_max_file_size(tmp_path):
@@ -108,7 +111,8 @@ def test_timeout(tmp_path, monkeypatch):
     test_file = tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
-    # Instead of mocking time.time, let's check if the timeout parameter is passed correctly
+    # Instead of mocking time.time, let's check if the timeout parameter
+    # is passed correctly
     # The actual timeout functionality is hard to test without complex mocking
 
     # Just verify that the scan completes with a reasonable timeout

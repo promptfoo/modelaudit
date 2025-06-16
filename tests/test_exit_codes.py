@@ -87,7 +87,8 @@ def test_exit_code_mixed_issues():
             },
         ],
     }
-    # Operational errors (exit code 2) should take precedence over security issues (exit code 1)
+    # Operational errors (exit code 2) should take precedence
+    # over security issues (exit code 1)
     assert determine_exit_code(results) == 2
 
 
