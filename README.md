@@ -52,6 +52,9 @@ pip install modelaudit[h5]
 # For PyTorch model scanning
 pip install modelaudit[pytorch]
 
+# For ONNX model scanning
+pip install modelaudit[onnx]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
@@ -79,6 +82,8 @@ pip install -e .[all]
 ```bash
 # Scan a single model
 modelaudit scan model.pkl
+# Scan an ONNX model
+modelaudit scan model.onnx
 
 # Scan multiple models
 modelaudit scan model1.pkl model2.h5 model3.pt
@@ -161,7 +166,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), ONNX (.onnx), Pickle (.pkl), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -211,6 +216,13 @@ modelaudit scan model.pkl || exit 1
 - Suspicious configurations containing code execution
 - Custom objects and metrics with arbitrary code
 - Model architecture analysis
+
+### ONNX Scanner
+
+**Inspects ONNX models for custom operators and external weight references:**
+
+- Flags non-standard operator domains
+- Validates external data files are present and sized correctly
 
 ### PyTorch Scanner
 
