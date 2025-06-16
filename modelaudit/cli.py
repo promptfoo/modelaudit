@@ -241,6 +241,9 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     if output:
         with open(output, "w") as f:
             f.write(output_text)
+        with open(output, "w") as f:
+            f.write(output_text)
+        click.echo(f"Results written to {output}")
     else:
         # Add a separator line between debug output and scan results
         if format == "text":
