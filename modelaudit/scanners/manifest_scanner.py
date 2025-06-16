@@ -428,6 +428,14 @@ class ManifestScanner(BaseScanner):
             "bos_token",
             "eos_token",
             "pad_token",
+            "vocab",  # Add vocab as a strong tokenizer indicator
+            "model_max_length",  # Common in tokenizer configs
+            "clean_up_tokenization_spaces",  # HuggingFace tokenizer specific
+            "do_lower_case",  # Common tokenizer parameter
+            "tokenize_chinese_chars",  # Tokenizer-specific parameter
+            "strip_accents",  # Tokenizer-specific parameter
+            "continuing_subword_prefix",  # BPE tokenizer parameter
+            "end_of_word_suffix",  # BPE tokenizer parameter
         ]
 
         model_config_indicators = [

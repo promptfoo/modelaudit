@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -9,6 +10,78 @@ from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.filetype import detect_file_format
 
 logger = logging.getLogger("modelaudit.core")
+
+
+def is_tokenizer_file(file_path: str) -> bool:
+    """
+    Detect if a file is a tokenizer file that should be skipped from security scanning.
+
+    Tokenizers are vocabulary files and don't contain executable code, so scanning them
+    for security patterns will typically produce false positives.
+
+    Args:
+        file_path: Path to the file to check
+
+    Returns:
+        True if the file should be skipped as a tokenizer file
+    """
+    filename = os.path.basename(file_path).lower()
+
+    # Common tokenizer file names - these are definitely tokenizer files
+    tokenizer_filenames = {
+        "tokenizer.json",
+        "tokenizer.model",
+        "vocab.json",
+        "vocab.txt",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "added_tokens.json",
+    }
+
+    if filename in tokenizer_filenames:
+        return True
+
+    # Check for tokenizer patterns in filename
+    tokenizer_patterns = ["tokenizer", "vocab", "vocabulary"]
+    has_tokenizer_pattern = any(pattern in filename for pattern in tokenizer_patterns)
+
+    if has_tokenizer_pattern:
+        # For non-JSON files with tokenizer patterns, assume they're tokenizers
+        if not filename.endswith(".json"):
+            return True
+
+        # For JSON files with tokenizer patterns in the name, assume they're tokenizers
+        # unless we can verify they're definitely not tokenizers
+        try:
+            # Quick check of file content for tokenizer-specific keys
+            with open(file_path, "r", encoding="utf-8") as f:
+                # Only read a small portion to check structure
+                content = f.read(2048)  # First 2KB should be enough
+
+                # If we find tokenizer-specific keys, definitely a tokenizer
+                if any(
+                    key in content
+                    for key in [
+                        '"vocab":',
+                        '"model":',
+                        '"added_tokens":',
+                        '"tokenizer_class":',
+                        '"model_max_length":',
+                    ]
+                ):
+                    return True
+
+                # If we can successfully read the file but don't find tokenizer keys,
+                # still assume it's a tokenizer if filename suggests it
+                # (better to err on the side of skipping potential tokenizers)
+                return True
+
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # If we can't read the file, but filename suggests tokenizer, skip it
+            return True
+
+    return False
 
 
 def scan_model_directory_or_file(
@@ -92,6 +165,14 @@ def scan_model_directory_or_file(
 
                     # Scan the file
                     try:
+                        if is_tokenizer_file(file_path):
+                            logger.info(f"Skipping tokenizer file: {file_path}")
+                            if progress_callback:
+                                progress_callback(
+                                    f"Skipping tokenizer file: {file}",
+                                    processed_files / total_files * 100,
+                                )
+                            continue  # Skip tokenizer files
                         file_result = scan_file(file_path, config)
                         # Use cast to help mypy understand the types
                         results["bytes_scanned"] = (
@@ -128,6 +209,14 @@ def scan_model_directory_or_file(
             # Scan a single file
             if progress_callback:
                 progress_callback(f"Scanning file: {path}", 0.0)
+
+            # Check if this is a tokenizer file that should be skipped
+            if is_tokenizer_file(path):
+                if progress_callback:
+                    progress_callback(f"Skipping tokenizer file: {path}", 100.0)
+                results["files_scanned"] = 1
+                # Return early with no issues for tokenizer files
+                return results
 
             # Get file size for progress reporting
             file_size = os.path.getsize(path)
