@@ -3,7 +3,6 @@ import zipfile
 from typing import Any, Dict, Optional
 
 from ..utils import sanitize_archive_path
-
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 

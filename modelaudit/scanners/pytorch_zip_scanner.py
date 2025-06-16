@@ -4,7 +4,6 @@ import zipfile
 from typing import Any, Optional
 
 from ..utils import sanitize_archive_path
-
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
