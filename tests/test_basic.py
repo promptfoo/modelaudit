@@ -108,7 +108,8 @@ def test_timeout(tmp_path, monkeypatch):
     test_file = tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
-    # Instead of mocking time.time, let's check if the timeout parameter is passed correctly
+    # Instead of mocking time.time, let's check if the timeout parameter
+    # is passed correctly
     # The actual timeout functionality is hard to test without complex mocking
 
     # Just verify that the scan completes with a reasonable timeout

@@ -265,7 +265,8 @@ def test_exit_code_clean_scan(tmp_path):
     assert result.exit_code == 0, (
         f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     )
-    # The output might not say "No issues found" if there are debug messages, so let's be less strict
+    # The output might not say "No issues found" if there are debug messages,
+    # so let's be less strict
     assert (
         "scan completed successfully" in result.output.lower()
         or "no issues found" in result.output.lower()

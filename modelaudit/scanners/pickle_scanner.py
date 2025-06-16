@@ -200,7 +200,8 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if isinstance(modules, list):
             for module in modules:
                 if module in global_refs:
-                    # Score based on presence and frequency, not proportion of total opcodes
+                    # Score based on presence and frequency,
+                    # not proportion of total opcodes
                     ref_count = global_refs[module]
 
                     # Base score for presence
@@ -458,7 +459,8 @@ def check_opcode_sequence(
     opcodes: list[tuple], ml_context: dict
 ) -> list[dict[str, Any]]:
     """
-    Analyze the full sequence of opcodes for suspicious patterns with ML context awareness.
+    Analyze the full sequence of opcodes for suspicious patterns
+    with ML context awareness.
     Returns a list of suspicious patterns found.
     """
     suspicious_patterns: list[dict[str, Any]] = []
@@ -680,7 +682,8 @@ class PickleScanner(BaseScanner):
                         },
                     )
 
-                # SMART DETECTION: Only flag other dangerous opcodes if not clearly ML content
+                # SMART DETECTION: Only flag other dangerous opcodes
+                # if not clearly ML content
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
                     "is_ml_content", False
                 ):
@@ -729,11 +732,13 @@ class PickleScanner(BaseScanner):
                             },
                         )
 
-            # Check for STACK_GLOBAL patterns (rebuild from opcodes to get proper context)
+            # Check for STACK_GLOBAL patterns
+            # (rebuild from opcodes to get proper context)
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
                     # Find the two immediately preceding STRING-like opcodes
-                    # STACK_GLOBAL expects exactly two strings on the stack: module and function
+                    # STACK_GLOBAL expects exactly two strings on the stack:
+                    # module and function
                     recent_strings: list[str] = []
                     for j in range(
                         i - 1, max(0, i - 10), -1
@@ -779,7 +784,8 @@ class PickleScanner(BaseScanner):
                         # Only warn about insufficient context if not ML content
                         if not ml_context.get("is_ml_content", False):
                             result.add_issue(
-                                "STACK_GLOBAL opcode found without sufficient string context",
+                                "STACK_GLOBAL opcode found without "
+                                "sufficient string context",
                                 severity=IssueSeverity.WARNING,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={

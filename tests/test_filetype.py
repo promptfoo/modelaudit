@@ -1,10 +1,6 @@
 import zipfile
 
-from modelaudit.utils.filetype import (
-    detect_file_format,
-    find_sharded_files,
-    is_zipfile,
-)
+from modelaudit.utils.filetype import detect_file_format, find_sharded_files, is_zipfile
 
 
 def test_detect_file_format_directory(tmp_path):
