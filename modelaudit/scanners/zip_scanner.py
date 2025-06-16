@@ -167,6 +167,7 @@ class ZipScanner(BaseScanner):
                                     f"ZIP entry {name} exceeds maximum size of "
                                     f"{max_entry_size} bytes"
                                 )
+
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
                         # Write to temporary file and scan recursively
@@ -231,6 +232,10 @@ class ZipScanner(BaseScanner):
                                     issue.details = {"zip_entry": name}
 
                             result.merge(file_result)
+
+                            # If no scanner handled the file, count the bytes ourselves
+                            if file_result.scanner_name == "unknown":
+                                result.bytes_scanned += len(data)
                         finally:
                             os.unlink(tmp_path)
 

@@ -130,7 +130,7 @@ Issues found: 2 errors, 1 warnings
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
 
 ────────────────────────────────────────────────────────────────────────────────
-✗ Scan completed with errors
+✗ Scan completed with findings
 ```
 
 ### Exit Codes
@@ -161,7 +161,7 @@ modelaudit scan model.pkl || exit 1
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -221,6 +221,14 @@ modelaudit scan model.pkl || exit 1
 - Suspicious additional files (Python scripts, executables)
 - Custom blacklist pattern matching
 
+### SafeTensors Scanner
+
+**Validates SafeTensors model files for integrity:**
+
+- Parses header metadata and verifies tensor offsets
+- Checks dtype and shape sizes against byte ranges
+- Flags suspicious or malformed metadata entries
+
 ### Manifest Scanner
 
 **Analyzes configuration and manifest files:**
@@ -239,6 +247,18 @@ modelaudit scan model.pkl || exit 1
 - **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
 - **Content analysis**: Each file in the archive is scanned with its appropriate scanner
 - **Resource limits**: Configurable max depth, max entries, and max file size protections
+
+### Weight Distribution Scanner
+
+**Detects anomalous weight patterns that may indicate trojaned models:**
+
+- **Outlier detection**: Uses Z-score analysis to find neurons with abnormal weight magnitudes
+- **Dissimilarity analysis**: Identifies weight vectors that are significantly different from others using cosine similarity
+- **Extreme value detection**: Flags neurons with unusually large weight values
+- **Multi-format support**: Works with PyTorch, Keras/TensorFlow H5, ONNX, and SafeTensors models
+- **Focus on classification models**: Designed for models with <10k output classes
+
+**Note**: This scanner is disabled by default for LLMs (models with >10k vocabulary size) as the detection methods are not effective for large language models. To enable experimental LLM scanning, use `--config '{"enable_llm_checks": true}'`.
 
 ## 🛠️ Development
 
