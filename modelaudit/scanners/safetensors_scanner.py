@@ -66,7 +66,7 @@ class SafeTensorsScanner(BaseScanner):
                 if len(header_len_bytes) != 8:
                     result.add_issue(
                         "File too small to contain SafeTensors header length",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
@@ -76,7 +76,7 @@ class SafeTensorsScanner(BaseScanner):
                 if header_len <= 0 or header_len > file_size - 8:
                     result.add_issue(
                         "Invalid SafeTensors header length",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"header_len": header_len},
                     )
@@ -87,7 +87,7 @@ class SafeTensorsScanner(BaseScanner):
                 if len(header_bytes) != header_len:
                     result.add_issue(
                         "Failed to read SafeTensors header",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
@@ -96,7 +96,7 @@ class SafeTensorsScanner(BaseScanner):
                 if not header_bytes.strip().startswith(b"{"):
                     result.add_issue(
                         "SafeTensors header does not start with '{'",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
@@ -107,7 +107,7 @@ class SafeTensorsScanner(BaseScanner):
                 except json.JSONDecodeError as e:
                     result.add_issue(
                         f"Invalid JSON header: {str(e)}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
@@ -128,7 +128,7 @@ class SafeTensorsScanner(BaseScanner):
                     if not isinstance(info, dict):
                         result.add_issue(
                             f"Invalid tensor entry for {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                         )
                         continue
@@ -140,7 +140,7 @@ class SafeTensorsScanner(BaseScanner):
                     if not isinstance(begin, int) or not isinstance(end, int):
                         result.add_issue(
                             f"Invalid data_offsets for {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                         )
                         continue
@@ -148,7 +148,7 @@ class SafeTensorsScanner(BaseScanner):
                     if begin < 0 or end <= begin or end > data_size:
                         result.add_issue(
                             f"Tensor {name} offsets out of bounds",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={"begin": begin, "end": end},
                         )
@@ -161,7 +161,7 @@ class SafeTensorsScanner(BaseScanner):
                     if expected_size is not None and expected_size != end - begin:
                         result.add_issue(
                             f"Size mismatch for tensor {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={
                                 "expected_size": expected_size,
@@ -176,7 +176,7 @@ class SafeTensorsScanner(BaseScanner):
                     if begin != last_end:
                         result.add_issue(
                             "Tensor data offsets have gaps or overlap",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                         )
                         break
@@ -186,7 +186,7 @@ class SafeTensorsScanner(BaseScanner):
                 if last_end != data_size:
                     result.add_issue(
                         "Tensor data does not cover entire file",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
 
@@ -215,7 +215,7 @@ class SafeTensorsScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning SafeTensors file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

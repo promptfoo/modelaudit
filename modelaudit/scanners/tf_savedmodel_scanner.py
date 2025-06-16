@@ -86,7 +86,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result = self._create_result()
             result.add_issue(
                 "TensorFlow not installed, cannot scan SavedModel.",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -101,7 +101,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result = self._create_result()
         result.add_issue(
             f"Path is neither a file nor a directory: {path}",
-            severity=IssueSeverity.ERROR,
+            severity=IssueSeverity.CRITICAL,
             location=path,
             details={"path": path},
         )
@@ -127,7 +127,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning TF SavedModel file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -146,7 +146,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if not saved_model_path.exists():
             result.add_issue(
                 "No saved_model.pb found in directory.",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=dir_path,
             )
             result.finish(success=False)
@@ -232,7 +232,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     suspicious_op_found = True
                     result.add_issue(
                         f"Suspicious TensorFlow operation: {node.op}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=f"{self.current_file_path} (node: {node.name})",
                         details={
                             "op_type": node.op,

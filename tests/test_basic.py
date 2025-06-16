@@ -164,7 +164,7 @@ def test_scan_result_class():
     result.add_issue("Debug message", severity=IssueSeverity.DEBUG)
     result.add_issue("Info message", severity=IssueSeverity.INFO)
     result.add_issue("Warning message", severity=IssueSeverity.WARNING)
-    result.add_issue("Error message", severity=IssueSeverity.ERROR)
+    result.add_issue("Error message", severity=IssueSeverity.CRITICAL)
 
     # Test issue count
     assert len(result.issues) == 4
@@ -191,7 +191,7 @@ def test_scan_result_class():
         assert result.has_errors is True
     else:
         # Manual check for errors
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_merge_scan_results():
