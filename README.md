@@ -55,6 +55,9 @@ pip install modelaudit[pytorch]
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
+# For Joblib model scanning
+pip install modelaudit[joblib]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -80,8 +83,8 @@ pip install -e .[all]
 # Scan a single model
 modelaudit scan model.pkl
 
-# Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt
+# Scan multiple models of different formats
+modelaudit scan model1.pkl model2.h5 model3.pt model4.joblib model5.npy
 
 # Scan a directory
 modelaudit scan ./models/
@@ -221,6 +224,24 @@ modelaudit scan model.pkl || exit 1
 - Suspicious additional files (Python scripts, executables)
 - Custom blacklist pattern matching
 
+### Joblib Scanner
+
+**Analyzes Joblib serialized files for security risks:**
+
+- Detects malicious pickle content within joblib files
+- Validates joblib file structure and integrity
+- Identifies dangerous serialized objects and functions
+- Checks for suspicious imports and code execution patterns
+
+### NumPy Scanner
+
+**Examines NumPy binary files for integrity issues:**
+
+- Validates NumPy file format and magic signatures
+- Checks array header information for consistency
+- Detects file size mismatches and corruption
+- Identifies unusually large declared array dimensions
+
 ### SafeTensors Scanner
 
 **Validates SafeTensors model files for integrity:**
@@ -303,8 +324,14 @@ poetry run python -c "from modelaudit.core import scan_file; print(scan_file('te
 # Create a simple test pickle file
 python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
 
-# Test scanning it
-modelaudit scan test_model.pkl
+# Create a test joblib file
+python -c "import joblib; joblib.dump({'test': 'data'}, 'test_model.joblib')"
+
+# Create a test numpy file
+python -c "import numpy as np; np.save('test_model.npy', np.array([1, 2, 3]))"
+
+# Test scanning them
+modelaudit scan test_model.pkl test_model.joblib test_model.npy
 ```
 
 ### Running Tests
@@ -375,10 +402,13 @@ git push origin feature/your-feature-name
 modelaudit/
 ├── modelaudit/
 │   ├── scanners/          # Model format scanners
-│   │   ├── pickle_scanner.py      # Pickle/joblib security scanner
+│   │   ├── pickle_scanner.py      # Pickle security scanner
+│   │   ├── joblib_scanner.py      # Joblib security scanner
+│   │   ├── numpy_scanner.py       # NumPy binary file scanner
 │   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
 │   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
 │   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
+│   │   ├── safetensors_scanner.py # SafeTensors model scanner
 │   │   └── manifest_scanner.py    # Config/manifest scanner
 │   ├── utils/             # Utility modules
 │   ├── cli.py            # Command-line interface
