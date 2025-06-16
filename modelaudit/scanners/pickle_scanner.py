@@ -574,24 +574,40 @@ class PickleScanner(BaseScanner):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
-                        # Scan the binary content after pickle
-                        binary_result = self._scan_binary_content(
-                            f, pickle_end_pos, file_size
-                        )
+                        # Check if this is likely a PyTorch model based on ML context
+                        ml_context = scan_result.metadata.get("ml_context", {})
+                        is_pytorch = "pytorch" in ml_context.get("frameworks", {})
+                        ml_confidence = ml_context.get("overall_confidence", 0)
 
-                        # Add binary scanning results
-                        for issue in binary_result.issues:
-                            result.add_issue(
-                                message=issue.message,
-                                severity=issue.severity,
-                                location=issue.location,
-                                details=issue.details,
+                        # Skip binary scanning for high-confidence ML model files
+                        # as they contain tensor data that can trigger false positives
+                        if is_pytorch and ml_confidence > 0.7:
+                            result.metadata["binary_scan_skipped"] = True
+                            result.metadata["skip_reason"] = (
+                                "High-confidence PyTorch model detected"
+                            )
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
+                        else:
+                            # Scan the binary content after pickle
+                            binary_result = self._scan_binary_content(
+                                f, pickle_end_pos, file_size
                             )
 
-                        # Update total bytes scanned
-                        result.bytes_scanned = file_size
-                        result.metadata["pickle_bytes"] = pickle_end_pos
-                        result.metadata["binary_bytes"] = remaining_bytes
+                            # Add binary scanning results
+                            for issue in binary_result.issues:
+                                result.add_issue(
+                                    message=issue.message,
+                                    severity=issue.severity,
+                                    location=issue.location,
+                                    details=issue.details,
+                                )
+
+                            # Update total bytes scanned
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
             result.add_issue(
@@ -923,14 +939,16 @@ class PickleScanner(BaseScanner):
                 b"socket.socket",
             ]
 
-            # Executable signatures
+            # Executable signatures with additional validation
+            # For PE files, we need to check for the full DOS header structure
+            # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"MZ": "Windows executable (PE)",
                 b"\x7fELF": "Linux executable (ELF)",
                 b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
                 b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
                 b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/": "Shell script shebang",
+                b"#!/bin/": "Shell script shebang",
+                b"#!/usr/bin/": "Shell script shebang",
             }
 
             # Read in chunks
@@ -975,6 +993,31 @@ class PickleScanner(BaseScanner):
                                 "section": "binary_data",
                             },
                         )
+
+                # Special check for Windows PE files with more validation
+                # to reduce false positives from random "MZ" bytes
+                pe_sig = b"MZ"
+                if pe_sig in chunk:
+                    pos = chunk.find(pe_sig)
+                    # For PE files, check if we have enough data to validate DOS header
+                    if pos + 64 <= len(chunk):  # DOS header is 64 bytes
+                        # Check for "This program cannot be run in DOS mode" string
+                        # which appears in all PE files
+                        dos_stub_msg = b"This program cannot be run in DOS mode"
+                        # Look for this message within reasonable distance from MZ
+                        search_end = min(pos + 512, len(chunk))
+                        if dos_stub_msg in chunk[pos:search_end]:
+                            result.add_issue(
+                                "Executable signature found in binary data: Windows executable (PE)",
+                                severity=IssueSeverity.ERROR,
+                                location=f"{self.current_file_path} (offset: {current_offset + pos})",
+                                details={
+                                    "signature": pe_sig.hex(),
+                                    "description": "Windows executable (PE) with valid DOS stub",
+                                    "offset": current_offset + pos,
+                                    "section": "binary_data",
+                                },
+                            )
 
                 # Check for timeout
                 if time.time() - result.start_time > self.timeout:
