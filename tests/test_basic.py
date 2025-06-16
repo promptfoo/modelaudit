@@ -56,13 +56,16 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results["bytes_scanned"] > 0
 
-    # Each file should have an issue about unknown format
+    # Check for unknown format issues (only .txt and .dat should be unknown)
     unknown_format_issues = [
         issue
         for issue in results["issues"]
         if "Unknown or unhandled format" in issue["message"]
     ]
-    assert len(unknown_format_issues) == 3
+    assert len(unknown_format_issues) == 2  # .txt and .dat files
+
+    # The .bin file should be handled by PyTorchBinaryScanner
+    assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))
 
 
 def test_max_file_size(tmp_path):

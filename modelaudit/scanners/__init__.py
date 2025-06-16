@@ -3,6 +3,7 @@ from . import (
     keras_h5_scanner,
     manifest_scanner,
     pickle_scanner,
+    pytorch_binary_scanner,
     pytorch_zip_scanner,
     tf_savedmodel_scanner,
     zip_scanner,
@@ -13,6 +14,7 @@ from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
 from .pickle_scanner import PickleScanner
+from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
 from .zip_scanner import ZipScanner
@@ -21,6 +23,7 @@ from .zip_scanner import ZipScanner
 # Order matters - more specific scanners should come before generic ones
 SCANNER_REGISTRY = [
     PickleScanner,
+    PyTorchBinaryScanner,  # Must come before generic scanners for .bin files
     TensorFlowSavedModelScanner,
     KerasH5Scanner,
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
@@ -33,6 +36,7 @@ __all__ = [
     "base",
     "keras_h5_scanner",
     "pickle_scanner",
+    "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
     "manifest_scanner",
@@ -42,6 +46,7 @@ __all__ = [
     "IssueSeverity",
     "Issue",
     "PickleScanner",
+    "PyTorchBinaryScanner",
     "TensorFlowSavedModelScanner",
     "KerasH5Scanner",
     "PyTorchZipScanner",
