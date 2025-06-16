@@ -202,7 +202,8 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if isinstance(modules, list):
             for module in modules:
                 if module in global_refs:
-                    # Score based on presence and frequency, not proportion of total opcodes
+                    # Score based on presence and frequency,
+                    # not proportion of total opcodes
                     ref_count = global_refs[module]
 
                     # Base score for presence
@@ -460,7 +461,8 @@ def check_opcode_sequence(
     opcodes: list[tuple], ml_context: dict
 ) -> list[dict[str, Any]]:
     """
-    Analyze the full sequence of opcodes for suspicious patterns with ML context awareness.
+    Analyze the full sequence of opcodes for suspicious patterns
+    with ML context awareness.
     Returns a list of suspicious patterns found.
     """
     suspicious_patterns: list[dict[str, Any]] = []
@@ -516,7 +518,7 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle", ".joblib", ".dill"]
+    supported_extensions = [".pkl", ".pickle", ".joblib", ".dill", ".bin", ".pt", ".pth", ".ckpt"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -525,9 +527,26 @@ class PickleScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Check if the file is a pickle based on extension"""
+        """Check if the file is a pickle based on extension and content"""
         file_ext = os.path.splitext(path)[1].lower()
-        return file_ext in cls.supported_extensions
+
+        # For known pickle extensions, always handle
+        if file_ext in [".pkl", ".pickle"]:
+            return True
+
+        # For ambiguous extensions, check the actual file format
+        if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
+            try:
+                # Import here to avoid circular dependency
+                from modelaudit.utils.filetype import detect_file_format
+
+                file_format = detect_file_format(path)
+                return file_format == "pickle"
+            except Exception:
+                # If detection fails, fall back to extension check
+                return file_ext in cls.supported_extensions
+
+        return False
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
@@ -540,12 +559,42 @@ class PickleScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        # Check if this is a .bin file that might be a PyTorch file
+        is_bin_file = os.path.splitext(path)[1].lower() == ".bin"
+
         try:
             with open(path, "rb") as f:
                 # Store the file path for use in issue locations
                 self.current_file_path = path
                 scan_result = self._scan_pickle_bytes(f, file_size)
                 result.merge(scan_result)
+
+                # For .bin files, also scan the remaining binary content
+                # PyTorch files have pickle header followed by tensor data
+                if is_bin_file and scan_result.success:
+                    pickle_end_pos = f.tell()
+                    remaining_bytes = file_size - pickle_end_pos
+
+                    if remaining_bytes > 0:
+                        # Scan the binary content after pickle
+                        binary_result = self._scan_binary_content(
+                            f, pickle_end_pos, file_size
+                        )
+
+                        # Add binary scanning results
+                        for issue in binary_result.issues:
+                            result.add_issue(
+                                message=issue.message,
+                                severity=issue.severity,
+                                location=issue.location,
+                                details=issue.details,
+                            )
+
+                        # Update total bytes scanned
+                        result.bytes_scanned = file_size
+                        result.metadata["pickle_bytes"] = pickle_end_pos
+                        result.metadata["binary_bytes"] = remaining_bytes
+
         except Exception as e:
             result.add_issue(
                 f"Error opening pickle file: {str(e)}",
@@ -682,7 +731,8 @@ class PickleScanner(BaseScanner):
                         },
                     )
 
-                # SMART DETECTION: Only flag other dangerous opcodes if not clearly ML content
+                # SMART DETECTION: Only flag other dangerous opcodes
+                # if not clearly ML content
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
                     "is_ml_content", False
                 ):
@@ -731,11 +781,13 @@ class PickleScanner(BaseScanner):
                             },
                         )
 
-            # Check for STACK_GLOBAL patterns (rebuild from opcodes to get proper context)
+            # Check for STACK_GLOBAL patterns
+            # (rebuild from opcodes to get proper context)
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
                     # Find the two immediately preceding STRING-like opcodes
-                    # STACK_GLOBAL expects exactly two strings on the stack: module and function
+                    # STACK_GLOBAL expects exactly two strings on the stack:
+                    # module and function
                     recent_strings: list[str] = []
                     for j in range(
                         i - 1, max(0, i - 10), -1
@@ -781,7 +833,8 @@ class PickleScanner(BaseScanner):
                         # Only warn about insufficient context if not ML content
                         if not ml_context.get("is_ml_content", False):
                             result.add_issue(
-                                "STACK_GLOBAL opcode found without sufficient string context",
+                                "STACK_GLOBAL opcode found without "
+                                "sufficient string context",
                                 severity=IssueSeverity.WARNING,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
@@ -861,5 +914,105 @@ class PickleScanner(BaseScanner):
                         "exception_type": type(e).__name__,
                     },
                 )
+
+        return result
+
+    def _scan_binary_content(
+        self, file_obj: BinaryIO, start_pos: int, file_size: int
+    ) -> ScanResult:
+        """Scan the binary content after pickle data for suspicious patterns"""
+        result = self._create_result()
+
+        try:
+            # Common patterns that might indicate embedded Python code
+            code_patterns = [
+                b"import os",
+                b"import sys",
+                b"import subprocess",
+                b"eval(",
+                b"exec(",
+                b"__import__",
+                b"compile(",
+                b"os.system",
+                b"subprocess.call",
+                b"subprocess.Popen",
+                b"socket.socket",
+            ]
+
+            # Executable signatures
+            executable_sigs = {
+                b"MZ": "Windows executable (PE)",
+                b"\x7fELF": "Linux executable (ELF)",
+                b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
+                b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
+                b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
+                b"#!/": "Shell script shebang",
+            }
+
+            # Read in chunks
+            chunk_size = 1024 * 1024  # 1MB chunks
+            bytes_scanned = 0
+
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+
+                current_offset = start_pos + bytes_scanned
+                bytes_scanned += len(chunk)
+
+                # Check for code patterns
+                for pattern in code_patterns:
+                    if pattern in chunk:
+                        pos = chunk.find(pattern)
+                        result.add_issue(
+                            f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore')}",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (offset: {current_offset + pos})",
+                            details={
+                                "pattern": pattern.decode("ascii", errors="ignore"),
+                                "offset": current_offset + pos,
+                                "section": "binary_data",
+                            },
+                        )
+
+                # Check for executable signatures
+                for sig, description in executable_sigs.items():
+                    if sig in chunk:
+                        pos = chunk.find(sig)
+                        result.add_issue(
+                            f"Executable signature found in binary data: {description}",
+                            severity=IssueSeverity.ERROR,
+                            location=f"{self.current_file_path} (offset: {current_offset + pos})",
+                            details={
+                                "signature": sig.hex(),
+                                "description": description,
+                                "offset": current_offset + pos,
+                                "section": "binary_data",
+                            },
+                        )
+
+                # Check for timeout
+                if time.time() - result.start_time > self.timeout:
+                    result.add_issue(
+                        f"Binary scanning timed out after {self.timeout} seconds",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            "bytes_scanned": start_pos + bytes_scanned,
+                            "timeout": self.timeout,
+                        },
+                    )
+                    break
+
+            result.bytes_scanned = bytes_scanned
+
+        except Exception as e:
+            result.add_issue(
+                f"Error scanning binary content: {str(e)}",
+                severity=IssueSeverity.ERROR,
+                location=self.current_file_path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
 
         return result
