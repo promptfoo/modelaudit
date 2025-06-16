@@ -274,12 +274,22 @@ def format_text_output(results, verbose=False):
                 ),
             )
     if "duration" in results:
-        output_lines.append(
-            click.style(
-                f"Scan completed in {results['duration']:.2f} seconds",
-                fg="cyan",
-            ),
-        )
+        duration = results["duration"]
+        if duration < 0.01:
+            # For very fast scans, show more precision
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.3f} seconds",
+                    fg="cyan",
+                ),
+            )
+        else:
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.2f} seconds",
+                    fg="cyan",
+                ),
+            )
     if "files_scanned" in results:
         output_lines.append(
             click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
