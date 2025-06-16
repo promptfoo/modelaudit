@@ -2,6 +2,7 @@ from . import (
     base,
     keras_h5_scanner,
     manifest_scanner,
+    oci_layer_scanner,
     pickle_scanner,
     pytorch_zip_scanner,
     tf_savedmodel_scanner,
@@ -12,6 +13,7 @@ from . import (
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
+from .oci_layer_scanner import OciLayerScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
@@ -24,6 +26,7 @@ SCANNER_REGISTRY = [
     TensorFlowSavedModelScanner,
     KerasH5Scanner,
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
+    OciLayerScanner,
     ManifestScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
@@ -35,6 +38,7 @@ __all__ = [
     "pickle_scanner",
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
+    "oci_layer_scanner",
     "manifest_scanner",
     "zip_scanner",
     "BaseScanner",
@@ -45,6 +49,7 @@ __all__ = [
     "TensorFlowSavedModelScanner",
     "KerasH5Scanner",
     "PyTorchZipScanner",
+    "OciLayerScanner",
     "ManifestScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
