@@ -138,6 +138,8 @@ ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     "sklearn": ["*"],
     "transformers": ["*"],
     "tokenizers": ["*"],
+    "joblib": ["*"],
+    "dill": ["*"],
     "tensorflow": ["*"],
     "keras": ["*"],
 }
@@ -514,7 +516,7 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle"]
+    supported_extensions = [".pkl", ".pickle", ".joblib", ".dill"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -840,10 +842,24 @@ class PickleScanner(BaseScanner):
             )
 
         except Exception as e:
-            result.add_issue(
-                f"Error analyzing pickle ops: {e}",
-                severity=IssueSeverity.ERROR,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+            # Joblib files may contain non-pickle data after the STOP opcode
+            # which can cause pickletools to raise "unknown opcode" errors.
+            if (
+                isinstance(e, ValueError)
+                and "unknown" in str(e)
+                and os.path.splitext(self.current_file_path)[1].lower()
+                in {".joblib", ".dill"}
+            ):
+                # Treat as non-fatal and return what we analyzed so far
+                result.metadata.update({"truncated": True})
+            else:
+                result.add_issue(
+                    f"Error analyzing pickle ops: {e}",
+                    severity=IssueSeverity.ERROR,
+                    details={
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                    },
+                )
 
         return result
