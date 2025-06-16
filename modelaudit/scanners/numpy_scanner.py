@@ -41,7 +41,9 @@ class NumPyScanner(BaseScanner):
                 elif (major, minor) == (2, 0):
                     shape, fortran, dtype = fmt.read_array_header_2_0(f)
                 else:
-                    shape, fortran, dtype = fmt._read_array_header(f, version=(major, minor))
+                    shape, fortran, dtype = fmt._read_array_header(  # type: ignore[attr-defined]
+                        f, version=(major, minor)
+                    )
                 data_offset = f.tell()
 
                 expected_size = dtype.itemsize

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import io
+import lzma
 import os
 import zlib
-import lzma
-from typing import Optional, Any
+from typing import Any, Optional
 
+from ..utils.filetype import read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
-from ..utils.filetype import read_magic_bytes
 
 
 class JoblibScanner(BaseScanner):
@@ -60,7 +60,9 @@ class JoblibScanner(BaseScanner):
 
             if magic.startswith(b"\x80"):
                 file_like = io.BytesIO(data)
-                sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
+                sub_result = self.pickle_scanner._scan_pickle_bytes(
+                    file_like, len(data)
+                )
                 result.merge(sub_result)
                 result.bytes_scanned = len(data)
             else:

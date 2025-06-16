@@ -1,8 +1,7 @@
 import numpy as np
-import pytest
 
-from modelaudit.scanners.numpy_scanner import NumPyScanner
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.numpy_scanner import NumPyScanner
 
 
 def test_numpy_scanner_valid(tmp_path):
