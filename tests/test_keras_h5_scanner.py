@@ -1,9 +1,13 @@
 import json
 
-import h5py
+import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
+
+# Skip all tests if h5py is not available
+pytest.importorskip("h5py")
+import h5py  # noqa: E402
 
 
 def test_keras_h5_scanner_can_handle(tmp_path):
@@ -138,7 +142,8 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
                     {
                         "class_name": "Lambda",
                         "config": {
-                            "function": "suspicious_function(x)",  # This matches our blacklist
+                            # This matches our blacklist
+                            "function": "suspicious_function(x)",
                         },
                     },
                 ],

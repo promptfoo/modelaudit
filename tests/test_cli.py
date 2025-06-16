@@ -4,6 +4,7 @@ import os
 import pytest
 from click.testing import CliRunner
 
+from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
 
 
@@ -14,6 +15,14 @@ def test_cli_help():
     assert result.exit_code == 0
     assert "Usage:" in result.output
     assert "scan" in result.output  # Should list the scan command
+
+
+def test_cli_version():
+    """Test the CLI version command."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
 
 
 def test_scan_command_help():
@@ -235,6 +244,90 @@ def test_format_text_output_only_debug_issues():
     assert "Scan completed successfully" in output
 
 
+def test_format_text_output_fast_scan_duration():
+    """Test duration formatting for very fast scans (< 0.01 seconds)."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 512,
+        "duration": 0.005,  # Very fast scan < 0.01 seconds
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 3 decimal places for very fast scans
+    assert "Scan completed in 0.005 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_normal_scan_duration():
+    """Test duration formatting for normal scans (>= 0.01 seconds)."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 2,
+        "bytes_scanned": 2048,
+        "duration": 0.25,  # Normal scan >= 0.01 seconds
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 2 decimal places for normal scans
+    assert "Scan completed in 0.25 seconds" in output
+    assert "Files scanned: 2" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_edge_case_duration():
+    """Test duration formatting for edge case exactly at 0.01 seconds."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 1024,
+        "duration": 0.01,  # Edge case exactly at threshold
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 2 decimal places (>= 0.01 branch)
+    assert "Scan completed in 0.01 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_very_fast_scan_with_issues():
+    """Test duration formatting for very fast scan with issues."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 256,
+        "duration": 0.003,  # Very fast scan with issues
+        "issues": [
+            {
+                "message": "Suspicious pattern detected",
+                "severity": "warning",
+                "location": "malicious.pkl",
+                "details": {"pattern": "eval"},
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 3 decimal places for very fast scans
+    assert "Scan completed in 0.003 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "Suspicious pattern detected" in output
+    assert "warning" in output.lower()
+
+
 def test_exit_code_clean_scan(tmp_path):
     """Test exit code 0 when scan is clean with no issues."""
     import pickle
@@ -256,7 +349,8 @@ def test_exit_code_clean_scan(tmp_path):
     assert result.exit_code == 0, (
         f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     )
-    # The output might not say "No issues found" if there are debug messages, so let's be less strict
+    # The output might not say "No issues found" if there are debug messages,
+    # so let's be less strict
     assert (
         "scan completed successfully" in result.output.lower()
         or "no issues found" in result.output.lower()
