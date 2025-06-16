@@ -88,7 +88,7 @@ def detect_file_format(path: str) -> str:
         return "pytorch_binary"
 
     # Extension-based detection for non-.bin files
-    if ext in (".pt", ".pth", ".ckpt", ".pkl", ".pickle"):
+    if ext in (".pt", ".pth", ".ckpt", ".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
         return "hdf5"
@@ -98,6 +98,14 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext == ".npy":
+        return "numpy"
+    if ext == ".npz":
+        return "zip"
+    if ext == ".joblib":
+        if magic4[:2] == b"PK":
+            return "zip"
+        return "pickle"
 
     return "unknown"
 

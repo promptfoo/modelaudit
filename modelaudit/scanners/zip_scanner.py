@@ -10,7 +10,7 @@ class ZipScanner(BaseScanner):
 
     name = "zip"
     description = "Scans ZIP archive files and their contents recursively"
-    supported_extensions = [".zip"]
+    supported_extensions = [".zip", ".npz"]
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
