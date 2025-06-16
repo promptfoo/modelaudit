@@ -349,6 +349,17 @@ This project uses modern Python tooling for maintaining code quality:
 
 - **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
 - **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
+- **[Biome](https://biomejs.dev/)**: Fast formatter for JSON and YAML files
+
+**File Formatting with Biome:**
+
+```bash
+# Format JSON and YAML files
+npx @biomejs/biome format --write .
+
+# Check formatting (for CI)
+npx @biomejs/biome ci .
+```
 
 ### Contributing
 
