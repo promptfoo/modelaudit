@@ -390,7 +390,7 @@ class WeightDistributionScanner(BaseScanner):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with abnormal weight magnitudes",
-                        "severity": IssueSeverity.WARNING,
+                        "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
                             "outlier_neurons": outlier_indices.tolist()[
@@ -435,7 +435,7 @@ class WeightDistributionScanner(BaseScanner):
                     anomalies.append(
                         {
                             "description": f"Layer '{layer_name}' output neuron {neuron_idx} has unusually dissimilar weights",
-                            "severity": IssueSeverity.WARNING,
+                            "severity": IssueSeverity.INFO,
                             "details": {
                                 "layer": layer_name,
                                 "neuron_index": neuron_idx,
@@ -461,7 +461,7 @@ class WeightDistributionScanner(BaseScanner):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
-                        "severity": IssueSeverity.WARNING,
+                        "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
                             "affected_neurons": neurons_with_extreme_weights.tolist()[

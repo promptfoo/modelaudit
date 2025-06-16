@@ -130,7 +130,7 @@ Issues found: 2 errors, 1 warnings
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
 
 ────────────────────────────────────────────────────────────────────────────────
-✗ Scan completed with errors
+✗ Scan completed with findings
 ```
 
 ### Exit Codes

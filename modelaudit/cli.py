@@ -343,7 +343,7 @@ def format_text_output(results, verbose=False):
         issue_summary = []
         if error_count:
             issue_summary.append(
-                click.style(f"{error_count} errors", fg="red", bold=True),
+                click.style(f"{error_count} findings", fg="red", bold=True),
             )
         if warning_count:
             issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
@@ -403,7 +403,7 @@ def format_text_output(results, verbose=False):
             isinstance(issue, dict) and issue.get("severity") == "error"
             for issue in visible_issues
         ):
-            status = click.style("✗ Scan completed with errors", fg="red", bold=True)
+            status = click.style("✗ Scan completed with findings", fg="red", bold=True)
         else:
             status = click.style(
                 "⚠ Scan completed with warnings",
