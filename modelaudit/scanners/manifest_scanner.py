@@ -79,7 +79,6 @@ SUSPICIOUS_CONFIG_PATTERNS = {
         "directory",
         "folder",
         "output",
-        "input",
         "save",
         "load",
         "write",
