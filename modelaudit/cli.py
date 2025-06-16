@@ -9,6 +9,8 @@ from yaspin import yaspin
 from yaspin.spinners import Spinners
 
 from . import __version__
+from .auth.client import auth_client
+from .auth.config import config
 from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
@@ -24,6 +26,107 @@ logger = logging.getLogger("modelaudit")
 def cli():
     """Static scanner for ML models"""
     pass
+
+
+@cli.group()
+def auth():
+    """Manage authentication"""
+    pass
+
+
+@auth.command()
+@click.option("--api-key", "-k", help="API key for authentication")
+@click.option("--host", "-h", help="API host URL")
+def login(api_key, host):
+    """Login to promptfoo services"""
+    try:
+        if api_key:
+            # Validate and set the API key
+            result = auth_client.validate_and_set_api_token(api_key, host)
+            user = result.get("user", {})
+            organization = result.get("organization", {})
+            app = result.get("app", {})
+
+            # Check if email changed
+            existing_email = config.get_user_email()
+            if existing_email and existing_email != user.get("email"):
+                click.echo(
+                    click.style(
+                        f"Updating local email configuration from {existing_email} to {user.get('email')}",
+                        fg="yellow",
+                    )
+                )
+
+            click.echo(click.style("Successfully logged in", fg="green", bold=True))
+            click.echo(click.style("Logged in as:", dim=True))
+            click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
+            click.echo(
+                f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}"
+            )
+            click.echo(
+                f"Access the app at {click.style(app.get('url', 'Unknown'), fg='cyan')}"
+            )
+        else:
+            click.echo(
+                f"Please login or sign up at {click.style('https://promptfoo.app', fg='green')} to get an API key."
+            )
+            click.echo(
+                f"After logging in, you can get your API token at {click.style('https://promptfoo.app/welcome', fg='green')}"
+            )
+    except Exception as e:
+        error_message = str(e)
+        click.echo(f"Authentication failed: {error_message}", err=True)
+        sys.exit(1)
+
+
+@auth.command()
+def logout():
+    """Logout and clear credentials"""
+    email = config.get_user_email()
+    api_key = config.get_api_key()
+
+    if not email and not api_key:
+        click.echo(
+            click.style(
+                "You're already logged out - no active session to terminate",
+                fg="yellow",
+            )
+        )
+        return
+
+    config.clear_credentials()
+    click.echo(click.style("Successfully logged out", fg="green"))
+
+
+@auth.command()
+def whoami():
+    """Show current user information"""
+    try:
+        email = config.get_user_email()
+        api_key = config.get_api_key()
+
+        if not email or not api_key:
+            click.echo(
+                f"Not logged in. Run {click.style('modelaudit auth login', bold=True)} to login."
+            )
+            return
+
+        # Get current user info from API
+        user_info = auth_client.get_user_info()
+        user = user_info.get("user", {})
+        organization = user_info.get("organization", {})
+
+        click.echo(click.style("Currently logged in as:", fg="green", bold=True))
+        click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
+        click.echo(
+            f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}"
+        )
+        click.echo(f"App URL: {click.style(config.get_app_url(), fg='cyan')}")
+
+    except Exception as e:
+        error_message = str(e)
+        click.echo(f"Failed to get user info: {error_message}", err=True)
+        sys.exit(1)
 
 
 @cli.command("scan")
