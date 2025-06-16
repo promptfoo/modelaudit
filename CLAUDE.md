@@ -67,6 +67,7 @@ poetry run ruff format --check .           # Check if Ruff formatting is needed
 - Unsafe Lambda layers (Keras/TensorFlow)
 - Executable files in archives
 - Blacklisted model names
+- Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 
 ## Exit Codes
 
