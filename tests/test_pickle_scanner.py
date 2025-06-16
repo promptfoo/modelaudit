@@ -429,14 +429,13 @@ class TestPickleScanner(unittest.TestCase):
                 ]
                 assert len(pe_issues) >= 1, "Should detect PE with DOS stub"
 
-                # Should be reported as ERROR severity
                 pe_error_issues = [
                     issue
                     for issue in pe_issues
-                    if issue.severity == IssueSeverity.ERROR
+                    if issue.severity == IssueSeverity.CRITICAL
                 ]
                 assert len(pe_error_issues) >= 1, (
-                    "PE detection should be ERROR severity"
+                    "PE detection should be CRITICAL severity"
                 )
 
             finally:
