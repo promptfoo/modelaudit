@@ -2,9 +2,9 @@ import json
 import os
 import tarfile
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
 try:
