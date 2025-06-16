@@ -85,7 +85,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if not HAS_TENSORFLOW:
             result = self._create_result()
             result.add_issue(
-                "TensorFlow not installed, cannot scan SavedModel.",
+                "TensorFlow not installed, cannot scan SavedModel. Install with "
+                "'pip install modelaudit[tensorflow]'.",
                 severity=IssueSeverity.ERROR,
                 location=path,
                 details={"path": path},
