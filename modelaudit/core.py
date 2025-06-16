@@ -4,9 +4,18 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
-from modelaudit.scanners import SCANNER_REGISTRY
+from modelaudit.scanners import (
+    SCANNER_REGISTRY,
+    KerasH5Scanner,
+    PickleScanner,
+    PyTorchBinaryScanner,
+    PyTorchZipScanner,
+    SafeTensorsScanner,
+    TensorFlowSavedModelScanner,
+    ZipScanner,
+)
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-from modelaudit.utils.filetype import detect_file_format
+from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -339,23 +348,74 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
 
     logger.info(f"Scanning file: {path}")
 
-    # Try to use scanners from the registry
-    for scanner_class in SCANNER_REGISTRY:
-        # These are concrete scanner classes, not the abstract BaseScanner
-        if scanner_class.can_handle(path):
-            logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)  # type: ignore[abstract]
-            return scanner.scan(path)
+    header_format = detect_file_format(path)
+    ext_format = detect_format_from_extension(path)
 
-    # If no scanner could handle the file, create a default unknown format result
-    format_ = detect_file_format(path)
-    sr = ScanResult(scanner_name="unknown")
-    sr.add_issue(
-        f"Unknown or unhandled format: {format_}",
-        severity=IssueSeverity.DEBUG,
-        details={"format": format_, "path": path},
-    )
-    return sr
+    discrepancy_msg = None
+    if (
+        header_format != ext_format
+        and header_format != "unknown"
+        and ext_format != "unknown"
+    ):
+        discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
+        logger.warning(discrepancy_msg)
+
+    # Prefer scanner based on header format
+    preferred_scanner: Optional[type] = None
+    if header_format == "zip" and os.path.splitext(path)[1].lower() in [
+        ".pt",
+        ".pth",
+    ]:
+        preferred_scanner = PyTorchZipScanner
+    else:
+        preferred_scanner = {
+            "pickle": PickleScanner,
+            "pytorch_binary": PyTorchBinaryScanner,
+            "hdf5": KerasH5Scanner,
+            "safetensors": SafeTensorsScanner,
+            "tensorflow_directory": TensorFlowSavedModelScanner,
+            "protobuf": TensorFlowSavedModelScanner,
+            "zip": ZipScanner,
+        }.get(header_format)
+
+    result: Optional[ScanResult]
+    if preferred_scanner and preferred_scanner.can_handle(path):
+        logger.debug(
+            f"Using {preferred_scanner.name} scanner for {path} based on header"
+        )
+        scanner = preferred_scanner(config=config)  # type: ignore[abstract]
+        result = scanner.scan(path)
+    else:
+        result = None
+        for scanner_class in SCANNER_REGISTRY:
+            if scanner_class.can_handle(path):
+                logger.debug(f"Using {scanner_class.name} scanner for {path}")
+                scanner = scanner_class(config=config)  # type: ignore[abstract]
+                result = scanner.scan(path)
+                break
+
+        if result is None:
+            format_ = header_format
+            sr = ScanResult(scanner_name="unknown")
+            sr.add_issue(
+                f"Unknown or unhandled format: {format_}",
+                severity=IssueSeverity.DEBUG,
+                details={"format": format_, "path": path},
+            )
+            result = sr
+
+    if discrepancy_msg:
+        result.add_issue(
+            discrepancy_msg + " Using header-based detection.",
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details={
+                "extension_format": ext_format,
+                "header_format": header_format,
+            },
+        )
+
+    return result
 
 
 def merge_scan_result(

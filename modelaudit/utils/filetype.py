@@ -116,3 +116,30 @@ def find_sharded_files(directory: str) -> list:
             and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
         ]
     )
+
+
+EXTENSION_FORMAT_MAP = {
+    ".pt": "pickle",
+    ".pth": "pickle",
+    ".ckpt": "pickle",
+    ".pkl": "pickle",
+    ".pickle": "pickle",
+    ".h5": "hdf5",
+    ".hdf5": "hdf5",
+    ".keras": "hdf5",
+    ".pb": "protobuf",
+    ".safetensors": "safetensors",
+    ".onnx": "onnx",
+    ".bin": "pytorch_binary",
+    ".zip": "zip",
+}
+
+
+def detect_format_from_extension(path: str) -> str:
+    """Return a format string based solely on the file extension."""
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+    return EXTENSION_FORMAT_MAP.get(file_path.suffix.lower(), "unknown")

@@ -1,6 +1,11 @@
 import zipfile
 
-from modelaudit.utils.filetype import detect_file_format, find_sharded_files, is_zipfile
+from modelaudit.utils.filetype import (
+    detect_file_format,
+    detect_format_from_extension,
+    find_sharded_files,
+    is_zipfile,
+)
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -106,3 +111,15 @@ def test_find_sharded_files(tmp_path):
     assert shards[0].endswith("pytorch_model-00001-of-00005.bin")
     assert shards[1].endswith("pytorch_model-00002-of-00005.bin")
     assert shards[2].endswith("pytorch_model-00003-of-00005.bin")
+
+
+def test_detect_format_from_extension(tmp_path):
+    """Test extension-only format detection."""
+    file_path = tmp_path / "model.pt"
+    file_path.write_bytes(b"abc")
+    assert detect_format_from_extension(str(file_path)) == "pickle"
+
+    dir_path = tmp_path / "saved_model"
+    dir_path.mkdir()
+    (dir_path / "saved_model.pb").write_bytes(b"d")
+    assert detect_format_from_extension(str(dir_path)) == "tensorflow_directory"
