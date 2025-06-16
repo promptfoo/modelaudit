@@ -48,7 +48,7 @@ class ModelAuditConfig:
         env_key = os.environ.get("MODELAUDIT_API_KEY")
         if env_key:
             return env_key
-        
+
         # Fall back to config file
         config = self._load_config()
         return config.get("api_key")
@@ -65,7 +65,7 @@ class ModelAuditConfig:
         env_host = os.environ.get("MODELAUDIT_API_HOST")
         if env_host:
             return env_host
-        
+
         # Fall back to config file
         config = self._load_config()
         return config.get("api_host", "https://api.promptfoo.app")
@@ -82,7 +82,7 @@ class ModelAuditConfig:
         env_email = os.environ.get("MODELAUDIT_USER_EMAIL")
         if env_email:
             return env_email
-        
+
         # Fall back to config file
         config = self._load_config()
         return config.get("user_email")
@@ -99,7 +99,7 @@ class ModelAuditConfig:
         env_url = os.environ.get("MODELAUDIT_APP_URL")
         if env_url:
             return env_url
-        
+
         # Fall back to config file
         config = self._load_config()
         return config.get("app_url")
@@ -122,4 +122,4 @@ class ModelAuditConfig:
 
 
 # Global config instance
-config = ModelAuditConfig() 
+config = ModelAuditConfig()
