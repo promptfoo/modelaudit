@@ -7,6 +7,7 @@ from . import (
     pytorch_zip_scanner,
     numpy_scanner,
     joblib_scanner,
+    safetensors_scanner,
     tf_savedmodel_scanner,
     weight_distribution_scanner,
     zip_scanner,
@@ -21,6 +22,7 @@ from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .numpy_scanner import NumPyScanner
 from .joblib_scanner import JoblibScanner
+from .safetensors_scanner import SafeTensorsScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
 from .weight_distribution_scanner import WeightDistributionScanner
 from .zip_scanner import ZipScanner
@@ -37,6 +39,7 @@ SCANNER_REGISTRY = [
     WeightDistributionScanner,
     JoblibScanner,
     NumPyScanner,
+    SafeTensorsScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -52,6 +55,7 @@ __all__ = [
     "weight_distribution_scanner",
     "joblib_scanner",
     "numpy_scanner",
+    "safetensors_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
@@ -66,6 +70,7 @@ __all__ = [
     "WeightDistributionScanner",
     "JoblibScanner",
     "NumPyScanner",
+    "SafeTensorsScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
 ]
