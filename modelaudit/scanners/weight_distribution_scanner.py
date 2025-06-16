@@ -174,27 +174,33 @@ class WeightDistributionScanner(BaseScanner):
                 for key, value in state_dict.items():
                     if isinstance(value, torch.Tensor):
                         # Look for final layer patterns
-                        if any(
-                            pattern in key.lower()
-                            for pattern in [
-                                "fc.weight",
-                                "classifier.weight",
-                                "head.weight",
-                                "output.weight",
-                                "final.weight",
-                            ]
+                        if (
+                            any(
+                                pattern in key.lower()
+                                for pattern in [
+                                    "fc",
+                                    "classifier",
+                                    "head",
+                                    "output",
+                                    "final",
+                                ]
+                            )
+                            and "weight" in key.lower()
                         ):
-                            weights_info[key] = value.detach().cpu().numpy()
+                            # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
+                            weights_info[key] = value.detach().cpu().numpy().T
                         # Also include all weight tensors for comprehensive analysis
                         elif "weight" in key.lower() and len(value.shape) >= 2:
-                            weights_info[key] = value.detach().cpu().numpy()
+                            # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
+                            weights_info[key] = value.detach().cpu().numpy().T
 
             elif hasattr(model_data, "state_dict"):
                 # Full model format
                 state_dict = model_data.state_dict()
                 for key, value in state_dict.items():
                     if "weight" in key.lower() and isinstance(value, torch.Tensor):
-                        weights_info[key] = value.detach().cpu().numpy()
+                        # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
+                        weights_info[key] = value.detach().cpu().numpy().T
 
         except Exception:
             # Try loading as a zip file (newer PyTorch format)
@@ -309,9 +315,19 @@ class WeightDistributionScanner(BaseScanner):
         # Focus on final layer weights (classification heads)
         final_layer_candidates = {}
         for name, weights in weights_info.items():
-            if any(
-                pattern in name.lower()
-                for pattern in ["fc", "classifier", "head", "output", "final", "dense"]
+            if (
+                any(
+                    pattern in name.lower()
+                    for pattern in [
+                        "fc",
+                        "classifier",
+                        "head",
+                        "output",
+                        "final",
+                        "dense",
+                    ]
+                )
+                and "weight" in name.lower()
             ):
                 if len(weights.shape) == 2:  # Ensure it's a 2D weight matrix
                     final_layer_candidates[name] = weights
