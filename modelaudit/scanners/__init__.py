@@ -6,6 +6,7 @@ from . import (
     pytorch_binary_scanner,
     pytorch_zip_scanner,
     gguf_scanner,
+    safetensors_scanner,
     tf_savedmodel_scanner,
     weight_distribution_scanner,
     zip_scanner,
@@ -19,6 +20,7 @@ from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .gguf_scanner import GgufScanner
+from .safetensors_scanner import SafeTensorsScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
 from .weight_distribution_scanner import WeightDistributionScanner
 from .zip_scanner import ZipScanner
@@ -34,6 +36,7 @@ SCANNER_REGISTRY = [
     ManifestScanner,
     WeightDistributionScanner,
     GgufScanner,
+    SafeTensorsScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -48,6 +51,7 @@ __all__ = [
     "manifest_scanner",
     "weight_distribution_scanner",
     "gguf_scanner",
+    "safetensors_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
@@ -61,6 +65,7 @@ __all__ = [
     "ManifestScanner",
     "WeightDistributionScanner",
     "GgufScanner",
+    "SafeTensorsScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
 ]
