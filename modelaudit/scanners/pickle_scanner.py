@@ -25,6 +25,17 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],
     "ctypes": ["*"],
     "socket": ["*"],
+    # dill's load helpers can execute arbitrary code when unpickling
+    # so we specifically flag those functions
+    "dill": [
+        "load",
+        "loads",
+        "load_module",
+        "load_module_asdict",
+        "load_session",
+    ],
+    # references to the private dill._dill module are also suspicious
+    "dill._dill": "*",
 }
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
@@ -36,6 +47,7 @@ DANGEROUS_OPCODES = [
     "INST",
     "OBJ",
     "NEWOBJ",
+    "NEWOBJ_EX",
     "GLOBAL",
     "BUILD",
     "STACK_GLOBAL",
@@ -336,12 +348,12 @@ def _get_context_aware_severity(
 
     # High confidence ML content - downgrade severity
     if confidence > 0.8:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
         elif base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
     elif confidence > 0.5:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
 
     return base_severity
@@ -612,7 +624,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error opening pickle file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -708,7 +720,7 @@ class PickleScanner(BaseScanner):
                             if _is_actually_dangerous_global(mod, func, ml_context):
                                 suspicious_count += 1
                                 severity = _get_context_aware_severity(
-                                    IssueSeverity.ERROR, ml_context
+                                    IssueSeverity.CRITICAL, ml_context
                                 )
                                 result.add_issue(
                                     f"Suspicious reference {mod}.{func}",
@@ -827,7 +839,7 @@ class PickleScanner(BaseScanner):
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
-                                IssueSeverity.ERROR, ml_context
+                                IssueSeverity.CRITICAL, ml_context
                             )
                             result.add_issue(
                                 f"Suspicious module reference found: {mod}.{func}",
@@ -865,7 +877,9 @@ class PickleScanner(BaseScanner):
             dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
             if dangerous_pattern and not ml_context.get("is_ml_content", False):
                 suspicious_count += 1
-                severity = _get_context_aware_severity(IssueSeverity.ERROR, ml_context)
+                severity = _get_context_aware_severity(
+                    IssueSeverity.CRITICAL, ml_context
+                )
                 result.add_issue(
                     f"Detected dangerous __reduce__ pattern with "
                     f"{dangerous_pattern.get('module', '')}."
@@ -911,8 +925,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error analyzing pickle ops: {e}",
-                severity=IssueSeverity.ERROR,
-                location=self.current_file_path,
+                severity=IssueSeverity.CRITICAL,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
@@ -985,7 +998,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(sig)
                         result.add_issue(
                             f"Executable signature found in binary data: {description}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "signature": sig.hex(),
@@ -1010,7 +1023,7 @@ class PickleScanner(BaseScanner):
                         if dos_stub_msg in chunk[pos:search_end]:
                             result.add_issue(
                                 "Executable signature found in binary data: Windows executable (PE)",
-                                severity=IssueSeverity.ERROR,
+                                severity=IssueSeverity.CRITICAL,
                                 location=f"{self.current_file_path} (offset: {current_offset + pos})",
                                 details={
                                     "signature": pe_sig.hex(),
@@ -1038,7 +1051,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning binary content: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

@@ -3,6 +3,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import dill
+
 # Add the parent directory to sys.path to allow importing modelaudit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -56,13 +58,31 @@ class TestPickleScanner(unittest.TestCase):
             "Failed to detect os.system/posix.system reference"
         )
 
+    def test_scan_dill_pickle(self):
+        """Scanner should flag suspicious dill references"""
+        dill_pickle_path = Path(__file__).parent / "dill_func.pkl"
+        if not dill_pickle_path.exists():
+
+            def func(x):
+                return x
+
+            with dill_pickle_path.open("wb") as f:
+                dill.dump(func, f)
+
+        scanner = PickleScanner()
+        result = scanner.scan(str(dill_pickle_path))
+
+        assert result.success
+        assert result.has_errors or result.has_warnings
+        assert any("dill" in issue.message for issue in result.issues)
+
     def test_scan_nonexistent_file(self):
         """Scanner returns failure and error issue for missing file"""
         scanner = PickleScanner()
         result = scanner.scan("nonexistent_file.pkl")
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
     def test_scan_bin_file_with_suspicious_binary_content(self):
         """Test scanning .bin file with suspicious code patterns in binary data"""
@@ -153,7 +173,7 @@ class TestPickleScanner(unittest.TestCase):
                 error_issues = [
                     issue
                     for issue in executable_issues
-                    if issue.severity == IssueSeverity.ERROR
+                    if issue.severity == IssueSeverity.CRITICAL
                 ]
                 assert len(error_issues) >= 2
 
@@ -429,14 +449,13 @@ class TestPickleScanner(unittest.TestCase):
                 ]
                 assert len(pe_issues) >= 1, "Should detect PE with DOS stub"
 
-                # Should be reported as ERROR severity
                 pe_error_issues = [
                     issue
                     for issue in pe_issues
-                    if issue.severity == IssueSeverity.ERROR
+                    if issue.severity == IssueSeverity.CRITICAL
                 ]
                 assert len(pe_error_issues) >= 1, (
-                    "PE detection should be ERROR severity"
+                    "PE detection should be CRITICAL severity"
                 )
 
             finally:
