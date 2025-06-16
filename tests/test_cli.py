@@ -1,5 +1,6 @@
 import json
 import os
+import zipfile
 
 import pytest
 from click.testing import CliRunner
@@ -306,3 +307,16 @@ def test_exit_code_scan_errors(tmp_path):
     # Should exit with code 2 for scan errors
     assert result.exit_code == 2
     assert "Error" in result.output
+
+
+def test_exit_code_zip_slip(tmp_path):
+    """Archive with path traversal should yield non-zero exit code."""
+    zip_path = tmp_path / "evil.zip"
+    with zipfile.ZipFile(zip_path, "w") as z:
+        z.writestr("../../evil.py", "malicious")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(zip_path)])
+
+    assert result.exit_code != 0
+    assert "directory traversal" in result.output.lower()

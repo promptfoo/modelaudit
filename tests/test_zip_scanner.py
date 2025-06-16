@@ -131,13 +131,13 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            assert result.success is True
+            assert result.success is False
 
             # Should have detected directory traversal attempts
             traversal_issues = [
                 i for i in result.issues if "directory traversal" in i.message.lower()
             ]
-            assert len(traversal_issues) >= 2
+            assert len(traversal_issues) >= 1
 
             # Check severity
             for issue in traversal_issues:
@@ -188,10 +188,12 @@ class TestZipScanner:
             scanner = ZipScanner(config={"max_zip_depth": 3})
             result = scanner.scan(current_path)
 
-            assert result.success is True
-            # Should have a warning about max depth
+            assert result.success is False
+            # Should have an error about max depth
             depth_issues = [i for i in result.issues if "depth" in i.message.lower()]
             assert len(depth_issues) >= 1
+            for issue in depth_issues:
+                assert issue.severity == IssueSeverity.ERROR
         finally:
             for path in paths_to_delete:
                 if os.path.exists(path):
@@ -211,12 +213,14 @@ class TestZipScanner:
             scanner = ZipScanner(config={"max_zip_entries": 50})
             result = scanner.scan(tmp_path)
 
-            assert result.success is True
-            # Should have a warning about too many entries
+            assert result.success is False
+            # Should have an error about too many entries
             entries_issues = [
                 i for i in result.issues if "too many entries" in i.message.lower()
             ]
             assert len(entries_issues) >= 1
+            for issue in entries_issues:
+                assert issue.severity == IssueSeverity.ERROR
         finally:
             os.unlink(tmp_path)
 

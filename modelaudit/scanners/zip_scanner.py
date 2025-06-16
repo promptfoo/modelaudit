@@ -14,7 +14,8 @@ class ZipScanner(BaseScanner):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
+        # Depth limit for nested archives
+        self.max_depth = self.config.get("max_zip_depth", 10)
         self.max_entries = self.config.get(
             "max_zip_entries", 10000
         )  # Limit number of entries
@@ -58,6 +59,9 @@ class ZipScanner(BaseScanner):
             # Scan the zip file recursively
             scan_result = self._scan_zip_file(path, depth=0)
             result.merge(scan_result)
+            if not scan_result.success:
+                result.finish(success=False)
+                return result
 
         except zipfile.BadZipFile:
             result.add_issue(
@@ -79,6 +83,7 @@ class ZipScanner(BaseScanner):
             return result
 
         result.finish(success=True)
+        result.finish(success=True)
         return result
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
@@ -89,10 +94,11 @@ class ZipScanner(BaseScanner):
         if depth >= self.max_depth:
             result.add_issue(
                 f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.ERROR,
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            result.finish(success=False)
             return result
 
         with zipfile.ZipFile(path, "r") as z:
@@ -101,13 +107,14 @@ class ZipScanner(BaseScanner):
                 result.add_issue(
                     f"ZIP file contains too many entries "
                     f"({len(z.namelist())} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.ERROR,
                     location=path,
                     details={
                         "entries": len(z.namelist()),
                         "max_entries": self.max_entries,
                     },
                 )
+                result.finish(success=False)
                 return result
 
             # Scan each file in the archive
@@ -115,19 +122,17 @@ class ZipScanner(BaseScanner):
                 info = z.getinfo(name)
 
                 # Check for directory traversal attempts
-                normalized_path = os.path.normpath(name)
-                if (
-                    not normalized_path
-                    or normalized_path.startswith("..")
-                    or os.path.isabs(normalized_path)
-                ):
+                normalized_path = name.replace("\\", "/")
+                canonical_parts = [p for p in normalized_path.split("/") if p and p != "."]
+                if any(part == ".." for part in canonical_parts) or normalized_path.startswith("/"):
                     result.add_issue(
                         f"Potential directory traversal in ZIP entry: {name}",
                         severity=IssueSeverity.ERROR,
                         location=f"{path}:{name}",
                         details={"entry": name, "normalized_path": normalized_path},
                     )
-                    continue
+                    result.finish(success=False)
+                    return result
 
                 # Skip directories
                 if name.endswith("/"):
@@ -189,6 +194,9 @@ class ZipScanner(BaseScanner):
                                         tmp_path, f"{path}:{name}", 1
                                     )
                             result.merge(nested_result)
+                            if not nested_result.success:
+                                result.finish(success=False)
+                                return result
                         finally:
                             os.unlink(tmp_path)
                     else:
@@ -242,4 +250,5 @@ class ZipScanner(BaseScanner):
                         details={"entry": name, "exception": str(e)},
                     )
 
+        result.finish(success=True)
         return result
