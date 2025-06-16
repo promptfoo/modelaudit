@@ -54,15 +54,18 @@ class TestPickleScanner(unittest.TestCase):
                 has_os_system_detection = True
 
         assert has_reduce_detection, "Failed to detect REDUCE opcode"
-        assert (
-            has_os_system_detection
-        ), "Failed to detect os.system/posix.system reference"
+        assert has_os_system_detection, (
+            "Failed to detect os.system/posix.system reference"
+        )
 
     def test_scan_dill_pickle(self):
         """Scanner should flag suspicious dill references"""
         dill_pickle_path = Path(__file__).parent / "dill_func.pkl"
         if not dill_pickle_path.exists():
-            func = lambda x: x
+
+            def func(x):
+                return x
+
             with dill_pickle_path.open("wb") as f:
                 dill.dump(func, f)
 
