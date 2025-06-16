@@ -22,7 +22,7 @@ logger = logging.getLogger("modelaudit")
 @click.group()
 @click.version_option(__version__)
 def cli():
-    """My Model Scanner CLI."""
+    """Static scanner for ML models"""
     pass
 
 
@@ -274,12 +274,22 @@ def format_text_output(results, verbose=False):
                 ),
             )
     if "duration" in results:
-        output_lines.append(
-            click.style(
-                f"Scan completed in {results['duration']:.2f} seconds",
-                fg="cyan",
-            ),
-        )
+        duration = results["duration"]
+        if duration < 0.01:
+            # For very fast scans, show more precision
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.3f} seconds",
+                    fg="cyan",
+                ),
+            )
+        else:
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.2f} seconds",
+                    fg="cyan",
+                ),
+            )
     if "files_scanned" in results:
         output_lines.append(
             click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
@@ -333,7 +343,7 @@ def format_text_output(results, verbose=False):
         issue_summary = []
         if error_count:
             issue_summary.append(
-                click.style(f"{error_count} errors", fg="red", bold=True),
+                click.style(f"{error_count} findings", fg="red", bold=True),
             )
         if warning_count:
             issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
@@ -393,7 +403,7 @@ def format_text_output(results, verbose=False):
             isinstance(issue, dict) and issue.get("severity") == "error"
             for issue in visible_issues
         ):
-            status = click.style("✗ Scan completed with errors", fg="red", bold=True)
+            status = click.style("✗ Scan completed with findings", fg="red", bold=True)
         else:
             status = click.style(
                 "⚠ Scan completed with warnings",
