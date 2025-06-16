@@ -1,6 +1,7 @@
 import struct
-from modelaudit.scanners.gguf_scanner import GgufScanner
+
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.gguf_scanner import GgufScanner
 
 
 def _write_minimal_gguf(path, n_kv=1, kv_key=b"test", kv_value=b"val"):
@@ -46,5 +47,6 @@ def test_gguf_scanner_truncated(tmp_path):
         f.write(struct.pack("<q", 0))
         f.write(struct.pack("<q", 5))
     result = GgufScanner().scan(str(path))
-    assert not result.success or any(i.severity == IssueSeverity.ERROR for i in result.issues)
-
+    assert not result.success or any(
+        i.severity == IssueSeverity.ERROR for i in result.issues
+    )

@@ -1,6 +1,5 @@
 import os
 import struct
-from typing import Any, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -69,7 +68,9 @@ class GgufScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not any(i.severity == IssueSeverity.ERROR for i in result.issues))
+        result.finish(
+            success=not any(i.severity == IssueSeverity.ERROR for i in result.issues)
+        )
         return result
 
     def _read_string(self, f, file_size: int, offset: int) -> tuple[str, int]:
@@ -88,12 +89,14 @@ class GgufScanner(BaseScanner):
         n_tensors = struct.unpack("<q", f.read(8))[0]
         n_kv = struct.unpack("<q", f.read(8))[0]
 
-        result.metadata.update({
-            "format": "gguf",
-            "version": version,
-            "n_tensors": n_tensors,
-            "n_kv": n_kv,
-        })
+        result.metadata.update(
+            {
+                "format": "gguf",
+                "version": version,
+                "n_tensors": n_tensors,
+                "n_kv": n_kv,
+            }
+        )
 
         if n_kv < 0 or n_kv > 1_000_000:
             result.add_issue(
@@ -169,4 +172,3 @@ class GgufScanner(BaseScanner):
             result.add_issue(
                 f"Suspicious GGML version: {version}", severity=IssueSeverity.WARNING
             )
-
