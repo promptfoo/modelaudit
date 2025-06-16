@@ -321,9 +321,9 @@ class TestFilePathDetection:
         ]
 
         for path in absolute_paths:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect absolute path: {path}"
-            )
+            assert (
+                scanner._is_file_path_value(path) is True
+            ), f"Should detect absolute path: {path}"
 
     def test_is_file_path_value_relative_paths(self):
         """Test detection of relative file paths with separators."""
@@ -337,9 +337,9 @@ class TestFilePathDetection:
         ]
 
         for path in relative_paths:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect relative path: {path}"
-            )
+            assert (
+                scanner._is_file_path_value(path) is True
+            ), f"Should detect relative path: {path}"
 
     def test_is_file_path_value_file_extensions(self):
         """Test detection based on file extensions."""
@@ -355,9 +355,9 @@ class TestFilePathDetection:
         ]
 
         for filename in file_extensions:
-            assert scanner._is_file_path_value(filename) is True, (
-                f"Should detect file extension: {filename}"
-            )
+            assert (
+                scanner._is_file_path_value(filename) is True
+            ), f"Should detect file extension: {filename}"
 
     def test_is_file_path_value_common_path_indicators(self):
         """Test detection of common path indicators."""
@@ -372,9 +372,9 @@ class TestFilePathDetection:
         ]
 
         for path in path_indicators:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect path indicator: {path}"
-            )
+            assert (
+                scanner._is_file_path_value(path) is True
+            ), f"Should detect path indicator: {path}"
 
     def test_is_file_path_value_non_paths(self):
         """Test that non-path values are not detected as paths."""
@@ -393,9 +393,9 @@ class TestFilePathDetection:
         ]
 
         for value in non_paths:
-            assert scanner._is_file_path_value(value) is False, (
-                f"Should not detect as path: {value}"
-            )
+            assert (
+                scanner._is_file_path_value(value) is False
+            ), f"Should not detect as path: {value}"
 
 
 class TestSeverityAssignment:
@@ -506,12 +506,12 @@ class TestIntegrationScenarios:
             errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
-            assert len(errors) == 0, (
-                f"Found unexpected errors: {[e.message for e in errors]}"
-            )
-            assert len(warnings) == 0, (
-                f"Found unexpected warnings: {[w.message for w in warnings]}"
-            )
+            assert (
+                len(errors) == 0
+            ), f"Found unexpected errors: {[e.message for e in errors]}"
+            assert (
+                len(warnings) == 0
+            ), f"Found unexpected warnings: {[w.message for w in warnings]}"
 
         finally:
             Path(test_file).unlink(missing_ok=True)

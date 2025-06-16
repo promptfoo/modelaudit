@@ -11,7 +11,7 @@ from modelaudit.scanners.manifest_scanner import ManifestScanner
 def test_manifest_scanner_json():
     """Test the manifest scanner with a JSON file."""
     # Create a temporary JSON file
-    test_file = "test_manifest.json"
+    test_file = "config.json"
     manifest_content = {
         "model_name": "test_model",
         "version": "1.0.0",
@@ -61,7 +61,7 @@ def test_manifest_scanner_json():
 def test_manifest_scanner_blacklist():
     """Test the manifest scanner with blacklisted terms."""
     # Create a temporary JSON file with a blacklisted term
-    test_file = "test_unsafe_manifest.json"
+    test_file = "model_card.json"
     manifest_content = {
         "model_name": "test_model",
         "version": "1.0.0",
@@ -110,7 +110,7 @@ def test_manifest_scanner_blacklist():
 def test_manifest_scanner_case_insensitive_blacklist():
     """Test that blacklist matching is case-insensitive."""
     # Create a temporary file with mixed-case blacklisted term
-    test_file = "test_case_manifest.txt"
+    test_file = "inference_config.json"
 
     try:
         with Path(test_file).open("w") as f:
@@ -139,55 +139,14 @@ def test_manifest_scanner_case_insensitive_blacklist():
 
 def test_manifest_scanner_yaml():
     """Test the manifest scanner with a YAML file."""
-    # Skip if yaml is not installed
-    pytest.importorskip("yaml")
-
-    # Create a temporary YAML file
-    test_file = "test_manifest.yaml"
-    yaml_content = """
-    model:
-      name: test_yaml_model
-      version: 1.0.0
-    execution:
-      command: python train.py
-      environment: production
-    """
-
-    try:
-        with Path(test_file).open("w") as f:
-            f.write(yaml_content)
-
-        # Create scanner
-        scanner = ManifestScanner()
-
-        # Test can_handle
-        assert scanner.can_handle(test_file) is True
-
-        # Test scan
-        result = scanner.scan(test_file)
-
-        # Verify scan completed successfully
-        assert result.success is True
-
-        # Check that suspicious keys were detected (execution.command)
-        suspicious_keys = [
-            issue.details.get("key", "")
-            for issue in result.issues
-            if hasattr(issue, "details")
-        ]
-        assert any("execution" in key for key in suspicious_keys)
-
-    finally:
-        # Clean up
-        test_file_path = Path(test_file)
-        if test_file_path.exists():
-            test_file_path.unlink()
+    # Skip this test - YAML files are no longer supported after whitelist changes
+    pytest.skip("YAML files are no longer supported by manifest scanner whitelist")
 
 
 def test_manifest_scanner_nested_structures():
     """Test the manifest scanner with nested structures."""
     # Create a temporary JSON file with nested structures
-    test_file = "test_nested_manifest.json"
+    test_file = "model_index.json"
     manifest_content = {
         "model": {
             "name": "nested_model",

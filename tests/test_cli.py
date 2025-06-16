@@ -262,10 +262,11 @@ def test_exit_code_clean_scan(tmp_path):
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert result.exit_code == 0, (
-        f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
-    )
-    # The output might not say "No issues found" if there are debug messages, so let's be less strict
+    assert (
+        result.exit_code == 0
+    ), f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
+    # The output might not say "No issues found" if there are debug messages,
+    # so let's be less strict
     assert (
         "scan completed successfully" in result.output.lower()
         or "no issues found" in result.output.lower()
@@ -290,9 +291,9 @@ def test_exit_code_security_issues(tmp_path):
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert result.exit_code == 1, (
-        f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    )
+    assert (
+        result.exit_code == 1
+    ), f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 
