@@ -369,6 +369,49 @@ git push origin feature/your-feature-name
 - All PRs are squash-merged with a conventional commit message
 - Keep changes small and focused
 
+## 🔒 Security Architecture
+
+### Centralized Suspicious Symbols System
+
+ModelAudit uses a centralized security pattern system to maintain consistency and enable comprehensive threat detection across all scanners. This architecture ensures that security patterns are:
+
+- **Centrally maintained** in `modelaudit/suspicious_symbols.py`
+- **Consistently applied** across all scanner types
+- **Easily extensible** for new threat patterns
+- **Well-documented** with security rationales
+
+**Key Components:**
+
+```python
+# Example usage in scanners
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_GLOBALS,      # Dangerous Python modules (pickle)
+    SUSPICIOUS_OPS,          # Risky TensorFlow operations  
+    SUSPICIOUS_LAYER_TYPES,  # Unsafe Keras layers
+    SUSPICIOUS_CONFIG_PATTERNS  # Manifest security patterns
+)
+```
+
+**Security Pattern Categories:**
+
+| Pattern Type | Risk Level | Description |
+|-------------|------------|-------------|
+| `SUSPICIOUS_GLOBALS` | HIGH-CRITICAL | Python modules/functions that enable code execution |
+| `SUSPICIOUS_STRING_PATTERNS` | MEDIUM-HIGH | Regex patterns matching malicious code strings |
+| `SUSPICIOUS_OPS` | HIGH | TensorFlow operations enabling file I/O or execution |
+| `SUSPICIOUS_LAYER_TYPES` | MEDIUM | Keras layers that can contain arbitrary code |
+| `SUSPICIOUS_CONFIG_PATTERNS` | MEDIUM | Configuration keys indicating security risks |
+
+**Contributing Security Patterns:**
+
+When adding new security patterns:
+
+1. **Document the threat model** - Explain why the pattern is dangerous
+2. **Consider false positives** - Test against legitimate ML models
+3. **Add comprehensive tests** - Include both positive and negative cases
+4. **Update documentation** - Explain the security rationale
+5. **Test performance impact** - Ensure patterns scale to large models
+
 ### Project Structure
 
 ```
@@ -380,6 +423,7 @@ modelaudit/
 │   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
 │   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
 │   │   └── manifest_scanner.py    # Config/manifest scanner
+│   ├── suspicious_symbols.py  # Centralized security patterns
 │   ├── utils/             # Utility modules
 │   ├── cli.py            # Command-line interface
 │   └── core.py           # Core scanning logic
