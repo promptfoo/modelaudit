@@ -1,26 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "modelaudit"
-version = "0.1.0"
-description = "A security scanner for machine learning models"
-readme = "README.md"
-requires-python = ">=3.7"
-dependencies = [
-    "click>=8.1.3,<9.0.0",
-    "yaspin>=2.3.0,<3.0.0",
-    "requests>=2.25.0",
-    "platformdirs>=3.0.0"
-]
-
-[project.scripts]
-modelaudit = "modelaudit.cli:main"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["modelaudit*"]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "modelaudit"
@@ -48,6 +28,8 @@ classifiers = [
 python = ">=3.9,<4.0"
 click = "^8.1.3"
 yaspin = "^2.3.0"
+requests = "^2.25.0"
+platformdirs = "^3.0.0"
 
 # Optional dependencies for specific scanners
 tensorflow = { version = ">=2.6", optional = true }
@@ -70,6 +52,9 @@ h5 = ["h5py"]
 pytorch = ["torch"]
 yaml = ["pyyaml"]
 all = ["tensorflow", "h5py", "torch", "pyyaml"]
+
+[tool.poetry.scripts]
+modelaudit = "modelaudit.cli:main"
 
 [tool.ruff]
 line-length = 88
