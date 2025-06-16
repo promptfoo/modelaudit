@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "modelaudit"
-version = "0.1.0"
-description = "Model file scanning library for detecting malicious code in ML model files"
+version = "0.1.1"
+description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = ["Ian Webster <ian@promptfoo.dev>"]
 license = "MIT"
 readme = "README.md"
