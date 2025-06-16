@@ -86,7 +86,8 @@ class KerasH5Scanner(BaseScanner):
         if not HAS_H5PY:
             result = self._create_result()
             result.add_issue(
-                "h5py not installed, cannot scan Keras H5 files.",
+                "h5py not installed, cannot scan Keras H5 files. Install with "
+                "'pip install modelaudit[h5]'.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
