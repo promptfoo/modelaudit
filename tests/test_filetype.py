@@ -1,10 +1,6 @@
 import zipfile
 
-from modelaudit.utils.filetype import (
-    detect_file_format,
-    find_sharded_files,
-    is_zipfile,
-)
+from modelaudit.utils.filetype import detect_file_format, find_sharded_files, is_zipfile
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -38,7 +34,7 @@ def test_detect_file_format_by_extension(tmp_path):
     extensions = {
         ".pt": "pickle",
         ".pth": "pickle",
-        ".bin": "pickle",
+        ".bin": "pytorch_binary",  # .bin files with generic content are now pytorch_binary
         ".ckpt": "pickle",
         ".pkl": "pickle",
         ".pickle": "pickle",
