@@ -589,9 +589,9 @@ class ManifestScanner(BaseScanner):
         self, matches: list[str], ml_context: dict
     ) -> IssueSeverity:
         """Determine severity based on context and match types"""
-        # Execution patterns are always ERROR (highest priority)
+        # Execution patterns are always WARNING
         if "execution" in matches:
-            return IssueSeverity.ERROR
+            return IssueSeverity.WARNING
 
         # In high-confidence ML context, downgrade some warnings
         if ml_context.get("confidence", 0) >= 2:
