@@ -252,6 +252,14 @@ modelaudit scan model.pkl || exit 1
 
 **Note**: This scanner is disabled by default for LLMs (models with >10k vocabulary size) as the detection methods are not effective for large language models. To enable experimental LLM scanning, use `--config '{"enable_llm_checks": true}'`.
 
+### GGUF/GGML Scanner
+
+**Validates GGUF/GGML model headers and metadata:**
+
+- Checks magic bytes and version numbers
+- Verifies key/value counts against file size
+- Flags suspicious metadata strings
+
 ## 🛠️ Development
 
 ### Setup
