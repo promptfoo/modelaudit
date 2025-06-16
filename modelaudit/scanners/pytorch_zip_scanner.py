@@ -128,8 +128,8 @@ class PyTorchZipScanner(BaseScanner):
                     os.path.basename(f) for f in pickle_files
                 ]:
                     result.add_issue(
-                        "PyTorch model missing data.pkl file - unusual for "
-                        "standard PyTorch models",
+                        "PyTorch model is missing 'data.pkl', which is "
+                        "unusual for standard PyTorch models.",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"missing_file": "data.pkl"},

@@ -22,11 +22,17 @@ poetry run pytest                          # Run all tests
 poetry run pytest tests/test_pickle_scanner.py  # Run specific test file
 poetry run pytest -k "test_pickle"         # Run tests matching pattern
 
-# Linting and Formatting
-poetry run black modelaudit/ tests/        # Format code (ALWAYS run before committing)
-poetry run isort modelaudit/ tests/        # Sort imports
-poetry run flake8 modelaudit/ tests/       # Check style
+# Linting and Formatting (run ALL before committing)
+poetry run ruff format .                   # Format code with Ruff (alternative formatter)
 poetry run mypy modelaudit/                # Type checking
+
+# Quick format check
+poetry run ruff format --check .           # Check if Ruff formatting is needed
+
+# Recommended order before committing:
+# 2. poetry run ruff format .
+# 5. poetry run mypy modelaudit/
+# 6. poetry run pytest
 ```
 
 ## Architecture
@@ -61,6 +67,7 @@ poetry run mypy modelaudit/                # Type checking
 - Unsafe Lambda layers (Keras/TensorFlow)
 - Executable files in archives
 - Blacklisted model names
+- Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 
 ## Exit Codes
 
