@@ -36,7 +36,7 @@ def test_gguf_scanner_large_kv(tmp_path):
     path = tmp_path / "bad.gguf"
     _write_minimal_gguf(path, n_kv=2**31)
     result = GgufScanner().scan(str(path))
-    assert any(i.severity == IssueSeverity.ERROR for i in result.issues)
+    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
 def test_gguf_scanner_truncated(tmp_path):
@@ -48,5 +48,5 @@ def test_gguf_scanner_truncated(tmp_path):
         f.write(struct.pack("<q", 5))
     result = GgufScanner().scan(str(path))
     assert not result.success or any(
-        i.severity == IssueSeverity.ERROR for i in result.issues
+        i.severity == IssueSeverity.CRITICAL for i in result.issues
     )

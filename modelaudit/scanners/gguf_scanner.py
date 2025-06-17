@@ -61,7 +61,7 @@ class GgufScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning GGUF file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -69,7 +69,7 @@ class GgufScanner(BaseScanner):
             return result
 
         result.finish(
-            success=not any(i.severity == IssueSeverity.ERROR for i in result.issues)
+            success=not any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
         )
         return result
 
@@ -101,14 +101,15 @@ class GgufScanner(BaseScanner):
         if n_kv < 0 or n_kv > 1_000_000:
             result.add_issue(
                 f"GGUF header appears invalid (declared {n_kv} entries)",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
             )
             return
 
         offset = 24
         if offset >= file_size:
             result.add_issue(
-                "File too small to contain GGUF metadata", severity=IssueSeverity.ERROR
+                "File too small to contain GGUF metadata",
+                severity=IssueSeverity.CRITICAL,
             )
             return
 
@@ -150,7 +151,7 @@ class GgufScanner(BaseScanner):
                     offset += size
         except Exception as e:
             result.add_issue(
-                f"GGUF metadata parse error: {e}", severity=IssueSeverity.ERROR
+                f"GGUF metadata parse error: {e}", severity=IssueSeverity.CRITICAL
             )
 
     def _scan_ggml(self, f, file_size: int, magic: bytes, result: ScanResult) -> None:
@@ -158,13 +159,13 @@ class GgufScanner(BaseScanner):
         result.metadata["magic"] = magic.decode("ascii", "ignore")
         if file_size < 32:
             result.add_issue(
-                "File too small to be valid GGML", severity=IssueSeverity.ERROR
+                "File too small to be valid GGML", severity=IssueSeverity.CRITICAL
             )
             return
         # Basic heuristic: read an int32 version and a count
         version_bytes = f.read(4)
         if len(version_bytes) < 4:
-            result.add_issue("Truncated GGML header", severity=IssueSeverity.ERROR)
+            result.add_issue("Truncated GGML header", severity=IssueSeverity.CRITICAL)
             return
         version = struct.unpack("<I", version_bytes)[0]
         result.metadata["version"] = version
