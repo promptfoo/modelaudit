@@ -1,7 +1,9 @@
+import re
+from importlib.metadata import PackageNotFoundError, version
+
+import modelaudit
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-import modelaudit
-from importlib.metadata import version, PackageNotFoundError
 
 
 def test_unknown_file(tmp_path):
@@ -251,3 +253,38 @@ def test_version_consistency():
             f"Expected __version__ to be 'unknown' when package is not installed, "
             f"but got '{modelaudit.__version__}'"
         )
+
+
+def test_version_is_semver():
+    """Test that __version__ follows semantic versioning format."""
+    # Semantic versioning pattern: MAJOR.MINOR.PATCH with optional pre-release and build metadata
+    # Examples: 1.0.0, 0.1.3, 2.1.0-alpha, 1.0.0-beta.1, 1.0.0+20130313144700
+    semver_pattern = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+
+    version = modelaudit.__version__
+
+    # Skip validation if version is "unknown" (development scenarios)
+    if version == "unknown":
+        return
+
+    assert re.match(semver_pattern, version), (
+        f"Version '{version}' does not follow semantic versioning format. "
+        f"Expected format: MAJOR.MINOR.PATCH (e.g., 1.0.0, 0.1.3, 2.1.0-alpha)"
+    )
+
+    # Additional basic checks
+    parts = version.split(".")
+    assert len(parts) >= 3, (
+        f"Version '{version}' must have at least 3 parts (major.minor.patch)"
+    )
+
+    # Ensure major, minor, patch are numeric (before any pre-release suffix)
+    major = parts[0]
+    minor = parts[1]
+    patch_part = (
+        parts[2].split("-")[0].split("+")[0]
+    )  # Remove pre-release/build metadata
+
+    assert major.isdigit(), f"Major version '{major}' must be numeric"
+    assert minor.isdigit(), f"Minor version '{minor}' must be numeric"
+    assert patch_part.isdigit(), f"Patch version '{patch_part}' must be numeric"
