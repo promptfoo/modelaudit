@@ -143,11 +143,12 @@ def test_scan_output_file(tmp_path):
     output_file = tmp_path / "output.txt"
 
     runner = CliRunner()
-    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
+    result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
 
     # The file should be created regardless of the exit code
     assert output_file.exists()
     assert output_file.read_text()  # Should not be empty
+    assert f"Results written to {output_file}" in result.output
 
 
 def test_scan_verbose_mode(tmp_path):
