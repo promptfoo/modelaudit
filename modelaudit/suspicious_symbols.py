@@ -85,6 +85,16 @@ SUSPICIOUS_GLOBALS = {
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
     "socket": ["*"],  # Network communication
+    # Serialization libraries that can execute arbitrary code - HIGH RISK
+    "dill": [
+        "load",
+        "loads",
+        "load_module",
+        "load_module_asdict",
+        "load_session",
+    ],  # dill's load helpers can execute arbitrary code when unpickling
+    # References to the private dill._dill module are also suspicious
+    "dill._dill": "*",
 }
 
 # Suspicious string patterns used by PickleScanner
