@@ -18,7 +18,7 @@ git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
 # Install with Poetry (recommended)
-poetry install --sync --with dev --extras "all"
+poetry sync --with dev --extras "all"
 
 # Or with pip
 pip install -e .[all]
@@ -36,7 +36,7 @@ pip install -e .[all]
 modelaudit scan test_model.pkl
 
 # Option 2: Use Poetry (recommended)
-poetry install --sync --with dev --extras "all"
+poetry sync --with dev --extras "all"
 
 # Test with Poetry run (no shell activation needed)
 poetry run modelaudit scan test_model.pkl
@@ -69,7 +69,7 @@ poetry run pytest tests/test_pickle_scanner.py -v
 poetry run pytest tests/test_integration.py -v
 
 # Run tests with all optional dependencies
-poetry install --sync --with dev --extras "all"
+poetry sync --with dev --extras "all"
 poetry run pytest
 ```
 
