@@ -31,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Lint with Ruff
         run: |
@@ -75,7 +75,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Type checking
         run: poetry run mypy modelaudit/
@@ -102,7 +102,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Run tests with pytest
         run: poetry run pytest -v --cov=modelaudit
@@ -127,7 +127,7 @@ jobs:
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
+          poetry sync --no-interaction
           poetry build
 
       - name: Upload artifacts
