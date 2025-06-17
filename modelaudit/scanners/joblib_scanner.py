@@ -23,8 +23,12 @@ class JoblibScanner(BaseScanner):
         self.pickle_scanner = PickleScanner(config)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
-        self.max_decompressed_size = self.config.get("max_decompressed_size", 100 * 1024 * 1024)  # 100MB
-        self.max_file_read_size = self.config.get("max_file_read_size", 100 * 1024 * 1024)  # 100MB
+        self.max_decompressed_size = self.config.get(
+            "max_decompressed_size", 100 * 1024 * 1024
+        )  # 100MB
+        self.max_file_read_size = self.config.get(
+            "max_file_read_size", 100 * 1024 * 1024
+        )  # 100MB
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -39,10 +43,12 @@ class JoblibScanner(BaseScanner):
         """Read file in chunks with size validation"""
         data = b""
         file_size = self.get_file_size(path)
-        
+
         if file_size > self.max_file_read_size:
-            raise ValueError(f"File too large: {file_size} bytes (max: {self.max_file_read_size})")
-        
+            raise ValueError(
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})"
+            )
+
         with open(path, "rb") as f:
             while True:
                 chunk = f.read(self.chunk_size)
@@ -56,7 +62,7 @@ class JoblibScanner(BaseScanner):
     def _safe_decompress(self, data: bytes) -> bytes:
         """Safely decompress data with bomb protection"""
         compressed_size = len(data)
-        
+
         # Try zlib first
         decompressed = None
         try:
@@ -67,7 +73,7 @@ class JoblibScanner(BaseScanner):
                 decompressed = lzma.decompress(data)
             except Exception as e:
                 raise ValueError(f"Unable to decompress joblib file: {e}")
-        
+
         # Check decompression ratio for compression bomb detection
         if compressed_size > 0:
             ratio = len(decompressed) / compressed_size
@@ -76,14 +82,14 @@ class JoblibScanner(BaseScanner):
                     f"Suspicious compression ratio: {ratio:.1f}x "
                     f"(max: {self.max_decompression_ratio}x) - possible compression bomb"
                 )
-        
+
         # Check absolute decompressed size
         if len(decompressed) > self.max_decompressed_size:
             raise ValueError(
                 f"Decompressed size too large: {len(decompressed)} bytes "
                 f"(max: {self.max_decompressed_size})"
             )
-        
+
         return decompressed
 
     def scan(self, path: str) -> ScanResult:
