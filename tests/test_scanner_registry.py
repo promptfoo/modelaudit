@@ -11,6 +11,7 @@ def test_scanner_registry_contains_all_scanners():
     assert "TensorFlowSavedModelScanner" in scanner_classes
     assert "KerasH5Scanner" in scanner_classes
     assert "PyTorchZipScanner" in scanner_classes
+    assert "OnnxScanner" in scanner_classes
     assert "SafeTensorsScanner" in scanner_classes
 
 
@@ -57,6 +58,7 @@ def test_scanner_registry_file_extension_coverage():
         ".hdf5",
         ".keras",
         ".pb",
+        ".onnx",
         ".safetensors",
     ]
 

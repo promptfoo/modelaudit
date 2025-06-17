@@ -339,3 +339,119 @@ class TestWeightDistributionScanner:
         for anomaly in anomalies:
             if "outlier_neurons" in anomaly["details"]:
                 assert anomaly["details"]["total_outliers"] <= 2
+
+    def test_gpt2_layer_pattern_detection(self):
+        """Test that GPT-2 style layer patterns are detected as LLM layers"""
+        scanner = WeightDistributionScanner()
+
+        # Test GPT-2 style layer names
+        gpt2_layer_names = [
+            "h.0.mlp.c_fc.weight",
+            "h.1.attn.c_attn.weight",
+            "h.11.mlp.c_proj.weight",
+            "transformer.h.5.mlp.c_fc.weight",
+        ]
+
+        # Create typical GPT-2 MLP weights (3072 -> 768 for GPT-2 base)
+        np.random.seed(42)
+        weights = np.random.randn(3072, 768) * 0.02
+
+        # Add some natural variation
+        weights[:, :10] *= 1.5  # Some neurons have different scales
+
+        for layer_name in gpt2_layer_names:
+            anomalies = scanner._analyze_layer_weights(layer_name, weights)
+
+            # Should return no anomalies due to LLM detection
+            assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
+
+    def test_transformer_layer_pattern_detection(self):
+        """Test that transformer-related patterns are detected as LLM layers"""
+        scanner = WeightDistributionScanner()
+
+        # Test transformer-related layer names
+        transformer_patterns = [
+            "encoder.layers.0.mlp.dense_h_to_4h.weight",
+            "decoder.attention.dense.weight",
+            "transformer.mlp.fc_in.weight",
+            "model.layers.5.mlp.gate_proj.weight",
+        ]
+
+        # Create transformer-like weights
+        np.random.seed(42)
+        weights = np.random.randn(1024, 4096) * 0.02  # Typical transformer dimensions
+
+        for layer_name in transformer_patterns:
+            anomalies = scanner._analyze_layer_weights(layer_name, weights)
+
+            # Should return no anomalies due to LLM detection
+            assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
+
+    def test_large_hidden_dimension_detection(self):
+        """Test that layers with large hidden dimensions are detected as LLM layers"""
+        scanner = WeightDistributionScanner()
+
+        # Test various large hidden dimensions typical of LLMs
+        large_dimensions = [768, 1024, 2048, 4096, 8192]
+
+        for hidden_dim in large_dimensions:
+            np.random.seed(42)
+            weights = np.random.randn(hidden_dim, 100) * 0.02  # Input dimension > 768
+
+            anomalies = scanner._analyze_layer_weights("some_layer.weight", weights)
+
+            # Should return no anomalies due to LLM detection
+            assert len(anomalies) == 0, (
+                f"Layer with {hidden_dim} hidden dims should be detected as LLM"
+            )
+
+    def test_non_llm_layers_still_analyzed(self):
+        """Test that non-LLM layers are still properly analyzed for anomalies"""
+        scanner = WeightDistributionScanner()
+
+        # Create small classification layer (typical for image classification)
+        np.random.seed(42)
+        weights = np.random.randn(512, 10) * 0.1  # 512 features -> 10 classes
+
+        # Add a clear anomaly
+        weights[:, 5] = np.random.randn(512) * 5.0  # One class with much larger weights
+
+        anomalies = scanner._analyze_layer_weights("classifier.weight", weights)
+
+        # Should detect the anomaly since this is not an LLM layer
+        assert len(anomalies) > 0, (
+            "Non-LLM layers should still be analyzed for anomalies"
+        )
+
+        # Should find outlier neurons
+        has_outlier = any(
+            "abnormal weight magnitudes" in a["description"] for a in anomalies
+        )
+        has_extreme = any(
+            "extremely large weight values" in a["description"] for a in anomalies
+        )
+        assert has_outlier or has_extreme
+
+    def test_llm_enabled_with_extreme_outliers(self):
+        """Test LLM analysis with extremely suspicious outliers when enabled"""
+        config = {"enable_llm_checks": True}
+        scanner = WeightDistributionScanner(config)
+
+        # Create GPT-2 style layer with extremely suspicious outliers
+        np.random.seed(42)
+        weights = np.random.randn(768, 3072) * 0.02  # GPT-2 attention projection
+
+        # Make just 1 neuron extremely suspicious (potential backdoor)
+        weights[:, 0] = np.random.randn(768) * 50.0  # Very extreme outlier
+
+        anomalies = scanner._analyze_layer_weights("h.0.attn.c_proj.weight", weights)
+
+        # With strict LLM thresholds, only extreme outliers should be flagged
+        # Should detect at most 1-2 issues (outlier detection + extreme values)
+        assert len(anomalies) <= 2
+
+        for anomaly in anomalies:
+            if "outlier_neurons" in anomaly["details"]:
+                # Should only flag the 1 extremely suspicious neuron
+                assert anomaly["details"]["total_outliers"] <= 1
+                assert 0 in anomaly["details"]["outlier_neurons"]

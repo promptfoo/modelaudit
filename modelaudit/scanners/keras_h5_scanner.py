@@ -67,8 +67,9 @@ class KerasH5Scanner(BaseScanner):
         if not HAS_H5PY:
             result = self._create_result()
             result.add_issue(
-                "h5py not installed, cannot scan Keras H5 files.",
-                severity=IssueSeverity.ERROR,
+                "h5py not installed, cannot scan Keras H5 files. Install with "
+                "'pip install modelaudit[h5]'.",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -88,12 +89,29 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
-                    result.add_issue(
-                        "File does not appear to be a Keras model "
-                        "(no model_config attribute)",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
+                    # Check if this might be a TensorFlow SavedModel H5 file instead
+                    # Look for common TensorFlow H5 structure patterns
+                    is_tensorflow_h5 = any(
+                        key.startswith(
+                            ("model_weights", "optimizer_weights", "variables")
+                        )
+                        for key in f.keys()
                     )
+
+                    if is_tensorflow_h5:
+                        result.add_issue(
+                            "File appears to be a TensorFlow H5 model, not Keras format "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - this is expected
+                            location=self.current_file_path,
+                        )
+                    else:
+                        result.add_issue(
+                            "File does not appear to be a Keras model "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - not necessarily suspicious
+                            location=self.current_file_path,
+                        )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
 
@@ -137,7 +155,7 @@ class KerasH5Scanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning Keras H5 file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -187,7 +205,7 @@ class KerasH5Scanner(BaseScanner):
             if layer_class in self.suspicious_layer_types:
                 result.add_issue(
                     f"Suspicious layer type found: {layer_class}",
-                    severity=IssueSeverity.ERROR,
+                    severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={
                         "layer_class": layer_class,
