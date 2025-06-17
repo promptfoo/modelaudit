@@ -40,11 +40,11 @@ SCANNER_REGISTRY = [
     KerasH5Scanner,
     OnnxScanner,
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
-    ManifestScanner,
-    WeightDistributionScanner,
     GgufScanner,
     JoblibScanner,
     NumPyScanner,
+    ManifestScanner,
+    WeightDistributionScanner,
     SafeTensorsScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
@@ -60,10 +60,10 @@ __all__ = [
     "onnx_scanner",
     "safetensors_scanner",
     "manifest_scanner",
-    "weight_distribution_scanner",
     "gguf_scanner",
     "joblib_scanner",
     "numpy_scanner",
+    "weight_distribution_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
