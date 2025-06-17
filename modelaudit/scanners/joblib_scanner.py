@@ -29,6 +29,7 @@ class JoblibScanner(BaseScanner):
         self.max_file_read_size = self.config.get(
             "max_file_read_size", 100 * 1024 * 1024
         )  # 100MB
+        self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
