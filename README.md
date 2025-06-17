@@ -339,6 +339,10 @@ poetry run mypy modelaudit/
 # Build package
 poetry build
 
+# The generated distribution contains only the `modelaudit` code and metadata.
+# Unnecessary files like tests and Docker configurations are excluded via
+# `MANIFEST.in`.
+
 # Publish (maintainers only)
 poetry publish
 ```
