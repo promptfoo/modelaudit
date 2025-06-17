@@ -12,14 +12,17 @@ COPY pyproject.toml poetry.lock* ./
 # Configure Poetry
 RUN poetry config virtualenvs.create false
 
-# Install dependencies first (this layer will be cached unless deps change)
-RUN poetry install --only main --no-interaction --no-root
+# Export dependencies to requirements.txt for layer caching
+RUN poetry export --only main --format requirements.txt --output requirements.txt --without-hashes
+
+# Install dependencies using pip (better layer caching, no Poetry conflicts)
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project code after dependencies are installed
 COPY . .
 
-# Install the package itself (editable install)
-RUN poetry install --only main --no-interaction --no-deps
+# Install the package itself using pip
+RUN pip install --no-cache-dir -e .
 
 # Set entrypoint
 ENTRYPOINT ["modelaudit"]
