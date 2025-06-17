@@ -1,13 +1,11 @@
 """Tests for the 'why' explanations feature."""
 
-import json
-import tempfile
 import pickle
-import pytest
+import tempfile
 
+from modelaudit.explanations import get_import_explanation, get_opcode_explanation
 from modelaudit.scanners.base import Issue, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.explanations import get_import_explanation, get_opcode_explanation
 
 
 def test_issue_with_why_field():

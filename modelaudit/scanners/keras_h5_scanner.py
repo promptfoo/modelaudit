@@ -2,8 +2,8 @@ import json
 import os
 from typing import Any, Optional
 
-from .base import BaseScanner, IssueSeverity, ScanResult
 from ..explanations import get_pattern_explanation
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
 try:

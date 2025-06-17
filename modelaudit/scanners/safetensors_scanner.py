@@ -199,7 +199,7 @@ class SafeTensorsScanner(BaseScanner):
                                 f"Metadata value for {key} is very long",
                                 severity=IssueSeverity.INFO,
                                 location=path,
-                                why=f"Metadata fields over 1000 characters are unusual in model files. Long strings in metadata could contain encoded payloads, scripts, or data exfiltration attempts.",
+                                why="Metadata fields over 1000 characters are unusual in model files. Long strings in metadata could contain encoded payloads, scripts, or data exfiltration attempts.",
                             )
                         if isinstance(value, str) and any(
                             s in value.lower() for s in ["import ", "#!/", "\\"]
