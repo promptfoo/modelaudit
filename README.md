@@ -18,7 +18,7 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 - [CI/CD Integration](#-cicd-integration)
 - [Troubleshooting](#-troubleshooting)
 - [Limitations](#-limitations)
-- [Development](#️-development)
+
 - [License](#-license)
 
 ## 🔍 What It Does
@@ -403,11 +403,6 @@ modelaudit scan model.pkl --verbose --format json | jq '.issues[].details'
 - **Check file permissions**: Ensure ModelAudit can read your files
 - **Verify file format**: Confirm the file is a supported model format
 
-For additional help:
-
-- Check the [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) for known problems
-- Visit the [GitHub Repository](https://github.com/promptfoo/modelaudit) for source code and development information
-
 ## ⚠️ Limitations
 
 ### What ModelAudit Detects
@@ -481,27 +476,7 @@ pickle.dump({'debug': True, 'os': __import__('os')}, file)
    - Implement automated scanning in CI/CD pipelines
    - Monitor model behavior after deployment
 
-## 🛠️ Development
 
-### Installing from Source
-
-If you want to install the latest development version from source:
-
-```bash
-# Clone repository
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
-
-# Install with Poetry (recommended)
-poetry install --all-extras
-
-# Or with pip
-pip install -e .[all]
-```
-
-### Contributing
-
-Interested in contributing? Visit the [GitHub Repository](https://github.com/promptfoo/modelaudit) to get started with development, view source code, and submit pull requests.
 
 ## 📝 License
 
