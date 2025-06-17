@@ -21,7 +21,6 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Security Detection](#security-detection)
   - [🛡️ Supported Model Formats](#️-supported-model-formats)
     - [Weight Analysis](#weight-analysis)
-    - [ONNX Scanner](#onnx-scanner)
   - [⚙️ Advanced Usage](#️-advanced-usage)
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
@@ -180,26 +179,6 @@ ModelAudit provides specialized security scanners for different model formats:
 ### Weight Analysis
 
 ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
-
-### ONNX Scanner
-
-**Inspects ONNX models for security risks and integrity issues:**
-
-- **Custom Operators**: Flags non-standard operator domains that could contain malicious code
-- **External Data Validation**: Verifies external weight files exist and have correct sizes
-- **Tensor Integrity**: Checks for truncated or corrupted tensor data
-- **Path Traversal Protection**: Ensures external data files stay within model directory
-- **Model Structure Analysis**: Validates ONNX model format and metadata
-
-### GGUF/GGML Scanner
-
-**Validates GGUF and GGML quantized model files used by llama.cpp:**
-
-- **Format Validation**: Verifies file headers and structure integrity
-- **Tensor Validation**: Checks tensor dimensions, alignments, and data consistency
-- **Metadata Security**: Detects path traversal attempts and suspicious patterns
-- **Size Limits**: Prevents DoS attacks through oversized tensors or metadata
-- **Quantization Checks**: Validates quantized tensor formats and block alignments
 
 ## ⚙️ Advanced Usage
 
