@@ -341,3 +341,77 @@ def test_gguf_scanner_error_handling(tmp_path):
     dir_path.mkdir()
     result = scanner.scan(str(dir_path))
     assert not result.success
+
+
+def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
+    """Test handling of tensors with invalid dimensions (regression test for dimension bug)."""
+    path = tmp_path / "invalid_dims.gguf"
+    with open(path, "wb") as f:
+        # Header
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))  # version
+        f.write(struct.pack("<Q", 2))  # tensor count - two tensors to test both cases
+        f.write(struct.pack("<Q", 1))  # kv count
+
+        # Minimal metadata
+        key = b"general.alignment"
+        f.write(struct.pack("<Q", len(key)))
+        f.write(key)
+        f.write(struct.pack("<I", 4))  # UINT32
+        f.write(struct.pack("<I", 32))  # alignment value
+
+        # Align to 32 bytes
+        pad = (32 - (f.tell() % 32)) % 32
+        f.write(b"\0" * pad)
+
+        # First tensor with invalid dimensions: [10, 0, 5] - has zero dimension
+        name1 = b"tensor_with_zero"
+        f.write(struct.pack("<Q", len(name1)))
+        f.write(name1)
+        f.write(struct.pack("<I", 3))  # 3 dimensions
+        f.write(struct.pack("<Q", 10))  # first dimension
+        f.write(struct.pack("<Q", 0))  # zero dimension (invalid!)
+        f.write(struct.pack("<Q", 5))  # third dimension
+        f.write(struct.pack("<I", 0))  # f32 tensor type
+        offset1 = 100  # dummy offset
+        f.write(struct.pack("<Q", offset1))
+
+        # Second tensor with invalid dimensions: [10, -1, 5] - has negative dimension
+        name2 = b"tensor_with_negative"
+        f.write(struct.pack("<Q", len(name2)))
+        f.write(name2)
+        f.write(struct.pack("<I", 3))  # 3 dimensions
+        f.write(struct.pack("<Q", 10))  # first dimension
+        f.write(struct.pack("<q", -1))  # negative dimension (invalid!)
+        f.write(struct.pack("<Q", 5))  # third dimension
+        f.write(struct.pack("<I", 0))  # f32 tensor type
+        offset2 = 200  # dummy offset
+        f.write(struct.pack("<Q", offset2))
+
+    result = GgufScanner().scan(str(path))
+
+    # The scan should succeed but report the invalid dimensions
+    assert result.success
+
+    # Should have warnings about both invalid dimensions
+    warning_messages = [issue.message for issue in result.issues]
+
+    # Check for zero dimension warning
+    assert any(
+        "tensor_with_zero" in msg and "invalid dimension: 0" in msg
+        for msg in warning_messages
+    )
+
+    # Check for negative dimension warning (the exact value depends on how it's interpreted)
+    assert any(
+        "tensor_with_negative" in msg and "invalid dimension" in msg
+        for msg in warning_messages
+    )
+
+    # Should have exactly 2 warnings (one for each invalid dimension)
+    dimension_warnings = [msg for msg in warning_messages if "invalid dimension" in msg]
+    assert len(dimension_warnings) == 2
+
+    # Verify that tensors metadata is still populated (shows parsing continued)
+    assert "tensors" in result.metadata
+    assert len(result.metadata["tensors"]) == 2

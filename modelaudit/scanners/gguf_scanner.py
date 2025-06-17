@@ -252,14 +252,20 @@ class GgufScanner(BaseScanner):
         for idx, tensor in enumerate(tensors):
             try:
                 nelements = 1
+                has_invalid_dimension = False
                 for d in tensor["dims"]:
                     if d <= 0 or d > 2**31:
                         result.add_issue(
                             f"Tensor {tensor['name']} has invalid dimension: {d}",
                             IssueSeverity.WARNING,
                         )
-                        continue
+                        has_invalid_dimension = True
+                        break
                     nelements *= d
+
+                # Skip tensor validation if any dimension is invalid
+                if has_invalid_dimension:
+                    continue
 
                 # Check for extremely large tensors
                 uncompressed = nelements * 4
