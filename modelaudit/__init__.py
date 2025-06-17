@@ -5,7 +5,7 @@ Python Packaging Authority (PyPA) as of 2025. The version is defined once in
 pyproject.toml and accessed at runtime via importlib.metadata.
 """
 
-from importlib.metadata import version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, version
 
 try:
     __version__ = version("modelaudit")
