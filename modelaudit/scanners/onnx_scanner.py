@@ -41,7 +41,7 @@ class OnnxScanner(BaseScanner):
         if not HAS_ONNX:
             result.add_issue(
                 "onnx package not installed, cannot scan ONNX files.",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
             )
             result.finish(success=False)
@@ -53,7 +53,7 @@ class OnnxScanner(BaseScanner):
         except Exception as e:  # pragma: no cover - unexpected parse errors
             result.add_issue(
                 f"Error parsing ONNX model: {e}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -107,14 +107,14 @@ class OnnxScanner(BaseScanner):
                 if not external_path.exists():
                     result.add_issue(
                         f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
                     )
                 elif not str(external_path).startswith(str(model_dir)):
                     result.add_issue(
                         f"External data file outside model directory for tensor '{tensor.name}'",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
                     )
@@ -134,7 +134,7 @@ class OnnxScanner(BaseScanner):
             if actual_size < expected_size:
                 result.add_issue(
                     "External data file size mismatch",
-                    severity=IssueSeverity.ERROR,
+                    severity=IssueSeverity.CRITICAL,
                     location=str(external_path),
                     details={
                         "tensor": tensor.name,
@@ -164,7 +164,7 @@ class OnnxScanner(BaseScanner):
                     if actual_size < expected_size:
                         result.add_issue(
                             f"Tensor '{tensor.name}' data appears truncated",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{path} (tensor: {tensor.name})",
                             details={
                                 "expected_size": expected_size,
