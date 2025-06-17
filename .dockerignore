@@ -23,9 +23,12 @@ test_*.py
 *.log
 *.pkl
 analysis.json
-*.json
+# Specific JSON files to exclude (avoid broad *.json exclusion)
 enhanced_yolo_results.json
 yolo_warnings.json
+test_results.json
+*_test.json
+*_results.json
 
 # Build artifacts
 dist/
