@@ -18,7 +18,6 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 - [CI/CD Integration](#-cicd-integration)
 - [Troubleshooting](#-troubleshooting)
 - [Limitations](#-limitations)
-
 - [License](#-license)
 
 ## 🔍 What It Does
@@ -29,6 +28,7 @@ ModelAudit scans ML model files for:
 - **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
 - **Potentially unsafe Keras Lambda layers** with arbitrary code execution
 - **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
+- **Custom ONNX operators** and external data integrity issues
 - **Encoded payloads** and suspicious string patterns
 - **Risky configurations** in model architectures
 - **Suspicious patterns** in model manifests and configuration files
@@ -39,7 +39,7 @@ ModelAudit scans ML model files for:
 
 ### Installation
 
-ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/).
+ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/) and requires **Python 3.9 or higher**.
 
 **Basic installation:**
 
@@ -105,7 +105,7 @@ Active Scanner: pickle
 Scan completed in 0.02 seconds
 Files scanned: 1
 Scanned 156 bytes
-Issues found: 2 errors, 1 warnings
+Issues found: 2 critical, 1 warnings
 
 1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
@@ -129,7 +129,7 @@ Issues found: 2 errors, 1 warnings
 
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Multiple Output Formats**: Human-readable text and machine-readable JSON
-- **Severity Levels**: ERROR, WARNING, INFO, DEBUG for flexible filtering
+- **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Ready**: Clear exit codes for automated pipeline integration
 
 ### Security Detection
@@ -151,6 +151,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
 | **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
+| **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
 | **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
@@ -158,6 +159,16 @@ ModelAudit provides specialized security scanners for different model formats:
 ### Weight Analysis
 
 For classification models, ModelAudit can also detect anomalous weight patterns that may indicate trojaned models using statistical analysis (disabled by default for large language models).
+
+### ONNX Scanner
+
+**Inspects ONNX models for security risks and integrity issues:**
+
+- **Custom Operators**: Flags non-standard operator domains that could contain malicious code
+- **External Data Validation**: Verifies external weight files exist and have correct sizes
+- **Tensor Integrity**: Checks for truncated or corrupted tensor data
+- **Path Traversal Protection**: Ensures external data files stay within model directory
+- **Model Structure Analysis**: Validates ONNX model format and metadata
 
 ## ⚙️ Advanced Usage
 
@@ -209,7 +220,7 @@ When using `--format json`, ModelAudit outputs:
       "timestamp": 1750136949.7755148
     }
   ],
-  "has_errors": false,
+  "has_errors": true,
   "files_scanned": 1,
   "duration": 0.0004527568817138672
 }
@@ -260,7 +271,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.9"
 
@@ -275,7 +286,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload scan results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: security-scan-results
           path: scan-results.json
@@ -309,8 +320,6 @@ model-security-scan:
     - modelaudit scan models/ --format json --output scan-results.json
   artifacts:
     when: always
-    reports:
-      junit: scan-results.json
     paths:
       - scan-results.json
   allow_failure: false
