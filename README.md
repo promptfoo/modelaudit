@@ -19,22 +19,9 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Core Capabilities](#core-capabilities)
     - [Reporting \& Integration](#reporting--integration)
     - [Security Detection](#security-detection)
-    - [Advanced Security Protections](#advanced-security-protections)
   - [🛡️ Supported Model Formats](#️-supported-model-formats)
     - [Weight Analysis](#weight-analysis)
     - [ONNX Scanner](#onnx-scanner)
-  - [🛠️ Security Scanners](#️-security-scanners)
-    - [Pickle Scanner](#pickle-scanner)
-    - [TensorFlow Scanner](#tensorflow-scanner)
-    - [Keras Scanner](#keras-scanner)
-    - [PyTorch Scanner](#pytorch-scanner)
-    - [Joblib Scanner](#joblib-scanner)
-    - [NumPy Scanner](#numpy-scanner)
-    - [SafeTensors Scanner](#safetensors-scanner)
-    - [GGUF/GGML Scanner](#ggufggml-scanner)
-    - [Manifest Scanner](#manifest-scanner)
-    - [ZIP Scanner](#zip-scanner)
-    - [Weight Distribution Scanner](#weight-distribution-scanner)
   - [⚙️ Advanced Usage](#️-advanced-usage)
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
@@ -62,9 +49,8 @@ ModelAudit scans ML model files for:
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
-- **Compressed archive vulnerabilities** (compression bombs, memory exhaustion)
+- **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
-- **Joblib serialization risks** (embedded pickle content, decompression attacks)
 
 ## 🚀 Quick Start
 
@@ -115,7 +101,7 @@ modelaudit scan model.pkl
 # Scan an ONNX model
 modelaudit scan model.onnx
 
-# Scan multiple models of different formats
+# Scan multiple models
 modelaudit scan model1.pkl model2.h5 model3.pt model4.joblib model5.npy
 
 # Scan a directory
@@ -178,14 +164,6 @@ Issues found: 2 critical, 1 warnings
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
-### Advanced Security Protections
-
-- **Compression Bomb Detection**: Prevents decompression attacks with configurable ratio limits (>100x compression flagged)
-- **Memory Exhaustion Protection**: Configurable limits on file sizes, array dimensions, and memory usage
-- **Integer Overflow Prevention**: Safe arithmetic prevents malicious array size calculations from causing crashes
-- **Resource Limits**: Configurable timeouts, file size limits, and memory constraints prevent DoS attacks
-- **Attack Scenario Testing**: Comprehensive test suite validates protection against real-world attack vectors
-
 ## 🛡️ Supported Model Formats
 
 ModelAudit provides specialized security scanners for different model formats:
@@ -200,7 +178,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
 | **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, metadata integrity, suspicious patterns      |
-| **Joblib**         | `.joblib`                                                                                                | Compression bombs, embedded pickle analysis, decompression safety |
+| **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
 | **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
 | **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
@@ -219,111 +197,6 @@ ModelAudit can detect anomalous weight patterns that may indicate trojaned model
 - **Path Traversal Protection**: Ensures external data files stay within model directory
 - **Model Structure Analysis**: Validates ONNX model format and metadata
 
-## 🛠️ Security Scanners
-
-### Pickle Scanner
-
-**Detects malicious code in Python pickle files:**
-
-- Dangerous opcodes: `REDUCE`, `INST`, `OBJ`, `STACK_GLOBAL`
-- Suspicious imports: `os`, `subprocess`, `eval`, `exec`
-- Encoded payloads and obfuscated code
-- `__reduce__` method exploits
-
-### TensorFlow Scanner
-
-**Analyzes TensorFlow SavedModel for suspicious operations:**
-
-- File I/O operations: `ReadFile`, `WriteFile`
-- Python execution: `PyFunc`, `PyCall`
-- System operations: `ShellExecute`, `SystemConfig`
-- Checks SavedModel directory structure
-
-### Keras Scanner
-
-**Examines Keras H5 models for security risks:**
-
-- Dangerous layer types: `Lambda`, `TFOpLambda`
-- Suspicious configurations containing code execution
-- Custom objects and metrics with arbitrary code
-- Model architecture analysis
-
-### PyTorch Scanner
-
-**Scans PyTorch models (ZIP-based format):**
-
-- Embedded pickle file analysis
-- Missing standard files (data.pkl warnings)
-- Suspicious additional files (Python scripts, executables)
-- Custom blacklist pattern matching
-
-### Joblib Scanner
-
-**Analyzes Joblib serialized files for security risks:**
-
-- **Compression Bomb Protection**: Detects suspicious compression ratios (>100x) that could cause memory exhaustion
-- **Memory Limits**: Configurable limits on decompressed file sizes and memory usage
-- **Format Validation**: Supports zlib, lzma, and ZIP-compressed joblib files
-- **Embedded Pickle Analysis**: Scans decompressed pickle content using the full pickle scanner security checks
-- **Safe Decompression**: Chunked reading and size validation prevent resource exhaustion attacks
-
-### NumPy Scanner
-
-**Examines NumPy binary files for integrity and security:**
-
-- **Array Validation**: Comprehensive validation of array dimensions, data types, and memory requirements
-- **Overflow Protection**: Prevents integer overflow in size calculations that could bypass security checks
-- **Memory Limits**: Configurable limits on total array size (default: 1GB) and individual dimensions
-- **Dangerous Type Detection**: Blocks potentially unsafe dtypes like 'object' and 'void' that could contain arbitrary Python objects
-- **File Integrity**: Validates NumPy file format, magic signatures, and header consistency
-
-### SafeTensors Scanner
-
-**Validates SafeTensors model files for integrity:**
-
-- Parses header metadata and verifies tensor offsets
-- Checks dtype and shape sizes against byte ranges
-- Flags suspicious or malformed metadata entries
-
-### GGUF/GGML Scanner
-
-**Validates GGUF and GGML model files:**
-
-- Header validation and metadata integrity
-- Suspicious patterns and configurations
-- Format compliance checking
-
-### Manifest Scanner
-
-**Analyzes configuration and manifest files:**
-
-- Suspicious keys: network access, file paths, execution commands
-- Credential exposure: passwords, API keys, secrets
-- Blacklisted model names and patterns
-- Supports JSON, YAML, XML, TOML formats
-
-### ZIP Scanner
-
-**Scans ZIP archives and their contents:**
-
-- **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
-- **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
-- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
-- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
-- **Resource limits**: Configurable max depth, max entries, and max file size protections
-
-### Weight Distribution Scanner
-
-**Detects anomalous weight patterns that may indicate trojaned models:**
-
-- **Outlier detection**: Uses Z-score analysis to find neurons with abnormal weight magnitudes
-- **Dissimilarity analysis**: Identifies weight vectors that are significantly different from others using cosine similarity
-- **Extreme value detection**: Flags neurons with unusually large weight values
-- **Multi-format support**: Works with PyTorch, Keras/TensorFlow H5, ONNX, and SafeTensors models
-- **Focus on classification models**: Designed for models with <10k output classes
-
-**Note**: This scanner is disabled by default for LLMs (models with >10k vocabulary size) as the detection methods are not effective for large language models. To enable experimental LLM scanning, use `--config '{"enable_llm_checks": true}'`.
-
 ## ⚙️ Advanced Usage
 
 ### Command Line Options
@@ -340,15 +213,6 @@ modelaudit scan large_model.pkl --timeout 300
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
-
-# Custom security configuration
-modelaudit scan model.pkl --config '{
-    "max_decompression_ratio": 50.0,
-    "max_decompressed_size": 50000000,
-    "max_array_bytes": 500000000,
-    "max_dimensions": 16,
-    "timeout": 120
-}'
 ```
 
 ### Exit Codes
@@ -425,6 +289,7 @@ modelaudit scan models/ --format json --output scan-results.json
 ### Platform Examples
 
 **GitHub Actions:**
+
 ```yaml
 - name: Scan models
   run: |
@@ -433,6 +298,7 @@ modelaudit scan models/ --format json --output scan-results.json
 ```
 
 **GitLab CI:**
+
 ```yaml
 model-security-scan:
   script:
@@ -443,6 +309,7 @@ model-security-scan:
 ```
 
 **Jenkins:**
+
 ```groovy
 sh 'pip install modelaudit[all]'
 sh 'modelaudit scan models/ --format json --output results.json'
@@ -453,6 +320,7 @@ sh 'modelaudit scan models/ --format json --output results.json'
 ### Common Issues
 
 **Installation Problems:**
+
 ```bash
 # If you get dependency conflicts
 pip install --upgrade pip setuptools wheel
@@ -464,28 +332,23 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 ```
 
 **Large Models:**
+
 ```bash
 # Increase file size limit and timeout for large models
 modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
 ```
 
 **Debug Mode:**
+
 ```bash
 # Enable verbose output for troubleshooting
 modelaudit scan model.pkl --verbose
-
-# Create test files for scanning
-python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
-python -c "import joblib; joblib.dump({'test': 'data'}, 'test_model.joblib')"
-python -c "import numpy as np; np.save('test_model.npy', np.array([1, 2, 3]))"
-
-# Test scanning them
-modelaudit scan test_model.pkl test_model.joblib test_model.npy
 ```
 
 **Getting Help:**
+
 - Use `--verbose` for detailed output
-- Use `--format json` to see all details  
+- Use `--format json` to see all details
 - Check file permissions and format support
 - Report issues on the [promptfoo GitHub repository](https://github.com/promptfoo/promptfoo/issues)
 
@@ -494,12 +357,14 @@ modelaudit scan test_model.pkl test_model.joblib test_model.npy
 ModelAudit is designed to find **obvious security risks** in model files, including direct code execution attempts, known dangerous patterns, malicious archive structures, and suspicious configurations.
 
 **What it cannot detect:**
+
 - Advanced adversarial attacks or subtle weight manipulation
-- Heavily encoded/encrypted malicious payloads  
+- Heavily encoded/encrypted malicious payloads
 - Runtime behavior that only triggers under specific conditions
 - Model poisoning through careful data manipulation
 
 **Recommendations:**
+
 - Use ModelAudit as one layer of your security strategy
 - Review flagged issues manually - not all warnings indicate malicious intent
 - Combine with other security practices like sandboxed execution and runtime monitoring
