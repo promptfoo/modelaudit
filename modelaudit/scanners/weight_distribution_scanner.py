@@ -133,6 +133,7 @@ class WeightDistributionScanner(BaseScanner):
                     severity=anomaly["severity"],
                     location=path,
                     details=anomaly["details"],
+                    why=anomaly.get("why"),
                 )
 
             # Add metadata
@@ -423,6 +424,7 @@ class WeightDistributionScanner(BaseScanner):
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
                         },
+                        "why": "Neurons with weight magnitudes significantly different from others in the same layer may indicate tampering, backdoors, or training anomalies. These outliers are flagged when their statistical z-score exceeds the threshold.",
                     }
                 )
 
@@ -463,6 +465,7 @@ class WeightDistributionScanner(BaseScanner):
                                 "weight_norm": float(output_norms[neuron_idx]),
                                 "total_outputs": n_outputs,
                             },
+                            "why": "Neurons with weight patterns completely unlike others in the same layer are uncommon in standard training. This dissimilarity (measured by cosine similarity below threshold) may indicate injected functionality or training irregularities.",
                         }
                     )
 
@@ -493,6 +496,7 @@ class WeightDistributionScanner(BaseScanner):
                             "max_weight": float(np.max(weight_magnitudes)),
                             "total_outputs": n_outputs,
                         },
+                        "why": "Weight values that are orders of magnitude larger than typical can cause numerical instability, overflow attacks, or may encode hidden data. The threshold is set at 100 times the mean magnitude.",
                     }
                 )
 
