@@ -135,6 +135,36 @@ Issues found: 2 errors, 1 warnings
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
+### 🛡️ Zip-Slip Protection
+
+ModelAudit includes automatic protection against Zip-Slip attacks (CVE-2018-1000180), a common vulnerability in archive processing:
+
+**What it protects against:**
+- **Directory Traversal**: Malicious archive entries like `../../../etc/passwd` or `C:\Windows\System32\malware.exe`
+- **Path Escapes**: Both Unix (`../`) and Windows (`..\\`) style path traversal attempts
+- **Absolute Paths**: Archive entries starting with `/` or containing drive letters (e.g., `C:`)
+- **Nested Archives**: Recursive scanning with path validation at every level
+
+**How it works:**
+- All archive paths are normalized and validated before extraction or scanning
+- Paths that would escape the intended extraction directory are flagged as CRITICAL security issues
+- Both ZIP archives and PyTorch model files (which use ZIP format internally) are protected
+- Works across platforms with proper handling of both Unix and Windows path separators
+
+**Example detection:**
+```bash
+$ modelaudit scan malicious_model.zip --format json
+{
+  "issues": [
+    {
+      "message": "Archive entry ../../../etc/passwd attempted path traversal outside the archive",
+      "severity": "critical",
+      "location": "malicious_model.zip:../../../etc/passwd"
+    }
+  ]
+}
+```
+
 ## 🛡️ Supported Model Formats
 
 ModelAudit provides specialized security scanners for different model formats:
