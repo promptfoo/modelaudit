@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install build dependencies and Poetry
 RUN apt-get update && apt-get install -y \
-    gcc g++ \
+    gcc g++ gfortran pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir poetry==1.5.1
 
@@ -28,7 +28,7 @@ COPY . .
 RUN pip install --no-cache-dir .
 
 # Clean up build dependencies to keep image lightweight
-RUN apt-get remove -y gcc g++ \
+RUN apt-get remove -y gcc g++ gfortran pkg-config \
     && apt-get autoremove -y \
     && apt-get clean
 
