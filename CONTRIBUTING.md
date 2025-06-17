@@ -6,7 +6,7 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - Poetry (recommended) or pip
 - Git
 
@@ -18,7 +18,7 @@ git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
 # Install with Poetry (recommended)
-poetry install --all-extras
+poetry install --sync --with dev --extras "all"
 
 # Or with pip
 pip install -e .[all]
@@ -36,7 +36,7 @@ pip install -e .[all]
 modelaudit scan test_model.pkl
 
 # Option 2: Use Poetry (recommended)
-poetry install --all-extras
+poetry install --sync --with dev --extras "all"
 
 # Test with Poetry run (no shell activation needed)
 poetry run modelaudit scan test_model.pkl
@@ -69,7 +69,7 @@ poetry run pytest tests/test_pickle_scanner.py -v
 poetry run pytest tests/test_integration.py -v
 
 # Run tests with all optional dependencies
-poetry install --all-extras
+poetry install --sync --with dev --extras "all"
 poetry run pytest
 ```
 
@@ -154,16 +154,24 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 modelaudit/
 ├── modelaudit/
 │   ├── scanners/          # Model format scanners
-│   │   ├── pickle_scanner.py      # Pickle/joblib security scanner
-│   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
-│   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
-│   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
-│   │   └── manifest_scanner.py    # Config/manifest scanner
+│   │   ├── base.py                    # Base scanner class
+│   │   ├── pickle_scanner.py          # Pickle/joblib security scanner
+│   │   ├── tf_savedmodel_scanner.py   # TensorFlow SavedModel scanner
+│   │   ├── keras_h5_scanner.py        # Keras H5 model scanner
+│   │   ├── pytorch_zip_scanner.py     # PyTorch ZIP format scanner
+│   │   ├── pytorch_binary_scanner.py  # PyTorch binary format scanner
+│   │   ├── safetensors_scanner.py     # SafeTensors format scanner
+│   │   ├── weight_distribution_scanner.py # Weight analysis scanner
+│   │   ├── zip_scanner.py             # ZIP archive scanner
+│   │   └── manifest_scanner.py        # Config/manifest scanner
 │   ├── utils/             # Utility modules
+│   ├── auth/              # Authentication modules
+│   ├── name_policies/     # Name policy modules
 │   ├── cli.py            # Command-line interface
 │   └── core.py           # Core scanning logic
 ├── tests/                # Test suite
-└── docs/                 # Documentation
+├── .github/              # GitHub Actions workflows
+└── README.md             # User documentation
 ```
 
 ### Adding New Scanners
@@ -217,10 +225,9 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 ### Release Process (Maintainers)
 
 1. Update version in `pyproject.toml`
-2. Update CHANGELOG.md
-3. Create release PR
-4. After merge, create GitHub release
-5. Poetry will automatically publish to PyPI
+2. Create release PR
+3. After merge, create GitHub release
+4. Poetry will automatically publish to PyPI
 
 ## 🐛 Reporting Issues
 
