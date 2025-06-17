@@ -406,7 +406,7 @@ modelaudit scan model.pkl --verbose --format json | jq '.issues[].details'
 For additional help:
 
 - Check the [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) for known problems
-- Review the [Contributing Guide](CONTRIBUTING.md) for development setup
+- Visit the [GitHub Repository](https://github.com/promptfoo/modelaudit) for source code and development information
 
 ## ⚠️ Limitations
 
@@ -501,7 +501,7 @@ pip install -e .[all]
 
 ### Contributing
 
-Interested in contributing? Please see our [CONTRIBUTING.md](CONTRIBUTING.md) guide for development setup, testing, and contribution guidelines.
+Interested in contributing? Visit the [GitHub Repository](https://github.com/promptfoo/modelaudit) to get started with development, view source code, and submit pull requests.
 
 ## 📝 License
 
