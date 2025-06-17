@@ -1,8 +1,10 @@
 from . import (
     base,
     gguf_scanner,
+    joblib_scanner,
     keras_h5_scanner,
     manifest_scanner,
+    numpy_scanner,
     onnx_scanner,
     pickle_scanner,
     pytorch_binary_scanner,
@@ -16,8 +18,10 @@ from . import (
 # Import scanner classes for direct use
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 from .gguf_scanner import GgufScanner
+from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
+from .numpy_scanner import NumPyScanner
 from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
@@ -39,6 +43,8 @@ SCANNER_REGISTRY = [
     ManifestScanner,
     WeightDistributionScanner,
     GgufScanner,
+    JoblibScanner,
+    NumPyScanner,
     SafeTensorsScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
@@ -56,7 +62,8 @@ __all__ = [
     "manifest_scanner",
     "weight_distribution_scanner",
     "gguf_scanner",
-    "safetensors_scanner",
+    "joblib_scanner",
+    "numpy_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
@@ -72,6 +79,8 @@ __all__ = [
     "ManifestScanner",
     "WeightDistributionScanner",
     "GgufScanner",
+    "JoblibScanner",
+    "NumPyScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
 ]
