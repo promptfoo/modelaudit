@@ -57,7 +57,8 @@ def detect_file_format(path: str) -> str:
     ext = file_path.suffix.lower()
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    if magic4[:2] == b"PK":
+    # Common ZIP signatures: PK\x03\x04 (local file header) or PK\x05\x06 (end of central directory)
+    if magic4[:2] == b"PK" and magic4[2:4] in [b"\x03\x04", b"\x05\x06", b"\x01\x02"]:
         return "zip"
 
     # Check pickle magic patterns
@@ -87,7 +88,14 @@ def detect_file_format(path: str) -> str:
         return "pytorch_binary"
 
     # Extension-based detection for non-.bin files
-    if ext in (".pkl", ".pickle"):
+    # For .pt/.pth/.ckpt files, check if they're ZIP format first
+    if ext in (".pt", ".pth", ".ckpt"):
+        # These files can be either ZIP or pickle format
+        if magic4[:2] == b"PK":
+            return "zip"
+        # If not ZIP, assume pickle format
+        return "pickle"
+    if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
         return "hdf5"
@@ -97,6 +105,14 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext == ".npy":
+        return "numpy"
+    if ext == ".npz":
+        return "zip"
+    if ext == ".joblib":
+        if magic4[:2] == b"PK":
+            return "zip"
+        return "pickle"
 
     return "unknown"
 

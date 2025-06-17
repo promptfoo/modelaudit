@@ -32,12 +32,13 @@ def test_detect_file_format_zip(tmp_path):
 def test_detect_file_format_by_extension(tmp_path):
     """Test detecting file format by extension."""
     extensions = {
-        ".pt": "unknown",  # .pt files without ZIP or pickle magic are unknown
-        ".pth": "unknown",  # .pth files without ZIP or pickle magic are unknown
+        ".pt": "pickle",  # .pt files are now treated as pickle files
+        ".pth": "pickle",  # .pth files are now treated as pickle files
         ".bin": "pytorch_binary",  # .bin files with generic content are now pytorch_binary
-        ".ckpt": "unknown",  # .ckpt files without pickle magic are unknown
+        ".ckpt": "pickle",  # .ckpt files are now treated as pickle files
         ".pkl": "pickle",
         ".pickle": "pickle",
+        ".dill": "pickle",  # .dill files are treated as pickle files
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".unknown": "unknown",
