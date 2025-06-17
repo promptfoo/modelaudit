@@ -21,7 +21,6 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Security Detection](#security-detection)
   - [🛡️ Supported Model Formats](#️-supported-model-formats)
     - [Weight Analysis](#weight-analysis)
-    - [ONNX Scanner](#onnx-scanner)
   - [⚙️ Advanced Usage](#️-advanced-usage)
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
@@ -48,6 +47,7 @@ ModelAudit scans ML model files for:
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
 - **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
@@ -102,7 +102,7 @@ modelaudit scan model.pkl
 modelaudit scan model.onnx
 
 # Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt model4.joblib model5.npy
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.npy
 
 # Scan a directory
 modelaudit scan ./models/
@@ -177,7 +177,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
-| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, metadata integrity, suspicious patterns      |
+| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
 | **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
 | **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
@@ -186,16 +186,6 @@ ModelAudit provides specialized security scanners for different model formats:
 ### Weight Analysis
 
 ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
-
-### ONNX Scanner
-
-**Inspects ONNX models for security risks and integrity issues:**
-
-- **Custom Operators**: Flags non-standard operator domains that could contain malicious code
-- **External Data Validation**: Verifies external weight files exist and have correct sizes
-- **Tensor Integrity**: Checks for truncated or corrupted tensor data
-- **Path Traversal Protection**: Ensures external data files stay within model directory
-- **Model Structure Analysis**: Validates ONNX model format and metadata
 
 ## ⚙️ Advanced Usage
 
