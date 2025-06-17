@@ -360,18 +360,37 @@ class WeightDistributionScanner(BaseScanner):
 
         n_inputs, n_outputs = weights.shape
 
-        # Detect if this is likely an LLM vocabulary layer
-        is_likely_llm = n_outputs > self.llm_vocab_threshold
+        # Detect if this is likely an LLM vocabulary layer or large transformer model
+        is_likely_llm = (
+            n_outputs > self.llm_vocab_threshold  # Large vocab layer
+            or n_inputs
+            > 768  # Large hidden dimensions typical of LLMs (768+ for BERT/GPT)
+            or "transformer" in layer_name.lower()  # Transformer architecture
+            or "attention" in layer_name.lower()  # Attention layers
+            or "gpt" in layer_name.lower()  # GPT models
+            or "bert" in layer_name.lower()  # BERT models
+            or "llama" in layer_name.lower()  # LLaMA models
+            or "t5" in layer_name.lower()  # T5 models
+            or
+            # GPT-style layer patterns
+            layer_name.startswith("h.")  # GPT-2 style layers (h.0, h.1, etc.)
+            or "mlp" in layer_name.lower()  # Multi-layer perceptron in transformers
+            or "c_fc" in layer_name.lower()  # GPT-2 feed-forward layers
+            or "c_attn" in layer_name.lower()  # GPT-2 attention layers
+            or "c_proj" in layer_name.lower()  # GPT-2 projection layers
+        )
 
-        # Skip checks for LLMs if disabled
+        # Skip checks for LLMs if disabled (default behavior)
         if is_likely_llm and not self.enable_llm_checks:
             return []
 
         # For LLMs, we need much stricter thresholds to avoid false positives
         if is_likely_llm:
             # For LLMs, only check for extreme outliers with much higher thresholds
-            z_score_threshold = max(5.0, self.z_score_threshold * 1.5)
-            outlier_percentage_threshold = 0.001  # 0.1% for LLMs
+            z_score_threshold = max(
+                8.0, self.z_score_threshold * 2.5
+            )  # Much higher threshold
+            outlier_percentage_threshold = 0.0001  # 0.01% for LLMs - very restrictive
         else:
             z_score_threshold = self.z_score_threshold
             outlier_percentage_threshold = 0.01  # 1% for classification models
