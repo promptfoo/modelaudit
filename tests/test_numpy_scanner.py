@@ -27,4 +27,4 @@ def test_numpy_scanner_truncated(tmp_path):
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert any(i.severity == IssueSeverity.ERROR for i in result.issues)
+    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)

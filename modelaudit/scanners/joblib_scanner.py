@@ -76,7 +76,7 @@ class JoblibScanner(BaseScanner):
                     except Exception as e:
                         result.add_issue(
                             f"Unable to decompress joblib file: {e}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                         )
                         result.finish(success=False)
@@ -90,7 +90,7 @@ class JoblibScanner(BaseScanner):
         except Exception as e:  # pragma: no cover
             result.add_issue(
                 f"Error scanning joblib file: {e}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

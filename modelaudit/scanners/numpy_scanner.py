@@ -29,7 +29,7 @@ class NumPyScanner(BaseScanner):
                 if magic != b"\x93NUMPY":
                     result.add_issue(
                         "Invalid NumPy file magic",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
@@ -53,7 +53,7 @@ class NumPyScanner(BaseScanner):
                 if file_size != data_offset + expected_size:
                     result.add_issue(
                         "File size does not match header information",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
                             "expected_size": data_offset + expected_size,
@@ -78,7 +78,7 @@ class NumPyScanner(BaseScanner):
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_issue(
                 f"Error scanning NumPy file: {e}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
