@@ -55,10 +55,10 @@ class JoblibScanner(BaseScanner):
                 chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
-                data.extend(chunk)
+                data += chunk
                 if len(data) > self.max_file_read_size:
                     raise ValueError(f"File read exceeds limit: {len(data)} bytes")
-        return bytes(data)
+        return data
 
     def _safe_decompress(self, data: bytes) -> bytes:
         """Safely decompress data with bomb protection"""
