@@ -223,7 +223,7 @@ class ManifestScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning manifest file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -249,7 +249,7 @@ class ManifestScanner(BaseScanner):
                     if pattern_lower in content:
                         result.add_issue(
                             f"Blacklisted term '{pattern}' found in file",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
                         )
@@ -333,7 +333,7 @@ class ManifestScanner(BaseScanner):
                     if blocked:
                         result.add_issue(
                             f"Model name blocked by policy: {value}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={
                                 "model_name": str(value),
@@ -346,7 +346,7 @@ class ManifestScanner(BaseScanner):
                 if self._is_actually_dangerous_value(key, value):
                     result.add_issue(
                         f"Dangerous configuration content: {full_key}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={
                             "key": full_key,
@@ -630,7 +630,7 @@ class ManifestScanner(BaseScanner):
         """Determine severity based on context and match types"""
         # Execution patterns are always ERROR
         if "execution" in matches:
-            return IssueSeverity.ERROR
+            return IssueSeverity.CRITICAL
 
         # In high-confidence ML context, downgrade some warnings
         if ml_context.get("confidence", 0) >= 2:

@@ -25,6 +25,17 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],
     "ctypes": ["*"],
     "socket": ["*"],
+    # dill's load helpers can execute arbitrary code when unpickling
+    # so we specifically flag those functions
+    "dill": [
+        "load",
+        "loads",
+        "load_module",
+        "load_module_asdict",
+        "load_session",
+    ],
+    # references to the private dill._dill module are also suspicious
+    "dill._dill": "*",
 }
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
@@ -36,6 +47,7 @@ DANGEROUS_OPCODES = [
     "INST",
     "OBJ",
     "NEWOBJ",
+    "NEWOBJ_EX",
     "GLOBAL",
     "BUILD",
     "STACK_GLOBAL",
@@ -336,12 +348,12 @@ def _get_context_aware_severity(
 
     # High confidence ML content - downgrade severity
     if confidence > 0.8:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
         elif base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
     elif confidence > 0.5:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
 
     return base_severity
@@ -574,29 +586,45 @@ class PickleScanner(BaseScanner):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
-                        # Scan the binary content after pickle
-                        binary_result = self._scan_binary_content(
-                            f, pickle_end_pos, file_size
-                        )
+                        # Check if this is likely a PyTorch model based on ML context
+                        ml_context = scan_result.metadata.get("ml_context", {})
+                        is_pytorch = "pytorch" in ml_context.get("frameworks", {})
+                        ml_confidence = ml_context.get("overall_confidence", 0)
 
-                        # Add binary scanning results
-                        for issue in binary_result.issues:
-                            result.add_issue(
-                                message=issue.message,
-                                severity=issue.severity,
-                                location=issue.location,
-                                details=issue.details,
+                        # Skip binary scanning for high-confidence ML model files
+                        # as they contain tensor data that can trigger false positives
+                        if is_pytorch and ml_confidence > 0.7:
+                            result.metadata["binary_scan_skipped"] = True
+                            result.metadata["skip_reason"] = (
+                                "High-confidence PyTorch model detected"
+                            )
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
+                        else:
+                            # Scan the binary content after pickle
+                            binary_result = self._scan_binary_content(
+                                f, pickle_end_pos, file_size
                             )
 
-                        # Update total bytes scanned
-                        result.bytes_scanned = file_size
-                        result.metadata["pickle_bytes"] = pickle_end_pos
-                        result.metadata["binary_bytes"] = remaining_bytes
+                            # Add binary scanning results
+                            for issue in binary_result.issues:
+                                result.add_issue(
+                                    message=issue.message,
+                                    severity=issue.severity,
+                                    location=issue.location,
+                                    details=issue.details,
+                                )
+
+                            # Update total bytes scanned
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
             result.add_issue(
                 f"Error opening pickle file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -692,7 +720,7 @@ class PickleScanner(BaseScanner):
                             if _is_actually_dangerous_global(mod, func, ml_context):
                                 suspicious_count += 1
                                 severity = _get_context_aware_severity(
-                                    IssueSeverity.ERROR, ml_context
+                                    IssueSeverity.CRITICAL, ml_context
                                 )
                                 result.add_issue(
                                     f"Suspicious reference {mod}.{func}",
@@ -811,7 +839,7 @@ class PickleScanner(BaseScanner):
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
-                                IssueSeverity.ERROR, ml_context
+                                IssueSeverity.CRITICAL, ml_context
                             )
                             result.add_issue(
                                 f"Suspicious module reference found: {mod}.{func}",
@@ -849,7 +877,9 @@ class PickleScanner(BaseScanner):
             dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
             if dangerous_pattern and not ml_context.get("is_ml_content", False):
                 suspicious_count += 1
-                severity = _get_context_aware_severity(IssueSeverity.ERROR, ml_context)
+                severity = _get_context_aware_severity(
+                    IssueSeverity.CRITICAL, ml_context
+                )
                 result.add_issue(
                     f"Detected dangerous __reduce__ pattern with "
                     f"{dangerous_pattern.get('module', '')}."
@@ -924,14 +954,16 @@ class PickleScanner(BaseScanner):
                 b"socket.socket",
             ]
 
-            # Executable signatures
+            # Executable signatures with additional validation
+            # For PE files, we need to check for the full DOS header structure
+            # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"MZ": "Windows executable (PE)",
                 b"\x7fELF": "Linux executable (ELF)",
                 b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
                 b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
                 b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/": "Shell script shebang",
+                b"#!/bin/": "Shell script shebang",
+                b"#!/usr/bin/": "Shell script shebang",
             }
 
             # Read in chunks
@@ -967,7 +999,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(sig)
                         result.add_issue(
                             f"Executable signature found in binary data: {description}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "signature": sig.hex(),
@@ -976,6 +1008,31 @@ class PickleScanner(BaseScanner):
                                 "section": "binary_data",
                             },
                         )
+
+                # Special check for Windows PE files with more validation
+                # to reduce false positives from random "MZ" bytes
+                pe_sig = b"MZ"
+                if pe_sig in chunk:
+                    pos = chunk.find(pe_sig)
+                    # For PE files, check if we have enough data to validate DOS header
+                    if pos + 64 <= len(chunk):  # DOS header is 64 bytes
+                        # Check for "This program cannot be run in DOS mode" string
+                        # which appears in all PE files
+                        dos_stub_msg = b"This program cannot be run in DOS mode"
+                        # Look for this message within reasonable distance from MZ
+                        search_end = min(pos + 512, len(chunk))
+                        if dos_stub_msg in chunk[pos:search_end]:
+                            result.add_issue(
+                                "Executable signature found in binary data: Windows executable (PE)",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{self.current_file_path} (offset: {current_offset + pos})",
+                                details={
+                                    "signature": pe_sig.hex(),
+                                    "description": "Windows executable (PE) with valid DOS stub",
+                                    "offset": current_offset + pos,
+                                    "section": "binary_data",
+                                },
+                            )
 
                 # Check for timeout
                 if time.time() - result.start_time > self.timeout:
@@ -995,7 +1052,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning binary content: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

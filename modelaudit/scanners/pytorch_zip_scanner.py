@@ -56,7 +56,7 @@ class PyTorchZipScanner(BaseScanner):
         if not header.startswith(b"PK"):
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -118,7 +118,7 @@ class PyTorchZipScanner(BaseScanner):
                     elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
                         result.add_issue(
                             f"Executable file found in PyTorch model: {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
@@ -195,7 +195,7 @@ class PyTorchZipScanner(BaseScanner):
         except zipfile.BadZipFile:
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -204,7 +204,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning PyTorch zip file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
