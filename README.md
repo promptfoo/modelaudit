@@ -49,6 +49,8 @@ ModelAudit scans ML model files for:
 - **Malicious content in ZIP archives** including nested archives and zip bombs
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
+- **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
+- **NumPy array integrity issues** (malformed headers, dangerous dtypes)
 
 ## 🚀 Quick Start
 
@@ -83,6 +85,9 @@ pip install modelaudit[yaml]
 # For SafeTensors model scanning
 pip install modelaudit[safetensors]
 
+# For Joblib model scanning
+pip install modelaudit[joblib]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -97,7 +102,7 @@ modelaudit scan model.pkl
 modelaudit scan model.onnx
 
 # Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.npy
 
 # Scan a directory
 modelaudit scan ./models/
@@ -137,7 +142,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -173,6 +178,8 @@ ModelAudit provides specialized security scanners for different model formats:
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
 | **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
+| **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
+| **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
 | **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
 
@@ -311,7 +318,7 @@ pip install modelaudit[all] --no-cache-dir
 
 # If optional dependencies fail, install base package first
 pip install modelaudit
-pip install tensorflow h5py torch pyyaml safetensors onnx  # Add what you need
+pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you need
 ```
 
 **Large Models:**

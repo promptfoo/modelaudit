@@ -48,7 +48,8 @@ pytorch = ["torch>=1.6"]
 yaml = ["pyyaml>=6.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0"]
-all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx"]
+joblib = ["joblib>=1.0.0"]
+all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx", "joblib"]
 
 [project.scripts]
 modelaudit = "modelaudit.cli:main"

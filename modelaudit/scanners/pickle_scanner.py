@@ -533,7 +533,16 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle", ".bin", ".pt", ".pth", ".ckpt"]
+    supported_extensions = [
+        ".pkl",
+        ".pickle",
+        ".dill",
+        ".joblib",
+        ".bin",
+        ".pt",
+        ".pth",
+        ".ckpt",
+    ]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -546,7 +555,7 @@ class PickleScanner(BaseScanner):
         file_ext = os.path.splitext(path)[1].lower()
 
         # For known pickle extensions, always handle
-        if file_ext in [".pkl", ".pickle"]:
+        if file_ext in [".pkl", ".pickle", ".dill", ".joblib"]:
             return True
 
         # For ambiguous extensions, check the actual file format
