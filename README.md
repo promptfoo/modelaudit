@@ -113,7 +113,7 @@ Issues found: 2 errors, 1 warnings
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), Pickle (.pkl, .pickle, .ckpt), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -139,15 +139,16 @@ Issues found: 2 errors, 1 warnings
 
 ModelAudit provides specialized security scanners for different model formats:
 
-| Format           | File Extensions          | What We Check                                                   |
-| ---------------- | ------------------------ | --------------------------------------------------------------- |
-| **Pickle**       | `.pkl`, `.joblib`        | Malicious code execution, dangerous opcodes, suspicious imports |
-| **PyTorch**      | `.pt`, `.pth`            | Embedded pickle analysis, suspicious files, custom patterns     |
-| **TensorFlow**   | SavedModel dirs          | Suspicious operations, file I/O, Python execution               |
-| **Keras**        | `.h5`, `.keras`          | Lambda layers, custom objects, dangerous configurations         |
-| **SafeTensors**  | `.safetensors`           | Metadata integrity, tensor validation                           |
-| **ZIP Archives** | `.zip`                   | Recursive content scanning, zip bombs, directory traversal      |
-| **Manifests**    | `.json`, `.yaml`, `.xml` | Suspicious keys, credential exposure, blacklisted patterns      |
+| Format             | File Extensions                                                                                          | What We Check                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **Pickle**         | `.pkl`, `.pickle`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                        | Malicious code execution, dangerous opcodes, suspicious imports |
+| **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
+| **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
+| **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
+| **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
+| **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
+| **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
+| **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
 
 ### Weight Analysis
 
@@ -186,25 +187,26 @@ When using `--format json`, ModelAudit outputs:
 ```json
 {
   "scanner_names": ["pickle"],
-  "start_time": 1750135672.0367858,
-  "bytes_scanned": 74,
+  "start_time": 1750136949.775118,
+  "bytes_scanned": 48,
   "issues": [
     {
       "message": "Suspicious module reference found: posix.system",
       "severity": "critical",
-      "location": "evil.pickle (pos 28)",
+      "location": "test_evil.pkl (pos 28)",
       "details": {
         "module": "posix",
         "function": "system",
         "position": 28,
-        "opcode": "STACK_GLOBAL"
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
       },
-      "timestamp": 1750135692.850314
+      "timestamp": 1750136949.7755148
     }
   ],
   "has_errors": false,
   "files_scanned": 1,
-  "duration": 0.0007040500640869141
+  "duration": 0.0004527568817138672
 }
 ```
 
@@ -229,6 +231,14 @@ When using `--format json`, ModelAudit outputs:
 | `location`  | string | File location (e.g., "file.pkl (pos 123)")        |
 | `details`   | object | Scanner-specific additional information           |
 | `timestamp` | number | Unix timestamp when issue was found               |
+
+**Common details fields:**
+
+- `position`: Byte position in file (for binary scanners)
+- `opcode`: Pickle opcode name (for pickle scanner)
+- `ml_context_confidence`: ML context detection confidence (0.0-1.0)
+- `module`/`function`: Module and function names (for code references)
+- `exception`/`exception_type`: Error details (for scan failures)
 
 ## 🔄 CI/CD Integration
 
