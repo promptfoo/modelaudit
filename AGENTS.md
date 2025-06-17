@@ -7,8 +7,9 @@ This file provides comprehensive guidance for AI agents working with the ModelAu
 ModelAudit is a Python security scanner that detects malicious code, backdoors, and security risks in ML model files. It supports multiple formats (PyTorch, TensorFlow, Keras, SafeTensors, Pickle, ZIP) and provides both CLI and programmatic interfaces.
 
 **Key Security Focus:**
+
 - Dangerous code execution patterns
-- Suspicious opcodes in pickle files  
+- Suspicious opcodes in pickle files
 - Malicious configurations in model files
 - Blacklisted model names and patterns
 - Weight distribution anomalies
@@ -52,11 +53,13 @@ modelaudit/
 **Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12)
 
 **Code Quality Tools:**
+
 - **Ruff**: Ultra-fast linter and formatter (replaces Black, isort, flake8)
 - **MyPy**: Static type checking
 - **pytest**: Testing framework with coverage
 
 **Formatting Standards:**
+
 ```bash
 # ALWAYS run these before committing:
 poetry run ruff format .         # Format code
@@ -75,6 +78,7 @@ poetry run pytest               # Run tests
 ### Type Hints
 
 Always use type hints for function parameters and return values:
+
 ```python
 def scan(self, path: str) -> ScanResult:
     """Scan a model file."""
@@ -116,6 +120,7 @@ class MyScanner(BaseScanner):
 ### Scanner Registration
 
 Add new scanners to `SCANNER_REGISTRY` in `modelaudit/scanners/__init__.py`:
+
 ```python
 SCANNER_REGISTRY = [
     PickleScanner,
@@ -128,6 +133,7 @@ SCANNER_REGISTRY = [
 ### Issue Reporting
 
 Use the `ScanResult` and `Issue` classes for consistent reporting:
+
 ```python
 # Report security issues
 result.add_issue(
@@ -160,11 +166,11 @@ def test_my_scanner_safe_file(tmp_path: Path) -> None:
     # Create test file
     test_file = tmp_path / "safe.myformat"
     test_file.write_bytes(b"safe content")
-    
+
     # Run scanner
     scanner = MyScanner()
     result = scanner.scan(str(test_file))
-    
+
     # Assert results
     assert result.success is True
     assert not result.has_errors
@@ -174,11 +180,11 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
     # Create malicious test file
     malicious_file = tmp_path / "malicious.myformat"
     malicious_file.write_bytes(b"malicious content")
-    
+
     # Run scanner
     scanner = MyScanner()
     result = scanner.scan(str(malicious_file))
-    
+
     # Assert malicious content detected
     assert result.has_errors
     assert any("malicious" in issue.message.lower() for issue in result.issues)
@@ -221,8 +227,9 @@ pip install -e .[all]
 ### Optional Dependencies
 
 The project uses optional dependencies for specific scanners:
+
 - `tensorflow`: TensorFlow SavedModel scanning
-- `h5py`: Keras H5 model scanning  
+- `h5py`: Keras H5 model scanning
 - `torch`: PyTorch model scanning
 - `pyyaml`: YAML manifest scanning
 - `safetensors`: SafeTensors model scanning
@@ -238,7 +245,7 @@ Always test that scanners gracefully handle missing optional dependencies.
 # Dangerous imports to detect
 SUSPICIOUS_GLOBALS = {
     "os": "*",
-    "subprocess": "*", 
+    "subprocess": "*",
     "eval": "*",
     "exec": "*",
     "__import__": "*"
@@ -262,11 +269,12 @@ SUSPICIOUS_PATTERNS = [
 ### ML Context Detection
 
 The codebase includes smart detection to reduce false positives in ML contexts:
+
 ```python
 # ML-safe patterns that shouldn't trigger alerts
 ML_SAFE_GLOBALS = {
     "torch": ["*"],
-    "numpy": ["*"], 
+    "numpy": ["*"],
     "transformers": ["*"],
     "sklearn": ["*"]
 }
@@ -280,7 +288,7 @@ ML_SAFE_GLOBALS = {
 # Scan single file
 modelaudit scan model.pkl
 
-# Scan directory  
+# Scan directory
 modelaudit scan ./models/
 
 # Export to JSON
@@ -355,4 +363,4 @@ poetry run pytest
 - **`pyproject.toml`**: Dependencies and project configuration
 - **`tests/conftest.py`**: Test configuration and fixtures
 
-Understanding these files is crucial for effective contributions to the ModelAudit codebase. 
+Understanding these files is crucial for effective contributions to the ModelAudit codebase.

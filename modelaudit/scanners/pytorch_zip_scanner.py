@@ -57,7 +57,7 @@ class PyTorchZipScanner(BaseScanner):
         if not header.startswith(b"PK"):
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -131,7 +131,7 @@ class PyTorchZipScanner(BaseScanner):
                     elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
                         result.add_issue(
                             f"Executable file found in PyTorch model: {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
@@ -141,8 +141,8 @@ class PyTorchZipScanner(BaseScanner):
                     os.path.basename(f) for f in pickle_files
                 ]:
                     result.add_issue(
-                        "PyTorch model missing data.pkl file - unusual for "
-                        "standard PyTorch models",
+                        "PyTorch model is missing 'data.pkl', which is "
+                        "unusual for standard PyTorch models.",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"missing_file": "data.pkl"},
@@ -208,7 +208,7 @@ class PyTorchZipScanner(BaseScanner):
         except zipfile.BadZipFile:
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -217,7 +217,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning PyTorch zip file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

@@ -228,7 +228,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             error_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity == IssueSeverity.ERROR
+                if issue.severity == IssueSeverity.CRITICAL
             ]
             self.assertEqual(
                 len(error_issues),
@@ -311,7 +311,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             high_severity_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity in [IssueSeverity.ERROR, IssueSeverity.WARNING]
+                if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             ]
             self.assertTrue(
                 len(high_severity_issues) > 0,

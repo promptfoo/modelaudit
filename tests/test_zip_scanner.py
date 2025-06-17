@@ -62,7 +62,7 @@ class TestZipScanner:
             assert result.bytes_scanned > 0
             # May have some debug/info issues about unknown formats
             error_issues = [
-                i for i in result.issues if i.severity == IssueSeverity.ERROR
+                i for i in result.issues if i.severity == IssueSeverity.CRITICAL
             ]
             assert len(error_issues) == 0
         finally:
@@ -144,7 +144,7 @@ class TestZipScanner:
 
             # Check severity
             for issue in traversal_issues:
-                assert issue.severity == IssueSeverity.ERROR
+                assert issue.severity == IssueSeverity.CRITICAL
         finally:
             os.unlink(tmp_path)
 
