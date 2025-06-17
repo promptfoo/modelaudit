@@ -403,6 +403,10 @@ modelaudit scan model.pkl --verbose --format json | jq '.issues[].details'
 - **Check file permissions**: Ensure ModelAudit can read your files
 - **Verify file format**: Confirm the file is a supported model format
 
+### Reporting Issues
+
+Found a bug or have a feature request? Please report issues on the [promptfoo GitHub repository](https://github.com/promptfoo/promptfoo/issues). ModelAudit is part of the promptfoo ecosystem, and the team actively monitors and responds to issues there.
+
 ## ⚠️ Limitations
 
 ### What ModelAudit Detects
