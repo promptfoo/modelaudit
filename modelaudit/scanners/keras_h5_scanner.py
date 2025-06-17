@@ -2,6 +2,7 @@ import json
 import os
 from typing import Any, Optional
 
+from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
@@ -231,6 +232,9 @@ class KerasH5Scanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                         "layer_config": layer.get("config", {}),
                     },
+                    why=get_pattern_explanation("lambda_layer")
+                    if layer_class == "Lambda"
+                    else None,
                 )
 
             # Check layer configuration for suspicious strings

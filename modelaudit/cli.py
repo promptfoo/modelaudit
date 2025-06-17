@@ -389,6 +389,14 @@ def format_text_output(results, verbose=False):
             else:
                 output_lines.append(f"{issue_num} {severity_style} {message}")
 
+            # Add "Why" explanation if available
+            why = issue.get("why")
+            if why:
+                # Indent the explanation and style it
+                why_label = click.style("   Why:", fg="magenta", bold=True)
+                why_text = click.style(f" {why}", fg="bright_white")
+                output_lines.append(f"{why_label}{why_text}")
+
             # Add a small separator between issues for readability
             if i < len(visible_issues):
                 output_lines.append("")
