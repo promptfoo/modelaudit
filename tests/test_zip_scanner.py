@@ -135,11 +135,33 @@ class TestZipScanner:
 
             # Should have detected directory traversal attempts
             traversal_issues = [
-                i for i in result.issues if "directory traversal" in i.message.lower()
+                i
+                for i in result.issues
+                if "path traversal" in i.message.lower()
+                or "directory traversal" in i.message.lower()
             ]
             assert len(traversal_issues) >= 2
 
             # Check severity
+            for issue in traversal_issues:
+                assert issue.severity == IssueSeverity.CRITICAL
+        finally:
+            os.unlink(tmp_path)
+
+    def test_windows_traversal_detection(self):
+        """Ensure Windows-style path traversal is caught"""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                z.writestr("..\\evil.txt", "malicious")
+                z.writestr("safe.txt", "ok")
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            traversal_issues = [
+                i for i in result.issues if "path traversal" in i.message.lower()
+            ]
+            assert len(traversal_issues) >= 1
             for issue in traversal_issues:
                 assert issue.severity == IssueSeverity.CRITICAL
         finally:

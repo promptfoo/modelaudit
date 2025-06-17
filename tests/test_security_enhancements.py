@@ -196,7 +196,7 @@ class TestJoblibScannerSecurity:
         """Test chunked file reading with size check during read."""
         # Create a file that would pass initial size check but fail during chunked read
         # This is tricky since we check file size first, but let's test the chunked read logic
-        
+
         # Test with a file exactly at the limit
         limit_data = b"X" * (50 * 1024 * 1024)  # 50MB
         limit_file = tmp_path / "at_limit.joblib"
@@ -370,7 +370,7 @@ class TestNumPyScannerSecurity:
         """Test NumPy format version 2.0 handling."""
         # Create array that will use version 2.0 format
         # Use a very long array description to trigger v2.0 format
-        
+
         # Create a large 4D array that should trigger version 2.0
         # due to large header size, not structured dtype
         arr = np.zeros((100, 50, 20, 10), dtype=np.float64)
@@ -379,7 +379,9 @@ class TestNumPyScannerSecurity:
         np.save(npy_file, arr)
 
         # Allow structured arrays for this test
-        config = {"max_array_bytes": 10 * 1024 * 1024 * 1024}  # 10GB limit to allow large test array
+        config = {
+            "max_array_bytes": 10 * 1024 * 1024 * 1024
+        }  # 10GB limit to allow large test array
         scanner = NumPyScanner(config)
         result = scanner.scan(str(npy_file))
 

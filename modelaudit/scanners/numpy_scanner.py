@@ -48,7 +48,9 @@ class NumPyScanner(BaseScanner):
         dangerous_kinds = ["O", "V"]  # Object and Void kinds
 
         if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
-            raise ValueError(f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})")
+            raise ValueError(
+                f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})"
+            )
 
         # Check for extremely large item sizes
         if dtype.itemsize > self.max_itemsize:
