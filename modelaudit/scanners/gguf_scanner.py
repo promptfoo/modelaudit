@@ -142,14 +142,14 @@ class GgufScanner(BaseScanner):
         )
 
         # Security checks on header values
-        if n_kv < 0 or n_kv > 1_000_000:
+        if n_kv > 1_000_000:
             result.add_issue(
                 f"GGUF header appears invalid (declared {n_kv} KV entries)",
                 severity=IssueSeverity.CRITICAL,
             )
             return
 
-        if n_tensors < 0 or n_tensors > 100_000:
+        if n_tensors > 100_000:
             result.add_issue(
                 f"GGUF header appears invalid (declared {n_tensors} tensors)",
                 severity=IssueSeverity.CRITICAL,
