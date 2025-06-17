@@ -75,7 +75,6 @@ def detect_file_format(path: str) -> str:
         # Check if it's a pickle file
         if any(magic4.startswith(m) for m in pickle_magics):
             return "pickle"
-
         # Check for safetensors format (starts with JSON header)
         if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
             return "safetensors"
@@ -88,7 +87,7 @@ def detect_file_format(path: str) -> str:
         return "pytorch_binary"
 
     # Extension-based detection for non-.bin files
-    if ext in (".pt", ".pth", ".ckpt", ".pkl", ".pickle"):
+    if ext in (".pkl", ".pickle"):
         return "pickle"
     if ext == ".h5":
         return "hdf5"

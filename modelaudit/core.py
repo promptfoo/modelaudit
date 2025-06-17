@@ -201,7 +201,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {str(e)}",
-            "severity": IssueSeverity.ERROR.value,
+            "severity": IssueSeverity.CRITICAL.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -255,7 +255,7 @@ def scan_model_directory_or_file(
             )
             for issue in issues_list
             if isinstance(issue, dict)
-            and issue.get("severity") == IssueSeverity.ERROR.value
+            and issue.get("severity") == IssueSeverity.CRITICAL.value
         )
         or not results["success"]
     )
@@ -332,7 +332,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
             f"Error checking file size: {e}",
-            severity=IssueSeverity.ERROR,
+            severity=IssueSeverity.CRITICAL,
             details={"error": str(e), "path": path},
         )
         return sr
