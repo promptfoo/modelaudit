@@ -252,6 +252,7 @@ class ManifestScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
+                            why="This term matches a user-defined blacklist pattern. Organizations use blacklists to identify models or configurations that violate security policies or contain known malicious indicators.",
                         )
         except Exception as e:
             result.add_issue(
@@ -366,6 +367,15 @@ class ManifestScanner(BaseScanner):
                     ):
                         # STEP 5: Report with context-aware severity
                         severity = self._get_context_aware_severity(matches, ml_context)
+                        why = None
+                        if severity == IssueSeverity.INFO:
+                            if "file_access" in matches and "network_access" in matches:
+                                why = "File and network access patterns in ML model configurations are common for loading datasets and downloading resources. They are flagged for awareness but are typically benign in ML contexts."
+                            elif "file_access" in matches:
+                                why = "File access patterns in ML model configurations often indicate dataset paths or model checkpoints. This is flagged for awareness but is typical in ML workflows."
+                            elif "network_access" in matches:
+                                why = "Network access patterns in ML model configurations may indicate remote model repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
+
                         result.add_issue(
                             f"Suspicious configuration pattern: {full_key} "
                             f"(category: {', '.join(matches)})",
@@ -378,6 +388,7 @@ class ManifestScanner(BaseScanner):
                                 "ml_context": ml_context,
                                 "analysis": "pattern_based",
                             },
+                            why=why,
                         )
 
                 # ALWAYS recursively check nested structures,
