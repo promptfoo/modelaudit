@@ -4,6 +4,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
+from modelaudit.license_checker import (
+    check_commercial_use_warnings,
+    collect_license_metadata,
+)
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.filetype import detect_file_format
@@ -116,7 +120,10 @@ def scan_model_directory_or_file(
 
                         # Save metadata for SBOM generation
                         file_meta = cast(dict[str, Any], results["file_metadata"])
-                        file_meta[file_path] = file_result.metadata
+                        # Merge scanner metadata with license metadata
+                        license_metadata = collect_license_metadata(file_path)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        file_meta[file_path] = combined_metadata
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
@@ -200,7 +207,10 @@ def scan_model_directory_or_file(
 
             # Save metadata for SBOM generation
             file_meta = cast(dict[str, Any], results["file_metadata"])
-            file_meta[path] = file_result.metadata
+            # Merge scanner metadata with license metadata
+            license_metadata = collect_license_metadata(path)
+            combined_metadata = {**file_result.metadata, **license_metadata}
+            file_meta[path] = combined_metadata
 
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
@@ -222,6 +232,23 @@ def scan_model_directory_or_file(
         float,
         results["start_time"],
     )
+
+    # Add license warnings if any
+    try:
+        license_warnings = check_commercial_use_warnings(results)
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        for warning in license_warnings:
+            # Convert license warnings to issues
+            issue_dict = {
+                "message": warning["message"],
+                "severity": warning["severity"],
+                "location": "",  # License warnings are generally project-wide
+                "details": warning.get("details", {}),
+                "type": warning["type"],
+            }
+            issues_list.append(issue_dict)
+    except Exception as e:
+        logger.warning(f"Error checking license warnings: {str(e)}")
 
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
