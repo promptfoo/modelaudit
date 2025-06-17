@@ -1,5 +1,5 @@
 # Multi-stage build for smaller, faster Docker image
-FROM python:3.9-slim as builder
+FROM python:3.13-slim as builder
 
 WORKDIR /app
 
@@ -30,12 +30,12 @@ COPY . .
 RUN pip install --no-cache-dir .
 
 # Production stage
-FROM python:3.9-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
 # Copy installed packages and binaries from builder
-COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy only the necessary project files for runtime
