@@ -107,6 +107,33 @@ jobs:
       - name: Run tests with pytest
         run: poetry run pytest -v --cov=modelaudit
 
+  test-windows:
+    name: Test on Windows ${{ matrix.python-version }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+          cache-dependency-path: poetry.lock
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: poetry install --sync --with dev --extras "all" --no-interaction
+
+      - name: Run tests with pytest
+        run: poetry run pytest -v --cov=modelaudit
+
   build:
     name: Build and Package
     needs: [lint, format-check, type-check]
