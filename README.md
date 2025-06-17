@@ -193,30 +193,13 @@ ModelAudit can detect anomalous weight patterns that may indicate trojaned model
 
 ### GGUF/GGML Scanner
 
-**Analyzes GGUF and GGML model files for structural integrity and security risks:**
+**Validates GGUF and GGML quantized model files used by llama.cpp:**
 
-- **File Format Validation**: Verifies GGUF magic bytes and version compatibility
-- **Tensor Consistency Checks**: Validates tensor dimensions, types, and data offsets
-- **Alignment Verification**: Ensures proper tensor alignment according to format specifications
-- **Size Validation**: Detects oversized tensors that could indicate corruption or attacks
-- **Metadata Security**: Analyzes model metadata for path traversal attempts and suspicious values
-- **Quantization Validation**: Verifies quantized tensor formats and block alignments
-
-**Supported formats:**
-- GGUF (.gguf) - Modern unified format for quantized models with comprehensive validation
-- GGML (.ggml) - Legacy format with basic security checks
-
-**Security checks:**
-- Path traversal detection in metadata keys
-- Suspicious command patterns in metadata values
-- Tensor dimension and size limits to prevent DoS attacks
-- String length limits to prevent buffer overflow attempts
-
-**Use cases:**
-- Validating llama.cpp compatible models
-- Detecting corrupted or tampered quantized models
-- Ensuring model integrity before deployment
-- Security scanning of community-shared models
+- **Format Validation**: Verifies file headers and structure integrity
+- **Tensor Validation**: Checks tensor dimensions, alignments, and data consistency
+- **Metadata Security**: Detects path traversal attempts and suspicious patterns
+- **Size Limits**: Prevents DoS attacks through oversized tensors or metadata
+- **Quantization Checks**: Validates quantized tensor formats and block alignments
 
 ## ⚙️ Advanced Usage
 
