@@ -76,7 +76,7 @@ def test_base_scanner_check_path_nonexistent():
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not exist" in result.issues[0].message.lower()
 
 
@@ -99,7 +99,7 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not readable" in result.issues[0].message.lower()
 
 
@@ -121,7 +121,7 @@ def test_base_scanner_check_path_directory(tmp_path):
         assert isinstance(result, ScanResult)
         assert result.success is False
         assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.ERROR
+        assert result.issues[0].severity == IssueSeverity.CRITICAL
         assert "directory" in result.issues[0].message.lower()
 
 

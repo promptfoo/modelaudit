@@ -16,7 +16,7 @@ class IssueSeverity(Enum):
     DEBUG = "debug"  # Debug information
     INFO = "info"  # Informational, not a security concern
     WARNING = "warning"  # Potential issue, needs review
-    ERROR = "error"  # Definite security concern
+    CRITICAL = "critical"  # Definite security concern
 
 
 class Issue:
@@ -75,18 +75,16 @@ class ScanResult:
         """Add an issue to the result"""
         issue = Issue(message, severity, location, details)
         self.issues.append(issue)
-        logger.log(
-            (
-                logging.ERROR
-                if severity == IssueSeverity.ERROR
-                else (
-                    logging.WARNING
-                    if severity == IssueSeverity.WARNING
-                    else logging.INFO
-                )
-            ),
-            str(issue),
+        log_level = (
+            logging.CRITICAL
+            if severity == IssueSeverity.CRITICAL
+            else (
+                logging.WARNING
+                if severity == IssueSeverity.WARNING
+                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+            )
         )
+        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -117,8 +115,8 @@ class ScanResult:
 
     @property
     def has_errors(self) -> bool:
-        """Return True if there are any error-level issues"""
-        return any(issue.severity == IssueSeverity.ERROR for issue in self.issues)
+        """Return True if there are any critical-level issues"""
+        return any(issue.severity == IssueSeverity.CRITICAL for issue in self.issues)
 
     @property
     def has_warnings(self) -> bool:
@@ -145,7 +143,7 @@ class ScanResult:
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
         error_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.ERROR
+            1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL
         )
         warning_count = sum(
             1 for issue in self.issues if issue.severity == IssueSeverity.WARNING
@@ -160,7 +158,7 @@ class ScanResult:
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"Found {len(self.issues)} issues ({error_count} critical, "
             f"{warning_count} warnings, {info_count} info)",
         )
 
@@ -223,7 +221,7 @@ class BaseScanner(ABC):
         if not os.path.exists(path):
             result.add_issue(
                 f"Path does not exist: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
@@ -233,7 +231,7 @@ class BaseScanner(ABC):
         if not os.access(path, os.R_OK):
             result.add_issue(
                 f"Path is not readable: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
