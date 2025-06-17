@@ -63,7 +63,7 @@ class TestAssetIntegration:
             security_issues = [
                 issue
                 for issue in results["issues"]
-                if issue.get("severity") in ["error", "warning", "info"]
+                if issue.get("severity") in ["critical", "error", "warning", "info"]
             ]
             assert len(security_issues) > 0, f"No security issues found in {asset_path}"
 
@@ -131,7 +131,7 @@ class TestAssetIntegration:
             security_issues = [
                 issue
                 for issue in output_data["issues"]
-                if issue.get("severity") in ["error", "warning", "info"]
+                if issue.get("severity") in ["critical", "error", "warning", "info"]
             ]
             assert len(security_issues) > 0
 
