@@ -137,7 +137,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), ONNX (.onnx), Pickle (.pkl, .pickle, .ckpt), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -172,6 +172,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
+| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, metadata integrity, suspicious patterns      |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
 | **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
 
@@ -281,6 +282,7 @@ modelaudit scan models/ --format json --output scan-results.json
 ### Platform Examples
 
 **GitHub Actions:**
+
 ```yaml
 - name: Scan models
   run: |
@@ -289,6 +291,7 @@ modelaudit scan models/ --format json --output scan-results.json
 ```
 
 **GitLab CI:**
+
 ```yaml
 model-security-scan:
   script:
@@ -299,6 +302,7 @@ model-security-scan:
 ```
 
 **Jenkins:**
+
 ```groovy
 sh 'pip install modelaudit[all]'
 sh 'modelaudit scan models/ --format json --output results.json'
@@ -309,6 +313,7 @@ sh 'modelaudit scan models/ --format json --output results.json'
 ### Common Issues
 
 **Installation Problems:**
+
 ```bash
 # If you get dependency conflicts
 pip install --upgrade pip setuptools wheel
@@ -320,20 +325,23 @@ pip install tensorflow h5py torch pyyaml safetensors onnx  # Add what you need
 ```
 
 **Large Models:**
+
 ```bash
 # Increase file size limit and timeout for large models
 modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
 ```
 
 **Debug Mode:**
+
 ```bash
 # Enable verbose output for troubleshooting
 modelaudit scan model.pkl --verbose
 ```
 
 **Getting Help:**
+
 - Use `--verbose` for detailed output
-- Use `--format json` to see all details  
+- Use `--format json` to see all details
 - Check file permissions and format support
 - Report issues on the [promptfoo GitHub repository](https://github.com/promptfoo/promptfoo/issues)
 
@@ -342,12 +350,14 @@ modelaudit scan model.pkl --verbose
 ModelAudit is designed to find **obvious security risks** in model files, including direct code execution attempts, known dangerous patterns, malicious archive structures, and suspicious configurations.
 
 **What it cannot detect:**
+
 - Advanced adversarial attacks or subtle weight manipulation
-- Heavily encoded/encrypted malicious payloads  
+- Heavily encoded/encrypted malicious payloads
 - Runtime behavior that only triggers under specific conditions
 - Model poisoning through careful data manipulation
 
 **Recommendations:**
+
 - Use ModelAudit as one layer of your security strategy
 - Review flagged issues manually - not all warnings indicate malicious intent
 - Combine with other security practices like sandboxed execution and runtime monitoring

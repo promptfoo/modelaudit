@@ -108,12 +108,29 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
-                    result.add_issue(
-                        "File does not appear to be a Keras model "
-                        "(no model_config attribute)",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
+                    # Check if this might be a TensorFlow SavedModel H5 file instead
+                    # Look for common TensorFlow H5 structure patterns
+                    is_tensorflow_h5 = any(
+                        key.startswith(
+                            ("model_weights", "optimizer_weights", "variables")
+                        )
+                        for key in f.keys()
                     )
+
+                    if is_tensorflow_h5:
+                        result.add_issue(
+                            "File appears to be a TensorFlow H5 model, not Keras format "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - this is expected
+                            location=self.current_file_path,
+                        )
+                    else:
+                        result.add_issue(
+                            "File does not appear to be a Keras model "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - not necessarily suspicious
+                            location=self.current_file_path,
+                        )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
 

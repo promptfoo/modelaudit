@@ -524,6 +524,20 @@ class ManifestScanner(BaseScanner):
         """Context-aware ignore logic combining smart patterns with value analysis"""
         key_lower = key.lower()
 
+        # Special case for HuggingFace patterns - check this FIRST before other logic
+        if ml_context.get("framework") == "huggingface" or "_name_or_path" in key_lower:
+            huggingface_safe_patterns = [
+                "_name_or_path",
+                "name_or_path",
+                "model_input_names",
+                "model_output_names",
+                "transformers_version",
+                "torch_dtype",
+                "architectures",
+            ]
+            if any(pattern in key_lower for pattern in huggingface_safe_patterns):
+                return True
+
         # High-confidence ML context gets more lenient treatment
         if ml_context.get("confidence", 0) >= 2:
             # File access patterns in ML context
