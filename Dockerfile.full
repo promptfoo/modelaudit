@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Install the package itself using pip
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 # Production stage
 FROM python:3.9-slim
