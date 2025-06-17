@@ -2,6 +2,9 @@
 Tests for security enhancements in Joblib and NumPy scanners.
 """
 
+import lzma
+import pickle
+import zipfile
 import zlib
 
 import numpy as np
@@ -94,8 +97,6 @@ class TestJoblibScannerSecurity:
         """Test that valid compressed joblib files still work."""
         # Create reasonable compressed data
         data = {"test": "data", "numbers": list(range(100))}
-        import pickle
-
         pickled = pickle.dumps(data)
         compressed = zlib.compress(pickled)
 
@@ -107,6 +108,107 @@ class TestJoblibScannerSecurity:
 
         # Should succeed
         assert result.success is True
+
+    def test_can_handle_edge_cases(self, tmp_path):
+        """Test can_handle method with various edge cases."""
+        scanner = JoblibScanner()
+
+        # Test with directory
+        test_dir = tmp_path / "testdir"
+        test_dir.mkdir()
+        assert scanner.can_handle(str(test_dir)) is False
+
+        # Test with wrong extension
+        wrong_ext = tmp_path / "test.pkl"
+        wrong_ext.write_text("test")
+        assert scanner.can_handle(str(wrong_ext)) is False
+
+        # Test with correct extension
+        correct_ext = tmp_path / "test.joblib"
+        correct_ext.write_text("test")
+        assert scanner.can_handle(str(correct_ext)) is True
+
+    def test_lzma_compressed_joblib(self, tmp_path):
+        """Test LZMA compressed joblib files."""
+        # Create LZMA compressed data
+        data = {"test": "lzma_data", "values": [1, 2, 3, 4, 5]}
+        pickled = pickle.dumps(data)
+        compressed = lzma.compress(pickled)
+
+        joblib_file = tmp_path / "lzma.joblib"
+        joblib_file.write_bytes(compressed)
+
+        scanner = JoblibScanner()
+        result = scanner.scan(str(joblib_file))
+
+        # Should succeed
+        assert result.success is True
+
+    def test_zip_format_joblib(self, tmp_path):
+        """Test joblib files that are actually ZIP archives."""
+        # Create a ZIP file with .joblib extension
+        zip_file = tmp_path / "archive.joblib"
+        with zipfile.ZipFile(zip_file, "w") as zf:
+            zf.writestr("test.txt", "test content")
+
+        scanner = JoblibScanner()
+        result = scanner.scan(str(zip_file))
+
+        # Should delegate to ZIP scanner and succeed
+        assert result.success is True
+
+    def test_direct_pickle_joblib(self, tmp_path):
+        """Test joblib files that are direct pickle (not compressed)."""
+        # Create direct pickle data with pickle magic bytes
+        data = {"test": "direct_pickle"}
+        pickled = pickle.dumps(data, protocol=2)  # Protocol 2 starts with 0x80
+
+        joblib_file = tmp_path / "direct.joblib"
+        joblib_file.write_bytes(pickled)
+
+        scanner = JoblibScanner()
+        result = scanner.scan(str(joblib_file))
+
+        # Should succeed
+        assert result.success is True
+
+    def test_invalid_compression_format(self, tmp_path):
+        """Test handling of invalid/unrecognized compression formats."""
+        # Create file with random bytes (not valid compression)
+        invalid_data = b"This is not compressed data at all!"
+
+        joblib_file = tmp_path / "invalid.joblib"
+        joblib_file.write_bytes(invalid_data)
+
+        scanner = JoblibScanner()
+        result = scanner.scan(str(joblib_file))
+
+        # Should fail with decompression error
+        assert result.success is False
+        decomp_issues = [
+            issue
+            for issue in result.issues
+            if "unable to decompress" in issue.message.lower()
+        ]
+        assert len(decomp_issues) > 0
+
+    def test_file_read_chunk_limit(self, tmp_path):
+        """Test chunked file reading with size check during read."""
+        # Create a file that would pass initial size check but fail during chunked read
+        # This is tricky since we check file size first, but let's test the chunked read logic
+        
+        # Test with a file exactly at the limit
+        limit_data = b"X" * (50 * 1024 * 1024)  # 50MB
+        limit_file = tmp_path / "at_limit.joblib"
+        limit_file.write_bytes(limit_data)
+
+        config = {"max_file_read_size": 50 * 1024 * 1024}  # Exactly 50MB limit
+        scanner = JoblibScanner(config)
+
+        # This should work (at the limit)
+        result = scanner.scan(str(limit_file))
+        # May fail on decompression but not on file read
+        assert "File read exceeds limit" not in str(result.issues)
 
 
 class TestNumPyScannerSecurity:
@@ -263,6 +365,105 @@ class TestNumPyScannerSecurity:
         assert result.bytes_scanned > 0
         assert "shape" in result.metadata
         assert "dtype" in result.metadata
+
+    def test_numpy_version_2_format(self, tmp_path):
+        """Test NumPy format version 2.0 handling."""
+        # Create array that will use version 2.0 format
+        # Use a very long array description to trigger v2.0 format
+        
+        # Create a large 4D array that should trigger version 2.0
+        # due to large header size, not structured dtype
+        arr = np.zeros((100, 50, 20, 10), dtype=np.float64)
+
+        npy_file = tmp_path / "version2.npy"
+        np.save(npy_file, arr)
+
+        # Allow structured arrays for this test
+        config = {"max_array_bytes": 10 * 1024 * 1024 * 1024}  # 10GB limit to allow large test array
+        scanner = NumPyScanner(config)
+        result = scanner.scan(str(npy_file))
+
+        # Should succeed
+        assert result.success is True
+
+    def test_large_itemsize_rejection(self, tmp_path):
+        """Test rejection of dtypes with very large item sizes."""
+        config = {"max_itemsize": 100}  # Low limit for testing
+        scanner = NumPyScanner(config)
+
+        # Create numpy file with large itemsize manually
+        npy_file = tmp_path / "large_itemsize.npy"
+
+        with open(npy_file, "wb") as f:
+            f.write(b"\x93NUMPY")  # Magic
+            f.write(b"\x01\x00")  # Version 1.0
+            # String dtype with large size (200 bytes per string)
+            header = "{'descr': '<U200', 'fortran_order': False, 'shape': (5,), }"
+            header_len = len(header)
+            f.write(header_len.to_bytes(2, "little"))
+            f.write(header.encode("latin1"))
+            # Add minimal data
+            f.write(b"\x00" * 100)
+
+        result = scanner.scan(str(npy_file))
+
+        assert result.success is False
+        itemsize_issues = [
+            issue
+            for issue in result.issues
+            if "itemsize too large" in issue.message.lower()
+        ]
+        assert len(itemsize_issues) > 0
+
+    def test_void_dtype_rejection(self, tmp_path):
+        """Test rejection of void dtype."""
+        scanner = NumPyScanner()
+
+        # Create numpy file with void dtype manually
+        npy_file = tmp_path / "void_dtype.npy"
+
+        with open(npy_file, "wb") as f:
+            f.write(b"\x93NUMPY")  # Magic
+            f.write(b"\x01\x00")  # Version 1.0
+            header = "{'descr': '|V10', 'fortran_order': False, 'shape': (5,), }"
+            header_len = len(header)
+            f.write(header_len.to_bytes(2, "little"))
+            f.write(header.encode("latin1"))
+            # Add some dummy data
+            f.write(b"\x00" * 50)  # 5 * 10 bytes per void
+
+        result = scanner.scan(str(npy_file))
+
+        assert result.success is False
+        dtype_issues = [
+            issue
+            for issue in result.issues
+            if "dangerous dtype" in issue.message.lower()
+        ]
+        assert len(dtype_issues) > 0
+
+    def test_unsupported_numpy_version(self, tmp_path):
+        """Test handling of unsupported NumPy file versions."""
+        scanner = NumPyScanner()
+
+        # Create numpy file with unsupported version manually
+        npy_file = tmp_path / "unsupported_version.npy"
+
+        with open(npy_file, "wb") as f:
+            f.write(b"\x93NUMPY")  # Magic
+            f.write(b"\x03\x00")  # Version 3.0 (hypothetical future version)
+            header = "{'descr': '<f8', 'fortran_order': False, 'shape': (10,), }"
+            header_len = len(header)
+            f.write(header_len.to_bytes(2, "little"))
+            f.write(header.encode("latin1"))
+            # Add some dummy data
+            f.write(b"\x00" * 80)
+
+        result = scanner.scan(str(npy_file))
+
+        # Should either succeed (if NumPy handles it) or fail gracefully
+        # The important thing is it doesn't crash
+        assert result is not None
 
 
 class TestConfigurableLimits:

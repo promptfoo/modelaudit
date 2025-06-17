@@ -44,10 +44,11 @@ class NumPyScanner(BaseScanner):
     def _validate_dtype(self, dtype) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
-        dangerous_types = ["object", "void"]
+        dangerous_names = ["object"]
+        dangerous_kinds = ["O", "V"]  # Object and Void kinds
 
-        if dtype.name in dangerous_types:
-            raise ValueError(f"Dangerous dtype not allowed: {dtype.name}")
+        if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
+            raise ValueError(f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})")
 
         # Check for extremely large item sizes
         if dtype.itemsize > self.max_itemsize:
