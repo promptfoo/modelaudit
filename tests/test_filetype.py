@@ -84,6 +84,15 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile("nonexistent_file.zip") is False
 
 
+def test_zip_magic_variants(tmp_path):
+    """Ensure alternate PK signatures are detected as ZIP."""
+    for sig in (b"PK\x06\x06", b"PK\x06\x07"):
+        path = tmp_path / f"file_{sig.hex()}.zip"
+        path.write_bytes(sig + b"extra")
+        assert is_zipfile(str(path)) is True
+        assert detect_file_format(str(path)) == "zip"
+
+
 def test_find_sharded_files(tmp_path):
     """Test finding sharded model files."""
     # Create directory with sharded files
