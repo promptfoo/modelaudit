@@ -75,7 +75,7 @@ class PyTorchZipScanner(BaseScanner):
                     if not is_safe:
                         result.add_issue(
                             f"Archive entry {name} attempted path traversal outside the archive",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"entry": name},
                         )

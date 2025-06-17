@@ -163,7 +163,7 @@ class TestZipScanner:
             ]
             assert len(traversal_issues) >= 1
             for issue in traversal_issues:
-                assert issue.severity == IssueSeverity.ERROR
+                assert issue.severity == IssueSeverity.CRITICAL
         finally:
             os.unlink(tmp_path)
 
