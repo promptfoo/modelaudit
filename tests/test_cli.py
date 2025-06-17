@@ -143,11 +143,12 @@ def test_scan_output_file(tmp_path):
     output_file = tmp_path / "output.txt"
 
     runner = CliRunner()
-    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
+    result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
 
     # The file should be created regardless of the exit code
     assert output_file.exists()
     assert output_file.read_text()  # Should not be empty
+    assert f"Results written to {output_file}" in result.output
 
 
 def test_scan_sbom_output(tmp_path):
@@ -261,6 +262,90 @@ def test_format_text_output_only_debug_issues():
     assert "Scan completed successfully" in output
 
 
+def test_format_text_output_fast_scan_duration():
+    """Test duration formatting for very fast scans (< 0.01 seconds)."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 512,
+        "duration": 0.005,  # Very fast scan < 0.01 seconds
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 3 decimal places for very fast scans
+    assert "Scan completed in 0.005 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_normal_scan_duration():
+    """Test duration formatting for normal scans (>= 0.01 seconds)."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 2,
+        "bytes_scanned": 2048,
+        "duration": 0.25,  # Normal scan >= 0.01 seconds
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 2 decimal places for normal scans
+    assert "Scan completed in 0.25 seconds" in output
+    assert "Files scanned: 2" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_edge_case_duration():
+    """Test duration formatting for edge case exactly at 0.01 seconds."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 1024,
+        "duration": 0.01,  # Edge case exactly at threshold
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 2 decimal places (>= 0.01 branch)
+    assert "Scan completed in 0.01 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "No issues found" in output
+
+
+def test_format_text_output_very_fast_scan_with_issues():
+    """Test duration formatting for very fast scan with issues."""
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": 1,
+        "bytes_scanned": 256,
+        "duration": 0.003,  # Very fast scan with issues
+        "issues": [
+            {
+                "message": "Suspicious pattern detected",
+                "severity": "warning",
+                "location": "malicious.pkl",
+                "details": {"pattern": "eval"},
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    # Should show 3 decimal places for very fast scans
+    assert "Scan completed in 0.003 seconds" in output
+    assert "Files scanned: 1" in output
+    assert "Suspicious pattern detected" in output
+    assert "warning" in output.lower()
+
+
 def test_exit_code_clean_scan(tmp_path):
     """Test exit code 0 when scan is clean with no issues."""
     import pickle
@@ -282,7 +367,8 @@ def test_exit_code_clean_scan(tmp_path):
     assert result.exit_code == 0, (
         f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     )
-    # The output might not say "No issues found" if there are debug messages, so let's be less strict
+    # The output might not say "No issues found" if there are debug messages,
+    # so let's be less strict
     assert (
         "scan completed successfully" in result.output.lower()
         or "no issues found" in result.output.lower()

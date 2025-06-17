@@ -3,6 +3,7 @@ import os
 import zipfile
 from typing import Any, Optional
 
+from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -56,7 +57,7 @@ class PyTorchZipScanner(BaseScanner):
         if not header.startswith(b"PK"):
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -68,7 +69,19 @@ class PyTorchZipScanner(BaseScanner):
             self.current_file_path = path
 
             with zipfile.ZipFile(path, "r") as z:
-                pickle_files = [name for name in z.namelist() if name.endswith(".pkl")]
+                safe_entries: list[str] = []
+                for name in z.namelist():
+                    _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                    if not is_safe:
+                        result.add_issue(
+                            f"Archive entry {name} attempted path traversal outside the archive",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}:{name}",
+                            details={"entry": name},
+                        )
+                        continue
+                    safe_entries.append(name)
+                pickle_files = [n for n in safe_entries if n.endswith(".pkl")]
                 result.metadata["pickle_files"] = pickle_files
 
                 # Track number of bytes scanned
@@ -105,7 +118,7 @@ class PyTorchZipScanner(BaseScanner):
                     result.merge(sub_result)
 
                 # Check for other suspicious files
-                for name in z.namelist():
+                for name in safe_entries:
                     # Check for Python code files
                     if name.endswith(".py"):
                         result.add_issue(
@@ -118,7 +131,7 @@ class PyTorchZipScanner(BaseScanner):
                     elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
                         result.add_issue(
                             f"Executable file found in PyTorch model: {name}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
@@ -128,8 +141,8 @@ class PyTorchZipScanner(BaseScanner):
                     os.path.basename(f) for f in pickle_files
                 ]:
                     result.add_issue(
-                        "PyTorch model missing data.pkl file - unusual for "
-                        "standard PyTorch models",
+                        "PyTorch model is missing 'data.pkl', which is "
+                        "unusual for standard PyTorch models.",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"missing_file": "data.pkl"},
@@ -142,7 +155,7 @@ class PyTorchZipScanner(BaseScanner):
                     and "blacklist_patterns" in self.config
                 ):
                     blacklist_patterns = self.config["blacklist_patterns"]
-                    for name in z.namelist():
+                    for name in safe_entries:
                         try:
                             file_data = z.read(name)
 
@@ -195,7 +208,7 @@ class PyTorchZipScanner(BaseScanner):
         except zipfile.BadZipFile:
             result.add_issue(
                 f"Not a valid zip file: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -204,7 +217,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning PyTorch zip file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

@@ -1,0 +1,9 @@
+include LICENSE
+include README.md
+exclude tests*
+exclude Dockerfile*
+exclude docker-compose.yml
+exclude setup-poetry.sh
+exclude AGENTS.md
+exclude CLAUDE.md
+exclude llm_context.txt

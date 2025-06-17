@@ -30,6 +30,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Lint with Ruff
@@ -39,6 +40,21 @@ jobs:
       - name: Check formatting with Ruff
         run: |
           poetry run ruff format --check .
+
+  format-check:
+    name: Format Check (Biome)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check formatting with Biome
+        run: npx @biomejs/biome ci .
 
   type-check:
     name: Type Check
@@ -58,6 +74,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Type checking
@@ -84,6 +101,7 @@ jobs:
           cache-dependency-path: poetry.lock
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: poetry install --sync --with dev --extras "all" --no-interaction
 
       - name: Run tests with pytest
@@ -91,7 +109,7 @@ jobs:
 
   build:
     name: Build and Package
-    needs: [lint, type-check]
+    needs: [lint, format-check, type-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
