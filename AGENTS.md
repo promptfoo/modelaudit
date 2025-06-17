@@ -49,7 +49,7 @@ modelaudit/
 
 ### Code Style & Standards
 
-**Python Version:** 3.10+ (supports 3.10, 3.11, 3.12, 3.13)
+**Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12, 3.13)
 
 **Code Quality Tools:**
 - **Ruff**: Ultra-fast linter and formatter (replaces Black, isort, flake8)
@@ -330,7 +330,7 @@ modelaudit scan model.pkl --verbose
 When contributing code:
 
 1. **Follow conventional commits**: `feat:`, `fix:`, `docs:`, etc.
-2. **All tests must pass** across Python 3.10-3.13
+2. **All tests must pass** across Python 3.9-3.13
 3. **Code must be formatted** with Ruff
 4. **Type checking must pass** with MyPy
 5. **Keep PRs focused** on single concerns
