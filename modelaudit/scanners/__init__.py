@@ -56,7 +56,6 @@ __all__ = [
     "manifest_scanner",
     "gguf_scanner",
     "weight_distribution_scanner",
-    "safetensors_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",

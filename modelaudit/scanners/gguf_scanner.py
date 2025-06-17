@@ -218,6 +218,16 @@ class GgufScanner(BaseScanner):
                 t_name = self._read_string(f)
                 (nd,) = struct.unpack("<I", f.read(4))
 
+                # Hard limit on dimensions to prevent DoS attacks
+                if nd > 1000:  # Extremely large dimension count - skip this tensor
+                    result.add_issue(
+                        f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
+                        IssueSeverity.CRITICAL,
+                    )
+                    # Skip the rest of this tensor's data to prevent DoS
+                    f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
+                    continue
+
                 if nd > 8:  # Reasonable limit for tensor dimensions
                     result.add_issue(
                         f"Tensor {t_name} has suspicious number of dimensions: {nd}",
@@ -267,11 +277,20 @@ class GgufScanner(BaseScanner):
                 if has_invalid_dimension:
                     continue
 
-                # Check for extremely large tensors
-                uncompressed = nelements * 4
-                if uncompressed > self.max_uncompressed:
+                # Check for extremely large tensors using correct size calculation
+                # For quantized types, use the actual type information
+                info = _GGML_TYPE_INFO.get(tensor["type"])
+                if info:
+                    # For quantized types, calculate based on block and type size
+                    blck, ts = info
+                    estimated_size = ((nelements + blck - 1) // blck) * ts
+                else:
+                    # Fallback for unknown types - assume 4 bytes per element
+                    estimated_size = nelements * 4
+
+                if estimated_size > self.max_uncompressed:
                     result.add_issue(
-                        f"Tensor {tensor['name']} uncompressed size ({uncompressed}) exceeds limit",
+                        f"Tensor {tensor['name']} estimated size ({estimated_size}) exceeds limit",
                         IssueSeverity.CRITICAL,
                     )
 
