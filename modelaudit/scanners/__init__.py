@@ -1,5 +1,6 @@
 from . import (
     base,
+    gguf_scanner,
     keras_h5_scanner,
     manifest_scanner,
     pickle_scanner,
@@ -13,6 +14,7 @@ from . import (
 
 # Import scanner classes for direct use
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .gguf_scanner import GgufScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
 from .pickle_scanner import PickleScanner
@@ -33,6 +35,7 @@ SCANNER_REGISTRY = [
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
     ManifestScanner,
     WeightDistributionScanner,
+    GgufScanner,
     SafeTensorsScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
@@ -47,6 +50,8 @@ __all__ = [
     "tf_savedmodel_scanner",
     "manifest_scanner",
     "weight_distribution_scanner",
+    "gguf_scanner",
+    "safetensors_scanner",
     "zip_scanner",
     "BaseScanner",
     "ScanResult",
@@ -59,6 +64,7 @@ __all__ = [
     "PyTorchZipScanner",
     "ManifestScanner",
     "WeightDistributionScanner",
+    "GgufScanner",
     "SafeTensorsScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
