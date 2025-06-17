@@ -1,5 +1,7 @@
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+import modelaudit
+from importlib.metadata import version, PackageNotFoundError
 
 
 def test_unknown_file(tmp_path):
@@ -230,3 +232,22 @@ def test_blacklist_patterns(tmp_path):
 
     # Just verify the scan completes successfully
     assert results["success"] is True
+
+
+def test_version_consistency():
+    """Test that __version__ matches the package metadata version."""
+    # This is a recommended test from the Python Packaging Guide
+    # to ensure version consistency between code and distribution metadata
+    try:
+        package_version = version("modelaudit")
+        assert modelaudit.__version__ == package_version, (
+            f"Version mismatch: __version__ is '{modelaudit.__version__}' "
+            f"but package metadata version is '{package_version}'"
+        )
+    except PackageNotFoundError:
+        # Package is not installed, so we can't compare versions
+        # This is expected in development environments
+        assert modelaudit.__version__ == "unknown", (
+            f"Expected __version__ to be 'unknown' when package is not installed, "
+            f"but got '{modelaudit.__version__}'"
+        )
