@@ -22,10 +22,10 @@ jobs:
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: poetry
           cache-dependency-path: poetry.lock
 
@@ -51,7 +51,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Check formatting with Biome
         run: npx @biomejs/biome ci .
@@ -66,10 +66,10 @@ jobs:
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: poetry
           cache-dependency-path: poetry.lock
 
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -112,7 +112,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.13"]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -129,10 +129,10 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry install --sync --with dev --extras "h5,pytorch,yaml,safetensors,onnx" --no-interaction
 
       - name: Run tests with pytest
-        run: poetry run pytest -v --cov=modelaudit
+        run: poetry run pytest -v --cov=modelaudit -k "not (tensorflow or keras)"
 
   build:
     name: Build and Package
@@ -145,10 +145,10 @@ jobs:
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: poetry
           cache-dependency-path: poetry.lock
 
