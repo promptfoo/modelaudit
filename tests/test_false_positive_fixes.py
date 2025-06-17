@@ -335,19 +335,22 @@ class TestFalsePositiveFixes:
 
         # Test directly with the scanner instead of CLI
         from modelaudit.scanners.manifest_scanner import ManifestScanner
+
         scanner = ManifestScanner()
         scan_result = scanner.scan(str(evil_manifest_path))
-        
+
         # Check that malicious content was detected
         critical_issues = [
-            issue for issue in scan_result.issues 
+            issue
+            for issue in scan_result.issues
             if issue.severity == IssueSeverity.CRITICAL
         ]
         warning_issues = [
-            issue for issue in scan_result.issues 
+            issue
+            for issue in scan_result.issues
             if issue.severity == IssueSeverity.WARNING
         ]
-        
+
         assert len(critical_issues) > 0 or len(warning_issues) > 0, (
             f"Malicious manifest should be detected. Found {len(scan_result.issues)} issues: "
             f"{[str(issue) for issue in scan_result.issues]}"
