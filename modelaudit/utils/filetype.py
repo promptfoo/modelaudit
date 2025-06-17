@@ -27,6 +27,7 @@ def detect_file_format(path: str) -> str:
     - Keras HDF5 (.h5 file with HDF5 magic bytes)
     - PyTorch ZIP (.pt/.pth file that's a ZIP)
     - Pickle (.pkl/.pickle or other files with pickle magic)
+    - PyTorch binary (.bin files with various formats)
     - If extension indicates pickle/pt/h5/pb, etc.
     """
     file_path = Path(path)
@@ -43,30 +44,59 @@ def detect_file_format(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    # Read first 4 bytes for most formats
+    # Read first bytes for format detection
     magic4 = read_magic_bytes(path, 4)
+    magic8 = read_magic_bytes(path, 8)
+    magic16 = read_magic_bytes(path, 16)
 
     # Check first 8 bytes for HDF5 magic
-    magic8 = read_magic_bytes(path, 8)
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
     if magic8 == hdf5_magic:
         return "hdf5"
 
     ext = file_path.suffix.lower()
-    if ext in (".pt", ".pth", ".bin", ".ckpt", ".pkl", ".pickle"):
+
+    # Check ZIP magic first (for .pt/.pth files that are actually zips)
+    if magic4[:2] == b"PK":
+        return "zip"
+
+    # Check pickle magic patterns
+    pickle_magics = [
+        b"\x80\x02",  # Protocol 2
+        b"\x80\x03",  # Protocol 3
+        b"\x80\x04",  # Protocol 4
+        b"\x80\x05",  # Protocol 5
+    ]
+    if any(magic4.startswith(m) for m in pickle_magics):
+        return "pickle"
+
+    # For .bin files, do more sophisticated detection
+    if ext == ".bin":
+        # Check if it's a pickle file
+        if any(magic4.startswith(m) for m in pickle_magics):
+            return "pickle"
+        # Check for safetensors format (starts with JSON header)
+        if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+            return "safetensors"
+
+        # Check for ONNX format (protobuf)
+        if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+            return "onnx"
+
+        # Otherwise, assume raw binary format (PyTorch weights)
+        return "pytorch_binary"
+
+    # Extension-based detection for non-.bin files
+    if ext in (".pkl", ".pickle"):
         return "pickle"
     if ext == ".h5":
         return "hdf5"
     if ext == ".pb":
         return "protobuf"
-
-    # Check ZIP magic
-    if magic4[:2] == b"PK":
-        return "zip"
-
-    # Check pickle magic patterns
-    if magic4 == b"\x80\x03]q" or magic4[:3] == b"\x80\x03]":
-        return "pickle"
+    if ext == ".safetensors":
+        return "safetensors"
+    if ext == ".onnx":
+        return "onnx"
 
     return "unknown"
 

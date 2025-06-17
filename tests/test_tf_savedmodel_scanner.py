@@ -1,7 +1,18 @@
 import pickle
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+# Try to import tensorflow and its core module
+try:
+    import tensorflow  # noqa: F401
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F401
+
+    HAS_TENSORFLOW = True
+except ImportError:
+    HAS_TENSORFLOW = False
 
 
 def test_tf_savedmodel_scanner_can_handle(tmp_path):
@@ -19,16 +30,22 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
     test_file = tmp_path / "test.pb"
     test_file.write_bytes(b"dummy content")
 
-    assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
-    assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-    assert (
-        TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
-    )  # Now accepts any .pb file
+    if HAS_TENSORFLOW:
+        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
+        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert (
+            TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+        )  # Now accepts any .pb file
+    else:
+        # When TensorFlow is not installed, can_handle returns False
+        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
+        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
 
 
 def create_tf_savedmodel(tmp_path, *, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F811
 
     # Create a directory that mimics a TensorFlow SavedModel
     model_dir = tmp_path / "tf_model"
@@ -86,6 +103,7 @@ def create_tf_savedmodel(tmp_path, *, malicious=False):
     return model_dir
 
 
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
 def test_tf_savedmodel_scanner_safe_model(tmp_path):
     """Test scanning a safe TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path)
@@ -98,11 +116,12 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
 
     # Check for issues - a safe model might still have some informational issues
     error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.ERROR
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
     assert len(error_issues) == 0
 
 
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
 def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     """Test scanning a malicious TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path, malicious=True)
@@ -114,7 +133,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     # 1. Malicious pickle files in the directory, OR
     # 2. Suspicious TensorFlow operations (e.g. PyFunc), OR
     # 3. Both malicious files and suspicious operations
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "malicious.pkl" in issue.message.lower()
         or "eval" in issue.message.lower()
@@ -135,16 +154,18 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(invalid_dir))
 
-    # Should have errors about invalid protobuf format
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    # Should have errors about invalid protobuf format or TensorFlow not installed
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "error" in issue.message.lower()
         or "parsing" in issue.message.lower()
         or "invalid" in issue.message.lower()
+        or "tensorflow not installed" in issue.message.lower()
         for issue in result.issues
     )
 
 
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
 def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
@@ -178,9 +199,11 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(test_file))
 
-    # Should have an error about invalid protobuf format
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    # Should have an error about invalid protobuf format or TensorFlow not installed
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
-        "error" in issue.message.lower() or "parsing" in issue.message.lower()
+        "error" in issue.message.lower()
+        or "parsing" in issue.message.lower()
+        or "tensorflow not installed" in issue.message.lower()
         for issue in result.issues
     )

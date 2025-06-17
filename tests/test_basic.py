@@ -1,3 +1,7 @@
+import re
+from importlib.metadata import PackageNotFoundError, version
+
+import modelaudit
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 
@@ -56,13 +60,16 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results["bytes_scanned"] > 0
 
-    # Each file should have an issue about unknown format
+    # Check for unknown format issues (only .txt and .dat should be unknown)
     unknown_format_issues = [
         issue
         for issue in results["issues"]
         if "Unknown or unhandled format" in issue["message"]
     ]
-    assert len(unknown_format_issues) == 3
+    assert len(unknown_format_issues) == 2  # .txt and .dat files
+
+    # The .bin file should be handled by PyTorchBinaryScanner
+    assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))
 
 
 def test_max_file_size(tmp_path):
@@ -108,7 +115,8 @@ def test_timeout(tmp_path, monkeypatch):
     test_file = tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
-    # Instead of mocking time.time, let's check if the timeout parameter is passed correctly
+    # Instead of mocking time.time, let's check if the timeout parameter
+    # is passed correctly
     # The actual timeout functionality is hard to test without complex mocking
 
     # Just verify that the scan completes with a reasonable timeout
@@ -160,7 +168,7 @@ def test_scan_result_class():
     result.add_issue("Debug message", severity=IssueSeverity.DEBUG)
     result.add_issue("Info message", severity=IssueSeverity.INFO)
     result.add_issue("Warning message", severity=IssueSeverity.WARNING)
-    result.add_issue("Error message", severity=IssueSeverity.ERROR)
+    result.add_issue("Error message", severity=IssueSeverity.CRITICAL)
 
     # Test issue count
     assert len(result.issues) == 4
@@ -187,7 +195,7 @@ def test_scan_result_class():
         assert result.has_errors is True
     else:
         # Manual check for errors
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_merge_scan_results():
@@ -226,3 +234,57 @@ def test_blacklist_patterns(tmp_path):
 
     # Just verify the scan completes successfully
     assert results["success"] is True
+
+
+def test_version_consistency():
+    """Test that __version__ matches the package metadata version."""
+    # This is a recommended test from the Python Packaging Guide
+    # to ensure version consistency between code and distribution metadata
+    try:
+        package_version = version("modelaudit")
+        assert modelaudit.__version__ == package_version, (
+            f"Version mismatch: __version__ is '{modelaudit.__version__}' "
+            f"but package metadata version is '{package_version}'"
+        )
+    except PackageNotFoundError:
+        # Package is not installed, so we can't compare versions
+        # This is expected in development environments
+        assert modelaudit.__version__ == "unknown", (
+            f"Expected __version__ to be 'unknown' when package is not installed, "
+            f"but got '{modelaudit.__version__}'"
+        )
+
+
+def test_version_is_semver():
+    """Test that __version__ follows semantic versioning format."""
+    # Semantic versioning pattern: MAJOR.MINOR.PATCH with optional pre-release and build metadata
+    # Examples: 1.0.0, 0.1.3, 2.1.0-alpha, 1.0.0-beta.1, 1.0.0+20130313144700
+    semver_pattern = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+
+    version = modelaudit.__version__
+
+    # Skip validation if version is "unknown" (development scenarios)
+    if version == "unknown":
+        return
+
+    assert re.match(semver_pattern, version), (
+        f"Version '{version}' does not follow semantic versioning format. "
+        f"Expected format: MAJOR.MINOR.PATCH (e.g., 1.0.0, 0.1.3, 2.1.0-alpha)"
+    )
+
+    # Additional basic checks
+    parts = version.split(".")
+    assert len(parts) >= 3, (
+        f"Version '{version}' must have at least 3 parts (major.minor.patch)"
+    )
+
+    # Ensure major, minor, patch are numeric (before any pre-release suffix)
+    major = parts[0]
+    minor = parts[1]
+    patch_part = (
+        parts[2].split("-")[0].split("+")[0]
+    )  # Remove pre-release/build metadata
+
+    assert major.isdigit(), f"Major version '{major}' must be numeric"
+    assert minor.isdigit(), f"Minor version '{minor}' must be numeric"
+    assert patch_part.isdigit(), f"Patch version '{patch_part}' must be numeric"

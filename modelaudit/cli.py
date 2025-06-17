@@ -8,6 +8,7 @@ import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
+from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 
 # Configure logging
@@ -19,8 +20,9 @@ logger = logging.getLogger("modelaudit")
 
 
 @click.group()
+@click.version_option(__version__)
 def cli():
-    """My Model Scanner CLI."""
+    """Static scanner for ML models"""
     pass
 
 
@@ -60,26 +62,29 @@ def cli():
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
 def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
-    """
-    Scan one or more model files or directories for malicious content or
-    suspicious references.
+    """Scan files or directories for malicious content.
 
-    Usage: modelaudit scan /path/to/model1 /path/to/model2 ...
+    \b
+    Usage:
+        modelaudit scan /path/to/model1 /path/to/model2 ...
 
-    You can specify additional blacklist patterns with --blacklist or -b option:
-    modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+    You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
+        modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+
+    \b
     Advanced options:
-      --format, -f       Output format (text or json)
-      --output, -o       Write results to a file instead of stdout
-      --timeout, -t      Set scan timeout in seconds
-      --verbose, -v      Show detailed information during scanning
-      --max-file-size    Maximum file size to scan in bytes
+        --format, -f       Output format (text or json)
+        --output, -o       Write results to a file instead of stdout
+        --timeout, -t      Set scan timeout in seconds
+        --verbose, -v      Show detailed information during scanning
+        --max-file-size    Maximum file size to scan in bytes
 
+    \b
     Exit codes:
-      0 - Success, no security issues found
-      1 - Security issues found (scan completed successfully)
-      2 - Errors occurred during scanning
+        0 - Success, no security issues found
+        1 - Security issues found (scan completed successfully)
+        2 - Errors occurred during scanning
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
@@ -236,6 +241,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     if output:
         with open(output, "w") as f:
             f.write(output_text)
+        click.echo(f"Results written to {output}")
     else:
         # Add a separator line between debug output and scan results
         if format == "text":
@@ -269,12 +275,22 @@ def format_text_output(results, verbose=False):
                 ),
             )
     if "duration" in results:
-        output_lines.append(
-            click.style(
-                f"Scan completed in {results['duration']:.2f} seconds",
-                fg="cyan",
-            ),
-        )
+        duration = results["duration"]
+        if duration < 0.01:
+            # For very fast scans, show more precision
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.3f} seconds",
+                    fg="cyan",
+                ),
+            )
+        else:
+            output_lines.append(
+                click.style(
+                    f"Scan completed in {duration:.2f} seconds",
+                    fg="cyan",
+                ),
+            )
     if "files_scanned" in results:
         output_lines.append(
             click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
@@ -294,21 +310,19 @@ def format_text_output(results, verbose=False):
 
     # Add issue details with color-coded severity
     issues = results.get("issues", [])
-    if issues:
-        # Filter out DEBUG severity issues when not in verbose mode
-        visible_issues = [
-            issue
-            for issue in issues
-            if verbose
-            or not isinstance(issue, dict)
-            or issue.get("severity") != "debug"
-        ]
+    # Filter out DEBUG severity issues when not in verbose mode
+    visible_issues = [
+        issue
+        for issue in issues
+        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+    ]
 
+    if visible_issues:
         # Count issues by severity (excluding DEBUG when not in verbose mode)
         error_count = sum(
             1
             for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "error"
+            if isinstance(issue, dict) and issue.get("severity") == "critical"
         )
         warning_count = sum(
             1
@@ -330,7 +344,7 @@ def format_text_output(results, verbose=False):
         issue_summary = []
         if error_count:
             issue_summary.append(
-                click.style(f"{error_count} errors", fg="red", bold=True),
+                click.style(f"{error_count} critical", fg="red", bold=True),
             )
         if warning_count:
             issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
@@ -356,14 +370,14 @@ def format_text_output(results, verbose=False):
             location = issue.get("location", "")
 
             # Color-code based on severity
-            if severity == "error":
-                severity_style = click.style("[ERROR]", fg="red", bold=True)
+            if severity == "critical":
+                severity_style = click.style("[CRITICAL]", fg="red", bold=True)
             elif severity == "warning":
                 severity_style = click.style("[WARNING]", fg="yellow")
             elif severity == "info":
                 severity_style = click.style("[INFO]", fg="blue")
             elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="gray")
+                severity_style = click.style("[DEBUG]", fg="bright_black")
 
             # Format the issue line
             issue_num = click.style(f"{i}.", fg="white", bold=True)
@@ -375,8 +389,16 @@ def format_text_output(results, verbose=False):
             else:
                 output_lines.append(f"{issue_num} {severity_style} {message}")
 
+            # Add "Why" explanation if available
+            why = issue.get("why")
+            if why:
+                # Indent the explanation and style it
+                why_label = click.style("   Why:", fg="magenta", bold=True)
+                why_text = click.style(f" {why}", fg="bright_white")
+                output_lines.append(f"{why_label}{why_text}")
+
             # Add a small separator between issues for readability
-            if i < len(issues):
+            if i < len(visible_issues):
                 output_lines.append("")
     else:
         output_lines.append(
@@ -385,12 +407,12 @@ def format_text_output(results, verbose=False):
 
     # Add a footer
     output_lines.append("─" * 80)
-    if issues:
+    if visible_issues:
         if any(
-            isinstance(issue, dict) and issue.get("severity") == "error"
-            for issue in issues
+            isinstance(issue, dict) and issue.get("severity") == "critical"
+            for issue in visible_issues
         ):
-            status = click.style("✗ Scan completed with errors", fg="red", bold=True)
+            status = click.style("✗ Scan completed with findings", fg="red", bold=True)
         else:
             status = click.style(
                 "⚠ Scan completed with warnings",

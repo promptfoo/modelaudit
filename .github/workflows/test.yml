@@ -59,11 +59,9 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -88,7 +86,7 @@ jobs:
 
   build:
     name: Build and Package
-    needs: lint
+    needs: [lint, type-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo

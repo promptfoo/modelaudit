@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, Optional
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Try to import the name policies module
 try:
@@ -56,6 +56,9 @@ MODEL_NAME_KEYS = [
     "package_name",
 ]
 
+# Pre-compute lowercase versions for faster checks
+MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
+
 # Suspicious configuration patterns
 SUSPICIOUS_CONFIG_PATTERNS = {
     "network_access": [
@@ -76,7 +79,6 @@ SUSPICIOUS_CONFIG_PATTERNS = {
         "directory",
         "folder",
         "output",
-        "input",
         "save",
         "load",
         "write",
@@ -126,23 +128,60 @@ class ManifestScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        # Check file extension
-        ext = os.path.splitext(path)[1].lower()
-        if ext in cls.supported_extensions:
+        filename = os.path.basename(path).lower()
+
+        # Whitelist: Only scan files that are unique to AI/ML models
+        aiml_specific_patterns = [
+            # HuggingFace/Transformers specific configuration files
+            "config.json",  # Model architecture config (when in ML model context)
+            "generation_config.json",  # Text generation parameters
+            "preprocessor_config.json",  # Data preprocessing config
+            "feature_extractor_config.json",  # Feature extraction config
+            "image_processor_config.json",  # Image processing config
+            "scheduler_config.json",  # Learning rate scheduler config
+            # Model metadata and manifest files specific to ML
+            "model_index.json",  # Diffusion model index
+            "model_card.json",  # Model card metadata
+            "pytorch_model.bin.index.json",  # PyTorch model shard index
+            "model.safetensors.index.json",  # SafeTensors model index
+            "tf_model.h5.index.json",  # TensorFlow model index
+            # ML-specific execution and deployment configs
+            "inference_config.json",  # Model inference configuration
+            "deployment_config.json",  # Model deployment configuration
+            "serving_config.json",  # Model serving configuration
+            # ONNX model specific
+            "onnx_config.json",  # ONNX export configuration
+            # Custom model configs that might contain execution parameters
+            "custom_config.json",  # Custom model configurations
+            "runtime_config.json",  # Runtime execution parameters
+        ]
+
+        # Check if filename matches any AI/ML specific pattern
+        if any(pattern in filename for pattern in aiml_specific_patterns):
             return True
 
-        # For files without a recognized extension, try to peek at the content
-        try:
-            with open(path, encoding="utf-8") as f:
-                first_line = f.readline().strip()
-                # Check for JSON format
-                if first_line.startswith("{") or first_line.startswith("["):
-                    return True
-                # Check for YAML format if yaml is available
-                if HAS_YAML and (first_line.startswith("---") or ":" in first_line):
-                    return True
-        except (OSError, UnicodeDecodeError):
-            pass
+        # Additional check: files with "config" in name that are in ML model context
+        # (but exclude tokenizer configs and general software configs)
+        if (
+            "config" in filename
+            and "tokenizer" not in filename
+            and filename
+            not in [
+                "config.py",
+                "config.yaml",
+                "config.yml",
+                "config.ini",
+                "config.cfg",
+            ]
+        ):
+            # Only if it's likely an ML model config
+            # (has model-related terms in path or specific extensions)
+            path_lower = path.lower()
+            if any(
+                ml_term in path_lower
+                for ml_term in ["model", "checkpoint", "huggingface", "transformers"]
+            ) or os.path.splitext(path)[1].lower() in [".json"]:
+                return True
 
         return False
 
@@ -166,7 +205,7 @@ class ManifestScanner(BaseScanner):
 
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
-            content = self._parse_file(path, ext)
+            content = self._parse_file(path, ext, result)
 
             if content:
                 result.bytes_scanned = file_size
@@ -184,7 +223,7 @@ class ManifestScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning manifest file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -210,9 +249,10 @@ class ManifestScanner(BaseScanner):
                     if pattern_lower in content:
                         result.add_issue(
                             f"Blacklisted term '{pattern}' found in file",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
+                            why="This term matches a user-defined blacklist pattern. Organizations use blacklists to identify models or configurations that violate security policies or contain known malicious indicators.",
                         )
         except Exception as e:
             result.add_issue(
@@ -222,7 +262,9 @@ class ManifestScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
-    def _parse_file(self, path: str, ext: str) -> Optional[dict[str, Any]]:
+    def _parse_file(
+        self, path: str, ext: str, result: Optional[ScanResult] = None
+    ) -> Optional[dict[str, Any]]:
         """Parse the file based on its extension"""
         try:
             with open(path, encoding="utf-8") as f:
@@ -255,7 +297,14 @@ class ManifestScanner(BaseScanner):
 
         except Exception as e:
             # Log the error but don't raise, as we want to continue scanning
-            print(f"Error parsing file {path}: {str(e)}")
+            logger.warning(f"Error parsing file {path}: {str(e)}")
+            if result is not None:
+                result.add_issue(
+                    f"Error parsing file: {path}",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
 
         return None
 
@@ -264,8 +313,10 @@ class ManifestScanner(BaseScanner):
         content: dict[str, Any],
         result: ScanResult,
     ) -> None:
-        """Check for suspicious patterns in the configuration"""
-        suspicious_keys = []
+        """Smart pattern detection with value analysis and ML context awareness"""
+
+        # STEP 1: Detect ML context for smart filtering
+        ml_context = self._detect_ml_context(content)
 
         def check_dict(d, prefix=""):
             if not isinstance(d, dict):
@@ -273,43 +324,354 @@ class ManifestScanner(BaseScanner):
 
             for key, value in d.items():
                 key_lower = key.lower()
+                full_key = f"{prefix}.{key}" if prefix else key
 
-                # Check each category of suspicious patterns
-                for category, patterns in SUSPICIOUS_CONFIG_PATTERNS.items():
-                    if any(pattern in key_lower for pattern in patterns):
-                        suspicious_keys.append(
-                            {
-                                "key": f"{prefix}.{key}" if prefix else key,
-                                "value": str(value)[:100]
-                                + (
-                                    "..."
-                                    if isinstance(value, str) and len(value) > 100
-                                    else ""
-                                ),
-                                "category": category,
+                # STEP 1.5: Check for blacklisted model names (integrated from original)
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value), self.blacklist_patterns
+                    )
+                    if blocked:
+                        result.add_issue(
+                            f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": full_key,
                             },
                         )
 
-                # Recursively check nested structures
+                # STEP 2: Value-based analysis - check for actually dangerous content
+                if self._is_actually_dangerous_value(key, value):
+                    result.add_issue(
+                        f"Dangerous configuration content: {full_key}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "key": full_key,
+                            "analysis": "value_based",
+                            "danger": "executable_content",
+                            "value": self._format_value(value),
+                        },
+                    )
+                    # Don't continue here - still check for patterns and recurse
+
+                # STEP 3: Smart pattern matching
+                matches = self._find_suspicious_matches(key_lower)
+                if matches:
+                    # STEP 4: Context-aware filtering
+                    if not self._should_ignore_in_context(
+                        key, value, matches, ml_context
+                    ):
+                        # STEP 5: Report with context-aware severity
+                        severity = self._get_context_aware_severity(matches, ml_context)
+                        why = None
+                        if severity == IssueSeverity.INFO:
+                            if "file_access" in matches and "network_access" in matches:
+                                why = "File and network access patterns in ML model configurations are common for loading datasets and downloading resources. They are flagged for awareness but are typically benign in ML contexts."
+                            elif "file_access" in matches:
+                                why = "File access patterns in ML model configurations often indicate dataset paths or model checkpoints. This is flagged for awareness but is typical in ML workflows."
+                            elif "network_access" in matches:
+                                why = "Network access patterns in ML model configurations may indicate remote model repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
+
+                        result.add_issue(
+                            f"Suspicious configuration pattern: {full_key} "
+                            f"(category: {', '.join(matches)})",
+                            severity=severity,
+                            location=self.current_file_path,
+                            details={
+                                "key": full_key,
+                                "value": self._format_value(value),
+                                "categories": matches,
+                                "ml_context": ml_context,
+                                "analysis": "pattern_based",
+                            },
+                            why=why,
+                        )
+
+                # ALWAYS recursively check nested structures,
+                # regardless of pattern matches
                 if isinstance(value, dict):
-                    check_dict(value, f"{prefix}.{key}" if prefix else key)
+                    check_dict(value, full_key)
                 elif isinstance(value, list):
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
-                            check_dict(
-                                item,
-                                f"{prefix}.{key}[{i}]" if prefix else f"{key}[{i}]",
-                            )
+                            check_dict(item, f"{full_key}[{i}]")
 
         check_dict(content)
 
-        # Report suspicious keys
-        for item in suspicious_keys:
-            result.add_issue(
-                f"Suspicious configuration key found: {item['key']} "
-                f"(category: {item['category']})",
-                severity=IssueSeverity.WARNING,
-                location=f"{self.current_file_path} "
-                f"(line {item.get('line', 'unknown')})",
-                details=item,
-            )
+    def _is_actually_dangerous_value(self, key: str, value: Any) -> bool:
+        """Check if value content is actually dangerous executable code"""
+        if not isinstance(value, str):
+            return False
+
+        value_lower = value.lower().strip()
+
+        # Look for ACTUAL executable content patterns
+        dangerous_patterns = [
+            "import os",
+            "subprocess.",
+            "eval(",
+            "exec(",
+            "os.system",
+            "__import__",
+            "runpy",
+            "shell=true",
+            "rm -rf",
+            "/bin/sh",
+            "cmd.exe",
+            # Add more specific patterns
+            "exec('",
+            'exec("',
+            "eval('",
+            'eval("',
+        ]
+
+        return any(pattern in value_lower for pattern in dangerous_patterns)
+
+    def _detect_ml_context(self, content: dict) -> dict:
+        """Detect ML model context to adjust sensitivity"""
+        indicators = {
+            "framework": None,
+            "model_type": None,
+            "confidence": 0,
+            "is_tokenizer": False,
+            "is_model_config": False,
+        }
+
+        # Framework detection patterns
+        framework_patterns = {
+            "huggingface": [
+                "tokenizer_class",
+                "transformers_version",
+                "model_type",
+                "architectures",
+                "auto_map",
+                "_name_or_path",
+            ],
+            "pytorch": [
+                "torch",
+                "state_dict",
+                "pytorch_model",
+                "model.pt",
+                "torch_dtype",
+            ],
+            "tensorflow": [
+                "tensorflow",
+                "saved_model",
+                "model.h5",
+                "tf_version",
+                "keras",
+            ],
+            "sklearn": ["sklearn", "pickle_module", "scikit"],
+        }
+
+        # Model type indicators
+        tokenizer_indicators = [
+            "tokenizer_class",
+            "added_tokens_decoder",
+            "model_input_names",
+            "special_tokens_map",
+            "bos_token",
+            "eos_token",
+            "pad_token",
+        ]
+
+        model_config_indicators = [
+            "hidden_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "vocab_size",
+            "max_position_embeddings",
+            "architectures",
+        ]
+
+        def check_indicators(d):
+            if not isinstance(d, dict):
+                return
+
+            for key, val in d.items():
+                key_str = str(key).lower()
+                val_str = str(val).lower()
+
+                # Check framework patterns
+                for framework, patterns in framework_patterns.items():
+                    if any(
+                        pattern in key_str or pattern in val_str for pattern in patterns
+                    ):
+                        indicators["framework"] = framework
+                        indicators["confidence"] += 1
+
+                # Check tokenizer indicators
+                if any(indicator in key_str for indicator in tokenizer_indicators):
+                    indicators["is_tokenizer"] = True
+                    indicators["confidence"] += 1
+
+                # Check model config indicators
+                if any(indicator in key_str for indicator in model_config_indicators):
+                    indicators["is_model_config"] = True
+                    indicators["confidence"] += 1
+
+                # Recursive check
+                if isinstance(val, dict):
+                    check_indicators(val)
+
+        check_indicators(content)
+        return indicators
+
+    def _find_suspicious_matches(self, key_lower: str) -> list[str]:
+        """Find all categories that match this key"""
+        matches = []
+        for category, patterns in SUSPICIOUS_CONFIG_PATTERNS.items():
+            if any(pattern in key_lower for pattern in patterns):
+                matches.append(category)
+        return matches
+
+    def _should_ignore_in_context(
+        self, key: str, value: Any, matches: list[str], ml_context: dict
+    ) -> bool:
+        """Context-aware ignore logic combining smart patterns with value analysis"""
+        key_lower = key.lower()
+
+        # Special case for HuggingFace patterns - check this FIRST before other logic
+        if ml_context.get("framework") == "huggingface" or "_name_or_path" in key_lower:
+            huggingface_safe_patterns = [
+                "_name_or_path",
+                "name_or_path",
+                "model_input_names",
+                "model_output_names",
+                "transformers_version",
+                "torch_dtype",
+                "architectures",
+            ]
+            if any(pattern in key_lower for pattern in huggingface_safe_patterns):
+                return True
+
+        # High-confidence ML context gets more lenient treatment
+        if ml_context.get("confidence", 0) >= 2:
+            # File access patterns in ML context
+            if "file_access" in matches:
+                # First check if this is an actual file path - never ignore those
+                if key_lower.endswith(
+                    ("_dir", "_path", "_file")
+                ) and self._is_file_path_value(value):
+                    return False  # Don't ignore actual file paths
+
+                # Common ML config patterns that aren't actual file access
+                safe_ml_patterns = [
+                    "_input",
+                    "input_",
+                    "_output",
+                    "output_",
+                    "_size",
+                    "_dim",
+                    "hidden_",
+                    "attention_",
+                    "embedding_",
+                    "_token_",
+                    "vocab_",
+                    "_names",
+                    "model_input_names",
+                    "model_output_names",
+                ]
+
+                if any(pattern in key_lower for pattern in safe_ml_patterns):
+                    return True
+
+            # Credentials in ML context
+            if "credentials" in matches:
+                # Token IDs and model tokens are not credentials in ML context
+                if any(
+                    pattern in key_lower
+                    for pattern in ["_token_id", "token_id_", "_token", "token_type"]
+                ):
+                    return True
+
+        # Special case for tokenizer configs
+        if ml_context.get("is_tokenizer"):
+            tokenizer_safe_keys = [
+                "added_tokens_decoder",
+                "model_input_names",
+                "special_tokens_map",
+                "tokenizer_class",
+                "model_max_length",
+            ]
+            if any(safe_key in key_lower for safe_key in tokenizer_safe_keys):
+                return True
+
+        return False
+
+    def _is_file_path_value(self, value: Any) -> bool:
+        """Check if value appears to be an actual file system path"""
+        if not isinstance(value, str):
+            return False
+
+        # Absolute paths
+        if value.startswith(("/", "\\", "C:", "D:")):
+            return True
+
+        # Relative paths with separators
+        if "/" in value or "\\" in value:
+            return True
+
+        # File extensions that suggest actual files (using endswith for better matching)
+        file_extensions = [
+            ".json",
+            ".h5",
+            ".pt",
+            ".onnx",
+            ".pkl",
+            ".model",
+            ".txt",
+            ".log",
+            ".csv",
+            ".xml",
+            ".yaml",
+            ".yml",
+            ".py",
+            ".js",
+            ".html",
+            ".css",
+            ".sql",
+            ".md",
+        ]
+        if any(value.lower().endswith(ext) for ext in file_extensions):
+            return True
+
+        # Common path indicators
+        if any(
+            indicator in value.lower()
+            for indicator in ["/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"]
+        ):
+            return True
+
+        return False
+
+    def _get_context_aware_severity(
+        self, matches: list[str], ml_context: dict
+    ) -> IssueSeverity:
+        """Determine severity based on context and match types"""
+        # Execution patterns are always ERROR
+        if "execution" in matches:
+            return IssueSeverity.CRITICAL
+
+        # In high-confidence ML context, downgrade some warnings
+        if ml_context.get("confidence", 0) >= 2:
+            # In ML context, file_access and network_access are less concerning
+            if all(match in ["file_access", "network_access"] for match in matches):
+                return IssueSeverity.INFO
+
+        # Credentials are high priority
+        if "credentials" in matches:
+            return IssueSeverity.WARNING
+
+        return IssueSeverity.WARNING
+
+    def _format_value(self, value: Any) -> str:
+        """Format a value for display, truncating if necessary"""
+        str_value = str(value)
+        if len(str_value) > 100:
+            return str_value[:100] + "..."
+        return str_value

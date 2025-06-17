@@ -62,7 +62,7 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
 
     # Check for issues - a safe model might still have some informational issues
     error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.ERROR
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
     assert len(error_issues) == 0
 
@@ -75,7 +75,7 @@ def test_pytorch_zip_scanner_malicious_model(tmp_path):
     result = scanner.scan(str(model_path))
 
     # The scanner should detect the eval function in the pickle
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any("eval" in issue.message.lower() for issue in result.issues)
 
 
@@ -89,7 +89,7 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     result = scanner.scan(str(invalid_path))
 
     # Should have an error about invalid ZIP
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower()
         or "corrupt" in issue.message.lower()
@@ -138,3 +138,21 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
         if "suspicious_function" in issue.message.lower()
     ]
     assert len(blacklist_issues) > 0
+
+
+def test_pytorch_pickle_file_unsupported(tmp_path):
+    """Raw pickle files with .pt extension should be unsupported."""
+    from tests.evil_pickle import EvilClass
+
+    file_path = tmp_path / "raw_pickle.pt"
+    with file_path.open("wb") as f:
+        pickle.dump(EvilClass(), f)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        "zip" in issue.message.lower() or "pytorch" in issue.message.lower()
+        for issue in result.issues
+    )

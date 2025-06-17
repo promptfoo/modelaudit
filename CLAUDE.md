@@ -25,6 +25,12 @@ rye run pytest -k "test_pickle"         # Run tests matching pattern
 rye run ruff format modelaudit/ tests/   # Format code (ALWAYS run before committing)
 rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
 rye run mypy modelaudit/                 # Type checking
+
+# Recommended order before committing:
+# 1. rye run ruff format modelaudit/ tests/
+# 2. rye run ruff check --fix modelaudit/ tests/
+# 3. rye run mypy modelaudit/
+# 4. rye run pytest
 ```
 
 ## Architecture
@@ -59,6 +65,7 @@ rye run mypy modelaudit/                 # Type checking
 - Unsafe Lambda layers (Keras/TensorFlow)
 - Executable files in archives
 - Blacklisted model names
+- Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 
 ## Exit Codes
 

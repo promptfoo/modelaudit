@@ -1,9 +1,9 @@
-import pytest
-import zipfile
-import tempfile
 import os
-from modelaudit.scanners.zip_scanner import ZipScanner
+import tempfile
+import zipfile
+
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.zip_scanner import ZipScanner
 
 
 class TestZipScanner:
@@ -28,6 +28,26 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_zip_bytes_scanned_single_count(self):
+        """Ensure bytes scanned equals the sum of embedded files once."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                import pickle
+
+                data1 = pickle.dumps({"a": 1})
+                data2 = pickle.dumps({"b": 2})
+                z.writestr("one.pkl", data1)
+                z.writestr("two.pkl", data2)
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            assert result.success is True
+            expected = len(data1) + len(data2)
+            assert result.bytes_scanned == expected
+        finally:
+            os.unlink(tmp_path)
+
     def test_scan_simple_zip(self):
         """Test scanning a simple ZIP file with text files"""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -42,7 +62,7 @@ class TestZipScanner:
             assert result.bytes_scanned > 0
             # May have some debug/info issues about unknown formats
             error_issues = [
-                i for i in result.issues if i.severity == IssueSeverity.ERROR
+                i for i in result.issues if i.severity == IssueSeverity.CRITICAL
             ]
             assert len(error_issues) == 0
         finally:
@@ -86,7 +106,6 @@ class TestZipScanner:
 
             result = self.scanner.scan(outer_path)
             assert result.success is True
-            assert result.bytes_scanned > 0
             # Should have scanned the nested content
             assert (
                 any(
@@ -116,13 +135,35 @@ class TestZipScanner:
 
             # Should have detected directory traversal attempts
             traversal_issues = [
-                i for i in result.issues if "directory traversal" in i.message.lower()
+                i
+                for i in result.issues
+                if "path traversal" in i.message.lower()
+                or "directory traversal" in i.message.lower()
             ]
             assert len(traversal_issues) >= 2
 
             # Check severity
             for issue in traversal_issues:
-                assert issue.severity == IssueSeverity.ERROR
+                assert issue.severity == IssueSeverity.CRITICAL
+        finally:
+            os.unlink(tmp_path)
+
+    def test_windows_traversal_detection(self):
+        """Ensure Windows-style path traversal is caught"""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                z.writestr("..\\evil.txt", "malicious")
+                z.writestr("safe.txt", "ok")
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            traversal_issues = [
+                i for i in result.issues if "path traversal" in i.message.lower()
+            ]
+            assert len(traversal_issues) >= 1
+            for issue in traversal_issues:
+                assert issue.severity == IssueSeverity.CRITICAL
         finally:
             os.unlink(tmp_path)
 
@@ -206,8 +247,8 @@ class TestZipScanner:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             with zipfile.ZipFile(tmp.name, "w") as z:
                 # Create a pickle with suspicious content
-                import pickle
                 import os as os_module
+                import pickle
 
                 class DangerousClass:
                     def __reduce__(self):

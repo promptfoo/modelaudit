@@ -2,19 +2,37 @@
 
 A security scanner for AI models. Quickly check your AIML models for potential security risks before deployment.
 
-<img width="989" alt="image" src="https://github.com/user-attachments/assets/9de32c99-b1c1-4a04-a913-e6031b30024a" />
+[![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
+
+<img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
 ## Table of Contents
 
-- [What It Does](#-what-it-does)
-- [Quick Start](#-quick-start)
-- [Features](#-features)
-- [Security Scanners](#️-security-scanners)
-- [Development](#️-development)
-- [Configuration](#-configuration)
-- [JSON Output Format](#-json-output-format)
-- [Contributing](#-contributing)
-- [License](#-license)
+- [ModelAudit](#modelaudit)
+  - [Table of Contents](#table-of-contents)
+  - [🔍 What It Does](#-what-it-does)
+  - [🚀 Quick Start](#-quick-start)
+    - [Installation](#installation)
+    - [Basic Usage](#basic-usage)
+  - [✨ Features](#-features)
+    - [Core Capabilities](#core-capabilities)
+    - [Reporting \& Integration](#reporting--integration)
+    - [Security Detection](#security-detection)
+  - [🛡️ Supported Model Formats](#️-supported-model-formats)
+    - [Weight Analysis](#weight-analysis)
+    - [ONNX Scanner](#onnx-scanner)
+  - [⚙️ Advanced Usage](#️-advanced-usage)
+    - [Command Line Options](#command-line-options)
+    - [Exit Codes](#exit-codes)
+  - [📋 JSON Output Format](#-json-output-format)
+  - [🔄 CI/CD Integration](#-cicd-integration)
+    - [Basic Integration](#basic-integration)
+    - [Platform Examples](#platform-examples)
+  - [🔧 Troubleshooting](#-troubleshooting)
+    - [Common Issues](#common-issues)
+  - [⚠️ Limitations](#️-limitations)
+  - [📝 License](#-license)
 
 ## 🔍 What It Does
 
@@ -24,15 +42,19 @@ ModelAudit scans ML model files for:
 - **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
 - **Potentially unsafe Keras Lambda layers** with arbitrary code execution
 - **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
+- **Custom ONNX operators** and external data integrity issues
 - **Encoded payloads** and suspicious string patterns
 - **Risky configurations** in model architectures
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
 
 ## 🚀 Quick Start
 
 ### Installation
+
+ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/) and requires **Python 3.9 or higher**.
 
 **Basic installation:**
 
@@ -52,8 +74,14 @@ pip install modelaudit[h5]
 # For PyTorch model scanning
 pip install modelaudit[pytorch]
 
+# For ONNX model scanning
+pip install modelaudit[onnx]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
+
+# For SafeTensors model scanning
+pip install modelaudit[safetensors]
 
 # Install all optional dependencies
 pip install modelaudit[all]
@@ -88,36 +116,21 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/m
 
 ### Basic Usage
 
-**Scan individual files:**
-
 ```bash
 # Scan a single model
 modelaudit scan model.pkl
+
+# Scan an ONNX model
+modelaudit scan model.onnx
 
 # Scan multiple models
 modelaudit scan model1.pkl model2.h5 model3.pt
 
 # Scan a directory
 modelaudit scan ./models/
-```
 
-**Advanced scanning options:**
-
-```bash
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
-
-# Set maximum file size to scan (1GB limit)
-modelaudit scan model.pkl --max-file-size 1073741824
-
-# Add custom blacklist patterns
-modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
-
-# Set scan timeout (5 minutes)
-modelaudit scan large_model.pkl --timeout 300
-
-# Verbose output for debugging
-modelaudit scan model.pkl --verbose
 ```
 
 **Example output:**
@@ -138,13 +151,88 @@ Active Scanner: pickle
 Scan completed in 0.02 seconds
 Files scanned: 1
 Scanned 156 bytes
-Issues found: 2 errors, 1 warnings
+Issues found: 2 critical, 1 warnings
 
-1. suspicious_model.pkl (pos 28): [ERROR] Suspicious module reference found: posix.system
+1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
 
 ────────────────────────────────────────────────────────────────────────────────
-✗ Scan completed with errors
+✗ Scan completed with findings
+```
+
+## ✨ Features
+
+### Core Capabilities
+
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Automatic Format Detection**: Identifies model formats automatically
+- **Deep Security Analysis**: Examines model internals, not just metadata
+- **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
+- **Batch Processing**: Scan multiple files and directories efficiently
+- **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
+
+### Reporting & Integration
+
+- **Multiple Output Formats**: Human-readable text and machine-readable JSON
+- **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
+- **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
+- **CI/CD Integration**: Clear exit codes for automated pipeline integration
+
+### Security Detection
+
+- **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
+- **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
+- **Model Integrity**: Checks for unexpected files, suspicious configurations
+- **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
+- **Pattern Matching**: Custom blacklist patterns for organizational policies
+
+## 🛡️ Supported Model Formats
+
+ModelAudit provides specialized security scanners for different model formats:
+
+| Format             | File Extensions                                                                                          | What We Check                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **Pickle**         | `.pkl`, `.pickle`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                        | Malicious code execution, dangerous opcodes, suspicious imports |
+| **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
+| **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
+| **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
+| **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
+| **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
+| **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
+| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, metadata integrity, suspicious patterns      |
+| **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
+| **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
+
+### Weight Analysis
+
+ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
+
+### ONNX Scanner
+
+**Inspects ONNX models for security risks and integrity issues:**
+
+- **Custom Operators**: Flags non-standard operator domains that could contain malicious code
+- **External Data Validation**: Verifies external weight files exist and have correct sizes
+- **Tensor Integrity**: Checks for truncated or corrupted tensor data
+- **Path Traversal Protection**: Ensures external data files stay within model directory
+- **Model Structure Analysis**: Validates ONNX model format and metadata
+
+## ⚙️ Advanced Usage
+
+### Command Line Options
+
+```bash
+# Set maximum file size to scan (1GB limit)
+modelaudit scan model.pkl --max-file-size 1073741824
+
+# Add custom blacklist patterns
+modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
+
+# Set scan timeout (5 minutes)
+modelaudit scan large_model.pkl --timeout 300
+
+# Verbose output for debugging
+modelaudit scan model.pkl --verbose
 ```
 
 ### Exit Codes
@@ -155,14 +243,75 @@ ModelAudit uses different exit codes to indicate scan results:
 - **1**: Security issues found (scan completed successfully)
 - **2**: Errors occurred during scanning (e.g., file not found, scan failures)
 
-**CI/CD Integration:**
+## 📋 JSON Output Format
+
+When using `--format json`, ModelAudit outputs structured results:
+
+```json
+{
+  "scanner_names": ["pickle"],
+  "start_time": 1750168822.481906,
+  "bytes_scanned": 74,
+  "issues": [
+    {
+      "message": "Found REDUCE opcode - potential __reduce__ method execution",
+      "severity": "warning",
+      "location": "evil.pickle (pos 71)",
+      "details": {
+        "position": 71,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1750168822.482304
+    },
+    {
+      "message": "Suspicious module reference found: posix.system",
+      "severity": "critical",
+      "location": "evil.pickle (pos 28)",
+      "details": {
+        "module": "posix",
+        "function": "system",
+        "position": 28,
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1750168822.482378
+    }
+  ],
+  "has_errors": false,
+  "files_scanned": 1,
+  "duration": 0.0005328655242919922
+}
+```
+
+Each issue includes a `message`, `severity` level (`critical`, `warning`, `info`, `debug`), `location`, and scanner-specific `details`.
+
+## 🔄 CI/CD Integration
+
+ModelAudit is designed to integrate seamlessly into CI/CD pipelines with clear exit codes:
+
+- **Exit Code 0**: No security issues found
+- **Exit Code 1**: Security issues found (fails the build)
+- **Exit Code 2**: Scan errors occurred (fails the build)
+
+### Basic Integration
 
 ```bash
-# Stop deployment if security issues are found
-modelaudit scan model.pkl || exit 1
+# Install ModelAudit
+pip install modelaudit[all]
 
-# In GitHub Actions
-- name: Security scan models
+# Scan models and fail build if issues found
+modelaudit scan models/ --format json --output scan-results.json
+
+# Optional: Upload scan-results.json as build artifact
+```
+
+### Platform Examples
+
+**GitHub Actions:**
+
+```yaml
+- name: Scan models
   run: |
     rye run modelaudit scan models/ --format json --output scan-results.json
     if [ $? -eq 1 ]; then
@@ -171,106 +320,54 @@ modelaudit scan model.pkl || exit 1
     fi
 ```
 
-## ✨ Features
+**GitLab CI:**
 
-### Core Capabilities
+```yaml
+model-security-scan:
+  script:
+    - pip install modelaudit[all]
+    - modelaudit scan models/ --format json --output results.json
+  artifacts:
+    paths: [results.json]
+```
 
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), Pickle (.pkl), ZIP archives (.zip)
-- **Automatic Format Detection**: Identifies model formats automatically
-- **Deep Security Analysis**: Examines model internals, not just metadata
-- **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
-- **Batch Processing**: Scan multiple files and directories efficiently
-- **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
+**Jenkins:**
 
-### Reporting & Integration
+```groovy
+sh 'pip install modelaudit[all]'
+sh 'modelaudit scan models/ --format json --output results.json'
+```
 
-- **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
-- **Multiple Output Formats**: Human-readable text and machine-readable JSON
-- **Severity Levels**: ERROR, WARNING, INFO, DEBUG for flexible filtering
-- **CI/CD Ready**: Clear exit codes for automated pipeline integration
+## 🔧 Troubleshooting
 
-### Security Detection
+### Common Issues
 
-- **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
-- **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
-- **Model Integrity**: Checks for unexpected files, suspicious configurations
-- **Archive Security**: Directory traversal attacks, zip bombs, malicious nested files
-- **Pattern Matching**: Custom blacklist patterns for organizational policies
-
-## 🛡️ Security Scanners
-
-### Pickle Scanner
-
-**Detects malicious code in Python pickle files:**
-
-- Dangerous opcodes: `REDUCE`, `INST`, `OBJ`, `STACK_GLOBAL`
-- Suspicious imports: `os`, `subprocess`, `eval`, `exec`
-- Encoded payloads and obfuscated code
-- `__reduce__` method exploits
-
-### TensorFlow Scanner
-
-**Analyzes TensorFlow SavedModel for suspicious operations:**
-
-- File I/O operations: `ReadFile`, `WriteFile`
-- Python execution: `PyFunc`, `PyCall`
-- System operations: `ShellExecute`, `SystemConfig`
-- Checks SavedModel directory structure
-
-### Keras Scanner
-
-**Examines Keras H5 models for security risks:**
-
-- Dangerous layer types: `Lambda`, `TFOpLambda`
-- Suspicious configurations containing code execution
-- Custom objects and metrics with arbitrary code
-- Model architecture analysis
-
-### PyTorch Scanner
-
-**Scans PyTorch models (ZIP-based format):**
-
-- Embedded pickle file analysis
-- Missing standard files (data.pkl warnings)
-- Suspicious additional files (Python scripts, executables)
-- Custom blacklist pattern matching
-
-### Manifest Scanner
-
-**Analyzes configuration and manifest files:**
-
-- Suspicious keys: network access, file paths, execution commands
-- Credential exposure: passwords, API keys, secrets
-- Blacklisted model names and patterns
-- Supports JSON, YAML, XML, TOML formats
-
-### ZIP Scanner
-
-**Scans ZIP archives and their contents:**
-
-- **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
-- **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
-- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
-- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
-- **Resource limits**: Configurable max depth, max entries, and max file size protections
-
-## 🛠️ Development
-
-### Setup
+**Installation Problems:**
 
 ```bash
-# Clone repository
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
+# If you get dependency conflicts
+pip install --upgrade pip setuptools wheel
+pip install modelaudit[all] --no-cache-dir
 
 # Install with Rye (recommended)
 rye sync --features all
 
 # Or with pip
 pip install -e .[all]
+
+# If optional dependencies fail, install base package first
+pip install modelaudit
+pip install tensorflow h5py torch pyyaml safetensors onnx  # Add what you need
 ```
 
-### Running Tests
+**Large Models:**
+
+```bash
+# Increase file size limit and timeout for large models
+modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
+```
+
+**Testing:**
 
 ```bash
 # Run all tests
@@ -291,7 +388,14 @@ rye run pytest
 ./test_migration.sh
 ```
 
-### Development Workflow
+**Debug Mode:**
+
+```bash
+# Enable verbose output for troubleshooting
+modelaudit scan model.pkl --verbose
+```
+
+**Development Commands:**
 
 ```bash
 # Run linting and formatting with Ruff
@@ -309,50 +413,31 @@ rye build
 rye publish
 ```
 
-**Code Quality Tools:**
+**Getting Help:**
 
-This project uses modern Python tooling for maintaining code quality:
+- Use `--verbose` for detailed output
+- Use `--format json` to see all details
+- Check file permissions and format support
+- Report issues on the [promptfoo GitHub repository](https://github.com/promptfoo/promptfoo/issues)
 
-- **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
-- **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
+## ⚠️ Limitations
 
-### Contributing
+ModelAudit is designed to find **obvious security risks** in model files, including direct code execution attempts, known dangerous patterns, malicious archive structures, and suspicious configurations.
 
-```bash
-# Create feature branch
-git checkout -b feature/your-feature-name
+**What it cannot detect:**
 
-# Make your changes...
-git add .
-git commit -m "feat: description"
-git push origin feature/your-feature-name
-```
+- Advanced adversarial attacks or subtle weight manipulation
+- Heavily encoded/encrypted malicious payloads
+- Runtime behavior that only triggers under specific conditions
+- Model poisoning through careful data manipulation
 
-**Pull Request Guidelines:**
+**Recommendations:**
 
-- Create PR against `main` branch
-- Follow Conventional Commits format (`feat:`, `fix:`, `docs:`, etc.)
-- All PRs are squash-merged with a conventional commit message
-- Keep changes small and focused
-
-### Project Structure
-
-```
-modelaudit/
-├── modelaudit/
-│   ├── scanners/          # Model format scanners
-│   │   ├── pickle_scanner.py      # Pickle/joblib security scanner
-│   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
-│   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
-│   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
-│   │   └── manifest_scanner.py    # Config/manifest scanner
-│   ├── utils/             # Utility modules
-│   ├── cli.py            # Command-line interface
-│   └── core.py           # Core scanning logic
-├── tests/                # Test suite
-└── docs/                 # Documentation
-```
+- Use ModelAudit as one layer of your security strategy
+- Review flagged issues manually - not all warnings indicate malicious intent
+- Combine with other security practices like sandboxed execution and runtime monitoring
+- Implement automated scanning in CI/CD pipelines
 
 ## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the [MIT License](https://opensource.org/licenses/MIT) - see the [LICENSE](LICENSE) file for details.
