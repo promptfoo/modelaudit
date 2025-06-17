@@ -21,6 +21,7 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Security Detection](#security-detection)
   - [🛡️ Supported Model Formats](#️-supported-model-formats)
     - [Weight Analysis](#weight-analysis)
+    - [ONNX Scanner](#onnx-scanner)
   - [⚙️ Advanced Usage](#️-advanced-usage)
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
@@ -41,6 +42,7 @@ ModelAudit scans ML model files for:
 - **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
 - **Potentially unsafe Keras Lambda layers** with arbitrary code execution
 - **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
+- **Custom ONNX operators** and external data integrity issues
 - **Encoded payloads** and suspicious string patterns
 - **Risky configurations** in model architectures
 - **Suspicious patterns** in model manifests and configuration files
@@ -52,7 +54,7 @@ ModelAudit scans ML model files for:
 
 ### Installation
 
-ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/).
+ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/) and requires **Python 3.9 or higher**.
 
 **Basic installation:**
 
@@ -72,6 +74,9 @@ pip install modelaudit[h5]
 # For PyTorch model scanning
 pip install modelaudit[pytorch]
 
+# For ONNX model scanning
+pip install modelaudit[onnx]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
@@ -87,6 +92,9 @@ pip install modelaudit[all]
 ```bash
 # Scan a single model
 modelaudit scan model.pkl
+
+# Scan an ONNX model
+modelaudit scan model.onnx
 
 # Scan multiple models
 modelaudit scan model1.pkl model2.h5 model3.pt
@@ -116,7 +124,7 @@ Active Scanner: pickle
 Scan completed in 0.02 seconds
 Files scanned: 1
 Scanned 156 bytes
-Issues found: 2 errors, 1 warnings
+Issues found: 2 critical, 1 warnings
 
 1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
 2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
@@ -162,6 +170,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
 | **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
+| **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
 | **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, metadata integrity, suspicious patterns      |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
@@ -170,6 +179,16 @@ ModelAudit provides specialized security scanners for different model formats:
 ### Weight Analysis
 
 ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
+
+### ONNX Scanner
+
+**Inspects ONNX models for security risks and integrity issues:**
+
+- **Custom Operators**: Flags non-standard operator domains that could contain malicious code
+- **External Data Validation**: Verifies external weight files exist and have correct sizes
+- **Tensor Integrity**: Checks for truncated or corrupted tensor data
+- **Path Traversal Protection**: Ensures external data files stay within model directory
+- **Model Structure Analysis**: Validates ONNX model format and metadata
 
 ## ⚙️ Advanced Usage
 
@@ -302,7 +321,7 @@ pip install modelaudit[all] --no-cache-dir
 
 # If optional dependencies fail, install base package first
 pip install modelaudit
-pip install tensorflow h5py torch pyyaml safetensors  # Add what you need
+pip install tensorflow h5py torch pyyaml safetensors onnx  # Add what you need
 ```
 
 **Large Models:**

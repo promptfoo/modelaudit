@@ -3,6 +3,7 @@ from . import (
     gguf_scanner,
     keras_h5_scanner,
     manifest_scanner,
+    onnx_scanner,
     pickle_scanner,
     pytorch_binary_scanner,
     pytorch_zip_scanner,
@@ -17,6 +18,7 @@ from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 from .gguf_scanner import GgufScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
+from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
@@ -32,6 +34,7 @@ SCANNER_REGISTRY = [
     PyTorchBinaryScanner,  # Must come before generic scanners for .bin files
     TensorFlowSavedModelScanner,
     KerasH5Scanner,
+    OnnxScanner,
     PyTorchZipScanner,  # Must come before ZipScanner since .pt/.pth files are zip files
     ManifestScanner,
     WeightDistributionScanner,
@@ -48,6 +51,8 @@ __all__ = [
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
+    "onnx_scanner",
+    "safetensors_scanner",
     "manifest_scanner",
     "weight_distribution_scanner",
     "gguf_scanner",
@@ -61,11 +66,12 @@ __all__ = [
     "PyTorchBinaryScanner",
     "TensorFlowSavedModelScanner",
     "KerasH5Scanner",
+    "OnnxScanner",
+    "SafeTensorsScanner",
     "PyTorchZipScanner",
     "ManifestScanner",
     "WeightDistributionScanner",
     "GgufScanner",
-    "SafeTensorsScanner",
     "ZipScanner",
     "SCANNER_REGISTRY",
 ]
