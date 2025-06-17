@@ -10,7 +10,7 @@ def is_zipfile(path: str) -> bool:
     try:
         with file_path.open("rb") as f:
             signature = f.read(4)
-        return signature in [b"PK\x03\x04", b"PK\x05\x06"]
+        return signature.startswith(b"PK")
     except OSError:
         return False
 
@@ -57,8 +57,7 @@ def detect_file_format(path: str) -> str:
     ext = file_path.suffix.lower()
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    # Common ZIP signatures: PK\x03\x04 (local file header) or PK\x05\x06 (end of central directory)
-    if magic4[:2] == b"PK" and magic4[2:4] in [b"\x03\x04", b"\x05\x06", b"\x01\x02"]:
+    if magic4.startswith(b"PK"):
         return "zip"
 
     # Check pickle magic patterns
@@ -91,7 +90,7 @@ def detect_file_format(path: str) -> str:
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
     if ext in (".pt", ".pth", ".ckpt"):
         # These files can be either ZIP or pickle format
-        if magic4[:2] == b"PK":
+        if magic4.startswith(b"PK"):
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
@@ -110,7 +109,7 @@ def detect_file_format(path: str) -> str:
     if ext == ".npz":
         return "zip"
     if ext == ".joblib":
-        if magic4[:2] == b"PK":
+        if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
 
