@@ -1,7 +1,6 @@
 """Comprehensive tests for the GGUF scanner."""
 
 import struct
-import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
@@ -15,7 +14,7 @@ def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"va
         f.write(struct.pack("<I", 3))  # version
         f.write(struct.pack("<Q", n_tensors))  # tensor count
         f.write(struct.pack("<Q", n_kv))  # kv count
-        
+
         # Metadata
         if n_kv > 0:
             f.write(struct.pack("<Q", len(kv_key)))  # key length
@@ -33,18 +32,18 @@ def _write_comprehensive_gguf(path):
         f.write(struct.pack("<I", 3))  # version
         f.write(struct.pack("<Q", 1))  # tensor count
         f.write(struct.pack("<Q", 1))  # kv count
-        
+
         # Metadata
         key = b"general.alignment"
         f.write(struct.pack("<Q", len(key)))
         f.write(key)
         f.write(struct.pack("<I", 4))  # UINT32
         f.write(struct.pack("<I", 32))  # alignment value
-        
+
         # Align to 32 bytes
         pad = (32 - (f.tell() % 32)) % 32
         f.write(b"\0" * pad)
-        
+
         # Tensor info
         name = b"weight"
         f.write(struct.pack("<Q", len(name)))
@@ -54,7 +53,7 @@ def _write_comprehensive_gguf(path):
         f.write(struct.pack("<I", 0))  # f32 tensor type
         offset = f.tell() + 8
         f.write(struct.pack("<Q", offset))  # tensor offset
-        
+
         # Tensor data (8 * 4 bytes for f32)
         f.write(b"\0" * 32)
 
@@ -129,7 +128,7 @@ def test_gguf_scanner_large_tensor_count(tmp_path):
         f.write(struct.pack("<I", 3))  # version
         f.write(struct.pack("<Q", 2**31))  # huge tensor count
         f.write(struct.pack("<Q", 0))  # kv count
-    
+
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
@@ -142,7 +141,7 @@ def test_gguf_scanner_truncated_file(tmp_path):
         f.write(struct.pack("<I", 3))
         f.write(struct.pack("<Q", 0))
         f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
-    
+
     result = GgufScanner().scan(str(path))
     assert not result.success or any(
         i.severity == IssueSeverity.CRITICAL for i in result.issues
@@ -153,7 +152,7 @@ def test_gguf_scanner_suspicious_key_paths(tmp_path):
     """Test detection of suspicious key names with path traversal."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"../../../etc/passwd", kv_value=b"root")
-    
+
     result = GgufScanner().scan(str(path))
     assert any("path traversal" in i.message.lower() for i in result.issues)
 
@@ -162,7 +161,7 @@ def test_gguf_scanner_suspicious_values(tmp_path):
     """Test detection of suspicious metadata values."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"command", kv_value=b"rm -rf /")
-    
+
     result = GgufScanner().scan(str(path))
     assert any("suspicious" in i.message.lower() for i in result.issues)
 
@@ -177,7 +176,7 @@ def test_gguf_scanner_string_length_security(tmp_path):
         f.write(struct.pack("<Q", 1))  # kv count
         f.write(struct.pack("<Q", 2**31))  # extremely long key
         # File ends here, should trigger error
-    
+
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
@@ -186,7 +185,7 @@ def test_ggml_scanner_basic(tmp_path):
     """Test basic GGML file scanning."""
     path = tmp_path / "model.ggml"
     _write_ggml_file(path)
-    
+
     result = GgufScanner().scan(str(path))
     assert result.success
     assert result.metadata["format"] == "ggml"
@@ -200,7 +199,7 @@ def test_ggml_scanner_suspicious_version(tmp_path):
         f.write(b"GGML")
         f.write(struct.pack("<I", 99999))  # suspicious version
         f.write(b"\0" * 24)
-    
+
     result = GgufScanner().scan(str(path))
     assert any("suspicious" in i.message.lower() for i in result.issues)
 
@@ -211,7 +210,7 @@ def test_ggml_scanner_truncated(tmp_path):
     with open(path, "wb") as f:
         f.write(b"GGML")
         f.write(b"\0" * 10)  # Too short
-    
+
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
@@ -224,14 +223,14 @@ def test_gguf_scanner_invalid_alignment(tmp_path):
         f.write(struct.pack("<I", 3))
         f.write(struct.pack("<Q", 0))  # tensor count
         f.write(struct.pack("<Q", 1))  # kv count
-        
+
         # Bad alignment value
         key = b"general.alignment"
         f.write(struct.pack("<Q", len(key)))
         f.write(key)
         f.write(struct.pack("<I", 4))  # UINT32
         f.write(struct.pack("<I", 3))  # Invalid alignment (not multiple of 8)
-    
+
     result = GgufScanner().scan(str(path))
     assert any("alignment" in i.message.lower() for i in result.issues)
 
@@ -244,29 +243,31 @@ def test_gguf_scanner_tensor_dimension_limits(tmp_path):
         f.write(struct.pack("<I", 3))
         f.write(struct.pack("<Q", 1))  # tensor count
         f.write(struct.pack("<Q", 1))  # kv count
-        
+
         # Minimal metadata
         key = b"general.alignment"
         f.write(struct.pack("<Q", len(key)))
         f.write(key)
         f.write(struct.pack("<I", 4))
         f.write(struct.pack("<I", 32))
-        
+
         # Align to 32
         pad = (32 - (f.tell() % 32)) % 32
         f.write(b"\0" * pad)
-        
+
         # Tensor with too many dimensions
         name = b"tensor"
         f.write(struct.pack("<Q", len(name)))
         f.write(name)
         f.write(struct.pack("<I", 20))  # 20 dimensions (suspicious)
-        
+
         # Don't write the rest as it would be too long
-    
+
     result = GgufScanner().scan(str(path))
-    assert any("suspicious" in i.message.lower() and "dimensions" in i.message.lower() 
-               for i in result.issues)
+    assert any(
+        "suspicious" in i.message.lower() and "dimensions" in i.message.lower()
+        for i in result.issues
+    )
 
 
 def test_gguf_scanner_file_extensions(tmp_path):
@@ -275,12 +276,12 @@ def test_gguf_scanner_file_extensions(tmp_path):
     gguf_path = tmp_path / "model.gguf"
     _write_minimal_gguf(gguf_path)
     assert GgufScanner.can_handle(str(gguf_path))
-    
+
     # Test .ggml extension
     ggml_path = tmp_path / "model.ggml"
     _write_ggml_file(ggml_path)
     assert GgufScanner.can_handle(str(ggml_path))
-    
+
     # Test unsupported extension
     txt_path = tmp_path / "model.txt"
     with open(txt_path, "w") as f:
@@ -296,7 +297,7 @@ def test_gguf_scanner_metadata_types(tmp_path):
         f.write(struct.pack("<I", 3))
         f.write(struct.pack("<Q", 0))  # tensor count
         f.write(struct.pack("<Q", 3))  # kv count
-        
+
         # String value
         key1 = b"string_key"
         f.write(struct.pack("<Q", len(key1)))
@@ -305,21 +306,21 @@ def test_gguf_scanner_metadata_types(tmp_path):
         val1 = b"string_value"
         f.write(struct.pack("<Q", len(val1)))
         f.write(val1)
-        
+
         # Int32 value
         key2 = b"int_key"
         f.write(struct.pack("<Q", len(key2)))
         f.write(key2)
         f.write(struct.pack("<I", 5))  # INT32
         f.write(struct.pack("<i", 42))
-        
+
         # Float32 value
         key3 = b"float_key"
         f.write(struct.pack("<Q", len(key3)))
         f.write(key3)
         f.write(struct.pack("<I", 6))  # FLOAT32
         f.write(struct.pack("<f", 3.14))
-    
+
     result = GgufScanner().scan(str(path))
     assert result.success
     assert "string_key" in result.metadata["metadata"]
@@ -330,11 +331,11 @@ def test_gguf_scanner_metadata_types(tmp_path):
 def test_gguf_scanner_error_handling(tmp_path):
     """Test various error conditions."""
     scanner = GgufScanner()
-    
+
     # Test non-existent file
     result = scanner.scan("non_existent_file.gguf")
     assert not result.success
-    
+
     # Test directory instead of file
     dir_path = tmp_path / "not_a_file"
     dir_path.mkdir()
