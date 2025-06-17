@@ -7,6 +7,7 @@ from modelaudit.suspicious_symbols import (
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
 )
+
 from ..explanations import (
     get_import_explanation,
     get_opcode_explanation,
