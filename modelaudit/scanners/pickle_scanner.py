@@ -1,5 +1,7 @@
+import logging
 import os
 import pickletools
+import struct
 import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 
@@ -9,6 +11,8 @@ from ..explanations import (
     get_pattern_explanation,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger(__name__)
 
 # Dictionary of suspicious references.
 # You can expand as needed.
@@ -155,8 +159,8 @@ ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     "sklearn": ["*"],
     "transformers": ["*"],
     "tokenizers": ["*"],
-    "joblib": ["*"],
-    "dill": ["*"],
+    "joblib": ["dump", "load", "Parallel", "delayed", "Memory", "hash"],
+    "dill": ["dump", "dumps", "load", "loads", "copy"],
     "tensorflow": ["*"],
     "keras": ["*"],
 }
@@ -369,6 +373,38 @@ def _get_context_aware_severity(
 # ============================================================================
 # END SMART DETECTION SYSTEM
 # ============================================================================
+
+
+def _is_legitimate_serialization_file(path: str) -> bool:
+    """
+    Validate that a file is a legitimate joblib or dill serialization file.
+    This helps prevent security bypass by simply renaming malicious files.
+    """
+    try:
+        with open(path, "rb") as f:
+            # Read first few bytes to check for pickle magic
+            header = f.read(10)
+            if not header:
+                return False
+            
+            # Check for standard pickle protocols (0-5)
+            if header[0:1] in (b'\x80', b'(', b']', b'}'):  # Common pickle starts
+                # For joblib files, look for joblib-specific patterns
+                if path.lower().endswith('.joblib'):
+                    f.seek(0)
+                    # Try to find joblib-specific markers in first 1KB
+                    sample = f.read(1024)
+                    return any(marker in sample for marker in [
+                        b'joblib', b'sklearn', b'numpy', b'_joblib'
+                    ])
+                
+                # For dill files, they're usually just enhanced pickle
+                elif path.lower().endswith('.dill'):
+                    return True
+                    
+        return False
+    except Exception:
+        return False
 
 
 def is_suspicious_global(mod: str, func: str) -> bool:
@@ -955,23 +991,54 @@ class PickleScanner(BaseScanner):
             )
 
         except Exception as e:
-            # Joblib files may contain non-pickle data after the STOP opcode
-            # which can cause pickletools to raise "unknown opcode" errors.
-            if (
-                isinstance(e, ValueError)
-                and "unknown" in str(e)
-                and os.path.splitext(self.current_file_path)[1].lower()
-                in {".joblib", ".dill"}
-            ):
-                # Treat as non-fatal and return what we analyzed so far
-                result.metadata.update({"truncated": True})
+            # Handle known issues with legitimate serialization files
+            file_ext = os.path.splitext(self.current_file_path)[1].lower()
+            
+            # Check if this is a known benign error in legitimate serialization files
+            is_benign_error = (
+                isinstance(e, (ValueError, struct.error))
+                and any(msg in str(e).lower() for msg in [
+                    "unknown opcode", "unpack requires", "truncated", "bad marshal data"
+                ])
+                and file_ext in {".joblib", ".dill"}
+                and _is_legitimate_serialization_file(self.current_file_path)
+            )
+            
+            if is_benign_error:
+                # Log for security auditing but treat as non-fatal
+                logger.warning(
+                    f"Truncated pickle scan of {self.current_file_path}: {e}. "
+                    f"This may be due to non-pickle data after STOP opcode."
+                )
+                result.metadata.update({
+                    "truncated": True,
+                    "truncation_reason": "post_stop_data_or_format_issue",
+                    "exception_type": type(e).__name__,
+                    "exception_message": str(e)[:100],  # Limit message length
+                    "validated_format": True
+                })
+                # Still add as info-level issue for transparency
+                result.add_issue(
+                    f"Scan truncated due to format complexity: {type(e).__name__}",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "reason": "post_stop_data_or_format_issue",
+                        "opcodes_analyzed": opcode_count,
+                        "file_format": file_ext
+                    },
+                    why="This file contains data after the pickle STOP opcode or uses format features that cannot be fully analyzed. The analyzable portion was scanned for security issues."
+                )
             else:
+                # Treat as critical error for unknown/suspicious cases
                 result.add_issue(
                     f"Error analyzing pickle ops: {e}",
                     severity=IssueSeverity.CRITICAL,
                     details={
                         "exception": str(e),
                         "exception_type": type(e).__name__,
+                        "file_extension": file_ext,
+                        "opcodes_analyzed": opcode_count
                     },
                 )
 

@@ -85,7 +85,7 @@ pip install modelaudit[yaml]
 # For SafeTensors model scanning
 pip install modelaudit[safetensors]
 
-# For enhanced pickle support (dill, joblib, scikit-learn)
+# For enhanced pickle support (dill serialization)
 pip install modelaudit[dill]
 
 # For Joblib model scanning

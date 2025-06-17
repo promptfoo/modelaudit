@@ -54,7 +54,6 @@ __all__ = [
     "base",
     "keras_h5_scanner",
     "pickle_scanner",
-    "numpy_scanner",
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "tf_savedmodel_scanner",
