@@ -28,22 +28,27 @@ class Issue:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ):
         self.message = message
         self.severity = severity
         self.location = location  # File position, line number, etc.
         self.details = details or {}
+        self.why = why  # Explanation of why this is a security concern
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization"""
-        return {
+        result = {
             "message": self.message,
             "severity": self.severity.value,
             "location": self.location,
             "details": self.details,
             "timestamp": self.timestamp,
         }
+        if self.why:
+            result["why"] = self.why
+        return result
 
     def __str__(self) -> str:
         """String representation of the issue"""
@@ -71,9 +76,10 @@ class ScanResult:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result"""
-        issue = Issue(message, severity, location, details)
+        issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
         log_level = (
             logging.CRITICAL
