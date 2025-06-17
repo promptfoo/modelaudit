@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install system dependencies needed for building
 RUN apt-get update && apt-get install -y \
-    gcc g++ \
+    build-essential gfortran pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Poetry
