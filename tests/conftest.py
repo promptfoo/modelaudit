@@ -13,7 +13,7 @@ def setup_logging():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     # Suppress excessive logging during tests
-    logging.getLogger("modelaudit").setLevel(logging.ERROR)
+    logging.getLogger("modelaudit").setLevel(logging.CRITICAL)
 
     yield
 
