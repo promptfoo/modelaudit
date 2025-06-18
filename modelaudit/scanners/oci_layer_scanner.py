@@ -58,7 +58,7 @@ class OciLayerScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error parsing manifest: {e}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception_type": type(e).__name__},
             )

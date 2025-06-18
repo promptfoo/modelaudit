@@ -20,4 +20,4 @@ def test_oci_layer_scanner_with_malicious_pickle(tmp_path):
     result = scanner.scan(str(manifest_path))
 
     assert result.success is True
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
