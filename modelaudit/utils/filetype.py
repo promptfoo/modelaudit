@@ -116,7 +116,7 @@ def detect_file_format(path: str) -> str:
     return "unknown"
 
 
-def find_sharded_files(directory: str) -> list:
+def find_sharded_files(directory: str) -> list[str]:
     """
     Look for sharded model files like:
     pytorch_model-00001-of-00002.bin
