@@ -100,6 +100,8 @@ def detect_file_format(path: str) -> str:
         return "hdf5"
     if ext == ".pb":
         return "protobuf"
+    if ext == ".tflite":
+        return "tflite"
     if ext == ".safetensors":
         return "safetensors"
     if ext == ".onnx":

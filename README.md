@@ -79,6 +79,9 @@ pip install modelaudit[pytorch]
 # For ONNX model scanning
 pip install modelaudit[onnx]
 
+# For TensorFlow Lite model scanning
+pip install modelaudit[tflite]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
@@ -173,6 +176,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Pickle**         | `.pkl`, `.pickle`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                        | Malicious code execution, dangerous opcodes, suspicious imports |
 | **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
 | **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
+| **TensorFlow Lite** | `.tflite` | Extreme tensor shapes, custom ops, FlatBuffer integrity |
 | **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |

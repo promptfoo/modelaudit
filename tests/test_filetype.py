@@ -41,6 +41,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".dill": "pickle",  # .dill files are treated as pickle files
         ".h5": "hdf5",
         ".pb": "protobuf",
+        ".tflite": "tflite",
         ".unknown": "unknown",
     }
 

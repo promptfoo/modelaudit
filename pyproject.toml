@@ -49,7 +49,8 @@ yaml = ["pyyaml>=6.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0"]
 joblib = ["joblib>=1.0.0"]
-all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx", "joblib"]
+tflite = ["tflite>=2.18.0"]
+all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx", "joblib", "tflite"]
 
 [project.scripts]
 modelaudit = "modelaudit.cli:main"
