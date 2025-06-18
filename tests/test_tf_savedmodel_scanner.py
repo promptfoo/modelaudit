@@ -116,7 +116,7 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
 
     # Check for issues - a safe model might still have some informational issues
     error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.ERROR
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
     assert len(error_issues) == 0
 
@@ -133,7 +133,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     # 1. Malicious pickle files in the directory, OR
     # 2. Suspicious TensorFlow operations (e.g. PyFunc), OR
     # 3. Both malicious files and suspicious operations
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "malicious.pkl" in issue.message.lower()
         or "eval" in issue.message.lower()
@@ -155,7 +155,7 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     result = scanner.scan(str(invalid_dir))
 
     # Should have errors about invalid protobuf format or TensorFlow not installed
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "error" in issue.message.lower()
         or "parsing" in issue.message.lower()
@@ -200,7 +200,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     result = scanner.scan(str(test_file))
 
     # Should have an error about invalid protobuf format or TensorFlow not installed
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "error" in issue.message.lower()
         or "parsing" in issue.message.lower()

@@ -3,6 +3,11 @@ import pickletools
 import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 
+from ..explanations import (
+    get_import_explanation,
+    get_opcode_explanation,
+    get_pattern_explanation,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Dictionary of suspicious references.
@@ -25,6 +30,17 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],
     "ctypes": ["*"],
     "socket": ["*"],
+    # dill's load helpers can execute arbitrary code when unpickling
+    # so we specifically flag those functions
+    "dill": [
+        "load",
+        "loads",
+        "load_module",
+        "load_module_asdict",
+        "load_session",
+    ],
+    # references to the private dill._dill module are also suspicious
+    "dill._dill": "*",
 }
 
 # Add dangerous builtin functions that might be used in __reduce__ methods
@@ -36,6 +52,7 @@ DANGEROUS_OPCODES = [
     "INST",
     "OBJ",
     "NEWOBJ",
+    "NEWOBJ_EX",
     "GLOBAL",
     "BUILD",
     "STACK_GLOBAL",
@@ -336,12 +353,12 @@ def _get_context_aware_severity(
 
     # High confidence ML content - downgrade severity
     if confidence > 0.8:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
         elif base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
     elif confidence > 0.5:
-        if base_severity == IssueSeverity.ERROR:
+        if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
 
     return base_severity
@@ -516,7 +533,16 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [".pkl", ".pickle", ".bin", ".pt", ".pth", ".ckpt"]
+    supported_extensions = [
+        ".pkl",
+        ".pickle",
+        ".dill",
+        ".joblib",
+        ".bin",
+        ".pt",
+        ".pth",
+        ".ckpt",
+    ]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -529,7 +555,7 @@ class PickleScanner(BaseScanner):
         file_ext = os.path.splitext(path)[1].lower()
 
         # For known pickle extensions, always handle
-        if file_ext in [".pkl", ".pickle"]:
+        if file_ext in [".pkl", ".pickle", ".dill", ".joblib"]:
             return True
 
         # For ambiguous extensions, check the actual file format
@@ -574,29 +600,46 @@ class PickleScanner(BaseScanner):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
-                        # Scan the binary content after pickle
-                        binary_result = self._scan_binary_content(
-                            f, pickle_end_pos, file_size
-                        )
+                        # Check if this is likely a PyTorch model based on ML context
+                        ml_context = scan_result.metadata.get("ml_context", {})
+                        is_pytorch = "pytorch" in ml_context.get("frameworks", {})
+                        ml_confidence = ml_context.get("overall_confidence", 0)
 
-                        # Add binary scanning results
-                        for issue in binary_result.issues:
-                            result.add_issue(
-                                message=issue.message,
-                                severity=issue.severity,
-                                location=issue.location,
-                                details=issue.details,
+                        # Skip binary scanning for high-confidence ML model files
+                        # as they contain tensor data that can trigger false positives
+                        if is_pytorch and ml_confidence > 0.7:
+                            result.metadata["binary_scan_skipped"] = True
+                            result.metadata["skip_reason"] = (
+                                "High-confidence PyTorch model detected"
+                            )
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
+                        else:
+                            # Scan the binary content after pickle
+                            binary_result = self._scan_binary_content(
+                                f, pickle_end_pos, file_size
                             )
 
-                        # Update total bytes scanned
-                        result.bytes_scanned = file_size
-                        result.metadata["pickle_bytes"] = pickle_end_pos
-                        result.metadata["binary_bytes"] = remaining_bytes
+                            # Add binary scanning results
+                            for issue in binary_result.issues:
+                                result.add_issue(
+                                    message=issue.message,
+                                    severity=issue.severity,
+                                    location=issue.location,
+                                    details=issue.details,
+                                    why=issue.why,
+                                )
+
+                            # Update total bytes scanned
+                            result.bytes_scanned = file_size
+                            result.metadata["pickle_bytes"] = pickle_end_pos
+                            result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
             result.add_issue(
                 f"Error opening pickle file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -648,6 +691,7 @@ class PickleScanner(BaseScanner):
                             "opcode_count": opcode_count,
                             "max_opcodes": self.max_opcodes,
                         },
+                        why=get_pattern_explanation("pickle_size_limit"),
                     )
                     break
 
@@ -658,6 +702,7 @@ class PickleScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
+                        why="The scan exceeded the configured time limit. Large or complex pickle files may take longer to analyze due to the number of opcodes that need to be processed.",
                     )
                     break
 
@@ -692,7 +737,7 @@ class PickleScanner(BaseScanner):
                             if _is_actually_dangerous_global(mod, func, ml_context):
                                 suspicious_count += 1
                                 severity = _get_context_aware_severity(
-                                    IssueSeverity.ERROR, ml_context
+                                    IssueSeverity.CRITICAL, ml_context
                                 )
                                 result.add_issue(
                                     f"Suspicious reference {mod}.{func}",
@@ -707,6 +752,7 @@ class PickleScanner(BaseScanner):
                                             "overall_confidence", 0
                                         ),
                                     },
+                                    why=get_import_explanation(mod),
                                 )
 
                 # SMART DETECTION: Only flag REDUCE opcodes if not clearly ML content
@@ -727,6 +773,7 @@ class PickleScanner(BaseScanner):
                                 "overall_confidence", 0
                             ),
                         },
+                        why=get_opcode_explanation("REDUCE"),
                     )
 
                 # SMART DETECTION: Only flag other dangerous opcodes
@@ -749,6 +796,7 @@ class PickleScanner(BaseScanner):
                                 "overall_confidence", 0
                             ),
                         },
+                        why=get_opcode_explanation(opcode.name),
                     )
 
                 # Check for suspicious strings
@@ -777,6 +825,9 @@ class PickleScanner(BaseScanner):
                                     "overall_confidence", 0
                                 ),
                             },
+                            why=get_pattern_explanation("encoded_strings")
+                            if suspicious_pattern == "potential_base64"
+                            else "This string contains patterns that match known security risks such as shell commands, code execution functions, or encoded data.",
                         )
 
             # Check for STACK_GLOBAL patterns
@@ -811,7 +862,7 @@ class PickleScanner(BaseScanner):
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
-                                IssueSeverity.ERROR, ml_context
+                                IssueSeverity.CRITICAL, ml_context
                             )
                             result.add_issue(
                                 f"Suspicious module reference found: {mod}.{func}",
@@ -826,6 +877,7 @@ class PickleScanner(BaseScanner):
                                         "overall_confidence", 0
                                     ),
                                 },
+                                why=get_import_explanation(mod),
                             )
                     else:
                         # Only warn about insufficient context if not ML content
@@ -843,13 +895,17 @@ class PickleScanner(BaseScanner):
                                         "overall_confidence", 0
                                     ),
                                 },
+                                why="STACK_GLOBAL requires two strings on the stack (module and function name) to import and access module attributes. Insufficient context prevents determining which module is being accessed.",
                             )
 
             # Check for dangerous patterns in the opcodes
             dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
             if dangerous_pattern and not ml_context.get("is_ml_content", False):
                 suspicious_count += 1
-                severity = _get_context_aware_severity(IssueSeverity.ERROR, ml_context)
+                severity = _get_context_aware_severity(
+                    IssueSeverity.CRITICAL, ml_context
+                )
+                module_name = dangerous_pattern.get("module", "")
                 result.add_issue(
                     f"Detected dangerous __reduce__ pattern with "
                     f"{dangerous_pattern.get('module', '')}."
@@ -863,6 +919,9 @@ class PickleScanner(BaseScanner):
                             "overall_confidence", 0
                         ),
                     },
+                    why=get_import_explanation(module_name)
+                    if module_name
+                    else "A dangerous pattern was detected that could execute arbitrary code during unpickling.",
                 )
 
             # Check for suspicious opcode sequences with ML context
@@ -883,6 +942,7 @@ class PickleScanner(BaseScanner):
                             "overall_confidence", 0
                         ),
                     },
+                    why="This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files.",
                 )
 
             # Update metadata
@@ -895,7 +955,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error analyzing pickle ops: {e}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
 
@@ -923,14 +983,16 @@ class PickleScanner(BaseScanner):
                 b"socket.socket",
             ]
 
-            # Executable signatures
+            # Executable signatures with additional validation
+            # For PE files, we need to check for the full DOS header structure
+            # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"MZ": "Windows executable (PE)",
                 b"\x7fELF": "Linux executable (ELF)",
                 b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
                 b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
                 b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/": "Shell script shebang",
+                b"#!/bin/": "Shell script shebang",
+                b"#!/usr/bin/": "Shell script shebang",
             }
 
             # Read in chunks
@@ -958,6 +1020,7 @@ class PickleScanner(BaseScanner):
                                 "offset": current_offset + pos,
                                 "section": "binary_data",
                             },
+                            why="Python code patterns found in binary sections of the file. Model weights are typically numeric data and should not contain readable code strings.",
                         )
 
                 # Check for executable signatures
@@ -966,7 +1029,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(sig)
                         result.add_issue(
                             f"Executable signature found in binary data: {description}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "signature": sig.hex(),
@@ -974,7 +1037,34 @@ class PickleScanner(BaseScanner):
                                 "offset": current_offset + pos,
                                 "section": "binary_data",
                             },
+                            why="Executable files embedded in model data can run arbitrary code on the system. Model files should contain only serialized weights and configuration data.",
                         )
+
+                # Special check for Windows PE files with more validation
+                # to reduce false positives from random "MZ" bytes
+                pe_sig = b"MZ"
+                if pe_sig in chunk:
+                    pos = chunk.find(pe_sig)
+                    # For PE files, check if we have enough data to validate DOS header
+                    if pos + 64 <= len(chunk):  # DOS header is 64 bytes
+                        # Check for "This program cannot be run in DOS mode" string
+                        # which appears in all PE files
+                        dos_stub_msg = b"This program cannot be run in DOS mode"
+                        # Look for this message within reasonable distance from MZ
+                        search_end = min(pos + 512, len(chunk))
+                        if dos_stub_msg in chunk[pos:search_end]:
+                            result.add_issue(
+                                "Executable signature found in binary data: Windows executable (PE)",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{self.current_file_path} (offset: {current_offset + pos})",
+                                details={
+                                    "signature": pe_sig.hex(),
+                                    "description": "Windows executable (PE) with valid DOS stub",
+                                    "offset": current_offset + pos,
+                                    "section": "binary_data",
+                                },
+                                why="Windows executable files embedded in model data can run arbitrary code on the system. The presence of a valid DOS stub confirms this is an actual PE executable.",
+                            )
 
                 # Check for timeout
                 if time.time() - result.start_time > self.timeout:
@@ -986,6 +1076,7 @@ class PickleScanner(BaseScanner):
                             "bytes_scanned": start_pos + bytes_scanned,
                             "timeout": self.timeout,
                         },
+                        why="The binary content scan exceeded the configured time limit. Large model files may require more time to fully analyze.",
                     )
                     break
 
@@ -994,7 +1085,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning binary content: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

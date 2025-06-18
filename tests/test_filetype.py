@@ -32,12 +32,13 @@ def test_detect_file_format_zip(tmp_path):
 def test_detect_file_format_by_extension(tmp_path):
     """Test detecting file format by extension."""
     extensions = {
-        ".pt": "unknown",  # .pt files without ZIP or pickle magic are unknown
-        ".pth": "unknown",  # .pth files without ZIP or pickle magic are unknown
+        ".pt": "pickle",  # .pt files are now treated as pickle files
+        ".pth": "pickle",  # .pth files are now treated as pickle files
         ".bin": "pytorch_binary",  # .bin files with generic content are now pytorch_binary
-        ".ckpt": "unknown",  # .ckpt files without pickle magic are unknown
+        ".ckpt": "pickle",  # .ckpt files are now treated as pickle files
         ".pkl": "pickle",
         ".pickle": "pickle",
+        ".dill": "pickle",  # .dill files are treated as pickle files
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".unknown": "unknown",
@@ -81,6 +82,15 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile(str(zip_path)) is True
     assert is_zipfile(str(non_zip_path)) is False
     assert is_zipfile("nonexistent_file.zip") is False
+
+
+def test_zip_magic_variants(tmp_path):
+    """Ensure alternate PK signatures are detected as ZIP."""
+    for sig in (b"PK\x06\x06", b"PK\x06\x07"):
+        path = tmp_path / f"file_{sig.hex()}.zip"
+        path.write_bytes(sig + b"extra")
+        assert is_zipfile(str(path)) is True
+        assert detect_file_format(str(path)) == "zip"
 
 
 def test_find_sharded_files(tmp_path):
