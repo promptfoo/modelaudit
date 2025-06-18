@@ -205,6 +205,13 @@ modelaudit scan large_model.pkl --timeout 300
 modelaudit scan model.pkl --verbose
 ```
 
+### Result Caching
+
+ModelAudit caches scan results by file hash to speed up repeated scans. The cache is
+stored at `~/.promptfoo/modelaudit_cache.json` by default. Set the
+`MODELAUDIT_CACHE_PATH` environment variable to override the location or set
+`MODELAUDIT_DISABLE_CACHE=true` to disable caching.
+
 ### Exit Codes
 
 ModelAudit uses different exit codes to indicate scan results:

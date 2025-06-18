@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+from modelaudit.utils.cache import (
+    compute_sha256,
+    get_cached_result,
+    update_cache,
+)
 from modelaudit.utils.filetype import detect_file_format
 
 logger = logging.getLogger("modelaudit.core")
@@ -46,6 +51,7 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "files_cached": 0,
     }
 
     # Configure scan options
@@ -101,6 +107,10 @@ def scan_model_directory_or_file(
                         results["files_scanned"] = (
                             cast(int, results["files_scanned"]) + 1
                         )  # Increment file count
+                        if file_result.metadata.get("cached"):
+                            results["files_cached"] = (
+                                cast(int, results["files_cached"]) + 1
+                            )
 
                         # Track scanner name
                         scanner_name = file_result.scanner_name
@@ -181,6 +191,8 @@ def scan_model_directory_or_file(
             results["bytes_scanned"] = (
                 cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
             )
+            if file_result.metadata.get("cached"):
+                results["files_cached"] = cast(int, results["files_cached"]) + 1
 
             # Track scanner name
             scanner_name = file_result.scanner_name
@@ -312,6 +324,9 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     if config is None:
         config = {}
 
+    use_cache = config.get("use_cache", True)
+    file_hash: Optional[str] = None
+
     # Check file size first
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
     try:
@@ -337,6 +352,17 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         )
         return sr
 
+    if use_cache and os.path.isfile(path):
+        try:
+            file_hash = compute_sha256(path)
+            cached = get_cached_result(file_hash)
+            if cached:
+                sr = scan_result_from_dict(cached["result"])
+                sr.metadata["cached"] = True
+                return sr
+        except OSError as e:
+            logger.debug(f"Could not compute hash for caching: {e}")
+
     logger.info(f"Scanning file: {path}")
 
     # Try to use scanners from the registry
@@ -345,7 +371,10 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         if scanner_class.can_handle(path):
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)  # type: ignore[abstract]
-            return scanner.scan(path)
+            sr = scanner.scan(path)
+            if use_cache and file_hash and sr.success:
+                update_cache(file_hash, path, sr)
+            return sr
 
     # If no scanner could handle the file, create a default unknown format result
     format_ = detect_file_format(path)
@@ -355,6 +384,8 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         severity=IssueSeverity.DEBUG,
         details={"format": format_, "path": path},
     )
+    if use_cache and file_hash and sr.success:
+        update_cache(file_hash, path, sr)
     return sr
 
 
@@ -398,3 +429,25 @@ def merge_scan_result(
         results["success"] = False
 
     return results
+
+
+def scan_result_from_dict(data: dict[str, Any]) -> ScanResult:
+    """Recreate a ScanResult from its dictionary representation."""
+    sr = ScanResult(scanner_name=data.get("scanner", "cache"))
+    sr.bytes_scanned = data.get("bytes_scanned", 0)
+    sr.success = data.get("success", True)
+    sr.metadata = data.get("metadata", {})
+    duration = data.get("duration", 0.0)
+    sr.end_time = sr.start_time + float(duration)
+    for issue_data in data.get("issues", []):
+        severity_str = issue_data.get("severity", "warning")
+        severity = IssueSeverity(severity_str)
+        issue = Issue(
+            issue_data.get("message", ""),
+            severity=severity,
+            location=issue_data.get("location"),
+            details=issue_data.get("details"),
+            why=issue_data.get("why"),
+        )
+        sr.issues.append(issue)
+    return sr
