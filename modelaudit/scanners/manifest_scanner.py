@@ -431,7 +431,7 @@ class ManifestScanner(BaseScanner):
 
         return any(pattern in value_lower for pattern in dangerous_patterns)
 
-    def _detect_ml_context(self, content: dict) -> dict:
+    def _detect_ml_context(self, content: dict[str, Any]) -> dict[str, Any]:
         """Detect ML model context to adjust sensitivity"""
         indicators = {
             "framework": None,
