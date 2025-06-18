@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import detect_file_format
 
 logger = logging.getLogger("modelaudit.core")
@@ -46,6 +47,7 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "assets": [],
     }
 
     # Configure scan options
@@ -112,6 +114,11 @@ def scan_model_directory_or_file(
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
+
+                        assets_list = cast(list[dict[str, Any]], results["assets"])
+                        assets_list.append(
+                            asset_from_scan_result(file_path, file_result)
+                        )
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
@@ -124,6 +131,8 @@ def scan_model_directory_or_file(
                                 "details": {"exception_type": type(e).__name__},
                             },
                         )
+                        assets_list = cast(list[dict[str, Any]], results["assets"])
+                        assets_list.append({"path": file_path, "type": "error"})
         else:
             # Scan a single file
             if progress_callback:
@@ -193,6 +202,9 @@ def scan_model_directory_or_file(
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
 
+            assets_list = cast(list[dict[str, Any]], results["assets"])
+            assets_list.append(asset_from_scan_result(path, file_result))
+
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
 
@@ -206,6 +218,8 @@ def scan_model_directory_or_file(
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
+        assets_list = cast(list[dict[str, Any]], results["assets"])
+        assets_list.append({"path": path, "type": "error"})
 
     # Add final timing information
     results["finish_time"] = time.time()

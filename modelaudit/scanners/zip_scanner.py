@@ -80,11 +80,14 @@ class ZipScanner(BaseScanner):
             return result
 
         result.finish(success=True)
+        result.metadata["contents"] = scan_result.metadata.get("contents", [])
+        result.metadata["file_size"] = os.path.getsize(path)
         return result
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
+        contents: list[dict[str, Any]] = []
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
@@ -186,6 +189,13 @@ class ZipScanner(BaseScanner):
                                         tmp_path, f"{path}:{name}", 1
                                     )
                             result.merge(nested_result)
+                            from ..utils.assets import asset_from_scan_result
+
+                            asset_entry = asset_from_scan_result(
+                                f"{path}:{name}", nested_result
+                            )
+                            asset_entry.setdefault("size", info.file_size)
+                            contents.append(asset_entry)
                         finally:
                             os.unlink(tmp_path)
                     else:
@@ -229,6 +239,14 @@ class ZipScanner(BaseScanner):
 
                             result.merge(file_result)
 
+                            from ..utils.assets import asset_from_scan_result
+
+                            asset_entry = asset_from_scan_result(
+                                f"{path}:{name}", file_result
+                            )
+                            asset_entry.setdefault("size", info.file_size)
+                            contents.append(asset_entry)
+
                             # If no scanner handled the file, count the bytes ourselves
                             if file_result.scanner_name == "unknown":
                                 result.bytes_scanned += len(data)
@@ -243,4 +261,7 @@ class ZipScanner(BaseScanner):
                         details={"entry": name, "exception": str(e)},
                     )
 
+        result.metadata["contents"] = contents
+        result.metadata["file_size"] = os.path.getsize(path)
+        result.finish(success=not result.has_errors)
         return result

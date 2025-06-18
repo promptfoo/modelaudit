@@ -405,6 +405,39 @@ def format_text_output(results, verbose=False):
             "\n" + click.style("✓ No issues found", fg="green", bold=True),
         )
 
+    # Asset list
+    assets = results.get("assets", [])
+    if assets:
+        output_lines.append("\nAssets encountered:")
+
+        def render_assets(items, indent=1):
+            lines = []
+            for asset in items:
+                prefix = "  " * indent + "- "
+                line = f"{prefix}{asset.get('path')}"
+                if asset.get("type"):
+                    line += f" ({asset['type']})"
+                if asset.get("size"):
+                    line += f" [{asset['size']} bytes]"
+                lines.append(line)
+                if asset.get("tensors"):
+                    tline = (
+                        "  " * (indent + 1) + "Tensors: " + ", ".join(asset["tensors"])
+                    )
+                    lines.append(tline)
+                if asset.get("keys"):
+                    kline = (
+                        "  " * (indent + 1)
+                        + "Keys: "
+                        + ", ".join(map(str, asset["keys"]))
+                    )
+                    lines.append(kline)
+                if asset.get("contents"):
+                    lines.extend(render_assets(asset["contents"], indent + 1))
+            return lines
+
+        output_lines.extend(render_assets(assets))
+
     # Add a footer
     output_lines.append("─" * 80)
     if visible_issues:

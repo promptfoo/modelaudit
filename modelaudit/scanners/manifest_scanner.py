@@ -209,6 +209,8 @@ class ManifestScanner(BaseScanner):
 
             if content:
                 result.bytes_scanned = file_size
+                if isinstance(content, dict):
+                    result.metadata["keys"] = list(content.keys())
 
                 # Check for suspicious configuration patterns
                 self._check_suspicious_patterns(content, result)
