@@ -139,7 +139,7 @@ class ErrorEventData(BaseEventData):
     error_message: str = ""
     component: str = "unknown"  # cli, scanner, core, etc.
     operation: str = "unknown"  # scan, detect, read, etc.
-    
+
     # Optional fields with defaults
     error_code: Optional[str] = None
     file_path_hash: Optional[str] = None
