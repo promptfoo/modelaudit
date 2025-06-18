@@ -88,6 +88,9 @@ pip install modelaudit[safetensors]
 # For Joblib model scanning
 pip install modelaudit[joblib]
 
+# For Flax msgpack scanning
+pip install modelaudit[flax]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -142,7 +145,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -177,6 +180,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
+| **Flax**           | `.msgpack`, `.ckpt`                                                   | MessagePack integrity, large blob validation                    |
 | **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
 | **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
 | **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |

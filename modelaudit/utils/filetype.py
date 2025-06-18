@@ -102,6 +102,8 @@ def detect_file_format(path: str) -> str:
         return "protobuf"
     if ext == ".safetensors":
         return "safetensors"
+    if ext == ".msgpack":
+        return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
     if ext == ".npy":

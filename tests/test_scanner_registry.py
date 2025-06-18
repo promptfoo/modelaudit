@@ -60,6 +60,7 @@ def test_scanner_registry_file_extension_coverage():
         ".pb",
         ".onnx",
         ".safetensors",
+        ".msgpack",
     ]
 
     for ext in common_extensions:

@@ -5,6 +5,7 @@ from . import (
     keras_h5_scanner,
     manifest_scanner,
     numpy_scanner,
+    flax_msgpack_scanner,
     onnx_scanner,
     pickle_scanner,
     pytorch_binary_scanner,
@@ -22,6 +23,7 @@ from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
 from .numpy_scanner import NumPyScanner
+from .flax_msgpack_scanner import FlaxMsgpackScanner
 from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
@@ -46,6 +48,7 @@ SCANNER_REGISTRY = [
     ManifestScanner,
     WeightDistributionScanner,
     SafeTensorsScanner,
+    FlaxMsgpackScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -65,6 +68,7 @@ __all__ = [
     "PyTorchZipScanner",
     "SCANNER_REGISTRY",
     "SafeTensorsScanner",
+    "FlaxMsgpackScanner",
     "ScanResult",
     "TensorFlowSavedModelScanner",
     "WeightDistributionScanner",
@@ -80,6 +84,7 @@ __all__ = [
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "safetensors_scanner",
+    "flax_msgpack_scanner",
     "tf_savedmodel_scanner",
     "weight_distribution_scanner",
     "zip_scanner",
