@@ -6,6 +6,12 @@ from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils import (
+    DEFAULT_HASH_DB_PATH,
+    check_hash,
+    compute_file_hash,
+    load_hash_db,
+)
 from modelaudit.utils.filetype import detect_file_format
 
 logger = logging.getLogger("modelaudit.core")
@@ -339,22 +345,78 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
 
     logger.info(f"Scanning file: {path}")
 
+    # Compute file hash for integrity checks
+    file_hash = compute_file_hash(path)
+    hash_db_path = (
+        config.get("hash_db_path")
+        or os.environ.get("MODELAUDIT_HASH_DB_PATH")
+        or str(DEFAULT_HASH_DB_PATH)
+    )
+    hash_db = load_hash_db(hash_db_path)
+    expected_hash = config.get("baseline_hash") or os.environ.get(
+        "MODELAUDIT_BASELINE_HASH"
+    )
+
     # Try to use scanners from the registry
     for scanner_class in SCANNER_REGISTRY:
         # These are concrete scanner classes, not the abstract BaseScanner
         if scanner_class.can_handle(path):
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)  # type: ignore[abstract]
-            return scanner.scan(path)
+            sr = scanner.scan(path)
+            sr.metadata.setdefault("file_hash", file_hash)
+            status, meta = check_hash(file_hash, hash_db)
+            if status == "known_bad":
+                sr.add_issue(
+                    "Model hash matches a known malicious model",
+                    severity=IssueSeverity.CRITICAL,
+                    details={"hash": file_hash, **(meta or {})},
+                )
+            elif status == "known_good":
+                sr.add_issue(
+                    "Model hash matches known-good baseline",
+                    severity=IssueSeverity.INFO,
+                    details={"hash": file_hash, **(meta or {})},
+                )
+            if expected_hash and expected_hash != file_hash:
+                sr.add_issue(
+                    "Drift detected: model hash differs from baseline",
+                    severity=IssueSeverity.WARNING,
+                    details={
+                        "expected_hash": expected_hash,
+                        "actual_hash": file_hash,
+                    },
+                )
+            return sr
 
     # If no scanner could handle the file, create a default unknown format result
     format_ = detect_file_format(path)
     sr = ScanResult(scanner_name="unknown")
+    sr.metadata["file_hash"] = file_hash
     sr.add_issue(
         f"Unknown or unhandled format: {format_}",
         severity=IssueSeverity.DEBUG,
         details={"format": format_, "path": path},
     )
+    status, meta = check_hash(file_hash, hash_db)
+    if status == "known_bad":
+        sr.add_issue(
+            "Model hash matches a known malicious model",
+            severity=IssueSeverity.CRITICAL,
+            details={"hash": file_hash, **(meta or {})},
+        )
+    elif status == "known_good":
+        sr.add_issue(
+            "Model hash matches known-good baseline",
+            severity=IssueSeverity.INFO,
+            details={"hash": file_hash, **(meta or {})},
+        )
+    if expected_hash and expected_hash != file_hash:
+        sr.add_issue(
+            "Drift detected: model hash differs from baseline",
+            severity=IssueSeverity.WARNING,
+            details={"expected_hash": expected_hash, "actual_hash": file_hash},
+        )
     return sr
 
 

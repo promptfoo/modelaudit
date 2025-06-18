@@ -1,6 +1,13 @@
 import os
 from pathlib import Path
 
+from .integrity import (
+    DEFAULT_HASH_DB_PATH,
+    check_hash,
+    compute_file_hash,
+    load_hash_db,
+)
+
 
 def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
     """Return normalized path for archive entry and whether it stays within base.
@@ -34,3 +41,12 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
         except ValueError:  # Windows: different drives
             is_safe = False
     return str(resolved), is_safe
+
+
+__all__ = [
+    "sanitize_archive_path",
+    "compute_file_hash",
+    "load_hash_db",
+    "check_hash",
+    "DEFAULT_HASH_DB_PATH",
+]

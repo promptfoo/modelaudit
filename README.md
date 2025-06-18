@@ -163,6 +163,7 @@ Issues found: 2 critical, 1 warnings
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
+- **Hash Baselines**: Alerts when a model's SHA-256 hash matches known-good or known-bad entries, or deviates from an expected baseline
 
 ## 🛡️ Supported Model Formats
 
@@ -203,6 +204,9 @@ modelaudit scan large_model.pkl --timeout 300
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
+
+# Check integrity against a baseline hash
+modelaudit scan model.pkl --baseline-hash abcdef1234...
 ```
 
 ### Exit Codes
@@ -212,6 +216,31 @@ ModelAudit uses different exit codes to indicate scan results:
 - **0**: Success - No security issues found
 - **1**: Security issues found (scan completed successfully)
 - **2**: Errors occurred during scanning (e.g., file not found, scan failures)
+
+### Hash Baseline Database
+
+ModelAudit can compare each scanned model's SHA-256 hash against a local JSON
+database of known-good and known-bad signatures. By default the tool looks for
+`~/.promptfoo/modelaudit_hashes.json` but you can override the path with
+`--hash-db-path`.
+
+Example format:
+
+```json
+{
+  "known_good": {
+    "d2d2ae0...abcd": {"name": "resnet50_v1"}
+  },
+  "known_bad": {
+    "7e240de...caff": {"origin": "Trojaned model"}
+  }
+}
+```
+
+When a scanned file's hash matches one of these entries, ModelAudit reports a
+corresponding info or critical issue. If an expected hash is supplied with
+`--baseline-hash` and it differs from the computed hash, the scan reports a
+drift warning.
 
 ## 📋 JSON Output Format
 

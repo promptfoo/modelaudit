@@ -61,7 +61,26 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+@click.option(
+    "--baseline-hash",
+    help="Expected SHA-256 hash for drift detection",
+)
+@click.option(
+    "--hash-db-path",
+    type=click.Path(),
+    help="Path to hash database",
+)
+def scan_command(
+    paths,
+    blacklist,
+    format,
+    output,
+    timeout,
+    verbose,
+    max_file_size,
+    baseline_hash,
+    hash_db_path,
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -79,6 +98,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
+        --baseline-hash    Expected SHA-256 hash for drift detection
+        --hash-db-path     Path to hash database
 
     \b
     Exit codes:
@@ -167,6 +188,8 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 blacklist_patterns=list(blacklist) if blacklist else None,
                 timeout=timeout,
                 max_file_size=max_file_size,
+                baseline_hash=baseline_hash,
+                hash_db_path=hash_db_path,
                 progress_callback=progress_callback,
             )
 
