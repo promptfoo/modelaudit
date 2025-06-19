@@ -28,6 +28,7 @@ def scan_model_directory_or_file(
     blacklist_patterns: Optional[list[str]] = None,
     timeout: int = 300,
     max_file_size: int = 0,
+    max_total_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     **kwargs,
 ) -> dict[str, Any]:
@@ -39,6 +40,7 @@ def scan_model_directory_or_file(
         blacklist_patterns: Additional blacklist patterns to check against model names
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
+        max_total_size: Maximum total bytes to scan across all files
         progress_callback: Optional callback function to report progress
                           (message, percentage)
         **kwargs: Additional arguments to pass to scanners
@@ -64,6 +66,7 @@ def scan_model_directory_or_file(
     config = {
         "blacklist_patterns": blacklist_patterns,
         "max_file_size": max_file_size,
+        "max_total_size": max_total_size,
         "timeout": timeout,
         **kwargs,
     }
@@ -85,6 +88,7 @@ def scan_model_directory_or_file(
             # Scan all files in the directory
             total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
             processed_files = 0
+            limit_reached = False
 
             for root, _, files in os.walk(path):
                 for file in files:
@@ -124,6 +128,21 @@ def scan_model_directory_or_file(
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
+
+                        if (
+                            max_total_size > 0
+                            and cast(int, results["bytes_scanned"]) > max_total_size
+                        ):
+                            issues_list.append(
+                                {
+                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                                    "severity": IssueSeverity.WARNING.value,
+                                    "location": file_path,
+                                    "details": {"max_total_size": max_total_size},
+                                }
+                            )
+                            limit_reached = True
+                            break
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
@@ -136,6 +155,11 @@ def scan_model_directory_or_file(
                                 "details": {"exception_type": type(e).__name__},
                             },
                         )
+                if limit_reached:
+                    break
+            # Stop scanning if size limit reached
+            if limit_reached:
+                pass
         else:
             # Scan a single file
             if progress_callback:
@@ -204,6 +228,19 @@ def scan_model_directory_or_file(
             issues_list = cast(list[dict[str, Any]], results["issues"])
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
+
+            if (
+                max_total_size > 0
+                and cast(int, results["bytes_scanned"]) > max_total_size
+            ):
+                issues_list.append(
+                    {
+                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                        "severity": IssueSeverity.WARNING.value,
+                        "location": path,
+                        "details": {"max_total_size": max_total_size},
+                    }
+                )
 
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
