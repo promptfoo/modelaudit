@@ -197,6 +197,10 @@ class BaseScanner(ABC):
             "chunk_size",
             10 * 1024 * 1024,
         )  # Default: 10MB chunks
+        self.max_file_read_size = self.config.get(
+            "max_file_read_size",
+            0,
+        )  # Default unlimited
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -248,3 +252,58 @@ class BaseScanner(ABC):
     def get_file_size(self, path: str) -> int:
         """Get the size of a file in bytes"""
         return os.path.getsize(path) if os.path.isfile(path) else 0
+
+    def _check_size_limit(self, path: str) -> Optional[ScanResult]:
+        """Check if the file exceeds the configured size limit."""
+        result = self._create_result()
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
+
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
+            result.add_issue(
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+            result.finish(success=False)
+            return result
+
+        return None
+
+    def _read_file_safely(self, path: str) -> bytes:
+        """Read a file with size validation and chunking."""
+        data = b""
+        file_size = self.get_file_size(path)
+
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
+            raise ValueError(
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})"
+            )
+
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                data += chunk
+                if (
+                    self.max_file_read_size
+                    and self.max_file_read_size > 0
+                    and len(data) > self.max_file_read_size
+                ):
+                    raise ValueError(
+                        f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})"
+                    )
+        return data

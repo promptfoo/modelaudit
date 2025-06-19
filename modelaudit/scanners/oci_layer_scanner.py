@@ -42,6 +42,10 @@ class OciLayerScanner(BaseScanner):
         if path_check:
             return path_check
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         manifest_data: Any = None
 
