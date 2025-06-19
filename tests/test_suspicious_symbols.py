@@ -47,7 +47,14 @@ class TestSuspiciousGlobals:
         assert "builtins" in SUSPICIOUS_GLOBALS
         builtins_funcs = SUSPICIOUS_GLOBALS["builtins"]
 
-        dangerous_builtins = ["eval", "exec", "__import__"]
+        dangerous_builtins = [
+            "eval",
+            "exec",
+            "compile",
+            "open",
+            "input",
+            "__import__",
+        ]
         for func in dangerous_builtins:
             assert func in builtins_funcs, f"Dangerous builtin {func} not flagged"
 
