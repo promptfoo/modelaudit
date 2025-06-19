@@ -15,26 +15,10 @@ from ..explanations import (
     get_opcode_explanation,
     get_pattern_explanation,
 )
+from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
-
-# Add dangerous builtin functions that might be used in __reduce__ methods
-DANGEROUS_BUILTINS = ["eval", "exec", "compile", "open", "input", "__import__"]
-
-# Dangerous opcodes that can lead to code execution
-DANGEROUS_OPCODES = [
-    "REDUCE",
-    "INST",
-    "OBJ",
-    "NEWOBJ",
-    "NEWOBJ_EX",
-    "GLOBAL",
-    "BUILD",
-    "STACK_GLOBAL",
-]
-
-
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
 # ============================================================================

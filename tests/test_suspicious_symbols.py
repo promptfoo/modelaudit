@@ -5,6 +5,8 @@ import re
 import pytest
 
 from modelaudit.suspicious_symbols import (
+    DANGEROUS_BUILTINS,
+    DANGEROUS_OPCODES,
     SUSPICIOUS_CONFIG_PATTERNS,
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_GLOBALS,
@@ -57,6 +59,24 @@ class TestSuspiciousGlobals:
         ]
         for func in dangerous_builtins:
             assert func in builtins_funcs, f"Dangerous builtin {func} not flagged"
+
+
+class TestDangerousBuiltins:
+    """Test DANGEROUS_BUILTINS constant."""
+
+    def test_dangerous_builtins_contents(self) -> None:
+        assert isinstance(DANGEROUS_BUILTINS, list)
+        for func in ["eval", "exec", "__import__"]:
+            assert func in DANGEROUS_BUILTINS
+
+
+class TestDangerousOpcodes:
+    """Test DANGEROUS_OPCODES constant."""
+
+    def test_dangerous_opcodes_non_empty(self) -> None:
+        assert isinstance(DANGEROUS_OPCODES, set)
+        for op in ["REDUCE", "INST", "STACK_GLOBAL"]:
+            assert op in DANGEROUS_OPCODES
 
 
 class TestSuspiciousStringPatterns:
@@ -236,6 +256,8 @@ class TestUtilityFunctions:
         expected_keys = [
             "pickle_globals",
             "pickle_strings",
+            "dangerous_builtins",
+            "dangerous_opcodes",
             "tensorflow_ops",
             "keras_layers",
             "config_properties",
