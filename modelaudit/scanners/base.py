@@ -246,5 +246,10 @@ class BaseScanner(ABC):
         return None  # Path is valid
 
     def get_file_size(self, path: str) -> int:
-        """Get the size of a file in bytes"""
-        return os.path.getsize(path) if os.path.isfile(path) else 0
+        """Get the size of a file in bytes."""
+        try:
+            return os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            # If the file becomes inaccessible during scanning, treat the size
+            # as zero rather than raising an exception.
+            return 0
