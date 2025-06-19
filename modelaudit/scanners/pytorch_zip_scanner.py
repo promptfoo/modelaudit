@@ -199,9 +199,17 @@ class PyTorchZipScanner(BaseScanner):
                                     # Skip blacklist checking for binary files
                                     # that can't be decoded as text
                                     pass
-                        except Exception:
-                            # Skip files we can't read
-                            pass
+                        except Exception as e:
+                            result.add_issue(
+                                f"Error reading file {name}: {str(e)}",
+                                severity=IssueSeverity.DEBUG,
+                                location=f"{self.current_file_path} ({name})",
+                                details={
+                                    "zip_entry": name,
+                                    "exception": str(e),
+                                    "exception_type": type(e).__name__,
+                                },
+                            )
 
                 result.bytes_scanned = bytes_scanned
 
