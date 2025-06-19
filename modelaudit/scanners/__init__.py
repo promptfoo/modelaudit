@@ -1,11 +1,11 @@
 from . import (
     base,
+    flax_msgpack_scanner,
     gguf_scanner,
     joblib_scanner,
     keras_h5_scanner,
     manifest_scanner,
     numpy_scanner,
-    flax_msgpack_scanner,
     oci_layer_scanner,
     onnx_scanner,
     pickle_scanner,
@@ -21,12 +21,12 @@ from . import (
 
 # Import scanner classes for direct use
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .flax_msgpack_scanner import FlaxMsgpackScanner
 from .gguf_scanner import GgufScanner
 from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
 from .numpy_scanner import NumPyScanner
-from .flax_msgpack_scanner import FlaxMsgpackScanner
 from .oci_layer_scanner import OciLayerScanner
 from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner

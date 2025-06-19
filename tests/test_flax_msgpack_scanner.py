@@ -1,7 +1,6 @@
 import msgpack
 
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
-from modelaudit.scanners.base import IssueSeverity
 
 
 def create_msgpack_file(path):
