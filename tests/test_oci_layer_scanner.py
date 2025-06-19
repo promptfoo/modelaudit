@@ -200,6 +200,27 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
+    def test_scan_manifest_with_traversal_layer_path(self, tmp_path):
+        """Test detection of path traversal in layer references."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+
+        evil_file = outside_dir / "evil.txt"
+        evil_file.write_text("bad")
+
+        layer_path = outside_dir / "evil.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_file, arcname="evil.txt")
+
+        manifest = {"layers": ["../outside/evil.tar.gz"]}
+        manifest_path = tmp_path / "traversal.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        scanner = OciLayerScanner()
+        result = scanner.scan(str(manifest_path))
+
+        assert any("path traversal" in i.message.lower() for i in result.issues)
+
     def test_scan_manifest_with_nested_layer_references(self, tmp_path):
         """Test scanning manifest with nested layer references."""
         safe_file = tmp_path / "safe.txt"
