@@ -110,6 +110,7 @@ class OciLayerScanner(BaseScanner):
                         ) as tmp:
                             tmp.write(fileobj.read())
                             tmp_path = tmp.name
+                        fileobj.close()
                         try:
                             from .. import core
 
