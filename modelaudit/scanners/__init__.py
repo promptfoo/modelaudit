@@ -1,5 +1,6 @@
 from . import (
     base,
+    flax_msgpack_scanner,
     gguf_scanner,
     joblib_scanner,
     keras_h5_scanner,
@@ -20,6 +21,7 @@ from . import (
 
 # Import scanner classes for direct use
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .flax_msgpack_scanner import FlaxMsgpackScanner
 from .gguf_scanner import GgufScanner
 from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
@@ -54,6 +56,7 @@ SCANNER_REGISTRY = [
     PmmlScanner,
     WeightDistributionScanner,
     SafeTensorsScanner,
+    FlaxMsgpackScanner,
     TFLiteScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
@@ -76,6 +79,7 @@ __all__ = [
     "PyTorchZipScanner",
     "SCANNER_REGISTRY",
     "SafeTensorsScanner",
+    "FlaxMsgpackScanner",
     "TFLiteScanner",
     "ScanResult",
     "TensorFlowSavedModelScanner",
@@ -93,6 +97,7 @@ __all__ = [
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "safetensors_scanner",
+    "flax_msgpack_scanner",
     "tflite_scanner",
     "pmml_scanner",
     "tf_savedmodel_scanner",

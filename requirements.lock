@@ -30,6 +30,7 @@ filelock==3.18.0
     # via torch
 flatbuffers==25.2.10
     # via tensorflow
+    # via tflite
 fsspec==2025.5.1
     # via torch
 gast==0.6.0
@@ -68,6 +69,8 @@ ml-dtypes==0.5.1
     # via tensorflow
 mpmath==1.3.0
     # via sympy
+msgpack==1.1.1
+    # via modelaudit
 namex==0.1.0
     # via keras
 networkx==3.5
@@ -82,6 +85,7 @@ numpy==2.1.3
     # via scipy
     # via tensorboard
     # via tensorflow
+    # via tflite
 onnx==1.18.0
     # via modelaudit
 opt-einsum==3.4.0
@@ -132,6 +136,8 @@ tensorflow-io-gcs-filesystem==0.37.1
 termcolor==2.3.0
     # via tensorflow
     # via yaspin
+tflite==2.18.0
+    # via modelaudit
 threadpoolctl==3.6.0
     # via scikit-learn
 torch==2.7.1
