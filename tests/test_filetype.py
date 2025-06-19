@@ -5,6 +5,7 @@ from modelaudit.utils.filetype import (
     detect_format_from_extension,
     find_sharded_files,
     is_zipfile,
+    validate_file_type,
 )
 
 
@@ -154,3 +155,17 @@ def test_detect_gguf_ggml_formats(tmp_path):
     fake_gguf_path.write_bytes(b"FAKE" + b"\x00" * 20)
     assert detect_file_format(str(fake_gguf_path)) == "gguf"  # Falls back to extension
     assert detect_format_from_extension(str(fake_gguf_path)) == "gguf"
+
+
+def test_validate_file_type(tmp_path):
+    """Validate files using magic numbers."""
+    # Valid ZIP-based PyTorch file
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("test.txt", "data")
+    assert validate_file_type(str(zip_path)) is True
+
+    # Invalid HDF5 file with .h5 extension
+    invalid_h5 = tmp_path / "bad.h5"
+    invalid_h5.write_bytes(b"not real hdf5")
+    assert validate_file_type(str(invalid_h5)) is False

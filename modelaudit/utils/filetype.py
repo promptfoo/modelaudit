@@ -20,6 +20,50 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
         return f.read(num_bytes)
 
 
+def detect_file_format_from_magic(path: str) -> str:
+    """Detect file format solely from magic bytes."""
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+
+    if not file_path.is_file():
+        return "unknown"
+
+    size = file_path.stat().st_size
+    if size < 4:
+        return "unknown"
+
+    magic4 = read_magic_bytes(path, 4)
+    magic8 = read_magic_bytes(path, 8)
+    magic16 = read_magic_bytes(path, 16)
+
+    hdf5_magic = b"\x89HDF\r\n\x1a\n"
+    if magic8 == hdf5_magic:
+        return "hdf5"
+
+    if magic4 == b"GGUF":
+        return "gguf"
+    if magic4 == b"GGML":
+        return "ggml"
+
+    if magic4.startswith(b"PK"):
+        return "zip"
+
+    pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+    if any(magic4.startswith(m) for m in pickle_magics):
+        return "pickle"
+
+    if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+        return "safetensors"
+
+    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+        return "onnx"
+
+    return "unknown"
+
+
 def detect_file_format(path: str) -> str:
     """
     Attempt to identify the format:
@@ -178,3 +222,25 @@ def detect_format_from_extension(path: str) -> str:
             return "tensorflow_directory"
         return "directory"
     return EXTENSION_FORMAT_MAP.get(file_path.suffix.lower(), "unknown")
+
+
+def validate_file_type(path: str) -> bool:
+    """Validate that a file's magic bytes match its extension-based format."""
+    header_format = detect_file_format_from_magic(path)
+    ext_format = detect_format_from_extension(path)
+
+    if ext_format == "unknown":
+        return True
+    if header_format == "unknown":
+        return False
+
+    if ext_format == "pickle" and header_format in {"pickle", "zip"}:
+        return True
+    if ext_format == "pytorch_binary" and header_format in {
+        "pytorch_binary",
+        "pickle",
+        "zip",
+    }:
+        return True
+
+    return header_format == ext_format

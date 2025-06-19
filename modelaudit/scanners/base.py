@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import stat
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -233,8 +234,29 @@ class BaseScanner(ABC):
             result.finish(success=False)
             return result
 
-        # Check if path is readable
+        # Check if path is readable. Use os.stat to catch unreadable files even
+        # when running as root.
         if not os.access(path, os.R_OK):
+            result.add_issue(
+                f"Path is not readable: {path}",
+                severity=IssueSeverity.CRITICAL,
+                details={"path": path},
+            )
+            result.finish(success=False)
+            return result
+
+        # Additional permission check based on file mode bits
+        try:
+            mode = os.stat(path).st_mode
+            if not (mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)):
+                result.add_issue(
+                    f"Path is not readable: {path}",
+                    severity=IssueSeverity.CRITICAL,
+                    details={"path": path},
+                )
+                result.finish(success=False)
+                return result
+        except OSError:
             result.add_issue(
                 f"Path is not readable: {path}",
                 severity=IssueSeverity.CRITICAL,
