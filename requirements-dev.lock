@@ -28,10 +28,13 @@ defusedxml==0.7.1
     # via modelaudit
 dill==0.4.0
     # via modelaudit
+execnet==2.1.1
+    # via pytest-xdist
 filelock==3.18.0
     # via torch
 flatbuffers==25.2.10
     # via tensorflow
+    # via tflite
 fsspec==2025.5.1
     # via torch
 gast==0.6.0
@@ -89,6 +92,7 @@ numpy==2.1.3
     # via scipy
     # via tensorboard
     # via tensorflow
+    # via tflite
     # via types-tensorflow
 onnx==1.18.0
     # via modelaudit
@@ -115,7 +119,9 @@ pygments==2.19.1
     # via rich
 pytest==8.4.1
     # via pytest-cov
+    # via pytest-xdist
 pytest-cov==6.2.1
+pytest-xdist==3.7.0
 pyyaml==6.0.2
     # via modelaudit
 requests==2.32.4
@@ -151,6 +157,8 @@ tensorflow-io-gcs-filesystem==0.37.1
 termcolor==2.3.0
     # via tensorflow
     # via yaspin
+tflite==2.18.0
+    # via modelaudit
 threadpoolctl==3.6.0
     # via scikit-learn
 torch==2.7.1
