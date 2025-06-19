@@ -63,6 +63,7 @@ dev-dependencies = [
     "types-tensorflow>=2.18.0.20250516",
     "pytest-cov>=6.2.1",
     "dill>=0.4.0",
+    "pytest-xdist>=3.7.0",
 ]
 
 [tool.ruff]
@@ -78,6 +79,27 @@ extend-select = ["I"]
 
 [tool.ruff.format]
 # Black-compatible formatting
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--disable-warnings",
+    "--tb=short",
+]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "performance: marks tests as performance benchmarks",
+    "unit: marks tests as unit tests (fast)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
 
 [tool.mypy]
 python_version = "3.9"

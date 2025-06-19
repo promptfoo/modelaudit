@@ -676,9 +676,9 @@ class TestEdgeCases:
         finally:
             Path(test_file).unlink(missing_ok=True)
 
-    def test_unicode_and_special_characters(self):
+    def test_unicode_and_special_characters(self, tmp_path):
         """Test handling of Unicode and special characters."""
-        test_file = "test_unicode.json"
+        test_file = tmp_path / "test_unicode.json"
         unicode_config = {
             "model_name": "测试模型",
             "description": "Тестовая модель",
@@ -687,18 +687,14 @@ class TestEdgeCases:
             "emoji_field": "🤖🔥💯",
         }
 
-        try:
-            with Path(test_file).open("w", encoding="utf-8") as f:
-                json.dump(unicode_config, f, ensure_ascii=False)
+        with test_file.open("w", encoding="utf-8") as f:
+            json.dump(unicode_config, f, ensure_ascii=False)
 
-            scanner = ManifestScanner()
-            result = scanner.scan(test_file)
+        scanner = ManifestScanner()
+        result = scanner.scan(str(test_file))
 
-            # Should handle Unicode without crashing
-            assert result.success is True
-
-        finally:
-            Path(test_file).unlink(missing_ok=True)
+        # Should handle Unicode without crashing
+        assert result.success is True
 
 
 # Test fixtures and helpers

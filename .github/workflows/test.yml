@@ -80,9 +80,14 @@ jobs:
         run: |
           rye sync --features all
 
-      - name: Run tests with pytest
+      - name: Run fast tests (parallel execution)
         run: |
-          rye run pytest -v --cov=modelaudit
+          rye run pytest -n auto -m "not slow and not integration" --cov=modelaudit --tb=short
+
+      - name: Run slow/integration tests (if main branch)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          rye run pytest -n auto -m "slow or integration" --tb=short
 
   build:
     name: Build and Package

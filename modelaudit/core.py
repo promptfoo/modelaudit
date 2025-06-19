@@ -1,8 +1,11 @@
+import builtins
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from threading import Lock
+from typing import IO, Any, Callable, Optional, cast
+from unittest.mock import patch
 
 from modelaudit.scanners import (
     SCANNER_REGISTRY,
@@ -21,6 +24,27 @@ from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
 
 logger = logging.getLogger("modelaudit.core")
+
+# Lock to ensure thread-safe monkey patching of builtins.open
+_OPEN_PATCH_LOCK = Lock()
+
+
+def validate_scan_config(config: dict[str, Any]) -> None:
+    """Validate configuration parameters for scanning."""
+    timeout = config.get("timeout")
+    if timeout is not None:
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError("timeout must be a positive integer")
+
+    max_file_size = config.get("max_file_size")
+    if max_file_size is not None:
+        if not isinstance(max_file_size, int) or max_file_size < 0:
+            raise ValueError("max_file_size must be a non-negative integer")
+
+    chunk_size = config.get("chunk_size")
+    if chunk_size is not None:
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
 
 
 def scan_model_directory_or_file(
@@ -70,6 +94,8 @@ def scan_model_directory_or_file(
         "timeout": timeout,
         **kwargs,
     }
+
+    validate_scan_config(config)
 
     try:
         # Check if path exists
@@ -171,16 +197,13 @@ def scan_model_directory_or_file(
 
             # Create a wrapper for the file to report progress
             if progress_callback is not None and file_size > 0:
-                import builtins
-                from typing import IO
-
                 original_builtins_open = builtins.open
 
                 def progress_open(
                     file_path: str,
                     mode: str = "r",
-                    *args,
-                    **kwargs,
+                    *args: Any,
+                    **kwargs: Any,
                 ) -> IO[Any]:
                     file = original_builtins_open(file_path, mode, *args, **kwargs)
                     file_pos = 0
@@ -203,14 +226,8 @@ def scan_model_directory_or_file(
                     file.read = progress_read  # type: ignore[method-assign]
                     return file
 
-                # Monkey patch open temporarily
-                builtins.open = progress_open  # type: ignore
-
-                try:
+                with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
                     file_result = scan_file(path, config)
-                finally:
-                    # Restore original open
-                    builtins.open = original_builtins_open
             else:
                 file_result = scan_file(path, config)
 
@@ -360,6 +377,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     """
     if config is None:
         config = {}
+    validate_scan_config(config)
 
     # Check file size first
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
