@@ -13,6 +13,7 @@ from . import (
     pytorch_zip_scanner,
     safetensors_scanner,
     tf_savedmodel_scanner,
+    tflite_scanner,
     weight_distribution_scanner,
     zip_scanner,
 )
@@ -32,6 +33,7 @@ from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .safetensors_scanner import SafeTensorsScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from .tflite_scanner import TFLiteScanner
 from .weight_distribution_scanner import WeightDistributionScanner
 from .zip_scanner import ZipScanner
 
@@ -52,6 +54,7 @@ SCANNER_REGISTRY = [
     PmmlScanner,
     WeightDistributionScanner,
     SafeTensorsScanner,
+    TFLiteScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -73,6 +76,7 @@ __all__ = [
     "PyTorchZipScanner",
     "SCANNER_REGISTRY",
     "SafeTensorsScanner",
+    "TFLiteScanner",
     "ScanResult",
     "TensorFlowSavedModelScanner",
     "WeightDistributionScanner",
@@ -89,6 +93,7 @@ __all__ = [
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "safetensors_scanner",
+    "tflite_scanner",
     "pmml_scanner",
     "tf_savedmodel_scanner",
     "weight_distribution_scanner",
