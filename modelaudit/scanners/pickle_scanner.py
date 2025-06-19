@@ -15,7 +15,7 @@ from ..explanations import (
     get_opcode_explanation,
     get_pattern_explanation,
 )
-from ..suspicious_symbols import DANGEROUS_BUILTINS, DANGEROUS_OPCODES
+from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
