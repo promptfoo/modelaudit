@@ -11,6 +11,24 @@ from modelaudit.utils.filetype import detect_file_format
 logger = logging.getLogger("modelaudit.core")
 
 
+def validate_scan_config(config: dict[str, Any]) -> None:
+    """Validate configuration parameters for scanning."""
+    timeout = config.get("timeout")
+    if timeout is not None:
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError("timeout must be a positive integer")
+
+    max_file_size = config.get("max_file_size")
+    if max_file_size is not None:
+        if not isinstance(max_file_size, int) or max_file_size < 0:
+            raise ValueError("max_file_size must be a non-negative integer")
+
+    chunk_size = config.get("chunk_size")
+    if chunk_size is not None:
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+
 def scan_model_directory_or_file(
     path: str,
     blacklist_patterns: Optional[list[str]] = None,
@@ -55,6 +73,8 @@ def scan_model_directory_or_file(
         "timeout": timeout,
         **kwargs,
     }
+
+    validate_scan_config(config)
 
     try:
         # Check if path exists
@@ -311,6 +331,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     """
     if config is None:
         config = {}
+    validate_scan_config(config)
 
     # Check file size first
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
