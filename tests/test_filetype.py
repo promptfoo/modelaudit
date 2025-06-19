@@ -133,3 +133,24 @@ def test_detect_format_from_extension(tmp_path):
     dir_path.mkdir()
     (dir_path / "saved_model.pb").write_bytes(b"d")
     assert detect_format_from_extension(str(dir_path)) == "tensorflow_directory"
+
+
+def test_detect_gguf_ggml_formats(tmp_path):
+    """Test detection of GGUF and GGML formats by magic bytes."""
+    # Test GGUF format
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF" + b"\x00" * 20)
+    assert detect_file_format(str(gguf_path)) == "gguf"
+    assert detect_format_from_extension(str(gguf_path)) == "gguf"
+
+    # Test GGML format
+    ggml_path = tmp_path / "model.ggml"
+    ggml_path.write_bytes(b"GGML" + b"\x00" * 20)
+    assert detect_file_format(str(ggml_path)) == "ggml"
+    assert detect_format_from_extension(str(ggml_path)) == "ggml"
+
+    # Test GGUF extension with wrong magic (should fall back to extension)
+    fake_gguf_path = tmp_path / "fake.gguf"
+    fake_gguf_path.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert detect_file_format(str(fake_gguf_path)) == "gguf"  # Falls back to extension
+    assert detect_format_from_extension(str(fake_gguf_path)) == "gguf"

@@ -28,6 +28,7 @@ def detect_file_format(path: str) -> str:
     - PyTorch ZIP (.pt/.pth file that's a ZIP)
     - Pickle (.pkl/.pickle or other files with pickle magic)
     - PyTorch binary (.bin files with various formats)
+    - GGUF/GGML files with magic bytes
     - If extension indicates pickle/pt/h5/pb, etc.
     """
     file_path = Path(path)
@@ -53,6 +54,12 @@ def detect_file_format(path: str) -> str:
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
     if magic8 == hdf5_magic:
         return "hdf5"
+
+    # Check for GGUF/GGML magic bytes
+    if magic4 == b"GGUF":
+        return "gguf"
+    if magic4 == b"GGML":
+        return "ggml"
 
     ext = file_path.suffix.lower()
 
@@ -104,6 +111,14 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext in (".gguf", ".ggml"):
+        # Check magic bytes first for accuracy
+        if magic4 == b"GGUF":
+            return "gguf"
+        elif magic4 == b"GGML":
+            return "ggml"
+        # Fall back to extension-based detection
+        return "gguf" if ext == ".gguf" else "ggml"
     if ext == ".npy":
         return "numpy"
     if ext == ".npz":
@@ -138,6 +153,7 @@ EXTENSION_FORMAT_MAP = {
     ".ckpt": "pickle",
     ".pkl": "pickle",
     ".pickle": "pickle",
+    ".dill": "pickle",
     ".h5": "hdf5",
     ".hdf5": "hdf5",
     ".keras": "hdf5",
@@ -146,6 +162,11 @@ EXTENSION_FORMAT_MAP = {
     ".onnx": "onnx",
     ".bin": "pytorch_binary",
     ".zip": "zip",
+    ".gguf": "gguf",
+    ".ggml": "ggml",
+    ".npy": "numpy",
+    ".npz": "zip",
+    ".joblib": "pickle",  # joblib can be either zip or pickle format
 }
 
 

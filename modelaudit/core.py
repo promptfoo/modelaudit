@@ -6,7 +6,10 @@ from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import (
     SCANNER_REGISTRY,
+    GgufScanner,
     KerasH5Scanner,
+    NumPyScanner,
+    OnnxScanner,
     PickleScanner,
     PyTorchBinaryScanner,
     PyTorchZipScanner,
@@ -376,6 +379,10 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
             "tensorflow_directory": TensorFlowSavedModelScanner,
             "protobuf": TensorFlowSavedModelScanner,
             "zip": ZipScanner,
+            "onnx": OnnxScanner,
+            "gguf": GgufScanner,
+            "ggml": GgufScanner,
+            "numpy": NumPyScanner,
         }.get(header_format)
 
     result: Optional[ScanResult]
