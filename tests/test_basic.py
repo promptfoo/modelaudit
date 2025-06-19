@@ -1,6 +1,8 @@
 import re
 from importlib.metadata import PackageNotFoundError, version
 
+import pytest
+
 import modelaudit
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
@@ -256,6 +258,21 @@ def test_blacklist_patterns(tmp_path):
 
     # Just verify the scan completes successfully
     assert results["success"] is True
+
+
+def test_invalid_config_values(tmp_path):
+    """Test validation of configuration parameters."""
+    test_file = tmp_path / "test_invalid.dat"
+    test_file.write_bytes(b"data")
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), timeout=0)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_file_size=-1)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), chunk_size=0)
 
 
 def test_version_consistency():
