@@ -102,6 +102,33 @@ pip install modelaudit[flax]
 pip install modelaudit[all]
 ```
 
+**Development installation:**
+
+```bash
+git clone https://github.com/promptfoo/modelaudit.git
+cd modelaudit
+
+# Using Rye (recommended)
+rye sync --features all
+
+# Or using pip
+pip install -e .[all]
+```
+
+**Docker installation:**
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/promptfoo/modelaudit:latest
+
+# Use specific variants
+docker pull ghcr.io/promptfoo/modelaudit:latest-full        # All ML frameworks
+docker pull ghcr.io/promptfoo/modelaudit:latest-tensorflow  # TensorFlow only
+
+# Run with Docker
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
+```
+
 ### Basic Usage
 
 ```bash
@@ -300,8 +327,11 @@ modelaudit scan models/ --format json --output scan-results.json
 ```yaml
 - name: Scan models
   run: |
-    pip install modelaudit[all]
-    modelaudit scan models/ --format json --output results.json
+    rye run modelaudit scan models/ --format json --output scan-results.json
+    if [ $? -eq 1 ]; then
+      echo "Security issues found in models!"
+      exit 1
+    fi
 ```
 
 **GitLab CI:**
@@ -333,6 +363,12 @@ sh 'modelaudit scan models/ --format json --output results.json'
 pip install --upgrade pip setuptools wheel
 pip install modelaudit[all] --no-cache-dir
 
+# Install with Rye (recommended)
+rye sync --features all
+
+# Or with pip
+pip install -e .[all]
+
 # If optional dependencies fail, install base package first
 pip install modelaudit
 pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you need
@@ -345,11 +381,50 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
 ```
 
+**Testing:**
+
+```bash
+# Run all tests
+rye run pytest
+
+# Run with coverage
+rye run pytest --cov=modelaudit
+
+# Run specific test categories
+rye run pytest tests/test_pickle_scanner.py -v
+rye run pytest tests/test_integration.py -v
+
+# Run tests with all optional dependencies
+rye sync --features all
+rye run pytest
+
+# Run comprehensive migration test (tests everything including Docker)
+./test_migration.sh
+```
+
 **Debug Mode:**
 
 ```bash
 # Enable verbose output for troubleshooting
 modelaudit scan model.pkl --verbose
+```
+
+**Development Commands:**
+
+```bash
+# Run linting and formatting with Ruff
+rye run ruff check modelaudit/          # Check for linting issues
+rye run ruff check --fix modelaudit/    # Fix auto-fixable issues
+rye run ruff format modelaudit/         # Format code
+
+# Type checking
+rye run mypy modelaudit/
+
+# Build package
+rye build
+
+# Publish (maintainers only)
+rye publish
 ```
 
 **Getting Help:**
