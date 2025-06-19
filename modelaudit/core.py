@@ -21,6 +21,7 @@ from modelaudit.scanners import (
     ZipScanner,
 )
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils import is_within_directory
 from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
 
 logger = logging.getLogger("modelaudit.core")
@@ -116,9 +117,22 @@ def scan_model_directory_or_file(
             processed_files = 0
             limit_reached = False
 
-            for root, _, files in os.walk(path):
+            base_dir = Path(path).resolve()
+            for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
+                    resolved_file = Path(file_path).resolve()
+                    if not is_within_directory(str(base_dir), str(resolved_file)):
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list.append(
+                            {
+                                "message": "Path traversal outside scanned directory",
+                                "severity": IssueSeverity.CRITICAL.value,
+                                "location": file_path,
+                                "details": {"resolved_path": str(resolved_file)},
+                            }
+                        )
+                        continue
 
                     # Check timeout
                     if time.time() - start_time > timeout:
