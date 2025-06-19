@@ -1,5 +1,7 @@
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
@@ -563,8 +565,8 @@ class ManifestScanner(BaseScanner):
         if not isinstance(value, str):
             return False
 
-        # Absolute paths
-        if value.startswith(("/", "\\", "C:", "D:")):
+        # Absolute paths (Unix or Windows)
+        if Path(value).is_absolute() or re.match(r"^[a-zA-Z]:\\", value):
             return True
 
         # Relative paths with separators
@@ -596,9 +598,10 @@ class ManifestScanner(BaseScanner):
             return True
 
         # Common path indicators
-        if any(
-            indicator in value.lower()
-            for indicator in ["/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"]
+        lower_value = value.lower()
+        indicators = ["/tmp", "/var", "/data", "/home", "/etc"]
+        if any(indicator in lower_value for indicator in indicators) or re.search(
+            r"[a-z]:\\", lower_value
         ):
             return True
 

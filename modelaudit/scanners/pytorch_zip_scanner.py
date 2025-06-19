@@ -1,5 +1,6 @@
 import io
 import os
+import tempfile
 import zipfile
 from typing import Any, Optional
 
@@ -71,7 +72,8 @@ class PyTorchZipScanner(BaseScanner):
             with zipfile.ZipFile(path, "r") as z:
                 safe_entries: list[str] = []
                 for name in z.namelist():
-                    _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                    temp_base = os.path.join(tempfile.gettempdir(), "extract")
+                    _, is_safe = sanitize_archive_path(name, temp_base)
                     if not is_safe:
                         result.add_issue(
                             f"Archive entry {name} attempted path traversal outside the archive",
