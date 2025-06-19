@@ -23,9 +23,10 @@ Thumbs.db
 .git/
 .gitignore
 
-# Documentation
-*.md
+# Documentation  
 docs/
+# Keep README.md as it's referenced in pyproject.toml
+!README.md
 
 # Testing
 .coverage

@@ -220,8 +220,16 @@ class PyTorchBinaryScanner(BaseScanner):
                     # Check if it's a reasonable float value (not NaN, not huge)
                     if not (-1e100 < value < 1e100) or value != value:  # NaN check
                         result.metadata["tensor_validation"] = "unusual_float_values"
-                except struct.error:
-                    pass
+                except struct.error as e:
+                    result.add_issue(
+                        "Error interpreting tensor header",
+                        severity=IssueSeverity.DEBUG,
+                        location=self.current_file_path,
+                        details={
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                        },
+                    )
 
         except Exception as e:
             result.add_issue(
