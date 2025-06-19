@@ -28,6 +28,7 @@ def detect_file_format(path: str) -> str:
     - PyTorch ZIP (.pt/.pth file that's a ZIP)
     - Pickle (.pkl/.pickle or other files with pickle magic)
     - PyTorch binary (.bin files with various formats)
+    - GGUF/GGML files with magic bytes
     - If extension indicates pickle/pt/h5/pb, etc.
     """
     file_path = Path(path)
@@ -53,6 +54,12 @@ def detect_file_format(path: str) -> str:
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
     if magic8 == hdf5_magic:
         return "hdf5"
+
+    # Check for GGUF/GGML magic bytes
+    if magic4 == b"GGUF":
+        return "gguf"
+    if magic4 == b"GGML":
+        return "ggml"
 
     ext = file_path.suffix.lower()
 
@@ -104,6 +111,14 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext in (".gguf", ".ggml"):
+        # Check magic bytes first for accuracy
+        if magic4 == b"GGUF":
+            return "gguf"
+        elif magic4 == b"GGML":
+            return "ggml"
+        # Fall back to extension-based detection
+        return "gguf" if ext == ".gguf" else "ggml"
     if ext == ".npy":
         return "numpy"
     if ext == ".npz":
@@ -116,7 +131,7 @@ def detect_file_format(path: str) -> str:
     return "unknown"
 
 
-def find_sharded_files(directory: str) -> list:
+def find_sharded_files(directory: str) -> list[str]:
     """
     Look for sharded model files like:
     pytorch_model-00001-of-00002.bin
@@ -130,3 +145,36 @@ def find_sharded_files(directory: str) -> list:
             and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
         ]
     )
+
+
+EXTENSION_FORMAT_MAP = {
+    ".pt": "pickle",
+    ".pth": "pickle",
+    ".ckpt": "pickle",
+    ".pkl": "pickle",
+    ".pickle": "pickle",
+    ".dill": "pickle",
+    ".h5": "hdf5",
+    ".hdf5": "hdf5",
+    ".keras": "hdf5",
+    ".pb": "protobuf",
+    ".safetensors": "safetensors",
+    ".onnx": "onnx",
+    ".bin": "pytorch_binary",
+    ".zip": "zip",
+    ".gguf": "gguf",
+    ".ggml": "ggml",
+    ".npy": "numpy",
+    ".npz": "zip",
+    ".joblib": "pickle",  # joblib can be either zip or pickle format
+}
+
+
+def detect_format_from_extension(path: str) -> str:
+    """Return a format string based solely on the file extension."""
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+    return EXTENSION_FORMAT_MAP.get(file_path.suffix.lower(), "unknown")

@@ -5,6 +5,7 @@ from . import (
     keras_h5_scanner,
     manifest_scanner,
     numpy_scanner,
+    oci_layer_scanner,
     onnx_scanner,
     pickle_scanner,
     pmml_scanner,
@@ -23,6 +24,7 @@ from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
 from .manifest_scanner import ManifestScanner
 from .numpy_scanner import NumPyScanner
+from .oci_layer_scanner import OciLayerScanner
 from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
 from .pmml_scanner import PmmlScanner
@@ -45,6 +47,7 @@ SCANNER_REGISTRY = [
     GgufScanner,
     JoblibScanner,
     NumPyScanner,
+    OciLayerScanner,
     ManifestScanner,
     PmmlScanner,
     WeightDistributionScanner,
@@ -63,6 +66,7 @@ __all__ = [
     "ManifestScanner",
     "PmmlScanner",
     "NumPyScanner",
+    "OciLayerScanner",
     "OnnxScanner",
     "PickleScanner",
     "PyTorchBinaryScanner",
@@ -79,6 +83,7 @@ __all__ = [
     "keras_h5_scanner",
     "manifest_scanner",
     "numpy_scanner",
+    "oci_layer_scanner",
     "onnx_scanner",
     "pickle_scanner",
     "pytorch_binary_scanner",

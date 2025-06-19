@@ -47,6 +47,7 @@ ModelAudit scans ML model files for:
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
 - **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
