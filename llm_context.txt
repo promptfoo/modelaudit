@@ -1,0 +1,91 @@
+## Overview
+This project, "modelaudit," scans ML model files for suspicious or malicious content. It also supports blacklisting certain model names or families (e.g. "llama"). The overall purpose is to enhance security around model files that might contain malicious code, especially in Python-based serialization formats (Pickle, PyTorch .pt, Keras .h5, TensorFlow SavedModel, etc.).
+
+## Purpose
+1. **Security / Compliance**: Detect potential code-injection attacks (e.g. `os.system` in a pickle) before models are used internally.
+2. **Pre-Deployment Checks**: Integrate with CI/CD so that any new model artifact gets scanned automatically.
+3. **Name-Based Policies**: For example, disallow certain model families by name ("llama," "alpaca," etc.).
+4. **Extendability**: The design is modular, so new scanners or rules can be added as the ML ecosystem evolves.
+
+## Project Structure
+- **pyproject.toml**: Defines build system and dependencies (optional extras for TensorFlow, PyTorch, h5py, dev tooling).
+- **README.md**: Intro to usage, installation, purpose.
+- **setup.cfg**: Additional packaging configuration.
+- **modelaudit/** (main code folder):
+  - **__init__.py**: Version info.
+  - **cli.py**: Provides the command-line interface (`modelaudit scan <path>`).
+  - **core.py**: High-level logic to decide how to scan a path. It uses `detect_file_format` from `utils/filetype.py` and calls the appropriate scanner.
+  - **name_policies/**:
+    - **blacklist.py**: Example of a simple text-based blacklist for model names.
+  - **scanners/**:
+    - **base.py**: Shared `ScanResult` class that collects issues.
+    - **pickle_scanner.py**: Scans for suspicious code references in pickles.
+    - **pytorch_zip_scanner.py**: Scans PyTorch's newer zip-based `.pt` or `.pth` files by extracting embedded `.pkl`s.
+    - **keras_h5_scanner.py**: Checks Keras .h5 files for `Lambda` layers or other suspicious config.
+    - **tf_savedmodel_scanner.py**: Looks for suspicious ops in TensorFlow SavedModel (e.g. `ReadFile` or `WriteFile`).
+  - **utils/**:
+    - **filetype.py**: More robust format detection by checking magic numbers, file extensions, or presence of special files like `saved_model.pb`. Also has logic to gather Hugging Face shards.
+- **tests/**: Contains a simple `test_basic.py`.
+
+## Shortcomings / Potential Improvements
+1. **Partial / Chunk-Based Scanning**: Large files might need streaming to avoid big memory usage.
+2. **Time Limits / Resource Constraints**: Production usage likely needs a timeout or safety checks if the file is huge or corrupted.
+3. **Advanced Name Inference**: Currently minimal; if you want to parse a Hugging Face–style `config.json` or `model_index.json` to detect the real model name, you'd have to implement that.
+4. **Safetensors / ONNX**: Provided placeholders, but the scanning logic is minimal or missing for those. Real usage might need further coverage.
+5. **Caching / Hash Checking**: Large organizations might want caching of scan results based on file checksums.
+6. **Policy Customization**: A simple blacklist is included, but advanced or dynamic rule sets (with version checks, in-code DSL, etc.) would require custom expansions.
+7. **Parallel / Distributed Scanning**: For big MLOps pipelines, you might want concurrency or a microservice approach.
+8. **Dependency Management**: Some scanners need optional packages (TensorFlow, h5py). If these are not installed, scanning is skipped or yields an error message.
+
+## Enhanced Scanner Architecture for Production Readiness
+Based on the review of the scanners, here are improvements to make the system more robust and production-ready:
+
+1. **Standardized Scanner Interface**: - DONE!
+   - Create an abstract base class with common methods all scanners must implement
+   - Define consistent input/output contracts for all scanners
+   - Implement capability detection (can_handle method) for each scanner
+
+2. **Enhanced Error Handling and Reporting**: - DONE!
+   - Classify issues by severity (INFO, WARNING, ERROR)
+   - Return structured results (JSON) with clear distinctions between errors and findings
+   - Add graceful error recovery to continue scanning when possible
+
+3. **Performance Improvements**:
+   - Process large files in chunks to avoid OOM errors
+   - Add configurable timeouts for each scanner to prevent hanging
+   - Implement progress reporting for tracking large file scans
+
+4. **Extensibility**:
+   - Create a plugin system for loading custom scanners
+   - Support external rule configuration files
+   - Enable version-specific scanning rules
+
+5. **Production Features**:
+   - Implement file hash-based caching to avoid rescanning unchanged files
+   - Support scanning multiple files concurrently
+   - Add metrics collection and telemetry
+   - Provide comprehensive logging with configurable levels
+
+6. **Security Enhancements**:
+   - Run high-risk operations in a sandboxed environment
+   - Expand detection rule sets for more comprehensive coverage
+   - Support model signature verification
+   - Implement resource limits during scanning
+
+7. **Testing Improvements**:
+   - Create a comprehensive test corpus with known-good and known-bad samples
+   - Add fuzz testing to ensure scanners don't crash on malformed inputs
+   - Measure and optimize scanner performance
+
+8. **CLI Improvements**:
+   - Add progress bars for large files
+   - Support multiple output formats (text, JSON, HTML report)
+   - Implement batch operations for scanning entire directories
+
+## Key Points for an LLM Developer
+- **Modularity**: Each scanner is an isolated module. New ones can be added for additional formats (like `.npz`, safetensors, or others).
+- **Context**: "modelaudit" is a base project that you can build on to handle security scanning in your ML pipeline. 
+- **Usage**: `modelaudit scan /path/to/model` is the main CLI entry. 
+- **Dependencies**: The optional extras `[tensorflow,h5,pytorch]` let you scan specific frameworks.
+
+The main idea is to keep scanning logic easy to modify or expand, ensuring that all major ML formats used by your organization can be checked for malicious content before use in production.
