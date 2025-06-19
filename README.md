@@ -50,7 +50,7 @@ ModelAudit scans ML model files for:
 - **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
-- **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
+- **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
 
 ## 🚀 Quick Start
@@ -86,10 +86,10 @@ pip install modelaudit[yaml]
 # For SafeTensors model scanning
 pip install modelaudit[safetensors]
 
-# For enhanced pickle support (dill serialization)
+# For enhanced pickle support (dill serialization with security validation)
 pip install modelaudit[dill]
 
-# For Joblib model scanning
+# For Joblib model scanning (includes scikit-learn integration)
 pip install modelaudit[joblib]
 
 # Install all optional dependencies
@@ -105,8 +105,8 @@ modelaudit scan model.pkl
 # Scan an ONNX model
 modelaudit scan model.onnx
 
-# Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.npy
+# Scan multiple models (including enhanced dill/joblib support)
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy
 
 # Scan a directory
 modelaudit scan ./models/
@@ -164,6 +164,7 @@ Issues found: 2 critical, 1 warnings
 
 - **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
 - **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
+- **Enhanced Dill/Joblib Analysis**: ML-aware scanning with format validation and bypass prevention
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
@@ -174,7 +175,7 @@ ModelAudit provides specialized security scanners for different model formats:
 
 | Format             | File Extensions                                                                                          | What We Check                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| **Pickle**         | `.pkl`, `.pickle`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                        | Malicious code execution, dangerous opcodes, suspicious imports |
+| **Pickle**         | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                | Malicious code execution, dangerous opcodes, suspicious imports |
 | **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
 | **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
 | **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
@@ -182,7 +183,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
 | **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
 | **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
-| **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
+| **Joblib**         | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering |
 | **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
 | **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
 | **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |

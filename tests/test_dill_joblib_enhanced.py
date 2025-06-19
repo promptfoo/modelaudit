@@ -330,13 +330,25 @@ class TestIntegration:
 
             result = scanner.scan(str(transparent_file))
 
-            # For this test, let's check if we get proper error handling
-            # The behavior might be CRITICAL errors rather than INFO depending on validation
+            # Should handle benign error with proper transparency
             assert len(result.issues) > 0
 
-            # Check if the error was handled properly
-            error_messages = [str(issue.message) for issue in result.issues]
-            assert any("Error analyzing pickle ops" in msg for msg in error_messages)
+            # Check that we get an INFO-level transparency issue for benign errors
+            info_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
+            assert len(info_issues) > 0
+
+            # Should contain truncation message for legitimate files
+            error_messages = [str(issue.message) for issue in info_issues]
+            assert any(
+                "truncated due to format complexity" in msg for msg in error_messages
+            )
+
+            # Should have proper metadata
+            assert result.metadata.get("truncated") is True
+            assert (
+                result.metadata.get("truncation_reason")
+                == "post_stop_data_or_format_issue"
+            )
 
     def test_backward_compatibility(self, tmp_path):
         """Test that regular pickle scanning still works unchanged."""

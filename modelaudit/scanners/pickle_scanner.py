@@ -117,7 +117,16 @@ ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     "sklearn": ["*"],
     "transformers": ["*"],
     "tokenizers": ["*"],
-    "joblib": ["dump", "load", "Parallel", "delayed", "Memory", "hash"],
+    "joblib": [
+        "dump",
+        "load",
+        "Parallel",
+        "delayed",
+        "Memory",
+        "hash",
+        "_pickle_dump",
+        "_pickle_load",
+    ],
     "dill": ["dump", "dumps", "load", "loads", "copy"],
     "tensorflow": ["*"],
     "keras": ["*"],
@@ -346,23 +355,47 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 return False
 
             # Check for standard pickle protocols (0-5)
-            if header[0:1] in (b"\x80", b"(", b"]", b"}"):  # Common pickle starts
-                # For joblib files, look for joblib-specific patterns
-                if path.lower().endswith(".joblib"):
-                    f.seek(0)
-                    # Try to find joblib-specific markers in first 1KB
-                    sample = f.read(1024)
-                    return any(
-                        marker in sample
-                        for marker in [b"joblib", b"sklearn", b"numpy", b"_joblib"]
-                    )
+            # Protocol 0: starts with '(' or other opcodes
+            # Protocol 1: starts with ']' or other opcodes
+            # Protocol 2+: starts with '\x80' followed by protocol number
+            first_byte = header[0:1]
+            if first_byte == b"\x80":
+                # Protocols 2-5 start with \x80 followed by protocol number
+                if len(header) < 2 or header[1] not in (2, 3, 4, 5):
+                    return False
+            elif first_byte not in (b"(", b"]", b"}", b"c", b"l", b"d", b"t", b"p"):
+                # Common pickle opcode starts for protocols 0-1
+                return False
 
-                # For dill files, they're usually just enhanced pickle
-                elif path.lower().endswith(".dill"):
-                    return True
+            # For joblib files, look for joblib-specific patterns
+            if path.lower().endswith(".joblib"):
+                f.seek(0)
+                # Try to find joblib-specific markers in first 2KB
+                sample = f.read(2048)
+                # Look for joblib-specific indicators
+                joblib_indicators = [
+                    b"joblib",
+                    b"sklearn",
+                    b"numpy",
+                    b"_joblib",
+                    b"__main__",
+                    b"_pickle",
+                    b"NumpyArrayWrapper",
+                ]
+                return any(marker in sample for marker in joblib_indicators)
+
+            # For dill files, they're usually just enhanced pickle
+            elif path.lower().endswith(".dill"):
+                # Dill files should contain standard pickle format
+                # Additional validation could check for dill-specific patterns
+                return True
 
         return False
+    except (OSError, IOError):
+        # File doesn't exist or can't be read
+        return False
     except Exception:
+        # Other errors (e.g., permissions) - be conservative
         return False
 
 
@@ -953,6 +986,17 @@ class PickleScanner(BaseScanner):
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
 
+            # Pre-validate file legitimacy to avoid nested exceptions
+            is_legitimate_file = False
+            if file_ext in {".joblib", ".dill"}:
+                try:
+                    is_legitimate_file = _is_legitimate_serialization_file(
+                        self.current_file_path
+                    )
+                except Exception:
+                    # If validation itself fails, treat as non-legitimate
+                    is_legitimate_file = False
+
             # Check if this is a known benign error in legitimate serialization files
             is_benign_error = (
                 isinstance(e, (ValueError, struct.error))
@@ -966,7 +1010,7 @@ class PickleScanner(BaseScanner):
                     ]
                 )
                 and file_ext in {".joblib", ".dill"}
-                and _is_legitimate_serialization_file(self.current_file_path)
+                and is_legitimate_file
             )
 
             if is_benign_error:
