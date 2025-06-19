@@ -18,7 +18,8 @@
       "!**/.cursor/**",
       "!**/node_modules/**",
       "!**/poetry.lock",
-      "!**/.coverage"
+      "!**/.coverage",
+      "!**/htmlcov/**"
     ]
   },
   "formatter": {
