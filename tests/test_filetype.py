@@ -1,6 +1,11 @@
 import zipfile
 
-from modelaudit.utils.filetype import detect_file_format, find_sharded_files, is_zipfile
+from modelaudit.utils.filetype import (
+    detect_file_format,
+    detect_format_from_extension,
+    find_sharded_files,
+    is_zipfile,
+)
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -84,6 +89,15 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile("nonexistent_file.zip") is False
 
 
+def test_zip_magic_variants(tmp_path):
+    """Ensure alternate PK signatures are detected as ZIP."""
+    for sig in (b"PK\x06\x06", b"PK\x06\x07"):
+        path = tmp_path / f"file_{sig.hex()}.zip"
+        path.write_bytes(sig + b"extra")
+        assert is_zipfile(str(path)) is True
+        assert detect_file_format(str(path)) == "zip"
+
+
 def test_find_sharded_files(tmp_path):
     """Test finding sharded model files."""
     # Create directory with sharded files
@@ -107,3 +121,36 @@ def test_find_sharded_files(tmp_path):
     assert shards[0].endswith("pytorch_model-00001-of-00005.bin")
     assert shards[1].endswith("pytorch_model-00002-of-00005.bin")
     assert shards[2].endswith("pytorch_model-00003-of-00005.bin")
+
+
+def test_detect_format_from_extension(tmp_path):
+    """Test extension-only format detection."""
+    file_path = tmp_path / "model.pt"
+    file_path.write_bytes(b"abc")
+    assert detect_format_from_extension(str(file_path)) == "pickle"
+
+    dir_path = tmp_path / "saved_model"
+    dir_path.mkdir()
+    (dir_path / "saved_model.pb").write_bytes(b"d")
+    assert detect_format_from_extension(str(dir_path)) == "tensorflow_directory"
+
+
+def test_detect_gguf_ggml_formats(tmp_path):
+    """Test detection of GGUF and GGML formats by magic bytes."""
+    # Test GGUF format
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF" + b"\x00" * 20)
+    assert detect_file_format(str(gguf_path)) == "gguf"
+    assert detect_format_from_extension(str(gguf_path)) == "gguf"
+
+    # Test GGML format
+    ggml_path = tmp_path / "model.ggml"
+    ggml_path.write_bytes(b"GGML" + b"\x00" * 20)
+    assert detect_file_format(str(ggml_path)) == "ggml"
+    assert detect_format_from_extension(str(ggml_path)) == "ggml"
+
+    # Test GGUF extension with wrong magic (should fall back to extension)
+    fake_gguf_path = tmp_path / "fake.gguf"
+    fake_gguf_path.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert detect_file_format(str(fake_gguf_path)) == "gguf"  # Falls back to extension
+    assert detect_format_from_extension(str(fake_gguf_path)) == "gguf"

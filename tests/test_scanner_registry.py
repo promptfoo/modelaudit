@@ -13,6 +13,7 @@ def test_scanner_registry_contains_all_scanners():
     assert "PyTorchZipScanner" in scanner_classes
     assert "OnnxScanner" in scanner_classes
     assert "SafeTensorsScanner" in scanner_classes
+    assert "PmmlScanner" in scanner_classes
 
 
 def test_scanner_registry_instances():

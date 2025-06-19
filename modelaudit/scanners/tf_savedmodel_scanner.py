@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
@@ -21,27 +23,6 @@ except ImportError:
         meta_graphs: list = []
 
     SavedModelType = SavedModel
-
-# List of suspicious TensorFlow operations that could be security risks
-SUSPICIOUS_OPS = {
-    # File I/O operations
-    "ReadFile",
-    "WriteFile",
-    "MergeV2Checkpoints",
-    "Save",
-    "SaveV2",
-    # Python execution
-    "PyFunc",
-    "PyCall",
-    # System operations
-    "ShellExecute",
-    "ExecuteOp",
-    "SystemConfig",
-    # Other potentially risky operations
-    "DecodeRaw",
-    "DecodeJpeg",
-    "DecodePng",
-}
 
 
 class TensorFlowSavedModelScanner(BaseScanner):

@@ -10,7 +10,7 @@ def is_zipfile(path: str) -> bool:
     try:
         with file_path.open("rb") as f:
             signature = f.read(4)
-        return signature in [b"PK\x03\x04", b"PK\x05\x06"]
+        return signature.startswith(b"PK")
     except OSError:
         return False
 
@@ -28,6 +28,7 @@ def detect_file_format(path: str) -> str:
     - PyTorch ZIP (.pt/.pth file that's a ZIP)
     - Pickle (.pkl/.pickle or other files with pickle magic)
     - PyTorch binary (.bin files with various formats)
+    - GGUF/GGML files with magic bytes
     - If extension indicates pickle/pt/h5/pb, etc.
     """
     file_path = Path(path)
@@ -54,11 +55,16 @@ def detect_file_format(path: str) -> str:
     if magic8 == hdf5_magic:
         return "hdf5"
 
+    # Check for GGUF/GGML magic bytes
+    if magic4 == b"GGUF":
+        return "gguf"
+    if magic4 == b"GGML":
+        return "ggml"
+
     ext = file_path.suffix.lower()
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    # Common ZIP signatures: PK\x03\x04 (local file header) or PK\x05\x06 (end of central directory)
-    if magic4[:2] == b"PK" and magic4[2:4] in [b"\x03\x04", b"\x05\x06", b"\x01\x02"]:
+    if magic4.startswith(b"PK"):
         return "zip"
 
     # Check pickle magic patterns
@@ -91,7 +97,7 @@ def detect_file_format(path: str) -> str:
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
     if ext in (".pt", ".pth", ".ckpt"):
         # These files can be either ZIP or pickle format
-        if magic4[:2] == b"PK":
+        if magic4.startswith(b"PK"):
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
@@ -105,19 +111,27 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext in (".gguf", ".ggml"):
+        # Check magic bytes first for accuracy
+        if magic4 == b"GGUF":
+            return "gguf"
+        elif magic4 == b"GGML":
+            return "ggml"
+        # Fall back to extension-based detection
+        return "gguf" if ext == ".gguf" else "ggml"
     if ext == ".npy":
         return "numpy"
     if ext == ".npz":
         return "zip"
     if ext == ".joblib":
-        if magic4[:2] == b"PK":
+        if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
 
     return "unknown"
 
 
-def find_sharded_files(directory: str) -> list:
+def find_sharded_files(directory: str) -> list[str]:
     """
     Look for sharded model files like:
     pytorch_model-00001-of-00002.bin
@@ -131,3 +145,36 @@ def find_sharded_files(directory: str) -> list:
             and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
         ]
     )
+
+
+EXTENSION_FORMAT_MAP = {
+    ".pt": "pickle",
+    ".pth": "pickle",
+    ".ckpt": "pickle",
+    ".pkl": "pickle",
+    ".pickle": "pickle",
+    ".dill": "pickle",
+    ".h5": "hdf5",
+    ".hdf5": "hdf5",
+    ".keras": "hdf5",
+    ".pb": "protobuf",
+    ".safetensors": "safetensors",
+    ".onnx": "onnx",
+    ".bin": "pytorch_binary",
+    ".zip": "zip",
+    ".gguf": "gguf",
+    ".ggml": "ggml",
+    ".npy": "numpy",
+    ".npz": "zip",
+    ".joblib": "pickle",  # joblib can be either zip or pickle format
+}
+
+
+def detect_format_from_extension(path: str) -> str:
+    """Return a format string based solely on the file extension."""
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+    return EXTENSION_FORMAT_MAP.get(file_path.suffix.lower(), "unknown")

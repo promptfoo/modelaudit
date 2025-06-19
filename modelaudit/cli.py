@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -253,7 +254,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     sys.exit(exit_code)
 
 
-def format_text_output(results, verbose=False):
+def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
