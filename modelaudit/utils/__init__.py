@@ -2,6 +2,19 @@ import os
 from pathlib import Path
 
 
+def is_within_directory(base_dir: str, target: str) -> bool:
+    """Return True if the target path is within the given base directory."""
+    base_path = Path(base_dir).resolve()
+    target_path = Path(target).resolve()
+    try:
+        return target_path.is_relative_to(base_path)
+    except AttributeError:  # Python < 3.9
+        try:
+            return os.path.commonpath([target_path, base_path]) == str(base_path)
+        except ValueError:
+            return False
+
+
 def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
     """Return normalized path for archive entry and whether it stays within base.
 
