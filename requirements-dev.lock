@@ -28,6 +28,8 @@ defusedxml==0.7.1
     # via modelaudit
 dill==0.4.0
     # via modelaudit
+execnet==2.1.1
+    # via pytest-xdist
 filelock==3.18.0
     # via torch
 flatbuffers==25.2.10
@@ -119,7 +121,9 @@ pygments==2.19.1
     # via rich
 pytest==8.4.1
     # via pytest-cov
+    # via pytest-xdist
 pytest-cov==6.2.1
+pytest-xdist==3.7.0
 pyyaml==6.0.2
     # via modelaudit
 requests==2.32.4
