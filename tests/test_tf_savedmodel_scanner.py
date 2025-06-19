@@ -207,3 +207,20 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
         or "tensorflow not installed" in issue.message.lower()
         for issue in result.issues
     )
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+def test_tf_savedmodel_scanner_unreadable_file(tmp_path):
+    """Scanner should report unreadable files instead of silently skipping."""
+    model_dir = create_tf_savedmodel(tmp_path)
+
+    missing = model_dir / "missing.txt"
+    missing.write_text("secret")
+    # Replace file with dangling symlink to trigger read error
+    missing.unlink()
+    missing.symlink_to("/nonexistent/path")
+
+    scanner = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["secret"]})
+    result = scanner.scan(str(model_dir))
+
+    assert any("error reading file" in issue.message.lower() for issue in result.issues)

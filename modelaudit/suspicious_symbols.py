@@ -71,7 +71,14 @@ SUSPICIOUS_GLOBALS = {
     "subprocess": "*",  # Process spawning and control
     "runpy": "*",  # Dynamic module execution
     # Code execution functions - CRITICAL RISK
-    "builtins": ["eval", "exec", "__import__"],  # Dynamic code evaluation
+    "builtins": [
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "__import__",
+    ],  # Dynamic code evaluation and file access
     "operator": ["attrgetter"],  # Attribute access bypass
     "importlib": ["import_module"],  # Dynamic module loading
     # Serialization/deserialization - MEDIUM RISK

@@ -1,5 +1,6 @@
 from . import (
     base,
+    flax_msgpack_scanner,
     gguf_scanner,
     joblib_scanner,
     keras_h5_scanner,
@@ -8,16 +9,19 @@ from . import (
     oci_layer_scanner,
     onnx_scanner,
     pickle_scanner,
+    pmml_scanner,
     pytorch_binary_scanner,
     pytorch_zip_scanner,
     safetensors_scanner,
     tf_savedmodel_scanner,
+    tflite_scanner,
     weight_distribution_scanner,
     zip_scanner,
 )
 
 # Import scanner classes for direct use
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .flax_msgpack_scanner import FlaxMsgpackScanner
 from .gguf_scanner import GgufScanner
 from .joblib_scanner import JoblibScanner
 from .keras_h5_scanner import KerasH5Scanner
@@ -26,10 +30,12 @@ from .numpy_scanner import NumPyScanner
 from .oci_layer_scanner import OciLayerScanner
 from .onnx_scanner import OnnxScanner
 from .pickle_scanner import PickleScanner
+from .pmml_scanner import PmmlScanner
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 from .pytorch_zip_scanner import PyTorchZipScanner
 from .safetensors_scanner import SafeTensorsScanner
 from .tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from .tflite_scanner import TFLiteScanner
 from .weight_distribution_scanner import WeightDistributionScanner
 from .zip_scanner import ZipScanner
 
@@ -47,8 +53,11 @@ SCANNER_REGISTRY = [
     NumPyScanner,
     OciLayerScanner,
     ManifestScanner,
+    PmmlScanner,
     WeightDistributionScanner,
     SafeTensorsScanner,
+    FlaxMsgpackScanner,
+    TFLiteScanner,
     ZipScanner,  # Generic zip scanner should be last
     # Add new scanners here as they are implemented
 ]
@@ -61,6 +70,7 @@ __all__ = [
     "JoblibScanner",
     "KerasH5Scanner",
     "ManifestScanner",
+    "PmmlScanner",
     "NumPyScanner",
     "OciLayerScanner",
     "OnnxScanner",
@@ -69,6 +79,8 @@ __all__ = [
     "PyTorchZipScanner",
     "SCANNER_REGISTRY",
     "SafeTensorsScanner",
+    "FlaxMsgpackScanner",
+    "TFLiteScanner",
     "ScanResult",
     "TensorFlowSavedModelScanner",
     "WeightDistributionScanner",
@@ -85,6 +97,9 @@ __all__ = [
     "pytorch_binary_scanner",
     "pytorch_zip_scanner",
     "safetensors_scanner",
+    "flax_msgpack_scanner",
+    "tflite_scanner",
+    "pmml_scanner",
     "tf_savedmodel_scanner",
     "weight_distribution_scanner",
     "zip_scanner",
