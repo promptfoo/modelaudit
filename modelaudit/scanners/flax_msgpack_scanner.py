@@ -256,37 +256,38 @@ class FlaxMsgpackScanner(BaseScanner):
 
         try:
             self.current_file_path = path
+
+            # Read entire file to check for trailing data
             with open(path, "rb") as f:
-                # Use strict unpacking to prevent some attacks
-                unpacker = msgpack.Unpacker(
-                    f,
-                    raw=False,
-                    strict_map_key=False,
-                    max_buffer_size=1024 * 1024 * 100,
-                )  # 100MB buffer limit
+                file_data = f.read()
 
-                try:
-                    obj = unpacker.unpack()
-                except msgpack.exceptions.ExtraData:
-                    result.add_issue(
-                        "Multiple msgpack objects found in file - potential tampering",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                    )
-                    # Continue with first object
-                    f.seek(0)
-                    unpacker = msgpack.Unpacker(f, raw=False, strict_map_key=False)
-                    obj = unpacker.unpack()
-
-                # Check for trailing data
-                remaining_bytes = len(f.read())
-                if remaining_bytes > 0:
-                    result.add_issue(
-                        f"Extra trailing bytes after msgpack data: {remaining_bytes} bytes",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"trailing_bytes": remaining_bytes},
-                    )
+            # Try to unpack and detect trailing data
+            try:
+                obj = msgpack.unpackb(file_data, raw=False, strict_map_key=False)
+                # If we get here, the entire file was valid msgpack - no trailing data
+            except msgpack.exceptions.ExtraData:
+                # This means there's extra data after valid msgpack
+                result.add_issue(
+                    "Extra trailing data found after msgpack content",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                )
+                # Unpack just the first object
+                unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
+                unpacker.feed(file_data)
+                obj = unpacker.unpack()
+            except (
+                msgpack.exceptions.UnpackException,
+                msgpack.exceptions.OutOfData,
+            ) as e:
+                result.add_issue(
+                    f"Invalid msgpack format: {str(e)}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={"msgpack_error": str(e)},
+                )
+                result.finish(success=False)
+                return result
 
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__
@@ -303,16 +304,6 @@ class FlaxMsgpackScanner(BaseScanner):
             self._analyze_content(obj, "root", result)
 
             result.bytes_scanned = file_size
-
-        except msgpack.exceptions.ValueError as e:
-            result.add_issue(
-                f"Invalid msgpack format: {str(e)}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"msgpack_error": str(e)},
-            )
-            result.finish(success=False)
-            return result
         except MemoryError:
             result.add_issue(
                 "File too large to process safely - potential memory exhaustion attack",
