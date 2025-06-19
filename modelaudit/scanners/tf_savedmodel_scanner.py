@@ -186,9 +186,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
-                    except Exception:
-                        # Skip files we can't read
-                        pass
+                    except Exception as e:
+                        result.add_issue(
+                            f"Error reading file {file}: {str(e)}",
+                            severity=IssueSeverity.DEBUG,
+                            location=str(file_path),
+                            details={
+                                "file": file,
+                                "exception": str(e),
+                                "exception_type": type(e).__name__,
+                            },
+                        )
 
         result.finish(success=True)
         return result
