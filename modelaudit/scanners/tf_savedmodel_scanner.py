@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
@@ -21,27 +23,6 @@ except ImportError:
         meta_graphs: list = []
 
     SavedModelType = SavedModel
-
-# List of suspicious TensorFlow operations that could be security risks
-SUSPICIOUS_OPS = {
-    # File I/O operations
-    "ReadFile",
-    "WriteFile",
-    "MergeV2Checkpoints",
-    "Save",
-    "SaveV2",
-    # Python execution
-    "PyFunc",
-    "PyCall",
-    # System operations
-    "ShellExecute",
-    "ExecuteOp",
-    "SystemConfig",
-    # Other potentially risky operations
-    "DecodeRaw",
-    "DecodeJpeg",
-    "DecodePng",
-}
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -205,9 +186,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
-                    except Exception:
-                        # Skip files we can't read
-                        pass
+                    except Exception as e:
+                        result.add_issue(
+                            f"Error reading file {file}: {str(e)}",
+                            severity=IssueSeverity.DEBUG,
+                            location=str(file_path),
+                            details={
+                                "file": file,
+                                "exception": str(e),
+                                "exception_type": type(e).__name__,
+                            },
+                        )
 
         result.finish(success=True)
         return result

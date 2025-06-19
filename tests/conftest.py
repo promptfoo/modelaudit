@@ -1,6 +1,9 @@
 import logging
 import pickle
+import shutil
+import tempfile
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -106,3 +109,74 @@ def mock_progress_callback():
     progress_callback.percentages = progress_percentages
 
     return progress_callback
+
+
+@pytest.fixture
+def temp_dir():
+    """Create a temporary directory for tests."""
+    temp_path = tempfile.mkdtemp()
+    yield Path(temp_path)
+    shutil.rmtree(temp_path, ignore_errors=True)
+
+
+@pytest.fixture
+def mock_malicious_pickle_data():
+    """Provide mock malicious pickle data for testing."""
+    return {
+        "os_system": b"cos\nsystem\nq\x00.",
+        "eval_call": b"cbuiltins\neval\nq\x00.",
+        "subprocess_call": b"csubprocess\ncall\nq\x00.",
+    }
+
+
+@pytest.fixture
+def performance_markers():
+    """Markers for performance-related tests."""
+    return {
+        "max_scan_time": 1.0,  # Maximum scan time in seconds
+        "max_validation_time": 0.001,  # Maximum validation time in seconds
+    }
+
+
+# Configure pytest to handle missing optional dependencies gracefully
+def pytest_configure(config):
+    """Configure pytest with custom markers."""
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow (deselect with '-m \"not slow\"')"
+    )
+    config.addinivalue_line("markers", "integration: mark test as integration test")
+    config.addinivalue_line(
+        "markers", "performance: mark test as performance benchmark"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests based on their names."""
+    for item in items:
+        # Mark performance tests
+        if "performance" in item.name.lower() or "benchmark" in item.name.lower():
+            item.add_marker(pytest.mark.performance)
+
+        # Mark integration tests
+        if "integration" in item.name.lower() or "real_world" in item.name.lower():
+            item.add_marker(pytest.mark.integration)
+
+        # Mark slow tests
+        if "large" in item.name.lower() or "multiple" in item.name.lower():
+            item.add_marker(pytest.mark.slow)
+
+
+@pytest.fixture(autouse=True)
+def cleanup_test_files():
+    """Ensure test files are cleaned up after each test."""
+    yield
+    # Cleanup any test files that might have been left behind
+    for pattern in ["*.test_*", "test_*", "*.tmp"]:
+        for file in Path.cwd().glob(pattern):
+            try:
+                if file.is_file():
+                    file.unlink()
+                elif file.is_dir():
+                    shutil.rmtree(file)
+            except (OSError, PermissionError):
+                pass  # Ignore cleanup errors

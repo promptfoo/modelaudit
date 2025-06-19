@@ -1,22 +1,30 @@
-FROM python:3.13-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Poetry
-RUN pip install poetry==1.5.1
+# Copy requirements lock file and install dependencies
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
-# Copy Poetry configuration files
-COPY pyproject.toml poetry.lock* ./
-
-# Configure Poetry to not create a virtual environment inside the container
-RUN poetry config virtualenvs.create false
-
-# Install dependencies with TensorFlow extras
-RUN poetry install --no-dev --no-interaction --extras "tensorflow"
-
-# Copy project code
+# Copy source code
 COPY . .
 
-# Set entrypoint
+# Install the application with TensorFlow extras using pip
+RUN pip install --no-cache-dir .[tensorflow]
+
+# Create a non-root user
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
+
+USER appuser
+
+# Set the entrypoint
 ENTRYPOINT ["modelaudit"]
 CMD ["--help"] 

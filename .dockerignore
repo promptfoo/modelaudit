@@ -1,53 +1,42 @@
-# Large directories that shouldn't be in the Docker image
-scratch/
-models/
+# Rye
+.venv/
+.python-version
+.rye/
 
 # Development files
-.git/
-.github/
-.venv/
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-.cursor/
+*.egg-info/
+build/
+dist/
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
 
-# Test files and outputs
-tests/
-test_*.py
-*_test.py
-*.log
-*.pkl
-analysis.json
-# Specific JSON files to exclude (avoid broad *.json exclusion)
-enhanced_yolo_results.json
-yolo_warnings.json
-test_results.json
-*_test.json
-*_results.json
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE files
+# IDE
 .vscode/
 .idea/
 
-# Documentation
-*.md
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation  
+docs/
+# Keep README.md as it's referenced in pyproject.toml
 !README.md
 
-# Config files not needed in container
-setup-poetry.sh
-setup.cfg
-docker-compose.yml 
+# Testing
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Scratch/development
+scratch/
+llm_context.txt
+
+# CI/CD
+.github/

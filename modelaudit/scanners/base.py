@@ -28,22 +28,27 @@ class Issue:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ):
         self.message = message
         self.severity = severity
         self.location = location  # File position, line number, etc.
         self.details = details or {}
+        self.why = why  # Explanation of why this is a security concern
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization"""
-        return {
+        result = {
             "message": self.message,
             "severity": self.severity.value,
             "location": self.location,
             "details": self.details,
             "timestamp": self.timestamp,
         }
+        if self.why:
+            result["why"] = self.why
+        return result
 
     def __str__(self) -> str:
         """String representation of the issue"""
@@ -71,9 +76,10 @@ class ScanResult:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result"""
-        issue = Issue(message, severity, location, details)
+        issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
         log_level = (
             logging.CRITICAL
@@ -240,5 +246,10 @@ class BaseScanner(ABC):
         return None  # Path is valid
 
     def get_file_size(self, path: str) -> int:
-        """Get the size of a file in bytes"""
-        return os.path.getsize(path) if os.path.isfile(path) else 0
+        """Get the size of a file in bytes."""
+        try:
+            return os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            # If the file becomes inaccessible during scanning, treat the size
+            # as zero rather than raising an exception.
+            return 0

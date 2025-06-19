@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -61,7 +62,15 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+@click.option(
+    "--max-total-size",
+    type=int,
+    default=0,
+    help="Maximum total bytes to scan before stopping [default: unlimited]",
+)
+def scan_command(
+    paths, blacklist, format, output, timeout, verbose, max_file_size, max_total_size
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -79,6 +88,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
+        --max-total-size   Maximum total bytes to scan before stopping
 
     \b
     Exit codes:
@@ -167,6 +177,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 blacklist_patterns=list(blacklist) if blacklist else None,
                 timeout=timeout,
                 max_file_size=max_file_size,
+                max_total_size=max_total_size,
                 progress_callback=progress_callback,
             )
 
@@ -253,7 +264,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     sys.exit(exit_code)
 
 
-def format_text_output(results, verbose=False):
+def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
@@ -388,6 +399,14 @@ def format_text_output(results, verbose=False):
                 )
             else:
                 output_lines.append(f"{issue_num} {severity_style} {message}")
+
+            # Add "Why" explanation if available
+            why = issue.get("why")
+            if why:
+                # Indent the explanation and style it
+                why_label = click.style("   Why:", fg="magenta", bold=True)
+                why_text = click.style(f" {why}", fg="bright_white")
+                output_lines.append(f"{why_label}{why_text}")
 
             # Add a small separator between issues for readability
             if i < len(visible_issues):

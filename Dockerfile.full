@@ -1,45 +1,30 @@
-# Multi-stage build for smaller, faster Docker image
-FROM python:3.13-slim as builder
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies needed for building
-RUN apt-get update && apt-get install -y \
-    build-essential gfortran pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# Copy requirements lock file and install all dependencies
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
-# Install Poetry
-RUN pip install --no-cache-dir poetry==1.5.1
-
-# Copy Poetry configuration files first (for better layer caching)
-COPY pyproject.toml poetry.lock* ./
-
-# Configure Poetry
-RUN poetry config virtualenvs.create false
-
-# Export dependencies to requirements.txt for layer caching
-RUN poetry export --only main --extras "all" --format requirements.txt --output requirements.txt --without-hashes
-
-# Install dependencies using pip (better layer caching, no Poetry conflicts)
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy project code after dependencies are installed
+# Copy source code
 COPY . .
 
-# Install the package itself using pip
-RUN pip install --no-cache-dir .
+# Install the application with all extras using pip
+RUN pip install --no-cache-dir .[all]
 
-# Production stage
-FROM python:3.13-slim
+# Create a non-root user
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
 
-WORKDIR /app
+USER appuser
 
-# Copy installed packages and binaries from builder
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Note: No need to copy source code since package is already installed in site-packages
-
-# Set entrypoint
+# Set the entrypoint
 ENTRYPOINT ["modelaudit"]
 CMD ["--help"] 
