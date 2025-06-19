@@ -156,3 +156,23 @@ def test_pytorch_pickle_file_unsupported(tmp_path):
         "zip" in issue.message.lower() or "pytorch" in issue.message.lower()
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
+    """Ensure BytesIO objects are properly closed after scanning."""
+    import io
+
+    closed = {}
+
+    class TrackedBytesIO(io.BytesIO):
+        def close(self) -> None:  # type: ignore[override]
+            closed["closed"] = True
+            super().close()
+
+    monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
+
+    model_path = create_pytorch_zip(tmp_path)
+    scanner = PyTorchZipScanner()
+    scanner.scan(str(model_path))
+
+    assert closed.get("closed") is True

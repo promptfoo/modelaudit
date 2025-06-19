@@ -109,6 +109,28 @@ def test_max_file_size(tmp_path):
     assert len(large_file_issues) == 0
 
 
+def test_max_total_size(tmp_path):
+    """Test max_total_size parameter."""
+    import pickle
+
+    file1 = tmp_path / "a.pkl"
+    with file1.open("wb") as f:
+        pickle.dump({"data": "x" * 100}, f)
+
+    file2 = tmp_path / "b.pkl"
+    with file2.open("wb") as f:
+        pickle.dump({"data": "y" * 100}, f)
+
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+
+    assert results["success"] is True
+
+    limit_issues = [
+        i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]
+    ]
+    assert len(limit_issues) == 1
+
+
 def test_timeout(tmp_path, monkeypatch):
     """Test timeout parameter."""
     # Create a test file

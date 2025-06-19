@@ -29,6 +29,7 @@ dependencies = [
     "yaspin>=2.3.0",
     "numpy>=1.19.0",
     "scipy>=1.5.0",
+    "defusedxml>=0.7.1",
 ]
 
 [tool.poetry.group.dev.dependencies]
@@ -37,20 +38,21 @@ coverage = "^7.2.7"
 mypy = "^1.4.1"
 ruff = ">=0.10.0"
 types-PyYAML = "^6.0.12.20250516"
-types-tensorflow = "^2.18.0.20250516"
 pytest-cov = "^6.2.1"
 dill = "^0.4.0"
 
 [project.optional-dependencies]
-tensorflow = ["tensorflow>=2.6"]
+tensorflow = ["tensorflow>=2.13.0"]
 h5 = ["h5py>=3.1"]
 pytorch = ["torch>=1.6"]
 yaml = ["pyyaml>=6.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0"]
-joblib = ["joblib>=1.0.0"]
+dill = ["dill>=0.3.0"]
+joblib = ["joblib>=1.0.0", "scikit-learn>=1.0.0"]
 flax = ["msgpack>=1.0.0"]
-all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx", "joblib", "flax"]
+tflite = ["tflite>=2.18.0"]
+all = ["tensorflow>=2.13.0", "h5py>=3.1", "torch>=1.6", "pyyaml>=6.0", "safetensors>=0.4.0", "onnx>=1.12.0", "dill>=0.3.0", "joblib>=1.0.0", "scikit-learn>=1.0.0", "msgpack>=1.0.0", "tflite>=2.18.0"]
 
 [project.scripts]
 modelaudit = "modelaudit.cli:main"
