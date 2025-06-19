@@ -11,40 +11,59 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 - [Testing](#testing)
 - [Code Style](#code-style)
 - [Pull Request Guidelines](#pull-request-guidelines)
+- [Project Structure](#project-structure)
 
-## Development Setup
+## 🛠️ Development Setup
 
 ### Prerequisites
 
 - Python 3.9 or higher
-- [Poetry](https://python-poetry.org/) for dependency management
+- [Rye](https://rye-up.com/) (recommended) or pip
 - Git
 
-### Clone and Setup
+### Setup
 
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install Poetry if you haven't already
-curl -sSL https://install.python-poetry.org | python3 -
+# Install with Rye (recommended)
+rye sync --features all
 
-# Install dependencies with all extras
-poetry install --all-extras
-
-# Verify installation
-poetry run modelaudit --help
+# Or with pip
+pip install -e .[all]
 ```
 
-### Development Environment
+### Testing with Development Version
+
+**Install and test your local development version:**
 
 ```bash
-# Activate the virtual environment
-poetry shell
+# Option 1: Install in development mode with pip
+pip install -e .[all]
 
-# Or run commands without activating the shell
-poetry run modelaudit scan test_model.pkl
+# Then test the CLI directly
+modelaudit scan test_model.pkl
+
+# Option 2: Use Rye (recommended)
+rye sync --features all
+
+# Test with Rye run (no shell activation needed)
+rye run modelaudit scan test_model.pkl
+
+# Test with Python import
+rye run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+```
+
+**Create test models for development:**
+
+```bash
+# Create a simple test pickle file
+python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+
+# Test scanning it
+modelaudit scan test_model.pkl
 ```
 
 ## Making Changes
@@ -61,14 +80,14 @@ poetry run modelaudit scan test_model.pkl
 
    ```bash
    # Run tests
-   poetry run pytest
+   rye run pytest -n auto -m "not slow and not integration"
 
    # Run linting
-   poetry run ruff check .
-   poetry run ruff format .
+   rye run ruff check .
+   rye run ruff format .
 
    # Run type checking
-   poetry run mypy modelaudit/
+   rye run mypy modelaudit/
    ```
 
 3. **Commit your changes:**
@@ -83,17 +102,69 @@ poetry run modelaudit scan test_model.pkl
    git push origin feature/your-feature-name
    ```
 
-### Commit Message Format
+### Running Tests
 
-We use [Conventional Commits](https://www.conventionalcommits.org/) format:
+This project uses optimized parallel test execution for faster development:
 
-- `feat:` - New features
-- `fix:` - Bug fixes
-- `docs:` - Documentation changes
-- `style:` - Code style changes (formatting, etc.)
-- `refactor:` - Code refactoring
-- `test:` - Adding or updating tests
-- `chore:` - Maintenance tasks
+```bash
+# 🚀 FAST - Development testing (excludes slow tests)
+rye run pytest -n auto -m "not slow and not integration"
+
+# ⚡ QUICK FEEDBACK - Fail fast on first error
+rye run pytest -n auto -x --tb=short
+
+# 🧪 COMPLETE - Full test suite with coverage
+rye run pytest -n auto --cov=modelaudit
+
+# 🎯 SPECIFIC - Test individual files or patterns
+rye run pytest tests/test_pickle_scanner.py -n auto -v
+rye run pytest -k "test_scanner" -n auto
+
+# 📊 PERFORMANCE - Profile slow tests
+rye run pytest --durations=10 --tb=no
+```
+
+**Test Speed Optimizations:**
+- Parallel execution with `-n auto` (37% faster)
+- Smart test markers: `slow`, `integration`, `unit`, `performance`
+- Optimized pytest configuration in `pyproject.toml`
+
+### Development Quality Checks
+
+```bash
+# Run linting and formatting with Ruff
+rye run ruff check .          # Check entire codebase (including tests)
+rye run ruff check --fix .    # Automatically fix lint issues
+rye run ruff format .         # Format code
+
+# Type checking
+rye run mypy modelaudit/
+
+# Build package
+rye build
+
+# The generated distribution contains only the `modelaudit` code and metadata.
+# Unnecessary files like tests and Docker configurations are excluded via
+# `MANIFEST.in`.
+```
+
+**Code Quality Tools:**
+
+This project uses modern Python tooling for maintaining code quality:
+
+- **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
+- **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
+- **[Biome](https://biomejs.dev/)**: Fast formatter for JSON and YAML files
+
+**File Formatting with Biome:**
+
+```bash
+# Format JSON and YAML files
+npx @biomejs/biome format --write .
+
+# Check formatting (for CI)
+npx @biomejs/biome ci .
+```
 
 ## Release Process
 
@@ -112,22 +183,21 @@ ModelAudit uses an automated release process with GitHub Actions:
 
 ```bash
 # For patch releases (0.1.1 -> 0.1.2)
-poetry version patch
+rye version patch
 
-# For minor releases (0.1.1 -> 0.2.0)
-poetry version minor
+# For minor releases (0.1.1 -> 0.2.0) 
+rye version minor
 
 # For major releases (0.1.1 -> 1.0.0)
-poetry version major
+rye version major
 
-# Or set a specific version
-poetry version 0.2.0
+# Or set a specific version manually in pyproject.toml
 ```
 
 **Verify the version change:**
 
 ```bash
-poetry version --short
+rye version
 ```
 
 #### 2. Update Documentation (if needed)
@@ -142,7 +212,7 @@ Update any version references in:
 
 ```bash
 git add pyproject.toml
-git commit -m "chore: bump version to $(poetry version --short)"
+git commit -m "chore: bump version to $(rye version)"
 git push origin main
 ```
 
@@ -216,44 +286,21 @@ We follow [Semantic Versioning](https://semver.org/):
 - **MINOR** (0.1.0): New features, backwards compatible
 - **PATCH** (0.0.1): Bug fixes, backwards compatible
 
-### Poetry Version Commands
+### Rye Version Commands
 
 ```bash
 # Show current version
-poetry version
+rye version
 
 # Bump versions
-poetry version patch    # 0.1.0 -> 0.1.1
-poetry version minor    # 0.1.0 -> 0.2.0
-poetry version major    # 0.1.0 -> 1.0.0
+rye version patch    # 0.1.0 -> 0.1.1
+rye version minor    # 0.1.0 -> 0.2.0
+rye version major    # 0.1.0 -> 1.0.0
 
-# Set specific version
-poetry version 1.2.3
-
-# Pre-release versions
-poetry version prerelease  # 0.1.0 -> 0.1.1a0
-poetry version prepatch    # 0.1.0 -> 0.1.1a0
-poetry version preminor    # 0.1.0 -> 0.2.0a0
-poetry version premajor    # 0.1.0 -> 1.0.0a0
+# Pre-release versions can be set manually in pyproject.toml
 ```
 
 ## Testing
-
-### Running Tests
-
-```bash
-# Run all tests
-poetry run pytest
-
-# Run with coverage
-poetry run pytest --cov=modelaudit
-
-# Run specific test files
-poetry run pytest tests/test_pickle_scanner.py -v
-
-# Run tests for specific Python versions (requires tox)
-poetry run tox
-```
 
 ### Writing Tests
 
@@ -265,32 +312,17 @@ poetry run tox
 
 ## Code Style
 
-### Formatting and Linting
+### Commit Message Format
 
-We use [Ruff](https://docs.astral.sh/ruff/) for both linting and formatting:
+We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
-```bash
-# Check for lint issues
-poetry run ruff check .
-
-# Auto-fix lint issues
-poetry run ruff check --fix .
-
-# Format code
-poetry run ruff format .
-
-# Check formatting without changing files
-poetry run ruff format --check .
-```
-
-### Type Checking
-
-We use [MyPy](https://mypy.readthedocs.io/) for type checking:
-
-```bash
-# Run type checking
-poetry run mypy modelaudit/
-```
+- `feat:` - New features
+- `fix:` - Bug fixes
+- `docs:` - Documentation updates
+- `test:` - Adding or updating tests
+- `refactor:` - Code refactoring
+- `perf:` - Performance improvements
+- `chore:` - Maintenance tasks
 
 ### Pre-commit Setup (Optional)
 
@@ -307,20 +339,31 @@ pre-commit install
 1. **Ensure all tests pass:**
 
    ```bash
-   poetry run pytest
+   rye run pytest -n auto
    ```
 
 2. **Check code style:**
 
    ```bash
-   poetry run ruff check .
-   poetry run ruff format --check .
-   poetry run mypy modelaudit/
+   rye run ruff check .
+   rye run ruff format --check .
+   rye run mypy modelaudit/
    ```
 
 3. **Update documentation** if you've changed APIs or added features
 
 4. **Add tests** for new functionality
+
+### 🤝 Contributing Guidelines
+
+**Pull Request Guidelines:**
+
+- Create PR against `main` branch
+- Follow Conventional Commits format (`feat:`, `fix:`, `docs:`, etc.)
+- All PRs are squash-merged with a conventional commit message
+- Keep changes small and focused
+- Add tests for new functionality
+- Update documentation as needed
 
 ### PR Requirements
 
@@ -336,6 +379,80 @@ pre-commit install
 - CI/CD must pass (tests, linting, type checking)
 - PRs are squash-merged with conventional commit messages
 - Maintain a clean, linear git history
+
+## Project Structure
+
+```
+modelaudit/
+├── modelaudit/
+│   ├── scanners/          # Model format scanners
+│   │   ├── base.py                    # Base scanner class
+│   │   ├── pickle_scanner.py          # Pickle/joblib security scanner
+│   │   ├── tf_savedmodel_scanner.py   # TensorFlow SavedModel scanner
+│   │   ├── keras_h5_scanner.py        # Keras H5 model scanner
+│   │   ├── pytorch_zip_scanner.py     # PyTorch ZIP format scanner
+│   │   ├── pytorch_binary_scanner.py  # PyTorch binary format scanner
+│   │   ├── safetensors_scanner.py     # SafeTensors format scanner
+│   │   ├── weight_distribution_scanner.py # Weight analysis scanner
+│   │   ├── zip_scanner.py             # ZIP archive scanner
+│   │   └── manifest_scanner.py        # Config/manifest scanner
+│   ├── utils/             # Utility modules
+│   ├── auth/              # Authentication modules
+│   ├── name_policies/     # Name policy modules
+│   ├── cli.py            # Command-line interface
+│   └── core.py           # Core scanning logic
+├── tests/                # Test suite
+├── .github/              # GitHub Actions workflows
+└── README.md             # User documentation
+```
+
+### Adding New Scanners
+
+When adding a new scanner for a model format:
+
+1. Create a new scanner file in `modelaudit/scanners/`
+2. Implement the scanner class following existing patterns
+3. Add appropriate tests in `tests/`
+4. Update documentation
+5. Add any new dependencies to `pyproject.toml`
+
+### Code Style Guidelines
+
+- Follow PEP 8 style guidelines
+- Use type hints where appropriate
+- Write descriptive docstrings
+- Keep functions focused and small
+- Add comments for complex logic
+
+## 📋 Development Tasks
+
+### Common Development Tasks
+
+```bash
+# Run full test suite with coverage (optimized parallel execution)
+rye run pytest -n auto --cov=modelaudit --cov-report=html
+
+# Check for type errors
+rye run mypy modelaudit/
+
+# Format and lint code
+rye run ruff format .
+rye run ruff check --fix .
+
+# Quick development test cycle
+rye run pytest -n auto -m "not slow and not integration" -x
+
+# Create test models for specific formats
+python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"
+python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl', 'wb'))"
+```
+
+### Release Process (Maintainers)
+
+1. Update version in `pyproject.toml`
+2. Create release PR
+3. After merge, create GitHub release
+4. Rye will automatically publish to PyPI
 
 ## Getting Help
 
@@ -368,6 +485,31 @@ Use this checklist when preparing releases:
 - [ ] GitHub release notes are complete and accurate
 - [ ] Documentation sites updated (if applicable)
 - [ ] Community notified (social media, forums, etc.)
+
+## 🐛 Reporting Issues
+
+When reporting issues:
+
+- Use the GitHub issue templates
+- Include ModelAudit version and Python version
+- Provide minimal reproduction steps
+- Include error messages and stack traces
+- Mention the model format and size if applicable
+
+## 💡 Feature Requests
+
+For feature requests:
+
+- Check existing issues first
+- Describe the use case clearly
+- Explain why it would benefit users
+- Consider proposing an implementation approach
+
+## 📞 Getting Help
+
+- GitHub Issues: For bugs and feature requests
+- GitHub Discussions: For questions and general discussion
+- Email: For security issues or private matters
 
 ---
 

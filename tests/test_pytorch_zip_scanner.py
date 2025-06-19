@@ -62,7 +62,7 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
 
     # Check for issues - a safe model might still have some informational issues
     error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.ERROR
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
     assert len(error_issues) == 0
 
@@ -75,7 +75,7 @@ def test_pytorch_zip_scanner_malicious_model(tmp_path):
     result = scanner.scan(str(model_path))
 
     # The scanner should detect the eval function in the pickle
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any("eval" in issue.message.lower() for issue in result.issues)
 
 
@@ -89,7 +89,7 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     result = scanner.scan(str(invalid_path))
 
     # Should have an error about invalid ZIP
-    assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower()
         or "corrupt" in issue.message.lower()
@@ -156,3 +156,23 @@ def test_pytorch_pickle_file_unsupported(tmp_path):
         "zip" in issue.message.lower() or "pytorch" in issue.message.lower()
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
+    """Ensure BytesIO objects are properly closed after scanning."""
+    import io
+
+    closed = {}
+
+    class TrackedBytesIO(io.BytesIO):
+        def close(self) -> None:  # type: ignore[override]
+            closed["closed"] = True
+            super().close()
+
+    monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
+
+    model_path = create_pytorch_zip(tmp_path)
+    scanner = PyTorchZipScanner()
+    scanner.scan(str(model_path))
+
+    assert closed.get("closed") is True

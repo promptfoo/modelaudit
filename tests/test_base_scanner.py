@@ -76,7 +76,7 @@ def test_base_scanner_check_path_nonexistent():
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not exist" in result.issues[0].message.lower()
 
 
@@ -99,7 +99,7 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not readable" in result.issues[0].message.lower()
 
 
@@ -121,7 +121,7 @@ def test_base_scanner_check_path_directory(tmp_path):
         assert isinstance(result, ScanResult)
         assert result.success is False
         assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.ERROR
+        assert result.issues[0].severity == IssueSeverity.CRITICAL
         assert "directory" in result.issues[0].message.lower()
 
 
@@ -149,6 +149,23 @@ def test_base_scanner_get_file_size(tmp_path):
     size = scanner.get_file_size(str(test_file))
 
     assert size == len(content)
+
+
+def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
+    """get_file_size should handle OS errors gracefully."""
+
+    test_file = tmp_path / "test.test"
+    test_file.write_bytes(b"data")
+
+    def mock_getsize(_path):  # pragma: no cover - error simulation
+        raise OSError("bad file")
+
+    monkeypatch.setattr(os.path, "getsize", mock_getsize)
+
+    scanner = MockScanner()
+    size = scanner.get_file_size(str(test_file))
+
+    assert size == 0
 
 
 def test_scanner_implementation(tmp_path):

@@ -16,7 +16,7 @@ class IssueSeverity(Enum):
     DEBUG = "debug"  # Debug information
     INFO = "info"  # Informational, not a security concern
     WARNING = "warning"  # Potential issue, needs review
-    ERROR = "error"  # Definite security concern
+    CRITICAL = "critical"  # Definite security concern
 
 
 class Issue:
@@ -28,22 +28,27 @@ class Issue:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ):
         self.message = message
         self.severity = severity
         self.location = location  # File position, line number, etc.
         self.details = details or {}
+        self.why = why  # Explanation of why this is a security concern
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization"""
-        return {
+        result = {
             "message": self.message,
             "severity": self.severity.value,
             "location": self.location,
             "details": self.details,
             "timestamp": self.timestamp,
         }
+        if self.why:
+            result["why"] = self.why
+        return result
 
     def __str__(self) -> str:
         """String representation of the issue"""
@@ -71,22 +76,21 @@ class ScanResult:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result"""
-        issue = Issue(message, severity, location, details)
+        issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
-        logger.log(
-            (
-                logging.ERROR
-                if severity == IssueSeverity.ERROR
-                else (
-                    logging.WARNING
-                    if severity == IssueSeverity.WARNING
-                    else logging.INFO
-                )
-            ),
-            str(issue),
+        log_level = (
+            logging.CRITICAL
+            if severity == IssueSeverity.CRITICAL
+            else (
+                logging.WARNING
+                if severity == IssueSeverity.WARNING
+                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+            )
         )
+        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -117,8 +121,8 @@ class ScanResult:
 
     @property
     def has_errors(self) -> bool:
-        """Return True if there are any error-level issues"""
-        return any(issue.severity == IssueSeverity.ERROR for issue in self.issues)
+        """Return True if there are any critical-level issues"""
+        return any(issue.severity == IssueSeverity.CRITICAL for issue in self.issues)
 
     @property
     def has_warnings(self) -> bool:
@@ -145,7 +149,7 @@ class ScanResult:
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
         error_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.ERROR
+            1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL
         )
         warning_count = sum(
             1 for issue in self.issues if issue.severity == IssueSeverity.WARNING
@@ -160,7 +164,7 @@ class ScanResult:
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"Found {len(self.issues)} issues ({error_count} critical, "
             f"{warning_count} warnings, {info_count} info)",
         )
 
@@ -223,7 +227,7 @@ class BaseScanner(ABC):
         if not os.path.exists(path):
             result.add_issue(
                 f"Path does not exist: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
@@ -233,7 +237,7 @@ class BaseScanner(ABC):
         if not os.access(path, os.R_OK):
             result.add_issue(
                 f"Path is not readable: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
@@ -242,5 +246,10 @@ class BaseScanner(ABC):
         return None  # Path is valid
 
     def get_file_size(self, path: str) -> int:
-        """Get the size of a file in bytes"""
-        return os.path.getsize(path) if os.path.isfile(path) else 0
+        """Get the size of a file in bytes."""
+        try:
+            return os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            # If the file becomes inaccessible during scanning, treat the size
+            # as zero rather than raising an exception.
+            return 0

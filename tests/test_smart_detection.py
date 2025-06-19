@@ -416,8 +416,8 @@ class TestSeverityAssignment:
             execution_matches, non_ml_context
         )
 
-        assert severity_ml == IssueSeverity.ERROR
-        assert severity_non_ml == IssueSeverity.ERROR
+        assert severity_ml == IssueSeverity.CRITICAL
+        assert severity_non_ml == IssueSeverity.CRITICAL
 
     def test_credentials_high_priority(self):
         """Test that credentials get WARNING severity."""
@@ -472,7 +472,7 @@ class TestSeverityAssignment:
         mixed_matches = ["execution", "file_access"]
         severity = scanner._get_context_aware_severity(mixed_matches, ml_context)
 
-        assert severity == IssueSeverity.ERROR
+        assert severity == IssueSeverity.CRITICAL
 
 
 class TestIntegrationScenarios:
@@ -503,7 +503,7 @@ class TestIntegrationScenarios:
             result = scanner.scan(test_file)
 
             # Should have no errors or warnings
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             assert len(errors) == 0, (
@@ -540,7 +540,7 @@ class TestIntegrationScenarios:
             result = scanner.scan(test_file)
 
             # Should have no errors or warnings
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             assert len(errors) == 0
@@ -568,7 +568,7 @@ class TestIntegrationScenarios:
             result = scanner.scan(test_file)
 
             # Should detect dangerous content
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             # Should have errors for dangerous values
@@ -606,7 +606,7 @@ class TestIntegrationScenarios:
             result = scanner.scan(test_file)
 
             # Should ignore safe ML patterns but catch dangerous ones
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
 
             # Should have at least one error for dangerous value
             dangerous_errors = [
@@ -670,15 +670,15 @@ class TestEdgeCases:
             result = scanner.scan(test_file)
 
             # Should detect both ML context and dangerous content in nested structure
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(errors) >= 1
 
         finally:
             Path(test_file).unlink(missing_ok=True)
 
-    def test_unicode_and_special_characters(self):
+    def test_unicode_and_special_characters(self, tmp_path):
         """Test handling of Unicode and special characters."""
-        test_file = "test_unicode.json"
+        test_file = tmp_path / "test_unicode.json"
         unicode_config = {
             "model_name": "测试模型",
             "description": "Тестовая модель",
@@ -687,18 +687,14 @@ class TestEdgeCases:
             "emoji_field": "🤖🔥💯",
         }
 
-        try:
-            with Path(test_file).open("w", encoding="utf-8") as f:
-                json.dump(unicode_config, f, ensure_ascii=False)
+        with test_file.open("w", encoding="utf-8") as f:
+            json.dump(unicode_config, f, ensure_ascii=False)
 
-            scanner = ManifestScanner()
-            result = scanner.scan(test_file)
+        scanner = ManifestScanner()
+        result = scanner.scan(str(test_file))
 
-            # Should handle Unicode without crashing
-            assert result.success is True
-
-        finally:
-            Path(test_file).unlink(missing_ok=True)
+        # Should handle Unicode without crashing
+        assert result.success is True
 
 
 # Test fixtures and helpers
