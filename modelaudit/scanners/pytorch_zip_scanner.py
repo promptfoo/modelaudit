@@ -92,12 +92,11 @@ class PyTorchZipScanner(BaseScanner):
                     data = z.read(name)
                     bytes_scanned += len(data)
 
-                    file_like = io.BytesIO(data)
-                    # Use the pickle scanner directly
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        file_like,
-                        len(data),
-                    )
+                    with io.BytesIO(data) as file_like:
+                        sub_result = self.pickle_scanner._scan_pickle_bytes(
+                            file_like,
+                            len(data),
+                        )
 
                     # Include the pickle filename in each issue
                     for issue in sub_result.issues:
