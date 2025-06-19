@@ -149,7 +149,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Core Capabilities
 
- - **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -176,22 +176,22 @@ Issues found: 2 critical, 1 warnings
 
 ModelAudit provides specialized security scanners for different model formats:
 
-| Format             | File Extensions                                                                                          | What We Check                                                   |
-| ------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| **Pickle**         | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                | Malicious code execution, dangerous opcodes, suspicious imports |
-| **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
-| **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
-| **TensorFlow Lite** | `.tflite` | Extreme tensor shapes, custom ops, FlatBuffer integrity |
-| **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
-| **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
-| **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
-| **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
-| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
-| **Joblib**         | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering |
-| **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
-| **PMML**           | `.pmml`                                                | XML well-formedness, external entity checks, suspicious extensions |
-| **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
-| **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
+| Format              | File Extensions                                                                                          | What We Check                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Pickle**          | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                               | Malicious code execution, dangerous opcodes, suspicious imports                                           |
+| **PyTorch Zip**     | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns                                               |
+| **PyTorch Binary**  | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                                                             |
+| **TensorFlow Lite** | `.tflite`                                                                                                | Extreme tensor shapes, custom ops, FlatBuffer integrity                                                   |
+| **TensorFlow**      | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution                                                         |
+| **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                   |
+| **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                              |
+| **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                     |
+| **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                             |
+| **Joblib**          | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering |
+| **NumPy**           | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation                                                   |
+| **PMML**            | `.pmml`                                                                                                  | XML well-formedness, external entity checks, suspicious extensions                                        |
+| **ZIP Archives**    | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal                                                |
+| **Manifests**       | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns                                                |
 
 ### Weight Analysis
 
