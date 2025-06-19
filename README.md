@@ -47,9 +47,10 @@ ModelAudit scans ML model files for:
 - **Suspicious patterns** in model manifests and configuration files
 - **Models with blacklisted names** or content patterns
 - **Malicious content in ZIP archives** including nested archives and zip bombs
+- **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
-- **Joblib serialization vulnerabilities** (compression bombs, embedded pickle content)
+- **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
 
 ## 🚀 Quick Start
@@ -79,17 +80,53 @@ pip install modelaudit[pytorch]
 # For ONNX model scanning
 pip install modelaudit[onnx]
 
+# For TensorFlow Lite model scanning
+pip install modelaudit[tflite]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
 # For SafeTensors model scanning
 pip install modelaudit[safetensors]
 
-# For Joblib model scanning
+# For enhanced pickle support (dill serialization with security validation)
+pip install modelaudit[dill]
+
+# For Joblib model scanning (includes scikit-learn integration)
 pip install modelaudit[joblib]
+
+# For Flax msgpack scanning
+pip install modelaudit[flax]
 
 # Install all optional dependencies
 pip install modelaudit[all]
+```
+
+**Development installation:**
+
+```bash
+git clone https://github.com/promptfoo/modelaudit.git
+cd modelaudit
+
+# Using Rye (recommended)
+rye sync --features all
+
+# Or using pip
+pip install -e .[all]
+```
+
+**Docker installation:**
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/promptfoo/modelaudit:latest
+
+# Use specific variants
+docker pull ghcr.io/promptfoo/modelaudit:latest-full        # All ML frameworks
+docker pull ghcr.io/promptfoo/modelaudit:latest-tensorflow  # TensorFlow only
+
+# Run with Docker
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
 ```
 
 ### Basic Usage
@@ -101,8 +138,8 @@ modelaudit scan model.pkl
 # Scan an ONNX model
 modelaudit scan model.onnx
 
-# Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.npy
+# Scan multiple models (including enhanced dill/joblib support)
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-checkpoint.msgpack
 
 # Scan a directory
 modelaudit scan ./models/
@@ -142,7 +179,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.)
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
@@ -160,6 +197,7 @@ Issues found: 2 critical, 1 warnings
 
 - **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
 - **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
+- **Enhanced Dill/Joblib Analysis**: ML-aware scanning with format validation and bypass prevention
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
@@ -169,20 +207,23 @@ Issues found: 2 critical, 1 warnings
 
 ModelAudit provides specialized security scanners for different model formats:
 
-| Format             | File Extensions                                                                                          | What We Check                                                   |
-| ------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| **Pickle**         | `.pkl`, `.pickle`, `.bin`, `.pt`, `.pth`, `.ckpt`                                                        | Malicious code execution, dangerous opcodes, suspicious imports |
-| **PyTorch Zip**    | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns     |
-| **PyTorch Binary** | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                   |
-| **TensorFlow**     | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution               |
-| **Keras**          | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations         |
-| **ONNX**           | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity    |
-| **SafeTensors**    | `.safetensors`                                                                                           | Metadata integrity, tensor validation                           |
-| **GGUF/GGML**      | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks   |
-| **Joblib**         | `.joblib`                                                                                                | Compression bomb detection, embedded pickle analysis            |
-| **NumPy**          | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation         |
-| **ZIP Archives**   | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal      |
-| **Manifests**      | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns      |
+| Format              | File Extensions                                                                                          | What We Check                                                                                                      |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Pickle**          | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                               | Malicious code execution, dangerous opcodes, suspicious imports                                                    |
+| **PyTorch Zip**     | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns                                                        |
+| **PyTorch Binary**  | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                                                                      |
+| **TensorFlow Lite** | `.tflite`                                                                                                | Extreme tensor shapes, custom ops, FlatBuffer integrity                                                            |
+| **TensorFlow**      | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution                                                                  |
+| **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
+| **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
+| **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
+| **Flax**            | `.msgpack`                                                                                               | MessagePack integrity, suspicious code pattern detection, decompression bomb prevention, embedded content analysis |
+| **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
+| **Joblib**          | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering          |
+| **NumPy**           | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation                                                            |
+| **PMML**            | `.pmml`                                                                                                  | XML well-formedness, external entity checks, suspicious extensions                                                 |
+| **ZIP Archives**    | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal                                                         |
+| **Manifests**       | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns                                                         |
 
 ### Weight Analysis
 
@@ -195,6 +236,9 @@ ModelAudit can detect anomalous weight patterns that may indicate trojaned model
 ```bash
 # Set maximum file size to scan (1GB limit)
 modelaudit scan model.pkl --max-file-size 1073741824
+
+# Stop scanning after a total of 5GB has been processed
+modelaudit scan models/ --max-total-size 5368709120
 
 # Add custom blacklist patterns
 modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
@@ -312,8 +356,11 @@ modelaudit scan models/ --format json --output scan-results.json
 ```yaml
 - name: Scan models
   run: |
-    pip install modelaudit[all]
-    modelaudit scan models/ --format json --output results.json
+    rye run modelaudit scan models/ --format json --output scan-results.json
+    if [ $? -eq 1 ]; then
+      echo "Security issues found in models!"
+      exit 1
+    fi
 ```
 
 **GitLab CI:**
@@ -345,6 +392,12 @@ sh 'modelaudit scan models/ --format json --output results.json'
 pip install --upgrade pip setuptools wheel
 pip install modelaudit[all] --no-cache-dir
 
+# Install with Rye (recommended)
+rye sync --features all
+
+# Or with pip
+pip install -e .[all]
+
 # If optional dependencies fail, install base package first
 pip install modelaudit
 pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you need
@@ -354,7 +407,28 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 
 ```bash
 # Increase file size limit and timeout for large models
-modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
+modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
+```
+
+**Testing:**
+
+```bash
+# Run all tests
+rye run pytest
+
+# Run with coverage
+rye run pytest --cov=modelaudit
+
+# Run specific test categories
+rye run pytest tests/test_pickle_scanner.py -v
+rye run pytest tests/test_integration.py -v
+
+# Run tests with all optional dependencies
+rye sync --features all
+rye run pytest
+
+# Run comprehensive migration test (tests everything including Docker)
+./test_migration.sh
 ```
 
 **Debug Mode:**
@@ -362,6 +436,24 @@ modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
 ```bash
 # Enable verbose output for troubleshooting
 modelaudit scan model.pkl --verbose
+```
+
+**Development Commands:**
+
+```bash
+# Run linting and formatting with Ruff
+rye run ruff check modelaudit/          # Check for linting issues
+rye run ruff check --fix modelaudit/    # Fix auto-fixable issues
+rye run ruff format modelaudit/         # Format code
+
+# Type checking
+rye run mypy modelaudit/
+
+# Build package
+rye build
+
+# Publish (maintainers only)
+rye publish
 ```
 
 **Getting Help:**

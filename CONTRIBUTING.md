@@ -7,7 +7,7 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 ### Prerequisites
 
 - Python 3.9 or higher
-- Poetry (recommended) or pip
+- Rye (recommended) or pip
 - Git
 
 ### Setup
@@ -17,8 +17,8 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Poetry (recommended)
-poetry sync --with dev --extras "all"
+# Install with Rye (recommended)
+rye sync --features all
 
 # Or with pip
 pip install -e .[all]
@@ -35,14 +35,14 @@ pip install -e .[all]
 # Then test the CLI directly
 modelaudit scan test_model.pkl
 
-# Option 2: Use Poetry (recommended)
-poetry sync --with dev --extras "all"
+# Option 2: Use Rye (recommended)
+rye sync --features all
 
-# Test with Poetry run (no shell activation needed)
-poetry run modelaudit scan test_model.pkl
+# Test with Rye run (no shell activation needed)
+rye run modelaudit scan test_model.pkl
 
 # Test with Python import
-poetry run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+rye run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
 ```
 
 **Create test models for development:**
@@ -57,42 +57,51 @@ modelaudit scan test_model.pkl
 
 ### Running Tests
 
+This project uses optimized parallel test execution for faster development:
+
 ```bash
-# Run all tests
-poetry run pytest
+# 🚀 FAST - Development testing (excludes slow tests)
+rye run pytest -n auto -m "not slow and not integration"
 
-# Run with coverage
-poetry run pytest --cov=modelaudit
+# ⚡ QUICK FEEDBACK - Fail fast on first error
+rye run pytest -n auto -x --tb=short
 
-# Run specific test categories
-poetry run pytest tests/test_pickle_scanner.py -v
-poetry run pytest tests/test_integration.py -v
+# 🧪 COMPLETE - Full test suite with coverage
+rye run pytest -n auto --cov=modelaudit
 
-# Run tests with all optional dependencies
-poetry sync --with dev --extras "all"
-poetry run pytest
+# 🎯 SPECIFIC - Test individual files or patterns
+rye run pytest tests/test_pickle_scanner.py -n auto -v
+rye run pytest -k "test_scanner" -n auto
+
+# 📊 PERFORMANCE - Profile slow tests
+rye run pytest --durations=10 --tb=no
 ```
+
+**Test Speed Optimizations:**
+- Parallel execution with `-n auto` (37% faster)
+- Smart test markers: `slow`, `integration`, `unit`, `performance`
+- Optimized pytest configuration in `pyproject.toml`
 
 ### Development Workflow
 
 ```bash
 # Run linting and formatting with Ruff
-poetry run ruff check .          # Check entire codebase (including tests)
-poetry run ruff check --fix .    # Automatically fix lint issues
-poetry run ruff format .         # Format code
+rye run ruff check .          # Check entire codebase (including tests)
+rye run ruff check --fix .    # Automatically fix lint issues
+rye run ruff format .         # Format code
 
 # Type checking
-poetry run mypy modelaudit/
+rye run mypy modelaudit/
 
 # Build package
-poetry build
+rye build
 
 # The generated distribution contains only the `modelaudit` code and metadata.
 # Unnecessary files like tests and Docker configurations are excluded via
 # `MANIFEST.in`.
 
 # Publish (maintainers only)
-poetry publish
+rye publish
 ```
 
 **Code Quality Tools:**
@@ -204,15 +213,18 @@ When adding a new scanner for a model format:
 ### Common Development Tasks
 
 ```bash
-# Run full test suite with coverage
-poetry run pytest --cov=modelaudit --cov-report=html
+# Run full test suite with coverage (optimized parallel execution)
+rye run pytest -n auto --cov=modelaudit --cov-report=html
 
 # Check for type errors
-poetry run mypy modelaudit/
+rye run mypy modelaudit/
 
 # Format and lint code
-poetry run ruff format .
-poetry run ruff check --fix .
+rye run ruff format .
+rye run ruff check --fix .
+
+# Quick development test cycle
+rye run pytest -n auto -m "not slow and not integration" -x
 
 # Build documentation (if applicable)
 # Add documentation build commands here

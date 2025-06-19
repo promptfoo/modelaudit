@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -62,6 +63,12 @@ def cli():
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
 @click.option(
+    "--max-total-size",
+    type=int,
+    default=0,
+    help="Maximum total bytes to scan before stopping [default: unlimited]",
+)
+@click.option(
     "--baseline-hash",
     help="Expected SHA-256 hash for drift detection",
 )
@@ -78,6 +85,7 @@ def scan_command(
     timeout,
     verbose,
     max_file_size,
+    max_total_size,
     baseline_hash,
     hash_db_path,
 ):
@@ -98,6 +106,7 @@ def scan_command(
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
+        --max-total-size   Maximum total bytes to scan before stopping
         --baseline-hash    Expected SHA-256 hash for drift detection
         --hash-db-path     Path to hash database
 
@@ -188,6 +197,7 @@ def scan_command(
                 blacklist_patterns=list(blacklist) if blacklist else None,
                 timeout=timeout,
                 max_file_size=max_file_size,
+                max_total_size=max_total_size,
                 baseline_hash=baseline_hash,
                 hash_db_path=hash_db_path,
                 progress_callback=progress_callback,
@@ -276,7 +286,7 @@ def scan_command(
     sys.exit(exit_code)
 
 
-def format_text_output(results, verbose=False):
+def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
