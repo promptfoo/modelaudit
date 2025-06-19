@@ -353,6 +353,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
 
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
+    ext = os.path.splitext(path)[1].lower()
 
     discrepancy_msg = None
     if (
@@ -360,16 +361,24 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         and header_format != "unknown"
         and ext_format != "unknown"
     ):
-        discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-        logger.warning(discrepancy_msg)
+        # Don't warn about common PyTorch .bin files that are ZIP format internally
+        # This is expected behavior for torch.save()
+        if not (
+            ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"
+        ):
+            discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
+            logger.warning(discrepancy_msg)
 
     # Prefer scanner based on header format
     preferred_scanner: Optional[type] = None
-    if header_format == "zip" and os.path.splitext(path)[1].lower() in [
-        ".pt",
-        ".pth",
-    ]:
+
+    # Special handling for PyTorch files that are ZIP-based
+    if header_format == "zip" and ext in [".pt", ".pth"]:
         preferred_scanner = PyTorchZipScanner
+    elif header_format == "zip" and ext == ".bin":
+        # PyTorch .bin files saved with torch.save() are ZIP format internally
+        # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
+        preferred_scanner = PickleScanner
     else:
         preferred_scanner = {
             "pickle": PickleScanner,
