@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional, cast
 
 from modelaudit.scanners import SCANNER_REGISTRY
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils import is_within_directory
 from modelaudit.utils.filetype import detect_file_format
 
 logger = logging.getLogger("modelaudit.core")
@@ -74,9 +75,22 @@ def scan_model_directory_or_file(
             total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
             processed_files = 0
 
-            for root, _, files in os.walk(path):
+            base_dir = Path(path).resolve()
+            for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
+                    resolved_file = Path(file_path).resolve()
+                    if not is_within_directory(str(base_dir), str(resolved_file)):
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list.append(
+                            {
+                                "message": "Path traversal outside scanned directory",
+                                "severity": IssueSeverity.CRITICAL.value,
+                                "location": file_path,
+                                "details": {"resolved_path": str(resolved_file)},
+                            }
+                        )
+                        continue
 
                     # Check timeout
                     if time.time() - start_time > timeout:
