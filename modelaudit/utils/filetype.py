@@ -10,7 +10,7 @@ def is_zipfile(path: str) -> bool:
     try:
         with file_path.open("rb") as f:
             signature = f.read(4)
-        return signature in [b"PK\x03\x04", b"PK\x05\x06"]
+        return signature.startswith(b"PK")
     except OSError:
         return False
 
@@ -57,7 +57,7 @@ def detect_file_format(path: str) -> str:
     ext = file_path.suffix.lower()
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    if magic4[:2] == b"PK":
+    if magic4.startswith(b"PK"):
         return "zip"
 
     # Check pickle magic patterns
@@ -87,7 +87,14 @@ def detect_file_format(path: str) -> str:
         return "pytorch_binary"
 
     # Extension-based detection for non-.bin files
-    if ext in (".pkl", ".pickle"):
+    # For .pt/.pth/.ckpt files, check if they're ZIP format first
+    if ext in (".pt", ".pth", ".ckpt"):
+        # These files can be either ZIP or pickle format
+        if magic4.startswith(b"PK"):
+            return "zip"
+        # If not ZIP, assume pickle format
+        return "pickle"
+    if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
         return "hdf5"
@@ -97,11 +104,19 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext == ".onnx":
         return "onnx"
+    if ext == ".npy":
+        return "numpy"
+    if ext == ".npz":
+        return "zip"
+    if ext == ".joblib":
+        if magic4.startswith(b"PK"):
+            return "zip"
+        return "pickle"
 
     return "unknown"
 
 
-def find_sharded_files(directory: str) -> list:
+def find_sharded_files(directory: str) -> list[str]:
     """
     Look for sharded model files like:
     pytorch_model-00001-of-00002.bin

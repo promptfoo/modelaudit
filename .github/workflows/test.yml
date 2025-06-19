@@ -31,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Lint with Ruff
         run: |
@@ -40,6 +40,21 @@ jobs:
       - name: Check formatting with Ruff
         run: |
           poetry run ruff format --check .
+
+  format-check:
+    name: Format Check (Biome)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check formatting with Biome
+        run: npx @biomejs/biome ci .
 
   type-check:
     name: Type Check
@@ -60,7 +75,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Type checking
         run: poetry run mypy modelaudit/
@@ -87,14 +102,14 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+        run: poetry sync --with dev --extras "all" --no-interaction
 
       - name: Run tests with pytest
         run: poetry run pytest -v --cov=modelaudit
 
   build:
     name: Build and Package
-    needs: [lint, type-check]
+    needs: [lint, format-check, type-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -112,7 +127,7 @@ jobs:
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
+          poetry sync --no-interaction
           poetry build
 
       - name: Upload artifacts

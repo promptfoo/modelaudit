@@ -27,4 +27,4 @@ def test_dill_malicious_detection(tmp_path):
     scanner = PickleScanner()
     result = scanner.scan(str(path))
 
-    assert any(i.severity == IssueSeverity.ERROR for i in result.issues)
+    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
