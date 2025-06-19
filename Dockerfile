@@ -2,15 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy requirements lock file and install dependencies
-COPY requirements.lock ./
-RUN pip install --no-cache-dir -r requirements.lock
-
-# Copy source code
+# Copy source code first
 COPY . .
 
-# Install the application using pip
-RUN pip install --no-cache-dir .
+# Install dependencies and the application
+# The lock file includes the current project as editable, so we install everything together
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Create a non-root user
 ARG UID=10001
