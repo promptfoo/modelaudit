@@ -151,6 +151,23 @@ def test_base_scanner_get_file_size(tmp_path):
     assert size == len(content)
 
 
+def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
+    """get_file_size should handle OS errors gracefully."""
+
+    test_file = tmp_path / "test.test"
+    test_file.write_bytes(b"data")
+
+    def mock_getsize(_path):  # pragma: no cover - error simulation
+        raise OSError("bad file")
+
+    monkeypatch.setattr(os.path, "getsize", mock_getsize)
+
+    scanner = MockScanner()
+    size = scanner.get_file_size(str(test_file))
+
+    assert size == 0
+
+
 def test_scanner_implementation(tmp_path):
     """Test a complete scan with the test scanner implementation."""
     # Create a test file
