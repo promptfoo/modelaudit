@@ -1,8 +1,11 @@
+import builtins
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from threading import Lock
+from typing import IO, Any, Callable, Optional, cast
+from unittest.mock import patch
 
 from modelaudit.scanners import (
     SCANNER_REGISTRY,
@@ -21,6 +24,9 @@ from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
 
 logger = logging.getLogger("modelaudit.core")
+
+# Lock to ensure thread-safe monkey patching of builtins.open
+_OPEN_PATCH_LOCK = Lock()
 
 
 def scan_model_directory_or_file(
@@ -171,16 +177,13 @@ def scan_model_directory_or_file(
 
             # Create a wrapper for the file to report progress
             if progress_callback is not None and file_size > 0:
-                import builtins
-                from typing import IO
-
                 original_builtins_open = builtins.open
 
                 def progress_open(
                     file_path: str,
                     mode: str = "r",
-                    *args,
-                    **kwargs,
+                    *args: Any,
+                    **kwargs: Any,
                 ) -> IO[Any]:
                     file = original_builtins_open(file_path, mode, *args, **kwargs)
                     file_pos = 0
@@ -203,14 +206,8 @@ def scan_model_directory_or_file(
                     file.read = progress_read  # type: ignore[method-assign]
                     return file
 
-                # Monkey patch open temporarily
-                builtins.open = progress_open  # type: ignore
-
-                try:
+                with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
                     file_result = scan_file(path, config)
-                finally:
-                    # Restore original open
-                    builtins.open = original_builtins_open
             else:
                 file_result = scan_file(path, config)
 
