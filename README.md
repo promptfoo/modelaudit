@@ -196,6 +196,9 @@ ModelAudit can detect anomalous weight patterns that may indicate trojaned model
 # Set maximum file size to scan (1GB limit)
 modelaudit scan model.pkl --max-file-size 1073741824
 
+# Stop scanning after a total of 5GB has been processed
+modelaudit scan models/ --max-total-size 5368709120
+
 # Add custom blacklist patterns
 modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
 
@@ -326,7 +329,7 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 
 ```bash
 # Increase file size limit and timeout for large models
-modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600
+modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
 ```
 
 **Debug Mode:**
