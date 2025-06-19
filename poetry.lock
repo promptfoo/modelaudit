@@ -329,7 +329,7 @@ description = "The FlatBuffers serialization format for Python"
 optional = true
 python-versions = "*"
 groups = ["main"]
-markers = "extra == \"tensorflow\" or extra == \"all\""
+markers = "extra == \"tensorflow\" or extra == \"all\" or extra == \"tflite\""
 files = [
     {file = "flatbuffers-25.2.10-py2.py3-none-any.whl", hash = "sha256:ebba5f4d5ea615af3f7fd70fc310636fbb2bbd1f566ac0a23d98dd412de50051"},
     {file = "flatbuffers-25.2.10.tar.gz", hash = "sha256:97e451377a41262f8d9bd4295cc836133415cc03d8cb966410a4af92eb00d26e"},
@@ -534,7 +534,7 @@ description = "Read metadata from Python packages"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "extra == \"tensorflow\" and python_version < \"3.10\" or extra == \"all\" and python_version < \"3.10\""
+markers = "(extra == \"tensorflow\" or extra == \"all\") and python_version < \"3.10\""
 files = [
     {file = "importlib_metadata-8.7.0-py3-none-any.whl", hash = "sha256:e5dd1551894c77868a30651cef00984d50e1002d06942a7101d34870c5f02afd"},
     {file = "importlib_metadata-8.7.0.tar.gz", hash = "sha256:d13b81ad223b890aa16c5471f2ac3056cf76c5f10f82d6f9292f0b415f389000"},
@@ -812,7 +812,7 @@ description = ""
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "extra == \"tensorflow\" and python_version < \"3.13\" or extra == \"all\" and python_version < \"3.13\""
+markers = "(extra == \"tensorflow\" or extra == \"all\") and python_version < \"3.13\""
 files = [
     {file = "ml_dtypes-0.5.1-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:bd73f51957949069573ff783563486339a9285d72e2f36c18e0c1aa9ca7eb190"},
     {file = "ml_dtypes-0.5.1-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:810512e2eccdfc3b41eefa3a27402371a3411453a1efc7e9c000318196140fed"},
@@ -842,10 +842,10 @@ files = [
 
 [package.dependencies]
 numpy = [
-    {version = ">=1.26.0", markers = "python_version >= \"3.12\" and python_version < \"3.13\""},
     {version = ">=1.23.3", markers = "python_version >= \"3.11\" and python_version < \"3.12\""},
     {version = ">=1.21.2", markers = "python_version >= \"3.10\" and python_version < \"3.11\""},
     {version = ">=1.21", markers = "python_version < \"3.10\""},
+    {version = ">=1.26.0", markers = "python_version >= \"3.12\" and python_version < \"3.13\""},
 ]
 
 [package.extras]
@@ -1453,7 +1453,7 @@ description = ""
 optional = true
 python-versions = ">=3.8"
 groups = ["main"]
-markers = "extra == \"tensorflow\" or extra == \"all\" or extra == \"onnx\""
+markers = "extra == \"tensorflow\" or extra == \"all\" or extra == \"onnx\" and python_version <= \"3.11\" or extra == \"onnx\" and python_version >= \"3.12\""
 files = [
     {file = "protobuf-5.29.5-cp310-abi3-win32.whl", hash = "sha256:3f1c6468a2cfd102ff4703976138844f78ebd1fb45f49011afc5139e9e283079"},
     {file = "protobuf-5.29.5-cp310-abi3-win_amd64.whl", hash = "sha256:3f76e3a3675b4a4d867b52e4a5f5b78a2ef9565549d4037e06cf7b0942b1d3fc"},
@@ -1907,7 +1907,7 @@ description = "TensorBoard lets you watch Tensors Flow"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "extra == \"tensorflow\" and python_version < \"3.13\" or extra == \"all\" and python_version < \"3.13\""
+markers = "(extra == \"tensorflow\" or extra == \"all\") and python_version < \"3.13\""
 files = [
     {file = "tensorboard-2.19.0-py3-none-any.whl", hash = "sha256:5e71b98663a641a7ce8a6e70b0be8e1a4c0c45d48760b076383ac4755c35b9a0"},
 ]
@@ -1999,7 +1999,7 @@ description = "TensorFlow is an open source machine learning framework for every
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "extra == \"tensorflow\" and python_version < \"3.13\" or extra == \"all\" and python_version < \"3.13\""
+markers = "(extra == \"tensorflow\" or extra == \"all\") and python_version < \"3.13\""
 files = [
     {file = "tensorflow-2.19.0-cp310-cp310-macosx_12_0_arm64.whl", hash = "sha256:c95604f25c3032e9591c7e01e457fdd442dde48e9cc1ce951078973ab1b4ca34"},
     {file = "tensorflow-2.19.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2b39293cae3aeee534dc4746dc6097b48c281e5e8b9a423efbd14d4495968e5c"},
@@ -2094,6 +2094,23 @@ files = [
 
 [package.extras]
 tests = ["pytest", "pytest-cov"]
+
+[[package]]
+name = "tflite"
+version = "2.18.0"
+description = "Parsing TensorFlow Lite Models (*.tflite) Easily"
+optional = true
+python-versions = "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,<4,>=2.7"
+groups = ["main"]
+markers = "extra == \"tflite\" or extra == \"all\""
+files = [
+    {file = "tflite-2.18.0-py2.py3-none-any.whl", hash = "sha256:a49a4316530377c597bb272176c12d5d3c4453640118b068c93a8c3cc6c5c2c1"},
+    {file = "tflite-2.18.0.tar.gz", hash = "sha256:07e9478e0d0fb4d3082d0ce8e7e6eab4a90a7174412faec7702e24bfcbf4190d"},
+]
+
+[package.dependencies]
+flatbuffers = "*"
+numpy = "*"
 
 [[package]]
 name = "threadpoolctl"
@@ -2430,7 +2447,7 @@ description = "Backport of pathlib-compatible object wrapper for zip files"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "extra == \"tensorflow\" and python_version < \"3.10\" or extra == \"all\" and python_version < \"3.10\""
+markers = "(extra == \"tensorflow\" or extra == \"all\") and python_version < \"3.10\""
 files = [
     {file = "zipp-3.23.0-py3-none-any.whl", hash = "sha256:071652d6115ed432f5ce1d34c336c0adfd6a884660d1e9712a256d3d3bd4b14e"},
     {file = "zipp-3.23.0.tar.gz", hash = "sha256:a07157588a12518c9d4034df3fbbee09c814741a33ff63c05fa29d26a2404166"},
@@ -2445,7 +2462,7 @@ test = ["big-O", "jaraco.functools", "jaraco.itertools", "jaraco.test", "more_it
 type = ["pytest-mypy"]
 
 [extras]
-all = ["dill", "h5py", "joblib", "onnx", "pyyaml", "safetensors", "scikit-learn", "tensorflow", "torch"]
+all = ["dill", "h5py", "joblib", "onnx", "pyyaml", "safetensors", "scikit-learn", "tensorflow", "tflite", "torch"]
 dill = ["dill"]
 h5 = ["h5py"]
 joblib = ["joblib", "scikit-learn"]
@@ -2453,9 +2470,10 @@ onnx = ["onnx"]
 pytorch = ["torch"]
 safetensors = ["safetensors"]
 tensorflow = ["tensorflow"]
+tflite = ["tflite"]
 yaml = ["pyyaml"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.9,<4.0"
-content-hash = "e352cf5cd28cf82dd1c714047bc796fda81fdccafd04d86e8d889737d1ba4aad"
+content-hash = "abac4619430d67b66405131d02f42f3249c035ad714f98c4564c9af88df2a0e7"
