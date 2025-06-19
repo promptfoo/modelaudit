@@ -96,7 +96,7 @@ class PyTorchBinaryScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning binary file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -156,7 +156,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 pos = chunk.find(pattern_bytes)
                 result.add_issue(
                     f"Blacklisted pattern found: {pattern}",
-                    severity=IssueSeverity.ERROR,
+                    severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern,
@@ -183,7 +183,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 pos = chunk.find(sig)
                 result.add_issue(
                     f"Executable signature found: {description}",
-                    severity=IssueSeverity.ERROR,
+                    severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "signature": sig.hex(),
