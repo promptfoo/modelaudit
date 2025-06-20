@@ -281,7 +281,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {str(e)}",
-            "severity": IssueSeverity.CRITICAL.value,
+            "severity": IssueSeverity.WARNING.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -413,7 +413,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
             f"Error checking file size: {e}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
         return sr
@@ -492,7 +492,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     if discrepancy_msg:
         result.add_issue(
             discrepancy_msg + " Using header-based detection.",
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.DEBUG,
             location=path,
             details={
                 "extension_format": ext_format,
