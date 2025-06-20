@@ -424,12 +424,18 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with findings", fg="red", bold=True)
-        else:
+        elif any(
+            isinstance(issue, dict) and issue.get("severity") == "warning"
+            for issue in visible_issues
+        ):
             status = click.style(
                 "⚠ Scan completed with warnings",
                 fg="yellow",
                 bold=True,
             )
+        else:
+            # Only info/debug issues
+            status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     else:
         status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     output_lines.append(status)
