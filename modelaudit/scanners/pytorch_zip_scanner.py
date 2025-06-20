@@ -122,7 +122,7 @@ class PyTorchZipScanner(BaseScanner):
                     if name.endswith(".py"):
                         result.add_issue(
                             f"Python code file found in PyTorch model: {name}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
@@ -142,7 +142,7 @@ class PyTorchZipScanner(BaseScanner):
                     result.add_issue(
                         "PyTorch model is missing 'data.pkl', which is "
                         "unusual for standard PyTorch models.",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"missing_file": "data.pkl"},
                     )
@@ -167,7 +167,7 @@ class PyTorchZipScanner(BaseScanner):
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' "
                                             f"found in pickled file {name}",
-                                            severity=IssueSeverity.WARNING,
+                                            severity=IssueSeverity.CRITICAL,
                                             location=f"{self.current_file_path} "
                                             f"({name})",
                                             details={
@@ -185,7 +185,7 @@ class PyTorchZipScanner(BaseScanner):
                                             result.add_issue(
                                                 f"Blacklisted pattern '{pattern}' "
                                                 f"found in file {name}",
-                                                severity=IssueSeverity.WARNING,
+                                                severity=IssueSeverity.CRITICAL,
                                                 location=f"{self.current_file_path} "
                                                 f"({name})",
                                                 details={

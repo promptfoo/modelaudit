@@ -121,7 +121,7 @@ class FlaxMsgpackScanner(BaseScanner):
             if size > self.max_blob_bytes:
                 result.add_issue(
                     f"Suspiciously large binary blob: {size:,} bytes",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=location,
                     details={"size": size, "max_allowed": self.max_blob_bytes},
                 )
@@ -145,7 +145,7 @@ class FlaxMsgpackScanner(BaseScanner):
             if len(value) > 100000:  # 100KB string
                 result.add_issue(
                     f"Extremely long string found: {len(value):,} characters",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=location,
                     details={"length": len(value)},
                 )
@@ -154,7 +154,7 @@ class FlaxMsgpackScanner(BaseScanner):
             if len(value) > self.max_items_per_container:
                 result.add_issue(
                     f"Dictionary with excessive items: {len(value):,}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=location,
                     details={
                         "item_count": len(value),
@@ -176,7 +176,7 @@ class FlaxMsgpackScanner(BaseScanner):
             if len(value) > self.max_items_per_container:
                 result.add_issue(
                     f"Array with excessive items: {len(value):,}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=location,
                     details={
                         "item_count": len(value),

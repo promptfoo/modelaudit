@@ -146,7 +146,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if file.endswith(".py"):
                     result.add_issue(
                         f"Python file found in SavedModel: {file}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(file_path),
                         details={"file": file, "directory": root},
                     )
@@ -182,7 +182,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' "
                                             f"found in file {file}",
-                                            severity=IssueSeverity.WARNING,
+                                            severity=IssueSeverity.CRITICAL,
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
