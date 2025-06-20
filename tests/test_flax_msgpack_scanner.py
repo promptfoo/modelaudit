@@ -90,12 +90,12 @@ def test_flax_msgpack_large_containers(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    warning_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
     ]
-    assert len(warning_issues) >= 2  # Should warn about both large containers
+    assert len(info_issues) >= 2  # Should report both large containers at INFO level
 
-    issue_messages = [issue.message for issue in warning_issues]
+    issue_messages = [issue.message for issue in info_issues]
     assert any("excessive items" in msg for msg in issue_messages)
 
 
@@ -161,7 +161,11 @@ def test_flax_msgpack_corrupted(tmp_path):
     critical_issues = [
         issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
     ]
-    assert any("Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message for issue in critical_issues)
+    assert any(
+        "Invalid msgpack format" in issue.message
+        or "Unexpected error processing" in issue.message
+        for issue in critical_issues
+    )
 
 
 def test_flax_msgpack_trailing_data(tmp_path):
@@ -194,11 +198,11 @@ def test_flax_msgpack_large_binary_blob(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    warning_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
     ]
     assert any(
-        "Suspiciously large binary blob" in issue.message for issue in warning_issues
+        "Suspiciously large binary blob" in issue.message for issue in info_issues
     )
 
 
