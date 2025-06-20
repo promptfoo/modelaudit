@@ -255,7 +255,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_issue(
                             f"Suspicious configuration string found in {context}: "
                             f"'{suspicious_term}'",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
                                 "suspicious_term": suspicious_term,
