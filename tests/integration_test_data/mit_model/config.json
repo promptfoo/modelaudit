@@ -1,0 +1,8 @@
+{
+  "model_type": "linear_regression",
+  "hidden_size": 128,
+  "num_features": 10,
+  "license": "MIT",
+  "copyright": "Copyright (c) 2024 Test Model Company",
+  "torch_dtype": "float32"
+}
