@@ -50,6 +50,7 @@ ModelAudit scans ML model files for:
 - **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
+- **License compliance issues** including commercial use restrictions and AGPL obligations
 - **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
 
@@ -146,6 +147,9 @@ modelaudit scan ./models/
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
+
+# Generate Software Bill of Materials (SBOM) with license information
+modelaudit scan model.pkl --sbom sbom.json
 ```
 
 **Example output:**
@@ -189,6 +193,7 @@ Issues found: 2 critical, 1 warnings
 ### Reporting & Integration
 
 - **Multiple Output Formats**: Human-readable text and machine-readable JSON
+- **SBOM Generation**: CycloneDX Software Bill of Materials with license metadata
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Integration**: Clear exit codes for automated pipeline integration
@@ -200,6 +205,7 @@ Issues found: 2 critical, 1 warnings
 - **Enhanced Dill/Joblib Analysis**: ML-aware scanning with format validation and bypass prevention
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
+- **License Compliance**: Identifies commercial use restrictions, AGPL network obligations, unlicensed datasets
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
 ## 🛡️ Supported Model Formats
@@ -244,6 +250,9 @@ modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
 
 # Set scan timeout (5 minutes)
 modelaudit scan large_model.pkl --timeout 300
+
+# Generate SBOM with license information
+modelaudit scan model.pkl --sbom sbom.json
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
@@ -444,12 +453,14 @@ ModelAudit is designed to find **obvious security risks** in model files, includ
 - Heavily encoded/encrypted malicious payloads
 - Runtime behavior that only triggers under specific conditions
 - Model poisoning through careful data manipulation
+- All possible license types or complex license arrangements
 
 **Recommendations:**
 
 - Use ModelAudit as one layer of your security strategy
 - Review flagged issues manually - not all warnings indicate malicious intent
 - Combine with other security practices like sandboxed execution and runtime monitoring
+- Consult legal counsel for license compliance requirements beyond technical detection
 - Implement automated scanning in CI/CD pipelines
 
 ## 📝 License

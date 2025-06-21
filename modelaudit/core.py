@@ -7,6 +7,10 @@ from threading import Lock
 from typing import IO, Any, Callable, Optional, cast
 from unittest.mock import patch
 
+from modelaudit.license_checker import (
+    check_commercial_use_warnings,
+    collect_license_metadata,
+)
 from modelaudit.scanners import (
     SCANNER_REGISTRY,
     GgufScanner,
@@ -85,6 +89,7 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "file_metadata": {},  # Per-file metadata
     }
 
     # Configure scan options
@@ -168,6 +173,13 @@ def scan_model_directory_or_file(
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
+
+                        # Save metadata for SBOM generation
+                        file_meta = cast(dict[str, Any], results["file_metadata"])
+                        # Merge scanner metadata with license metadata
+                        license_metadata = collect_license_metadata(file_path)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        file_meta[file_path] = combined_metadata
 
                         if (
                             max_total_size > 0
@@ -260,6 +272,13 @@ def scan_model_directory_or_file(
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
 
+            # Save metadata for SBOM generation
+            file_meta = cast(dict[str, Any], results["file_metadata"])
+            # Merge scanner metadata with license metadata
+            license_metadata = collect_license_metadata(path)
+            combined_metadata = {**file_result.metadata, **license_metadata}
+            file_meta[path] = combined_metadata
+
             if (
                 max_total_size > 0
                 and cast(int, results["bytes_scanned"]) > max_total_size
@@ -293,6 +312,23 @@ def scan_model_directory_or_file(
         float,
         results["start_time"],
     )
+
+    # Add license warnings if any
+    try:
+        license_warnings = check_commercial_use_warnings(results)
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        for warning in license_warnings:
+            # Convert license warnings to issues
+            issue_dict = {
+                "message": warning["message"],
+                "severity": warning["severity"],
+                "location": "",  # License warnings are generally project-wide
+                "details": warning.get("details", {}),
+                "type": warning["type"],
+            }
+            issues_list.append(issue_dict)
+    except Exception as e:
+        logger.warning(f"Error checking license warnings: {str(e)}")
 
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
