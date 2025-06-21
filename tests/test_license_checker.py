@@ -32,9 +32,9 @@ def example_function():
     pass
 """
         test_file.write_text(content)
-        
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         assert len(licenses) == 1
         assert licenses[0].spdx_id == "MIT"
         assert licenses[0].name == "MIT License"
@@ -44,16 +44,16 @@ def example_function():
 
     def test_apache_license_detection(self, tmp_path):
         """Test detection of Apache 2.0 license."""
-        test_file = tmp_path / "apache_file.py" 
+        test_file = tmp_path / "apache_file.py"
         content = """# Licensed under the Apache License, Version 2.0
 # Copyright 2024 Apache Foundation
 
 import numpy as np
 """
         test_file.write_text(content)
-        
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         assert len(licenses) == 1
         assert licenses[0].spdx_id == "Apache-2.0"
         assert licenses[0].commercial_allowed is True
@@ -68,14 +68,16 @@ def network_service():
     pass
 """
         test_file.write_text(content)
-        
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         # May detect both GPL and AGPL patterns, check that AGPL is present
         assert len(licenses) >= 1
         agpl_licenses = [lic for lic in licenses if lic.spdx_id == "AGPL-3.0"]
         assert len(agpl_licenses) == 1
-        assert agpl_licenses[0].commercial_allowed is True  # But with strong obligations
+        assert (
+            agpl_licenses[0].commercial_allowed is True
+        )  # But with strong obligations
 
     def test_cc_by_nc_license_detection(self, tmp_path):
         """Test detection of Creative Commons NonCommercial license."""
@@ -86,9 +88,9 @@ This work is licensed under CC BY-NC 4.0
 Some dataset content here...
 """
         test_file.write_text(content)
-        
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         assert len(licenses) == 1
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
@@ -102,25 +104,25 @@ def some_function():
     pass
 """
         test_file.write_text(content)
-        
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         assert len(licenses) == 0
 
     def test_binary_file_handling(self, tmp_path):
         """Test handling of binary files."""
         test_file = tmp_path / "binary_file.bin"
-        test_file.write_bytes(b'\x00\x01\x02\x03\x04\x05')
-        
+        test_file.write_bytes(b"\x00\x01\x02\x03\x04\x05")
+
         licenses = scan_for_license_headers(str(test_file))
-        
+
         # Should handle gracefully and return empty list
         assert len(licenses) == 0
 
     def test_nonexistent_file_handling(self):
         """Test handling of nonexistent files."""
         licenses = scan_for_license_headers("/path/that/does/not/exist")
-        
+
         assert len(licenses) == 0
 
 
@@ -137,17 +139,19 @@ def example():
     pass
 """
         test_file.write_text(content)
-        
+
         copyrights = extract_copyright_notices(str(test_file))
-        
+
         # May extract duplicates, check that we have the expected holders
         assert len(copyrights) >= 2
         holders = {cr.holder for cr in copyrights}
         assert "Example Corporation" in holders
         assert "Another Corp" in holders
-        
+
         # Check years are extracted correctly
-        example_corp_copyrights = [cr for cr in copyrights if cr.holder == "Example Corporation"]
+        example_corp_copyrights = [
+            cr for cr in copyrights if cr.holder == "Example Corporation"
+        ]
         assert len(example_corp_copyrights) >= 1
         assert example_corp_copyrights[0].year == "2024"
 
@@ -161,9 +165,9 @@ def test():
     pass
 """
         test_file.write_text(content)
-        
+
         copyrights = extract_copyright_notices(str(test_file))
-        
+
         assert len(copyrights) == 2
         holders = {cr.holder for cr in copyrights}
         assert "Unicode Corp" in holders
@@ -178,9 +182,9 @@ def function():
     pass
 """
         test_file.write_text(content)
-        
+
         copyrights = extract_copyright_notices(str(test_file))
-        
+
         assert len(copyrights) == 0
 
 
@@ -195,9 +199,9 @@ class TestLicenseFiles:
         (tmp_path / "COPYING").write_text("GPL License")
         (tmp_path / "COPYRIGHT").write_text("Copyright notices")
         (tmp_path / "README.md").write_text("Not a license file")
-        
+
         license_files = find_license_files(str(tmp_path))
-        
+
         assert len(license_files) == 4
         filenames = {Path(f).name.lower() for f in license_files}
         assert "license" in filenames
@@ -209,7 +213,7 @@ class TestLicenseFiles:
     def test_find_license_files_nonexistent_dir(self):
         """Test handling of nonexistent directory."""
         license_files = find_license_files("/path/that/does/not/exist")
-        
+
         assert len(license_files) == 0
 
 
@@ -220,21 +224,21 @@ class TestUnlicensedDatasetDetection:
         """Test detection of unlicensed CSV file."""
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,age,score\nAlice,25,85\nBob,30,92")
-        
+
         unlicensed = detect_unlicensed_datasets([str(csv_file)])
-        
+
         assert len(unlicensed) == 1
         assert str(csv_file) in unlicensed
 
     def test_detect_unlicensed_json_large(self, tmp_path):
         """Test detection of large unlicensed JSON file."""
         json_file = tmp_path / "large_data.json"
-        # Create a large file (>100KB) 
+        # Create a large file (>100KB)
         large_data = {"data": [{"id": i, "value": f"item_{i}"} for i in range(5000)]}
         json_file.write_text(json.dumps(large_data))
-        
+
         unlicensed = detect_unlicensed_datasets([str(json_file)])
-        
+
         assert len(unlicensed) == 1
         assert str(json_file) in unlicensed
 
@@ -242,24 +246,26 @@ class TestUnlicensedDatasetDetection:
         """Test that small single files are not flagged."""
         small_json = tmp_path / "small.json"
         small_json.write_text('{"test": "data"}')  # Small file
-        
+
         unlicensed = detect_unlicensed_datasets([str(small_json)])
-        
+
         # Note: Small JSON files may still be flagged if they don't have license info
         # This test verifies the behavior - small files in multi-file contexts are skipped
         # but single small files may still be checked
-        assert len(unlicensed) <= 1  # May or may not be flagged depending on size threshold
+        assert (
+            len(unlicensed) <= 1
+        )  # May or may not be flagged depending on size threshold
 
     def test_dataset_with_nearby_license(self, tmp_path):
         """Test dataset with license file in same directory."""
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,age\nAlice,25\nBob,30")
-        
+
         license_file = tmp_path / "LICENSE"
         license_file.write_text("MIT License")
-        
+
         unlicensed = detect_unlicensed_datasets([str(csv_file)])
-        
+
         assert len(unlicensed) == 0  # Should not be flagged due to nearby license
 
     def test_ml_model_directory_skip(self, tmp_path):
@@ -267,11 +273,13 @@ class TestUnlicensedDatasetDetection:
         # Create ML model directory
         (tmp_path / "config.json").write_text('{"model_type": "gpt2"}')
         (tmp_path / "pytorch_model.bin").write_bytes(b"model weights")
-        (tmp_path / "data.pkl").write_bytes(b"some data")  # This would normally be flagged
-        
+        (tmp_path / "data.pkl").write_bytes(
+            b"some data"
+        )  # This would normally be flagged
+
         file_paths = [str(f) for f in tmp_path.glob("*")]
         unlicensed = detect_unlicensed_datasets(file_paths)
-        
+
         assert len(unlicensed) == 0  # PKL file should be skipped in ML model dir
 
 
@@ -282,29 +290,22 @@ class TestMLDirectoryDetection:
         """Test detection of HuggingFace model directory."""
         files = [
             "/path/config.json",
-            "/path/pytorch_model.bin", 
-            "/path/tokenizer_config.json"
+            "/path/pytorch_model.bin",
+            "/path/tokenizer_config.json",
         ]
-        
+
         assert _is_ml_model_directory(files) is True
 
     def test_is_ml_model_directory_pytorch(self):
         """Test detection of PyTorch model directory."""
-        files = [
-            "/path/model.safetensors",
-            "/path/config.json"
-        ]
-        
+        files = ["/path/model.safetensors", "/path/config.json"]
+
         assert _is_ml_model_directory(files) is True
 
     def test_is_not_ml_model_directory(self):
         """Test non-ML directory detection."""
-        files = [
-            "/path/data.csv",
-            "/path/analysis.py",
-            "/path/README.md"
-        ]
-        
+        files = ["/path/data.csv", "/path/analysis.py", "/path/README.md"]
+
         assert _is_ml_model_directory(files) is False
 
     def test_is_ml_config_file(self):
@@ -313,7 +314,7 @@ class TestMLDirectoryDetection:
         assert _is_ml_config_file("tokenizer_config.json") is True
         assert _is_ml_config_file("model.json") is True
         assert _is_ml_config_file("generation_config.json") is True
-        
+
         assert _is_ml_config_file("data.json") is False
         assert _is_ml_config_file("analysis.json") is False
         assert _is_ml_config_file("config.txt") is False
@@ -333,9 +334,9 @@ class TestCommercialUseWarnings:
                 }
             }
         }
-        
+
         agpl_files = detect_agpl_components(scan_results)
-        
+
         assert len(agpl_files) == 1
         assert "/path/agpl_file.py" in agpl_files
 
@@ -344,15 +345,13 @@ class TestCommercialUseWarnings:
         scan_results = {
             "file_metadata": {
                 "/path/mit_file.py": {
-                    "license_info": [
-                        {"spdx_id": "MIT", "commercial_allowed": True}
-                    ]
+                    "license_info": [{"spdx_id": "MIT", "commercial_allowed": True}]
                 }
             }
         }
-        
+
         agpl_files = detect_agpl_components(scan_results)
-        
+
         assert len(agpl_files) == 0
 
     def test_check_commercial_use_warnings_agpl(self):
@@ -366,12 +365,12 @@ class TestCommercialUseWarnings:
                 }
             }
         }
-        
+
         warnings = check_commercial_use_warnings(scan_results)
-        
+
         # AGPL may trigger both AGPL-specific and general copyleft warnings
         assert len(warnings) >= 1
-        
+
         # Check that AGPL-specific warning is present
         agpl_warnings = [w for w in warnings if "AGPL" in w["message"]]
         assert len(agpl_warnings) == 1
@@ -390,9 +389,9 @@ class TestCommercialUseWarnings:
                 }
             }
         }
-        
+
         warnings = check_commercial_use_warnings(scan_results)
-        
+
         assert len(warnings) == 1
         assert warnings[0]["severity"] == "warning"
         assert "Non-commercial" in warnings[0]["message"]
@@ -403,15 +402,13 @@ class TestCommercialUseWarnings:
         scan_results = {
             "file_metadata": {
                 "/path/mit_file.py": {
-                    "license_info": [
-                        {"spdx_id": "MIT", "commercial_allowed": True}
-                    ]
+                    "license_info": [{"spdx_id": "MIT", "commercial_allowed": True}]
                 }
             }
         }
-        
+
         warnings = check_commercial_use_warnings(scan_results)
-        
+
         assert len(warnings) == 0
 
 
@@ -428,9 +425,9 @@ def test_function():
     pass
 """
         test_file.write_text(content)
-        
+
         metadata = collect_license_metadata(str(test_file))
-        
+
         assert metadata["is_dataset"] is False
         assert metadata["is_model"] is False
         assert len(metadata["license_info"]) == 1
@@ -447,9 +444,9 @@ Alice,25
 Bob,30
 """
         test_file.write_text(content)
-        
+
         metadata = collect_license_metadata(str(test_file))
-        
+
         assert metadata["is_dataset"] is True
         assert metadata["is_model"] is False
 
@@ -457,10 +454,12 @@ Bob,30
         """Test license metadata for model file."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"dummy model content")
-        
+
         metadata = collect_license_metadata(str(test_file))
-        
-        assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
+
+        assert (
+            metadata["is_dataset"] is True
+        )  # .pkl is both dataset and model extension
         assert metadata["is_model"] is True
 
 
@@ -470,9 +469,9 @@ class TestIntegration:
     def test_license_warnings_in_scan_results(self, tmp_path):
         """Test that license warnings appear in scan results."""
         from modelaudit.core import scan_model_directory_or_file
-        
+
         # Create a file with non-commercial license
-        test_file = tmp_path / "nc_dataset.csv" 
+        test_file = tmp_path / "nc_dataset.csv"
         content = """# Creative Commons Attribution NonCommercial
 # CC BY-NC 4.0
 name,value
@@ -481,39 +480,46 @@ test,data
         # Make it large enough to trigger warning
         content += "\n".join([f"item{i},value{i}" for i in range(1000)])
         test_file.write_text(content)
-        
+
         results = scan_model_directory_or_file(str(test_file))
-        
+
         # Should have license warning
         license_issues = [
-            issue for issue in results.get("issues", [])
+            issue
+            for issue in results.get("issues", [])
             if issue.get("type") == "license_warning"
         ]
-        
+
         assert len(license_issues) > 0
-        assert any("Non-commercial" in issue.get("message", "") for issue in license_issues)
+        assert any(
+            "Non-commercial" in issue.get("message", "") for issue in license_issues
+        )
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):
         """Test that ML model directories don't generate false positive license warnings."""
         from modelaudit.core import scan_model_directory_or_file
-        
+
         # Create ML model directory
         model_dir = tmp_path / "gpt2_model"
         model_dir.mkdir()
-        
+
         config = {"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]}
         (model_dir / "config.json").write_text(json.dumps(config))
-        (model_dir / "tokenizer_config.json").write_text('{"tokenizer_class": "GPT2Tokenizer"}')
+        (model_dir / "tokenizer_config.json").write_text(
+            '{"tokenizer_class": "GPT2Tokenizer"}'
+        )
         (model_dir / "pytorch_model.bin").write_bytes(b"dummy model weights")
-        
+
         results = scan_model_directory_or_file(str(model_dir))
-        
+
         # Should not have license warnings for config files
         license_issues = [
-            issue for issue in results.get("issues", [])
-            if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
+            issue
+            for issue in results.get("issues", [])
+            if issue.get("type") == "license_warning"
+            and "unspecified licenses" in issue.get("message", "")
         ]
-        
+
         assert len(license_issues) == 0
 
 
@@ -525,7 +531,7 @@ class TestEdgeCases:
         # Empty results
         warnings = check_commercial_use_warnings({})
         assert len(warnings) == 0
-        
+
         # Missing file_metadata
         warnings = check_commercial_use_warnings({"issues": []})
         assert len(warnings) == 0
@@ -540,22 +546,20 @@ class TestEdgeCases:
         # Test LicenseInfo
         license_info = LicenseInfo(
             spdx_id="MIT",
-            name="MIT License", 
+            name="MIT License",
             commercial_allowed=True,
             source="test",
             confidence=0.9,
-            text="License text"
+            text="License text",
         )
-        
+
         assert license_info.spdx_id == "MIT"
         assert license_info.commercial_allowed is True
-        
+
         # Test CopyrightInfo
         copyright_info = CopyrightInfo(
-            holder="Test Corp",
-            year="2024",
-            text="Copyright 2024 Test Corp"
+            holder="Test Corp", year="2024", text="Copyright 2024 Test Corp"
         )
-        
+
         assert copyright_info.holder == "Test Corp"
         assert copyright_info.year == "2024"

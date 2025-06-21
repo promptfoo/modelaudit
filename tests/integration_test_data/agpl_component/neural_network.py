@@ -1,5 +1,5 @@
 # GNU Affero General Public License v3.0
-# 
+#
 # Copyright (C) 2024 AGPL Neural Network Project
 #
 # This program is free software: you can redistribute it and/or modify
@@ -14,18 +14,23 @@
 
 import numpy as np
 
+
 class AGPLNeuralNetwork:
     def __init__(self, layers):
         self.layers = layers
-        self.weights = [np.random.randn(layers[i], layers[i+1]) for i in range(len(layers)-1)]
-    
+        self.weights = [
+            np.random.randn(layers[i], layers[i + 1]) for i in range(len(layers) - 1)
+        ]
+
     def forward(self, x):
         for w in self.weights:
             x = np.tanh(x @ w)
         return x
 
+
 # Save the model
 model = AGPLNeuralNetwork([784, 128, 64, 10])
 import pickle
-with open('integration_test_data/agpl_component/agpl_model.pkl', 'wb') as f:
+
+with open("integration_test_data/agpl_component/agpl_model.pkl", "wb") as f:
     pickle.dump(model, f)
