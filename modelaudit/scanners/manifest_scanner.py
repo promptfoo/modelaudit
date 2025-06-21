@@ -165,6 +165,11 @@ class ManifestScanner(BaseScanner):
             if content:
                 result.bytes_scanned = file_size
 
+                # Extract license information if present
+                license_info = self._extract_license_info(content)
+                if license_info:
+                    result.metadata["license"] = license_info
+
                 # Check for suspicious configuration patterns
                 self._check_suspicious_patterns(content, result)
 
@@ -260,6 +265,24 @@ class ManifestScanner(BaseScanner):
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
+
+        return None
+
+    def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
+        """Return license string if found in manifest content"""
+        if not isinstance(content, dict):
+            return None
+
+        potential_keys = ["license", "licence", "licenses"]
+        for key in potential_keys:
+            if key in content:
+                value = content[key]
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, list) and value:
+                    first = value[0]
+                    if isinstance(first, str):
+                        return first
 
         return None
 
