@@ -74,7 +74,15 @@ def cli():
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
 def scan_command(
-    paths, blacklist, format, output, sbom, timeout, verbose, max_file_size, max_total_size
+    paths,
+    blacklist,
+    format,
+    output,
+    sbom,
+    timeout,
+    verbose,
+    max_file_size,
+    max_total_size,
 ):
     """Scan files or directories for malicious content.
 
