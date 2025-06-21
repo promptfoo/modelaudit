@@ -49,6 +49,11 @@ def cli():
     help="Output file path (prints to stdout if not specified)",
 )
 @click.option(
+    "--sbom",
+    type=click.Path(),
+    help="Write CycloneDX SBOM to the specified file",
+)
+@click.option(
     "--timeout",
     "-t",
     type=int,
@@ -62,7 +67,23 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+@click.option(
+    "--max-total-size",
+    type=int,
+    default=0,
+    help="Maximum total bytes to scan before stopping [default: unlimited]",
+)
+def scan_command(
+    paths,
+    blacklist,
+    format,
+    output,
+    sbom,
+    timeout,
+    verbose,
+    max_file_size,
+    max_total_size,
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -77,9 +98,11 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     Advanced options:
         --format, -f       Output format (text or json)
         --output, -o       Write results to a file instead of stdout
+        --sbom             Write CycloneDX SBOM to file
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
+        --max-total-size   Maximum total bytes to scan before stopping
 
     \b
     Exit codes:
@@ -168,6 +191,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 blacklist_patterns=list(blacklist) if blacklist else None,
                 timeout=timeout,
                 max_file_size=max_file_size,
+                max_total_size=max_total_size,
                 progress_callback=progress_callback,
             )
 
@@ -237,6 +261,14 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     else:
         # Text format
         output_text = format_text_output(aggregated_results, verbose)
+
+    # Generate SBOM if requested
+    if sbom:
+        from .sbom import generate_sbom
+
+        sbom_text = generate_sbom(paths, aggregated_results)
+        with open(sbom, "w") as f:
+            f.write(sbom_text)
 
     # Send output to the specified destination
     if output:
@@ -414,12 +446,18 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with findings", fg="red", bold=True)
-        else:
+        elif any(
+            isinstance(issue, dict) and issue.get("severity") == "warning"
+            for issue in visible_issues
+        ):
             status = click.style(
                 "⚠ Scan completed with warnings",
                 fg="yellow",
                 bold=True,
             )
+        else:
+            # Only info/debug issues
+            status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     else:
         status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     output_lines.append(status)

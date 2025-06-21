@@ -55,7 +55,7 @@ class PyTorchBinaryScanner(BaseScanner):
             if file_size < 100:
                 result.add_issue(
                     f"Suspiciously small binary file: {file_size} bytes",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"file_size": file_size},
                 )
@@ -138,7 +138,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 pos = chunk.find(pattern)
                 result.add_issue(
                     f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern.decode("ascii", errors="ignore"),
@@ -204,7 +204,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 if len(header) < 8:
                     result.add_issue(
                         "File too small to be a valid tensor file",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"header_size": len(header)},
                     )
@@ -220,8 +220,16 @@ class PyTorchBinaryScanner(BaseScanner):
                     # Check if it's a reasonable float value (not NaN, not huge)
                     if not (-1e100 < value < 1e100) or value != value:  # NaN check
                         result.metadata["tensor_validation"] = "unusual_float_values"
-                except struct.error:
-                    pass
+                except struct.error as e:
+                    result.add_issue(
+                        "Error interpreting tensor header",
+                        severity=IssueSeverity.DEBUG,
+                        location=self.current_file_path,
+                        details={
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                        },
+                    )
 
         except Exception as e:
             result.add_issue(

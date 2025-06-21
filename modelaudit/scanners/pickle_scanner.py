@@ -15,26 +15,10 @@ from ..explanations import (
     get_opcode_explanation,
     get_pattern_explanation,
 )
+from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
-
-# Add dangerous builtin functions that might be used in __reduce__ methods
-DANGEROUS_BUILTINS = ["eval", "exec", "compile", "open", "input", "__import__"]
-
-# Dangerous opcodes that can lead to code execution
-DANGEROUS_OPCODES = [
-    "REDUCE",
-    "INST",
-    "OBJ",
-    "NEWOBJ",
-    "NEWOBJ_EX",
-    "GLOBAL",
-    "BUILD",
-    "STACK_GLOBAL",
-]
-
-
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
 # ============================================================================
@@ -715,7 +699,7 @@ class PickleScanner(BaseScanner):
                 if opcode_count > self.max_opcodes:
                     result.add_issue(
                         f"Too many opcodes in pickle (> {self.max_opcodes})",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "opcode_count": opcode_count,
@@ -729,7 +713,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
                         why="The scan exceeded the configured time limit. Large or complex pickle files may take longer to analyze due to the number of opcodes that need to be processed.",
@@ -915,7 +899,7 @@ class PickleScanner(BaseScanner):
                             result.add_issue(
                                 "STACK_GLOBAL opcode found without "
                                 "sufficient string context",
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
                                     "position": pos,
@@ -1107,7 +1091,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(pattern)
                         result.add_issue(
                             f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore')}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "pattern": pattern.decode("ascii", errors="ignore"),
@@ -1164,7 +1148,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Binary scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "bytes_scanned": start_pos + bytes_scanned,

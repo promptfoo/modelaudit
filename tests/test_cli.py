@@ -151,6 +151,23 @@ def test_scan_output_file(tmp_path):
     assert f"Results written to {output_file}" in result.output
 
 
+def test_scan_sbom_output(tmp_path):
+    """Test scanning with SBOM output."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    sbom_file = tmp_path / "sbom.json"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)])
+
+    assert sbom_file.exists()
+    try:
+        json.loads(sbom_file.read_text())
+    except json.JSONDecodeError:
+        pytest.fail("SBOM output is not valid JSON")
+
+
 def test_scan_verbose_mode(tmp_path):
     """Test scanning in verbose mode."""
     test_file = tmp_path / "test_file.dat"
@@ -243,6 +260,44 @@ def test_format_text_output_only_debug_issues():
     output = format_text_output(results, verbose=False)
     assert "No issues found" in output
     assert "Scan completed successfully" in output
+
+
+def test_format_text_output_only_info_issues():
+    """Ensure info-only issues result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Info message", "severity": "info", "location": "file.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    assert "1 info" in output
+    assert "Scan completed successfully" in output
+    assert "Scan completed with warnings" not in output
+
+
+def test_format_text_output_debug_and_info_issues():
+    """Ensure debug and info issues (no warnings) result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Debug info", "severity": "debug", "location": "file1.pkl"},
+            {"message": "Info message", "severity": "info", "location": "file2.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=True)
+    assert "1 info" in output
+    assert "1 debug" in output
+    assert "Scan completed successfully" in output
+    assert "Scan completed with warnings" not in output
 
 
 def test_format_text_output_fast_scan_duration():
