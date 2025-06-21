@@ -262,6 +262,44 @@ def test_format_text_output_only_debug_issues():
     assert "Scan completed successfully" in output
 
 
+def test_format_text_output_only_info_issues():
+    """Ensure info-only issues result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Info message", "severity": "info", "location": "file.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    assert "1 info" in output
+    assert "Scan completed successfully" in output
+    assert "Scan completed with warnings" not in output
+
+
+def test_format_text_output_debug_and_info_issues():
+    """Ensure debug and info issues (no warnings) result in a success status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Debug info", "severity": "debug", "location": "file1.pkl"},
+            {"message": "Info message", "severity": "info", "location": "file2.pkl"},
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=True)
+    assert "1 info" in output
+    assert "1 debug" in output
+    assert "Scan completed successfully" in output
+    assert "Scan completed with warnings" not in output
+
+
 def test_format_text_output_fast_scan_duration():
     """Test duration formatting for very fast scans (< 0.01 seconds)."""
     results = {

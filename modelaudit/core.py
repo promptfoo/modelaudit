@@ -1,18 +1,55 @@
+import builtins
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from threading import Lock
+from typing import IO, Any, Callable, Optional, cast
+from unittest.mock import patch
 
 from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
-from modelaudit.scanners import SCANNER_REGISTRY
+from modelaudit.scanners import (
+    SCANNER_REGISTRY,
+    GgufScanner,
+    KerasH5Scanner,
+    NumPyScanner,
+    OnnxScanner,
+    PickleScanner,
+    PyTorchBinaryScanner,
+    PyTorchZipScanner,
+    SafeTensorsScanner,
+    TensorFlowSavedModelScanner,
+    ZipScanner,
+)
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-from modelaudit.utils.filetype import detect_file_format
+from modelaudit.utils import is_within_directory
+from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
 
 logger = logging.getLogger("modelaudit.core")
+
+# Lock to ensure thread-safe monkey patching of builtins.open
+_OPEN_PATCH_LOCK = Lock()
+
+
+def validate_scan_config(config: dict[str, Any]) -> None:
+    """Validate configuration parameters for scanning."""
+    timeout = config.get("timeout")
+    if timeout is not None:
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError("timeout must be a positive integer")
+
+    max_file_size = config.get("max_file_size")
+    if max_file_size is not None:
+        if not isinstance(max_file_size, int) or max_file_size < 0:
+            raise ValueError("max_file_size must be a non-negative integer")
+
+    chunk_size = config.get("chunk_size")
+    if chunk_size is not None:
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
 
 
 def scan_model_directory_or_file(
@@ -20,6 +57,7 @@ def scan_model_directory_or_file(
     blacklist_patterns: Optional[list[str]] = None,
     timeout: int = 300,
     max_file_size: int = 0,
+    max_total_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     **kwargs,
 ) -> dict[str, Any]:
@@ -31,6 +69,7 @@ def scan_model_directory_or_file(
         blacklist_patterns: Additional blacklist patterns to check against model names
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
+        max_total_size: Maximum total bytes to scan across all files
         progress_callback: Optional callback function to report progress
                           (message, percentage)
         **kwargs: Additional arguments to pass to scanners
@@ -57,9 +96,12 @@ def scan_model_directory_or_file(
     config = {
         "blacklist_patterns": blacklist_patterns,
         "max_file_size": max_file_size,
+        "max_total_size": max_total_size,
         "timeout": timeout,
         **kwargs,
     }
+
+    validate_scan_config(config)
 
     try:
         # Check if path exists
@@ -78,10 +120,24 @@ def scan_model_directory_or_file(
             # Scan all files in the directory
             total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
             processed_files = 0
+            limit_reached = False
 
-            for root, _, files in os.walk(path):
+            base_dir = Path(path).resolve()
+            for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
+                    resolved_file = Path(file_path).resolve()
+                    if not is_within_directory(str(base_dir), str(resolved_file)):
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list.append(
+                            {
+                                "message": "Path traversal outside scanned directory",
+                                "severity": IssueSeverity.CRITICAL.value,
+                                "location": file_path,
+                                "details": {"resolved_path": str(resolved_file)},
+                            }
+                        )
+                        continue
 
                     # Check timeout
                     if time.time() - start_time > timeout:
@@ -124,6 +180,21 @@ def scan_model_directory_or_file(
                         license_metadata = collect_license_metadata(file_path)
                         combined_metadata = {**file_result.metadata, **license_metadata}
                         file_meta[file_path] = combined_metadata
+
+                        if (
+                            max_total_size > 0
+                            and cast(int, results["bytes_scanned"]) > max_total_size
+                        ):
+                            issues_list.append(
+                                {
+                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                                    "severity": IssueSeverity.WARNING.value,
+                                    "location": file_path,
+                                    "details": {"max_total_size": max_total_size},
+                                }
+                            )
+                            limit_reached = True
+                            break
                     except Exception as e:
                         logger.warning(f"Error scanning file {file_path}: {str(e)}")
                         # Add as an issue
@@ -136,6 +207,11 @@ def scan_model_directory_or_file(
                                 "details": {"exception_type": type(e).__name__},
                             },
                         )
+                if limit_reached:
+                    break
+            # Stop scanning if size limit reached
+            if limit_reached:
+                pass
         else:
             # Scan a single file
             if progress_callback:
@@ -147,16 +223,13 @@ def scan_model_directory_or_file(
 
             # Create a wrapper for the file to report progress
             if progress_callback is not None and file_size > 0:
-                import builtins
-                from typing import IO
-
                 original_builtins_open = builtins.open
 
                 def progress_open(
                     file_path: str,
                     mode: str = "r",
-                    *args,
-                    **kwargs,
+                    *args: Any,
+                    **kwargs: Any,
                 ) -> IO[Any]:
                     file = original_builtins_open(file_path, mode, *args, **kwargs)
                     file_pos = 0
@@ -179,14 +252,8 @@ def scan_model_directory_or_file(
                     file.read = progress_read  # type: ignore[method-assign]
                     return file
 
-                # Monkey patch open temporarily
-                builtins.open = progress_open  # type: ignore
-
-                try:
+                with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
                     file_result = scan_file(path, config)
-                finally:
-                    # Restore original open
-                    builtins.open = original_builtins_open
             else:
                 file_result = scan_file(path, config)
 
@@ -212,6 +279,19 @@ def scan_model_directory_or_file(
             combined_metadata = {**file_result.metadata, **license_metadata}
             file_meta[path] = combined_metadata
 
+            if (
+                max_total_size > 0
+                and cast(int, results["bytes_scanned"]) > max_total_size
+            ):
+                issues_list.append(
+                    {
+                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                        "severity": IssueSeverity.WARNING.value,
+                        "location": path,
+                        "details": {"max_total_size": max_total_size},
+                    }
+                )
+
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
 
@@ -220,7 +300,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {str(e)}",
-            "severity": IssueSeverity.CRITICAL.value,
+            "severity": IssueSeverity.WARNING.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -347,6 +427,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     """
     if config is None:
         config = {}
+    validate_scan_config(config)
 
     # Check file size first
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
@@ -368,30 +449,94 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
             f"Error checking file size: {e}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
         return sr
 
     logger.info(f"Scanning file: {path}")
 
-    # Try to use scanners from the registry
-    for scanner_class in SCANNER_REGISTRY:
-        # These are concrete scanner classes, not the abstract BaseScanner
-        if scanner_class.can_handle(path):
-            logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)  # type: ignore[abstract]
-            return scanner.scan(path)
+    header_format = detect_file_format(path)
+    ext_format = detect_format_from_extension(path)
+    ext = os.path.splitext(path)[1].lower()
 
-    # If no scanner could handle the file, create a default unknown format result
-    format_ = detect_file_format(path)
-    sr = ScanResult(scanner_name="unknown")
-    sr.add_issue(
-        f"Unknown or unhandled format: {format_}",
-        severity=IssueSeverity.DEBUG,
-        details={"format": format_, "path": path},
-    )
-    return sr
+    discrepancy_msg = None
+    if (
+        header_format != ext_format
+        and header_format != "unknown"
+        and ext_format != "unknown"
+    ):
+        # Don't warn about common PyTorch .bin files that are ZIP format internally
+        # This is expected behavior for torch.save()
+        if not (
+            ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"
+        ):
+            discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
+            logger.warning(discrepancy_msg)
+
+    # Prefer scanner based on header format
+    preferred_scanner: Optional[type] = None
+
+    # Special handling for PyTorch files that are ZIP-based
+    if header_format == "zip" and ext in [".pt", ".pth"]:
+        preferred_scanner = PyTorchZipScanner
+    elif header_format == "zip" and ext == ".bin":
+        # PyTorch .bin files saved with torch.save() are ZIP format internally
+        # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
+        preferred_scanner = PickleScanner
+    else:
+        preferred_scanner = {
+            "pickle": PickleScanner,
+            "pytorch_binary": PyTorchBinaryScanner,
+            "hdf5": KerasH5Scanner,
+            "safetensors": SafeTensorsScanner,
+            "tensorflow_directory": TensorFlowSavedModelScanner,
+            "protobuf": TensorFlowSavedModelScanner,
+            "zip": ZipScanner,
+            "onnx": OnnxScanner,
+            "gguf": GgufScanner,
+            "ggml": GgufScanner,
+            "numpy": NumPyScanner,
+        }.get(header_format)
+
+    result: Optional[ScanResult]
+    if preferred_scanner and preferred_scanner.can_handle(path):
+        logger.debug(
+            f"Using {preferred_scanner.name} scanner for {path} based on header"
+        )
+        scanner = preferred_scanner(config=config)  # type: ignore[abstract]
+        result = scanner.scan(path)
+    else:
+        result = None
+        for scanner_class in SCANNER_REGISTRY:
+            if scanner_class.can_handle(path):
+                logger.debug(f"Using {scanner_class.name} scanner for {path}")
+                scanner = scanner_class(config=config)  # type: ignore[abstract]
+                result = scanner.scan(path)
+                break
+
+        if result is None:
+            format_ = header_format
+            sr = ScanResult(scanner_name="unknown")
+            sr.add_issue(
+                f"Unknown or unhandled format: {format_}",
+                severity=IssueSeverity.DEBUG,
+                details={"format": format_, "path": path},
+            )
+            result = sr
+
+    if discrepancy_msg:
+        result.add_issue(
+            discrepancy_msg + " Using header-based detection.",
+            severity=IssueSeverity.DEBUG,
+            location=path,
+            details={
+                "extension_format": ext_format,
+                "header_format": header_format,
+            },
+        )
+
+    return result
 
 
 def merge_scan_result(

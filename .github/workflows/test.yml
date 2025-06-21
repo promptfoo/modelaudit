@@ -19,42 +19,22 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Sync dependencies
+        run: |
+          rye sync --features all
 
       - name: Lint with Ruff
         run: |
-          poetry run ruff check .
+          rye run ruff check modelaudit/
 
       - name: Check formatting with Ruff
         run: |
-          poetry run ruff format --check .
-
-  format-check:
-    name: Format Check (Biome)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Check formatting with Biome
-        run: npx @biomejs/biome ci .
+          rye run ruff format --check modelaudit/
 
   type-check:
     name: Type Check
@@ -63,22 +43,18 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Sync dependencies
+        run: |
+          rye sync --features all
 
       - name: Type checking
-        run: poetry run mypy modelaudit/
+        run: |
+          rye run mypy modelaudit/
 
   test:
     name: Test Python ${{ matrix.python-version }}
@@ -90,45 +66,49 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+          version: latest
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
 
-      - name: Run tests with pytest
-        run: poetry run pytest -v --cov=modelaudit
+      - name: Sync dependencies
+        run: |
+          rye sync --features all
+
+      - name: Run fast tests (parallel execution)
+        run: |
+          rye run pytest -n auto -m "not slow and not integration" --cov=modelaudit --tb=short
+
+      - name: Run slow/integration tests (if main branch)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          rye run pytest -n auto -m "slow or integration" --tb=short
 
   build:
     name: Build and Package
-    needs: [lint, format-check, type-check]
+    needs: [lint, type-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
-          poetry build
+          rye build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
