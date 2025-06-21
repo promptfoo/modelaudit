@@ -304,9 +304,11 @@ def detect_unlicensed_datasets(file_paths: List[str]) -> List[str]:
 
             # Check if there's a nearby license file
             dir_path = Path(file_path).parent
-            has_license = any(
-                (dir_path / license_file).exists() for license_file in LICENSE_FILES
-            )
+            try:
+                existing_files = {f.name.lower() for f in dir_path.iterdir() if f.is_file()}
+                has_license = bool(LICENSE_FILES & existing_files)
+            except OSError:
+                has_license = False
 
             if not has_license:
                 # Check if the file itself contains license info
