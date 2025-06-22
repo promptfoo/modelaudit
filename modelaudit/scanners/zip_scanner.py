@@ -1,4 +1,5 @@
 import os
+import tempfile
 import zipfile
 from typing import Any, Dict, Optional
 
@@ -115,7 +116,8 @@ class ZipScanner(BaseScanner):
             for name in z.namelist():
                 info = z.getinfo(name)
 
-                _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                temp_base = os.path.join(tempfile.gettempdir(), "extract")
+                _, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
                     result.add_issue(
                         f"Archive entry {name} attempted path traversal outside the archive",
@@ -167,7 +169,6 @@ class ZipScanner(BaseScanner):
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
                         # Write to temporary file and scan recursively
-                        import tempfile
 
                         with tempfile.NamedTemporaryFile(
                             suffix=".zip", delete=False
@@ -191,7 +192,6 @@ class ZipScanner(BaseScanner):
                     else:
                         # Try to scan the file with appropriate scanner
                         # Write to temporary file with proper extension
-                        import tempfile
 
                         _, ext = os.path.splitext(name)
                         with tempfile.NamedTemporaryFile(
