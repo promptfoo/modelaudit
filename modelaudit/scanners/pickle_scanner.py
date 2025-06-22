@@ -576,9 +576,25 @@ class PickleScanner(BaseScanner):
         if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
             try:
                 # Import here to avoid circular dependency
-                from modelaudit.utils.filetype import detect_file_format
+                from modelaudit.utils.filetype import (
+                    detect_file_format,
+                    validate_file_type,
+                )
 
                 file_format = detect_file_format(path)
+
+                # For security-sensitive pickle files, also validate file type
+                # This helps detect potential file spoofing attacks
+                if file_format == "pickle" and not validate_file_type(path):
+                    # File type validation failed - this could be suspicious
+                    # Log but still allow scanning for now (let scanner handle the validation)
+                    import logging
+
+                    pickle_logger = logging.getLogger("modelaudit.scanners.pickle")
+                    pickle_logger.warning(
+                        f"File type validation failed for potential pickle file: {path}"
+                    )
+
                 return file_format == "pickle"
             except Exception:
                 # If detection fails, fall back to extension check
