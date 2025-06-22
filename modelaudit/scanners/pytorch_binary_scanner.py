@@ -59,9 +59,6 @@ class PyTorchBinaryScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        # Merge any path validation warnings
-        self._merge_path_validation_issues(result)
-
         try:
             self.current_file_path = path
 

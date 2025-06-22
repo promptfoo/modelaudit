@@ -85,9 +85,6 @@ class GgufScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        # Merge any path validation warnings
-        self._merge_path_validation_issues(result)
-
         try:
             with open(path, "rb") as f:
                 magic = f.read(4)

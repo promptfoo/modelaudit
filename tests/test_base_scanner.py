@@ -18,9 +18,6 @@ class MockScanner(BaseScanner):
         if path_check:
             return path_check
 
-        # Merge any path validation warnings
-        self._merge_path_validation_issues(result)
-
         # Add a test issue
         result.add_issue(
             "Test issue",

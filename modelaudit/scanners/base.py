@@ -197,6 +197,7 @@ class BaseScanner(ABC):
             "chunk_size",
             10 * 1024 * 1024,
         )  # Default: 10MB chunks
+        self._path_validation_result: Optional[ScanResult] = None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -213,7 +214,15 @@ class BaseScanner(ABC):
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        return ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name)
+
+        # Automatically merge any stored path validation warnings
+        if hasattr(self, "_path_validation_result") and self._path_validation_result:
+            result.merge(self._path_validation_result)
+            # Clear the stored result to avoid duplicate merging
+            self._path_validation_result = None
+
+        return result
 
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
@@ -285,13 +294,6 @@ class BaseScanner(ABC):
             return result
 
         return None  # Path is valid, scanner should continue and merge warnings if any
-
-    def _merge_path_validation_issues(self, scan_result: ScanResult) -> None:
-        """Merge any path validation warnings into the scan result"""
-        if hasattr(self, "_path_validation_result") and self._path_validation_result:
-            scan_result.merge(self._path_validation_result)
-            # Clear the stored result to avoid duplicate merging
-            self._path_validation_result = None
 
     def get_file_size(self, path: str) -> int:
         """Get the size of a file in bytes."""

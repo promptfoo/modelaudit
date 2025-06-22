@@ -262,15 +262,13 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "unknown":
             return True
 
-        # If header format is unknown but extension is known, this might be suspicious
-        # unless the file is very small or empty
-        if header_format == "unknown":
-            file_path = Path(path)
-            if file_path.is_file() and file_path.stat().st_size >= 4:
-                return False
-            return True  # Small files are acceptable
+        # Small files (< 4 bytes) are always valid - can't determine magic bytes reliably
+        file_path = Path(path)
+        if file_path.is_file() and file_path.stat().st_size < 4:
+            return True
 
-        # Handle special cases where different formats are compatible
+        # Handle special cases where different formats are compatible first
+        # before doing the unknown header check
 
         # Pickle files can be stored in various ways
         if ext_format == "pickle" and header_format in {"pickle", "zip"}:
@@ -305,9 +303,9 @@ def validate_file_type(path: str) -> bool:
         if ext_format in {"gguf", "ggml"}:
             return header_format == ext_format
 
-        # ONNX files should match
+        # ONNX files (Protocol Buffer format - difficult to detect reliably)
         if ext_format == "onnx":
-            return header_format == "onnx"
+            return header_format in {"onnx", "unknown"}
 
         # NumPy files should match
         if ext_format == "numpy":
@@ -324,6 +322,14 @@ def validate_file_type(path: str) -> bool:
         # TensorFlow Lite files
         if ext_format == "tflite":
             return True  # TFLite format can be complex to validate
+
+        # If header format is unknown but extension is known, this might be suspicious
+        # unless the file is very small or empty (checked after format-specific rules)
+        if header_format == "unknown":
+            file_path = Path(path)
+            if file_path.is_file() and file_path.stat().st_size >= 4:
+                return False
+            return True  # Small files are acceptable
 
         # Default: exact match required
         return header_format == ext_format

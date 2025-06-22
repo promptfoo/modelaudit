@@ -613,9 +613,6 @@ class PickleScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        # Merge any path validation warnings
-        self._merge_path_validation_issues(result)
-
         # Check if this is a .bin file that might be a PyTorch file
         is_bin_file = os.path.splitext(path)[1].lower() == ".bin"
 
