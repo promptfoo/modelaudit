@@ -6,7 +6,7 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Tests](https://github.com/promptfoo/modelaudit/actions/workflows/test.yml/badge.svg)](https://github.com/promptfoo/modelaudit/actions/workflows/test.yml)
 [![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
-[![License](https://img.shields.io/github/license/promptfoo/modelaudit)](https://github.com/promptfoo/modelaudit/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
