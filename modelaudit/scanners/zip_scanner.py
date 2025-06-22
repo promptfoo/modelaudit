@@ -201,11 +201,17 @@ class ZipScanner(BaseScanner):
                             os.unlink(tmp_path)
                     else:
                         # Try to scan the file with appropriate scanner
-                        # Write to temporary file with proper extension
+                        # Write to temporary file with proper extension and original filename
+                        # This preserves the original filename for scanners that need it (like ManifestScanner)
 
                         _, ext = os.path.splitext(name)
+                        # Create a more meaningful temporary filename that includes the original name
+                        # This helps scanners like ManifestScanner that depend on filename patterns
+                        safe_name = (
+                            os.path.basename(name).replace("/", "_").replace("\\", "_")
+                        )
                         with tempfile.NamedTemporaryFile(
-                            suffix=ext, delete=False
+                            suffix=f"_{safe_name}", delete=False
                         ) as tmp:
                             tmp.write(data)
                             tmp_path = tmp.name

@@ -143,11 +143,13 @@ def scan_command(
         "issues": [],
         "has_errors": False,
         "files_scanned": 0,
+        "assets": [],  # Track all assets encountered
     }
 
     # Scan each path
     for path in paths:
         # Early exit for common non-model file extensions
+        # Note: Allow .json, .yaml, .yml as they can be model config files
         if os.path.isfile(path):
             _, ext = os.path.splitext(path)
             ext = ext.lower()
@@ -158,9 +160,6 @@ def scan_command(
                 ".js",
                 ".html",
                 ".css",
-                ".json",
-                ".yaml",
-                ".yml",
             ):
                 if verbose:
                     logger.info(f"Skipping non-model file: {path}")
@@ -202,6 +201,7 @@ def scan_command(
                 "files_scanned",
                 1,
             )  # Count each file scanned
+            aggregated_results["assets"].extend(results.get("assets", []))
             if results.get("has_errors", False):
                 aggregated_results["has_errors"] = True
 
