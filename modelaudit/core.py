@@ -26,7 +26,11 @@ from modelaudit.scanners import (
 )
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory
-from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
+from modelaudit.utils.filetype import (
+    detect_file_format,
+    detect_format_from_extension,
+    validate_file_type,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -460,8 +464,15 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
 
+    # Validate file type consistency as a security check
+    file_type_valid = validate_file_type(path)
     discrepancy_msg = None
-    if (
+
+    if not file_type_valid:
+        # File type validation failed - this is a security concern
+        discrepancy_msg = f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing or corruption."
+        logger.warning(discrepancy_msg)
+    elif (
         header_format != ext_format
         and header_format != "unknown"
         and ext_format != "unknown"
@@ -526,13 +537,16 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
             result = sr
 
     if discrepancy_msg:
+        # Determine severity based on whether it's a validation failure or just a discrepancy
+        severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
         result.add_issue(
             discrepancy_msg + " Using header-based detection.",
-            severity=IssueSeverity.DEBUG,
+            severity=severity,
             location=path,
             details={
                 "extension_format": ext_format,
                 "header_format": header_format,
+                "file_type_validation_failed": not file_type_valid,
             },
         )
 

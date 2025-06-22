@@ -265,6 +265,37 @@ class BaseScanner(ABC):
             result.finish(success=False)
             return result
 
+        # Validate file type consistency for files (security check)
+        if os.path.isfile(path):
+            try:
+                from modelaudit.utils.filetype import (
+                    detect_file_format_from_magic,
+                    detect_format_from_extension,
+                    validate_file_type,
+                )
+
+                if not validate_file_type(path):
+                    header_format = detect_file_format_from_magic(path)
+                    ext_format = detect_format_from_extension(path)
+                    result.add_issue(
+                        f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing, corruption, or a security threat.",
+                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        location=path,
+                        details={
+                            "header_format": header_format,
+                            "extension_format": ext_format,
+                            "security_check": "file_type_validation",
+                        },
+                    )
+            except Exception as e:
+                # Don't fail the scan if file type validation has an error
+                result.add_issue(
+                    f"File type validation error: {str(e)}",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
+
         return None  # Path is valid
 
     def get_file_size(self, path: str) -> int:

@@ -55,6 +55,25 @@ def detect_file_format_from_magic(path: str) -> str:
     if any(magic4.startswith(m) for m in pickle_magics):
         return "pickle"
 
+    # SafeTensors format check: 8-byte length header + JSON metadata
+    if size >= 12:  # Minimum: 8 bytes length + some JSON
+        try:
+            import struct
+
+            # Read 8 bytes as little-endian u64 for JSON length
+            json_length = struct.unpack("<Q", magic8)[0]
+            # Sanity check: JSON length should be reasonable
+            if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
+                # Read some bytes after the header to check for JSON
+                with open(path, "rb") as f:
+                    f.seek(8)  # Skip the 8-byte header
+                    json_start = f.read(min(32, json_length))
+                    if json_start.startswith(b"{") and b'"' in json_start:
+                        return "safetensors"
+        except (struct.error, OSError):
+            pass
+
+    # Fallback: check if it starts with JSON (for old safetensors or other JSON formats)
     if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
         return "safetensors"
 
@@ -230,21 +249,80 @@ def detect_format_from_extension(path: str) -> str:
 
 def validate_file_type(path: str) -> bool:
     """Validate that a file's magic bytes match its extension-based format."""
-    header_format = detect_file_format_from_magic(path)
-    ext_format = detect_format_from_extension(path)
+    try:
+        header_format = detect_file_format_from_magic(path)
+        ext_format = detect_format_from_extension(path)
 
-    if ext_format == "unknown":
-        return True
-    if header_format == "unknown":
-        return False
+        # If extension format is unknown, we can't validate - assume valid
+        if ext_format == "unknown":
+            return True
 
-    if ext_format == "pickle" and header_format in {"pickle", "zip"}:
-        return True
-    if ext_format == "pytorch_binary" and header_format in {
-        "pytorch_binary",
-        "pickle",
-        "zip",
-    }:
-        return True
+        # If header format is unknown but extension is known, this might be suspicious
+        # unless the file is very small or empty
+        if header_format == "unknown":
+            file_path = Path(path)
+            if file_path.is_file() and file_path.stat().st_size >= 4:
+                return False
+            return True  # Small files are acceptable
 
-    return header_format == ext_format
+        # Handle special cases where different formats are compatible
+
+        # Pickle files can be stored in various ways
+        if ext_format == "pickle" and header_format in {"pickle", "zip"}:
+            return True
+
+        # PyTorch binary files are flexible in format
+        if ext_format == "pytorch_binary" and header_format in {
+            "pytorch_binary",
+            "pickle",
+            "zip",
+            "unknown",  # .bin files can contain arbitrary binary data
+        }:
+            return True
+
+        # TensorFlow protobuf files (.pb extension)
+        if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
+            return True
+
+        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt when they're torch.save() files)
+        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary"}:
+            return True
+
+        # HDF5 files should always match
+        if ext_format == "hdf5":
+            return header_format == "hdf5"
+
+        # SafeTensors files should always match
+        if ext_format == "safetensors":
+            return header_format == "safetensors"
+
+        # GGUF/GGML files should match their format
+        if ext_format in {"gguf", "ggml"}:
+            return header_format == ext_format
+
+        # ONNX files should match
+        if ext_format == "onnx":
+            return header_format == "onnx"
+
+        # NumPy files should match
+        if ext_format == "numpy":
+            return header_format == "numpy"
+
+        # Flax msgpack files (less strict validation)
+        if ext_format == "flax_msgpack":
+            return True  # Hard to validate msgpack format reliably
+
+        # TensorFlow directories are special case
+        if ext_format == "tensorflow_directory":
+            return header_format == "tensorflow_directory"
+
+        # TensorFlow Lite files
+        if ext_format == "tflite":
+            return True  # TFLite format can be complex to validate
+
+        # Default: exact match required
+        return header_format == ext_format
+
+    except Exception:
+        # If validation fails due to error, assume valid to avoid breaking scans
+        return True

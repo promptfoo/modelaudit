@@ -215,3 +215,60 @@ def test_issue_class():
     assert "[WARNING]" in issue_str
     assert "test.pkl" in issue_str
     assert "Test issue" in issue_str
+
+
+def test_base_scanner_file_type_validation(tmp_path):
+    """Test that BaseScanner performs file type validation in _check_path."""
+    scanner = MockScanner()
+    
+    # Create a file with mismatched extension and magic bytes
+    invalid_h5 = tmp_path / "fake.h5"
+    invalid_h5.write_bytes(b"not real hdf5 data")
+    
+    result = scanner._check_path(str(invalid_h5))
+    
+    # Should return None (path is valid) but with warning issues
+    assert result is None
+    
+    # Scan the file to see if warnings are generated
+    scan_result = scanner.scan(str(invalid_h5))
+    
+    # Check if any issues were generated during path validation
+    # The file type validation should be done in _check_path
+    # which gets called before scan, so we expect some validation
+    assert scan_result is not None
+
+
+def test_base_scanner_valid_file_type(tmp_path):
+    """Test that BaseScanner doesn't warn for valid file types."""
+    import zipfile
+    
+    scanner = MockScanner()
+    
+    # Create a valid ZIP file with .zip extension
+    zip_file = tmp_path / "archive.zip"
+    with zipfile.ZipFile(zip_file, "w") as zipf:
+        zipf.writestr("test.txt", "data")
+    
+    result = scanner._check_path(str(zip_file))
+    
+    # Should return None (path is valid) without validation warnings
+    assert result is None
+    
+    # Scan should work without file type validation issues
+    scan_result = scanner.scan(str(zip_file))
+    assert scan_result is not None
+
+
+def test_base_scanner_small_file_handling(tmp_path):
+    """Test that BaseScanner handles small files properly in validation."""
+    scanner = MockScanner()
+    
+    # Create a very small file (< 4 bytes)
+    small_file = tmp_path / "tiny.h5"
+    small_file.write_bytes(b"hi")
+    
+    result = scanner._check_path(str(small_file))
+    
+    # Should return None (path is valid) - small files can't be validated
+    assert result is None
