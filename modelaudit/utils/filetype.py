@@ -43,6 +43,11 @@ def detect_file_format_from_magic(path: str) -> str:
     if magic8 == hdf5_magic:
         return "hdf5"
 
+    # NumPy magic check
+    numpy_magic = b"\x93NUMPY"
+    if magic8.startswith(numpy_magic):
+        return "numpy"
+
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 == b"GGML":
