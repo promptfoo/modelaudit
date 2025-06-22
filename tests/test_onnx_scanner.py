@@ -65,7 +65,7 @@ def test_onnx_scanner_basic_model(tmp_path):
     assert result.success
     assert result.bytes_scanned > 0
     assert not any(
-        i.severity in (IssueSeverity.ERROR, IssueSeverity.WARNING)
+        i.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING)
         for i in result.issues
     )
 
@@ -89,5 +89,5 @@ def test_onnx_scanner_corrupted(tmp_path):
     model_path.write_bytes(data[:10])
     result = OnnxScanner().scan(str(model_path))
     assert not result.success or any(
-        i.severity == IssueSeverity.ERROR for i in result.issues
+        i.severity == IssueSeverity.CRITICAL for i in result.issues
     )
