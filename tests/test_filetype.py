@@ -44,8 +44,10 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pkl": "pickle",
         ".pickle": "pickle",
         ".dill": "pickle",  # .dill files are treated as pickle files
+        ".msgpack": "flax_msgpack",
         ".h5": "hdf5",
         ".pb": "protobuf",
+        ".tflite": "tflite",
         ".unknown": "unknown",
     }
 

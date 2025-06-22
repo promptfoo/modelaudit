@@ -54,6 +54,8 @@ Version History:
 
 from typing import Any
 
+from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
+
 # =============================================================================
 # PICKLE SECURITY PATTERNS
 # =============================================================================
@@ -69,7 +71,14 @@ SUSPICIOUS_GLOBALS = {
     "subprocess": "*",  # Process spawning and control
     "runpy": "*",  # Dynamic module execution
     # Code execution functions - CRITICAL RISK
-    "builtins": ["eval", "exec", "__import__"],  # Dynamic code evaluation
+    "builtins": [
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "__import__",
+    ],  # Dynamic code evaluation and file access
     "operator": ["attrgetter"],  # Attribute access bypass
     "importlib": ["import_module"],  # Dynamic module loading
     # Serialization/deserialization - MEDIUM RISK
@@ -97,6 +106,16 @@ SUSPICIOUS_GLOBALS = {
     "dill._dill": "*",
 }
 
+# Builtin functions that enable dynamic code execution or module loading
+DANGEROUS_BUILTINS = [
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "input",
+    "__import__",
+]
+
 # Suspicious string patterns used by PickleScanner
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
@@ -119,6 +138,9 @@ SUSPICIOUS_STRING_PATTERNS = [
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
 ]
+
+# Dangerous pickle opcodes that can lead to code execution
+DANGEROUS_OPCODES = set(_EXPLAIN_OPCODES.keys())
 
 # =============================================================================
 # TENSORFLOW/KERAS SECURITY PATTERNS
@@ -255,6 +277,16 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "description": "Regex patterns for malicious code strings",
             "risk_level": "MEDIUM-HIGH",
         },
+        "dangerous_builtins": {
+            "patterns": DANGEROUS_BUILTINS,
+            "description": "Builtin functions enabling dynamic code execution",
+            "risk_level": "HIGH",
+        },
+        "dangerous_opcodes": {
+            "patterns": sorted(DANGEROUS_OPCODES),
+            "description": "Pickle opcodes that can trigger code execution",
+            "risk_level": "HIGH",
+        },
         "tensorflow_ops": {
             "patterns": SUSPICIOUS_OPS,
             "description": "Dangerous TensorFlow operations",
@@ -302,5 +334,15 @@ def validate_patterns() -> list[str]:
             warnings.append(f"Module name must be string: {module}")
         if not (funcs == "*" or isinstance(funcs, list)):
             warnings.append(f"Functions must be '*' or list for module {module}")
+
+    # Validate dangerous builtins
+    for builtin in DANGEROUS_BUILTINS:
+        if not isinstance(builtin, str):
+            warnings.append(f"Builtin name must be string: {builtin}")
+
+    # Validate dangerous opcodes
+    for opcode in DANGEROUS_OPCODES:
+        if not isinstance(opcode, str):
+            warnings.append(f"Opcode name must be string: {opcode}")
 
     return warnings
