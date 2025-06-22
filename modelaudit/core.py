@@ -39,6 +39,20 @@ logger = logging.getLogger("modelaudit.core")
 _OPEN_PATCH_LOCK = Lock()
 
 
+def _add_asset_to_results(
+    results: dict[str, Any], file_path: str, file_result: ScanResult
+) -> None:
+    """Helper function to add an asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append(asset_from_scan_result(file_path, file_result))
+
+
+def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None:
+    """Helper function to add an error asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append({"path": file_path, "type": "error"})
+
+
 def validate_scan_config(config: dict[str, Any]) -> None:
     """Validate configuration parameters for scanning."""
     timeout = config.get("timeout")
@@ -181,10 +195,7 @@ def scan_model_directory_or_file(
                             issues_list.append(issue.to_dict())
 
                         # Add to assets list for inventory
-                        assets_list = cast(list[dict[str, Any]], results["assets"])
-                        assets_list.append(
-                            asset_from_scan_result(file_path, file_result)
-                        )
+                        _add_asset_to_results(results, file_path, file_result)
 
                         # Save metadata for SBOM generation
                         file_meta = cast(dict[str, Any], results["file_metadata"])
@@ -220,8 +231,7 @@ def scan_model_directory_or_file(
                             },
                         )
                         # Add error entry to assets
-                        assets_list = cast(list[dict[str, Any]], results["assets"])
-                        assets_list.append({"path": file_path, "type": "error"})
+                        _add_error_asset_to_results(results, file_path)
                 if limit_reached:
                     break
             # Stop scanning if size limit reached
@@ -288,8 +298,7 @@ def scan_model_directory_or_file(
                 issues_list.append(issue.to_dict())
 
             # Add to assets list for inventory
-            assets_list = cast(list[dict[str, Any]], results["assets"])
-            assets_list.append(asset_from_scan_result(path, file_result))
+            _add_asset_to_results(results, path, file_result)
 
             # Save metadata for SBOM generation
             file_meta = cast(dict[str, Any], results["file_metadata"])
@@ -324,8 +333,7 @@ def scan_model_directory_or_file(
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
-        assets_list = cast(list[dict[str, Any]], results["assets"])
-        assets_list.append({"path": path, "type": "error"})
+        _add_error_asset_to_results(results, path)
 
     # Add final timing information
     results["finish_time"] = time.time()

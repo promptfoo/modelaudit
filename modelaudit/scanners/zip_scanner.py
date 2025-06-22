@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import zipfile
 from typing import Any, Dict, Optional
@@ -207,8 +208,9 @@ class ZipScanner(BaseScanner):
                         _, ext = os.path.splitext(name)
                         # Create a more meaningful temporary filename that includes the original name
                         # This helps scanners like ManifestScanner that depend on filename patterns
-                        safe_name = (
-                            os.path.basename(name).replace("/", "_").replace("\\", "_")
+                        # Use robust sanitization to handle special characters safely
+                        safe_name = re.sub(
+                            r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name)
                         )
                         with tempfile.NamedTemporaryFile(
                             suffix=f"_{safe_name}", delete=False
