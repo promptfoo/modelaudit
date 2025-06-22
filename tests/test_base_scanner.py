@@ -18,6 +18,9 @@ class MockScanner(BaseScanner):
         if path_check:
             return path_check
 
+        # Merge any path validation warnings
+        self._merge_path_validation_issues(result)
+
         # Add a test issue
         result.add_issue(
             "Test issue",
@@ -227,16 +230,26 @@ def test_base_scanner_file_type_validation(tmp_path):
     
     result = scanner._check_path(str(invalid_h5))
     
-    # Should return None (path is valid) but with warning issues
+    # Should return None (warnings don't stop the scan)
     assert result is None
     
-    # Scan the file to see if warnings are generated
+    # But scan should include the validation warnings
     scan_result = scanner.scan(str(invalid_h5))
-    
-    # Check if any issues were generated during path validation
-    # The file type validation should be done in _check_path
-    # which gets called before scan, so we expect some validation
     assert scan_result is not None
+    
+    # Check that we have a file type validation warning in the scan result
+    validation_issues = [
+        issue for issue in scan_result.issues
+        if "file type validation failed" in issue.message.lower()
+    ]
+    assert len(validation_issues) > 0
+    
+    # Should be WARNING level (not CRITICAL) to allow scan to continue
+    assert validation_issues[0].severity == IssueSeverity.WARNING
+    
+    # Should contain details about the mismatch
+    assert "header_format" in validation_issues[0].details
+    assert "extension_format" in validation_issues[0].details
 
 
 def test_base_scanner_valid_file_type(tmp_path):

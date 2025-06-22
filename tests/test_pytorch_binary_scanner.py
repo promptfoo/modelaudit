@@ -38,7 +38,11 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
 
     assert result.success
     assert result.bytes_scanned == len(data) * 10
-    assert len(result.issues) == 0  # Should have no issues for clean file
+    
+    # Should have one file type validation warning (random data doesn't match pytorch_binary format)
+    validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
+    assert len(validation_issues) == 1
+    assert validation_issues[0].severity.value == "warning"
 
 
 def test_pytorch_binary_scanner_code_patterns(tmp_path):

@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import stat
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -220,7 +219,7 @@ class BaseScanner(ABC):
         """Common path checks and validation
 
         Returns:
-            None if path is valid, otherwise a ScanResult with errors
+            None if path is valid or has only warnings, otherwise a ScanResult with critical errors
         """
         result = self._create_result()
 
@@ -234,29 +233,8 @@ class BaseScanner(ABC):
             result.finish(success=False)
             return result
 
-        # Check if path is readable. Use os.stat to catch unreadable files even
-        # when running as root.
+        # Check if path is readable
         if not os.access(path, os.R_OK):
-            result.add_issue(
-                f"Path is not readable: {path}",
-                severity=IssueSeverity.CRITICAL,
-                details={"path": path},
-            )
-            result.finish(success=False)
-            return result
-
-        # Additional permission check based on file mode bits
-        try:
-            mode = os.stat(path).st_mode
-            if not (mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)):
-                result.add_issue(
-                    f"Path is not readable: {path}",
-                    severity=IssueSeverity.CRITICAL,
-                    details={"path": path},
-                )
-                result.finish(success=False)
-                return result
-        except OSError:
             result.add_issue(
                 f"Path is not readable: {path}",
                 severity=IssueSeverity.CRITICAL,
@@ -296,7 +274,24 @@ class BaseScanner(ABC):
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
 
-        return None  # Path is valid
+        # Store validation warnings for the scanner to merge later
+        self._path_validation_result = result if result.issues else None
+
+        # Only return result for CRITICAL issues that should stop the scan
+        critical_issues = [
+            issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        if critical_issues:
+            return result
+
+        return None  # Path is valid, scanner should continue and merge warnings if any
+
+    def _merge_path_validation_issues(self, scan_result: ScanResult) -> None:
+        """Merge any path validation warnings into the scan result"""
+        if hasattr(self, "_path_validation_result") and self._path_validation_result:
+            scan_result.merge(self._path_validation_result)
+            # Clear the stored result to avoid duplicate merging
+            self._path_validation_result = None
 
     def get_file_size(self, path: str) -> int:
         """Get the size of a file in bytes."""
