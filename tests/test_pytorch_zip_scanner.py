@@ -142,7 +142,7 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
 
 def test_pytorch_pickle_file_unsupported(tmp_path):
     """Raw pickle files with .pt extension should be unsupported."""
-    from tests.evil_pickle import EvilClass
+    from tests.assets.generators.generate_evil_pickle import EvilClass
 
     file_path = tmp_path / "raw_pickle.pt"
     with file_path.open("wb") as f:
@@ -156,3 +156,23 @@ def test_pytorch_pickle_file_unsupported(tmp_path):
         "zip" in issue.message.lower() or "pytorch" in issue.message.lower()
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
+    """Ensure BytesIO objects are properly closed after scanning."""
+    import io
+
+    closed = {}
+
+    class TrackedBytesIO(io.BytesIO):
+        def close(self) -> None:  # type: ignore[override]
+            closed["closed"] = True
+            super().close()
+
+    monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
+
+    model_path = create_pytorch_zip(tmp_path)
+    scanner = PyTorchZipScanner()
+    scanner.scan(str(model_path))
+
+    assert closed.get("closed") is True

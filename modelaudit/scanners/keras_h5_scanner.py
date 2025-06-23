@@ -2,6 +2,12 @@ import json
 import os
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_CONFIG_PROPERTIES,
+    SUSPICIOUS_LAYER_TYPES,
+)
+
+from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
@@ -11,30 +17,6 @@ try:
     HAS_H5PY = True
 except ImportError:
     HAS_H5PY = False
-
-# Suspicious Keras layer types that might contain executable code
-SUSPICIOUS_LAYER_TYPES = {
-    "Lambda": "Can contain arbitrary Python code",
-    "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
-    "PyFunc": "Can execute Python code",
-    "CallbackLambda": "Can execute callbacks at runtime",
-}
-
-# Suspicious config properties that might indicate security issues
-SUSPICIOUS_CONFIG_PROPERTIES = [
-    "function",
-    "module",
-    "code",
-    "eval",
-    "exec",
-    "import",
-    "subprocess",
-    "os.",
-    "system",
-    "popen",
-    "shell",
-]
 
 
 class KerasH5Scanner(BaseScanner):
@@ -82,6 +64,10 @@ class KerasH5Scanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
@@ -108,12 +94,29 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
-                    result.add_issue(
-                        "File does not appear to be a Keras model "
-                        "(no model_config attribute)",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
+                    # Check if this might be a TensorFlow SavedModel H5 file instead
+                    # Look for common TensorFlow H5 structure patterns
+                    is_tensorflow_h5 = any(
+                        key.startswith(
+                            ("model_weights", "optimizer_weights", "variables")
+                        )
+                        for key in f.keys()
                     )
+
+                    if is_tensorflow_h5:
+                        result.add_issue(
+                            "File appears to be a TensorFlow H5 model, not Keras format "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - this is expected
+                            location=self.current_file_path,
+                        )
+                    else:
+                        result.add_issue(
+                            "File does not appear to be a Keras model "
+                            "(no model_config attribute)",
+                            severity=IssueSeverity.DEBUG,  # Reduced severity - not necessarily suspicious
+                            location=self.current_file_path,
+                        )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
 
@@ -214,6 +217,9 @@ class KerasH5Scanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                         "layer_config": layer.get("config", {}),
                     },
+                    why=get_pattern_explanation("lambda_layer")
+                    if layer_class == "Lambda"
+                    else None,
                 )
 
             # Check layer configuration for suspicious strings
@@ -253,7 +259,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_issue(
                             f"Suspicious configuration string found in {context}: "
                             f"'{suspicious_term}'",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
                                 "suspicious_term": suspicious_term,

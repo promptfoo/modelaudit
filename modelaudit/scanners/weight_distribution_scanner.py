@@ -87,6 +87,10 @@ class WeightDistributionScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -133,6 +137,7 @@ class WeightDistributionScanner(BaseScanner):
                     severity=anomaly["severity"],
                     location=path,
                     details=anomaly["details"],
+                    why=anomaly.get("why"),
                 )
 
             # Add metadata
@@ -360,18 +365,37 @@ class WeightDistributionScanner(BaseScanner):
 
         n_inputs, n_outputs = weights.shape
 
-        # Detect if this is likely an LLM vocabulary layer
-        is_likely_llm = n_outputs > self.llm_vocab_threshold
+        # Detect if this is likely an LLM vocabulary layer or large transformer model
+        is_likely_llm = (
+            n_outputs > self.llm_vocab_threshold  # Large vocab layer
+            or n_inputs
+            > 768  # Large hidden dimensions typical of LLMs (768+ for BERT/GPT)
+            or "transformer" in layer_name.lower()  # Transformer architecture
+            or "attention" in layer_name.lower()  # Attention layers
+            or "gpt" in layer_name.lower()  # GPT models
+            or "bert" in layer_name.lower()  # BERT models
+            or "llama" in layer_name.lower()  # LLaMA models
+            or "t5" in layer_name.lower()  # T5 models
+            or
+            # GPT-style layer patterns
+            layer_name.startswith("h.")  # GPT-2 style layers (h.0, h.1, etc.)
+            or "mlp" in layer_name.lower()  # Multi-layer perceptron in transformers
+            or "c_fc" in layer_name.lower()  # GPT-2 feed-forward layers
+            or "c_attn" in layer_name.lower()  # GPT-2 attention layers
+            or "c_proj" in layer_name.lower()  # GPT-2 projection layers
+        )
 
-        # Skip checks for LLMs if disabled
+        # Skip checks for LLMs if disabled (default behavior)
         if is_likely_llm and not self.enable_llm_checks:
             return []
 
         # For LLMs, we need much stricter thresholds to avoid false positives
         if is_likely_llm:
             # For LLMs, only check for extreme outliers with much higher thresholds
-            z_score_threshold = max(5.0, self.z_score_threshold * 1.5)
-            outlier_percentage_threshold = 0.001  # 0.1% for LLMs
+            z_score_threshold = max(
+                8.0, self.z_score_threshold * 2.5
+            )  # Much higher threshold
+            outlier_percentage_threshold = 0.0001  # 0.01% for LLMs - very restrictive
         else:
             z_score_threshold = self.z_score_threshold
             outlier_percentage_threshold = 0.01  # 1% for classification models
@@ -404,6 +428,7 @@ class WeightDistributionScanner(BaseScanner):
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
                         },
+                        "why": "Neurons with weight magnitudes significantly different from others in the same layer may indicate tampering, backdoors, or training anomalies. These outliers are flagged when their statistical z-score exceeds the threshold.",
                     }
                 )
 
@@ -444,6 +469,7 @@ class WeightDistributionScanner(BaseScanner):
                                 "weight_norm": float(output_norms[neuron_idx]),
                                 "total_outputs": n_outputs,
                             },
+                            "why": "Neurons with weight patterns completely unlike others in the same layer are uncommon in standard training. This dissimilarity (measured by cosine similarity below threshold) may indicate injected functionality or training irregularities.",
                         }
                     )
 
@@ -474,6 +500,7 @@ class WeightDistributionScanner(BaseScanner):
                             "max_weight": float(np.max(weight_magnitudes)),
                             "total_outputs": n_outputs,
                         },
+                        "why": "Weight values that are orders of magnitude larger than typical can cause numerical instability, overflow attacks, or may encode hidden data. The threshold is set at 100 times the mean magnitude.",
                     }
                 )
 
