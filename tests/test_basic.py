@@ -274,6 +274,9 @@ def test_invalid_config_values(tmp_path):
     with pytest.raises(ValueError):
         scan_model_directory_or_file(str(test_file), chunk_size=0)
 
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_total_size=-1)
+
 
 def test_version_consistency():
     """Test that __version__ matches the package metadata version."""
