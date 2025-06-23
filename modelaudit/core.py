@@ -508,11 +508,11 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
 
     # Special handling for PyTorch files that are ZIP-based
     if header_format == "zip" and ext in [".pt", ".pth"]:
-        preferred_scanner = _registry._load_scanner("pytorch_zip")
+        preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
         # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
-        preferred_scanner = _registry._load_scanner("pickle")
+        preferred_scanner = _registry.load_scanner_by_id("pickle")
     else:
         format_to_scanner = {
             "pickle": "pickle",
@@ -529,7 +529,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         }
         scanner_id = format_to_scanner.get(header_format)
         if scanner_id:
-            preferred_scanner = _registry._load_scanner(scanner_id)
+            preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
     result: Optional[ScanResult]
     if preferred_scanner and preferred_scanner.can_handle(path):

@@ -1,6 +1,7 @@
 import importlib
 import logging
-from typing import Any, ClassVar, Dict, List, Optional, Type
+import threading
+from typing import Any, Dict, List, Optional, Type
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -18,7 +19,27 @@ class ScannerRegistry:
     def __init__(self):
         self._scanners: Dict[str, Dict[str, Any]] = {}
         self._loaded_scanners: Dict[str, Type[BaseScanner]] = {}
+        self._lock = threading.Lock()
         self._init_registry()
+
+    # Class-level constant for AI/ML manifest patterns
+    _AIML_MANIFEST_PATTERNS = frozenset([
+        "config.json",
+        "model.json", 
+        "tokenizer.json",
+        "params.json",
+        "hyperparams.yaml",
+        "training_args.json",
+        "dataset_info.json",
+        "model.yaml",
+        "environment.yml",
+        "conda.yaml",
+        "requirements.txt",
+        "metadata.json",
+        "index.json",
+        "tokenizer_config.json",
+        "model_config.json",
+    ])
 
     def _init_registry(self):
         """Initialize the scanner registry with metadata"""
@@ -190,29 +211,36 @@ class ScannerRegistry:
         }
 
     def _load_scanner(self, scanner_id: str) -> Optional[Type[BaseScanner]]:
-        """Lazy load a scanner class"""
+        """Lazy load a scanner class (thread-safe)"""
+        # Check if already loaded (fast path without lock)
         if scanner_id in self._loaded_scanners:
             return self._loaded_scanners[scanner_id]
 
-        if scanner_id not in self._scanners:
-            return None
+        # Use lock for loading to prevent race conditions
+        with self._lock:
+            # Double-check after acquiring lock
+            if scanner_id in self._loaded_scanners:
+                return self._loaded_scanners[scanner_id]
 
-        scanner_info = self._scanners[scanner_id]
+            if scanner_id not in self._scanners:
+                return None
 
-        try:
-            module = importlib.import_module(scanner_info["module"])
-            scanner_class = getattr(module, scanner_info["class"])
-            self._loaded_scanners[scanner_id] = scanner_class
-            logger.debug(f"Loaded scanner: {scanner_id}")
-            return scanner_class
-        except ImportError as e:
-            logger.debug(f"Failed to load scanner {scanner_id}: {e}")
-            return None
-        except AttributeError as e:
-            logger.error(
-                f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-            )
-            return None
+            scanner_info = self._scanners[scanner_id]
+
+            try:
+                module = importlib.import_module(scanner_info["module"])
+                scanner_class = getattr(module, scanner_info["class"])
+                self._loaded_scanners[scanner_id] = scanner_class
+                logger.debug(f"Loaded scanner: {scanner_id}")
+                return scanner_class
+            except ImportError as e:
+                logger.debug(f"Failed to load scanner {scanner_id}: {e}")
+                return None
+            except AttributeError as e:
+                logger.error(
+                    f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
+                )
+                return None
 
     def get_scanner_classes(self) -> List[Type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
@@ -249,26 +277,7 @@ class ScannerRegistry:
                 extension_match = True
             elif scanner_id == "manifest":
                 # Special handling for manifest scanner - check filename patterns
-                aiml_patterns = [
-                    "config.json",
-                    "model.json",
-                    "tokenizer.json",
-                    "params.json",
-                    "hyperparams.yaml",
-                    "training_args.json",
-                    "dataset_info.json",
-                    "model.yaml",
-                    "environment.yml",
-                    "conda.yaml",
-                    "requirements.txt",
-                    "metadata.json",
-                    "index.json",
-                    "tokenizer_config.json",
-                    "model_config.json",
-                ]
-                # Use exact filename matching to avoid false positives like "config.json.backup"
-                if any(filename == pattern or filename.endswith(f"/{pattern}") for pattern in aiml_patterns):
-                    extension_match = True
+                extension_match = self._is_aiml_manifest_file(filename)
 
             if extension_match:
                 # Only load and check can_handle for scanners that match extension
@@ -286,22 +295,42 @@ class ScannerRegistry:
         """Get metadata about a scanner without loading it"""
         return self._scanners.get(scanner_id)
 
+    def load_scanner_by_id(self, scanner_id: str) -> Optional[Type[BaseScanner]]:
+        """Load a specific scanner by ID (public API)"""
+        return self._load_scanner(scanner_id)
+
+    def _is_aiml_manifest_file(self, filename: str) -> bool:
+        """Check if filename matches AI/ML manifest patterns."""
+        # Use exact filename matching to avoid false positives like "config.json.backup"
+        return any(
+            filename == pattern or filename.endswith(f"/{pattern}") 
+            for pattern in self._AIML_MANIFEST_PATTERNS
+        )
+
 
 # Global registry instance
 _registry = ScannerRegistry()
 
 
 class _LazyList:
-    """Lazy list that loads scanners only when accessed"""
+    """Lazy list that loads scanners only when accessed (thread-safe)"""
 
     def __init__(self, registry):
         self._registry = registry
         self._cached_list = None
+        self._lock = threading.Lock()
 
     def _get_list(self):
-        if self._cached_list is None:
-            self._cached_list = self._registry.get_scanner_classes()
-        return self._cached_list
+        # Fast path without lock
+        if self._cached_list is not None:
+            return self._cached_list
+            
+        # Use lock for initialization
+        with self._lock:
+            # Double-check after acquiring lock
+            if self._cached_list is None:
+                self._cached_list = self._registry.get_scanner_classes()
+            return self._cached_list
 
     def __iter__(self):
         return iter(self._get_list())
@@ -346,7 +375,7 @@ def __getattr__(name: str):
 
     if name in class_to_id:
         scanner_id = class_to_id[name]
-        scanner_class = _registry._load_scanner(scanner_id)
+        scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
             return scanner_class
         else:
