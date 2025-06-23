@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class ScannerRegistry:
     """
     Lazy-loading registry for model scanners
-    
+
     This registry manages scanner loading and selection. For security patterns
     used by scanners, see modelaudit.suspicious_symbols module.
     """
@@ -23,23 +23,25 @@ class ScannerRegistry:
         self._init_registry()
 
     # Class-level constant for AI/ML manifest patterns
-    _AIML_MANIFEST_PATTERNS = frozenset([
-        "config.json",
-        "model.json", 
-        "tokenizer.json",
-        "params.json",
-        "hyperparams.yaml",
-        "training_args.json",
-        "dataset_info.json",
-        "model.yaml",
-        "environment.yml",
-        "conda.yaml",
-        "requirements.txt",
-        "metadata.json",
-        "index.json",
-        "tokenizer_config.json",
-        "model_config.json",
-    ])
+    _AIML_MANIFEST_PATTERNS = frozenset(
+        [
+            "config.json",
+            "model.json",
+            "tokenizer.json",
+            "params.json",
+            "hyperparams.yaml",
+            "training_args.json",
+            "dataset_info.json",
+            "model.yaml",
+            "environment.yml",
+            "conda.yaml",
+            "requirements.txt",
+            "metadata.json",
+            "index.json",
+            "tokenizer_config.json",
+            "model_config.json",
+        ]
+    )
 
     def _init_registry(self):
         """Initialize the scanner registry with metadata"""
@@ -303,7 +305,7 @@ class ScannerRegistry:
         """Check if filename matches AI/ML manifest patterns."""
         # Use exact filename matching to avoid false positives like "config.json.backup"
         return any(
-            filename == pattern or filename.endswith(f"/{pattern}") 
+            filename == pattern or filename.endswith(f"/{pattern}")
             for pattern in self._AIML_MANIFEST_PATTERNS
         )
 
@@ -324,7 +326,7 @@ class _LazyList:
         # Fast path without lock
         if self._cached_list is not None:
             return self._cached_list
-            
+
         # Use lock for initialization
         with self._lock:
             # Double-check after acquiring lock
