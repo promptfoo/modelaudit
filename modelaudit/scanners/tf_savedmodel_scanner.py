@@ -59,6 +59,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Store the file path for use in issue locations
         self.current_file_path = path
 
