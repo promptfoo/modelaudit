@@ -1,4 +1,3 @@
-import logging
 import os
 import pickletools
 import struct
@@ -18,9 +17,8 @@ from ..explanations import (
     get_pattern_explanation,
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
-logger = logging.getLogger(__name__)
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
 # ============================================================================
@@ -590,10 +588,7 @@ class PickleScanner(BaseScanner):
                 if file_format == "pickle" and not validate_file_type(path):
                     # File type validation failed - this could be suspicious
                     # Log but still allow scanning for now (let scanner handle the validation)
-                    import logging
-
-                    pickle_logger = logging.getLogger("modelaudit.scanners.pickle")
-                    pickle_logger.warning(
+                    logger.warning(
                         f"File type validation failed for potential pickle file: {path}"
                     )
 

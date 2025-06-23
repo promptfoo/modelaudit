@@ -1,4 +1,3 @@
-import logging
 import os
 import struct
 from typing import Any, Optional
@@ -8,7 +7,7 @@ from modelaudit.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
 )
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
 class PyTorchBinaryScanner(BaseScanner):
@@ -45,7 +44,6 @@ class PyTorchBinaryScanner(BaseScanner):
             if not validate_file_type(path):
                 # File type validation failed - log but don't reject immediately
                 # for .bin files since they can contain arbitrary binary data
-                logger = logging.getLogger("modelaudit.scanners.pytorch_binary")
                 logger.warning(f"File type validation failed for .bin file: {path}")
                 # Continue to check if it's still a valid pytorch_binary format
 

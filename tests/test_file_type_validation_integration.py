@@ -320,10 +320,8 @@ class TestFileTypeValidationIntegration:
         malicious_model.write_bytes(malicious_content)
 
         result = scan_file(str(malicious_model))
-        # Record whether executable patterns were detected (pickle scanner)
-        _has_executable_warning = any(
-            "executable" in issue.message.lower() for issue in result.issues
-        )
+        # Should detect executable patterns (this would be caught by pickle scanner)
+        # Check if any issues were detected (executable patterns would be caught by pickle scanner)
 
         # Scenario 2: Model with suspicious file size vs content mismatch
         tiny_model = temp_test_dir / "suspicious_model.h5"

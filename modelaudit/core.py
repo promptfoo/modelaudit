@@ -26,6 +26,7 @@ from modelaudit.scanners import (
 )
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory
+from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_format_from_extension,
@@ -36,6 +37,20 @@ logger = logging.getLogger("modelaudit.core")
 
 # Lock to ensure thread-safe monkey patching of builtins.open
 _OPEN_PATCH_LOCK = Lock()
+
+
+def _add_asset_to_results(
+    results: dict[str, Any], file_path: str, file_result: ScanResult
+) -> None:
+    """Helper function to add an asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append(asset_from_scan_result(file_path, file_result))
+
+
+def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None:
+    """Helper function to add an error asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append({"path": file_path, "type": "error"})
 
 
 def validate_scan_config(config: dict[str, Any]) -> None:
@@ -49,6 +64,11 @@ def validate_scan_config(config: dict[str, Any]) -> None:
     if max_file_size is not None:
         if not isinstance(max_file_size, int) or max_file_size < 0:
             raise ValueError("max_file_size must be a non-negative integer")
+
+    max_total_size = config.get("max_total_size")
+    if max_total_size is not None:
+        if not isinstance(max_total_size, int) or max_total_size < 0:
+            raise ValueError("max_total_size must be a non-negative integer")
 
     chunk_size = config.get("chunk_size")
     if chunk_size is not None:
@@ -93,6 +113,7 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "assets": [],
         "file_metadata": {},  # Per-file metadata
     }
 
@@ -178,6 +199,9 @@ def scan_model_directory_or_file(
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
 
+                        # Add to assets list for inventory
+                        _add_asset_to_results(results, file_path, file_result)
+
                         # Save metadata for SBOM generation
                         file_meta = cast(dict[str, Any], results["file_metadata"])
                         # Merge scanner metadata with license metadata
@@ -211,6 +235,8 @@ def scan_model_directory_or_file(
                                 "details": {"exception_type": type(e).__name__},
                             },
                         )
+                        # Add error entry to assets
+                        _add_error_asset_to_results(results, file_path)
                 if limit_reached:
                     break
             # Stop scanning if size limit reached
@@ -276,6 +302,9 @@ def scan_model_directory_or_file(
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
 
+            # Add to assets list for inventory
+            _add_asset_to_results(results, path, file_result)
+
             # Save metadata for SBOM generation
             file_meta = cast(dict[str, Any], results["file_metadata"])
             # Merge scanner metadata with license metadata
@@ -309,6 +338,7 @@ def scan_model_directory_or_file(
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
+        _add_error_asset_to_results(results, path)
 
     # Add final timing information
     results["finish_time"] = time.time()

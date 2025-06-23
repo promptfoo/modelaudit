@@ -110,7 +110,8 @@ def _component_for_file(
     )
 
     if license_expressions:
-        component.licenses = LicenseRepository(license_expressions)
+        for license_expr in license_expressions:
+            component.licenses.add(license_expr)
 
     return component
 
