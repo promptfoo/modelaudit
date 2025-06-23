@@ -64,6 +64,10 @@ class KerasH5Scanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()

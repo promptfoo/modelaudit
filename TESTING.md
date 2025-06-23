@@ -161,7 +161,6 @@ Most IDEs can use these same optimizations:
 ### Common Issues
 
 1. **Tests fail in parallel but pass individually**
-
    - Check for shared state between tests
    - Use proper fixtures for temporary files
 

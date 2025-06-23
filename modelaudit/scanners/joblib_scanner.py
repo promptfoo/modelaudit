@@ -26,9 +26,6 @@ class JoblibScanner(BaseScanner):
         self.max_decompressed_size = self.config.get(
             "max_decompressed_size", 100 * 1024 * 1024
         )  # 100MB
-        self.max_file_read_size = self.config.get(
-            "max_file_read_size", 100 * 1024 * 1024
-        )  # 100MB
         self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
     @classmethod
@@ -41,24 +38,8 @@ class JoblibScanner(BaseScanner):
         return True
 
     def _read_file_safely(self, path: str) -> bytes:
-        """Read file in chunks with size validation"""
-        data = b""
-        file_size = self.get_file_size(path)
-
-        if file_size > self.max_file_read_size:
-            raise ValueError(
-                f"File too large: {file_size} bytes (max: {self.max_file_read_size})"
-            )
-
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(self.chunk_size)
-                if not chunk:
-                    break
-                data += chunk
-                if len(data) > self.max_file_read_size:
-                    raise ValueError(f"File read exceeds limit: {len(data)} bytes")
-        return data
+        """Read file in chunks using the base class helper."""
+        return super()._read_file_safely(path)
 
     def _safe_decompress(self, data: bytes) -> bytes:
         """Safely decompress data with bomb protection"""
@@ -97,6 +78,10 @@ class JoblibScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
