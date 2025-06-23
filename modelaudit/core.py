@@ -50,6 +50,11 @@ def validate_scan_config(config: dict[str, Any]) -> None:
         if not isinstance(max_file_size, int) or max_file_size < 0:
             raise ValueError("max_file_size must be a non-negative integer")
 
+    max_total_size = config.get("max_total_size")
+    if max_total_size is not None:
+        if not isinstance(max_total_size, int) or max_total_size < 0:
+            raise ValueError("max_total_size must be a non-negative integer")
+
     chunk_size = config.get("chunk_size")
     if chunk_size is not None:
         if not isinstance(chunk_size, int) or chunk_size <= 0:
