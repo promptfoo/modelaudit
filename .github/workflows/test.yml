@@ -30,11 +30,15 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          rye run ruff check modelaudit/
+          rye run ruff check modelaudit/ tests/
+
+      - name: Check import organization with Ruff
+        run: |
+          rye run ruff check --select I modelaudit/ tests/
 
       - name: Check formatting with Ruff
         run: |
-          rye run ruff format --check modelaudit/
+          rye run ruff format --check modelaudit/ tests/
 
   type-check:
     name: Type Check
@@ -54,7 +58,7 @@ jobs:
 
       - name: Type checking
         run: |
-          rye run mypy modelaudit/
+          rye run mypy modelaudit/ tests/
 
   test:
     name: Test Python ${{ matrix.python-version }}
