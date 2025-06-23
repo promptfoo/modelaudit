@@ -41,7 +41,7 @@ modelaudit/
 │   ├── test_integration.py   # Integration tests
 │   ├── test_cli.py          # CLI tests
 │   └── conftest.py          # pytest configuration
-├── pyproject.toml           # Poetry configuration
+├── pyproject.toml           # Rye configuration
 ├── README.md                # Project documentation
 └── CLAUDE.md               # Claude-specific guidance
 ```
@@ -61,11 +61,20 @@ modelaudit/
 **Formatting Standards:**
 
 ```bash
-# ALWAYS run these before committing:
-poetry run ruff format .         # Format code
-poetry run ruff check .          # Lint code
-poetry run mypy modelaudit/      # Type check
-poetry run pytest               # Run tests
+# PRODUCTION CODE (matches CI workflow):
+rye run ruff format modelaudit/       # Format production code
+rye run ruff check modelaudit/        # Lint production code
+rye run mypy modelaudit/             # Type check
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+
+# DEVELOPMENT (including tests):
+rye run ruff format modelaudit/ tests/  # Format code and tests
+rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
+rye run mypy modelaudit/             # Type check
+rye run pytest                      # Run all tests
+
+# CI FORMAT CHECK (read-only verification):
+rye run ruff format --check modelaudit/  # Verify formatting without changes
 ```
 
 ### Naming Conventions
@@ -194,17 +203,23 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
 
 ```bash
 # Run all tests
-poetry run pytest
+rye run pytest
+
+# Run fast tests (parallel execution, excludes slow/integration/performance tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
 
 # Run specific test file
-poetry run pytest tests/test_my_scanner.py -v
+rye run pytest tests/test_my_scanner.py -v
 
 # Run with coverage
-poetry run pytest --cov=modelaudit
+rye run pytest --cov=modelaudit
+
+# Run slow/integration tests (usually CI-only on main branch)
+rye run pytest -n auto -m "slow or integration" --tb=short
 
 # Run tests for specific Python versions
-poetry install --extras all  # Install all dependencies first
-poetry run pytest
+rye sync --features all  # Install all dependencies first
+rye run pytest
 ```
 
 ## 📦 Dependencies & Installation
@@ -216,12 +231,13 @@ poetry run pytest
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Poetry (recommended)
-poetry install --extras all  # All optional dependencies
-poetry install --extras "tensorflow pytorch h5"  # Specific extras
+# Install with Rye (recommended) - matches CI workflow
+rye sync --features all  # All optional dependencies for comprehensive testing
+rye sync                 # Basic dependencies only
 
-# Or with pip
-pip install -e .[all]
+# Or with pip (alternative)
+pip install -e .[all]    # Install in development mode with all extras
+pip install -e .         # Basic installation
 ```
 
 ### Optional Dependencies
@@ -229,11 +245,25 @@ pip install -e .[all]
 The project uses optional dependencies for specific scanners:
 
 - `tensorflow`: TensorFlow SavedModel scanning
-- `h5py`: Keras H5 model scanning
-- `torch`: PyTorch model scanning
-- `pyyaml`: YAML manifest scanning
+- `h5`: Keras H5 model scanning (h5py)
+- `pytorch`: PyTorch model scanning (torch)
+- `yaml`: YAML manifest scanning (pyyaml)
 - `safetensors`: SafeTensors model scanning
 - `onnx`: ONNX model scanning
+- `dill`: Enhanced pickle support with security validation
+- `joblib`: Joblib model scanning with scikit-learn integration
+- `flax`: Flax msgpack scanning
+- `tflite`: TensorFlow Lite model scanning
+- `all`: All of the above dependencies
+
+Install specific extras as needed:
+```bash
+# With pip
+pip install modelaudit[tensorflow,pytorch,h5]
+
+# With rye (development)
+rye sync --features="tensorflow pytorch h5"
+```
 
 Always test that scanners gracefully handle missing optional dependencies.
 
@@ -348,11 +378,11 @@ When contributing code:
 ### Pre-commit Checklist
 
 ```bash
-# Run before every commit
-poetry run ruff format .
-poetry run ruff check .
-poetry run mypy modelaudit/
-poetry run pytest
+# Run before every commit (development workflow):
+rye run ruff format modelaudit/ tests/
+rye run ruff check --fix modelaudit/ tests/
+rye run mypy modelaudit/
+rye run pytest
 ```
 
 ## 🔗 Key Files for AI Agents
