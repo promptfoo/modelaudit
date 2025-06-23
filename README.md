@@ -264,9 +264,9 @@ modelaudit scan model.pkl --verbose
 ### Result Caching
 
 ModelAudit caches scan results by file hash to speed up repeated scans. The cache is
-stored at `~/.promptfoo/modelaudit_cache.json` by default. Set the
-`MODELAUDIT_CACHE_PATH` environment variable to override the location or set
-`MODELAUDIT_DISABLE_CACHE=true` to disable caching.
+stored at `~/.promptfoo/modelaudit/cache.json` by default. Set the
+`PROMPTFOO_CONFIG_DIR` environment variable to override the base directory or set
+`PROMPTFOO_CACHE_ENABLED=false` to disable caching.
 
 ### Exit Codes
 

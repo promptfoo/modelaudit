@@ -6,24 +6,31 @@ from typing import Any, Optional
 
 from .. import __version__
 
-CACHE_ENV_VAR = "MODELAUDIT_CACHE_PATH"
-DISABLE_ENV_VAR = "MODELAUDIT_DISABLE_CACHE"
-DEFAULT_CACHE_PATH = os.path.expanduser("~/.promptfoo/modelaudit_cache.json")
+CONFIG_DIR_ENV_VAR = "PROMPTFOO_CONFIG_DIR"
+CACHE_ENABLED_ENV_VAR = "PROMPTFOO_CACHE_ENABLED"
+DEFAULT_CONFIG_DIR = os.path.expanduser("~/.promptfoo")
+MODELAUDIT_SUBDIR = "modelaudit"
+CACHE_FILENAME = "cache.json"
 
 _cache_data: Optional[dict[str, Any]] = None
 _cache_path: Optional[str] = None
 
 
 def _get_cache_path() -> str:
-    path = os.getenv(CACHE_ENV_VAR)
-    if path is not None and path != "":
-        return os.path.expanduser(path)
-    return DEFAULT_CACHE_PATH
+    config_dir = os.getenv(CONFIG_DIR_ENV_VAR)
+    if config_dir is not None and config_dir != "":
+        config_dir = os.path.expanduser(config_dir)
+    else:
+        config_dir = DEFAULT_CONFIG_DIR
+
+    # Always use the modelaudit subdirectory
+    cache_dir = os.path.join(config_dir, MODELAUDIT_SUBDIR)
+    return os.path.join(cache_dir, CACHE_FILENAME)
 
 
 def _cache_disabled() -> bool:
-    value = os.getenv(DISABLE_ENV_VAR, "").lower()
-    return value in {"1", "true", "yes"}
+    value = os.getenv(CACHE_ENABLED_ENV_VAR, "true").lower()
+    return value in {"0", "false", "no", "off"}
 
 
 def load_cache() -> dict[str, Any]:
