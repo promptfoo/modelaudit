@@ -11,6 +11,7 @@ CACHE_ENABLED_ENV_VAR = "PROMPTFOO_CACHE_ENABLED"
 DEFAULT_CONFIG_DIR = os.path.expanduser("~/.promptfoo")
 MODELAUDIT_SUBDIR = "modelaudit"
 CACHE_FILENAME = "cache.json"
+MAX_CACHE_ENTRIES = 1000  # Limit cache size to prevent unbounded growth
 
 _cache_data: Optional[dict[str, Any]] = None
 _cache_path: Optional[str] = None
@@ -49,11 +50,20 @@ def load_cache() -> dict[str, Any]:
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-            if data.get("version") == __version__:
+            # Validate cache structure
+            if (
+                not isinstance(data, dict)
+                or "version" not in data
+                or "entries" not in data
+            ):
+                # Invalid cache structure, recreate
+                pass
+            elif data.get("version") == __version__:
                 _cache_data = data
                 _cache_path = path
                 return data
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, TypeError):
+            # Cache file is corrupted or unreadable, will recreate
             pass
 
     _cache_data = {"version": __version__, "entries": {}}
@@ -109,7 +119,22 @@ def update_cache(file_hash: str, file_path: str, result: Any) -> None:
         result_dict = result
     else:
         result_dict = result.to_dict()
-    data.setdefault("entries", {})[file_hash] = {
+
+    entries = data.setdefault("entries", {})
+
+    # Enforce cache size limit by removing oldest entries
+    if len(entries) >= MAX_CACHE_ENTRIES:
+        # Remove oldest entries (by scan_time) to make room
+        sorted_entries = sorted(
+            entries.items(),
+            key=lambda x: x[1].get("scan_time", ""),
+        )
+        # Remove oldest 10% of entries
+        remove_count = max(1, len(entries) // 10)
+        for old_hash, _ in sorted_entries[:remove_count]:
+            del entries[old_hash]
+
+    entries[file_hash] = {
         "file": file_path,
         "scan_time": datetime.utcnow().isoformat(),
         "result": result_dict,

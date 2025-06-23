@@ -661,8 +661,14 @@ def scan_result_from_dict(data: dict[str, Any]) -> ScanResult:
     sr.bytes_scanned = data.get("bytes_scanned", 0)
     sr.success = data.get("success", True)
     sr.metadata = data.get("metadata", {})
+
+    # Preserve original timing - don't use current time
     duration = data.get("duration", 0.0)
-    sr.end_time = sr.start_time + float(duration)
+    # Set both start_time and end_time to preserve cached timing
+    # Use arbitrary but consistent timing for cached results
+    sr.start_time = 0.0  # Cached results use epoch as start
+    sr.end_time = float(duration)
+
     for issue_data in data.get("issues", []):
         severity_str = issue_data.get("severity", "warning")
         severity = IssueSeverity(severity_str)
