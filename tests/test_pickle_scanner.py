@@ -12,6 +12,10 @@ from modelaudit.scanners.base import IssueSeverity  # noqa: E402
 
 # Import only what we need for the pickle scanner test
 from modelaudit.scanners.pickle_scanner import PickleScanner  # noqa: E402
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
+)
 from tests.evil_pickle import EvilClass  # noqa: E402
 
 
@@ -99,8 +103,16 @@ class TestPickleScanner(unittest.TestCase):
                 pickle.dump(simple_data, f)
 
                 # Add suspicious binary content
+                pattern_import = BINARY_CODE_PATTERNS[0]
+                pattern_eval = next(
+                    p for p in BINARY_CODE_PATTERNS if p.startswith(b"eval")
+                )
                 suspicious_content = (
-                    b"some_data" + b"import os" + b"more_data" + b"eval(" + b"end_data"
+                    b"some_data"
+                    + pattern_import
+                    + b"more_data"
+                    + pattern_eval
+                    + b"end_data"
                 )
                 f.write(suspicious_content)
                 f.flush()
@@ -144,12 +156,12 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Add binary content with executable signatures
                 f.write(b"some_padding")
-                # Windows PE executable signature with DOS stub
-                f.write(b"MZ")  # PE signature
-                f.write(b"padding" * 10)  # Some padding
-                f.write(b"This program cannot be run in DOS mode")  # DOS stub message
+                sigs = list(EXECUTABLE_SIGNATURES.keys())
+                f.write(sigs[0])  # PE signature
+                f.write(b"padding" * 10)
+                f.write(b"This program cannot be run in DOS mode")  # DOS stub
                 f.write(b"more_padding")
-                f.write(b"\x7fELF")  # Linux ELF executable signature
+                f.write(sigs[1])  # Another signature
                 f.write(b"end_padding")
                 f.flush()
 

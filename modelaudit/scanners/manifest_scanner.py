@@ -26,7 +26,7 @@ except ImportError:
 
 # Try to import yaml, but handle the case where it's not installed
 try:
-    import yaml
+    import yaml  # type: ignore
 
     HAS_YAML = True
 except ImportError:
@@ -148,6 +148,10 @@ class ManifestScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
