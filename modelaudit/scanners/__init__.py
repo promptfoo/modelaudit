@@ -17,7 +17,7 @@ class ScannerRegistry:
 
     def _init_registry(self):
         """Initialize the scanner registry with metadata"""
-        # Order matters - more specific scanners should come before generic ones
+# Order matters - more specific scanners should come before generic ones
         self._scanners = {
             "pickle": {
                 "module": "modelaudit.scanners.pickle_scanner",
