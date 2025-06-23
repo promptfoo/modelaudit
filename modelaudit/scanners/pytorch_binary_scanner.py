@@ -2,6 +2,11 @@ import os
 import struct
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
+)
+
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
@@ -124,28 +129,7 @@ class PyTorchBinaryScanner(BaseScanner):
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
-        code_patterns = [
-            b"import os",
-            b"import sys",
-            b"import subprocess",
-            b"eval(",
-            b"exec(",
-            b"__import__",
-            b"compile(",
-            b"globals()",
-            b"locals()",
-            b"open(",
-            b"file(",
-            b"input(",
-            b"raw_input(",
-            b"execfile(",
-            b"os.system",
-            b"subprocess.call",
-            b"subprocess.Popen",
-            b"socket.socket",
-        ]
-
-        for pattern in code_patterns:
+        for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 # Find the position within the chunk
                 pos = chunk.find(pattern)
@@ -182,16 +166,7 @@ class PyTorchBinaryScanner(BaseScanner):
     ) -> None:
         """Check for executable file signatures"""
         # Common executable signatures
-        executable_sigs = {
-            b"MZ": "Windows executable (PE)",
-            b"\x7fELF": "Linux executable (ELF)",
-            b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-            b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-            b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-            b"#!/": "Shell script shebang",
-        }
-
-        for sig, description in executable_sigs.items():
+        for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
                 pos = chunk.find(sig)
                 result.add_issue(

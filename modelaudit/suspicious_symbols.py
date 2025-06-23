@@ -142,6 +142,45 @@ SUSPICIOUS_STRING_PATTERNS = [
 # Dangerous pickle opcodes that can lead to code execution
 DANGEROUS_OPCODES = set(_EXPLAIN_OPCODES.keys())
 
+# ======================================================================
+# BINARY SECURITY PATTERNS
+# ======================================================================
+
+# Byte patterns that commonly indicate embedded Python code in binary blobs
+# Used by scanners that analyze raw binary sections for malicious content
+BINARY_CODE_PATTERNS: list[bytes] = [
+    b"import os",
+    b"import sys",
+    b"import subprocess",
+    b"eval(",
+    b"exec(",
+    b"__import__",
+    b"compile(",
+    b"globals()",
+    b"locals()",
+    b"open(",
+    b"file(",
+    b"input(",
+    b"raw_input(",
+    b"execfile(",
+    b"os.system",
+    b"subprocess.call",
+    b"subprocess.Popen",
+    b"socket.socket",
+]
+
+# Common executable file signatures found in malicious model data
+EXECUTABLE_SIGNATURES: dict[bytes, str] = {
+    b"MZ": "Windows executable (PE)",
+    b"\x7fELF": "Linux executable (ELF)",
+    b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
+    b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
+    b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
+    b"#!/": "Shell script shebang",
+    b"#!/bin/": "Shell script shebang",
+    b"#!/usr/bin/": "Shell script shebang",
+}
+
 # =============================================================================
 # TENSORFLOW/KERAS SECURITY PATTERNS
 # =============================================================================
