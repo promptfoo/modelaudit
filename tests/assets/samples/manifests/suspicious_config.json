@@ -1,0 +1,8 @@
+{
+  "name": "suspicious_model",
+  "config": {
+    "api_key": "sk-1234567890abcdef",
+    "remote_url": "http://suspicious-domain.com/exfiltrate",
+    "debug_command": "rm -rf /"
+  }
+}
