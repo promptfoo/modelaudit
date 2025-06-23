@@ -8,10 +8,13 @@ from .. import __version__
 
 CONFIG_DIR_ENV_VAR = "PROMPTFOO_CONFIG_DIR"
 CACHE_ENABLED_ENV_VAR = "PROMPTFOO_CACHE_ENABLED"
+CACHE_MAX_FILE_COUNT_ENV_VAR = "PROMPTFOO_CACHE_MAX_FILE_COUNT"
+CACHE_MAX_SIZE_ENV_VAR = "PROMPTFOO_CACHE_MAX_SIZE"
 DEFAULT_CONFIG_DIR = os.path.expanduser("~/.promptfoo")
 MODELAUDIT_SUBDIR = "modelaudit"
 CACHE_FILENAME = "cache.json"
-MAX_CACHE_ENTRIES = 1000  # Limit cache size to prevent unbounded growth
+DEFAULT_MAX_CACHE_ENTRIES = 1000  # Default file count limit
+DEFAULT_MAX_CACHE_SIZE = 100 * 1024 * 1024  # Default 100MB cache size limit
 
 _cache_data: Optional[dict[str, Any]] = None
 _cache_path: Optional[str] = None
@@ -32,6 +35,32 @@ def _get_cache_path() -> str:
 def _cache_disabled() -> bool:
     value = os.getenv(CACHE_ENABLED_ENV_VAR, "true").lower()
     return value in {"0", "false", "no", "off"}
+
+
+def _get_max_cache_entries() -> int:
+    try:
+        return int(
+            os.getenv(CACHE_MAX_FILE_COUNT_ENV_VAR, str(DEFAULT_MAX_CACHE_ENTRIES))
+        )
+    except ValueError:
+        return DEFAULT_MAX_CACHE_ENTRIES
+
+
+def _get_max_cache_size() -> int:
+    try:
+        return int(os.getenv(CACHE_MAX_SIZE_ENV_VAR, str(DEFAULT_MAX_CACHE_SIZE)))
+    except ValueError:
+        return DEFAULT_MAX_CACHE_SIZE
+
+
+def _calculate_cache_size(entries: dict[str, Any]) -> int:
+    """Calculate approximate cache size in bytes."""
+    # Rough estimation: JSON size of the entries
+    try:
+        return len(json.dumps(entries).encode("utf-8"))
+    except (TypeError, ValueError):
+        # Fallback: estimate based on entry count
+        return len(entries) * 1024  # Assume 1KB per entry average
 
 
 def load_cache() -> dict[str, Any]:
@@ -121,22 +150,48 @@ def update_cache(file_hash: str, file_path: str, result: Any) -> None:
         result_dict = result.to_dict()
 
     entries = data.setdefault("entries", {})
+    max_entries = _get_max_cache_entries()
+    max_size = _get_max_cache_size()
 
-    # Enforce cache size limit by removing oldest entries
-    if len(entries) >= MAX_CACHE_ENTRIES:
-        # Remove oldest entries (by scan_time) to make room
-        sorted_entries = sorted(
-            entries.items(),
-            key=lambda x: x[1].get("scan_time", ""),
-        )
-        # Remove oldest 10% of entries
-        remove_count = max(1, len(entries) // 10)
-        for old_hash, _ in sorted_entries[:remove_count]:
-            del entries[old_hash]
-
-    entries[file_hash] = {
+    # Add the new entry first
+    new_entry = {
         "file": file_path,
         "scan_time": datetime.utcnow().isoformat(),
         "result": result_dict,
     }
+    entries[file_hash] = new_entry
+
+    # Check both file count and size limits
+    needs_cleanup = (
+        len(entries) > max_entries or _calculate_cache_size(entries) > max_size
+    )
+
+    if needs_cleanup:
+        # Sort entries by scan_time (oldest first)
+        sorted_entries = sorted(
+            entries.items(),
+            key=lambda x: x[1].get("scan_time", ""),
+        )
+
+        # Remove oldest entries until both limits are satisfied
+        # Remove at least 10% or enough to get under limits
+        min_remove = max(1, len(entries) // 10)
+        removed_count = 0
+
+        for old_hash, _ in sorted_entries:
+            # Don't remove the entry we just added
+            if old_hash == file_hash:
+                continue
+
+            del entries[old_hash]
+            removed_count += 1
+
+            # Check if we've satisfied both limits
+            if (
+                removed_count >= min_remove
+                and len(entries) <= max_entries
+                and _calculate_cache_size(entries) <= max_size
+            ):
+                break
+
     save_cache()

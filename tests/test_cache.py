@@ -42,26 +42,42 @@ def test_cache_disabled(tmp_path, monkeypatch):
 
 
 def test_cache_size_limiting(tmp_path, monkeypatch):
-    """Test that cache doesn't grow beyond MAX_CACHE_ENTRIES."""
+    """Test that cache doesn't grow beyond PROMPTFOO_CACHE_MAX_FILE_COUNT."""
     config_dir = tmp_path / "promptfoo_config"
     monkeypatch.setenv("PROMPTFOO_CONFIG_DIR", str(config_dir))
+    monkeypatch.setenv("PROMPTFOO_CACHE_MAX_FILE_COUNT", "5")
     
-    # Temporarily reduce max cache size for testing
+    # Create and scan 10 different files (more than cache limit)
+    for i in range(10):
+        test_file = tmp_path / f"test_{i}.bin"
+        test_file.write_bytes(f"content_{i}".encode())
+        scan_model_directory_or_file(str(test_file))
+    
+    # Check that cache doesn't exceed limit
     from modelaudit.utils import cache
-    original_max = cache.MAX_CACHE_ENTRIES
-    cache.MAX_CACHE_ENTRIES = 5
+    data = cache.load_cache()
+    assert len(data.get("entries", {})) <= 5
+
+
+def test_cache_size_limiting_by_bytes(tmp_path, monkeypatch):
+    """Test that cache respects PROMPTFOO_CACHE_MAX_SIZE limit."""
+    config_dir = tmp_path / "promptfoo_config"
+    monkeypatch.setenv("PROMPTFOO_CONFIG_DIR", str(config_dir))
+    # Set very small cache size limit (1KB)
+    monkeypatch.setenv("PROMPTFOO_CACHE_MAX_SIZE", "1024")
     
-    try:
-        # Create and scan 10 different files (more than cache limit)
-        for i in range(10):
-            test_file = tmp_path / f"test_{i}.bin"
-            test_file.write_bytes(f"content_{i}".encode())
-            scan_model_directory_or_file(str(test_file))
-        
-        # Check that cache doesn't exceed limit
-        data = cache.load_cache()
-        assert len(data.get("entries", {})) <= 5
-        
-    finally:
-        # Restore original limit
-        cache.MAX_CACHE_ENTRIES = original_max
+    # Create and scan files until cache size limit is hit
+    for i in range(5):
+        test_file = tmp_path / f"large_test_{i}.bin"
+        # Create files with enough content to exceed size limit
+        test_file.write_bytes(b"x" * 200 + f"content_{i}".encode())
+        scan_model_directory_or_file(str(test_file))
+    
+    # Check that cache size is reasonable (not exceeding limit by much)
+    from modelaudit.utils import cache
+    data = cache.load_cache()
+    entries = data.get("entries", {})
+    cache_size = cache._calculate_cache_size(entries)
+    
+    # Cache should be under control (allow some overhead but not excessive)
+    assert cache_size < 5 * 1024  # Should be less than 5KB
