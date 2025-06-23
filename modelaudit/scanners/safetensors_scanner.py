@@ -113,9 +113,9 @@ class SafeTensorsScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-                result.metadata["tensor_count"] = len(
-                    [k for k in header.keys() if k != "__metadata__"]
-                )
+                tensor_names = [k for k in header.keys() if k != "__metadata__"]
+                result.metadata["tensor_count"] = len(tensor_names)
+                result.metadata["tensors"] = tensor_names
 
                 # Validate tensor offsets and sizes
                 tensor_entries: list[tuple[str, Any]] = [
