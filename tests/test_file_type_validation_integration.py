@@ -38,12 +38,12 @@ class TestFileTypeValidationIntegration:
     @pytest.fixture
     def test_data_dir(self):
         """Return path to integration test data."""
-        return Path(__file__).parent / "integration_test_data"
+        return Path(__file__).parent / "assets/scenarios/license_scenarios"
 
     @pytest.fixture
     def temp_test_dir(self, tmp_path):
         """Create a temporary directory with copies of test data for modification."""
-        test_data_dir = Path(__file__).parent / "integration_test_data"
+        test_data_dir = Path(__file__).parent / "assets/scenarios/license_scenarios"
         temp_dir = tmp_path / "file_type_tests"
         temp_dir.mkdir()
 
