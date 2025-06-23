@@ -12,6 +12,8 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
+import pickle
+
 import numpy as np
 
 
@@ -30,7 +32,6 @@ class AGPLNeuralNetwork:
 
 # Save the model
 model = AGPLNeuralNetwork([784, 128, 64, 10])
-import pickle
 
 with open("integration_test_data/agpl_component/agpl_model.pkl", "wb") as f:
     pickle.dump(model, f)

@@ -11,7 +11,6 @@ These tests verify the file type validation feature works correctly with:
 
 import json
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -19,9 +18,7 @@ import numpy as np
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils.filetype import (
-    detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
@@ -285,9 +282,7 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(malicious_model))
         # Should detect executable patterns (this would be caught by pickle scanner)
-        has_executable_warning = any(
-            "executable" in issue.message.lower() for issue in result.issues
-        )
+        # Check if any issues were detected (executable patterns would be caught by pickle scanner)
 
         # Scenario 2: Model with suspicious file size vs content mismatch
         tiny_model = temp_test_dir / "suspicious_model.h5"
