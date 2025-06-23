@@ -130,7 +130,8 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"os\.system",  # Direct system command execution
     r"subprocess\.(?:Popen|call|check_output)",  # Process spawning
     # Dynamic imports - HIGH RISK
-    r"import ",  # Import statements in strings
+    # Match explicit module imports to reduce noise from unrelated "import" substrings
+    r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
     # Code construction - MEDIUM RISK
