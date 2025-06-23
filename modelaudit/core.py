@@ -4,27 +4,15 @@ import os
 import time
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, cast
+from typing import IO, Any, Callable, Optional, Type, cast
 from unittest.mock import patch
 
 from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
-from modelaudit.scanners import (
-    SCANNER_REGISTRY,
-    GgufScanner,
-    KerasH5Scanner,
-    NumPyScanner,
-    OnnxScanner,
-    PickleScanner,
-    PyTorchBinaryScanner,
-    PyTorchZipScanner,
-    SafeTensorsScanner,
-    TensorFlowSavedModelScanner,
-    ZipScanner,
-)
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners import _registry
+from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
@@ -515,30 +503,33 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.warning(discrepancy_msg)
 
-    # Prefer scanner based on header format
-    preferred_scanner: Optional[type] = None
+    # Prefer scanner based on header format using lazy loading
+    preferred_scanner: Optional[Type[BaseScanner]] = None
 
     # Special handling for PyTorch files that are ZIP-based
     if header_format == "zip" and ext in [".pt", ".pth"]:
-        preferred_scanner = PyTorchZipScanner
+        preferred_scanner = _registry._load_scanner("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
         # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
-        preferred_scanner = PickleScanner
+        preferred_scanner = _registry._load_scanner("pickle")
     else:
-        preferred_scanner = {
-            "pickle": PickleScanner,
-            "pytorch_binary": PyTorchBinaryScanner,
-            "hdf5": KerasH5Scanner,
-            "safetensors": SafeTensorsScanner,
-            "tensorflow_directory": TensorFlowSavedModelScanner,
-            "protobuf": TensorFlowSavedModelScanner,
-            "zip": ZipScanner,
-            "onnx": OnnxScanner,
-            "gguf": GgufScanner,
-            "ggml": GgufScanner,
-            "numpy": NumPyScanner,
-        }.get(header_format)
+        format_to_scanner = {
+            "pickle": "pickle",
+            "pytorch_binary": "pytorch_binary",
+            "hdf5": "keras_h5",
+            "safetensors": "safetensors",
+            "tensorflow_directory": "tf_savedmodel",
+            "protobuf": "tf_savedmodel",
+            "zip": "zip",
+            "onnx": "onnx",
+            "gguf": "gguf",
+            "ggml": "gguf",
+            "numpy": "numpy",
+        }
+        scanner_id = format_to_scanner.get(header_format)
+        if scanner_id:
+            preferred_scanner = _registry._load_scanner(scanner_id)
 
     result: Optional[ScanResult]
     if preferred_scanner and preferred_scanner.can_handle(path):
@@ -548,15 +539,13 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         scanner = preferred_scanner(config=config)  # type: ignore[abstract]
         result = scanner.scan(path)
     else:
-        result = None
-        for scanner_class in SCANNER_REGISTRY:
-            if scanner_class.can_handle(path):
-                logger.debug(f"Using {scanner_class.name} scanner for {path}")
-                scanner = scanner_class(config=config)  # type: ignore[abstract]
-                result = scanner.scan(path)
-                break
-
-        if result is None:
+        # Use registry's lazy loading method to avoid loading all scanners
+        scanner_class = _registry.get_scanner_for_path(path)
+        if scanner_class:
+            logger.debug(f"Using {scanner_class.name} scanner for {path}")
+            scanner = scanner_class(config=config)  # type: ignore[abstract]
+            result = scanner.scan(path)
+        else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
             sr.add_issue(
