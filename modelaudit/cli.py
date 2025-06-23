@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -48,6 +49,11 @@ def cli():
     help="Output file path (prints to stdout if not specified)",
 )
 @click.option(
+    "--sbom",
+    type=click.Path(),
+    help="Write CycloneDX SBOM to the specified file",
+)
+@click.option(
     "--timeout",
     "-t",
     type=int,
@@ -61,7 +67,23 @@ def cli():
     default=0,
     help="Maximum file size to scan in bytes [default: unlimited]",
 )
-def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_size):
+@click.option(
+    "--max-total-size",
+    type=int,
+    default=0,
+    help="Maximum total bytes to scan before stopping [default: unlimited]",
+)
+def scan_command(
+    paths,
+    blacklist,
+    format,
+    output,
+    sbom,
+    timeout,
+    verbose,
+    max_file_size,
+    max_total_size,
+):
     """Scan files or directories for malicious content.
 
     \b
@@ -76,9 +98,11 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     Advanced options:
         --format, -f       Output format (text or json)
         --output, -o       Write results to a file instead of stdout
+        --sbom             Write CycloneDX SBOM to file
         --timeout, -t      Set scan timeout in seconds
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
+        --max-total-size   Maximum total bytes to scan before stopping
 
     \b
     Exit codes:
@@ -119,11 +143,13 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         "issues": [],
         "has_errors": False,
         "files_scanned": 0,
+        "assets": [],  # Track all assets encountered
     }
 
     # Scan each path
     for path in paths:
         # Early exit for common non-model file extensions
+        # Note: Allow .json, .yaml, .yml as they can be model config files
         if os.path.isfile(path):
             _, ext = os.path.splitext(path)
             ext = ext.lower()
@@ -134,9 +160,6 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 ".js",
                 ".html",
                 ".css",
-                ".json",
-                ".yaml",
-                ".yml",
             ):
                 if verbose:
                     logger.info(f"Skipping non-model file: {path}")
@@ -167,6 +190,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 blacklist_patterns=list(blacklist) if blacklist else None,
                 timeout=timeout,
                 max_file_size=max_file_size,
+                max_total_size=max_total_size,
                 progress_callback=progress_callback,
             )
 
@@ -177,6 +201,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
                 "files_scanned",
                 1,
             )  # Count each file scanned
+            aggregated_results["assets"].extend(results.get("assets", []))
             if results.get("has_errors", False):
                 aggregated_results["has_errors"] = True
 
@@ -237,6 +262,14 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
         # Text format
         output_text = format_text_output(aggregated_results, verbose)
 
+    # Generate SBOM if requested
+    if sbom:
+        from .sbom import generate_sbom
+
+        sbom_text = generate_sbom(paths, aggregated_results)
+        with open(sbom, "w") as f:
+            f.write(sbom_text)
+
     # Send output to the specified destination
     if output:
         with open(output, "w") as f:
@@ -253,7 +286,7 @@ def scan_command(paths, blacklist, format, output, timeout, verbose, max_file_si
     sys.exit(exit_code)
 
 
-def format_text_output(results, verbose=False):
+def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
@@ -405,6 +438,39 @@ def format_text_output(results, verbose=False):
             "\n" + click.style("✓ No issues found", fg="green", bold=True),
         )
 
+    # Asset list
+    assets = results.get("assets", [])
+    if assets:
+        output_lines.append("\nAssets encountered:")
+
+        def render_assets(items, indent=1):
+            lines = []
+            for asset in items:
+                prefix = "  " * indent + "- "
+                line = f"{prefix}{asset.get('path')}"
+                if asset.get("type"):
+                    line += f" ({asset['type']})"
+                if asset.get("size"):
+                    line += f" [{asset['size']} bytes]"
+                lines.append(line)
+                if asset.get("tensors"):
+                    tline = (
+                        "  " * (indent + 1) + "Tensors: " + ", ".join(asset["tensors"])
+                    )
+                    lines.append(tline)
+                if asset.get("keys"):
+                    kline = (
+                        "  " * (indent + 1)
+                        + "Keys: "
+                        + ", ".join(map(str, asset["keys"]))
+                    )
+                    lines.append(kline)
+                if asset.get("contents"):
+                    lines.extend(render_assets(asset["contents"], indent + 1))
+            return lines
+
+        output_lines.extend(render_assets(assets))
+
     # Add a footer
     output_lines.append("─" * 80)
     if visible_issues:
@@ -413,12 +479,18 @@ def format_text_output(results, verbose=False):
             for issue in visible_issues
         ):
             status = click.style("✗ Scan completed with findings", fg="red", bold=True)
-        else:
+        elif any(
+            isinstance(issue, dict) and issue.get("severity") == "warning"
+            for issue in visible_issues
+        ):
             status = click.style(
                 "⚠ Scan completed with warnings",
                 fg="yellow",
                 bold=True,
             )
+        else:
+            # Only info/debug issues
+            status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     else:
         status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     output_lines.append(status)

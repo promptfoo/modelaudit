@@ -2,6 +2,11 @@ import json
 import os
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_CONFIG_PROPERTIES,
+    SUSPICIOUS_LAYER_TYPES,
+)
+
 from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -12,30 +17,6 @@ try:
     HAS_H5PY = True
 except ImportError:
     HAS_H5PY = False
-
-# Suspicious Keras layer types that might contain executable code
-SUSPICIOUS_LAYER_TYPES = {
-    "Lambda": "Can contain arbitrary Python code",
-    "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
-    "PyFunc": "Can execute Python code",
-    "CallbackLambda": "Can execute callbacks at runtime",
-}
-
-# Suspicious config properties that might indicate security issues
-SUSPICIOUS_CONFIG_PROPERTIES = [
-    "function",
-    "module",
-    "code",
-    "eval",
-    "exec",
-    "import",
-    "subprocess",
-    "os.",
-    "system",
-    "popen",
-    "shell",
-]
 
 
 class KerasH5Scanner(BaseScanner):
@@ -82,6 +63,10 @@ class KerasH5Scanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         # Check if h5py is installed
         if not HAS_H5PY:
@@ -274,7 +259,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_issue(
                             f"Suspicious configuration string found in {context}: "
                             f"'{suspicious_term}'",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
                                 "suspicious_term": suspicious_term,

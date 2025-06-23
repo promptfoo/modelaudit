@@ -1,77 +1,23 @@
 import os
 import pickletools
+import struct
 import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
+
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
+    SUSPICIOUS_GLOBALS,
+    SUSPICIOUS_STRING_PATTERNS,
+)
 
 from ..explanations import (
     get_import_explanation,
     get_opcode_explanation,
     get_pattern_explanation,
 )
-from .base import BaseScanner, IssueSeverity, ScanResult
-
-# Dictionary of suspicious references.
-# You can expand as needed.
-SUSPICIOUS_GLOBALS = {
-    "os": "*",
-    "posix": "*",  # posix.system is equivalent to os.system on Unix
-    "sys": "*",
-    "subprocess": "*",
-    "runpy": "*",
-    "builtins": ["eval", "exec", "__import__"],
-    "operator": ["attrgetter"],
-    "importlib": ["import_module"],
-    "pickle": ["loads", "load"],
-    "base64": ["b64decode", "b64encode", "decode"],
-    "codecs": ["decode", "encode"],
-    "shutil": ["rmtree", "copy", "move"],
-    "tempfile": ["mktemp"],
-    "pty": ["spawn"],
-    "platform": ["system", "popen"],
-    "ctypes": ["*"],
-    "socket": ["*"],
-    # dill's load helpers can execute arbitrary code when unpickling
-    # so we specifically flag those functions
-    "dill": [
-        "load",
-        "loads",
-        "load_module",
-        "load_module_asdict",
-        "load_session",
-    ],
-    # references to the private dill._dill module are also suspicious
-    "dill._dill": "*",
-}
-
-# Add dangerous builtin functions that might be used in __reduce__ methods
-DANGEROUS_BUILTINS = ["eval", "exec", "compile", "open", "input", "__import__"]
-
-# Dangerous opcodes that can lead to code execution
-DANGEROUS_OPCODES = [
-    "REDUCE",
-    "INST",
-    "OBJ",
-    "NEWOBJ",
-    "NEWOBJ_EX",
-    "GLOBAL",
-    "BUILD",
-    "STACK_GLOBAL",
-]
-
-# Suspicious string patterns that might indicate encoded payloads
-SUSPICIOUS_STRING_PATTERNS = [
-    r"__[\w]+__",  # Magic methods
-    r"base64\.b64decode",
-    r"eval\(",
-    r"exec\(",
-    r"os\.system",
-    r"subprocess\.(?:Popen|call|check_output)",
-    r"import ",
-    r"importlib",
-    r"__import__",
-    r"lambda",
-    r"\\x[0-9a-fA-F]{2}",  # Hex encoded characters
-]
+from ..suspicious_symbols import DANGEROUS_OPCODES
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
@@ -155,6 +101,17 @@ ML_SAFE_GLOBALS: Dict[str, List[str]] = {
     "sklearn": ["*"],
     "transformers": ["*"],
     "tokenizers": ["*"],
+    "joblib": [
+        "dump",
+        "load",
+        "Parallel",
+        "delayed",
+        "Memory",
+        "hash",
+        "_pickle_dump",
+        "_pickle_load",
+    ],
+    "dill": ["dump", "dumps", "load", "loads", "copy"],
     "tensorflow": ["*"],
     "keras": ["*"],
 }
@@ -369,6 +326,63 @@ def _get_context_aware_severity(
 # ============================================================================
 
 
+def _is_legitimate_serialization_file(path: str) -> bool:
+    """
+    Validate that a file is a legitimate joblib or dill serialization file.
+    This helps prevent security bypass by simply renaming malicious files.
+    """
+    try:
+        with open(path, "rb") as f:
+            # Read first few bytes to check for pickle magic
+            header = f.read(10)
+            if not header:
+                return False
+
+            # Check for standard pickle protocols (0-5)
+            # Protocol 0: starts with '(' or other opcodes
+            # Protocol 1: starts with ']' or other opcodes
+            # Protocol 2+: starts with '\x80' followed by protocol number
+            first_byte = header[0:1]
+            if first_byte == b"\x80":
+                # Protocols 2-5 start with \x80 followed by protocol number
+                if len(header) < 2 or header[1] not in (2, 3, 4, 5):
+                    return False
+            elif first_byte not in (b"(", b"]", b"}", b"c", b"l", b"d", b"t", b"p"):
+                # Common pickle opcode starts for protocols 0-1
+                return False
+
+            # For joblib files, look for joblib-specific patterns
+            if path.lower().endswith(".joblib"):
+                f.seek(0)
+                # Try to find joblib-specific markers in first 2KB
+                sample = f.read(2048)
+                # Look for joblib-specific indicators
+                joblib_indicators = [
+                    b"joblib",
+                    b"sklearn",
+                    b"numpy",
+                    b"_joblib",
+                    b"__main__",
+                    b"_pickle",
+                    b"NumpyArrayWrapper",
+                ]
+                return any(marker in sample for marker in joblib_indicators)
+
+            # For dill files, they're usually just enhanced pickle
+            elif path.lower().endswith(".dill"):
+                # Dill files should contain standard pickle format
+                # Additional validation could check for dill-specific patterns
+                return True
+
+        return False
+    except (OSError, IOError):
+        # File doesn't exist or can't be read
+        return False
+    except Exception:
+        # Other errors (e.g., permissions) - be conservative
+        return False
+
+
 def is_suspicious_global(mod: str, func: str) -> bool:
     """Check if a module.function reference is suspicious"""
     if mod in SUSPICIOUS_GLOBALS:
@@ -562,9 +576,22 @@ class PickleScanner(BaseScanner):
         if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
             try:
                 # Import here to avoid circular dependency
-                from modelaudit.utils.filetype import detect_file_format
+                from modelaudit.utils.filetype import (
+                    detect_file_format,
+                    validate_file_type,
+                )
 
                 file_format = detect_file_format(path)
+
+                # For security-sensitive pickle files, also validate file type
+                # This helps detect potential file spoofing attacks
+                if file_format == "pickle" and not validate_file_type(path):
+                    # File type validation failed - this could be suspicious
+                    # Log but still allow scanning for now (let scanner handle the validation)
+                    logger.warning(
+                        f"File type validation failed for potential pickle file: {path}"
+                    )
+
                 return file_format == "pickle"
             except Exception:
                 # If detection fails, fall back to extension check
@@ -578,6 +605,10 @@ class PickleScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -685,7 +716,7 @@ class PickleScanner(BaseScanner):
                 if opcode_count > self.max_opcodes:
                     result.add_issue(
                         f"Too many opcodes in pickle (> {self.max_opcodes})",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "opcode_count": opcode_count,
@@ -699,7 +730,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
                         why="The scan exceeded the configured time limit. Large or complex pickle files may take longer to analyze due to the number of opcodes that need to be processed.",
@@ -885,7 +916,7 @@ class PickleScanner(BaseScanner):
                             result.add_issue(
                                 "STACK_GLOBAL opcode found without "
                                 "sufficient string context",
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
                                     "position": pos,
@@ -953,11 +984,75 @@ class PickleScanner(BaseScanner):
             )
 
         except Exception as e:
-            result.add_issue(
-                f"Error analyzing pickle ops: {e}",
-                severity=IssueSeverity.CRITICAL,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+            # Handle known issues with legitimate serialization files
+            file_ext = os.path.splitext(self.current_file_path)[1].lower()
+
+            # Pre-validate file legitimacy to avoid nested exceptions
+            is_legitimate_file = False
+            if file_ext in {".joblib", ".dill"}:
+                try:
+                    is_legitimate_file = _is_legitimate_serialization_file(
+                        self.current_file_path
+                    )
+                except Exception:
+                    # If validation itself fails, treat as non-legitimate
+                    is_legitimate_file = False
+
+            # Check if this is a known benign error in legitimate serialization files
+            is_benign_error = (
+                isinstance(e, (ValueError, struct.error))
+                and any(
+                    msg in str(e).lower()
+                    for msg in [
+                        "unknown opcode",
+                        "unpack requires",
+                        "truncated",
+                        "bad marshal data",
+                    ]
+                )
+                and file_ext in {".joblib", ".dill"}
+                and is_legitimate_file
             )
+
+            if is_benign_error:
+                # Log for security auditing but treat as non-fatal
+                logger.warning(
+                    f"Truncated pickle scan of {self.current_file_path}: {e}. "
+                    f"This may be due to non-pickle data after STOP opcode."
+                )
+                result.metadata.update(
+                    {
+                        "truncated": True,
+                        "truncation_reason": "post_stop_data_or_format_issue",
+                        "exception_type": type(e).__name__,
+                        "exception_message": str(e)[:100],  # Limit message length
+                        "validated_format": True,
+                    }
+                )
+                # Still add as info-level issue for transparency
+                result.add_issue(
+                    f"Scan truncated due to format complexity: {type(e).__name__}",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "reason": "post_stop_data_or_format_issue",
+                        "opcodes_analyzed": opcode_count,
+                        "file_format": file_ext,
+                    },
+                    why="This file contains data after the pickle STOP opcode or uses format features that cannot be fully analyzed. The analyzable portion was scanned for security issues.",
+                )
+            else:
+                # Treat as critical error for unknown/suspicious cases
+                result.add_issue(
+                    f"Error analyzing pickle ops: {e}",
+                    severity=IssueSeverity.CRITICAL,
+                    details={
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "file_extension": file_ext,
+                        "opcodes_analyzed": opcode_count,
+                    },
+                )
 
         return result
 
@@ -969,30 +1064,13 @@ class PickleScanner(BaseScanner):
 
         try:
             # Common patterns that might indicate embedded Python code
-            code_patterns = [
-                b"import os",
-                b"import sys",
-                b"import subprocess",
-                b"eval(",
-                b"exec(",
-                b"__import__",
-                b"compile(",
-                b"os.system",
-                b"subprocess.call",
-                b"subprocess.Popen",
-                b"socket.socket",
-            ]
+            code_patterns = BINARY_CODE_PATTERNS
 
             # Executable signatures with additional validation
             # For PE files, we need to check for the full DOS header structure
             # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"\x7fELF": "Linux executable (ELF)",
-                b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-                b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-                b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/bin/": "Shell script shebang",
-                b"#!/usr/bin/": "Shell script shebang",
+                k: v for k, v in EXECUTABLE_SIGNATURES.items() if k != b"MZ"
             }
 
             # Read in chunks
@@ -1013,7 +1091,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(pattern)
                         result.add_issue(
                             f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore')}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "pattern": pattern.decode("ascii", errors="ignore"),
@@ -1070,7 +1148,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Binary scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "bytes_scanned": start_pos + bytes_scanned,

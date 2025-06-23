@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, BinaryIO, Dict, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -81,6 +81,10 @@ class GgufScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -115,7 +119,7 @@ class GgufScanner(BaseScanner):
         )
         return result
 
-    def _read_string(self, f, max_length: int = 1024 * 1024) -> str:
+    def _read_string(self, f: BinaryIO, max_length: int = 1024 * 1024) -> str:
         """Read a string with length checking for security."""
         (length,) = struct.unpack("<Q", f.read(8))
         if length > max_length:
@@ -125,7 +129,7 @@ class GgufScanner(BaseScanner):
             raise ValueError("Unexpected end of file while reading string")
         return data.decode("utf-8", "ignore")
 
-    def _scan_gguf(self, f, file_size: int, result: ScanResult) -> None:
+    def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
         # Read header
         version = struct.unpack("<I", f.read(4))[0]
@@ -326,7 +330,9 @@ class GgufScanner(BaseScanner):
 
         result.bytes_scanned = f.tell()
 
-    def _scan_ggml(self, f, file_size: int, magic: bytes, result: ScanResult) -> None:
+    def _scan_ggml(
+        self, f: BinaryIO, file_size: int, magic: bytes, result: ScanResult
+    ) -> None:
         """Basic GGML file validation with security checks."""
         result.metadata["format"] = "ggml"
         result.metadata["magic"] = magic.decode("ascii", "ignore")
@@ -364,7 +370,7 @@ class GgufScanner(BaseScanner):
 
         result.bytes_scanned = file_size
 
-    def _read_value(self, f, vtype: int):
+    def _read_value(self, f: BinaryIO, vtype: int) -> Any:
         """Read a value of the specified type with security checks."""
         if vtype == 0:  # UINT8
             return struct.unpack("<B", f.read(1))[0]

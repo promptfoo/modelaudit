@@ -55,6 +55,10 @@ class SafeTensorsScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -113,9 +117,9 @@ class SafeTensorsScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-                result.metadata["tensor_count"] = len(
-                    [k for k in header.keys() if k != "__metadata__"]
-                )
+                tensor_names = [k for k in header.keys() if k != "__metadata__"]
+                result.metadata["tensor_count"] = len(tensor_names)
+                result.metadata["tensors"] = tensor_names
 
                 # Validate tensor offsets and sizes
                 tensor_entries: list[tuple[str, Any]] = [

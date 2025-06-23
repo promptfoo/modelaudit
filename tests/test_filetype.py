@@ -1,6 +1,12 @@
 import zipfile
 
-from modelaudit.utils.filetype import detect_file_format, find_sharded_files, is_zipfile
+from modelaudit.utils.filetype import (
+    detect_file_format,
+    detect_format_from_extension,
+    find_sharded_files,
+    is_zipfile,
+    validate_file_type,
+)
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -39,8 +45,10 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pkl": "pickle",
         ".pickle": "pickle",
         ".dill": "pickle",  # .dill files are treated as pickle files
+        ".msgpack": "flax_msgpack",
         ".h5": "hdf5",
         ".pb": "protobuf",
+        ".tflite": "tflite",
         ".unknown": "unknown",
     }
 
@@ -116,3 +124,97 @@ def test_find_sharded_files(tmp_path):
     assert shards[0].endswith("pytorch_model-00001-of-00005.bin")
     assert shards[1].endswith("pytorch_model-00002-of-00005.bin")
     assert shards[2].endswith("pytorch_model-00003-of-00005.bin")
+
+
+def test_detect_format_from_extension(tmp_path):
+    """Test extension-only format detection."""
+    file_path = tmp_path / "model.pt"
+    file_path.write_bytes(b"abc")
+    assert detect_format_from_extension(str(file_path)) == "pickle"
+
+    dir_path = tmp_path / "saved_model"
+    dir_path.mkdir()
+    (dir_path / "saved_model.pb").write_bytes(b"d")
+    assert detect_format_from_extension(str(dir_path)) == "tensorflow_directory"
+
+
+def test_detect_gguf_ggml_formats(tmp_path):
+    """Test detection of GGUF and GGML formats by magic bytes."""
+    # Test GGUF format
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF" + b"\x00" * 20)
+    assert detect_file_format(str(gguf_path)) == "gguf"
+    assert detect_format_from_extension(str(gguf_path)) == "gguf"
+
+    # Test GGML format
+    ggml_path = tmp_path / "model.ggml"
+    ggml_path.write_bytes(b"GGML" + b"\x00" * 20)
+    assert detect_file_format(str(ggml_path)) == "ggml"
+    assert detect_format_from_extension(str(ggml_path)) == "ggml"
+
+    # Test GGUF extension with wrong magic (should fall back to extension)
+    fake_gguf_path = tmp_path / "fake.gguf"
+    fake_gguf_path.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert detect_file_format(str(fake_gguf_path)) == "gguf"  # Falls back to extension
+    assert detect_format_from_extension(str(fake_gguf_path)) == "gguf"
+
+
+def test_validate_file_type(tmp_path):
+    """Validate files using magic numbers."""
+    # Valid ZIP-based PyTorch file
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("test.txt", "data")
+    assert validate_file_type(str(zip_path)) is True
+
+    # Invalid HDF5 file with .h5 extension
+    invalid_h5 = tmp_path / "bad.h5"
+    invalid_h5.write_bytes(b"not real hdf5")
+    assert validate_file_type(str(invalid_h5)) is False
+    
+    # Valid HDF5 file
+    valid_h5 = tmp_path / "good.h5"
+    hdf5_magic = b"\x89HDF\r\n\x1a\n"
+    valid_h5.write_bytes(hdf5_magic + b"hdf5 data")
+    assert validate_file_type(str(valid_h5)) is True
+    
+    # Valid pickle file
+    pickle_path = tmp_path / "model.pkl"
+    pickle_path.write_bytes(b"\x80\x03" + b"pickle data")
+    assert validate_file_type(str(pickle_path)) is True
+    
+    # Valid GGUF file
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF" + b"\x00" * 20)
+    assert validate_file_type(str(gguf_path)) is True
+    
+    # Invalid GGUF file (wrong magic)
+    bad_gguf = tmp_path / "bad.gguf"
+    bad_gguf.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert validate_file_type(str(bad_gguf)) is False
+    
+    # Small file should be valid (can't determine magic bytes)
+    small_file = tmp_path / "small.h5"
+    small_file.write_bytes(b"hi")
+    assert validate_file_type(str(small_file)) is True
+    
+    # Unknown extension should be valid
+    unknown_ext = tmp_path / "file.unknown"
+    unknown_ext.write_bytes(b"some data")
+    assert validate_file_type(str(unknown_ext)) is True
+    
+    # SafeTensors file with JSON header
+    safetensors_path = tmp_path / "model.safetensors"
+    safetensors_path.write_bytes(b'{"metadata": "test"}' + b"\x00" * 20)
+    assert validate_file_type(str(safetensors_path)) is True
+    
+    # PyTorch binary (.bin) that's actually a ZIP (valid case)
+    bin_zip = tmp_path / "model.bin"
+    with zipfile.ZipFile(bin_zip, "w") as zipf:
+        zipf.writestr("weights.pt", "data")
+    assert validate_file_type(str(bin_zip)) is True
+    
+    # PyTorch binary (.bin) that's actually pickle (valid case)
+    bin_pickle = tmp_path / "weights.bin"
+    bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
+    assert validate_file_type(str(bin_pickle)) is True
