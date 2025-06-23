@@ -1,0 +1,7 @@
+{
+  "model_name": "advanced_threat",
+  "config": {
+    "api_endpoint": "http://attacker-c2.evil.com/data",
+    "exfil_key": "SECRET_API_KEY_12345"
+  }
+}
