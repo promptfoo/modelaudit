@@ -16,13 +16,13 @@ from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from tests.evil_pickle import EvilClass  # noqa: E402
+from tests.assets.generators.generate_evil_pickle import EvilClass  # noqa: E402
 
 
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
-        # Path to evil.pickle sample
-        self.evil_pickle_path = Path(__file__).parent / "evil.pickle"
+        # Path to assets/samples/pickles/evil.pickle sample
+        self.evil_pickle_path = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
 
         # Create the evil pickle if it doesn't exist
         if not self.evil_pickle_path.exists():
@@ -32,7 +32,7 @@ class TestPickleScanner(unittest.TestCase):
 
     def test_scan_evil_pickle(self):
         """Test that the scanner can detect the malicious pickle
-        created by evil_pickle.py"""
+        created by assets/generators/generate_evil_pickle.py"""
         scanner = PickleScanner()
         result = scanner.scan(str(self.evil_pickle_path))
 
@@ -64,7 +64,7 @@ class TestPickleScanner(unittest.TestCase):
 
     def test_scan_dill_pickle(self):
         """Scanner should flag suspicious dill references"""
-        dill_pickle_path = Path(__file__).parent / "dill_func.pkl"
+        dill_pickle_path = Path(__file__).parent / "assets/samples/pickles/dill_func.pkl"
         if not dill_pickle_path.exists():
 
             def func(x):

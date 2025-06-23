@@ -35,7 +35,7 @@ def demonstrate_license_features():
     print()
 
     # Get test data directory
-    test_data_dir = Path(__file__).parent / "integration_test_data"
+    test_data_dir = Path(__file__).parent / "assets/scenarios/license_scenarios"
 
     if not test_data_dir.exists():
         print("❌ Test data directory not found. Run the integration tests first.")
