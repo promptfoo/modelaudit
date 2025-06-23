@@ -240,7 +240,7 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 1. Update version in `pyproject.toml`
 2. Create release PR
 3. After merge, create GitHub release
-4. Poetry will automatically publish to PyPI
+4. Package will automatically publish to PyPI via GitHub Actions
 
 ## 🐛 Reporting Issues
 
