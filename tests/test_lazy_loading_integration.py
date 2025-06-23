@@ -20,9 +20,9 @@ class TestCoreIntegration:
         # Reset loaded scanners
         _registry._loaded_scanners.clear()
         
-        # Create a JSON file
-        with tempfile.NamedTemporaryFile(suffix=".json", mode='w') as f:
-            f.write('{"model": "test"}')
+        # Create a JSON file with ML-related content
+        with tempfile.NamedTemporaryFile(suffix="_config.json", mode='w') as f:
+            f.write('{"model": "test", "tokenizer": "config"}')
             f.flush()
             
             # Scan the file
@@ -190,8 +190,8 @@ class TestErrorRecovery:
     def test_scan_continues_with_available_scanners(self):
         """Test that scanning continues even if some scanners fail to load."""
         # Create a file that should be scannable by available scanners
-        with tempfile.NamedTemporaryFile(suffix=".json", mode='w') as f:
-            f.write('{"test": "config"}')
+        with tempfile.NamedTemporaryFile(suffix="_config.json", mode='w') as f:
+            f.write('{"model": "test", "config": "data"}')
             f.flush()
             
             # This should work even if some heavy dependency scanners fail
