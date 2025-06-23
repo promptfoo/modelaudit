@@ -59,11 +59,26 @@ def save_cache() -> None:
         return
     data = load_cache()
     path = _get_cache_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Ensure directory exists with more robust error handling
+    dir_path = os.path.dirname(path)
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+    except OSError:
+        # If we can't create the directory, skip caching
+        return
+
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+    except OSError:
+        # If we can't write the cache file, clean up and skip
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def compute_sha256(path: str) -> str:
