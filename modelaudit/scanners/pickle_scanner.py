@@ -6,6 +6,8 @@ import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
 )
@@ -1063,30 +1065,13 @@ class PickleScanner(BaseScanner):
 
         try:
             # Common patterns that might indicate embedded Python code
-            code_patterns = [
-                b"import os",
-                b"import sys",
-                b"import subprocess",
-                b"eval(",
-                b"exec(",
-                b"__import__",
-                b"compile(",
-                b"os.system",
-                b"subprocess.call",
-                b"subprocess.Popen",
-                b"socket.socket",
-            ]
+            code_patterns = BINARY_CODE_PATTERNS
 
             # Executable signatures with additional validation
             # For PE files, we need to check for the full DOS header structure
             # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"\x7fELF": "Linux executable (ELF)",
-                b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-                b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-                b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/bin/": "Shell script shebang",
-                b"#!/usr/bin/": "Shell script shebang",
+                k: v for k, v in EXECUTABLE_SIGNATURES.items() if k != b"MZ"
             }
 
             # Read in chunks

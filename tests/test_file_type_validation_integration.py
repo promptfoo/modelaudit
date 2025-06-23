@@ -11,7 +11,6 @@ These tests verify the file type validation feature works correctly with:
 
 import json
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -19,9 +18,7 @@ import numpy as np
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils.filetype import (
-    detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
@@ -51,7 +48,12 @@ class TestFileTypeValidationIntegration:
         temp_dir.mkdir()
 
         # Copy test data to temp directory
-        for subdir in ["mit_model", "agpl_component", "mixed_licenses", "unlicensed_dataset"]:
+        for subdir in [
+            "mit_model",
+            "agpl_component",
+            "mixed_licenses",
+            "unlicensed_dataset",
+        ]:
             src_dir = test_data_dir / subdir
             if src_dir.exists():
                 dest_dir = temp_dir / subdir
@@ -64,7 +66,12 @@ class TestFileTypeValidationIntegration:
         validation_failures = []
 
         # Test all files in the integration test data
-        for test_subdir in ["mit_model", "agpl_component", "mixed_licenses", "unlicensed_dataset"]:
+        for test_subdir in [
+            "mit_model",
+            "agpl_component",
+            "mixed_licenses",
+            "unlicensed_dataset",
+        ]:
             subdir_path = test_data_dir / test_subdir
             if not subdir_path.exists():
                 continue
@@ -78,30 +85,39 @@ class TestFileTypeValidationIntegration:
                         ext_format = detect_format_from_extension(str(file_path))
 
                         if not is_valid:
-                            validation_failures.append({
-                                "file": str(file_path.relative_to(test_data_dir)),
-                                "header_format": header_format,
-                                "ext_format": ext_format,
-                            })
+                            validation_failures.append(
+                                {
+                                    "file": str(file_path.relative_to(test_data_dir)),
+                                    "header_format": header_format,
+                                    "ext_format": ext_format,
+                                }
+                            )
 
                         # Also test scanning doesn't produce validation errors
                         result = scan_file(str(file_path))
                         validation_issues = [
-                            i for i in result.issues
+                            i
+                            for i in result.issues
                             if "file type validation failed" in i.message.lower()
                         ]
 
                         if validation_issues:
-                            validation_failures.append({
-                                "file": str(file_path.relative_to(test_data_dir)),
-                                "scan_issues": [i.message for i in validation_issues],
-                            })
+                            validation_failures.append(
+                                {
+                                    "file": str(file_path.relative_to(test_data_dir)),
+                                    "scan_issues": [
+                                        i.message for i in validation_issues
+                                    ],
+                                }
+                            )
 
                     except Exception as e:
-                        validation_failures.append({
-                            "file": str(file_path.relative_to(test_data_dir)),
-                            "error": str(e),
-                        })
+                        validation_failures.append(
+                            {
+                                "file": str(file_path.relative_to(test_data_dir)),
+                                "error": str(e),
+                            }
+                        )
 
         # All legitimate files should pass validation
         assert len(validation_failures) == 0, (
@@ -113,19 +129,26 @@ class TestFileTypeValidationIntegration:
         # Test MIT model pickle file
         mit_pickle = test_data_dir / "mit_model" / "model_weights.pkl"
         if mit_pickle.exists():
-            assert validate_file_type(str(mit_pickle)), "MIT model pickle should be valid"
+            assert validate_file_type(str(mit_pickle)), (
+                "MIT model pickle should be valid"
+            )
 
             result = scan_file(str(mit_pickle))
             validation_issues = [
-                i for i in result.issues
+                i
+                for i in result.issues
                 if "file type validation failed" in i.message.lower()
             ]
-            assert len(validation_issues) == 0, "MIT pickle should not have validation issues"
+            assert len(validation_issues) == 0, (
+                "MIT pickle should not have validation issues"
+            )
 
         # Test AGPL model pickle file
         agpl_pickle = test_data_dir / "agpl_component" / "agpl_model.pkl"
         if agpl_pickle.exists():
-            assert validate_file_type(str(agpl_pickle)), "AGPL model pickle should be valid"
+            assert validate_file_type(str(agpl_pickle)), (
+                "AGPL model pickle should be valid"
+            )
 
     def test_numpy_files_validation(self, test_data_dir):
         """Test validation of NumPy files."""
@@ -137,7 +160,9 @@ class TestFileTypeValidationIntegration:
 
             assert header_format == "numpy", f"Expected numpy, got {header_format}"
             assert ext_format == "numpy", f"Expected numpy, got {ext_format}"
-            assert validate_file_type(str(embeddings_file)), "NumPy file should be valid"
+            assert validate_file_type(str(embeddings_file)), (
+                "NumPy file should be valid"
+            )
 
     def test_json_files_validation(self, test_data_dir):
         """Test validation of JSON configuration files."""
@@ -163,7 +188,8 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(fake_h5))
         validation_issues = [
-            i for i in result.issues
+            i
+            for i in result.issues
             if "file type validation failed" in i.message.lower()
         ]
 
@@ -177,7 +203,8 @@ class TestFileTypeValidationIntegration:
 
             result = scan_file(str(fake_safetensors))
             validation_issues = [
-                i for i in result.issues
+                i
+                for i in result.issues
                 if "file type validation failed" in i.message.lower()
             ]
 
@@ -190,7 +217,8 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(fake_gguf))
         validation_issues = [
-            i for i in result.issues
+            i
+            for i in result.issues
             if "file type validation failed" in i.message.lower()
         ]
 
@@ -203,7 +231,8 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(fake_pickle))
         validation_issues = [
-            i for i in result.issues
+            i
+            for i in result.issues
             if "file type validation failed" in i.message.lower()
         ]
 
@@ -227,21 +256,27 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(pytorch_zip))
         validation_issues = [
-            i for i in result.issues
+            i
+            for i in result.issues
             if "file type validation failed" in i.message.lower()
         ]
-        assert len(validation_issues) == 0, "PyTorch ZIP should not trigger validation failures"
+        assert len(validation_issues) == 0, (
+            "PyTorch ZIP should not trigger validation failures"
+        )
 
         # Test 2: PyTorch binary that's actually pickle format
         pytorch_pickle = temp_test_dir / "weights.bin"
         # Create a real pickle file
         import pickle
+
         data = {"weights": [1.0, 2.0, 3.0]}
         with open(pytorch_pickle, "wb") as f:
             pickle.dump(data, f)
 
         # Should pass validation (.bin with pickle content is legitimate)
-        assert validate_file_type(str(pytorch_pickle)), "PyTorch pickle binary should be valid"
+        assert validate_file_type(str(pytorch_pickle)), (
+            "PyTorch pickle binary should be valid"
+        )
 
     def test_directory_scan_with_validation(self, temp_test_dir):
         """Test scanning entire directories with file type validation enabled."""
@@ -255,7 +290,8 @@ class TestFileTypeValidationIntegration:
 
             # Check for validation issues
             validation_issues = [
-                issue for issue in results["issues"]
+                issue
+                for issue in results["issues"]
                 if "file type validation failed" in issue.get("message", "").lower()
             ]
 
@@ -284,8 +320,8 @@ class TestFileTypeValidationIntegration:
         malicious_model.write_bytes(malicious_content)
 
         result = scan_file(str(malicious_model))
-        # Should detect executable patterns (this would be caught by pickle scanner)
-        has_executable_warning = any(
+        # Record whether executable patterns were detected (pickle scanner)
+        _has_executable_warning = any(
             "executable" in issue.message.lower() for issue in result.issues
         )
 
@@ -295,7 +331,8 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(tiny_model))
         validation_issues = [
-            i for i in result.issues
+            i
+            for i in result.issues
             if "file type validation failed" in i.message.lower()
         ]
 
@@ -315,12 +352,15 @@ class TestFileTypeValidationIntegration:
 
         results = scan_model_directory_or_file(str(attack_dir))
         all_validation_issues = [
-            issue for issue in results["issues"]
+            issue
+            for issue in results["issues"]
             if "file type validation failed" in issue.get("message", "").lower()
         ]
 
         if len(all_validation_issues) == 0:
-            security_threats.append("Mixed legitimate/malicious directory not fully detected")
+            security_threats.append(
+                "Mixed legitimate/malicious directory not fully detected"
+            )
 
         # Some security threats should be detected
         total_detections = len([t for t in security_threats if "not detected" not in t])
@@ -372,7 +412,9 @@ class TestFileTypeValidationIntegration:
         for file_path, should_be_valid, description in test_files:
             actual_valid = validate_file_type(str(file_path))
             if actual_valid != should_be_valid:
-                test_cases.append(f"{description}: expected {should_be_valid}, got {actual_valid}")
+                test_cases.append(
+                    f"{description}: expected {should_be_valid}, got {actual_valid}"
+                )
 
         assert len(test_cases) == 0, f"Format compatibility test failures: {test_cases}"
 
@@ -420,7 +462,12 @@ class TestFileTypeValidationIntegration:
         start_time = time.time()
 
         # Scan all test directories
-        for subdir in ["mit_model", "agpl_component", "mixed_licenses", "unlicensed_dataset"]:
+        for subdir in [
+            "mit_model",
+            "agpl_component",
+            "mixed_licenses",
+            "unlicensed_dataset",
+        ]:
             test_dir = test_data_dir / subdir
             if test_dir.exists():
                 results = scan_model_directory_or_file(str(test_dir))
@@ -451,22 +498,26 @@ class TestFileTypeValidationIntegration:
 
         # Should have validation warnings
         validation_warnings = [
-            issue for issue in results["issues"]
+            issue
+            for issue in results["issues"]
             if "file type validation failed" in issue.get("message", "").lower()
             and issue.get("severity") == "warning"
         ]
 
-        assert len(validation_warnings) > 0, "Should generate file type validation warnings"
+        assert len(validation_warnings) > 0, (
+            "Should generate file type validation warnings"
+        )
 
         # Should still complete successfully (warnings, not errors)
         assert results["success"], "Scan should complete successfully despite warnings"
 
         # Exit code should be 1 (warnings found) not 0 (clean) or 2 (errors)
         from modelaudit.core import determine_exit_code
+
         exit_code = determine_exit_code(results)
         assert exit_code == 1, f"Expected exit code 1 (warnings), got {exit_code}"
 
 
 if __name__ == "__main__":
     # Allow running individual tests for debugging
-    pytest.main([__file__, "-v"]) 
+    pytest.main([__file__, "-v"])
