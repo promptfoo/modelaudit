@@ -143,11 +143,13 @@ def scan_command(
         "issues": [],
         "has_errors": False,
         "files_scanned": 0,
+        "assets": [],  # Track all assets encountered
     }
 
     # Scan each path
     for path in paths:
         # Early exit for common non-model file extensions
+        # Note: Allow .json, .yaml, .yml as they can be model config files
         if os.path.isfile(path):
             _, ext = os.path.splitext(path)
             ext = ext.lower()
@@ -158,9 +160,6 @@ def scan_command(
                 ".js",
                 ".html",
                 ".css",
-                ".json",
-                ".yaml",
-                ".yml",
             ):
                 if verbose:
                     logger.info(f"Skipping non-model file: {path}")
@@ -202,6 +201,7 @@ def scan_command(
                 "files_scanned",
                 1,
             )  # Count each file scanned
+            aggregated_results["assets"].extend(results.get("assets", []))
             if results.get("has_errors", False):
                 aggregated_results["has_errors"] = True
 
@@ -437,6 +437,39 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             "\n" + click.style("✓ No issues found", fg="green", bold=True),
         )
+
+    # Asset list
+    assets = results.get("assets", [])
+    if assets:
+        output_lines.append("\nAssets encountered:")
+
+        def render_assets(items, indent=1):
+            lines = []
+            for asset in items:
+                prefix = "  " * indent + "- "
+                line = f"{prefix}{asset.get('path')}"
+                if asset.get("type"):
+                    line += f" ({asset['type']})"
+                if asset.get("size"):
+                    line += f" [{asset['size']} bytes]"
+                lines.append(line)
+                if asset.get("tensors"):
+                    tline = (
+                        "  " * (indent + 1) + "Tensors: " + ", ".join(asset["tensors"])
+                    )
+                    lines.append(tline)
+                if asset.get("keys"):
+                    kline = (
+                        "  " * (indent + 1)
+                        + "Keys: "
+                        + ", ".join(map(str, asset["keys"]))
+                    )
+                    lines.append(kline)
+                if asset.get("contents"):
+                    lines.extend(render_assets(asset["contents"], indent + 1))
+            return lines
+
+        output_lines.extend(render_assets(assets))
 
     # Add a footer
     output_lines.append("─" * 80)
