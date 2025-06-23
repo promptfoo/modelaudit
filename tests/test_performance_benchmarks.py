@@ -149,6 +149,7 @@ class TestPerformanceBenchmarks:
         # Should scan multiple files
         assert metrics["files_scanned"] > 1, "Should scan multiple files in directory"
 
+    @pytest.mark.performance
     def test_scaling_performance(self, assets_dir):
         """Test how performance scales with number of files."""
         if not assets_dir.exists():
@@ -199,6 +200,7 @@ class TestPerformanceBenchmarks:
                 f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
             )
 
+    @pytest.mark.performance
     def test_memory_usage_stability(self, assets_dir):
         """Test that memory usage remains stable during scanning."""
         if not assets_dir.exists():
@@ -225,6 +227,7 @@ class TestPerformanceBenchmarks:
         # Memory growth should be reasonable
         assert memory_growth < 50, f"Memory growth {memory_growth:.2f}MB too high"
 
+    @pytest.mark.performance
     def test_concurrent_performance(self, assets_dir):
         """Test performance under concurrent load."""
         if not assets_dir.exists():
