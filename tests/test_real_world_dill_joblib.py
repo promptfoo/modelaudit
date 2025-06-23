@@ -334,6 +334,8 @@ class TestErrorScenarios:
     def test_permission_denied_handling(self, tmp_path):
         """Test handling of files with permission issues."""
         if hasattr(os, "chmod"):  # Unix-like systems
+            if os.geteuid() == 0:
+                pytest.skip("Running as root, permission errors won't trigger")
             restricted_file = tmp_path / "restricted.joblib"
             restricted_file.write_bytes(b"joblib test")
 
