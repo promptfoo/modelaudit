@@ -5,7 +5,6 @@ This test provides a concise example of how the file type validation feature wor
 with real model files, showcasing both security benefits and legitimate use cases.
 """
 
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -82,7 +81,7 @@ class TestFileTypeValidationDemo:
             if not is_valid or len(validation_issues) > 0:
                 print(f"   ✅ THREAT DETECTED for {filename}")
             else:
-                print(f"   ⚠️  Threat not detected (may be due to permissive validation)")
+                print("   ⚠️  Threat not detected (may be due to permissive validation)")
 
     def test_cross_format_compatibility_demo(self, tmp_path):
         """Demonstrate legitimate cross-format file compatibility."""
@@ -133,7 +132,7 @@ class TestFileTypeValidationDemo:
                 if "file type validation failed" in issue.get("message", "").lower()
             ]
 
-            print(f"📁 MIT Model Directory:")
+            print("📁 MIT Model Directory:")
             print(f"   Files scanned: {results['files_scanned']}")
             print(f"   Validation warnings: {len(validation_warnings)}")
             print(f"   Scan success: {results['success']}")
@@ -172,7 +171,7 @@ class TestFileTypeValidationDemo:
                    for keyword in ["spoofing", "security", "validation failed"])
         ]
 
-        print(f"📁 Mixed Directory (legitimate + malicious):")
+        print("📁 Mixed Directory (legitimate + malicious):")
         print(f"   Files scanned: {results['files_scanned']}")
         print(f"   Validation warnings: {len(validation_warnings)}")
         print(f"   Security issues: {len(security_issues)}")

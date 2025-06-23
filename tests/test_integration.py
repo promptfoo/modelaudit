@@ -199,7 +199,6 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
 
 def test_file_type_validation_integration(tmp_path):
     """Test that file type validation is integrated into the main scanning workflow."""
-    import zipfile
     from modelaudit.core import scan_file
     from modelaudit.scanners.base import IssueSeverity
     
@@ -227,6 +226,7 @@ def test_file_type_validation_integration(tmp_path):
 def test_valid_file_type_no_warnings(tmp_path):
     """Test that valid file types don't generate false positive warnings."""
     import zipfile
+
     from modelaudit.core import scan_file
     
     # Create a valid ZIP file with .zip extension
@@ -248,6 +248,7 @@ def test_valid_file_type_no_warnings(tmp_path):
 def test_pytorch_zip_file_valid(tmp_path):
     """Test that PyTorch files saved as ZIP are properly validated."""
     import zipfile
+
     from modelaudit.core import scan_file
     
     # Create a PyTorch file that's actually a ZIP (common with torch.save())

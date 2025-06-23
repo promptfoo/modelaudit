@@ -306,11 +306,19 @@ When using `--format json`, ModelAudit outputs structured results:
   ],
   "has_errors": false,
   "files_scanned": 1,
-  "duration": 0.0005328655242919922
+  "duration": 0.0005328655242919922,
+  "assets": [
+    {
+      "path": "model.safetensors",
+      "type": "safetensors",
+      "tensors": ["embedding.weight", "decoder.weight"]
+    }
+  ]
 }
 ```
 
 Each issue includes a `message`, `severity` level (`critical`, `warning`, `info`, `debug`), `location`, and scanner-specific `details`.
+The `assets` array lists every file and component encountered during the scan, including nested archive members and tensor names.
 
 ## 🔄 CI/CD Integration
 
