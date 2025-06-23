@@ -20,12 +20,39 @@ Implemented a lazy loading architecture that only imports dependencies when actu
 | CLI startup | ~7s | 0.059s | ~120x faster |
 | Light scans | 3.3s | 0.01s | 330x faster |
 
+### Technical Implementation
+
+#### Scanner Registry Architecture
+```python
+class ScannerRegistry:
+    def _init_registry(self):
+        self._scanners = {
+            "tensorflow": {
+                "module": "modelaudit.scanners.tf_savedmodel_scanner",
+                "class": "TensorFlowSavedModelScanner",
+                "dependencies": ["tensorflow"],  # Heavy dependency marked
+                "priority": 3,
+            },
+            # ... other scanners
+        }
+    
+    def get_scanner_for_path(self, path: str):
+        # Pre-filter by file extension before loading any scanners
+        # Only loads the specific scanner needed for the file type
+```
+
+#### Lazy Loading Behavior
+- **Extension-based filtering**: Checks file extensions before loading scanners
+- **Priority-based selection**: Loads scanners in correct priority order
+- **Dependency isolation**: Heavy ML frameworks only imported when scanning relevant files
+- **Backwards compatibility**: Existing API unchanged via `__getattr__` magic
+
 ### Key Changes
 - ✅ **Lazy Scanner Registry** - Only loads scanners when needed
 - ✅ **Smart File Type Detection** - Pre-filters by extension before loading
 - ✅ **Backwards Compatibility** - No breaking changes to existing API
 - ✅ **Memory Optimization** - Only loads heavy dependencies when scanning relevant files
-- ✅ **Documentation** - Comprehensive optimization guide included
+- ✅ **Comprehensive Tests** - Full test coverage for lazy loading functionality
 
 ### Dependencies Optimized
 Heavy dependencies now load only when needed:
@@ -39,19 +66,13 @@ Heavy dependencies now load only when needed:
 
 ### Testing
 - ✅ All CI checks pass (linting, formatting, type checking)
-- ✅ 479 tests pass with 82% coverage
+- ✅ 479+ tests pass with 82%+ coverage
 - ✅ Build succeeds
 - ✅ Backwards compatibility verified
+- ✅ Lazy loading specific tests added
 - ✅ Performance benchmarks included
 
 ### Impact
 This transforms ModelAudit from a slow-starting tool to a snappy, responsive scanner that only pays the cost of heavy dependencies when actually scanning relevant model types.
 
 **Real-world benefit**: Users can now run quick scans on common files (JSON, pickles, etc.) without waiting 7+ seconds for TensorFlow to load.
-
-### Technical Details
-See `LAZY_LOADING_OPTIMIZATION.md` for comprehensive technical documentation including:
-- Architecture overview
-- Performance benchmarks
-- Implementation details
-- Future optimization opportunities
