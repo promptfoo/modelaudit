@@ -5,7 +5,7 @@ from typing import Any, Iterable
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
-from cyclonedx.model.license import LicenseExpression, LicenseRepository
+from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 
@@ -110,7 +110,8 @@ def _component_for_file(
     )
 
     if license_expressions:
-        component.licenses = LicenseRepository(license_expressions)
+        for license_expr in license_expressions:
+            component.licenses.add(license_expr)
 
     return component
 
