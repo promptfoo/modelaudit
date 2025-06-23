@@ -356,4 +356,35 @@ class TestSpecificFileTypes:
         with tempfile.NamedTemporaryFile(suffix=".unknown_ext") as f:
             scanner = _registry.get_scanner_for_path(f.name)
             # May return None or a fallback scanner
-            # The exact behavior depends on implementation 
+            # The exact behavior depends on implementation
+
+    def test_manifest_scanner_exact_filename_matching(self):
+        """Test that manifest scanner uses exact filename matching to prevent false positives."""
+        _registry._loaded_scanners.clear()
+        
+        # Test exact match - should work
+        with tempfile.NamedTemporaryFile(suffix="config.json", delete=False) as f:
+            f.write(b'{"test": "config"}')
+            exact_path = f.name
+        
+        # Test false positive case - should NOT match
+        with tempfile.NamedTemporaryFile(suffix="config.json.backup", delete=False) as f:
+            f.write(b'{"test": "backup"}')
+            backup_path = f.name
+        
+        try:
+            # Exact filename should potentially match (depends on manifest scanner logic)
+            exact_scanner = _registry.get_scanner_for_path(exact_path)
+            
+            # Backup file should NOT match due to exact matching
+            backup_scanner = _registry.get_scanner_for_path(backup_path)
+            
+            # The backup file should not be matched by manifest scanner
+            # since "config.json.backup" != "config.json"
+            if exact_scanner is not None:
+                # If exact match works, backup should not match
+                assert backup_scanner is None or backup_scanner.name != "manifest"
+                
+        finally:
+            Path(exact_path).unlink(missing_ok=True)
+            Path(backup_path).unlink(missing_ok=True) 

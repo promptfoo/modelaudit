@@ -8,7 +8,12 @@ logger = logging.getLogger(__name__)
 
 
 class ScannerRegistry:
-    """Lazy-loading registry for model scanners"""
+    """
+    Lazy-loading registry for model scanners
+    
+    This registry manages scanner loading and selection. For security patterns
+    used by scanners, see modelaudit.suspicious_symbols module.
+    """
 
     def __init__(self):
         self._scanners: Dict[str, Dict[str, Any]] = {}
@@ -261,7 +266,8 @@ class ScannerRegistry:
                     "tokenizer_config.json",
                     "model_config.json",
                 ]
-                if any(pattern in filename for pattern in aiml_patterns):
+                # Use exact filename matching to avoid false positives like "config.json.backup"
+                if any(filename == pattern or filename.endswith(f"/{pattern}") for pattern in aiml_patterns):
                     extension_match = True
 
             if extension_match:
