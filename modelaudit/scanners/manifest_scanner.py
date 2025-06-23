@@ -1,5 +1,7 @@
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
@@ -168,6 +170,13 @@ class ManifestScanner(BaseScanner):
 
             if content:
                 result.bytes_scanned = file_size
+                if isinstance(content, dict):
+                    result.metadata["keys"] = list(content.keys())
+
+                # Extract license information if present
+                license_info = self._extract_license_info(content)
+                if license_info:
+                    result.metadata["license"] = license_info
 
                 # Check for suspicious configuration patterns
                 self._check_suspicious_patterns(content, result)
@@ -264,6 +273,24 @@ class ManifestScanner(BaseScanner):
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
+
+        return None
+
+    def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
+        """Return license string if found in manifest content"""
+        if not isinstance(content, dict):
+            return None
+
+        potential_keys = ["license", "licence", "licenses"]
+        for key in potential_keys:
+            if key in content:
+                value = content[key]
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, list) and value:
+                    first = value[0]
+                    if isinstance(first, str):
+                        return first
 
         return None
 
@@ -567,8 +594,8 @@ class ManifestScanner(BaseScanner):
         if not isinstance(value, str):
             return False
 
-        # Absolute paths
-        if value.startswith(("/", "\\", "C:", "D:")):
+        # Absolute paths (Unix or Windows)
+        if Path(value).is_absolute() or re.match(r"^[a-zA-Z]:\\", value):
             return True
 
         # Relative paths with separators
@@ -600,9 +627,10 @@ class ManifestScanner(BaseScanner):
             return True
 
         # Common path indicators
-        if any(
-            indicator in value.lower()
-            for indicator in ["/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"]
+        lower_value = value.lower()
+        indicators = ["/tmp", "/var", "/data", "/home", "/etc"]
+        if any(indicator in lower_value for indicator in indicators) or re.search(
+            r"[a-z]:\\", lower_value
         ):
             return True
 

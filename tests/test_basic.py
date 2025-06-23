@@ -1,6 +1,8 @@
 import re
 from importlib.metadata import PackageNotFoundError, version
 
+import pytest
+
 import modelaudit
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
@@ -107,6 +109,28 @@ def test_max_file_size(tmp_path):
         if "File too large to scan" in issue["message"]
     ]
     assert len(large_file_issues) == 0
+
+
+def test_max_total_size(tmp_path):
+    """Test max_total_size parameter."""
+    import pickle
+
+    file1 = tmp_path / "a.pkl"
+    with file1.open("wb") as f:
+        pickle.dump({"data": "x" * 100}, f)
+
+    file2 = tmp_path / "b.pkl"
+    with file2.open("wb") as f:
+        pickle.dump({"data": "y" * 100}, f)
+
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+
+    assert results["success"] is True
+
+    limit_issues = [
+        i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]
+    ]
+    assert len(limit_issues) == 1
 
 
 def test_timeout(tmp_path, monkeypatch):
@@ -234,6 +258,24 @@ def test_blacklist_patterns(tmp_path):
 
     # Just verify the scan completes successfully
     assert results["success"] is True
+
+
+def test_invalid_config_values(tmp_path):
+    """Test validation of configuration parameters."""
+    test_file = tmp_path / "test_invalid.dat"
+    test_file.write_bytes(b"data")
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), timeout=0)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_file_size=-1)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), chunk_size=0)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_total_size=-1)
 
 
 def test_version_consistency():

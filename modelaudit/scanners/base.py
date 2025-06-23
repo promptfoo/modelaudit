@@ -201,6 +201,7 @@ class BaseScanner(ABC):
             "max_file_read_size",
             0,
         )  # Default unlimited
+        self._path_validation_result: Optional[ScanResult] = None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -217,13 +218,21 @@ class BaseScanner(ABC):
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        return ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name)
+
+        # Automatically merge any stored path validation warnings
+        if hasattr(self, "_path_validation_result") and self._path_validation_result:
+            result.merge(self._path_validation_result)
+            # Clear the stored result to avoid duplicate merging
+            self._path_validation_result = None
+
+        return result
 
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 
         Returns:
-            None if path is valid, otherwise a ScanResult with errors
+            None if path is valid or has only warnings, otherwise a ScanResult with critical errors
         """
         result = self._create_result()
 
@@ -247,11 +256,57 @@ class BaseScanner(ABC):
             result.finish(success=False)
             return result
 
-        return None  # Path is valid
+        # Validate file type consistency for files (security check)
+        if os.path.isfile(path):
+            try:
+                from modelaudit.utils.filetype import (
+                    detect_file_format_from_magic,
+                    detect_format_from_extension,
+                    validate_file_type,
+                )
+
+                if not validate_file_type(path):
+                    header_format = detect_file_format_from_magic(path)
+                    ext_format = detect_format_from_extension(path)
+                    result.add_issue(
+                        f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing, corruption, or a security threat.",
+                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        location=path,
+                        details={
+                            "header_format": header_format,
+                            "extension_format": ext_format,
+                            "security_check": "file_type_validation",
+                        },
+                    )
+            except Exception as e:
+                # Don't fail the scan if file type validation has an error
+                result.add_issue(
+                    f"File type validation error: {str(e)}",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
+
+        # Store validation warnings for the scanner to merge later
+        self._path_validation_result = result if result.issues else None
+
+        # Only return result for CRITICAL issues that should stop the scan
+        critical_issues = [
+            issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        if critical_issues:
+            return result
+
+        return None  # Path is valid, scanner should continue and merge warnings if any
 
     def get_file_size(self, path: str) -> int:
-        """Get the size of a file in bytes"""
-        return os.path.getsize(path) if os.path.isfile(path) else 0
+        """Get the size of a file in bytes."""
+        try:
+            return os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            # If the file becomes inaccessible during scanning, treat the size
+            # as zero rather than raising an exception.
+            return 0
 
     def _check_size_limit(self, path: str) -> Optional[ScanResult]:
         """Check if the file exceeds the configured size limit."""

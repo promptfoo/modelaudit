@@ -195,3 +195,92 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     assert len(combined_results["issues"]) >= len(results1["issues"]) + len(
         results2["issues"],
     )
+
+
+def test_file_type_validation_integration(tmp_path):
+    """Test that file type validation is integrated into the main scanning workflow."""
+    from modelaudit.core import scan_file
+    from modelaudit.scanners.base import IssueSeverity
+    
+    # Create a file with mismatched extension and content
+    fake_h5 = tmp_path / "malicious.h5"
+    fake_h5.write_bytes(b"this is not hdf5 data" + b"\x00" * 100)
+    
+    result = scan_file(str(fake_h5))
+    
+    # Should detect file type validation failure
+    validation_issues = [
+        issue for issue in result.issues 
+        if "file type validation" in issue.message.lower()
+    ]
+    
+    # Should have at least one validation issue
+    assert len(validation_issues) > 0
+    
+    # Check that the issue has proper details
+    validation_issue = validation_issues[0]
+    assert validation_issue.severity in [IssueSeverity.WARNING, IssueSeverity.CRITICAL]
+    assert "spoofing" in validation_issue.message or "security" in validation_issue.message
+
+
+def test_valid_file_type_no_warnings(tmp_path):
+    """Test that valid file types don't generate false positive warnings."""
+    import zipfile
+
+    from modelaudit.core import scan_file
+    
+    # Create a valid ZIP file with .zip extension
+    zip_file = tmp_path / "valid.zip"
+    with zipfile.ZipFile(zip_file, "w") as zipf:
+        zipf.writestr("test.txt", "data")
+    
+    result = scan_file(str(zip_file))
+    
+    # Should not have file type validation warnings
+    validation_issues = [
+        issue for issue in result.issues 
+        if "file type validation" in issue.message.lower()
+    ]
+    
+    assert len(validation_issues) == 0
+
+
+def test_pytorch_zip_file_valid(tmp_path):
+    """Test that PyTorch files saved as ZIP are properly validated."""
+    import zipfile
+
+    from modelaudit.core import scan_file
+    
+    # Create a PyTorch file that's actually a ZIP (common with torch.save())
+    pt_file = tmp_path / "model.pt"
+    with zipfile.ZipFile(pt_file, "w") as zipf:
+        zipf.writestr("data.pkl", "tensor data")
+    
+    result = scan_file(str(pt_file))
+    
+    # Should not have file type validation warnings (this is a valid case)
+    validation_issues = [
+        issue for issue in result.issues 
+        if "file type validation failed" in issue.message.lower()
+    ]
+    
+    assert len(validation_issues) == 0
+
+
+def test_small_file_no_false_positives(tmp_path):
+    """Test that very small files don't trigger false validation warnings."""
+    from modelaudit.core import scan_file
+    
+    # Create a very small file
+    small_file = tmp_path / "tiny.h5"
+    small_file.write_bytes(b"hi")
+    
+    result = scan_file(str(small_file))
+    
+    # Should not have file type validation warnings for small files
+    validation_issues = [
+        issue for issue in result.issues 
+        if "file type validation failed" in issue.message.lower()
+    ]
+    
+    assert len(validation_issues) == 0

@@ -105,10 +105,10 @@ class JoblibScanner(BaseScanner):
                 return result
 
             if magic.startswith(b"\x80"):
-                file_like = io.BytesIO(data)
-                sub_result = self.pickle_scanner._scan_pickle_bytes(
-                    file_like, len(data)
-                )
+                with io.BytesIO(data) as file_like:
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(
+                        file_like, len(data)
+                    )
                 result.merge(sub_result)
                 result.bytes_scanned = len(data)
             else:
@@ -132,10 +132,10 @@ class JoblibScanner(BaseScanner):
                     )
                     result.finish(success=False)
                     return result
-                file_like = io.BytesIO(decompressed)
-                sub_result = self.pickle_scanner._scan_pickle_bytes(
-                    file_like, len(decompressed)
-                )
+                with io.BytesIO(decompressed) as file_like:
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(
+                        file_like, len(decompressed)
+                    )
                 result.merge(sub_result)
                 result.bytes_scanned = len(decompressed)
         except Exception as e:  # pragma: no cover

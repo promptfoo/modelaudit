@@ -1,22 +1,27 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Poetry
-RUN pip install poetry==1.5.1
-
-# Copy Poetry configuration files
-COPY pyproject.toml poetry.lock* ./
-
-# Configure Poetry to not create a virtual environment inside the container
-RUN poetry config virtualenvs.create false
-
-# Install dependencies (base only by default)
-RUN poetry install --no-dev --no-interaction
-
-# Copy project code
+# Copy source code first
 COPY . .
 
-# Set entrypoint
+# Install dependencies and the application
+# The lock file includes the current project as editable, so we install everything together
+RUN pip install --no-cache-dir -r requirements.lock
+
+# Create a non-root user
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
+
+USER appuser
+
+# Set the entrypoint
 ENTRYPOINT ["modelaudit"]
 CMD ["--help"] 

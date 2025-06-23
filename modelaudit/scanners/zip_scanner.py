@@ -1,4 +1,6 @@
 import os
+import re
+import tempfile
 import zipfile
 from typing import Any, Dict, Optional
 
@@ -84,11 +86,14 @@ class ZipScanner(BaseScanner):
             return result
 
         result.finish(success=True)
+        result.metadata["contents"] = scan_result.metadata.get("contents", [])
+        result.metadata["file_size"] = os.path.getsize(path)
         return result
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
+        contents: list[dict[str, Any]] = []
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
@@ -119,7 +124,8 @@ class ZipScanner(BaseScanner):
             for name in z.namelist():
                 info = z.getinfo(name)
 
-                _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                temp_base = os.path.join(tempfile.gettempdir(), "extract")
+                _, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
                     result.add_issue(
                         f"Archive entry {name} attempted path traversal outside the archive",
@@ -171,7 +177,6 @@ class ZipScanner(BaseScanner):
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
                         # Write to temporary file and scan recursively
-                        import tempfile
 
                         with tempfile.NamedTemporaryFile(
                             suffix=".zip", delete=False
@@ -190,16 +195,29 @@ class ZipScanner(BaseScanner):
                                         tmp_path, f"{path}:{name}", 1
                                     )
                             result.merge(nested_result)
+                            from ..utils.assets import asset_from_scan_result
+
+                            asset_entry = asset_from_scan_result(
+                                f"{path}:{name}", nested_result
+                            )
+                            asset_entry.setdefault("size", info.file_size)
+                            contents.append(asset_entry)
                         finally:
                             os.unlink(tmp_path)
                     else:
                         # Try to scan the file with appropriate scanner
-                        # Write to temporary file with proper extension
-                        import tempfile
+                        # Write to temporary file with proper extension and original filename
+                        # This preserves the original filename for scanners that need it (like ManifestScanner)
 
                         _, ext = os.path.splitext(name)
+                        # Create a more meaningful temporary filename that includes the original name
+                        # This helps scanners like ManifestScanner that depend on filename patterns
+                        # Use robust sanitization to handle special characters safely
+                        safe_name = re.sub(
+                            r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name)
+                        )
                         with tempfile.NamedTemporaryFile(
-                            suffix=ext, delete=False
+                            suffix=f"_{safe_name}", delete=False
                         ) as tmp:
                             tmp.write(data)
                             tmp_path = tmp.name
@@ -233,6 +251,14 @@ class ZipScanner(BaseScanner):
 
                             result.merge(file_result)
 
+                            from ..utils.assets import asset_from_scan_result
+
+                            asset_entry = asset_from_scan_result(
+                                f"{path}:{name}", file_result
+                            )
+                            asset_entry.setdefault("size", info.file_size)
+                            contents.append(asset_entry)
+
                             # If no scanner handled the file, count the bytes ourselves
                             if file_result.scanner_name == "unknown":
                                 result.bytes_scanned += len(data)
@@ -247,4 +273,7 @@ class ZipScanner(BaseScanner):
                         details={"entry": name, "exception": str(e)},
                     )
 
+        result.metadata["contents"] = contents
+        result.metadata["file_size"] = os.path.getsize(path)
+        result.finish(success=not result.has_errors)
         return result
