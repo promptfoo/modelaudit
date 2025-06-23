@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
@@ -21,27 +23,6 @@ except ImportError:
         meta_graphs: list = []
 
     SavedModelType = SavedModel
-
-# List of suspicious TensorFlow operations that could be security risks
-SUSPICIOUS_OPS = {
-    # File I/O operations
-    "ReadFile",
-    "WriteFile",
-    "MergeV2Checkpoints",
-    "Save",
-    "SaveV2",
-    # Python execution
-    "PyFunc",
-    "PyCall",
-    # System operations
-    "ShellExecute",
-    "ExecuteOp",
-    "SystemConfig",
-    # Other potentially risky operations
-    "DecodeRaw",
-    "DecodeJpeg",
-    "DecodePng",
-}
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -78,6 +59,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Store the file path for use in issue locations
         self.current_file_path = path
 
@@ -85,8 +70,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if not HAS_TENSORFLOW:
             result = self._create_result()
             result.add_issue(
-                "TensorFlow not installed, cannot scan SavedModel.",
-                severity=IssueSeverity.ERROR,
+                "TensorFlow not installed, cannot scan SavedModel. Install with "
+                "'pip install modelaudit[tensorflow]'.",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
             )
@@ -101,7 +87,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result = self._create_result()
         result.add_issue(
             f"Path is neither a file nor a directory: {path}",
-            severity=IssueSeverity.ERROR,
+            severity=IssueSeverity.CRITICAL,
             location=path,
             details={"path": path},
         )
@@ -127,7 +113,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning TF SavedModel file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -146,7 +132,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if not saved_model_path.exists():
             result.add_issue(
                 "No saved_model.pb found in directory.",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=dir_path,
             )
             result.finish(success=False)
@@ -164,7 +150,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if file.endswith(".py"):
                     result.add_issue(
                         f"Python file found in SavedModel: {file}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(file_path),
                         details={"file": file, "directory": root},
                     )
@@ -200,13 +186,21 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' "
                                             f"found in file {file}",
-                                            severity=IssueSeverity.WARNING,
+                                            severity=IssueSeverity.CRITICAL,
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
-                    except Exception:
-                        # Skip files we can't read
-                        pass
+                    except Exception as e:
+                        result.add_issue(
+                            f"Error reading file {file}: {str(e)}",
+                            severity=IssueSeverity.DEBUG,
+                            location=str(file_path),
+                            details={
+                                "file": file,
+                                "exception": str(e),
+                                "exception_type": type(e).__name__,
+                            },
+                        )
 
         result.finish(success=True)
         return result
@@ -232,7 +226,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     suspicious_op_found = True
                     result.add_issue(
                         f"Suspicious TensorFlow operation: {node.op}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=f"{self.current_file_path} (node: {node.name})",
                         details={
                             "op_type": node.op,

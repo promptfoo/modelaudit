@@ -1,6 +1,10 @@
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
+
+from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -22,7 +26,7 @@ except ImportError:
 
 # Try to import yaml, but handle the case where it's not installed
 try:
-    import yaml
+    import yaml  # type: ignore
 
     HAS_YAML = True
 except ImportError:
@@ -58,53 +62,6 @@ MODEL_NAME_KEYS = [
 
 # Pre-compute lowercase versions for faster checks
 MODEL_NAME_KEYS_LOWER = [key.lower() for key in MODEL_NAME_KEYS]
-
-# Suspicious configuration patterns
-SUSPICIOUS_CONFIG_PATTERNS = {
-    "network_access": [
-        "url",
-        "endpoint",
-        "server",
-        "host",
-        "callback",
-        "webhook",
-        "http",
-        "https",
-        "ftp",
-        "socket",
-    ],
-    "file_access": [
-        "file",
-        "path",
-        "directory",
-        "folder",
-        "output",
-        "save",
-        "load",
-        "write",
-        "read",
-    ],
-    "execution": [
-        "exec",
-        "eval",
-        "execute",
-        "run",
-        "command",
-        "script",
-        "shell",
-        "subprocess",
-        "system",
-        "code",
-    ],
-    "credentials": [
-        "password",
-        "secret",
-        "credential",
-        "auth",
-        "authentication",
-        "api_key",
-    ],
-}
 
 
 class ManifestScanner(BaseScanner):
@@ -192,6 +149,10 @@ class ManifestScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -209,6 +170,13 @@ class ManifestScanner(BaseScanner):
 
             if content:
                 result.bytes_scanned = file_size
+                if isinstance(content, dict):
+                    result.metadata["keys"] = list(content.keys())
+
+                # Extract license information if present
+                license_info = self._extract_license_info(content)
+                if license_info:
+                    result.metadata["license"] = license_info
 
                 # Check for suspicious configuration patterns
                 self._check_suspicious_patterns(content, result)
@@ -223,7 +191,7 @@ class ManifestScanner(BaseScanner):
         except Exception as e:
             result.add_issue(
                 f"Error scanning manifest file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -249,9 +217,10 @@ class ManifestScanner(BaseScanner):
                     if pattern_lower in content:
                         result.add_issue(
                             f"Blacklisted term '{pattern}' found in file",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
+                            why="This term matches a user-defined blacklist pattern. Organizations use blacklists to identify models or configurations that violate security policies or contain known malicious indicators.",
                         )
         except Exception as e:
             result.add_issue(
@@ -307,6 +276,24 @@ class ManifestScanner(BaseScanner):
 
         return None
 
+    def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
+        """Return license string if found in manifest content"""
+        if not isinstance(content, dict):
+            return None
+
+        potential_keys = ["license", "licence", "licenses"]
+        for key in potential_keys:
+            if key in content:
+                value = content[key]
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, list) and value:
+                    first = value[0]
+                    if isinstance(first, str):
+                        return first
+
+        return None
+
     def _check_suspicious_patterns(
         self,
         content: dict[str, Any],
@@ -333,7 +320,7 @@ class ManifestScanner(BaseScanner):
                     if blocked:
                         result.add_issue(
                             f"Model name blocked by policy: {value}",
-                            severity=IssueSeverity.ERROR,
+                            severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={
                                 "model_name": str(value),
@@ -346,7 +333,7 @@ class ManifestScanner(BaseScanner):
                 if self._is_actually_dangerous_value(key, value):
                     result.add_issue(
                         f"Dangerous configuration content: {full_key}",
-                        severity=IssueSeverity.ERROR,
+                        severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={
                             "key": full_key,
@@ -366,6 +353,15 @@ class ManifestScanner(BaseScanner):
                     ):
                         # STEP 5: Report with context-aware severity
                         severity = self._get_context_aware_severity(matches, ml_context)
+                        why = None
+                        if severity == IssueSeverity.INFO:
+                            if "file_access" in matches and "network_access" in matches:
+                                why = "File and network access patterns in ML model configurations are common for loading datasets and downloading resources. They are flagged for awareness but are typically benign in ML contexts."
+                            elif "file_access" in matches:
+                                why = "File access patterns in ML model configurations often indicate dataset paths or model checkpoints. This is flagged for awareness but is typical in ML workflows."
+                            elif "network_access" in matches:
+                                why = "Network access patterns in ML model configurations may indicate remote model repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
+
                         result.add_issue(
                             f"Suspicious configuration pattern: {full_key} "
                             f"(category: {', '.join(matches)})",
@@ -378,6 +374,7 @@ class ManifestScanner(BaseScanner):
                                 "ml_context": ml_context,
                                 "analysis": "pattern_based",
                             },
+                            why=why,
                         )
 
                 # ALWAYS recursively check nested structures,
@@ -420,7 +417,7 @@ class ManifestScanner(BaseScanner):
 
         return any(pattern in value_lower for pattern in dangerous_patterns)
 
-    def _detect_ml_context(self, content: dict) -> dict:
+    def _detect_ml_context(self, content: dict[str, Any]) -> dict[str, Any]:
         """Detect ML model context to adjust sensitivity"""
         indicators = {
             "framework": None,
@@ -524,6 +521,20 @@ class ManifestScanner(BaseScanner):
         """Context-aware ignore logic combining smart patterns with value analysis"""
         key_lower = key.lower()
 
+        # Special case for HuggingFace patterns - check this FIRST before other logic
+        if ml_context.get("framework") == "huggingface" or "_name_or_path" in key_lower:
+            huggingface_safe_patterns = [
+                "_name_or_path",
+                "name_or_path",
+                "model_input_names",
+                "model_output_names",
+                "transformers_version",
+                "torch_dtype",
+                "architectures",
+            ]
+            if any(pattern in key_lower for pattern in huggingface_safe_patterns):
+                return True
+
         # High-confidence ML context gets more lenient treatment
         if ml_context.get("confidence", 0) >= 2:
             # File access patterns in ML context
@@ -583,8 +594,8 @@ class ManifestScanner(BaseScanner):
         if not isinstance(value, str):
             return False
 
-        # Absolute paths
-        if value.startswith(("/", "\\", "C:", "D:")):
+        # Absolute paths (Unix or Windows)
+        if Path(value).is_absolute() or re.match(r"^[a-zA-Z]:\\", value):
             return True
 
         # Relative paths with separators
@@ -616,9 +627,10 @@ class ManifestScanner(BaseScanner):
             return True
 
         # Common path indicators
-        if any(
-            indicator in value.lower()
-            for indicator in ["/tmp", "/var", "/data", "/home", "/etc", "c:\\", "d:\\"]
+        lower_value = value.lower()
+        indicators = ["/tmp", "/var", "/data", "/home", "/etc"]
+        if any(indicator in lower_value for indicator in indicators) or re.search(
+            r"[a-z]:\\", lower_value
         ):
             return True
 
@@ -630,7 +642,7 @@ class ManifestScanner(BaseScanner):
         """Determine severity based on context and match types"""
         # Execution patterns are always ERROR
         if "execution" in matches:
-            return IssueSeverity.ERROR
+            return IssueSeverity.CRITICAL
 
         # In high-confidence ML context, downgrade some warnings
         if ml_context.get("confidence", 0) >= 2:

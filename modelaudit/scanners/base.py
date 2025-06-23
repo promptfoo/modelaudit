@@ -16,7 +16,7 @@ class IssueSeverity(Enum):
     DEBUG = "debug"  # Debug information
     INFO = "info"  # Informational, not a security concern
     WARNING = "warning"  # Potential issue, needs review
-    ERROR = "error"  # Definite security concern
+    CRITICAL = "critical"  # Definite security concern
 
 
 class Issue:
@@ -28,22 +28,27 @@ class Issue:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ):
         self.message = message
         self.severity = severity
         self.location = location  # File position, line number, etc.
         self.details = details or {}
+        self.why = why  # Explanation of why this is a security concern
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization"""
-        return {
+        result = {
             "message": self.message,
             "severity": self.severity.value,
             "location": self.location,
             "details": self.details,
             "timestamp": self.timestamp,
         }
+        if self.why:
+            result["why"] = self.why
+        return result
 
     def __str__(self) -> str:
         """String representation of the issue"""
@@ -71,22 +76,21 @@ class ScanResult:
         severity: IssueSeverity = IssueSeverity.WARNING,
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result"""
-        issue = Issue(message, severity, location, details)
+        issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
-        logger.log(
-            (
-                logging.ERROR
-                if severity == IssueSeverity.ERROR
-                else (
-                    logging.WARNING
-                    if severity == IssueSeverity.WARNING
-                    else logging.INFO
-                )
-            ),
-            str(issue),
+        log_level = (
+            logging.CRITICAL
+            if severity == IssueSeverity.CRITICAL
+            else (
+                logging.WARNING
+                if severity == IssueSeverity.WARNING
+                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+            )
         )
+        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -117,8 +121,8 @@ class ScanResult:
 
     @property
     def has_errors(self) -> bool:
-        """Return True if there are any error-level issues"""
-        return any(issue.severity == IssueSeverity.ERROR for issue in self.issues)
+        """Return True if there are any critical-level issues"""
+        return any(issue.severity == IssueSeverity.CRITICAL for issue in self.issues)
 
     @property
     def has_warnings(self) -> bool:
@@ -145,7 +149,7 @@ class ScanResult:
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
         error_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.ERROR
+            1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL
         )
         warning_count = sum(
             1 for issue in self.issues if issue.severity == IssueSeverity.WARNING
@@ -160,7 +164,7 @@ class ScanResult:
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} errors, "
+            f"Found {len(self.issues)} issues ({error_count} critical, "
             f"{warning_count} warnings, {info_count} info)",
         )
 
@@ -193,6 +197,11 @@ class BaseScanner(ABC):
             "chunk_size",
             10 * 1024 * 1024,
         )  # Default: 10MB chunks
+        self.max_file_read_size = self.config.get(
+            "max_file_read_size",
+            0,
+        )  # Default unlimited
+        self._path_validation_result: Optional[ScanResult] = None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -209,13 +218,21 @@ class BaseScanner(ABC):
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        return ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name)
+
+        # Automatically merge any stored path validation warnings
+        if hasattr(self, "_path_validation_result") and self._path_validation_result:
+            result.merge(self._path_validation_result)
+            # Clear the stored result to avoid duplicate merging
+            self._path_validation_result = None
+
+        return result
 
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 
         Returns:
-            None if path is valid, otherwise a ScanResult with errors
+            None if path is valid or has only warnings, otherwise a ScanResult with critical errors
         """
         result = self._create_result()
 
@@ -223,7 +240,7 @@ class BaseScanner(ABC):
         if not os.path.exists(path):
             result.add_issue(
                 f"Path does not exist: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
@@ -233,14 +250,116 @@ class BaseScanner(ABC):
         if not os.access(path, os.R_OK):
             result.add_issue(
                 f"Path is not readable: {path}",
-                severity=IssueSeverity.ERROR,
+                severity=IssueSeverity.CRITICAL,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
 
-        return None  # Path is valid
+        # Validate file type consistency for files (security check)
+        if os.path.isfile(path):
+            try:
+                from modelaudit.utils.filetype import (
+                    detect_file_format_from_magic,
+                    detect_format_from_extension,
+                    validate_file_type,
+                )
+
+                if not validate_file_type(path):
+                    header_format = detect_file_format_from_magic(path)
+                    ext_format = detect_format_from_extension(path)
+                    result.add_issue(
+                        f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing, corruption, or a security threat.",
+                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        location=path,
+                        details={
+                            "header_format": header_format,
+                            "extension_format": ext_format,
+                            "security_check": "file_type_validation",
+                        },
+                    )
+            except Exception as e:
+                # Don't fail the scan if file type validation has an error
+                result.add_issue(
+                    f"File type validation error: {str(e)}",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
+
+        # Store validation warnings for the scanner to merge later
+        self._path_validation_result = result if result.issues else None
+
+        # Only return result for CRITICAL issues that should stop the scan
+        critical_issues = [
+            issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        if critical_issues:
+            return result
+
+        return None  # Path is valid, scanner should continue and merge warnings if any
 
     def get_file_size(self, path: str) -> int:
-        """Get the size of a file in bytes"""
-        return os.path.getsize(path) if os.path.isfile(path) else 0
+        """Get the size of a file in bytes."""
+        try:
+            return os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            # If the file becomes inaccessible during scanning, treat the size
+            # as zero rather than raising an exception.
+            return 0
+
+    def _check_size_limit(self, path: str) -> Optional[ScanResult]:
+        """Check if the file exceeds the configured size limit."""
+        result = self._create_result()
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
+
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
+            result.add_issue(
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+                why="Large files may consume excessive memory or processing time. Consider whether this file size is expected for your use case.",
+            )
+            result.finish(success=False)
+            return result
+
+        return None
+
+    def _read_file_safely(self, path: str) -> bytes:
+        """Read a file with size validation and chunking."""
+        data = b""
+        file_size = self.get_file_size(path)
+
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
+            raise ValueError(
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})"
+            )
+
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                data += chunk
+                if (
+                    self.max_file_read_size
+                    and self.max_file_read_size > 0
+                    and len(data) > self.max_file_read_size
+                ):
+                    raise ValueError(
+                        f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})"
+                    )
+        return data

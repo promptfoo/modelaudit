@@ -416,8 +416,8 @@ class TestSeverityAssignment:
             execution_matches, non_ml_context
         )
 
-        assert severity_ml == IssueSeverity.ERROR
-        assert severity_non_ml == IssueSeverity.ERROR
+        assert severity_ml == IssueSeverity.CRITICAL
+        assert severity_non_ml == IssueSeverity.CRITICAL
 
     def test_credentials_high_priority(self):
         """Test that credentials get WARNING severity."""
@@ -472,7 +472,7 @@ class TestSeverityAssignment:
         mixed_matches = ["execution", "file_access"]
         severity = scanner._get_context_aware_severity(mixed_matches, ml_context)
 
-        assert severity == IssueSeverity.ERROR
+        assert severity == IssueSeverity.CRITICAL
 
 
 class TestIntegrationScenarios:
@@ -480,7 +480,6 @@ class TestIntegrationScenarios:
 
     def test_huggingface_tokenizer_no_false_positives(self):
         """Test that legitimate HF tokenizer config produces no false positives."""
-        test_file = "test_hf_tokenizer.json"
         hf_tokenizer_config = {
             "tokenizer_class": "LlamaTokenizer",
             "added_tokens_decoder": {
@@ -495,15 +494,16 @@ class TestIntegrationScenarios:
             "special_tokens_map": {"bos_token": "<s>", "eos_token": "</s>"},
         }
 
-        try:
-            with Path(test_file).open("w") as f:
-                json.dump(hf_tokenizer_config, f)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(hf_tokenizer_config, f)
+            test_file = f.name
 
+        try:
             scanner = ManifestScanner()
             result = scanner.scan(test_file)
 
             # Should have no errors or warnings
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             assert len(errors) == 0, (
@@ -518,7 +518,6 @@ class TestIntegrationScenarios:
 
     def test_pytorch_model_config_no_false_positives(self):
         """Test that legitimate PyTorch model config produces no false positives."""
-        test_file = "test_pytorch_model.json"
         pytorch_config = {
             "architectures": ["LlamaForCausalLM"],
             "model_type": "llama",
@@ -532,15 +531,16 @@ class TestIntegrationScenarios:
             "torch_dtype": "float16",
         }
 
-        try:
-            with Path(test_file).open("w") as f:
-                json.dump(pytorch_config, f)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(pytorch_config, f)
+            test_file = f.name
 
+        try:
             scanner = ManifestScanner()
             result = scanner.scan(test_file)
 
             # Should have no errors or warnings
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             assert len(errors) == 0
@@ -551,7 +551,6 @@ class TestIntegrationScenarios:
 
     def test_dangerous_config_still_detected(self):
         """Test that actually dangerous configurations are still detected."""
-        test_file = "test_dangerous.json"
         dangerous_config = {
             "model_name": "safe_model",
             "initialization_script": "import os; os.system('rm -rf /')",
@@ -560,15 +559,16 @@ class TestIntegrationScenarios:
             "api_key": "secret_key_123",
         }
 
-        try:
-            with Path(test_file).open("w") as f:
-                json.dump(dangerous_config, f)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(dangerous_config, f)
+            test_file = f.name
 
+        try:
             scanner = ManifestScanner()
             result = scanner.scan(test_file)
 
             # Should detect dangerous content
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             # Should have errors for dangerous values
@@ -587,7 +587,6 @@ class TestIntegrationScenarios:
 
     def test_mixed_safe_and_dangerous_content(self):
         """Test configuration with both safe ML content and dangerous elements."""
-        test_file = "test_mixed.json"
         mixed_config = {
             # Safe ML content
             "tokenizer_class": "BertTokenizer",
@@ -598,15 +597,16 @@ class TestIntegrationScenarios:
             "data_exfiltration": "http://malicious.com/api",
         }
 
-        try:
-            with Path(test_file).open("w") as f:
-                json.dump(mixed_config, f)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(mixed_config, f)
+            test_file = f.name
 
+        try:
             scanner = ManifestScanner()
             result = scanner.scan(test_file)
 
             # Should ignore safe ML patterns but catch dangerous ones
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
 
             # Should have at least one error for dangerous value
             dangerous_errors = [
@@ -648,7 +648,6 @@ class TestEdgeCases:
 
     def test_deeply_nested_structures(self):
         """Test handling of deeply nested configuration structures."""
-        test_file = "test_nested.json"
         deeply_nested = {
             "level1": {
                 "level2": {
@@ -662,23 +661,24 @@ class TestEdgeCases:
             }
         }
 
-        try:
-            with Path(test_file).open("w") as f:
-                json.dump(deeply_nested, f)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(deeply_nested, f)
+            test_file = f.name
 
+        try:
             scanner = ManifestScanner()
             result = scanner.scan(test_file)
 
             # Should detect both ML context and dangerous content in nested structure
-            errors = [i for i in result.issues if i.severity == IssueSeverity.ERROR]
+            errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(errors) >= 1
 
         finally:
             Path(test_file).unlink(missing_ok=True)
 
-    def test_unicode_and_special_characters(self):
+    def test_unicode_and_special_characters(self, tmp_path):
         """Test handling of Unicode and special characters."""
-        test_file = "test_unicode.json"
+        test_file = tmp_path / "test_unicode.json"
         unicode_config = {
             "model_name": "测试模型",
             "description": "Тестовая модель",
@@ -687,18 +687,14 @@ class TestEdgeCases:
             "emoji_field": "🤖🔥💯",
         }
 
-        try:
-            with Path(test_file).open("w", encoding="utf-8") as f:
-                json.dump(unicode_config, f, ensure_ascii=False)
+        with test_file.open("w", encoding="utf-8") as f:
+            json.dump(unicode_config, f, ensure_ascii=False)
 
-            scanner = ManifestScanner()
-            result = scanner.scan(test_file)
+        scanner = ManifestScanner()
+        result = scanner.scan(str(test_file))
 
-            # Should handle Unicode without crashing
-            assert result.success is True
-
-        finally:
-            Path(test_file).unlink(missing_ok=True)
+        # Should handle Unicode without crashing
+        assert result.success is True
 
 
 # Test fixtures and helpers

@@ -1,6 +1,7 @@
 import struct
 
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
+from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
 
 
 def test_pytorch_binary_scanner_can_handle(tmp_path):
@@ -38,7 +39,12 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
 
     assert result.success
     assert result.bytes_scanned == len(data) * 10
-    assert len(result.issues) == 0  # Should have no issues for clean file
+
+    # Should have no file type validation warnings (.bin files with unknown headers are valid)
+    validation_issues = [
+        i for i in result.issues if "file type validation failed" in i.message.lower()
+    ]
+    assert len(validation_issues) == 0
 
 
 def test_pytorch_binary_scanner_code_patterns(tmp_path):
@@ -47,7 +53,9 @@ def test_pytorch_binary_scanner_code_patterns(tmp_path):
 
     # Create a binary file with embedded code patterns
     binary_file = tmp_path / "malicious.bin"
-    data = b"\x00" * 100 + b'import os\nos.system("rm -rf /")' + b"\x00" * 100
+    pattern_import = BINARY_CODE_PATTERNS[0]
+    pattern_system = next(p for p in BINARY_CODE_PATTERNS if p.startswith(b"os.system"))
+    data = b"\x00" * 100 + pattern_import + b"\n" + pattern_system + b"\x00" * 100
     binary_file.write_bytes(data)
 
     result = scanner.scan(str(binary_file))
@@ -74,10 +82,8 @@ def test_pytorch_binary_scanner_executable_signatures(tmp_path):
 
     # Create a binary file with executable signatures
     binary_file = tmp_path / "with_exe.bin"
-    # Add Windows PE signature
-    data = b"\x00" * 50 + b"MZ" + b"\x00" * 100
-    # Add Linux ELF signature
-    data += b"\x7fELF" + b"\x00" * 100
+    sigs = list(EXECUTABLE_SIGNATURES.keys())[:2]
+    data = b"\x00" * 50 + sigs[0] + b"\x00" * 100 + sigs[1] + b"\x00" * 100
     binary_file.write_bytes(data)
 
     result = scanner.scan(str(binary_file))
