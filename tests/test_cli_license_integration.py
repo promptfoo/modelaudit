@@ -20,7 +20,7 @@ class TestCLILicenseIntegration:
     @pytest.fixture
     def test_data_dir(self):
         """Return path to integration test data."""
-        return Path(__file__).parent / "integration_test_data"
+        return Path(__file__).parent / "assets/scenarios/license_scenarios"
 
     @pytest.fixture
     def cli_command(self):

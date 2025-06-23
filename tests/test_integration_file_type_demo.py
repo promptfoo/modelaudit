@@ -20,7 +20,7 @@ class TestFileTypeValidationDemo:
     @pytest.fixture
     def test_data_dir(self):
         """Return path to integration test data."""
-        return Path(__file__).parent / "integration_test_data"
+        return Path(__file__).parent / "assets/scenarios/license_scenarios"
 
     def test_legitimate_files_validation_demo(self, test_data_dir):
         """Demonstrate validation of legitimate model files."""

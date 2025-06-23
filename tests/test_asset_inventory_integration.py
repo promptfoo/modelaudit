@@ -340,7 +340,7 @@ class TestAssetInventoryIntegration:
 
     def test_asset_inventory_with_integration_test_data(self):
         """Test asset inventory with existing integration test data."""
-        test_data_dir = Path(__file__).parent / "integration_test_data"
+        test_data_dir = Path(__file__).parent / "assets/scenarios/license_scenarios"
         if not test_data_dir.exists():
             pytest.skip("Integration test data not available")
         
