@@ -321,12 +321,13 @@ class BaseScanner(ABC):
         ):
             result.add_issue(
                 f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
+                why="Large files may consume excessive memory or processing time. Consider whether this file size is expected for your use case.",
             )
             result.finish(success=False)
             return result
