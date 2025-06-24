@@ -90,6 +90,13 @@ class OnnxScanner(BaseScanner):
                     location=f"{path} (node: {node.name})",
                     details={"op_type": node.op_type, "domain": node.domain},
                 )
+            if "python" in node.op_type.lower():
+                result.add_issue(
+                    f"Model uses Python operator '{node.op_type}'",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path} (node: {node.name})",
+                    details={"op_type": node.op_type, "domain": node.domain},
+                )
         if custom_domains:
             result.metadata["custom_domains"] = sorted(custom_domains)
 
