@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
-from typing import Any
+from typing import Any, Optional
 
 import click
 from yaspin import yaspin
@@ -283,6 +284,130 @@ def scan_command(
 
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(aggregated_results)
+    sys.exit(exit_code)
+
+
+@cli.command("scan-hf")
+@click.argument("model_id", type=str, required=True)
+@click.option("--revision", "-r", default="main", help="Model revision to download")
+@click.option(
+    "--blacklist",
+    "-b",
+    multiple=True,
+    help="Additional blacklist patterns to check against model names",
+)
+@click.option(
+    "--format",
+    "-f",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format [default: text]",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    help="Output file path (prints to stdout if not specified)",
+)
+@click.option(
+    "--sbom",
+    type=click.Path(),
+    help="Write CycloneDX SBOM to the specified file",
+)
+@click.option(
+    "--timeout",
+    "-t",
+    type=int,
+    default=300,
+    help="Scan timeout in seconds [default: 300]",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option(
+    "--max-file-size",
+    type=int,
+    default=0,
+    help="Maximum file size to scan in bytes [default: unlimited]",
+)
+@click.option(
+    "--max-total-size",
+    type=int,
+    default=0,
+    help="Maximum total bytes to scan before stopping [default: unlimited]",
+)
+def scan_hf_command(
+    model_id: str,
+    revision: str,
+    blacklist: tuple[str, ...],
+    format: str,
+    output: Optional[str],
+    sbom: Optional[str],
+    timeout: int,
+    verbose: bool,
+    max_file_size: int,
+    max_total_size: int,
+):
+    """Download a model from HuggingFace Hub and scan it."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:  # pragma: no cover - optional dependency
+        raise click.ClickException(
+            "huggingface-hub package is required for scan-hf. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    if format == "text" and not output:
+        header = [
+            "─" * 80,
+            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
+            click.style(
+                "Scanning for potential security issues in ML model files",
+                fg="cyan",
+            ),
+            "─" * 80,
+        ]
+        click.echo("\n".join(header))
+        click.echo(f"Model to scan: {click.style(model_id, fg='green')}")
+        click.echo("─" * 80)
+        click.echo("")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=tmpdir,
+            local_dir_use_symlinks=False,
+        )
+
+        results = scan_model_directory_or_file(
+            tmpdir,
+            blacklist_patterns=list(blacklist) if blacklist else None,
+            timeout=timeout,
+            max_file_size=max_file_size,
+            max_total_size=max_total_size,
+        )
+
+    if format == "json":
+        output_text = json.dumps(results, indent=2)
+    else:
+        output_text = format_text_output(results, verbose)
+
+    if sbom:
+        from .sbom import generate_sbom
+
+        sbom_text = generate_sbom([model_id], results)
+        with open(sbom, "w") as f:
+            f.write(sbom_text)
+
+    if output:
+        with open(output, "w") as f:
+            f.write(output_text)
+        click.echo(f"Results written to {output}")
+    else:
+        if format == "text":
+            click.echo("\n" + "─" * 80)
+        click.echo(output_text)
+
+    exit_code = determine_exit_code(results)
     sys.exit(exit_code)
 
 

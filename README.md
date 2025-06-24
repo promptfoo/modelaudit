@@ -148,6 +148,9 @@ modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib mo
 # Scan a directory
 modelaudit scan ./models/
 
+# Scan a model from HuggingFace Hub
+modelaudit scan-hf bert-base-uncased
+
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
 

@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -317,6 +319,30 @@ def test_format_text_output_fast_scan_duration():
     assert "Scan completed in 0.005 seconds" in output
     assert "Files scanned: 1" in output
     assert "No issues found" in output
+
+
+def test_scan_hf_command(monkeypatch, tmp_path):
+    """Test scanning a model from HuggingFace Hub."""
+
+    pytest.importorskip("huggingface_hub")
+
+    model_dir = tmp_path / "hf_model"
+    model_dir.mkdir()
+    (model_dir / "pytorch_model.bin").write_bytes(b"dummy")
+
+    def fake_snapshot_download(repo_id, revision="main", local_dir=None, **kwargs):
+        dest = Path(local_dir)
+        shutil.copytree(model_dir, dest, dirs_exist_ok=True)
+        return str(dest)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan-hf", "test/model", "--format", "json"])
+
+    assert result.exit_code in (0, 1)
+    out = json.loads(result.output)
+    assert out["files_scanned"] >= 1
 
 
 def test_format_text_output_normal_scan_duration():
