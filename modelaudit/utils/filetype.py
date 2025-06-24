@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+import magic  # type: ignore
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -20,6 +22,18 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
         return f.read(num_bytes)
 
 
+MIME_FORMAT_MAP = {
+    "application/zip": "zip",
+    "application/x-zip": "zip",
+    "application/x-gzip": "zip",
+    "application/gzip": "zip",
+    "application/x-hdf": "hdf5",
+    "application/x-hdf5": "hdf5",
+    "application/x-python-pickle": "pickle",
+    "application/x-onnx": "onnx",
+}
+
+
 def detect_file_format_from_magic(path: str) -> str:
     """Detect file format solely from magic bytes."""
     file_path = Path(path)
@@ -34,6 +48,16 @@ def detect_file_format_from_magic(path: str) -> str:
     size = file_path.stat().st_size
     if size < 4:
         return "unknown"
+
+    try:
+        mime = magic.from_file(str(file_path), mime=True)
+        if mime:
+            mime_lower = mime.lower()
+            for key, fmt in MIME_FORMAT_MAP.items():
+                if mime_lower.startswith(key):
+                    return fmt
+    except Exception:
+        pass
 
     magic4 = read_magic_bytes(path, 4)
     magic8 = read_magic_bytes(path, 8)
