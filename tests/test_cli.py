@@ -135,6 +135,19 @@ def test_scan_json_output(tmp_path):
         pytest.fail("Output is not valid JSON")
 
 
+def test_scan_rich_output(tmp_path):
+    """Test scanning with Rich output format."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "rich"])
+
+    assert "Severity" in result.output
+    assert "Location" in result.output
+    assert "Message" in result.output
+
+
 def test_scan_output_file(tmp_path):
     """Test scanning with output to a file."""
     test_file = tmp_path / "test_file.dat"

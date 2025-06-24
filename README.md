@@ -28,6 +28,7 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
   - [📋 JSON Output Format](#-json-output-format)
+  - [🖥 Rich Output Format](#-rich-output-format)
   - [🔄 CI/CD Integration](#-cicd-integration)
     - [Basic Integration](#basic-integration)
     - [Platform Examples](#platform-examples)
@@ -195,7 +196,7 @@ Issues found: 2 critical, 1 warnings
 
 ### Reporting & Integration
 
-- **Multiple Output Formats**: Human-readable text and machine-readable JSON
+- **Multiple Output Formats**: Human-readable text, Rich tables, and machine-readable JSON
 - **SBOM Generation**: CycloneDX Software Bill of Materials with license metadata
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
@@ -319,6 +320,12 @@ When using `--format json`, ModelAudit outputs structured results:
 
 Each issue includes a `message`, `severity` level (`critical`, `warning`, `info`, `debug`), `location`, and scanner-specific `details`.
 The `assets` array lists every file and component encountered during the scan, including nested archive members and tensor names.
+
+## 🖥 Rich Output Format
+
+When using `--format rich`, ModelAudit displays results in colorful tables powered by the [rich](https://github.com/Textualize/rich) library.
+
+![Rich output](docs/rich_output.svg)
 
 ## 🔄 CI/CD Integration
 

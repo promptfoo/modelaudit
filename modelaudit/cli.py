@@ -38,7 +38,7 @@ def cli():
 @click.option(
     "--format",
     "-f",
-    type=click.Choice(["text", "json"]),
+    type=click.Choice(["text", "json", "rich", "html"]),
     default="text",
     help="Output format [default: text]",
 )
@@ -258,6 +258,9 @@ def scan_command(
     if format == "json":
         output_data = aggregated_results
         output_text = json.dumps(output_data, indent=2)
+    elif format == "rich":
+        format_rich_output(aggregated_results)
+        output_text = None
     else:
         # Text format
         output_text = format_text_output(aggregated_results, verbose)
@@ -271,15 +274,16 @@ def scan_command(
             f.write(sbom_text)
 
     # Send output to the specified destination
-    if output:
-        with open(output, "w") as f:
-            f.write(output_text)
-        click.echo(f"Results written to {output}")
-    else:
-        # Add a separator line between debug output and scan results
-        if format == "text":
-            click.echo("\n" + "─" * 80)
-        click.echo(output_text)
+    if output_text is not None:
+        if output:
+            with open(output, "w") as f:
+                f.write(output_text)
+            click.echo(f"Results written to {output}")
+        else:
+            # Add a separator line between debug output and scan results
+            if format == "text":
+                click.echo("\n" + "─" * 80)
+            click.echo(output_text)
 
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(aggregated_results)
@@ -496,6 +500,59 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines.append(status)
 
     return "\n".join(output_lines)
+
+
+def format_rich_output(results: dict[str, Any]) -> None:
+    """Display scan results using rich tables and trees."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.tree import Tree
+
+    console = Console()
+
+    summary = Table(title="Scan Summary")
+    summary.add_column("Files Scanned", justify="right")
+    summary.add_column("Bytes Scanned", justify="right")
+    summary.add_column("Duration", justify="right")
+    summary.add_row(
+        str(results.get("files_scanned", 0)),
+        str(results.get("bytes_scanned", 0)),
+        f"{results.get('duration', 0.0):.2f}s",
+    )
+    console.print(summary)
+
+    issues = results.get("issues", [])
+    if issues:
+        issue_table = Table(title="Issues", show_lines=True)
+        issue_table.add_column("Severity")
+        issue_table.add_column("Location")
+        issue_table.add_column("Message")
+        for issue in issues:
+            issue_table.add_row(
+                str(issue.get("severity", "")),
+                str(issue.get("location", "")),
+                str(issue.get("message", "")),
+            )
+        console.print(issue_table)
+    else:
+        console.print(Panel("No issues found", style="green"))
+
+    assets = results.get("assets", [])
+    if assets:
+        tree = Tree("Assets")
+
+        def add_assets(node: Tree, items: list[dict[str, Any]]) -> None:
+            for asset in items:
+                label = asset.get("path", "")
+                if asset.get("type"):
+                    label += f" ({asset['type']})"
+                child = node.add(label)
+                if asset.get("contents"):
+                    add_assets(child, asset["contents"])
+
+        add_assets(tree, assets)
+        console.print(tree)
 
 
 def main():
