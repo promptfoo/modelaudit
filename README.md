@@ -52,7 +52,7 @@ ModelAudit scans ML model files for:
 - **Malicious content in ZIP archives** including nested archives and zip bombs
 - **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
-- **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
+- **Anomalous weight patterns** that may indicate trojaned models (statistical analysis, now including TensorFlow SavedModel weights)
 - **License compliance issues** including commercial use restrictions and AGPL obligations
 - **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
@@ -236,6 +236,7 @@ ModelAudit provides specialized security scanners for different model formats:
 ### Weight Analysis
 
 ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
+TensorFlow SavedModel directories are now supported for weight analysis without executing the graph.
 
 ## ⚙️ Advanced Usage
 

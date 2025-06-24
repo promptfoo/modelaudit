@@ -64,6 +64,11 @@ class WeightDistributionScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
+        if os.path.isdir(path):
+            return HAS_TENSORFLOW and os.path.exists(
+                os.path.join(path, "saved_model.pb")
+            )
+
         if not os.path.isfile(path):
             return False
 
@@ -97,26 +102,29 @@ class WeightDistributionScanner(BaseScanner):
 
         try:
             # Extract weights based on file format
-            ext = os.path.splitext(path)[1].lower()
-
-            if ext in [".pt", ".pth"]:
-                weights_info = self._extract_pytorch_weights(path)
-            elif ext in [".h5", ".keras", ".hdf5"]:
-                weights_info = self._extract_keras_weights(path)
-            elif ext == ".pb":
+            if os.path.isdir(path):
                 weights_info = self._extract_tensorflow_weights(path)
-            elif ext == ".onnx":
-                weights_info = self._extract_onnx_weights(path)
-            elif ext == ".safetensors":
-                weights_info = self._extract_safetensors_weights(path)
             else:
-                result.add_issue(
-                    f"Unsupported model format for weight distribution scanner: {ext}",
-                    severity=IssueSeverity.DEBUG,
-                    location=path,
-                )
-                result.finish(success=False)
-                return result
+                ext = os.path.splitext(path)[1].lower()
+
+                if ext in [".pt", ".pth"]:
+                    weights_info = self._extract_pytorch_weights(path)
+                elif ext in [".h5", ".keras", ".hdf5"]:
+                    weights_info = self._extract_keras_weights(path)
+                elif ext == ".pb":
+                    weights_info = self._extract_tensorflow_weights(path)
+                elif ext == ".onnx":
+                    weights_info = self._extract_onnx_weights(path)
+                elif ext == ".safetensors":
+                    weights_info = self._extract_safetensors_weights(path)
+                else:
+                    result.add_issue(
+                        f"Unsupported model format for weight distribution scanner: {ext}",
+                        severity=IssueSeverity.DEBUG,
+                        location=path,
+                    )
+                    result.finish(success=False)
+                    return result
 
             if not weights_info:
                 result.add_issue(
@@ -252,9 +260,62 @@ class WeightDistributionScanner(BaseScanner):
 
         weights_info: Dict[str, np.ndarray] = {}
 
-        # TensorFlow SavedModel weight extraction is complex and would require
-        # loading the full graph. For now, we'll return empty.
-        # This is a limitation that should be documented.
+        try:
+            if os.path.isdir(path):
+                ckpt_prefix = os.path.join(path, "variables", "variables")
+                if os.path.exists(ckpt_prefix + ".index"):
+                    for name, _shape in tf.train.list_variables(ckpt_prefix):
+                        if (
+                            "weight" not in name.lower()
+                            and "kernel" not in name.lower()
+                        ):
+                            continue
+                        tensor = tf.train.load_variable(ckpt_prefix, name)
+                        array = np.array(tensor)
+                        if (
+                            self.max_file_read_size
+                            and self.max_file_read_size > 0
+                            and array.nbytes > self.max_file_read_size
+                        ):
+                            continue
+                        weights_info[name] = array
+            else:
+                data = self._read_file_safely(path)
+                from tensorflow.core.framework import graph_pb2
+                from tensorflow.core.protobuf import saved_model_pb2
+
+                nodes = []
+                saved_model = saved_model_pb2.SavedModel()
+                try:
+                    saved_model.ParseFromString(data)
+                    if saved_model.meta_graphs:
+                        for meta_graph in saved_model.meta_graphs:
+                            nodes.extend(meta_graph.graph_def.node)
+                except Exception:
+                    pass
+
+                if not nodes:
+                    graph_def = graph_pb2.GraphDef()
+                    graph_def.ParseFromString(data)
+                    nodes = graph_def.node
+
+                for node in nodes:
+                    if node.op == "Const" and "value" in node.attr:
+                        tensor_proto = node.attr["value"].tensor
+                        array = tf.make_ndarray(tensor_proto)
+                        if (
+                            self.max_file_read_size
+                            and self.max_file_read_size > 0
+                            and array.nbytes > self.max_file_read_size
+                        ):
+                            continue
+                        if (
+                            "weight" in node.name.lower()
+                            or "kernel" in node.name.lower()
+                        ) and len(array.shape) >= 2:
+                            weights_info[node.name] = array
+        except Exception as e:
+            logger.debug(f"Failed to extract weights from {path}: {e}")
 
         return weights_info
 
