@@ -123,6 +123,10 @@ def test_max_total_size(tmp_path):
     with file2.open("wb") as f:
         pickle.dump({"data": "y" * 100}, f)
 
+    file3 = tmp_path / "c.pkl"
+    with file3.open("wb") as f:
+        pickle.dump({"data": "z" * 100}, f)
+
     results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
 
     assert results["success"] is True
@@ -131,6 +135,15 @@ def test_max_total_size(tmp_path):
         i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]
     ]
     assert len(limit_issues) == 1
+
+    assert results["files_scanned"] == 2
+
+    termination_messages = [
+        i
+        for i in results["issues"]
+        if "Scan terminated early due to total size limit" in i["message"]
+    ]
+    assert len(termination_messages) == 1
 
 
 def test_timeout(tmp_path, monkeypatch):
