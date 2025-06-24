@@ -140,6 +140,15 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
 ]
 
+# Suspicious metadata patterns used by SafeTensorsScanner and others
+# Regex patterns that match unusual or potentially malicious metadata values
+SUSPICIOUS_METADATA_PATTERNS = [
+    r"https?://",  # Embedded URLs can be used for exfiltration
+    r"(?i)\bimport\s+(?:os|subprocess|sys)\b",  # Inline Python imports
+    r"(?i)(?:rm\s+-rf|wget\s|curl\s|chmod\s)",  # Shell command indicators
+    r"(?i)<script",  # Embedded HTML/JS content
+]
+
 # Dangerous pickle opcodes that can lead to code execution
 DANGEROUS_OPCODES = set(_EXPLAIN_OPCODES.keys())
 
@@ -347,6 +356,11 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "description": "Manifest file security patterns",
             "risk_level": "MEDIUM",
         },
+        "metadata_strings": {
+            "patterns": SUSPICIOUS_METADATA_PATTERNS,
+            "description": "Regex patterns for suspicious metadata values in model files",
+            "risk_level": "MEDIUM",
+        },
     }
 
 
@@ -362,7 +376,7 @@ def validate_patterns() -> list[str]:
     warnings = []
 
     # Validate regex patterns
-    for pattern in SUSPICIOUS_STRING_PATTERNS:
+    for pattern in SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS:
         try:
             re.compile(pattern)
         except re.error as e:

@@ -13,6 +13,7 @@ from modelaudit.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_LAYER_TYPES,
+    SUSPICIOUS_METADATA_PATTERNS,
     SUSPICIOUS_OPS,
     SUSPICIOUS_STRING_PATTERNS,
     get_all_suspicious_patterns,
@@ -153,6 +154,17 @@ class TestSuspiciousStringPatterns:
         # Document known false positives but don't fail
         # (These are trade-offs between security and usability)
         print(f"Known false positives: {false_positives}")
+
+
+class TestSuspiciousMetadataPatterns:
+    """Test SUSPICIOUS_METADATA_PATTERNS regex patterns."""
+
+    def test_metadata_patterns_valid_regex(self) -> None:
+        for pattern in SUSPICIOUS_METADATA_PATTERNS:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                pytest.fail(f"Invalid regex pattern '{pattern}': {e}")
 
 
 class TestSuspiciousOps:
