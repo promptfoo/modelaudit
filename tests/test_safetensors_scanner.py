@@ -1,6 +1,7 @@
 import json
 import struct
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -9,7 +10,7 @@ from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
 def create_safetensors_file(path: Path) -> None:
-    data = {
+    data: Dict[str, np.ndarray] = {
         "t1": np.arange(10, dtype=np.float32),
         "t2": np.ones((2, 2), dtype=np.int64),
     }

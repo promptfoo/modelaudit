@@ -376,7 +376,9 @@ class TestPerformanceBenchmarks:
         import os
 
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        overhead_threshold = 2.0 if is_ci else 0.5  # Allow up to 200% variance in CI, 50% locally
+        overhead_threshold = (
+            2.0 if is_ci else 0.5
+        )  # Allow up to 200% variance in CI, 50% locally
         assert timeout_overhead < overhead_threshold, (
             f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
         )
@@ -424,7 +426,7 @@ class TestPerformanceBenchmarks:
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
-        benchmark_results = {
+        benchmark_results: Dict[str, Any] = {
             "timestamp": time.time(),
             "directory_scan": self.measure_scan_performance(str(assets_dir), runs=3),
         }
