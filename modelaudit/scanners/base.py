@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, ClassVar, Optional
 
+from ..explanations import get_message_explanation
+
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -79,6 +81,8 @@ class ScanResult:
         why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result"""
+        if why is None:
+            why = get_message_explanation(message)
         issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
         log_level = (

@@ -98,3 +98,41 @@ def get_opcode_explanation(opcode_name: str) -> Optional[str]:
 def get_pattern_explanation(pattern_name: str) -> Optional[str]:
     """Get explanation for a suspicious pattern."""
     return get_explanation("pattern", pattern_name)
+
+
+# Default explanations for common issue messages when no explicit "why"
+# is provided at the call site.
+COMMON_MESSAGE_EXPLANATIONS = {
+    "Maximum ZIP nesting depth": (
+        "Deeply nested archives can be used to hide malicious content or create"
+        " zip bombs that exhaust system resources during extraction."
+    ),
+    "ZIP file contains too many entries": (
+        "Large numbers of archive entries may indicate a zip bomb designed to"
+        " overwhelm the scanner or extraction process."
+    ),
+    "Archive entry": (
+        "Archive paths should never resolve outside the extraction directory as"
+        " this would allow attackers to overwrite arbitrary files."
+    ),
+    "Symlink": (
+        "Symlinks inside archives can point to sensitive locations and enable"
+        " path traversal attacks when extracted."
+    ),
+    "File too small": (
+        "Files smaller than expected may be truncated or corrupted, which is"
+        " often a sign of tampering or incomplete downloads."
+    ),
+    "Not a valid zip file": (
+        "Corrupted or malformed archives could be used to crash tools or hide"
+        " malicious payloads."
+    ),
+}
+
+
+def get_message_explanation(message: str) -> Optional[str]:
+    """Return a default explanation for an issue message if available."""
+    for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
+        if message.startswith(prefix):
+            return explanation
+    return None
