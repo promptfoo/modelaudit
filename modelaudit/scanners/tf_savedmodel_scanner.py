@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
 
+from ..explanations import get_tf_op_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed
@@ -237,6 +238,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 else "unknown"
                             ),
                         },
+                        why=get_tf_op_explanation(node.op),
                     )
 
         # Add operation counts to metadata

@@ -59,6 +59,23 @@ PATTERN_EXPLANATIONS = {
     "torch_legacy": "Legacy PyTorch formats may have unpatched vulnerabilities. The _use_new_zipfile_serialization=False flag indicates use of the older, less secure format.",
 }
 
+# Explanations for suspicious TensorFlow operations
+TF_OP_EXPLANATIONS = {
+    "PyFunc": "The PyFunc operation executes arbitrary Python code in the TensorFlow graph, which attackers can abuse to run system commands or other malicious code.",
+    "PyCall": "The PyCall operation invokes Python callbacks during graph execution and may allow arbitrary code execution.",
+    "ShellExecute": "ShellExecute runs shell commands from the TensorFlow graph, potentially compromising the host system.",
+    "ExecuteOp": "ExecuteOp allows running arbitrary operations and may be leveraged for code execution.",
+    "ReadFile": "ReadFile retrieves data from arbitrary files; malicious models could exfiltrate secrets or read sensitive files.",
+    "WriteFile": "WriteFile writes data to arbitrary locations, which could overwrite files or drop malicious payloads.",
+    "Save": "Save operations write checkpoint data. Attackers might use them to persist malicious data or overwrite existing files.",
+    "SaveV2": "SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution.",
+    "SystemConfig": "SystemConfig operations access or modify system configuration, aiding reconnaissance or privilege escalation.",
+    "MergeV2Checkpoints": "MergeV2Checkpoints manipulates TensorFlow checkpoints and could inject malicious parameters.",
+    "DecodeRaw": "DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion.",
+    "DecodeJpeg": "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources.",
+    "DecodePng": "DecodePng decodes PNG data, which could be abused with malformed inputs.",
+}
+
 
 # Function to get explanation for a security issue
 def get_explanation(category: str, specific_item: str = None) -> Optional[str]:
@@ -98,3 +115,8 @@ def get_opcode_explanation(opcode_name: str) -> Optional[str]:
 def get_pattern_explanation(pattern_name: str) -> Optional[str]:
     """Get explanation for a suspicious pattern."""
     return get_explanation("pattern", pattern_name)
+
+
+def get_tf_op_explanation(op_name: str) -> Optional[str]:
+    """Get explanation for a suspicious TensorFlow operation."""
+    return TF_OP_EXPLANATIONS.get(op_name)
