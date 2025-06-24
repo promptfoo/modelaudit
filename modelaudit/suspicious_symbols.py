@@ -384,4 +384,18 @@ def validate_patterns() -> list[str]:
         if not isinstance(opcode, str):
             warnings.append(f"Opcode name must be string: {opcode}")
 
+    # Validate binary code patterns
+    for binary_pattern in BINARY_CODE_PATTERNS:
+        if not isinstance(binary_pattern, bytes):
+            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")
+
+    # Validate executable signatures
+    for signature, description in EXECUTABLE_SIGNATURES.items():
+        if not isinstance(signature, bytes):
+            warnings.append(f"Executable signature must be bytes: {signature!r}")
+        if not isinstance(description, str) or not description:
+            warnings.append(
+                f"Description must be non-empty string for signature {signature!r}"
+            )
+
     return warnings

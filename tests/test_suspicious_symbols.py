@@ -5,8 +5,10 @@ import re
 import pytest
 
 from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
     DANGEROUS_BUILTINS,
     DANGEROUS_OPCODES,
+    EXECUTABLE_SIGNATURES,
     SUSPICIOUS_CONFIG_PATTERNS,
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_GLOBALS,
@@ -77,6 +79,26 @@ class TestDangerousOpcodes:
         assert isinstance(DANGEROUS_OPCODES, set)
         for op in ["REDUCE", "INST", "STACK_GLOBAL"]:
             assert op in DANGEROUS_OPCODES
+
+
+class TestBinaryCodePatterns:
+    """Test BINARY_CODE_PATTERNS list."""
+
+    def test_binary_code_patterns_bytes(self) -> None:
+        assert isinstance(BINARY_CODE_PATTERNS, list)
+        for pattern in BINARY_CODE_PATTERNS:
+            assert isinstance(pattern, bytes)
+
+
+class TestExecutableSignatures:
+    """Test EXECUTABLE_SIGNATURES mapping."""
+
+    def test_executable_signatures_structure(self) -> None:
+        assert isinstance(EXECUTABLE_SIGNATURES, dict)
+        for signature, description in EXECUTABLE_SIGNATURES.items():
+            assert isinstance(signature, bytes)
+            assert isinstance(description, str)
+            assert len(description) > 0
 
 
 class TestSuspiciousStringPatterns:
