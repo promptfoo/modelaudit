@@ -245,6 +245,33 @@ def test_format_text_output():
     # Verbose might include details, but we can't guarantee it
 
 
+def test_format_text_output_grouped_by_file():
+    """Ensure issues are grouped by file path."""
+    results = {
+        "files_scanned": 2,
+        "bytes_scanned": 200,
+        "duration": 0.2,
+        "issues": [
+            {
+                "message": "First issue",
+                "severity": "warning",
+                "location": "file1.pkl (pos 1)",
+            },
+            {
+                "message": "Second issue",
+                "severity": "critical",
+                "location": "file2.pkl (pos 2)",
+            },
+        ],
+    }
+
+    output = format_text_output(results)
+    assert "file1.pkl" in output
+    assert "file2.pkl" in output
+    assert "(pos 1)" in output
+    assert "(pos 2)" in output
+
+
 def test_format_text_output_only_debug_issues():
     """Ensure debug-only issues result in a success status."""
     results = {

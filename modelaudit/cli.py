@@ -391,47 +391,69 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 click.style("Issues found: ", fg="white") + ", ".join(issue_summary),
             )
 
-        # Only display visible issues
-        for i, issue in enumerate(visible_issues, 1):
-            severity = issue.get("severity", "warning").lower()
+        from collections import OrderedDict
 
-            # Skip debug issues if verbose is not enabled
-            if severity == "debug" and not verbose:
-                continue
+        def _location_prefix(loc: str) -> str:
+            loc = loc or ""
+            idx_paren = loc.find(" (")
+            idx_colon = loc.find(":")
+            indices = [i for i in (idx_paren, idx_colon) if i != -1]
+            if indices:
+                return loc[: min(indices)].strip()
+            return loc.strip()
 
-            message = issue.get("message", "Unknown issue")
-            location = issue.get("location", "")
+        issues_by_file: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+        for issue in visible_issues:
+            prefix = _location_prefix(str(issue.get("location", "")))
+            issues_by_file.setdefault(prefix, []).append(issue)
 
-            # Color-code based on severity
-            if severity == "critical":
-                severity_style = click.style("[CRITICAL]", fg="red", bold=True)
-            elif severity == "warning":
-                severity_style = click.style("[WARNING]", fg="yellow")
-            elif severity == "info":
-                severity_style = click.style("[INFO]", fg="blue")
-            elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="bright_black")
+        file_items = list(issues_by_file.items())
+        for file_index, (file_path, file_issues) in enumerate(file_items):
+            if file_path:
+                output_lines.append(click.style(file_path, fg="cyan", bold=True))
+            for i, issue in enumerate(file_issues, 1):
+                severity = issue.get("severity", "warning").lower()
 
-            # Format the issue line
-            issue_num = click.style(f"{i}.", fg="white", bold=True)
-            if location:
-                location_str = click.style(f"{location}", fg="cyan", bold=True)
-                output_lines.append(
-                    f"{issue_num} {location_str}: {severity_style} {message}",
+                if severity == "debug" and not verbose:
+                    continue
+
+                message = issue.get("message", "Unknown issue")
+                location = str(issue.get("location", ""))
+
+                if severity == "critical":
+                    severity_style = click.style("[CRITICAL]", fg="red", bold=True)
+                elif severity == "warning":
+                    severity_style = click.style("[WARNING]", fg="yellow")
+                elif severity == "info":
+                    severity_style = click.style("[INFO]", fg="blue")
+                elif severity == "debug":
+                    severity_style = click.style("[DEBUG]", fg="bright_black")
+
+                issue_num = click.style(f"{i}.", fg="white", bold=True)
+
+                suffix = (
+                    location[len(file_path) :].lstrip()
+                    if file_path and location.startswith(file_path)
+                    else location
                 )
-            else:
-                output_lines.append(f"{issue_num} {severity_style} {message}")
+                if suffix:
+                    location_str = click.style(suffix, fg="cyan", bold=True)
+                    output_lines.append(
+                        f"{issue_num} {location_str}: {severity_style} {message}"
+                    )
+                else:
+                    output_lines.append(f"{issue_num} {severity_style} {message}")
 
-            # Add "Why" explanation if available
-            why = issue.get("why")
-            if why:
-                # Indent the explanation and style it
-                why_label = click.style("   Why:", fg="magenta", bold=True)
-                why_text = click.style(f" {why}", fg="bright_white")
-                output_lines.append(f"{why_label}{why_text}")
+                why = issue.get("why")
+                if why:
+                    why_label = click.style("   Why:", fg="magenta", bold=True)
+                    why_text = click.style(f" {why}", fg="bright_white")
+                    output_lines.append(f"{why_label}{why_text}")
 
-            # Add a small separator between issues for readability
-            if i < len(visible_issues):
+                if i < len(file_issues):
+                    output_lines.append("")
+
+            if file_index < len(file_items) - 1:
                 output_lines.append("")
     else:
         output_lines.append(

@@ -158,25 +158,30 @@ modelaudit scan model.pkl --sbom sbom.json
 **Example output:**
 
 ```bash
-$ modelaudit scan suspicious_model.pkl
+$ modelaudit scan suspicious_model.pkl another_model.pkl
 
 ────────────────────────────────────────────────────────────────────────────────
 ModelAudit Security Scanner
 Scanning for potential security issues in ML model files
 ────────────────────────────────────────────────────────────────────────────────
-Paths to scan: suspicious_model.pkl
+Paths to scan: suspicious_model.pkl another_model.pkl
 ────────────────────────────────────────────────────────────────────────────────
 
 ✓ Scanning suspicious_model.pkl
+✓ Scanning another_model.pkl
 
 Active Scanner: pickle
 Scan completed in 0.02 seconds
-Files scanned: 1
-Scanned 156 bytes
+Files scanned: 2
+Scanned 312 bytes
 Issues found: 2 critical, 1 warnings
 
-1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
-2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
+suspicious_model.pkl
+1. (pos 28): [CRITICAL] Suspicious module reference found: posix.system
+2. (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
+
+another_model.pkl
+1. (pos 10): [INFO] Example info message
 
 ────────────────────────────────────────────────────────────────────────────────
 ✗ Scan completed with findings
