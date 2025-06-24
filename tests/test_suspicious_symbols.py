@@ -5,8 +5,10 @@ import re
 import pytest
 
 from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
     DANGEROUS_BUILTINS,
     DANGEROUS_OPCODES,
+    EXECUTABLE_SIGNATURES,
     SUSPICIOUS_CONFIG_PATTERNS,
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_GLOBALS,
@@ -79,6 +81,26 @@ class TestDangerousOpcodes:
             assert op in DANGEROUS_OPCODES
 
 
+class TestBinaryCodePatterns:
+    """Test BINARY_CODE_PATTERNS list."""
+
+    def test_binary_code_patterns_bytes(self) -> None:
+        assert isinstance(BINARY_CODE_PATTERNS, list)
+        for pattern in BINARY_CODE_PATTERNS:
+            assert isinstance(pattern, bytes)
+
+
+class TestExecutableSignatures:
+    """Test EXECUTABLE_SIGNATURES mapping."""
+
+    def test_executable_signatures_structure(self) -> None:
+        assert isinstance(EXECUTABLE_SIGNATURES, dict)
+        for signature, description in EXECUTABLE_SIGNATURES.items():
+            assert isinstance(signature, bytes)
+            assert isinstance(description, str)
+            assert len(description) > 0
+
+
 class TestSuspiciousStringPatterns:
     """Test SUSPICIOUS_STRING_PATTERNS regex patterns."""
 
@@ -102,6 +124,7 @@ class TestSuspiciousStringPatterns:
             ),
             (r"__[\w]+__", "__reduce__"),
             (r"base64\.b64decode", "base64.b64decode(encoded_payload)"),
+            (r"\bimport\s+[\w\.]+", "import os"),
             (r"\\x[0-9a-fA-F]{2}", "\\x41\\x42\\x43"),
         ]
 
@@ -117,6 +140,7 @@ class TestSuspiciousStringPatterns:
             "model.eval()",  # This might match eval( pattern - that's expected
             "data.shape",
             "model.parameters()",
+            "important_variable",  # Contains 'import' substring but isn't a module import
         ]
 
         # Count false positives for documentation
@@ -305,6 +329,36 @@ class TestUtilityFunctions:
         # Test that the function can be called without errors
         warnings = validate_patterns()
         assert isinstance(warnings, list)
+
+    def test_validate_patterns_with_invalid_entries(self) -> None:
+        """Inject invalid entries and verify warnings are produced."""
+        original_globals = SUSPICIOUS_GLOBALS.copy()
+        original_builtins = DANGEROUS_BUILTINS.copy()
+        original_opcodes = DANGEROUS_OPCODES.copy()
+        original_strings = SUSPICIOUS_STRING_PATTERNS.copy()
+
+        try:
+            SUSPICIOUS_GLOBALS[123] = "*"  # type: ignore[assignment]
+            SUSPICIOUS_GLOBALS["valid_module"] = 123  # type: ignore[assignment]
+            DANGEROUS_BUILTINS.append(123)  # type: ignore[arg-type]
+            DANGEROUS_OPCODES.add(123)  # type: ignore[arg-type]
+            SUSPICIOUS_STRING_PATTERNS.append("[")
+
+            warnings = validate_patterns()
+
+            assert any("Module name must be string" in w for w in warnings)
+            assert any("Functions must be '*'" in w for w in warnings)
+            assert any("Builtin name must be string" in w for w in warnings)
+            assert any("Opcode name must be string" in w for w in warnings)
+            assert any("Invalid regex pattern" in w for w in warnings)
+            assert len(warnings) >= 5
+        finally:
+            SUSPICIOUS_GLOBALS.clear()
+            SUSPICIOUS_GLOBALS.update(original_globals)
+            DANGEROUS_BUILTINS[:] = original_builtins
+            DANGEROUS_OPCODES.clear()
+            DANGEROUS_OPCODES.update(original_opcodes)
+            SUSPICIOUS_STRING_PATTERNS[:] = original_strings
 
 
 class TestSecurityCoverage:

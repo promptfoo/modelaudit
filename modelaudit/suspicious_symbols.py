@@ -130,7 +130,8 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"os\.system",  # Direct system command execution
     r"subprocess\.(?:Popen|call|check_output)",  # Process spawning
     # Dynamic imports - HIGH RISK
-    r"import ",  # Import statements in strings
+    # Match explicit module imports to reduce noise from unrelated "import" substrings
+    r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
     # Code construction - MEDIUM RISK
@@ -383,5 +384,19 @@ def validate_patterns() -> list[str]:
     for opcode in DANGEROUS_OPCODES:
         if not isinstance(opcode, str):
             warnings.append(f"Opcode name must be string: {opcode}")
+
+    # Validate binary code patterns
+    for binary_pattern in BINARY_CODE_PATTERNS:
+        if not isinstance(binary_pattern, bytes):
+            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")
+
+    # Validate executable signatures
+    for signature, description in EXECUTABLE_SIGNATURES.items():
+        if not isinstance(signature, bytes):
+            warnings.append(f"Executable signature must be bytes: {signature!r}")
+        if not isinstance(description, str) or not description:
+            warnings.append(
+                f"Description must be non-empty string for signature {signature!r}"
+            )
 
     return warnings
