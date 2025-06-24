@@ -182,6 +182,14 @@ Issues found: 2 critical, 1 warnings
 ✗ Scan completed with findings
 ```
 
+Some issues will also show a short **Why** paragraph explaining the security
+risk:
+
+```bash
+1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
+   Why: The 'os' module provides direct access to operating system functions.
+```
+
 ## ✨ Features
 
 ### Core Capabilities
@@ -314,6 +322,18 @@ When using `--format json`, ModelAudit outputs structured results:
       "tensors": ["embedding.weight", "decoder.weight"]
     }
   ]
+}
+```
+
+Some issues also include a `why` field explaining **why** the finding is a
+problem:
+
+```json
+{
+  "message": "Dangerous import: os.system",
+  "severity": "critical",
+  "location": "test.pkl",
+  "why": "The 'os' module provides direct access to operating system functions."
 }
 ```
 
