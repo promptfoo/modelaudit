@@ -1,11 +1,26 @@
 import os
 import re
+import stat
 import tempfile
 import zipfile
 from typing import Any, Dict, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+CRITICAL_SYSTEM_PATHS = [
+    "/etc",
+    "/bin",
+    "/usr",
+    "/var",
+    "/lib",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/sbin",
+    "C:\\Windows",
+]
 
 
 class ZipScanner(BaseScanner):
@@ -125,7 +140,7 @@ class ZipScanner(BaseScanner):
                 info = z.getinfo(name)
 
                 temp_base = os.path.join(tempfile.gettempdir(), "extract")
-                _, is_safe = sanitize_archive_path(name, temp_base)
+                resolved_name, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
                     result.add_issue(
                         f"Archive entry {name} attempted path traversal outside the archive",
@@ -133,6 +148,35 @@ class ZipScanner(BaseScanner):
                         location=f"{path}:{name}",
                         details={"entry": name},
                     )
+                    continue
+
+                is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+                if is_symlink:
+                    try:
+                        target = z.read(name).decode("utf-8", "replace")
+                    except Exception:
+                        target = ""
+                    target_base = os.path.dirname(resolved_name)
+                    target_resolved, target_safe = sanitize_archive_path(
+                        target, target_base
+                    )
+                    if not target_safe:
+                        result.add_issue(
+                            f"Symlink {name} resolves outside extraction directory",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}:{name}",
+                            details={"target": target},
+                        )
+                    if os.path.isabs(target) and any(
+                        target.startswith(p) for p in CRITICAL_SYSTEM_PATHS
+                    ):
+                        result.add_issue(
+                            f"Symlink {name} points to critical system path: {target}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}:{name}",
+                            details={"target": target},
+                        )
+                    # Do not scan symlink contents
                     continue
 
                 # Skip directories
