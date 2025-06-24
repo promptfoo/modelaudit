@@ -350,29 +350,29 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
     ]
 
-    if visible_issues:
-        # Count issues by severity (excluding DEBUG when not in verbose mode)
-        error_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "critical"
-        )
-        warning_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "warning"
-        )
-        info_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "info"
-        )
-        debug_count = sum(
-            1
-            for issue in issues
-            if isinstance(issue, dict) and issue.get("severity") == "debug"
-        )
+    # Count issues by severity (excluding DEBUG when not in verbose mode)
+    error_count = sum(
+        1
+        for issue in visible_issues
+        if isinstance(issue, dict) and issue.get("severity") == "critical"
+    )
+    warning_count = sum(
+        1
+        for issue in visible_issues
+        if isinstance(issue, dict) and issue.get("severity") == "warning"
+    )
+    info_count = sum(
+        1
+        for issue in visible_issues
+        if isinstance(issue, dict) and issue.get("severity") == "info"
+    )
+    debug_count = sum(
+        1
+        for issue in issues
+        if isinstance(issue, dict) and issue.get("severity") == "debug"
+    )
 
+    if visible_issues:
         # Only show debug count in verbose mode
         issue_summary = []
         if error_count:
@@ -493,7 +493,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status = click.style("✓ Scan completed successfully", fg="green", bold=True)
     else:
         status = click.style("✓ Scan completed successfully", fg="green", bold=True)
+
     output_lines.append(status)
+    summary_line = (
+        f"Summary: {error_count} critical, {warning_count} warnings, {info_count} info"
+    )
+    output_lines.append(summary_line)
 
     return "\n".join(output_lines)
 

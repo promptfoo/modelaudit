@@ -236,12 +236,14 @@ def test_format_text_output():
     assert "Files scanned: 5" in output
     assert "Test issue" in output
     assert "warning" in output.lower()
+    assert "Summary: 0 critical, 1 warnings, 0 info" in output
 
     # Test verbose output
     output = format_text_output(results, verbose=True)
     assert "Files scanned: 5" in output
     assert "Test issue" in output
     assert "warning" in output.lower()
+    assert "Summary: 0 critical, 1 warnings, 0 info" in output
     # Verbose might include details, but we can't guarantee it
 
 
@@ -260,6 +262,7 @@ def test_format_text_output_only_debug_issues():
     output = format_text_output(results, verbose=False)
     assert "No issues found" in output
     assert "Scan completed successfully" in output
+    assert "Summary: 0 critical, 0 warnings, 0 info" in output
 
 
 def test_format_text_output_only_info_issues():
@@ -278,6 +281,7 @@ def test_format_text_output_only_info_issues():
     assert "1 info" in output
     assert "Scan completed successfully" in output
     assert "Scan completed with warnings" not in output
+    assert "Summary: 0 critical, 0 warnings, 1 info" in output
 
 
 def test_format_text_output_debug_and_info_issues():
@@ -298,6 +302,7 @@ def test_format_text_output_debug_and_info_issues():
     assert "1 debug" in output
     assert "Scan completed successfully" in output
     assert "Scan completed with warnings" not in output
+    assert "Summary: 0 critical, 0 warnings, 1 info" in output
 
 
 def test_format_text_output_fast_scan_duration():
