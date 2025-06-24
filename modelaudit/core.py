@@ -1,4 +1,5 @@
 import builtins
+import json
 import logging
 import os
 import time
@@ -83,6 +84,8 @@ def scan_model_directory_or_file(
     max_file_size: int = 0,
     max_total_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    cache_dir: Optional[str] = None,
+    jobs: int = 1,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -123,6 +126,8 @@ def scan_model_directory_or_file(
         "max_file_size": max_file_size,
         "max_total_size": max_total_size,
         "timeout": timeout,
+        "cache_dir": cache_dir,
+        "jobs": jobs,
         **kwargs,
     }
 
@@ -178,7 +183,7 @@ def scan_model_directory_or_file(
 
                     # Scan the file
                     try:
-                        file_result = scan_file(file_path, config)
+                        file_result = scan_file(file_path, config, cache_dir=cache_dir)
                         # Use cast to help mypy understand the types
                         results["bytes_scanned"] = (
                             cast(int, results["bytes_scanned"])
@@ -283,9 +288,9 @@ def scan_model_directory_or_file(
                     return file
 
                 with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
-                    file_result = scan_file(path, config)
+                    file_result = scan_file(path, config, cache_dir=cache_dir)
             else:
-                file_result = scan_file(path, config)
+                file_result = scan_file(path, config, cache_dir=cache_dir)
 
             results["bytes_scanned"] = (
                 cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
@@ -448,7 +453,12 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     return 0
 
 
-def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
+def scan_file(
+    path: str,
+    config: Optional[dict[str, Any]] = None,
+    *,
+    cache_dir: Optional[str] = None,
+) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -462,6 +472,23 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     if config is None:
         config = {}
     validate_scan_config(config)
+
+    file_hash: Optional[str] = None
+    cache_path: Optional[str] = None
+    if cache_dir:
+        from .utils import sha256_file
+
+        try:
+            file_hash = sha256_file(path)
+            cache_path = os.path.join(cache_dir, f"{file_hash}.json")
+            if os.path.exists(cache_path):
+                with open(cache_path, "r") as f:
+                    data = json.load(f)
+                sr = ScanResult.from_dict(data)
+                sr.metadata["cached"] = True
+                return sr
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Error loading cache for {path}: {e}")
 
     # Check file size first
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
@@ -579,6 +606,14 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
                 "file_type_validation_failed": not file_type_valid,
             },
         )
+
+    if cache_dir and cache_path:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(result.to_dict(), f)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Error writing cache for {path}: {e}")
 
     return result
 

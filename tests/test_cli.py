@@ -37,6 +37,8 @@ def test_scan_command_help():
     assert "--timeout" in result.output
     assert "--verbose" in result.output
     assert "--max-file-size" in result.output
+    assert "--cache-dir" in result.output
+    assert "--jobs" in result.output
 
 
 def test_scan_nonexistent_file():
@@ -96,6 +98,23 @@ def test_scan_multiple_paths(tmp_path):
     assert (
         str(file1) in result.output or str(file2) in result.output
     )  # Should mention at least one file path
+
+
+def test_scan_multiple_paths_jobs(tmp_path):
+    """Test scanning multiple paths concurrently."""
+    file1 = tmp_path / "file1.dat"
+    file1.write_bytes(b"test1")
+    file2 = tmp_path / "file2.dat"
+    file2.write_bytes(b"test2")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", str(file1), str(file2), "--jobs", "2"],
+        catch_exceptions=True,
+    )
+
+    assert result.output
 
 
 def test_scan_with_blacklist(tmp_path):

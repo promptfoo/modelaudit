@@ -183,6 +183,22 @@ def test_progress_callback(tmp_path):
     assert 100.0 in progress_percentages  # Should reach 100%
 
 
+def test_scan_file_caching(tmp_path):
+    """Ensure cached scan results are reused."""
+    test_file = tmp_path / "test.txt"
+    test_file.write_text("test")
+    cache_dir = tmp_path / "cache"
+
+    _ = scan_model_directory_or_file(str(test_file), cache_dir=str(cache_dir))
+    second = scan_model_directory_or_file(str(test_file), cache_dir=str(cache_dir))
+
+    cache_files = list(cache_dir.glob("*.json"))
+    assert cache_files, "Cache file should be created"
+    assert second["file_metadata"][str(test_file)].get("cached") is True, (
+        "Second scan should use cache"
+    )
+
+
 def test_scan_result_class():
     """Test the ScanResult class functionality."""
     # Create a scan result

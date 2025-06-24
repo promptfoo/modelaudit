@@ -259,6 +259,9 @@ modelaudit scan model.pkl --sbom sbom.json
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
+
+# Enable caching and concurrent scanning
+modelaudit scan model.pkl --cache-dir .cache --jobs 4
 ```
 
 ### Exit Codes

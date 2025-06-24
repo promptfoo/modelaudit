@@ -146,6 +146,28 @@ class ScanResult:
         """Convert the scan result to a JSON string"""
         return json.dumps(self.to_dict(), indent=indent)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
+        """Create a ScanResult from a dictionary."""
+        sr = cls(scanner_name=data.get("scanner", "unknown"))
+        sr.success = data.get("success", True)
+        sr.bytes_scanned = data.get("bytes_scanned", 0)
+        sr.metadata = data.get("metadata", {})
+        for issue_data in data.get("issues", []):
+            severity_value = issue_data.get("severity", "warning")
+            try:
+                severity = IssueSeverity(severity_value)
+            except ValueError:
+                severity = IssueSeverity.WARNING
+            sr.add_issue(
+                issue_data.get("message", ""),
+                severity=severity,
+                location=issue_data.get("location"),
+                details=issue_data.get("details"),
+                why=issue_data.get("why"),
+            )
+        return sr
+
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
         error_count = sum(

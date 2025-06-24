@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 
@@ -47,3 +48,12 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
         except ValueError:  # Windows: different drives
             is_safe = False
     return str(resolved), is_safe
+
+
+def sha256_file(path: str) -> str:
+    """Return SHA-256 hash of the file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()

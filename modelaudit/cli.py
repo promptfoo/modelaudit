@@ -1,6 +1,6 @@
+import concurrent.futures
 import json
 import logging
-import os
 import sys
 import time
 from typing import Any
@@ -73,6 +73,17 @@ def cli():
     default=0,
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Directory to store cached scan results",
+)
+@click.option(
+    "--jobs",
+    type=int,
+    default=1,
+    help="Number of concurrent scan jobs",
+)
 def scan_command(
     paths,
     blacklist,
@@ -83,6 +94,8 @@ def scan_command(
     verbose,
     max_file_size,
     max_total_size,
+    cache_dir,
+    jobs,
 ):
     """Scan files or directories for malicious content.
 
@@ -103,6 +116,8 @@ def scan_command(
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
         --max-total-size   Maximum total bytes to scan before stopping
+        --cache-dir        Directory to store cached scan results
+        --jobs             Number of concurrent scan jobs
 
     \b
     Exit codes:
@@ -146,110 +161,106 @@ def scan_command(
         "assets": [],  # Track all assets encountered
     }
 
-    # Scan each path
-    for path in paths:
-        # Early exit for common non-model file extensions
-        # Note: Allow .json, .yaml, .yml as they can be model config files
-        if os.path.isfile(path):
-            _, ext = os.path.splitext(path)
-            ext = ext.lower()
-            if ext in (
-                ".md",
-                ".txt",
-                ".py",
-                ".js",
-                ".html",
-                ".css",
-            ):
-                if verbose:
-                    logger.info(f"Skipping non-model file: {path}")
-                click.echo(f"Skipping non-model file: {path}")
-                continue
-
-        # Show progress indicator if in text mode and not writing to a file
-        spinner = None
-        if format == "text" and not output:
-            spinner_text = f"Scanning {click.style(path, fg='cyan')}"
-            spinner = yaspin(Spinners.dots, text=spinner_text)
-            spinner.start()
-
-        # Perform the scan with the specified options
-        try:
-            # Define progress callback if using spinner
-            progress_callback = None
-            if spinner:
-
-                def update_progress(message, percentage):
-                    spinner.text = f"{message} ({percentage:.1f}%)"
-
-                progress_callback = update_progress
-
-            # Run the scan with progress reporting
-            results = scan_model_directory_or_file(
-                path,
-                blacklist_patterns=list(blacklist) if blacklist else None,
-                timeout=timeout,
-                max_file_size=max_file_size,
-                max_total_size=max_total_size,
-                progress_callback=progress_callback,
-            )
-
-            # Aggregate results
-            aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-            aggregated_results["issues"].extend(results.get("issues", []))
-            aggregated_results["files_scanned"] += results.get(
-                "files_scanned",
-                1,
-            )  # Count each file scanned
-            aggregated_results["assets"].extend(results.get("assets", []))
-            if results.get("has_errors", False):
-                aggregated_results["has_errors"] = True
-
-            # Track scanner names
-            for scanner in results.get("scanners", []):
-                if (
-                    scanner
-                    and scanner not in aggregated_results["scanner_names"]
-                    and scanner != "unknown"
-                ):
-                    aggregated_results["scanner_names"].append(scanner)
-
-            # Show completion status if in text mode and not writing to a file
-            if spinner:
-                if results.get("issues", []):
-                    # Filter out DEBUG severity issues when not in verbose mode
-                    visible_issues = [
-                        issue
-                        for issue in results.get("issues", [])
-                        if verbose
-                        or not isinstance(issue, dict)
-                        or issue.get("severity") != "debug"
-                    ]
-                    issue_count = len(visible_issues)
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    if issue_count > 0:
-                        spinner.ok(
-                            click.style(
-                                f"✓ Found {issue_count} issues!",
-                                fg="yellow",
-                                bold=True,
-                            ),
-                        )
-                    else:
-                        spinner.ok(click.style("✓", fg="green", bold=True))
-                else:
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    spinner.ok(click.style("✓", fg="green", bold=True))
-
-        except Exception as e:
-            # Show error if in text mode and not writing to a file
-            if spinner:
-                spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                spinner.fail(click.style("✗", fg="red", bold=True))
-
-            logger.error(f"Error during scan of {path}: {str(e)}", exc_info=verbose)
-            click.echo(f"Error scanning {path}: {str(e)}", err=True)
+    def aggregate(results: dict[str, Any]) -> None:
+        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+        aggregated_results["issues"].extend(results.get("issues", []))
+        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
+        aggregated_results["assets"].extend(results.get("assets", []))
+        if results.get("has_errors", False):
             aggregated_results["has_errors"] = True
+        for scanner in results.get("scanners", []):
+            if (
+                scanner
+                and scanner not in aggregated_results["scanner_names"]
+                and scanner != "unknown"
+            ):
+                aggregated_results["scanner_names"].append(scanner)
+
+    if jobs > 1 and len(paths) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            future_to_path = {
+                executor.submit(
+                    scan_model_directory_or_file,
+                    p,
+                    blacklist_patterns=list(blacklist) if blacklist else None,
+                    timeout=timeout,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                    cache_dir=cache_dir,
+                ): p
+                for p in paths
+            }
+            for future in concurrent.futures.as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    results = future.result()
+                    aggregate(results)
+                except Exception as e:
+                    logger.error(f"Error during scan of {path}: {e}", exc_info=verbose)
+                    click.echo(f"Error scanning {path}: {e}", err=True)
+                    aggregated_results["has_errors"] = True
+    else:
+        for path in paths:
+            spinner = None
+            if format == "text" and not output:
+                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+                spinner = yaspin(Spinners.dots, text=spinner_text)
+                spinner.start()
+
+            try:
+                progress_callback = None
+                if spinner:
+
+                    def update_progress(message, percentage):
+                        spinner.text = f"{message} ({percentage:.1f}%)"
+
+                    progress_callback = update_progress
+
+                results = scan_model_directory_or_file(
+                    path,
+                    blacklist_patterns=list(blacklist) if blacklist else None,
+                    timeout=timeout,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                    progress_callback=progress_callback,
+                    cache_dir=cache_dir,
+                )
+
+                aggregate(results)
+
+                if spinner:
+                    if results.get("issues", []):
+                        visible_issues = [
+                            issue
+                            for issue in results.get("issues", [])
+                            if verbose
+                            or not isinstance(issue, dict)
+                            or issue.get("severity") != "debug"
+                        ]
+                        issue_count = len(visible_issues)
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        if issue_count > 0:
+                            spinner.ok(
+                                click.style(
+                                    f"✓ Found {issue_count} issues!",
+                                    fg="yellow",
+                                    bold=True,
+                                ),
+                            )
+                        else:
+                            spinner.ok(click.style("✓", fg="green", bold=True))
+                    else:
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        spinner.ok(click.style("✓", fg="green", bold=True))
+
+            except Exception as e:
+                if spinner:
+                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
+                    spinner.fail(click.style("✗", fg="red", bold=True))
+
+                logger.error(f"Error during scan of {path}: {e}", exc_info=verbose)
+                click.echo(f"Error scanning {path}: {e}", err=True)
+                aggregated_results["has_errors"] = True
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
