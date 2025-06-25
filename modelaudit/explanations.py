@@ -108,12 +108,12 @@ COMMON_MESSAGE_EXPLANATIONS = {
         " zip bombs that exhaust system resources during extraction."
     ),
     "ZIP file contains too many entries": (
-        "Large numbers of archive entries may indicate a zip bomb designed to"
+        "Large numbers of archive entries may indicate a malicious zip bomb designed to"
         " overwhelm the scanner or extraction process."
     ),
     "Archive entry": (
         "Archive paths should never resolve outside the extraction directory as"
-        " this would allow attackers to overwrite arbitrary files."
+        " this enables path traversal attacks where attackers can overwrite arbitrary files."
     ),
     "Symlink": (
         "Symlinks inside archives can point to sensitive locations and enable"
@@ -126,6 +126,22 @@ COMMON_MESSAGE_EXPLANATIONS = {
     "Not a valid zip file": (
         "Corrupted or malformed archives could be used to crash tools or hide"
         " malicious payloads."
+    ),
+    "File too large": (
+        "Extremely large files may be used for denial-of-service attacks by"
+        " exhausting system resources during processing."
+    ),
+    "Too many": (
+        "Excessive quantities of data structures may indicate a malicious attempt"
+        " to overwhelm the system or hide malicious content."
+    ),
+    "Error scanning": (
+        "Scanning errors may indicate corrupted files, unsupported formats, or"
+        " malicious content designed to crash security tools."
+    ),
+    "Decompressed size too large": (
+        "Maliciously crafted compressed data can expand to enormous sizes"
+        " (compression bombs) to exhaust system memory and crash the application."
     ),
 }
 
