@@ -44,6 +44,15 @@ _TYPE_SIZES = {
     12: 8,  # FLOAT64
 }
 
+# Accepted GGML variant magic bytes
+GGML_VARIANT_MAGICS = {
+    b"GGML",
+    b"GGMF",
+    b"GGJT",
+    b"GGLA",
+    b"GGSA",
+}
+
 
 class GgufScanner(BaseScanner):
     """Scanner for GGUF/GGML model files with comprehensive parsing and security checks."""
@@ -52,7 +61,15 @@ class GgufScanner(BaseScanner):
     description = (
         "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
     )
-    supported_extensions = [".gguf", ".ggml"]
+    # Include common GGML variant extensions as well
+    supported_extensions = [
+        ".gguf",
+        ".ggml",
+        ".ggmf",
+        ".ggjt",
+        ".ggla",
+        ".ggsa",
+    ]
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
@@ -72,7 +89,7 @@ class GgufScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 magic = f.read(4)
-            return magic in (b"GGUF", b"GGML")
+            return magic == b"GGUF" or magic in GGML_VARIANT_MAGICS
         except Exception:
             return False
 
@@ -94,7 +111,7 @@ class GgufScanner(BaseScanner):
                 magic = f.read(4)
                 if magic == b"GGUF":
                     self._scan_gguf(f, file_size, result)
-                elif magic == b"GGML":
+                elif magic in GGML_VARIANT_MAGICS:
                     self._scan_ggml(f, file_size, magic, result)
                 else:
                     result.add_issue(
