@@ -1,11 +1,10 @@
+import joblib
 import numpy as np
 import pytest
 
-pytest.importorskip("joblib")
-
-import joblib
-
 from modelaudit.scanners.joblib_scanner import JoblibScanner
+
+pytest.importorskip("joblib")
 
 
 def test_joblib_scanner_basic(tmp_path):

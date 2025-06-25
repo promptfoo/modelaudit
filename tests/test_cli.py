@@ -99,9 +99,7 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert (
-        str(file1) in result.output or str(file2) in result.output
-    )  # Should mention at least one file path
+    assert str(file1) in result.output or str(file2) in result.output  # Should mention at least one file path
 
 
 def test_scan_with_blacklist(tmp_path):
@@ -286,9 +284,7 @@ def test_format_text_output_only_info_issues():
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
     assert "1 Info" in clean_output
-    assert (
-        "INFORMATIONAL FINDINGS" in clean_output
-    )  # Info issues show INFORMATIONAL FINDINGS
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
     assert "WARNINGS DETECTED" not in clean_output
 
 
@@ -309,9 +305,7 @@ def test_format_text_output_debug_and_info_issues():
     clean_output = strip_ansi(output)
     assert "1 Info" in clean_output
     assert "1 Debug" in clean_output
-    assert (
-        "INFORMATIONAL FINDINGS" in clean_output
-    )  # Info issues show INFORMATIONAL FINDINGS
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
     assert "WARNINGS DETECTED" not in clean_output
 
 
@@ -421,15 +415,10 @@ def test_exit_code_clean_scan(tmp_path):
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert result.exit_code == 0, (
-        f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 0, f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     # The output might not say "No issues found" if there are debug messages,
     # so let's be less strict
-    assert (
-        "scan completed successfully" in result.output.lower()
-        or "no issues found" in result.output.lower()
-    )
+    assert "scan completed successfully" in result.output.lower() or "no issues found" in result.output.lower()
 
 
 def test_exit_code_security_issues(tmp_path):
@@ -450,9 +439,7 @@ def test_exit_code_security_issues(tmp_path):
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert result.exit_code == 1, (
-        f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 
