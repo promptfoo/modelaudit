@@ -146,22 +146,7 @@ def scan_command(
         click.echo("╚" + "═" * 78 + "╝")
         click.echo("")
 
-        # Scan configuration
-        click.echo(click.style("🎯 TARGET FILES", fg="white", bold=True))
-        click.echo("─" * 40)
-        for path in paths:
-            click.echo(f"  📄 {click.style(path, fg='green')}")
 
-        if blacklist:
-            click.echo("")
-            click.echo(click.style("🚫 BLACKLIST PATTERNS", fg="white", bold=True))
-            click.echo("─" * 40)
-            for pattern in blacklist:
-                click.echo(f"  • {click.style(pattern, fg='yellow')}")
-
-        click.echo("")
-        click.echo("═" * 80)
-        click.echo("")
 
     # Set logging level based on verbosity
     if verbose:
@@ -300,6 +285,9 @@ def scan_command(
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
+    
+    # Add paths to results for formatting
+    aggregated_results["paths"] = list(paths)
 
     # Format the output
     if format == "json":
@@ -334,47 +322,44 @@ def scan_command(
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
-    """Format scan results as human-readable text using Rich."""
+    """Format scan results as clean, focused text output."""
     console = Console(file=io.StringIO(), record=True)
 
-    # Add scan summary header with emoji
-    console.print("\n📊 [bold white]SCAN SUMMARY[/bold white]")
-    console.print("─" * 60)
+    # Get basic info
+    files_scanned = results.get("files_scanned", 0)
+    bytes_scanned = results.get("bytes_scanned", 0)
+    duration = results.get("duration", 0)
+    scanner_names = results.get("scanner_names", [])
+    
+    # Format file size
+    if bytes_scanned >= 1024 * 1024 * 1024:
+        size_str = f"{bytes_scanned / (1024 * 1024 * 1024):.1f}GB"
+    elif bytes_scanned >= 1024 * 1024:
+        size_str = f"{bytes_scanned / (1024 * 1024):.1f}MB"
+    elif bytes_scanned >= 1024:
+        size_str = f"{bytes_scanned / 1024:.1f}KB"
+    else:
+        size_str = f"{bytes_scanned}B"
 
-    # Create summary table
-    summary = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
-
-    scanners = results.get("scanner_names")
-    if scanners:
-        label = "🔍 Active Scanner" if len(scanners) == 1 else "🔍 Active Scanners"
-        summary.add_row(label, "[blue]" + ", ".join(scanners) + "[/blue]")
-
-    duration = results.get("duration")
-    if duration is not None:
-        if duration < 0.01:
-            duration_str = f"{duration:.3f}s"
+    # Determine scan target info
+    paths = results.get("paths", [])
+    if len(paths) == 1:
+        path = paths[0]
+        if os.path.isdir(path):
+            scan_target = f"📁 {os.path.basename(path)}/ ({files_scanned} files, {size_str})"
+        elif path.endswith('.zip') or path.endswith('.tar.gz'):
+            scan_target = f"📦 {os.path.basename(path)} ({size_str})"
         else:
-            duration_str = f"{duration:.2f}s"
-        summary.add_row("⏱️  Duration", f"[cyan]{duration_str}[/cyan]")
+            scan_target = f"📄 {os.path.basename(path)} ({size_str})"
+    else:
+        scan_target = f"📁 {files_scanned} files ({size_str})"
 
-    if "files_scanned" in results:
-        summary.add_row("📁 Files scanned", f"[cyan]{results['files_scanned']}[/cyan]")
+    console.print("🔐 ModelAudit Security Scanner")
+    console.print()
+    console.print(scan_target)
+    console.print()
 
-    if "bytes_scanned" in results:
-        bytes_scanned = results["bytes_scanned"]
-        if bytes_scanned >= 1024 * 1024 * 1024:
-            size_str = f"{bytes_scanned / (1024 * 1024 * 1024):.2f} GB"
-        elif bytes_scanned >= 1024 * 1024:
-            size_str = f"{bytes_scanned / (1024 * 1024):.2f} MB"
-        elif bytes_scanned >= 1024:
-            size_str = f"{bytes_scanned / 1024:.2f} KB"
-        else:
-            size_str = f"{bytes_scanned} bytes"
-        summary.add_row("💾 Data scanned", f"[cyan]{size_str}[/cyan]")
-
-    console.print(summary)
-
-    # Add security findings section
+    # Process issues
     issues = results.get("issues", [])
     visible_issues = [
         issue
@@ -383,199 +368,231 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     ]
 
     # Count issues by severity
-    severity_counts = {
-        "critical": 0,
-        "warning": 0,
-        "info": 0,
-        "debug": 0,
-    }
+    critical_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
+    warning_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
+    info_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "info"]
 
-    for issue in issues:
-        if isinstance(issue, dict):
-            severity = issue.get("severity", "warning")
-            if severity in severity_counts:
-                severity_counts[severity] += 1
-
-    console.print("\n🔍 [bold white]SECURITY FINDINGS[/bold white]")
-    console.print("─" * 60)
-
-    if visible_issues:
-        # Show issue counts with rich formatting
-        count_table = Table(show_header=False, box=None, padding=(0, 2))
+    if not visible_issues:
+        # Clean scan - very concise
+        console.print("✅ [bold green]NO SECURITY ISSUES FOUND[/bold green]")
+        console.print("─" * 42)
+        console.print()
         
-        if severity_counts["critical"] > 0:
-            count_table.add_row(
-                "🚨",
-                f"[bold red]{severity_counts['critical']} Critical[/bold red]"
-            )
-        if severity_counts["warning"] > 0:
-            count_table.add_row(
-                "⚠️",
-                f"[yellow]{severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}[/yellow]"
-            )
-        if severity_counts["info"] > 0:
-            count_table.add_row(
-                "ℹ️",
-                f"[blue]{severity_counts['info']} Info[/blue]"
-            )
-        if verbose and severity_counts["debug"] > 0:
-            count_table.add_row(
-                "🐛",
-                f"[cyan]{severity_counts['debug']} Debug[/cyan]"
-            )
-            
-        console.print(count_table)
+        # Brief summary for clean scans
+        console.print("📊 [bold]SUMMARY[/bold]")
+        console.print("─" * 20)
+        
+        scanner_text = ", ".join(scanner_names) if scanner_names else "unknown"
+        duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
+        
+        console.print(f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})")
+        console.print(f"⏱️  Duration: {duration_str}")
+        if scanner_names:
+            console.print(f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_text}")
+        
+        console.print()
+        console.print("✅ [bold green]Scan completed successfully[/bold green]")
+        console.print("─" * 80)
+        
+    else:
+        # Issues found - show detailed breakdown
+        issue_summary = []
+        if critical_issues:
+            count = len(critical_issues)
+            issue_summary.append(f"{count} CRITICAL ISSUE{'S' if count > 1 else ''}")
+        if warning_issues:
+            count = len(warning_issues)  
+            issue_summary.append(f"{count} WARNING{'S' if count > 1 else ''}")
+        if info_issues:
+            count = len(info_issues)
+            issue_summary.append(f"{count} INFO")
+
+        console.print(f"🚨 [bold red]{', '.join(issue_summary)} FOUND[/bold red]")
+        console.print("─" * 42)
         console.print()
 
-        # Group and display issues by severity
-        critical_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "critical"
-        ]
+        # Show critical issues first
         if critical_issues:
-            console.print("🚨 [bold red]Critical Issues[/bold red]")
-            console.print("─" * 40)
-            for issue in critical_issues:
-                _format_issue_rich(console, issue, "critical")
+            console.print("🚨 [bold red]CRITICAL[/bold red]")
+            for i, issue in enumerate(critical_issues):
+                symbol = "├─" if i < len(critical_issues) - 1 else "└─"
+                _format_issue_tree(console, issue, symbol, True)
             console.print()
 
-        warning_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "warning"
-        ]
+        # Show warnings
         if warning_issues:
-            if critical_issues:
-                console.print()
-            console.print("⚠️  [bold yellow]Warnings[/bold yellow]")
-            console.print("─" * 40)
-            for issue in warning_issues:
-                _format_issue_rich(console, issue, "warning")
+            console.print("⚠️  [bold yellow]WARNINGS[/bold yellow]")
+            for i, issue in enumerate(warning_issues):
+                symbol = "├─" if i < len(warning_issues) - 1 else "└─"
+                _format_issue_tree(console, issue, symbol, False)
             console.print()
 
-        info_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "info"
-        ]
-        if info_issues:
-            if critical_issues or warning_issues:
-                console.print()
-            console.print("ℹ️  [bold blue]Information[/bold blue]")
-            console.print("─" * 40)
-            for issue in info_issues:
-                _format_issue_rich(console, issue, "info")
+        # Show info in verbose mode
+        if info_issues and verbose:
+            console.print("ℹ️  [bold blue]INFO[/bold blue]")
+            for i, issue in enumerate(info_issues):
+                symbol = "├─" if i < len(info_issues) - 1 else "└─"
+                _format_issue_tree(console, issue, symbol, False)
             console.print()
 
-        if verbose:
-            debug_issues = [
-                issue
-                for issue in issues
-                if isinstance(issue, dict) and issue.get("severity") == "debug"
-            ]
-            if debug_issues:
-                console.print("🐛 [bold cyan]Debug Information[/bold cyan]")
-                console.print("─" * 40)
-                for issue in debug_issues:
-                    _format_issue_rich(console, issue, "debug")
-                console.print()
+        # Show archive contents for complex scans (only in verbose or when relevant)
+        show_contents = verbose or any(
+            (issue.get("location") or "").count(":") > 0 for issue in visible_issues
+        )
+        if show_contents and results.get("assets"):
+            _format_archive_contents(console, results["assets"], visible_issues)
 
-    else:
-        console.print("✅ [bold green]No security issues found[/bold green]")
-
-    # Asset inventory (keep existing Rich tree implementation)
-    if "assets" in results and results["assets"]:
-        console.print("\n📦 [bold white]ASSET INVENTORY[/bold white]")
-        console.print("─" * 60)
-
-        # Group assets by scanner type
-        assets_by_scanner: dict[str, list[dict[str, Any]]] = {}
-        for asset in results["assets"]:
-            scanner = asset.get("scanner", "unknown")
-            if scanner not in assets_by_scanner:
-                assets_by_scanner[scanner] = []
-            assets_by_scanner[scanner].append(asset)
-
-        # Create tree structure
-        tree = Tree("📦 [bold]Discovered Assets[/bold]")
-
-        def add_assets(node: Tree, items: list[dict[str, Any]]):
-            for asset in items[:10]:  # Limit to first 10 per scanner
-                asset_name = asset.get("path", "Unknown")
-                asset_type = asset.get("type", "unknown")
-                asset_size = asset.get("size")
-
-                # Format the asset entry
-                if asset_size:
-                    if asset_size >= 1024 * 1024:
-                        size_str = f"{asset_size / (1024 * 1024):.1f}MB"
-                    elif asset_size >= 1024:
-                        size_str = f"{asset_size / 1024:.1f}KB"
-                    else:
-                        size_str = f"{asset_size}B"
-                    asset_info = f"[cyan]{asset_name}[/cyan] ([dim]{asset_type}, {size_str}[/dim])"
-                else:
-                    asset_info = f"[cyan]{asset_name}[/cyan] ([dim]{asset_type}[/dim])"
-
-                node.add(asset_info)
-
-            if len(items) > 10:
-                node.add(f"[dim]... and {len(items) - 10} more[/dim]")
-
-        for scanner, assets in assets_by_scanner.items():
-            scanner_node = tree.add(f"🔍 [blue]{scanner}[/blue] ({len(assets)} assets)")
-            add_assets(scanner_node, assets)
-
-        console.print(tree)
-
-    # Final status
-    console.print("\n" + "─" * 80)
-    if visible_issues:
-        if any(
-            isinstance(issue, dict) and issue.get("severity") == "critical"
-            for issue in visible_issues
-        ):
-            console.print("[bold red]✗ Scan completed with critical findings[/bold red]")
-        elif any(
-            isinstance(issue, dict) and issue.get("severity") == "warning"
-            for issue in visible_issues
-        ):
-            console.print("[bold yellow]⚠ Scan completed with warnings[/bold yellow]")
+        # Summary
+        console.print("📊 [bold]SUMMARY[/bold]")
+        console.print("─" * 20)
+        
+        scanner_text = ", ".join(scanner_names) if scanner_names else "unknown"
+        duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
+        
+        if any(":" in (issue.get("location") or "") for issue in visible_issues):
+            # Archive scan
+            nested_files = len([i for i in visible_issues if ":" in (i.get("location") or "")])
+            console.print(f"✓ Scanned: 1 archive → {nested_files} nested files")
         else:
-            console.print("[bold green]✓ Scan completed successfully[/bold green]")
-    else:
-        console.print("[bold green]✓ Scan completed successfully[/bold green]")
+            console.print(f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})")
+        
+        console.print(f"⏱️  Duration: {duration_str}")
+        if scanner_names:
+            scanner_display = " → ".join(scanner_names) if len(scanner_names) > 1 else scanner_names[0]
+            console.print(f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_display}")
+        
+        console.print()
+        
+        # Final status
+        if critical_issues:
+            console.print("🚨 [bold red]Scan completed with CRITICAL findings[/bold red]")
+        elif warning_issues:
+            console.print("⚠️  [bold yellow]Scan completed with warnings[/bold yellow]")
+        else:
+            console.print("✅ [bold green]Scan completed successfully[/bold green]")
+        console.print("─" * 80)
 
     return console.export_text()
 
 
-def _format_issue_rich(console: Console, issue: dict[str, Any], severity: str) -> None:
-    """Format a single issue using Rich."""
+def _format_issue_tree(console: Console, issue: dict[str, Any], symbol: str, is_critical: bool) -> None:
+    """Format a single issue in tree structure with smart path handling."""
     message = issue.get("message", "Unknown issue")
     location = issue.get("location", "")
     
-    # Color coding by severity
-    severity_colors = {
-        "critical": "red",
-        "warning": "yellow",
-        "info": "blue",
-        "debug": "cyan"
-    }
-    color = severity_colors.get(severity, "white")
-    
+    # Smart path handling
     if location:
-        console.print(f"  📍 [bold {color}]{location}[/bold {color}]")
-        console.print(f"     {message}")
+        if ":" in location:
+            # Archive path like "archive.zip:file.pkl" or "archive.zip:file.pkl (pos 123)"
+            parts = location.split(":")
+            if len(parts) >= 2:
+                archive = parts[0]
+                inner_path = ":".join(parts[1:])
+                
+                # Clean up position info
+                if " (pos " in inner_path:
+                    inner_path = inner_path.split(" (pos ")[0]
+                
+                # Determine file type icon
+                if inner_path.startswith("../"):
+                    icon = "📁"  # Malicious path
+                elif inner_path.endswith((".pkl", ".pt", ".pth")):
+                    icon = "📄"
+                else:
+                    icon = "📄"
+                
+                file_context = f"{icon} {inner_path}"
+            else:
+                file_context = location
+        else:
+            # Regular file path - use basename
+            import os
+            file_context = os.path.basename(location)
     else:
-        console.print(f"  • [{color}]{message}[/{color}]")
+        file_context = ""
+
+    # Extract key information from message
+    short_message = _shorten_message(message)
     
-    # Add "Why" explanation if available
+    # Format the main line
+    if file_context:
+        console.print(f"{symbol} {file_context}: {short_message}")
+    else:
+        console.print(f"{symbol} {short_message}")
+    
+    # Add explanation if available and important
     why = issue.get("why")
-    if why:
-        console.print(f"     [dim]💡 {why}[/dim]")
+    if why and is_critical:
+        # Shorten explanation for tree format
+        short_why = _shorten_explanation(why)
+        console.print(f"   💡 {short_why}")
+
+
+def _format_archive_contents(console: Console, assets: list[dict], issues: list[dict]) -> None:
+    """Format archive contents when relevant."""
+    # Only show if we have archives with nested content
+    archive_assets = [a for a in assets if a.get("type") == "zip" and a.get("contents")]
+    if not archive_assets:
+        return
+        
+    console.print("📦 [bold]ARCHIVE CONTENTS[/bold]")
+    for asset in archive_assets:
+        contents = asset.get("contents", [])
+        if contents:
+            for i, content in enumerate(contents[:5]):  # Limit to first 5
+                symbol = "├─" if i < min(len(contents), 5) - 1 else "└─"
+                path = content.get("path", "")
+                size = content.get("size", 0)
+                
+                # Check if this file has issues
+                has_issues = any(
+                    path in issue.get("location", "") for issue in issues
+                )
+                
+                if path.startswith("../"):
+                    console.print(f"{symbol} 📁 {path} [red](MALICIOUS PATH)[/red]")
+                else:
+                    size_str = f"{size}B" if size < 1024 else f"{size//1024}KB"
+                    file_type = content.get("type", "unknown")
+                    status = " [red](ISSUES)[/red]" if has_issues else ""
+                    console.print(f"{symbol} 📄 {path} ({file_type}, {size_str}){status}")
+            
+            if len(contents) > 5:
+                console.print(f"    ... and {len(contents) - 5} more files")
+        console.print()
+
+
+def _shorten_message(message: str) -> str:
+    """Shorten common message patterns for tree display."""
+    # Common patterns to shorten
+    replacements = {
+        "Found REDUCE opcode - potential __reduce__ method execution": "REDUCE opcode (code execution risk)",
+        "Found NEWOBJ opcode - potential code execution": "NEWOBJ opcode detected",
+        "Suspicious module reference found: ": "",
+        "Archive entry ": "",
+        " attempted path traversal outside the archive": ": Path traversal attack",
+        "Suspicious configuration pattern: ": "",
+    }
     
-    console.print()
+    short = message
+    for old, new in replacements.items():
+        short = short.replace(old, new)
+    
+    # Truncate if still too long
+    if len(short) > 60:
+        short = short[:57] + "..."
+        
+    return short
+
+
+def _shorten_explanation(explanation: str) -> str:
+    """Shorten explanations for tree display."""
+    # Take first sentence or up to 80 chars
+    sentences = explanation.split(". ")
+    if len(sentences[0]) <= 80:
+        return sentences[0] + ("." if not sentences[0].endswith(".") else "")
+    else:
+        return explanation[:77] + "..." if len(explanation) > 80 else explanation
 
 
 def main() -> None:

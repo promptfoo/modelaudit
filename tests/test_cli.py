@@ -66,7 +66,8 @@ def test_scan_file(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert str(test_file) in result.output  # Should mention the file path
+    # With new format, the output shows basename, not full path
+    assert "test_file.dat" in result.output  # Should mention the file basename
 
 
 def test_scan_directory(tmp_path):
@@ -82,7 +83,8 @@ def test_scan_directory(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert str(test_dir) in result.output  # Should mention the directory path
+    # With new format, shows directory basename
+    assert "test_dir/" in result.output  # Should mention the directory basename
 
 
 def test_scan_multiple_paths(tmp_path):
@@ -99,9 +101,8 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert (
-        str(file1) in result.output or str(file2) in result.output
-    )  # Should mention at least one file path
+    # With new format, shows file count instead of individual paths for multiple
+    assert "2 files" in result.output  # Should mention file count
 
 
 def test_scan_with_blacklist(tmp_path):
@@ -118,8 +119,9 @@ def test_scan_with_blacklist(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert str(test_file) in result.output  # Should mention the file path
-    assert "pattern1" in result.output  # Should mention the blacklist pattern
+    # With new format, shows file basename
+    assert "test_file.dat" in result.output  # Should mention the file basename
+    # Blacklist patterns are no longer shown in the new clean output format
 
 
 def test_scan_json_output(tmp_path):
@@ -214,15 +216,15 @@ def test_scan_max_file_size(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert str(test_file) in result.output  # Should mention the file path
-    assert "500" in result.output  # Should mention the max file size
+    # With new format, shows file basename 
+    assert "large_file.dat" in result.output  # Should mention the file basename
 
 
 def test_format_text_output():
     """Test the format_text_output function."""
     # Create a sample results dictionary
     results = {
-        "path": "/path/to/model",
+        "paths": ["/path/to/model"],
         "files_scanned": 5,
         "bytes_scanned": 1024,
         "duration": 0.5,
@@ -235,27 +237,28 @@ def test_format_text_output():
             },
         ],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     # Test normal output
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
-    assert "Files scanned" in clean_output and "5" in clean_output
+    assert "✓ Scanned: 5 file" in clean_output
     assert "Test issue" in clean_output
-    assert "warning" in clean_output.lower()
+    assert "WARNING" in clean_output
 
     # Test verbose output
     output = format_text_output(results, verbose=True)
     clean_output = strip_ansi(output)
-    assert "Files scanned" in clean_output and "5" in clean_output
+    assert "✓ Scanned: 5 file" in clean_output
     assert "Test issue" in clean_output
-    assert "warning" in clean_output.lower()
-    # Verbose might include details, but we can't guarantee it
+    assert "WARNING" in clean_output
 
 
 def test_format_text_output_only_debug_issues():
     """Ensure debug-only issues result in a success status."""
     results = {
+        "paths": ["/path/to/file.pkl"],
         "files_scanned": 1,
         "bytes_scanned": 10,
         "duration": 0.1,
@@ -263,16 +266,18 @@ def test_format_text_output_only_debug_issues():
             {"message": "Debug info", "severity": "debug", "location": "file.pkl"},
         ],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
-    assert "No security issues found" in clean_output
+    assert "NO SECURITY ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_only_info_issues():
     """Ensure info-only issues result in a success status."""
     results = {
+        "paths": ["/path/to/file.pkl"],
         "files_scanned": 1,
         "bytes_scanned": 10,
         "duration": 0.1,
@@ -280,17 +285,19 @@ def test_format_text_output_only_info_issues():
             {"message": "Info message", "severity": "info", "location": "file.pkl"},
         ],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
-    assert "1 Info" in clean_output
+    assert "1 INFO FOUND" in clean_output
     assert "completed successfully" in clean_output
 
 
 def test_format_text_output_debug_and_info_issues():
     """Ensure debug and info issues (no warnings) result in a success status."""
     results = {
+        "paths": ["/path/to/file.pkl"],
         "files_scanned": 1,
         "bytes_scanned": 10,
         "duration": 0.1,
@@ -299,79 +306,82 @@ def test_format_text_output_debug_and_info_issues():
             {"message": "Info message", "severity": "info", "location": "file2.pkl"},
         ],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=True)
     clean_output = strip_ansi(output)
-    assert "1 Info" in clean_output
-    assert "1 Debug" in clean_output
+    assert "1 INFO" in clean_output
     assert "completed successfully" in clean_output
 
 
 def test_format_text_output_fast_scan_duration():
     """Test duration formatting for very fast scans (< 0.01 seconds)."""
     results = {
-        "path": "/path/to/model",
+        "paths": ["/path/to/model"],
         "files_scanned": 1,
         "bytes_scanned": 512,
         "duration": 0.005,  # Very fast scan < 0.01 seconds
         "issues": [],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Duration" in clean_output and "0.005s" in clean_output
-    assert "Files scanned" in clean_output and "1" in clean_output
-    assert "No security issues found" in clean_output
+    assert "Duration: 0.005s" in clean_output
+    assert "✓ Scanned: 1 file" in clean_output
+    assert "NO SECURITY ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_normal_scan_duration():
     """Test duration formatting for normal scans (>= 0.01 seconds)."""
     results = {
-        "path": "/path/to/model",
+        "paths": ["/path/to/model"],
         "files_scanned": 2,
         "bytes_scanned": 2048,
         "duration": 0.25,  # Normal scan >= 0.01 seconds
         "issues": [],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
 
     # Should show 2 decimal places for normal scans
-    assert "Duration" in clean_output and "0.25s" in clean_output
-    assert "Files scanned" in clean_output and "2" in clean_output
-    assert "No security issues found" in clean_output
+    assert "Duration: 0.25s" in clean_output
+    assert "✓ Scanned: 2 file" in clean_output
+    assert "NO SECURITY ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_edge_case_duration():
     """Test duration formatting for edge case exactly at 0.01 seconds."""
     results = {
-        "path": "/path/to/model",
+        "paths": ["/path/to/model"],
         "files_scanned": 1,
         "bytes_scanned": 1024,
         "duration": 0.01,  # Edge case exactly at threshold
         "issues": [],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
 
     # Should show 2 decimal places (>= 0.01 branch)
-    assert "Duration" in clean_output and "0.01s" in clean_output
-    assert "Files scanned" in clean_output and "1" in clean_output
-    assert "No security issues found" in clean_output
+    assert "Duration: 0.01s" in clean_output
+    assert "✓ Scanned: 1 file" in clean_output
+    assert "NO SECURITY ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_very_fast_scan_with_issues():
     """Test duration formatting for very fast scan with issues."""
     results = {
-        "path": "/path/to/model",
+        "paths": ["/path/to/model"],
         "files_scanned": 1,
         "bytes_scanned": 256,
         "duration": 0.003,  # Very fast scan with issues
@@ -384,16 +394,17 @@ def test_format_text_output_very_fast_scan_with_issues():
             },
         ],
         "has_errors": False,
+        "scanner_names": ["pickle"],
     }
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Duration" in clean_output and "0.003s" in clean_output
-    assert "Files scanned" in clean_output and "1" in clean_output
+    assert "Duration: 0.003s" in clean_output
+    assert "✓ Scanned: 1 file" in clean_output
     assert "Suspicious pattern detected" in clean_output
-    assert "warning" in output.lower()
+    assert "WARNING" in clean_output
 
 
 def test_exit_code_clean_scan(tmp_path):
