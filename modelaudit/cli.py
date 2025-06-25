@@ -7,10 +7,7 @@ import time
 from typing import Any, Optional
 
 import click
-from rich import box
 from rich.console import Console
-from rich.table import Table
-from rich.tree import Tree
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
@@ -145,8 +142,6 @@ def scan_command(
         click.echo("║" + " " * 78 + "║")
         click.echo("╚" + "═" * 78 + "╝")
         click.echo("")
-
-
 
     # Set logging level based on verbosity
     if verbose:
@@ -285,7 +280,7 @@ def scan_command(
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
-    
+
     # Add paths to results for formatting
     aggregated_results["paths"] = list(paths)
 
@@ -330,7 +325,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     bytes_scanned = results.get("bytes_scanned", 0)
     duration = results.get("duration", 0)
     scanner_names = results.get("scanner_names", [])
-    
+
     # Format file size
     if bytes_scanned >= 1024 * 1024 * 1024:
         size_str = f"{bytes_scanned / (1024 * 1024 * 1024):.1f}GB"
@@ -346,8 +341,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     if len(paths) == 1:
         path = paths[0]
         if os.path.isdir(path):
-            scan_target = f"📁 {os.path.basename(path)}/ ({files_scanned} files, {size_str})"
-        elif path.endswith('.zip') or path.endswith('.tar.gz'):
+            scan_target = (
+                f"📁 {os.path.basename(path)}/ ({files_scanned} files, {size_str})"
+            )
+        elif path.endswith(".zip") or path.endswith(".tar.gz"):
             scan_target = f"📦 {os.path.basename(path)} ({size_str})"
         else:
             scan_target = f"📄 {os.path.basename(path)} ({size_str})"
@@ -368,32 +365,46 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     ]
 
     # Count issues by severity
-    critical_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
-    warning_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
-    info_issues = [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "info"]
+    critical_issues = [
+        i
+        for i in visible_issues
+        if isinstance(i, dict) and i.get("severity") == "critical"
+    ]
+    warning_issues = [
+        i
+        for i in visible_issues
+        if isinstance(i, dict) and i.get("severity") == "warning"
+    ]
+    info_issues = [
+        i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "info"
+    ]
 
     if not visible_issues:
         # Clean scan - very concise
         console.print("✅ [bold green]NO SECURITY ISSUES FOUND[/bold green]")
         console.print("─" * 42)
         console.print()
-        
+
         # Brief summary for clean scans
         console.print("📊 [bold]SUMMARY[/bold]")
         console.print("─" * 20)
-        
+
         scanner_text = ", ".join(scanner_names) if scanner_names else "unknown"
         duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
-        
-        console.print(f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})")
+
+        console.print(
+            f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})"
+        )
         console.print(f"⏱️  Duration: {duration_str}")
         if scanner_names:
-            console.print(f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_text}")
-        
+            console.print(
+                f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_text}"
+            )
+
         console.print()
         console.print("✅ [bold green]Scan completed successfully[/bold green]")
         console.print("─" * 80)
-        
+
     else:
         # Issues found - show detailed breakdown
         issue_summary = []
@@ -401,7 +412,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             count = len(critical_issues)
             issue_summary.append(f"{count} CRITICAL ISSUE{'S' if count > 1 else ''}")
         if warning_issues:
-            count = len(warning_issues)  
+            count = len(warning_issues)
             issue_summary.append(f"{count} WARNING{'S' if count > 1 else ''}")
         if info_issues:
             count = len(info_issues)
@@ -445,27 +456,39 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         # Summary
         console.print("📊 [bold]SUMMARY[/bold]")
         console.print("─" * 20)
-        
+
         scanner_text = ", ".join(scanner_names) if scanner_names else "unknown"
         duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
-        
+
         if any(":" in (issue.get("location") or "") for issue in visible_issues):
             # Archive scan
-            nested_files = len([i for i in visible_issues if ":" in (i.get("location") or "")])
+            nested_files = len(
+                [i for i in visible_issues if ":" in (i.get("location") or "")]
+            )
             console.print(f"✓ Scanned: 1 archive → {nested_files} nested files")
         else:
-            console.print(f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})")
-        
+            console.print(
+                f"✓ Scanned: {files_scanned} file{'s' if files_scanned != 1 else ''} ({scanner_text})"
+            )
+
         console.print(f"⏱️  Duration: {duration_str}")
         if scanner_names:
-            scanner_display = " → ".join(scanner_names) if len(scanner_names) > 1 else scanner_names[0]
-            console.print(f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_display}")
-        
+            scanner_display = (
+                " → ".join(scanner_names)
+                if len(scanner_names) > 1
+                else scanner_names[0]
+            )
+            console.print(
+                f"🔍 Scanner{'s' if len(scanner_names) > 1 else ''}: {scanner_display}"
+            )
+
         console.print()
-        
+
         # Final status
         if critical_issues:
-            console.print("🚨 [bold red]Scan completed with CRITICAL findings[/bold red]")
+            console.print(
+                "🚨 [bold red]Scan completed with CRITICAL findings[/bold red]"
+            )
         elif warning_issues:
             console.print("⚠️  [bold yellow]Scan completed with warnings[/bold yellow]")
         else:
@@ -475,24 +498,25 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     return console.export_text()
 
 
-def _format_issue_tree(console: Console, issue: dict[str, Any], symbol: str, is_critical: bool) -> None:
+def _format_issue_tree(
+    console: Console, issue: dict[str, Any], symbol: str, is_critical: bool
+) -> None:
     """Format a single issue in tree structure with smart path handling."""
     message = issue.get("message", "Unknown issue")
     location = issue.get("location", "")
-    
+
     # Smart path handling
     if location:
         if ":" in location:
             # Archive path like "archive.zip:file.pkl" or "archive.zip:file.pkl (pos 123)"
             parts = location.split(":")
             if len(parts) >= 2:
-                archive = parts[0]
                 inner_path = ":".join(parts[1:])
-                
+
                 # Clean up position info
                 if " (pos " in inner_path:
                     inner_path = inner_path.split(" (pos ")[0]
-                
+
                 # Determine file type icon
                 if inner_path.startswith("../"):
                     icon = "📁"  # Malicious path
@@ -500,26 +524,27 @@ def _format_issue_tree(console: Console, issue: dict[str, Any], symbol: str, is_
                     icon = "📄"
                 else:
                     icon = "📄"
-                
+
                 file_context = f"{icon} {inner_path}"
             else:
                 file_context = location
         else:
             # Regular file path - use basename
             import os
+
             file_context = os.path.basename(location)
     else:
         file_context = ""
 
     # Extract key information from message
     short_message = _shorten_message(message)
-    
+
     # Format the main line
     if file_context:
         console.print(f"{symbol} {file_context}: {short_message}")
     else:
         console.print(f"{symbol} {short_message}")
-    
+
     # Add explanation if available and important
     why = issue.get("why")
     if why and is_critical:
@@ -528,13 +553,15 @@ def _format_issue_tree(console: Console, issue: dict[str, Any], symbol: str, is_
         console.print(f"   💡 {short_why}")
 
 
-def _format_archive_contents(console: Console, assets: list[dict], issues: list[dict]) -> None:
+def _format_archive_contents(
+    console: Console, assets: list[dict], issues: list[dict]
+) -> None:
     """Format archive contents when relevant."""
     # Only show if we have archives with nested content
     archive_assets = [a for a in assets if a.get("type") == "zip" and a.get("contents")]
     if not archive_assets:
         return
-        
+
     console.print("📦 [bold]ARCHIVE CONTENTS[/bold]")
     for asset in archive_assets:
         contents = asset.get("contents", [])
@@ -543,20 +570,20 @@ def _format_archive_contents(console: Console, assets: list[dict], issues: list[
                 symbol = "├─" if i < min(len(contents), 5) - 1 else "└─"
                 path = content.get("path", "")
                 size = content.get("size", 0)
-                
+
                 # Check if this file has issues
-                has_issues = any(
-                    path in issue.get("location", "") for issue in issues
-                )
-                
+                has_issues = any(path in issue.get("location", "") for issue in issues)
+
                 if path.startswith("../"):
                     console.print(f"{symbol} 📁 {path} [red](MALICIOUS PATH)[/red]")
                 else:
-                    size_str = f"{size}B" if size < 1024 else f"{size//1024}KB"
+                    size_str = f"{size}B" if size < 1024 else f"{size // 1024}KB"
                     file_type = content.get("type", "unknown")
                     status = " [red](ISSUES)[/red]" if has_issues else ""
-                    console.print(f"{symbol} 📄 {path} ({file_type}, {size_str}){status}")
-            
+                    console.print(
+                        f"{symbol} 📄 {path} ({file_type}, {size_str}){status}"
+                    )
+
             if len(contents) > 5:
                 console.print(f"    ... and {len(contents) - 5} more files")
         console.print()
@@ -573,15 +600,15 @@ def _shorten_message(message: str) -> str:
         " attempted path traversal outside the archive": ": Path traversal attack",
         "Suspicious configuration pattern: ": "",
     }
-    
+
     short = message
     for old, new in replacements.items():
         short = short.replace(old, new)
-    
+
     # Truncate if still too long
     if len(short) > 60:
         short = short[:57] + "..."
-        
+
     return short
 
 

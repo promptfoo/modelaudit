@@ -216,7 +216,7 @@ def test_scan_max_file_size(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    # With new format, shows file basename 
+    # With new format, shows file basename
     assert "large_file.dat" in result.output  # Should mention the file basename
 
 

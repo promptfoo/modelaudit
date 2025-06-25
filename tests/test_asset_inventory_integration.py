@@ -462,7 +462,9 @@ class TestAssetInventoryIntegration:
 
         # Rich tree format may have different symbols (├, └, │) for tree structure
         asset_lines = [
-            line for line in assets_section if line.strip() and any(char in line for char in ["├", "└", "│"])
+            line
+            for line in assets_section
+            if line.strip() and any(char in line for char in ["├", "└", "│"])
         ]
         assert len(asset_lines) >= 3  # Should list all three files
 
