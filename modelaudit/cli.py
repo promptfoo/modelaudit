@@ -530,8 +530,6 @@ def _format_issue_tree(
                 file_context = location
         else:
             # Regular file path - use basename
-            import os
-
             file_context = os.path.basename(location)
     else:
         file_context = ""
