@@ -113,6 +113,7 @@ def test_pickle_scanner_includes_why():
 def test_cli_output_format_includes_why():
     """Test that CLI output formatting includes 'why' explanations."""
     import re
+
     from modelaudit.cli import format_text_output
 
     # Create test results with 'why' explanations
