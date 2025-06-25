@@ -95,7 +95,9 @@ class TestFileTypeValidationIntegration:
 
                         # Also test scanning doesn't produce validation errors
                         result = scan_file(str(file_path))
-                        validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
+                        validation_issues = [
+                            i for i in result.issues if "file type validation failed" in i.message.lower()
+                        ]
 
                         if validation_issues:
                             validation_failures.append(
@@ -114,7 +116,9 @@ class TestFileTypeValidationIntegration:
                         )
 
         # All legitimate files should pass validation
-        assert len(validation_failures) == 0, f"Expected legitimate files to pass validation, but found failures: {validation_failures}"
+        assert len(validation_failures) == 0, (
+            f"Expected legitimate files to pass validation, but found failures: {validation_failures}"
+        )
 
     def test_pickle_files_validation(self, test_data_dir):
         """Test specific validation of pickle files in test data."""
@@ -243,9 +247,15 @@ class TestFileTypeValidationIntegration:
             assert results["success"], "MIT model directory scan should succeed"
 
             # Check for validation issues
-            validation_issues = [issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()]
+            validation_issues = [
+                issue
+                for issue in results["issues"]
+                if "file type validation failed" in issue.get("message", "").lower()
+            ]
 
-            assert len(validation_issues) == 0, f"MIT model directory should not have validation issues: {validation_issues}"
+            assert len(validation_issues) == 0, (
+                f"MIT model directory should not have validation issues: {validation_issues}"
+            )
 
         # Scan a directory with mixed file types
         mixed_dir = temp_test_dir / "mixed_licenses"
@@ -293,7 +303,9 @@ class TestFileTypeValidationIntegration:
         (attack_dir / "weights.safetensors").write_bytes(b"Not SafeTensors at all")
 
         results = scan_model_directory_or_file(str(attack_dir))
-        all_validation_issues = [issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()]
+        all_validation_issues = [
+            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
+        ]
 
         if len(all_validation_issues) == 0:
             security_threats.append(
@@ -436,7 +448,9 @@ class TestFileTypeValidationIntegration:
 
         # Should have validation warnings
         validation_warnings = [
-            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower() and issue.get("severity") == "warning"
+            issue
+            for issue in results["issues"]
+            if "file type validation failed" in issue.get("message", "").lower() and issue.get("severity") == "warning"
         ]
 
         assert len(validation_warnings) > 0, "Should generate file type validation warnings"

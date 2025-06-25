@@ -376,11 +376,21 @@ class TestAssetInventoryIntegration:
         # Simulate a transformer model structure
         tensors = {}
         for layer in range(12):  # 12 transformer layers
-            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(np.float32)
-            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(np.float32)
-            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(np.float32)
-            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(np.float32)
-            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(
+                np.float32
+            )
+            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(
+                np.float32
+            )
+            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(
+                np.float32
+            )
+            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(
+                np.float32
+            )
+            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(
+                np.float32
+            )
             tensors[f"transformer.layer.{layer}.output.dense.weight"] = np.random.randn(
                 768,
                 3072,

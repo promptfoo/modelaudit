@@ -225,7 +225,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         details={
                             "op_type": node.op,
                             "node_name": node.name,
-                            "meta_graph": (meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"),
+                            "meta_graph": (
+                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                            ),
                         },
                     )
 

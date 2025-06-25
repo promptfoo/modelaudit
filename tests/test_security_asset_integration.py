@@ -54,7 +54,9 @@ class TestSecurityAssetIntegration:
             if category_dir.exists():
                 # Look for files with malicious indicators
                 for file_path in category_dir.iterdir():
-                    if any(indicator in file_path.name.lower() for indicator in ["malicious", "evil", "suspicious", "bad"]):
+                    if any(
+                        indicator in file_path.name.lower() for indicator in ["malicious", "evil", "suspicious", "bad"]
+                    ):
                         malicious_files.append(file_path)
 
         return malicious_files
@@ -85,7 +87,11 @@ class TestSecurityAssetIntegration:
                         "dill_func",
                         "path_traversal",
                     ]
-                    if not any(indicator in file_path.name.lower() for indicator in exclusions) and file_path.is_file() and not file_path.name.startswith("."):
+                    if (
+                        not any(indicator in file_path.name.lower() for indicator in exclusions)
+                        and file_path.is_file()
+                        and not file_path.name.startswith(".")
+                    ):
                         safe_files.append(file_path)
 
         return safe_files
@@ -108,7 +114,9 @@ class TestSecurityAssetIntegration:
             assert results["success"] is True, f"Scan failed for {malicious_file.name}"
 
             # Check for security-level issues
-            security_issues = [issue for issue in results["issues"] if issue.get("severity") in ["critical", "error", "warning"]]
+            security_issues = [
+                issue for issue in results["issues"] if issue.get("severity") in ["critical", "error", "warning"]
+            ]
             assert len(security_issues) > 0, f"No security issues found in {malicious_file.name}"
 
     def test_safe_sample_validation(self, samples_dir):
@@ -128,8 +136,12 @@ class TestSecurityAssetIntegration:
             assert results["success"] is True, f"Scan failed for {safe_file.name}"
 
             # Any issues should be low-severity only
-            high_severity_issues = [issue for issue in results["issues"] if issue.get("severity") in ["critical", "error"]]
-            assert len(high_severity_issues) == 0, f"High-severity false positive in {safe_file.name}: {high_severity_issues}"
+            high_severity_issues = [
+                issue for issue in results["issues"] if issue.get("severity") in ["critical", "error"]
+            ]
+            assert len(high_severity_issues) == 0, (
+                f"High-severity false positive in {safe_file.name}: {high_severity_issues}"
+            )
 
     def test_existing_pickle_assets(self, assets_dir):
         """Test existing pickle assets in the organized structure."""

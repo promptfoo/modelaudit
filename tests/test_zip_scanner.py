@@ -143,7 +143,10 @@ class TestZipScanner:
             result = self.scanner.scan(outer_path)
             assert result.success is True
             # Should have scanned the nested content
-            assert any("nested.zip" in str(issue.location) for issue in result.issues if hasattr(issue, "location")) or result.bytes_scanned > 0
+            assert (
+                any("nested.zip" in str(issue.location) for issue in result.issues if hasattr(issue, "location"))
+                or result.bytes_scanned > 0
+            )
         finally:
             os.unlink(inner_path)
             os.unlink(outer_path)
@@ -163,7 +166,11 @@ class TestZipScanner:
             assert result.success is True
 
             # Should have detected directory traversal attempts
-            traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower() or "directory traversal" in i.message.lower()]
+            traversal_issues = [
+                i
+                for i in result.issues
+                if "path traversal" in i.message.lower() or "directory traversal" in i.message.lower()
+            ]
             assert len(traversal_issues) >= 2
 
             # Check severity

@@ -104,7 +104,9 @@ class TestRealDillFiles:
             or ("suspicious" in str(i.message).lower() and "module" in str(i.message).lower())
             for i in critical_issues
         )
-        assert malicious_detected, f"Should detect malicious patterns. Found issues: {[str(i.message) for i in critical_issues]}"
+        assert malicious_detected, (
+            f"Should detect malicious patterns. Found issues: {[str(i.message) for i in critical_issues]}"
+        )
 
 
 class TestRealJoblibFiles:

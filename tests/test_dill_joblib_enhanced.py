@@ -230,7 +230,9 @@ class TestErrorHandling:
             has_logged_messages = len(caplog.records) > 0
 
             # Should have at least one form of error handling
-            assert has_issues or has_truncation_metadata or has_logged_messages, "Should have some form of error handling (issues, truncation, or logging)"
+            assert has_issues or has_truncation_metadata or has_logged_messages, (
+                "Should have some form of error handling (issues, truncation, or logging)"
+            )
 
 
 class TestPerformanceAndEdgeCases:

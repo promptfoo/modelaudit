@@ -7,7 +7,6 @@ Estimates token count to stay within Claude 4's context limits (~200k tokens).
 import fnmatch
 import sys
 from pathlib import Path
-from typing import List
 
 
 def estimate_tokens(text: str) -> int:
@@ -15,16 +14,13 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def should_include_file(file_path: Path, excluded_patterns: List[str]) -> bool:
+def should_include_file(file_path: Path, excluded_patterns: list[str]) -> bool:
     """Check if file should be included based on exclusion patterns."""
     file_str = str(file_path)
-    for pattern in excluded_patterns:
-        if fnmatch.fnmatch(file_str, pattern):
-            return False
-    return True
+    return all(not fnmatch.fnmatch(file_str, pattern) for pattern in excluded_patterns)
 
 
-def collect_python_files(directory: Path, excluded_patterns: List[str]) -> List[Path]:
+def collect_python_files(directory: Path, excluded_patterns: list[str]) -> list[Path]:
     """Recursively collect all Python files in directory."""
     python_files = []
     for file_path in directory.rglob("*.py"):

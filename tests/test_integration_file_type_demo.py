@@ -123,7 +123,11 @@ class TestFileTypeValidationDemo:
         if mit_dir.exists():
             results = scan_model_directory_or_file(str(mit_dir))
 
-            validation_warnings = [issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()]
+            validation_warnings = [
+                issue
+                for issue in results["issues"]
+                if "file type validation failed" in issue.get("message", "").lower()
+            ]
 
             print("📁 MIT Model Directory:")
             print(f"   Files scanned: {results['files_scanned']}")
@@ -153,12 +157,16 @@ class TestFileTypeValidationDemo:
         # Scan the directory
         results = scan_model_directory_or_file(str(mixed_dir))
 
-        validation_warnings = [issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()]
+        validation_warnings = [
+            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
+        ]
 
         security_issues = [
             issue
             for issue in results["issues"]
-            if any(keyword in issue.get("message", "").lower() for keyword in ["spoofing", "security", "validation failed"])
+            if any(
+                keyword in issue.get("message", "").lower() for keyword in ["spoofing", "security", "validation failed"]
+            )
         ]
 
         print("📁 Mixed Directory (legitimate + malicious):")

@@ -194,7 +194,10 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     # Should have an error about invalid protobuf format or TensorFlow not installed
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
-        "error" in issue.message.lower() or "parsing" in issue.message.lower() or "tensorflow not installed" in issue.message.lower() for issue in result.issues
+        "error" in issue.message.lower()
+        or "parsing" in issue.message.lower()
+        or "tensorflow not installed" in issue.message.lower()
+        for issue in result.issues
     )
 
 

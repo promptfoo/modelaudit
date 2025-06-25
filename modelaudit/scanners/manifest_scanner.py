@@ -131,9 +131,9 @@ class ManifestScanner(BaseScanner):
             # Only if it's likely an ML model config
             # (has model-related terms in path or specific extensions)
             path_lower = path.lower()
-            if any(ml_term in path_lower for ml_term in ["model", "checkpoint", "huggingface", "transformers"]) or os.path.splitext(path)[1].lower() in [
-                ".json"
-            ]:
+            if any(
+                ml_term in path_lower for ml_term in ["model", "checkpoint", "huggingface", "transformers"]
+            ) or os.path.splitext(path)[1].lower() in [".json"]:
                 return True
 
         return False
@@ -215,8 +215,9 @@ class ManifestScanner(BaseScanner):
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
                             why=(
-                                "This term matches a user-defined blacklist pattern. Organizations use blacklists to identify "
-                                "models or configurations that violate security policies or contain known malicious indicators."
+                                "This term matches a user-defined blacklist pattern. Organizations use blacklists to "
+                                "identify models or configurations that violate security policies or contain known "
+                                "malicious indicators."
                             ),
                         )
         except Exception as e:
@@ -357,8 +358,9 @@ class ManifestScanner(BaseScanner):
                     if severity == IssueSeverity.INFO:
                         if "file_access" in matches and "network_access" in matches:
                             why = (
-                                "File and network access patterns in ML model configurations are common for loading datasets "
-                                "and downloading resources. They are flagged for awareness but are typically benign in ML contexts."
+                                "File and network access patterns in ML model configurations are common for loading "
+                                "datasets and downloading resources. They are flagged for awareness but are typically "
+                                "benign in ML contexts."
                             )
                         elif "file_access" in matches:
                             why = (
@@ -367,8 +369,8 @@ class ManifestScanner(BaseScanner):
                             )
                         elif "network_access" in matches:
                             why = (
-                                "Network access patterns in ML model configurations may indicate remote model repositories "
-                                "or dataset URLs. This is common in ML pipelines but worth reviewing."
+                                "Network access patterns in ML model configurations may indicate remote model "
+                                "repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
                             )
 
                     result.add_issue(
@@ -577,7 +579,9 @@ class ManifestScanner(BaseScanner):
                     return True
 
             # Credentials in ML context
-            if "credentials" in matches and any(pattern in key_lower for pattern in ["_token_id", "token_id_", "_token", "token_type"]):
+            if "credentials" in matches and any(
+                pattern in key_lower for pattern in ["_token_id", "token_id_", "_token", "token_type"]
+            ):
                 return True
 
         # Special case for tokenizer configs
@@ -647,7 +651,9 @@ class ManifestScanner(BaseScanner):
             return IssueSeverity.CRITICAL
 
         # In high-confidence ML context, downgrade some warnings
-        if ml_context.get("confidence", 0) >= 2 and all(match in ["file_access", "network_access"] for match in matches):
+        if ml_context.get("confidence", 0) >= 2 and all(
+            match in ["file_access", "network_access"] for match in matches
+        ):
             return IssueSeverity.INFO
 
         # Credentials are high priority

@@ -238,13 +238,17 @@ def scan_command(
                 if results.get("issues", []):
                     # Filter out DEBUG severity issues when not in verbose mode
                     visible_issues = [
-                        issue for issue in results.get("issues", []) if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                        issue
+                        for issue in results.get("issues", [])
+                        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
                     ]
                     issue_count = len(visible_issues)
                     spinner.text = f"Scanned {click.style(path, fg='cyan')}"
                     if issue_count > 0:
                         # Determine severity for coloring
-                        has_critical = any(issue.get("severity") == "critical" for issue in visible_issues if isinstance(issue, dict))
+                        has_critical = any(
+                            issue.get("severity") == "critical" for issue in visible_issues if isinstance(issue, dict)
+                        )
                         if has_critical:
                             spinner.fail(
                                 click.style(
@@ -363,7 +367,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
-    visible_issues = [issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"]
+    visible_issues = [
+        issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+    ]
 
     # Count issues by severity
     severity_counts = {
@@ -419,7 +425,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append("")
 
         # Display critical issues first
-        critical_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"]
+        critical_issues = [
+            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"
+        ]
         if critical_issues:
             output_lines.append(
                 click.style("  🚨 Critical Issues", fg="red", bold=True),
@@ -430,7 +438,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display warnings
-        warning_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"]
+        warning_issues = [
+            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"
+        ]
         if warning_issues:
             if critical_issues:
                 output_lines.append("")
@@ -453,7 +463,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display debug issues if verbose
         if verbose:
-            debug_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"]
+            debug_issues = [
+                issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"
+            ]
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
                     output_lines.append("")

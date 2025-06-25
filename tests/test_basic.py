@@ -267,12 +267,15 @@ def test_version_consistency():
     try:
         package_version = version("modelaudit")
         assert modelaudit.__version__ == package_version, (
-            f"Version mismatch: __version__ is '{modelaudit.__version__}' but package metadata version is '{package_version}'"
+            f"Version mismatch: __version__ is '{modelaudit.__version__}' but package metadata version is "
+            f"'{package_version}'"
         )
     except PackageNotFoundError:
         # Package is not installed, so we can't compare versions
         # This is expected in development environments
-        assert modelaudit.__version__ == "unknown", f"Expected __version__ to be 'unknown' when package is not installed, but got '{modelaudit.__version__}'"
+        assert modelaudit.__version__ == "unknown", (
+            f"Expected __version__ to be 'unknown' when package is not installed, but got '{modelaudit.__version__}'"
+        )
 
 
 def test_version_is_semver():
@@ -292,7 +295,8 @@ def test_version_is_semver():
         return
 
     assert re.match(semver_pattern, version), (
-        f"Version '{version}' does not follow semantic versioning format. Expected format: MAJOR.MINOR.PATCH (e.g., 1.0.0, 0.1.3, 2.1.0-alpha)"
+        f"Version '{version}' does not follow semantic versioning format. Expected format: MAJOR.MINOR.PATCH "
+        f"(e.g., 1.0.0, 0.1.3, 2.1.0-alpha)"
     )
 
     # Additional basic checks

@@ -500,7 +500,9 @@ test,data
 
         # Should not have license warnings for config files
         license_issues = [
-            issue for issue in results.get("issues", []) if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
+            issue
+            for issue in results.get("issues", [])
+            if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
         ]
 
         assert len(license_issues) == 0

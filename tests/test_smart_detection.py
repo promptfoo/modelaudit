@@ -601,7 +601,9 @@ class TestIntegrationScenarios:
             errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
 
             # Should have at least one error for dangerous value
-            dangerous_errors = [e for e in errors if "init_script" in e.message or e.details.get("analysis") == "value_based"]
+            dangerous_errors = [
+                e for e in errors if "init_script" in e.message or e.details.get("analysis") == "value_based"
+            ]
             assert len(dangerous_errors) >= 1
 
         finally:

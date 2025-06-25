@@ -202,8 +202,9 @@ class SafeTensorsScanner(BaseScanner):
                                 severity=IssueSeverity.INFO,
                                 location=path,
                                 why=(
-                                    "Metadata fields over 1000 characters are unusual in model files. Long strings in metadata "
-                                    "could contain encoded payloads, scripts, or data exfiltration attempts."
+                                    "Metadata fields over 1000 characters are unusual in model files. Long strings "
+                                    "in metadata could contain encoded payloads, scripts, or data exfiltration "
+                                    "attempts."
                                 ),
                             )
                         if isinstance(value, str) and any(s in value.lower() for s in ["import ", "#!/", "\\"]):
@@ -212,8 +213,9 @@ class SafeTensorsScanner(BaseScanner):
                                 severity=IssueSeverity.INFO,
                                 location=path,
                                 why=(
-                                    "Metadata containing code-like patterns (import statements, shebangs, escape sequences) "
-                                    "is atypical for model files and may indicate embedded scripts or injection attempts."
+                                    "Metadata containing code-like patterns (import statements, shebangs, escape "
+                                    "sequences) is atypical for model files and may indicate embedded scripts or "
+                                    "injection attempts."
                                 ),
                             )
 

@@ -164,7 +164,9 @@ class TestFalsePositiveFixes:
 
             # Should not flag any of these patterns as suspicious
             assert result["exit_code"] == 0, f"HuggingFace config {config_info['filename']} should not be flagged"
-            assert result["has_warnings"] is False, f"HuggingFace config {config_info['filename']} should not have warnings"
+            assert result["has_warnings"] is False, (
+                f"HuggingFace config {config_info['filename']} should not have warnings"
+            )
 
     def test_tensorflow_h5_not_flagged_as_warning(self, tmp_path):
         """Test that TensorFlow H5 files don't generate warnings."""
@@ -319,7 +321,8 @@ class TestFalsePositiveFixes:
         warning_issues = [issue for issue in scan_result.issues if issue.severity == IssueSeverity.WARNING]
 
         assert len(critical_issues) > 0 or len(warning_issues) > 0, (
-            f"Malicious manifest should be detected. Found {len(scan_result.issues)} issues: {[str(issue) for issue in scan_result.issues]}"
+            f"Malicious manifest should be detected. Found {len(scan_result.issues)} issues: "
+            f"{[str(issue) for issue in scan_result.issues]}"
         )
 
     def test_comprehensive_gpt2_model_scan(self, tmp_path):
@@ -441,7 +444,9 @@ class TestFalsePositiveFixes:
                 scan_results = {"issues": []}
 
             # Analyze results
-            has_warnings = any(issue.get("severity") in ["warning", "critical"] for issue in scan_results.get("issues", []))
+            has_warnings = any(
+                issue.get("severity") in ["warning", "critical"] for issue in scan_results.get("issues", [])
+            )
             has_errors = any(issue.get("severity") == "critical" for issue in scan_results.get("issues", []))
 
             return {

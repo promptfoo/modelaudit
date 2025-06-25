@@ -381,7 +381,10 @@ def _is_ml_model_directory(file_paths: list[str]) -> bool:
     has_ml_files = any(filename in ml_indicators for filename in filenames)
 
     # Check for model weight files with typical patterns
-    has_weight_files = any("model" in filename and any(ext in filename for ext in [".bin", ".h5", ".safetensors"]) for filename in filenames)
+    has_weight_files = any(
+        "model" in filename and any(ext in filename for ext in [".bin", ".h5", ".safetensors"])
+        for filename in filenames
+    )
 
     # Check for config files
     has_config_files = any("config" in filename and filename.endswith(".json") for filename in filenames)
@@ -435,7 +438,8 @@ def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"AGPL-licensed components detected ({len(agpl_files)} files). Review network use restrictions for SaaS deployment.",
+                "message": f"AGPL-licensed components detected ({len(agpl_files)} files). Review network use "
+                f"restrictions for SaaS deployment.",
                 "details": {
                     "files": agpl_files[:5],  # Show first 5 files
                     "total_count": len(agpl_files),
@@ -470,7 +474,8 @@ def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"Datasets with unspecified licenses detected ({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
+                "message": f"Datasets with unspecified licenses detected "
+                f"({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
                 "details": {
                     "files": significant_unlicensed_datasets[:5],  # Show first 5 files
                     "total_count": len(significant_unlicensed_datasets),
@@ -500,7 +505,8 @@ def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"Non-commercial licensed components detected ({len(nc_files)} files). These cannot be used commercially.",
+                "message": f"Non-commercial licensed components detected ({len(nc_files)} files). These cannot "
+                f"be used commercially.",
                 "details": {
                     "files": nc_files[:5],
                     "total_count": len(nc_files),
@@ -529,7 +535,8 @@ def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str
             {
                 "type": "license_warning",
                 "severity": "info",
-                "message": f"Strong copyleft licensed components detected ({len(copyleft_files)} files). May require derivative works to be open-sourced.",
+                "message": f"Strong copyleft licensed components detected ({len(copyleft_files)} files). May "
+                f"require derivative works to be open-sourced.",
                 "details": {
                     "files": copyleft_files[:5],
                     "total_count": len(copyleft_files),

@@ -193,7 +193,8 @@ def scan_model_directory_or_file(
                         if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
                             issues_list.append(
                                 {
-                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                                    f"(max: {max_total_size})",
                                     "severity": IssueSeverity.WARNING.value,
                                     "location": file_path,
                                     "details": {"max_total_size": max_total_size},
@@ -291,7 +292,8 @@ def scan_model_directory_or_file(
             if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
                 issues_list.append(
                     {
-                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                        f"(max: {max_total_size})",
                         "severity": IssueSeverity.WARNING.value,
                         "location": path,
                         "details": {"max_total_size": max_total_size},

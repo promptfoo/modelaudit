@@ -408,7 +408,9 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Check for GLOBAL followed by REDUCE - common in exploits
-        if (opcode.name == "GLOBAL" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "REDUCE") and isinstance(arg, str):
+        if (opcode.name == "GLOBAL" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "REDUCE") and isinstance(
+            arg, str
+        ):
             parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
             if len(parts) == 2:
                 mod, func = parts
@@ -707,8 +709,8 @@ class PickleScanner(BaseScanner):
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
                         why=(
-                            "The scan exceeded the configured time limit. Large or complex pickle files may take longer "
-                            "to analyze due to the number of opcodes that need to be processed."
+                            "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                            "longer to analyze due to the number of opcodes that need to be processed."
                         ),
                     )
                     break
@@ -913,8 +915,9 @@ class PickleScanner(BaseScanner):
                                     ),
                                 },
                                 why=(
-                                    "STACK_GLOBAL requires two strings on the stack (module and function name) to import and access "
-                                    "module attributes. Insufficient context prevents determining which module is being accessed."
+                                    "STACK_GLOBAL requires two strings on the stack (module and function name) to "
+                                    "import and access module attributes. Insufficient context prevents determining "
+                                    "which module is being accessed."
                                 ),
                             )
 
@@ -928,7 +931,8 @@ class PickleScanner(BaseScanner):
                 )
                 module_name = dangerous_pattern.get("module", "")
                 result.add_issue(
-                    f"Detected dangerous __reduce__ pattern with {dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
+                    f"Detected dangerous __reduce__ pattern with "
+                    f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
                     severity=severity,
                     location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
                     details={
@@ -1009,7 +1013,8 @@ class PickleScanner(BaseScanner):
             if is_benign_error:
                 # Log for security auditing but treat as non-fatal
                 logger.warning(
-                    f"Truncated pickle scan of {self.current_file_path}: {e}. This may be due to non-pickle data after STOP opcode.",
+                    f"Truncated pickle scan of {self.current_file_path}: {e}. This may be due to non-pickle "
+                    f"data after STOP opcode."
                 )
                 result.metadata.update(
                     {
@@ -1094,8 +1099,8 @@ class PickleScanner(BaseScanner):
                                 "section": "binary_data",
                             },
                             why=(
-                                "Python code patterns found in binary sections of the file. Model weights are typically "
-                                "numeric data and should not contain readable code strings."
+                                "Python code patterns found in binary sections of the file. Model weights are "
+                                "typically numeric data and should not contain readable code strings."
                             ),
                         )
 
@@ -1143,8 +1148,8 @@ class PickleScanner(BaseScanner):
                                     "section": "binary_data",
                                 },
                                 why=(
-                                    "Windows executable files embedded in model data can run arbitrary code on the system. "
-                                    "The presence of a valid DOS stub confirms this is an actual PE executable."
+                                    "Windows executable files embedded in model data can run arbitrary code on the "
+                                    "system. The presence of a valid DOS stub confirms this is an actual PE executable."
                                 ),
                             )
 
@@ -1158,7 +1163,10 @@ class PickleScanner(BaseScanner):
                             "bytes_scanned": start_pos + bytes_scanned,
                             "timeout": self.timeout,
                         },
-                        why="The binary content scan exceeded the configured time limit. Large model files may require more time to fully analyze.",
+                        why=(
+                            "The binary content scan exceeded the configured time limit. Large model files may "
+                            "require more time to fully analyze."
+                        ),
                     )
                     break
 

@@ -119,8 +119,12 @@ class TestPerformanceBenchmarks:
         assert metrics["duration_avg"] < performance_thresholds["directory_scan_max_time"], (
             f"Average directory scan time {metrics['duration_avg']:.2f}s too slow"
         )
-        assert metrics["files_per_second"] >= performance_thresholds["files_per_second_min"], f"Files per second {metrics['files_per_second']:.2f} too low"
-        assert metrics["bytes_per_second"] >= performance_thresholds["bytes_per_second_min"], f"Bytes per second {metrics['bytes_per_second']:.2f} too low"
+        assert metrics["files_per_second"] >= performance_thresholds["files_per_second_min"], (
+            f"Files per second {metrics['files_per_second']:.2f} too low"
+        )
+        assert metrics["bytes_per_second"] >= performance_thresholds["bytes_per_second_min"], (
+            f"Bytes per second {metrics['bytes_per_second']:.2f} too low"
+        )
 
         # Should scan multiple files
         assert metrics["files_scanned"] > 1, "Should scan multiple files in directory"
@@ -286,8 +290,12 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result["files_scanned"] == first_result["files_scanned"], f"Inconsistent files_scanned on run {i + 1}"
-            assert result["bytes_scanned"] == first_result["bytes_scanned"], f"Inconsistent bytes_scanned on run {i + 1}"
+            assert result["files_scanned"] == first_result["files_scanned"], (
+                f"Inconsistent files_scanned on run {i + 1}"
+            )
+            assert result["bytes_scanned"] == first_result["bytes_scanned"], (
+                f"Inconsistent bytes_scanned on run {i + 1}"
+            )
             assert len(result["issues"]) == len(first_result["issues"]), f"Inconsistent issue count on run {i + 1}"
             assert result["success"] == first_result["success"], f"Inconsistent success status on run {i + 1}"
 
@@ -330,7 +338,9 @@ class TestPerformanceBenchmarks:
 
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
         overhead_threshold = 2.0 if is_ci else 0.5  # Allow up to 200% variance in CI, 50% locally
-        assert timeout_overhead < overhead_threshold, f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
+        assert timeout_overhead < overhead_threshold, (
+            f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
+        )
 
     @pytest.mark.slow
     def test_stress_performance(self, assets_dir):

@@ -84,7 +84,11 @@ class ScanResult:
         log_level = (
             logging.CRITICAL
             if severity == IssueSeverity.CRITICAL
-            else (logging.WARNING if severity == IssueSeverity.WARNING else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG))
+            else (
+                logging.WARNING
+                if severity == IssueSeverity.WARNING
+                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+            )
         )
         logger.log(log_level, str(issue))
 
@@ -256,7 +260,8 @@ class BaseScanner(ABC):
                     result.add_issue(
                         (
                             f"File type validation failed: extension indicates {ext_format} but magic bytes "
-                            f"indicate {header_format}. This could indicate file spoofing, corruption, or a security threat."
+                            f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
+                            f"security threat."
                         ),
                         severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
                         location=path,
@@ -309,7 +314,8 @@ class BaseScanner(ABC):
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
-                why="Large files may consume excessive memory or processing time. Consider whether this file size is expected for your use case.",
+                why="Large files may consume excessive memory or processing time. Consider whether this file "
+                "size is expected for your use case.",
             )
             result.finish(success=False)
             return result

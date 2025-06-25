@@ -78,7 +78,9 @@ class TestJoblibScannerSecurity:
         assert result.success is False
         # Should be caught by either decompressed size limit or compression ratio
         security_issues = [
-            issue for issue in result.issues if ("decompressed size too large" in issue.message.lower() or "compression ratio" in issue.message.lower())
+            issue
+            for issue in result.issues
+            if ("decompressed size too large" in issue.message.lower() or "compression ratio" in issue.message.lower())
         ]
         assert len(security_issues) > 0
 

@@ -210,7 +210,11 @@ def find_sharded_files(directory: str) -> list[str]:
     """
     dir_path = Path(directory)
     return sorted(
-        [str(dir_path / fname) for fname in dir_path.iterdir() if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)],
+        [
+            str(dir_path / fname)
+            for fname in dir_path.iterdir()
+            if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
+        ],
     )
 
 

@@ -43,7 +43,11 @@ def test_manifest_scanner_json():
         assert result.success is True
 
         # Check that suspicious keys were detected
-        suspicious_keys = [issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details") and "key" in issue.details]
+        suspicious_keys = [
+            issue.details.get("key", "")
+            for issue in result.issues
+            if hasattr(issue, "details") and "key" in issue.details
+        ]
         assert any("file_path" in key for key in suspicious_keys)
         assert any("api_key" in key for key in suspicious_keys)
 
@@ -80,12 +84,16 @@ def test_manifest_scanner_blacklist():
         assert result.success is True
 
         # Check that blacklisted term was detected
-        blacklist_issues = [issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message]
+        blacklist_issues = [
+            issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message
+        ]
         assert len(blacklist_issues) > 0
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in blacklist_issues)
 
         # Verify the specific blacklisted term was identified
-        blacklisted_terms = [issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")]
+        blacklisted_terms = [
+            issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")
+        ]
         assert "unsafe" in blacklisted_terms
 
     finally:
@@ -111,7 +119,9 @@ def test_manifest_scanner_case_insensitive_blacklist():
         result = scanner.scan(test_file)
 
         # Check that the mixed-case term was detected
-        blacklist_issues = [issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message]
+        blacklist_issues = [
+            issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message
+        ]
         assert len(blacklist_issues) > 0
 
     finally:
@@ -214,7 +224,9 @@ def test_huggingface_name_or_path_pattern():
 
         # Check that _name_or_path was not flagged as suspicious
         suspicious_issues = [
-            issue for issue in result.issues if hasattr(issue, "message") and "suspicious" in issue.message.lower() and "_name_or_path" in issue.message
+            issue
+            for issue in result.issues
+            if hasattr(issue, "message") and "suspicious" in issue.message.lower() and "_name_or_path" in issue.message
         ]
         assert len(suspicious_issues) == 0, "HuggingFace _name_or_path should not be flagged"
 
@@ -222,7 +234,9 @@ def test_huggingface_name_or_path_pattern():
         file_access_issues = [
             issue
             for issue in result.issues
-            if hasattr(issue, "details") and issue.details.get("categories") == ["file_access"] and "_name_or_path" in issue.details.get("key", "")
+            if hasattr(issue, "details")
+            and issue.details.get("categories") == ["file_access"]
+            and "_name_or_path" in issue.details.get("key", "")
         ]
         assert len(file_access_issues) == 0, "_name_or_path should not be flagged as file access"
 
@@ -277,7 +291,11 @@ def test_huggingface_patterns_ignored_in_context():
         assert len(huggingface_issues) == 0, "HuggingFace patterns should be ignored"
 
         # But genuine suspicious patterns should still be flagged
-        suspicious_issues = [issue for issue in result.issues if hasattr(issue, "details") and "api_endpoint" in issue.details.get("key", "")]
+        suspicious_issues = [
+            issue
+            for issue in result.issues
+            if hasattr(issue, "details") and "api_endpoint" in issue.details.get("key", "")
+        ]
         assert len(suspicious_issues) > 0, "Real suspicious patterns should still be detected"
 
     finally:
@@ -333,7 +351,9 @@ def test_tokenizer_config_patterns():
         assert len(tokenizer_issues) == 0, "Tokenizer patterns should be ignored"
 
         # But credentials should still be flagged
-        credential_issues = [issue for issue in result.issues if hasattr(issue, "details") and "api_key" in issue.details.get("key", "")]
+        credential_issues = [
+            issue for issue in result.issues if hasattr(issue, "details") and "api_key" in issue.details.get("key", "")
+        ]
         assert len(credential_issues) > 0, "Real credential patterns should be detected"
 
     finally:
@@ -373,7 +393,10 @@ def test_ml_context_detection():
         ml_pattern_issues = [
             issue
             for issue in result.issues
-            if hasattr(issue, "details") and any(pattern in issue.details.get("key", "") for pattern in ["model_input_names", "hidden_", "attention_"])
+            if hasattr(issue, "details")
+            and any(
+                pattern in issue.details.get("key", "") for pattern in ["model_input_names", "hidden_", "attention_"]
+            )
         ]
         assert len(ml_pattern_issues) == 0, "ML patterns should be ignored in ML context"
 

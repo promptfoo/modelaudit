@@ -144,7 +144,10 @@ def test_flax_msgpack_corrupted(tmp_path):
 
     assert result.has_errors
     critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
-    assert any("Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message for issue in critical_issues)
+    assert any(
+        "Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message
+        for issue in critical_issues
+    )
 
 
 def test_flax_msgpack_trailing_data(tmp_path):

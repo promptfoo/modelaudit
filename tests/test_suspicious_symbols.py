@@ -40,9 +40,9 @@ class TestSuspiciousGlobals:
         critical_modules = ["os", "subprocess", "sys", "eval", "exec"]
 
         for module in critical_modules:
-            assert module in SUSPICIOUS_GLOBALS or any(module in funcs for funcs in SUSPICIOUS_GLOBALS.values() if isinstance(funcs, list)), (
-                f"Critical module {module} not found in suspicious patterns"
-            )
+            assert module in SUSPICIOUS_GLOBALS or any(
+                module in funcs for funcs in SUSPICIOUS_GLOBALS.values() if isinstance(funcs, list)
+            ), f"Critical module {module} not found in suspicious patterns"
 
     def test_builtins_functions(self) -> None:
         """Test that dangerous builtin functions are flagged."""

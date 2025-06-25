@@ -49,7 +49,11 @@ class TestCLILicenseIntegration:
         assert output_data["bytes_scanned"] > 0
 
         # Should not have critical license issues
-        critical_issues = [issue for issue in output_data.get("issues", []) if issue.get("severity") == "critical" and issue.get("type") == "license_warning"]
+        critical_issues = [
+            issue
+            for issue in output_data.get("issues", [])
+            if issue.get("severity") == "critical" and issue.get("type") == "license_warning"
+        ]
         assert len(critical_issues) == 0, "MIT model should not have critical license issues"
 
     def test_cli_agpl_component_warnings(self, test_data_dir, cli_command):
@@ -101,7 +105,9 @@ class TestCLILicenseIntegration:
 
         # Should have dataset license warnings
         dataset_issues = [
-            issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
+            issue
+            for issue in output_data.get("issues", [])
+            if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
         ]
         assert len(dataset_issues) > 0, "Should warn about unlicensed datasets"
 
@@ -137,7 +143,9 @@ class TestCLILicenseIntegration:
             assert len(components) > 0, "SBOM should contain components"
 
             # Components should have properties
-            has_properties = any("properties" in component and len(component["properties"]) > 0 for component in components)
+            has_properties = any(
+                "properties" in component and len(component["properties"]) > 0 for component in components
+            )
             assert has_properties, "Components should have license-related properties"
 
         finally:
@@ -161,7 +169,9 @@ class TestCLILicenseIntegration:
 
         # Check for license-related content in output
         output_text = result.stdout + result.stderr
-        assert "license" in output_text.lower() or "agpl" in output_text.lower(), "Verbose output should mention license-related information"
+        assert "license" in output_text.lower() or "agpl" in output_text.lower(), (
+            "Verbose output should mention license-related information"
+        )
 
     def test_cli_mixed_licenses_comprehensive(self, test_data_dir, cli_command):
         """Test CLI scanning of mixed license directory."""
@@ -281,7 +291,9 @@ class TestCLILicenseIntegration:
             assert output_data["files_scanned"] > 5, "Should scan many files in comprehensive test"
 
             # Should have various license warnings
-            license_issues = [issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning"]
+            license_issues = [
+                issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning"
+            ]
 
             # Should detect different types of license issues
             issue_types = set()

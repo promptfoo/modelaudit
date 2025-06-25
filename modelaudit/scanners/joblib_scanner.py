@@ -60,7 +60,8 @@ class JoblibScanner(BaseScanner):
             ratio = len(decompressed) / compressed_size
             if ratio > self.max_decompression_ratio:
                 raise ValueError(
-                    f"Suspicious compression ratio: {ratio:.1f}x (max: {self.max_decompression_ratio}x) - possible compression bomb",
+                    f"Suspicious compression ratio: {ratio:.1f}x (max: {self.max_decompression_ratio}x) - "
+                    f"possible compression bomb"
                 )
 
         # Check absolute decompressed size

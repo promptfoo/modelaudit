@@ -96,7 +96,8 @@ class PmmlScanner(BaseScanner):
                     "Non UTF-8 characters in PMML file",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate corruption or malicious content.",
+                    why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate "
+                    "corruption or malicious content.",
                 )
             except Exception as e:
                 result.add_issue(
@@ -121,7 +122,8 @@ class PmmlScanner(BaseScanner):
                     "Using unsafe XML parser - defusedxml not available",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. Install defusedxml for better security.",
+                    why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. "
+                    "Install defusedxml for better security.",
                 )
                 root = UnsafeET.fromstring(text)
         except Exception as e:
@@ -130,7 +132,10 @@ class PmmlScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
-                why="The file contains malformed XML that cannot be parsed. This may indicate corruption or malicious content.",
+                why=(
+                    "The file contains malformed XML that cannot be parsed. This may indicate corruption "
+                    "or malicious content."
+                ),
             )
             result.finish(success=False)
             return result
@@ -207,7 +212,10 @@ class PmmlScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"tag": elem.tag, "url_pattern": url_pattern},
-                        why="External references in PMML files may be used to exfiltrate data or perform network requests.",
+                        why=(
+                            "External references in PMML files may be used to exfiltrate data or perform "
+                            "network requests."
+                        ),
                     )
                     break
 
@@ -230,7 +238,10 @@ class PmmlScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={"tag": elem.tag, "pattern": pattern},
-                            why="Extension elements can contain arbitrary content and may be used to embed malicious code or scripts.",
+                            why=(
+                                "Extension elements can contain arbitrary content and may be used to embed "
+                                "malicious code or scripts."
+                            ),
                         )
                         break
 

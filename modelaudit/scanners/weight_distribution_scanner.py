@@ -332,7 +332,9 @@ class WeightDistributionScanner(BaseScanner):
 
         # If no clear final layer found, analyze all 2D weight matrices
         if not final_layer_candidates:
-            final_layer_candidates = {name: weights for name, weights in weights_info.items() if len(weights.shape) == 2}
+            final_layer_candidates = {
+                name: weights for name, weights in weights_info.items() if len(weights.shape) == 2
+            }
 
         # Analyze each candidate layer
         for layer_name, weights in final_layer_candidates.items():
@@ -401,7 +403,8 @@ class WeightDistributionScanner(BaseScanner):
             if len(outlier_indices) > 0 and outlier_percentage < outlier_percentage_threshold:
                 anomalies.append(
                     {
-                        "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with abnormal weight magnitudes",
+                        "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with "
+                        f"abnormal weight magnitudes",
                         "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
@@ -414,8 +417,9 @@ class WeightDistributionScanner(BaseScanner):
                             "std_norm": float(np.std(output_norms)),
                         },
                         "why": (
-                            "Neurons with weight magnitudes significantly different from others in the same layer may indicate "
-                            "tampering, backdoors, or training anomalies. These outliers are flagged when their statistical z-score exceeds the threshold."
+                            "Neurons with weight magnitudes significantly different from others in the same layer may "
+                            "indicate tampering, backdoors, or training anomalies. These outliers are flagged when "
+                            "their statistical z-score exceeds the threshold."
                         ),
                     },
                 )
@@ -444,7 +448,8 @@ class WeightDistributionScanner(BaseScanner):
                 for neuron_idx, max_sim in dissimilar_neurons:
                     anomalies.append(
                         {
-                            "description": f"Layer '{layer_name}' output neuron {neuron_idx} has unusually dissimilar weights",
+                            "description": f"Layer '{layer_name}' output neuron {neuron_idx} has unusually "
+                            f"dissimilar weights",
                             "severity": IssueSeverity.INFO,
                             "details": {
                                 "layer": layer_name,
@@ -454,9 +459,9 @@ class WeightDistributionScanner(BaseScanner):
                                 "total_outputs": n_outputs,
                             },
                             "why": (
-                                "Neurons with weight patterns completely unlike others in the same layer are uncommon in standard training. "
-                                "This dissimilarity (measured by cosine similarity below threshold) may indicate injected "
-                                "functionality or training irregularities."
+                                "Neurons with weight patterns completely unlike others in the same layer are "
+                                "uncommon in standard training. This dissimilarity (measured by cosine similarity "
+                                "below threshold) may indicate injected functionality or training irregularities."
                             ),
                         },
                     )
@@ -487,8 +492,9 @@ class WeightDistributionScanner(BaseScanner):
                             "total_outputs": n_outputs,
                         },
                         "why": (
-                            "Weight values that are orders of magnitude larger than typical can cause numerical instability, overflow attacks, "
-                            "or may encode hidden data. The threshold is set at 100 times the mean magnitude."
+                            "Weight values that are orders of magnitude larger than typical can cause numerical "
+                            "instability, overflow attacks, or may encode hidden data. The threshold is set at "
+                            "100 times the mean magnitude."
                         ),
                     },
                 )

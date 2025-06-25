@@ -88,7 +88,10 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
 
     # Should have an error about invalid ZIP
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert any("invalid" in issue.message.lower() or "corrupt" in issue.message.lower() or "error" in issue.message.lower() for issue in result.issues)
+    assert any(
+        "invalid" in issue.message.lower() or "corrupt" in issue.message.lower() or "error" in issue.message.lower()
+        for issue in result.issues
+    )
 
 
 def test_pytorch_zip_scanner_missing_data_pkl(tmp_path):

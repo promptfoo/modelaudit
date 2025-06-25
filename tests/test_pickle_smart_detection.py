@@ -4,9 +4,6 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
-# Add the parent directory to sys.path to allow importing modelaudit
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
@@ -14,6 +11,9 @@ from modelaudit.scanners.pickle_scanner import (
     _is_actually_dangerous_global,
     _should_ignore_opcode_sequence,
 )
+
+# Add the parent directory to sys.path to allow importing modelaudit
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # Define test classes at module level to make them picklable
@@ -311,7 +311,9 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertTrue(len(result.issues) > 0, "Should detect malicious pickle")
 
             # Should have at least one ERROR or WARNING
-            high_severity_issues = [issue for issue in result.issues if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]]
+            high_severity_issues = [
+                issue for issue in result.issues if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
+            ]
             self.assertTrue(
                 len(high_severity_issues) > 0,
                 "Should flag malicious content with high severity",

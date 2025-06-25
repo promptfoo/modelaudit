@@ -91,7 +91,11 @@ def test_pickle_scanner_includes_why():
         assert len(issues_with_why) > 0
 
         # Check that at least one issue mentions 'os' or 'posix' and has an explanation
-        system_issues = [issue for issue in result.issues if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None]
+        system_issues = [
+            issue
+            for issue in result.issues
+            if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None
+        ]
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system

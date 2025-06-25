@@ -301,7 +301,9 @@ def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
     result = GgufScanner().scan(str(path))
 
     # Should detect the DoS attempt
-    assert any("excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert any(
+        "excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues
+    )
 
     # Should mention skipping for security
     assert any("skipping for security" in i.message.lower() for i in result.issues)
