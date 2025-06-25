@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
 import click
 from rich import box
@@ -27,7 +27,7 @@ logger = logging.getLogger("modelaudit")
 
 @click.group()
 @click.version_option(__version__)
-def cli():
+def cli() -> None:
     """Static scanner for ML models"""
     pass
 
@@ -79,16 +79,16 @@ def cli():
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
 def scan_command(
-    paths,
-    blacklist,
-    format,
-    output,
-    sbom,
-    timeout,
-    verbose,
-    max_file_size,
-    max_total_size,
-):
+    paths: tuple[str, ...],
+    blacklist: tuple[str, ...],
+    format: str,
+    output: Optional[str],
+    sbom: Optional[str],
+    timeout: int,
+    verbose: bool,
+    max_file_size: int,
+    max_total_size: int,
+) -> None:
     """Scan files or directories for malicious content.
 
     \b
@@ -117,23 +117,50 @@ def scan_command(
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
-        header = [
-            "─" * 80,
-            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
-            click.style(
-                "Scanning for potential security issues in ML model files",
-                fg="cyan",
-            ),
-            "─" * 80,
-        ]
-        click.echo("\n".join(header))
-        click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
+        # Create a stylish header
+        click.echo("")
+        click.echo("╔" + "═" * 78 + "╗")
+        click.echo("║" + " " * 78 + "║")
+
+        # Title with icon
+        title = "🔐 ModelAudit Security Scanner"
+        title_styled = click.style(title, fg="blue", bold=True)
+        padding = (78 - len(title)) // 2
+        click.echo(
+            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║"
+        )
+
+        # Subtitle
+        subtitle = "Scanning for potential security issues in ML model files"
+        subtitle_styled = click.style(subtitle, fg="cyan")
+        padding = (78 - len(subtitle)) // 2
+        click.echo(
+            "║"
+            + " " * padding
+            + subtitle_styled
+            + " " * (78 - padding - len(subtitle))
+            + "║"
+        )
+
+        click.echo("║" + " " * 78 + "║")
+        click.echo("╚" + "═" * 78 + "╝")
+        click.echo("")
+
+        # Scan configuration
+        click.echo(click.style("🎯 TARGET FILES", fg="white", bold=True))
+        click.echo("─" * 40)
+        for path in paths:
+            click.echo(f"  📄 {click.style(path, fg='green')}")
+
         if blacklist:
-            click.echo(
-                f"Additional blacklist patterns: "
-                f"{click.style(', '.join(blacklist), fg='yellow')}",
-            )
-        click.echo("─" * 80)
+            click.echo("")
+            click.echo(click.style("🚫 BLACKLIST PATTERNS", fg="white", bold=True))
+            click.echo("─" * 40)
+            for pattern in blacklist:
+                click.echo(f"  • {click.style(pattern, fg='yellow')}")
+
+        click.echo("")
+        click.echo("═" * 80)
         click.echo("")
 
     # Set logging level based on verbosity
@@ -141,7 +168,7 @@ def scan_command(
         logger.setLevel(logging.DEBUG)
 
     # Aggregated results
-    aggregated_results = {
+    aggregated_results: dict[str, Any] = {
         "scanner_names": [],  # Track all scanner names used
         "start_time": time.time(),
         "bytes_scanned": 0,
@@ -233,24 +260,39 @@ def scan_command(
                     issue_count = len(visible_issues)
                     spinner.text = f"Scanned {click.style(path, fg='cyan')}"
                     if issue_count > 0:
-                        spinner.ok(
-                            click.style(
-                                f"✓ Found {issue_count} issues!",
-                                fg="yellow",
-                                bold=True,
-                            ),
+                        # Determine severity for coloring
+                        has_critical = any(
+                            issue.get("severity") == "critical"
+                            for issue in visible_issues
+                            if isinstance(issue, dict)
                         )
+                        if has_critical:
+                            spinner.fail(
+                                click.style(
+                                    f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                    fg="red",
+                                    bold=True,
+                                ),
+                            )
+                        else:
+                            spinner.ok(
+                                click.style(
+                                    f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                    fg="yellow",
+                                    bold=True,
+                                ),
+                            )
                     else:
-                        spinner.ok(click.style("✓", fg="green", bold=True))
+                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
                 else:
                     spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    spinner.ok(click.style("✓", fg="green", bold=True))
+                    spinner.ok(click.style("✅ Clean", fg="green", bold=True))
 
         except Exception as e:
             # Show error if in text mode and not writing to a file
             if spinner:
                 spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                spinner.fail(click.style("✗", fg="red", bold=True))
+                spinner.fail(click.style("❌ Error", fg="red", bold=True))
 
             logger.error(f"Error during scan of {path}: {str(e)}", exc_info=verbose)
             click.echo(f"Error scanning {path}: {str(e)}", err=True)
@@ -295,22 +337,28 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text using Rich."""
     console = Console(file=io.StringIO(), record=True)
 
-    summary = Table(show_header=False, box=box.SIMPLE)
+    # Add scan summary header with emoji
+    console.print("\n📊 [bold white]SCAN SUMMARY[/bold white]")
+    console.print("─" * 60)
+
+    # Create summary table
+    summary = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
 
     scanners = results.get("scanner_names")
     if scanners:
-        label = "Active Scanner" if len(scanners) == 1 else "Active Scanners"
-        summary.add_row(label, ", ".join(scanners))
+        label = "🔍 Active Scanner" if len(scanners) == 1 else "🔍 Active Scanners"
+        summary.add_row(label, "[blue]" + ", ".join(scanners) + "[/blue]")
 
     duration = results.get("duration")
     if duration is not None:
         if duration < 0.01:
-            summary.add_row("Duration", f"{duration:.3f} seconds")
+            duration_str = f"{duration:.3f}s"
         else:
-            summary.add_row("Duration", f"{duration:.2f} seconds")
+            duration_str = f"{duration:.2f}s"
+        summary.add_row("⏱️  Duration", f"[cyan]{duration_str}[/cyan]")
 
     if "files_scanned" in results:
-        summary.add_row("Files scanned", str(results["files_scanned"]))
+        summary.add_row("📁 Files scanned", f"[cyan]{results['files_scanned']}[/cyan]")
 
     if "bytes_scanned" in results:
         bytes_scanned = results["bytes_scanned"]
@@ -322,10 +370,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             size_str = f"{bytes_scanned / 1024:.2f} KB"
         else:
             size_str = f"{bytes_scanned} bytes"
-        summary.add_row("Scanned", size_str)
+        summary.add_row("💾 Data scanned", f"[cyan]{size_str}[/cyan]")
 
     console.print(summary)
 
+    # Add security findings section
     issues = results.get("issues", [])
     visible_issues = [
         issue
@@ -333,114 +382,205 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
     ]
 
+    # Count issues by severity
+    severity_counts = {
+        "critical": 0,
+        "warning": 0,
+        "info": 0,
+        "debug": 0,
+    }
+
+    for issue in issues:
+        if isinstance(issue, dict):
+            severity = issue.get("severity", "warning")
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+
+    console.print("\n🔍 [bold white]SECURITY FINDINGS[/bold white]")
+    console.print("─" * 60)
+
     if visible_issues:
-        error_count = sum(
-            1
+        # Show issue counts with rich formatting
+        count_table = Table(show_header=False, box=None, padding=(0, 2))
+        
+        if severity_counts["critical"] > 0:
+            count_table.add_row(
+                "🚨",
+                f"[bold red]{severity_counts['critical']} Critical[/bold red]"
+            )
+        if severity_counts["warning"] > 0:
+            count_table.add_row(
+                "⚠️",
+                f"[yellow]{severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}[/yellow]"
+            )
+        if severity_counts["info"] > 0:
+            count_table.add_row(
+                "ℹ️",
+                f"[blue]{severity_counts['info']} Info[/blue]"
+            )
+        if verbose and severity_counts["debug"] > 0:
+            count_table.add_row(
+                "🐛",
+                f"[cyan]{severity_counts['debug']} Debug[/cyan]"
+            )
+            
+        console.print(count_table)
+        console.print()
+
+        # Group and display issues by severity
+        critical_issues = [
+            issue
             for issue in visible_issues
             if isinstance(issue, dict) and issue.get("severity") == "critical"
-        )
-        warning_count = sum(
-            1
+        ]
+        if critical_issues:
+            console.print("🚨 [bold red]Critical Issues[/bold red]")
+            console.print("─" * 40)
+            for issue in critical_issues:
+                _format_issue_rich(console, issue, "critical")
+            console.print()
+
+        warning_issues = [
+            issue
             for issue in visible_issues
             if isinstance(issue, dict) and issue.get("severity") == "warning"
-        )
-        info_count = sum(
-            1
+        ]
+        if warning_issues:
+            if critical_issues:
+                console.print()
+            console.print("⚠️  [bold yellow]Warnings[/bold yellow]")
+            console.print("─" * 40)
+            for issue in warning_issues:
+                _format_issue_rich(console, issue, "warning")
+            console.print()
+
+        info_issues = [
+            issue
             for issue in visible_issues
             if isinstance(issue, dict) and issue.get("severity") == "info"
-        )
-        debug_count = sum(
-            1
-            for issue in issues
-            if isinstance(issue, dict) and issue.get("severity") == "debug"
-        )
+        ]
+        if info_issues:
+            if critical_issues or warning_issues:
+                console.print()
+            console.print("ℹ️  [bold blue]Information[/bold blue]")
+            console.print("─" * 40)
+            for issue in info_issues:
+                _format_issue_rich(console, issue, "info")
+            console.print()
 
-        summary_parts = []
-        if error_count:
-            summary_parts.append(f"[red bold]{error_count} critical[/]")
-        if warning_count:
-            summary_parts.append(f"[yellow]{warning_count} warnings[/]")
-        if info_count:
-            summary_parts.append(f"[blue]{info_count} info[/]")
-        if verbose and debug_count:
-            summary_parts.append(f"[cyan]{debug_count} debug[/]")
-        if summary_parts:
-            console.print("Issues found: " + ", ".join(summary_parts))
+        if verbose:
+            debug_issues = [
+                issue
+                for issue in issues
+                if isinstance(issue, dict) and issue.get("severity") == "debug"
+            ]
+            if debug_issues:
+                console.print("🐛 [bold cyan]Debug Information[/bold cyan]")
+                console.print("─" * 40)
+                for issue in debug_issues:
+                    _format_issue_rich(console, issue, "debug")
+                console.print()
 
-        issue_table = Table(box=box.SIMPLE)
-        issue_table.add_column("#", style="bold")
-        issue_table.add_column("Severity")
-        issue_table.add_column("Location")
-        issue_table.add_column("Message")
-
-        for i, issue in enumerate(visible_issues, 1):
-            severity = issue.get("severity", "warning").lower()
-            if severity == "critical":
-                severity_text = "[bold red]CRITICAL[/]"
-            elif severity == "warning":
-                severity_text = "[yellow]WARNING[/]"
-            elif severity == "info":
-                severity_text = "[blue]INFO[/]"
-            else:
-                severity_text = "[cyan]DEBUG[/]"
-
-            location = issue.get("location", "")
-            message = issue.get("message", "Unknown issue")
-
-            issue_table.add_row(str(i), severity_text, location, message)
-
-            why = issue.get("why")
-            if why:
-                issue_table.add_row("", "", "", f"[magenta]Why:[/] {why}")
-
-        console.print(issue_table)
     else:
-        console.print("[bold green]✓ No issues found")
+        console.print("✅ [bold green]No security issues found[/bold green]")
 
-    assets = results.get("assets", [])
-    if assets:
-        tree = Tree("Assets encountered:")
+    # Asset inventory (keep existing Rich tree implementation)
+    if "assets" in results and results["assets"]:
+        console.print("\n📦 [bold white]ASSET INVENTORY[/bold white]")
+        console.print("─" * 60)
+
+        # Group assets by scanner type
+        assets_by_scanner: dict[str, list[dict[str, Any]]] = {}
+        for asset in results["assets"]:
+            scanner = asset.get("scanner", "unknown")
+            if scanner not in assets_by_scanner:
+                assets_by_scanner[scanner] = []
+            assets_by_scanner[scanner].append(asset)
+
+        # Create tree structure
+        tree = Tree("📦 [bold]Discovered Assets[/bold]")
 
         def add_assets(node: Tree, items: list[dict[str, Any]]):
-            for asset in items:
-                label = asset.get("path", "")
-                if asset.get("type"):
-                    label += f" ({asset['type']})"
-                if asset.get("size"):
-                    label += f" [{asset['size']} bytes]"
-                child = node.add(label)
-                if asset.get("tensors"):
-                    child.add("Tensors: " + ", ".join(asset["tensors"]))
-                if asset.get("keys"):
-                    child.add("Keys: " + ", ".join(map(str, asset["keys"])))
-                if asset.get("contents"):
-                    add_assets(child, asset["contents"])
+            for asset in items[:10]:  # Limit to first 10 per scanner
+                asset_name = asset.get("path", "Unknown")
+                asset_type = asset.get("type", "unknown")
+                asset_size = asset.get("size")
 
-        add_assets(tree, assets)
+                # Format the asset entry
+                if asset_size:
+                    if asset_size >= 1024 * 1024:
+                        size_str = f"{asset_size / (1024 * 1024):.1f}MB"
+                    elif asset_size >= 1024:
+                        size_str = f"{asset_size / 1024:.1f}KB"
+                    else:
+                        size_str = f"{asset_size}B"
+                    asset_info = f"[cyan]{asset_name}[/cyan] ([dim]{asset_type}, {size_str}[/dim])"
+                else:
+                    asset_info = f"[cyan]{asset_name}[/cyan] ([dim]{asset_type}[/dim])"
+
+                node.add(asset_info)
+
+            if len(items) > 10:
+                node.add(f"[dim]... and {len(items) - 10} more[/dim]")
+
+        for scanner, assets in assets_by_scanner.items():
+            scanner_node = tree.add(f"🔍 [blue]{scanner}[/blue] ({len(assets)} assets)")
+            add_assets(scanner_node, assets)
+
         console.print(tree)
 
-    console.rule()
-
+    # Final status
+    console.print("\n" + "─" * 80)
     if visible_issues:
         if any(
             isinstance(issue, dict) and issue.get("severity") == "critical"
             for issue in visible_issues
         ):
-            status = "[bold red]✗ Scan completed with findings[/]"
+            console.print("[bold red]✗ Scan completed with critical findings[/bold red]")
         elif any(
             isinstance(issue, dict) and issue.get("severity") == "warning"
             for issue in visible_issues
         ):
-            status = "[bold yellow]⚠ Scan completed with warnings[/]"
+            console.print("[bold yellow]⚠ Scan completed with warnings[/bold yellow]")
         else:
-            status = "[bold green]✓ Scan completed successfully[/]"
+            console.print("[bold green]✓ Scan completed successfully[/bold green]")
     else:
-        status = "[bold green]✓ Scan completed successfully[/]"
-
-    console.print(status)
+        console.print("[bold green]✓ Scan completed successfully[/bold green]")
 
     return console.export_text()
 
 
-def main():
+def _format_issue_rich(console: Console, issue: dict[str, Any], severity: str) -> None:
+    """Format a single issue using Rich."""
+    message = issue.get("message", "Unknown issue")
+    location = issue.get("location", "")
+    
+    # Color coding by severity
+    severity_colors = {
+        "critical": "red",
+        "warning": "yellow",
+        "info": "blue",
+        "debug": "cyan"
+    }
+    color = severity_colors.get(severity, "white")
+    
+    if location:
+        console.print(f"  📍 [bold {color}]{location}[/bold {color}]")
+        console.print(f"     {message}")
+    else:
+        console.print(f"  • [{color}]{message}[/{color}]")
+    
+    # Add "Why" explanation if available
+    why = issue.get("why")
+    if why:
+        console.print(f"     [dim]💡 {why}[/dim]")
+    
+    console.print()
+
+
+def main() -> None:
     cli()
+
+
+if __name__ == "__main__":
+    main()
