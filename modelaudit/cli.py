@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
 import click
 from yaspin import yaspin
@@ -22,7 +22,7 @@ logger = logging.getLogger("modelaudit")
 
 @click.group()
 @click.version_option(__version__)
-def cli():
+def cli() -> None:
     """Static scanner for ML models"""
     pass
 
@@ -74,16 +74,16 @@ def cli():
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
 def scan_command(
-    paths,
-    blacklist,
-    format,
-    output,
-    sbom,
-    timeout,
-    verbose,
-    max_file_size,
-    max_total_size,
-):
+    paths: tuple[str, ...],
+    blacklist: tuple[str, ...],
+    format: str,
+    output: Optional[str],
+    sbom: Optional[str],
+    timeout: int,
+    verbose: bool,
+    max_file_size: int,
+    max_total_size: int,
+) -> None:
     """Scan files or directories for malicious content.
 
     \b
@@ -163,7 +163,7 @@ def scan_command(
         logger.setLevel(logging.DEBUG)
 
     # Aggregated results
-    aggregated_results = {
+    aggregated_results: dict[str, Any] = {
         "scanner_names": [],  # Track all scanner names used
         "start_time": time.time(),
         "bytes_scanned": 0,
@@ -623,5 +623,5 @@ def _format_issue(
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
-def main():
+def main() -> None:
     cli()
