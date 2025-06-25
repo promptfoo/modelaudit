@@ -122,6 +122,7 @@ def test_cli_output_format_includes_why():
         "files_scanned": 1,
         "bytes_scanned": 1024,
         "scanner_names": ["test_scanner"],
+        "paths": ["test.pkl"],
         "issues": [
             {
                 "message": "Dangerous import: os.system",
@@ -135,8 +136,8 @@ def test_cli_output_format_includes_why():
     # Format the output
     output = format_text_output(test_results)
 
-    # Check that the output includes the "Why:" label
-    assert "Why:" in output
+    # Check that the output includes the explanation (with 💡 emoji instead of "Why:")
+    assert "💡" in output
 
     # Check for the explanation text, accounting for line wrapping
     # Remove ANSI codes and normalize whitespace

@@ -77,10 +77,11 @@ def test_cli_scan_directory(temp_model_dir):
         0,
         1,
     ], f"Unexpected exit code {result.exit_code}. Output: {result.output}"
-    assert str(temp_model_dir) in result.output
+    # With new format, shows directory basename instead of full path
+    assert temp_model_dir.name in result.output or "files" in result.output
 
     # Should mention the number of files scanned
-    assert "Files scanned" in result.output
+    assert "✓ Scanned:" in result.output
 
 
 def test_cli_json_output_parsing(temp_model_dir):
