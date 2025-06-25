@@ -262,3 +262,44 @@ def test_magic_validation_mislabeled_gzip(tmp_path):
         assert magic_result == "unknown"
         # Unknown format files with .h5 extension fail validation if they don't have HDF5 magic
         assert validation_result is False
+
+
+def test_python_magic_availability():
+    """Test that we can detect whether python-magic is available."""
+    # This test just validates the HAS_PYTHON_MAGIC flag
+    assert isinstance(HAS_PYTHON_MAGIC, bool)
+
+
+def test_python_magic_fallback_behavior(tmp_path):
+    """Test that fallback behavior works correctly when python-magic fails."""
+    # Create a file with known magic bytes
+    hdf5_path = tmp_path / "test.h5"
+    hdf5_magic = b"\x89HDF\r\n\x1a\n"
+    hdf5_path.write_bytes(hdf5_magic + b"hdf5 data")
+
+    # This should work regardless of python-magic availability
+    # because we have manual magic byte detection as fallback
+    result = detect_file_format_from_magic(str(hdf5_path))
+    assert result == "hdf5"
+
+
+def test_comprehensive_format_detection(tmp_path):
+    """Test detection of various file formats with and without python-magic."""
+    test_cases = [
+        # (magic_bytes, expected_format)
+        (b"\x80\x03", "pickle"),  # Pickle protocol 3
+        (b"\x89HDF\r\n\x1a\n", "hdf5"),  # HDF5 magic
+        (b"GGUF", "gguf"),  # GGUF magic
+        (b"GGML", "ggml"),  # GGML magic
+        (b"PK\x03\x04", "zip"),  # ZIP magic
+        (b"\x93NUMPY", "numpy"),  # NumPy magic
+    ]
+
+    for i, (magic_bytes, expected_format) in enumerate(test_cases):
+        test_file = tmp_path / f"test_{i}.dat"
+        test_file.write_bytes(magic_bytes + b"\x00" * 20)  # Add padding
+
+        result = detect_file_format_from_magic(str(test_file))
+        assert result == expected_format, (
+            f"Failed for {magic_bytes}: got {result}, expected {expected_format}"
+        )

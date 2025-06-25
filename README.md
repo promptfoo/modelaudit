@@ -102,6 +102,11 @@ pip install modelaudit[joblib]
 # For Flax msgpack scanning
 pip install modelaudit[flax]
 
+# For enhanced file type detection (requires system libmagic)
+# On macOS: brew install libmagic
+# On Ubuntu/Debian: apt-get install libmagic1
+pip install modelaudit[magic]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -187,7 +192,7 @@ Issues found: 2 critical, 1 warnings
 ### Core Capabilities
 
 - **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
-- **Automatic Format Detection**: Identifies model formats automatically using `python-magic` for high accuracy
+- **Automatic Format Detection**: Identifies model formats automatically using `python-magic` for high accuracy (when available)
 - **Deep Security Analysis**: Examines model internals, not just metadata
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently

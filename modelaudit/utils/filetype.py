@@ -29,14 +29,28 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
 
 
 MIME_FORMAT_MAP = {
+    # ZIP-like formats
     "application/zip": "zip",
     "application/x-zip": "zip",
-    "application/x-gzip": "zip",
+    "application/x-zip-compressed": "zip",
+    "application/x-gzip": "zip",  # Gzip files are often compressed archives
     "application/gzip": "zip",
+    # HDF5 formats
     "application/x-hdf": "hdf5",
     "application/x-hdf5": "hdf5",
+    "application/hdf5": "hdf5",
+    # Pickle formats
     "application/x-python-pickle": "pickle",
+    "application/x-pickle": "pickle",
+    "application/python-pickle": "pickle",
+    # ONNX formats
     "application/x-onnx": "onnx",
+    "application/onnx": "onnx",
+    # Protocol Buffer formats (used by TensorFlow, ONNX)
+    "application/x-protobuf": "protobuf",
+    "application/protobuf": "protobuf",
+    # Binary formats that could be model files
+    "application/octet-stream": None,  # Too generic, skip this one
 }
 
 
@@ -62,7 +76,7 @@ def detect_file_format_from_magic(path: str) -> str:
             if mime:
                 mime_lower = mime.lower()
                 for key, fmt in MIME_FORMAT_MAP.items():
-                    if mime_lower.startswith(key):
+                    if mime_lower.startswith(key) and fmt is not None:
                         return fmt
         except Exception:
             # Fall back to manual detection if python-magic fails

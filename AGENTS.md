@@ -257,6 +257,7 @@ The project uses optional dependencies for specific scanners:
 - `all`: All of the above dependencies
 
 Install specific extras as needed:
+
 ```bash
 # With pip
 pip install modelaudit[tensorflow,pytorch,h5]
