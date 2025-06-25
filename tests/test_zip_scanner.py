@@ -28,6 +28,48 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_symlink_outside_extraction_root(self):
+        """Symlinks resolving outside the extraction root should be flagged."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                import stat
+
+                info = zipfile.ZipInfo("link.txt")
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                z.writestr(info, "../evil.txt")
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            symlink_issues = [
+                i for i in result.issues if "symlink" in i.message.lower()
+            ]
+            assert any("outside" in i.message.lower() for i in symlink_issues)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_symlink_to_critical_path(self):
+        """Symlinks targeting critical system paths should be flagged."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                import stat
+
+                info = zipfile.ZipInfo("etc_passwd")
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                z.writestr(info, "/etc/passwd")
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            symlink_issues = [
+                i for i in result.issues if "symlink" in i.message.lower()
+            ]
+            assert any("critical system" in i.message.lower() for i in symlink_issues)
+        finally:
+            os.unlink(tmp_path)
+
     def test_zip_bytes_scanned_single_count(self):
         """Ensure bytes scanned equals the sum of embedded files once."""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
