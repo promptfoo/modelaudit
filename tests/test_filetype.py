@@ -1,6 +1,7 @@
 import zipfile
 
 from modelaudit.utils.filetype import (
+    HAS_PYTHON_MAGIC,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
@@ -222,23 +223,42 @@ def test_validate_file_type(tmp_path):
 
 
 def test_magic_detects_gzip(tmp_path):
-    """Ensure python-magic identifies gzip files correctly."""
+    """Ensure python-magic identifies gzip files correctly when available."""
     import gzip
 
     gz_path = tmp_path / "archive.gz"
     with gzip.open(gz_path, "wb") as f:
         f.write(b"hello")
 
-    assert detect_file_format_from_magic(str(gz_path)) == "zip"
+    result = detect_file_format_from_magic(str(gz_path))
+
+    if HAS_PYTHON_MAGIC:
+        # When python-magic is available, it should detect gzip as zip
+        assert result == "zip"
+    else:
+        # When python-magic is not available, it falls back to manual detection
+        # Gzip files don't have standard ZIP magic bytes, so they appear as unknown
+        assert result == "unknown"
 
 
 def test_magic_validation_mislabeled_gzip(tmp_path):
-    """Validate that gzip masquerading as HDF5 fails."""
+    """Validate that gzip masquerading as HDF5 is handled appropriately."""
     import gzip
 
     fake_h5 = tmp_path / "fake.h5"
     with gzip.open(fake_h5, "wb") as f:
         f.write(b"data")
 
-    assert detect_file_format_from_magic(str(fake_h5)) == "zip"
-    assert validate_file_type(str(fake_h5)) is False
+    magic_result = detect_file_format_from_magic(str(fake_h5))
+    validation_result = validate_file_type(str(fake_h5))
+
+    if HAS_PYTHON_MAGIC:
+        # When python-magic is available, it should detect gzip as zip
+        assert magic_result == "zip"
+        # A .h5 file that's actually gzip should fail validation
+        assert validation_result is False
+    else:
+        # When python-magic is not available, gzip files appear as unknown
+        assert magic_result == "unknown"
+        # Unknown format files with .h5 extension fail validation if they don't have HDF5 magic
+        assert validation_result is False

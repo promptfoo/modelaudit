@@ -135,6 +135,8 @@ pytest==8.4.1
     # via pytest-xdist
 pytest-cov==6.2.1
 pytest-xdist==3.7.0
+python-magic==0.4.27
+    # via modelaudit
 pyyaml==6.0.2
     # via modelaudit
 requests==2.32.4

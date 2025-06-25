@@ -113,6 +113,8 @@ py-serializable==2.0.0
     # via cyclonedx-python-lib
 pygments==2.19.1
     # via rich
+python-magic==0.4.27
+    # via modelaudit
 pyyaml==6.0.2
     # via modelaudit
 requests==2.32.4

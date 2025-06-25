@@ -1,7 +1,13 @@
 import re
 from pathlib import Path
 
-import magic  # type: ignore
+# Optional python-magic import for enhanced file type detection
+try:
+    import magic
+
+    HAS_PYTHON_MAGIC = True
+except ImportError:
+    HAS_PYTHON_MAGIC = False
 
 
 def is_zipfile(path: str) -> bool:
@@ -49,15 +55,18 @@ def detect_file_format_from_magic(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    try:
-        mime = magic.from_file(str(file_path), mime=True)
-        if mime:
-            mime_lower = mime.lower()
-            for key, fmt in MIME_FORMAT_MAP.items():
-                if mime_lower.startswith(key):
-                    return fmt
-    except Exception:
-        pass
+    # Try python-magic first if available
+    if HAS_PYTHON_MAGIC:
+        try:
+            mime = magic.from_file(str(file_path), mime=True)
+            if mime:
+                mime_lower = mime.lower()
+                for key, fmt in MIME_FORMAT_MAP.items():
+                    if mime_lower.startswith(key):
+                        return fmt
+        except Exception:
+            # Fall back to manual detection if python-magic fails
+            pass
 
     magic4 = read_magic_bytes(path, 4)
     magic8 = read_magic_bytes(path, 8)
