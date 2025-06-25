@@ -273,6 +273,51 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     return None
 
 
+def _looks_like_pickle(data: bytes) -> bool:
+    """Check if the given bytes resemble a pickle payload."""
+    import io
+
+    if not data:
+        return False
+
+    try:
+        stream = io.BytesIO(data)
+        for _, _a, _p in pickletools.genops(stream):
+            # If we can iterate at least one opcode without error, it's pickle-like
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
+    """Attempt to decode a string from common encodings."""
+    import base64
+    import binascii
+    import re
+
+    candidates: list[tuple[str, bytes]] = []
+
+    # Base64
+    try:
+        if len(s) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", s):
+            candidates.append(("base64", base64.b64decode(s)))
+    except Exception:
+        pass
+
+    # Hex encoded (\xAA style or plain hex)
+    try:
+        hex_str = s
+        if "\\x" in s:
+            hex_str = s.replace("\\x", "")
+        if re.fullmatch(r"[0-9a-fA-F]+", hex_str) and len(hex_str) % 2 == 0:
+            candidates.append(("hex", binascii.unhexlify(hex_str)))
+    except Exception:
+        pass
+
+    return candidates
+
+
 def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bool:
     """
     Determine if an opcode sequence should be ignored based on ML context.
@@ -538,6 +583,42 @@ def check_opcode_sequence(
             # Reset counter to avoid multiple alerts
             dangerous_opcode_count = 0
             max_consecutive = 0
+
+        parsed = None
+        if opcode.name == "GLOBAL" and isinstance(arg, str):
+            if " " in arg:
+                mod, func = arg.split(" ", 1)
+            elif "." in arg:
+                mod, func = arg.rsplit(".", 1)
+            else:
+                mod = func = ""
+            parsed = (mod, func)
+
+        if (
+            parsed
+            and parsed[0] in {"base64", "codecs", "binascii"}
+            and "decode" in parsed[1]
+        ):
+            for j in range(i + 1, min(i + 6, len(opcodes))):
+                op2, arg2, pos2 = opcodes[j]
+                if op2.name == "GLOBAL" and isinstance(arg2, str):
+                    if " " in arg2:
+                        m2, f2 = arg2.split(" ", 1)
+                    elif "." in arg2:
+                        m2, f2 = arg2.rsplit(".", 1)
+                    else:
+                        continue
+                    if (m2 == "pickle" and f2 in {"loads", "load"}) or (
+                        m2 == "builtins" and f2 in {"eval", "exec"}
+                    ):
+                        suspicious_patterns.append(
+                            {
+                                "pattern": "DECODE_EXEC_CHAIN",
+                                "modules": [f"{parsed[0]}.{parsed[1]}", f"{m2}.{f2}"],
+                                "position": pos,
+                            }
+                        )
+                        break
 
     return suspicious_patterns
 
@@ -860,6 +941,52 @@ class PickleScanner(BaseScanner):
                             if suspicious_pattern == "potential_base64"
                             else "This string contains patterns that match known security risks such as shell commands, code execution functions, or encoded data.",
                         )
+
+                # Detect nested pickle bytes
+                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(
+                    arg, (bytes, bytearray)
+                ):
+                    sample = bytes(arg[:1024])  # limit
+                    if _looks_like_pickle(sample):
+                        severity = _get_context_aware_severity(
+                            IssueSeverity.CRITICAL, ml_context
+                        )
+                        result.add_issue(
+                            "Nested pickle payload detected",
+                            severity=severity,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            details={
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "sample_size": len(sample),
+                            },
+                            why=get_pattern_explanation("nested_pickle"),
+                        )
+
+                # Detect encoded nested pickle strings
+                if opcode.name in [
+                    "STRING",
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                    "UNICODE",
+                ] and isinstance(arg, str):
+                    for enc, decoded in _decode_string_to_bytes(arg):
+                        if _looks_like_pickle(decoded[:1024]):
+                            severity = _get_context_aware_severity(
+                                IssueSeverity.CRITICAL, ml_context
+                            )
+                            result.add_issue(
+                                "Encoded pickle payload detected",
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "encoding": enc,
+                                    "decoded_size": len(decoded),
+                                },
+                                why=get_pattern_explanation("nested_pickle"),
+                            )
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
