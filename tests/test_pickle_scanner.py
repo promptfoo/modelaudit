@@ -5,26 +5,25 @@ from pathlib import Path
 
 import dill
 
-# Add the parent directory to sys.path to allow importing modelaudit
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from modelaudit.scanners.base import IssueSeverity  # noqa: E402
-
-# Import only what we need for the pickle scanner test
-from modelaudit.scanners.pickle_scanner import PickleScanner  # noqa: E402
+from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from tests.assets.generators.generate_evil_pickle import EvilClass  # noqa: E402
+from tests.assets.generators.generate_evil_pickle import EvilClass
+
+# Add the parent directory to sys.path to allow importing modelaudit
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+# Import only what we need for the pickle scanner test
 
 
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
-        self.evil_pickle_path = (
-            Path(__file__).parent / "assets/samples/pickles/evil.pickle"
-        )
+        self.evil_pickle_path = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
 
         # Create the evil pickle if it doesn't exist
         if not self.evil_pickle_path.exists():
@@ -60,15 +59,11 @@ class TestPickleScanner(unittest.TestCase):
                 has_os_system_detection = True
 
         assert has_reduce_detection, "Failed to detect REDUCE opcode"
-        assert has_os_system_detection, (
-            "Failed to detect os.system/posix.system reference"
-        )
+        assert has_os_system_detection, "Failed to detect os.system/posix.system reference"
 
     def test_scan_dill_pickle(self):
         """Scanner should flag suspicious dill references"""
-        dill_pickle_path = (
-            Path(__file__).parent / "assets/samples/pickles/dill_func.pkl"
-        )
+        dill_pickle_path = Path(__file__).parent / "assets/samples/pickles/dill_func.pkl"
         if not dill_pickle_path.exists():
 
             def func(x):
@@ -108,16 +103,8 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Add suspicious binary content
                 pattern_import = BINARY_CODE_PATTERNS[0]
-                pattern_eval = next(
-                    p for p in BINARY_CODE_PATTERNS if p.startswith(b"eval")
-                )
-                suspicious_content = (
-                    b"some_data"
-                    + pattern_import
-                    + b"more_data"
-                    + pattern_eval
-                    + b"end_data"
-                )
+                pattern_eval = next(p for p in BINARY_CODE_PATTERNS if p.startswith(b"eval"))
+                suspicious_content = b"some_data" + pattern_import + b"more_data" + pattern_eval + b"end_data"
                 f.write(suspicious_content)
                 f.flush()
 
@@ -129,13 +116,9 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Should find suspicious patterns
                 suspicious_issues = [
-                    issue
-                    for issue in result.issues
-                    if "suspicious code pattern" in issue.message.lower()
+                    issue for issue in result.issues if "suspicious code pattern" in issue.message.lower()
                 ]
-                assert (
-                    len(suspicious_issues) >= 2
-                )  # Should find both "import os" and "eval("
+                assert len(suspicious_issues) >= 2  # Should find both "import os" and "eval("
 
                 # Check metadata
                 assert "pickle_bytes" in result.metadata
@@ -177,20 +160,12 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Should find executable signatures
                 executable_issues = [
-                    issue
-                    for issue in result.issues
-                    if "executable signature" in issue.message.lower()
+                    issue for issue in result.issues if "executable signature" in issue.message.lower()
                 ]
-                assert (
-                    len(executable_issues) >= 2
-                )  # Should find both PE and ELF signatures
+                assert len(executable_issues) >= 2  # Should find both PE and ELF signatures
 
                 # Check that errors are reported for executable signatures
-                error_issues = [
-                    issue
-                    for issue in executable_issues
-                    if issue.severity == IssueSeverity.CRITICAL
-                ]
+                error_issues = [issue for issue in executable_issues if issue.severity == IssueSeverity.CRITICAL]
                 assert len(error_issues) >= 2
 
             finally:
@@ -221,11 +196,7 @@ class TestPickleScanner(unittest.TestCase):
                 assert result.success
 
                 # Should not find any suspicious patterns in binary content
-                binary_issues = [
-                    issue
-                    for issue in result.issues
-                    if "binary data" in issue.message.lower()
-                ]
+                binary_issues = [issue for issue in result.issues if "binary data" in issue.message.lower()]
                 assert len(binary_issues) == 0
 
                 # Check metadata
@@ -285,7 +256,7 @@ class TestPickleScanner(unittest.TestCase):
                 ("_metadata", collections.OrderedDict([("version", 1)])),
                 ("_modules", collections.OrderedDict()),
                 ("_parameters", collections.OrderedDict()),
-            ]
+            ],
         )
 
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
@@ -320,17 +291,13 @@ class TestPickleScanner(unittest.TestCase):
                 if is_pytorch and ml_confidence > 0.7:
                     # Should have skipped binary scanning
                     assert result.metadata.get("binary_scan_skipped") is True
-                    assert (
-                        "High-confidence PyTorch model detected"
-                        in result.metadata.get("skip_reason", "")
-                    )
+                    assert "High-confidence PyTorch model detected" in result.metadata.get("skip_reason", "")
 
                     # Should not find binary-related issues (since binary scan was skipped)
                     binary_issues = [
                         issue
                         for issue in result.issues
-                        if "binary data" in issue.message.lower()
-                        or "executable signature" in issue.message.lower()
+                        if "binary data" in issue.message.lower() or "executable signature" in issue.message.lower()
                     ]
                     assert len(binary_issues) == 0, (
                         f"Found unexpected binary issues: {[issue.message for issue in binary_issues]}"
@@ -339,7 +306,8 @@ class TestPickleScanner(unittest.TestCase):
                     # If conditions not met, binary scan should proceed normally
                     assert result.metadata.get("binary_scan_skipped") is not True
                     print(
-                        f"ML confidence too low ({ml_confidence}) or PyTorch not detected ({is_pytorch}) - binary scan proceeded normally"
+                        f"ML confidence too low ({ml_confidence}) or PyTorch not detected ({is_pytorch}) - "
+                        f"binary scan proceeded normally"
                     )
 
                 # Should have metadata about the scan regardless
@@ -383,9 +351,7 @@ class TestPickleScanner(unittest.TestCase):
 
                 # Should have performed binary scan and found the ELF signature
                 executable_issues = [
-                    issue
-                    for issue in result.issues
-                    if "executable signature" in issue.message.lower()
+                    issue for issue in result.issues if "executable signature" in issue.message.lower()
                 ]
                 assert len(executable_issues) >= 1, "Should have found ELF signature"
 
@@ -418,11 +384,7 @@ class TestPickleScanner(unittest.TestCase):
                 assert result.success
 
                 # Should NOT find PE executable signature (missing DOS stub)
-                pe_issues = [
-                    issue
-                    for issue in result.issues
-                    if "windows executable (pe)" in issue.message.lower()
-                ]
+                pe_issues = [issue for issue in result.issues if "windows executable (pe)" in issue.message.lower()]
                 assert len(pe_issues) == 0, (
                     f"Should not detect PE without DOS stub, but found: {[issue.message for issue in pe_issues]}"
                 )
@@ -458,21 +420,11 @@ class TestPickleScanner(unittest.TestCase):
                 assert result.success
 
                 # Should find PE executable signature
-                pe_issues = [
-                    issue
-                    for issue in result.issues
-                    if "windows executable (pe)" in issue.message.lower()
-                ]
+                pe_issues = [issue for issue in result.issues if "windows executable (pe)" in issue.message.lower()]
                 assert len(pe_issues) >= 1, "Should detect PE with DOS stub"
 
-                pe_error_issues = [
-                    issue
-                    for issue in pe_issues
-                    if issue.severity == IssueSeverity.CRITICAL
-                ]
-                assert len(pe_error_issues) >= 1, (
-                    "PE detection should be CRITICAL severity"
-                )
+                pe_error_issues = [issue for issue in pe_issues if issue.severity == IssueSeverity.CRITICAL]
+                assert len(pe_error_issues) >= 1, "PE detection should be CRITICAL severity"
 
             finally:
                 os.unlink(f.name)

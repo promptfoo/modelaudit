@@ -33,9 +33,7 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
     if HAS_TENSORFLOW:
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert (
-            TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
-        )  # Now accepts any .pb file
+        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is True  # Now accepts any .pb file
     else:
         # When TensorFlow is not installed, can_handle returns False
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
@@ -45,7 +43,7 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
 
 def create_tf_savedmodel(tmp_path, *, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F811
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     # Create a directory that mimics a TensorFlow SavedModel
     model_dir = tmp_path / "tf_model"
@@ -115,9 +113,7 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
     assert result.bytes_scanned > 0
 
     # Check for issues - a safe model might still have some informational issues
-    error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-    ]
+    error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert len(error_issues) == 0
 
 
@@ -182,11 +178,7 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
     result = scanner.scan(str(model_dir))
 
     # Should detect our blacklisted pattern
-    blacklist_issues = [
-        issue
-        for issue in result.issues
-        if "suspicious_function" in issue.message.lower()
-    ]
+    blacklist_issues = [issue for issue in result.issues if "suspicious_function" in issue.message.lower()]
     assert len(blacklist_issues) > 0
 
 

@@ -64,9 +64,7 @@ def test_assets_safetensors_metadata(tmp_path: Path) -> None:
 
 def test_assets_json_manifest_metadata(tmp_path: Path) -> None:
     """Test that JSON manifest assets include keys metadata."""
-    config_path = (
-        tmp_path / "config.json"
-    )  # This filename will be recognized by ManifestScanner
+    config_path = tmp_path / "config.json"  # This filename will be recognized by ManifestScanner
     config_data = {
         "model_type": "bert",
         "hidden_size": 768,
@@ -293,7 +291,9 @@ def test_assets_empty_results(tmp_path: Path) -> None:
     ],
 )
 def test_assets_file_type_detection(
-    tmp_path: Path, file_extension: str, expected_type: str
+    tmp_path: Path,
+    file_extension: str,
+    expected_type: str,
 ) -> None:
     """Test that different file types are correctly detected and typed in assets."""
     file_path = tmp_path / f"test{file_extension}"

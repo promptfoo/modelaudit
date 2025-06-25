@@ -5,6 +5,7 @@ This test suite specifically verifies that legitimate ML models don't trigger
 false positive security alerts while maintaining detection of real threats.
 """
 
+import contextlib
 import json
 import tempfile
 from pathlib import Path
@@ -51,16 +52,11 @@ class TestFalsePositiveFixes:
         if HAS_SAFETENSORS:
             safetensors_path = tmp_path / "model.safetensors"
             gpt2_weights = {
-                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32)
-                * 0.02,
-                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32)
-                * 0.02,
-                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32)
-                * 0.02,
-                "h.1.attn.c_proj.weight": np.random.randn(768, 768).astype(np.float32)
-                * 0.02,
-                "wte.weight": np.random.randn(50257, 768).astype(np.float32)
-                * 0.02,  # Token embeddings
+                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32) * 0.02,
+                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32) * 0.02,
+                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32) * 0.02,
+                "h.1.attn.c_proj.weight": np.random.randn(768, 768).astype(np.float32) * 0.02,
+                "wte.weight": np.random.randn(50257, 768).astype(np.float32) * 0.02,  # Token embeddings
             }
             save_file(gpt2_weights, safetensors_path)
             test_files.append(safetensors_path)
@@ -94,7 +90,8 @@ class TestFalsePositiveFixes:
                     data=np.random.randn(768, 3072).astype(np.float32) * 0.02,
                 )
                 layer_group.create_dataset(
-                    "bias:0", data=np.random.randn(3072).astype(np.float32) * 0.01
+                    "bias:0",
+                    data=np.random.randn(3072).astype(np.float32) * 0.01,
                 )
 
                 # Add optimizer weights to make it clearly a TensorFlow file
@@ -108,15 +105,9 @@ class TestFalsePositiveFixes:
             result = self._run_cli_scan(str(file_path))
 
             # Should complete successfully with no warnings/errors
-            assert result["exit_code"] == 0, (
-                f"File {file_path.name} should scan without issues"
-            )
-            assert result["has_warnings"] is False, (
-                f"File {file_path.name} should not have warnings"
-            )
-            assert result["has_errors"] is False, (
-                f"File {file_path.name} should not have errors"
-            )
+            assert result["exit_code"] == 0, f"File {file_path.name} should scan without issues"
+            assert result["has_warnings"] is False, f"File {file_path.name} should not have warnings"
+            assert result["has_errors"] is False, f"File {file_path.name} should not have errors"
 
     def test_huggingface_patterns_not_flagged(self, tmp_path):
         """Test that common HuggingFace configuration patterns are not flagged."""
@@ -172,9 +163,7 @@ class TestFalsePositiveFixes:
             result = self._run_cli_scan(str(config_path))
 
             # Should not flag any of these patterns as suspicious
-            assert result["exit_code"] == 0, (
-                f"HuggingFace config {config_info['filename']} should not be flagged"
-            )
+            assert result["exit_code"] == 0, f"HuggingFace config {config_info['filename']} should not be flagged"
             assert result["has_warnings"] is False, (
                 f"HuggingFace config {config_info['filename']} should not have warnings"
             )
@@ -191,10 +180,12 @@ class TestFalsePositiveFixes:
             model_weights = f.create_group("model_weights")
             dense_layer = model_weights.create_group("dense_1")
             dense_layer.create_dataset(
-                "kernel:0", data=np.random.randn(100, 50).astype(np.float32)
+                "kernel:0",
+                data=np.random.randn(100, 50).astype(np.float32),
             )
             dense_layer.create_dataset(
-                "bias:0", data=np.random.randn(50).astype(np.float32)
+                "bias:0",
+                data=np.random.randn(50).astype(np.float32),
             )
 
             # Add optimizer state (clear TensorFlow indicator)
@@ -238,9 +229,7 @@ class TestFalsePositiveFixes:
             anomalies = scanner._analyze_layer_weights(layer_name, weights)
 
             # Should return no anomalies due to LLM detection
-            assert len(anomalies) == 0, (
-                f"LLM layer {layer_name} should not generate anomalies"
-            )
+            assert len(anomalies) == 0, f"LLM layer {layer_name} should not generate anomalies"
 
     def test_small_models_still_analyzed(self):
         """Test that small/non-LLM models are still properly analyzed."""
@@ -248,9 +237,7 @@ class TestFalsePositiveFixes:
 
         # Create a small classification model with a clear anomaly
         np.random.seed(42)
-        weights = (
-            np.random.randn(512, 10).astype(np.float32) * 0.1
-        )  # 512 features -> 10 classes
+        weights = np.random.randn(512, 10).astype(np.float32) * 0.1  # 512 features -> 10 classes
 
         # Add a clear anomaly - one class with much larger weights (potential backdoor)
         weights[:, 5] = np.random.randn(512).astype(np.float32) * 3.0
@@ -258,17 +245,11 @@ class TestFalsePositiveFixes:
         anomalies = scanner._analyze_layer_weights("classifier.weight", weights)
 
         # Should detect the anomaly since this is not an LLM layer
-        assert len(anomalies) > 0, (
-            "Non-LLM models should still be analyzed for anomalies"
-        )
+        assert len(anomalies) > 0, "Non-LLM models should still be analyzed for anomalies"
 
         # Should detect outlier or extreme weight patterns
-        has_outlier = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_extreme = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_outlier = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme, "Should detect the injected anomaly"
 
     def test_malicious_files_still_detected(self, tmp_path):
@@ -289,9 +270,7 @@ class TestFalsePositiveFixes:
 
         result = self._run_cli_scan(str(evil_pickle_path))
         assert result["exit_code"] == 1, "Malicious pickle should be detected"
-        assert result["has_errors"] is True, (
-            "Malicious pickle should have critical issues"
-        )
+        assert result["has_errors"] is True, "Malicious pickle should have critical issues"
 
         # Test 2: Malicious Keras model
         if HAS_H5PY:
@@ -304,19 +283,17 @@ class TestFalsePositiveFixes:
                             {
                                 "class_name": "Lambda",
                                 "config": {
-                                    "function": 'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
+                                    "function": 'lambda x: eval(\'__import__("os").system("rm -rf /")\')',
                                 },
-                            }
-                        ]
+                            },
+                        ],
                     },
                 }
                 f.attrs["model_config"] = json.dumps(malicious_config)
 
             result = self._run_cli_scan(str(evil_keras_path))
             assert result["exit_code"] == 1, "Malicious Keras model should be detected"
-            assert result["has_warnings"] is True or result["has_errors"] is True, (
-                "Malicious Keras should have issues"
-            )
+            assert result["has_warnings"] is True or result["has_errors"] is True, "Malicious Keras should have issues"
 
         # Test 3: Malicious manifest file (use ML-specific filename to ensure it's scanned)
         evil_manifest_path = tmp_path / "config.json"  # Use standard config.json name
@@ -340,16 +317,8 @@ class TestFalsePositiveFixes:
         scan_result = scanner.scan(str(evil_manifest_path))
 
         # Check that malicious content was detected
-        critical_issues = [
-            issue
-            for issue in scan_result.issues
-            if issue.severity == IssueSeverity.CRITICAL
-        ]
-        warning_issues = [
-            issue
-            for issue in scan_result.issues
-            if issue.severity == IssueSeverity.WARNING
-        ]
+        critical_issues = [issue for issue in scan_result.issues if issue.severity == IssueSeverity.CRITICAL]
+        warning_issues = [issue for issue in scan_result.issues if issue.severity == IssueSeverity.WARNING]
 
         assert len(critical_issues) > 0 or len(warning_issues) > 0, (
             f"Malicious manifest should be detected. Found {len(scan_result.issues)} issues: "
@@ -390,12 +359,9 @@ class TestFalsePositiveFixes:
         # SafeTensors model weights
         if HAS_SAFETENSORS:
             gpt2_weights = {
-                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32)
-                * 0.02,
-                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32)
-                * 0.02,
-                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32)
-                * 0.02,
+                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32) * 0.02,
+                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32) * 0.02,
+                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32) * 0.02,
                 "wte.weight": np.random.randn(50257, 768).astype(np.float32) * 0.02,
             }
             save_file(gpt2_weights, model_dir / "model.safetensors")
@@ -427,9 +393,7 @@ class TestFalsePositiveFixes:
         result = self._run_cli_scan(str(model_dir))
 
         # Should complete with no issues
-        assert result["exit_code"] == 0, (
-            "Complete GPT-2 model directory should scan clean"
-        )
+        assert result["exit_code"] == 0, "Complete GPT-2 model directory should scan clean"
         assert result["has_warnings"] is False, "GPT-2 model should not have warnings"
         assert result["has_errors"] is False, "GPT-2 model should not have errors"
 
@@ -474,20 +438,16 @@ class TestFalsePositiveFixes:
 
             # Parse JSON output
             try:
-                with open(output_file, "r") as f:
+                with open(output_file) as f:
                     scan_results = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 scan_results = {"issues": []}
 
             # Analyze results
             has_warnings = any(
-                issue.get("severity") in ["warning", "critical"]
-                for issue in scan_results.get("issues", [])
+                issue.get("severity") in ["warning", "critical"] for issue in scan_results.get("issues", [])
             )
-            has_errors = any(
-                issue.get("severity") == "critical"
-                for issue in scan_results.get("issues", [])
-            )
+            has_errors = any(issue.get("severity") == "critical" for issue in scan_results.get("issues", []))
 
             return {
                 "exit_code": exit_code or 0,
@@ -500,7 +460,5 @@ class TestFalsePositiveFixes:
 
         finally:
             # Clean up
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 Path(output_file).unlink()
-            except FileNotFoundError:
-                pass
