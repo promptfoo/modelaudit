@@ -112,6 +112,8 @@ def test_pickle_scanner_includes_why():
 
 def test_cli_output_format_includes_why():
     """Test that CLI output formatting includes 'why' explanations."""
+    import re
+
     from modelaudit.cli import format_text_output
 
     # Create test results with 'why' explanations
@@ -133,6 +135,11 @@ def test_cli_output_format_includes_why():
     # Format the output
     output = format_text_output(test_results)
 
-    # Check that the output includes the "Why:" label and explanation
+    # Check that the output includes the "Why:" label
     assert "Why:" in output
-    assert "operating system functions" in output
+
+    # Check for the explanation text, accounting for line wrapping
+    # Remove ANSI codes and normalize whitespace
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    normalized_output = " ".join(clean_output.split())
+    assert "operating system functions" in normalized_output

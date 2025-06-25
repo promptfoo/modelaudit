@@ -186,7 +186,7 @@ class TestAssetInventoryIntegration:
         assert result.exit_code in [0, 1]
 
         # Should contain asset section in output
-        assert "Assets encountered:" in result.output
+        assert "SCANNED FILES" in result.output
 
         # Should list the main files
         assert "model.safetensors" in result.output
@@ -194,14 +194,8 @@ class TestAssetInventoryIntegration:
         assert "weights.zip" in result.output
         assert "tokenizer_config.json" in result.output
 
-        # Should show tensor information for SafeTensors
-        assert "Tensors:" in result.output
-        assert "embedding.weight" in result.output
-        assert "decoder.weight" in result.output
-
-        # Should show keys for JSON files
-        assert "Keys:" in result.output
-        assert "model_type" in result.output
+        # Note: We simplified the asset display, so tensor and key details
+        # are no longer shown in the CLI output to reduce verbosity
 
     def test_asset_inventory_cli_json_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI JSON output."""
@@ -452,7 +446,7 @@ class TestAssetInventoryIntegration:
         # Find the assets section
         assets_start = None
         for i, line in enumerate(output_lines):
-            if "Assets encountered:" in line:
+            if "SCANNED FILES" in line:
                 assets_start = i
                 break
 
@@ -461,16 +455,12 @@ class TestAssetInventoryIntegration:
         # Check formatting structure
         assets_section = output_lines[assets_start:]
 
-        # Should have proper indentation and structure
-        asset_lines = [line for line in assets_section if line.strip().startswith("- ")]
+        # Should have proper indentation and structure with bullet points
+        asset_lines = [line for line in assets_section if line.strip().startswith("•")]
         assert len(asset_lines) >= 3  # Should list all three files
 
-        # Should have sub-items for tensors and keys
-        tensor_lines = [line for line in assets_section if "Tensors:" in line]
-        assert len(tensor_lines) >= 1
-
-        key_lines = [line for line in assets_section if "Keys:" in line]
-        assert len(key_lines) >= 1
+        # Note: We simplified the asset display, so tensor and key details
+        # are no longer shown in the CLI output to reduce verbosity
 
     def test_asset_inventory_performance_large_directory(self, tmp_path: Path):
         """Test asset inventory performance with many files."""
