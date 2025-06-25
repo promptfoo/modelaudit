@@ -41,9 +41,7 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
     assert result.bytes_scanned == len(data) * 10
 
     # Should have no file type validation warnings (.bin files with unknown headers are valid)
-    validation_issues = [
-        i for i in result.issues if "file type validation failed" in i.message.lower()
-    ]
+    validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
     assert len(validation_issues) == 0
 
 
@@ -111,13 +109,7 @@ def test_pytorch_binary_scanner_blacklist_patterns(tmp_path):
 
     # Create a binary file with blacklisted patterns
     binary_file = tmp_path / "with_blacklist.bin"
-    data = (
-        b"\x00" * 50
-        + b"CONFIDENTIAL_DATA"
-        + b"\x00" * 50
-        + b"SECRET_KEY=12345"
-        + b"\x00" * 50
-    )
+    data = b"\x00" * 50 + b"CONFIDENTIAL_DATA" + b"\x00" * 50 + b"SECRET_KEY=12345" + b"\x00" * 50
     binary_file.write_bytes(data)
 
     result = scanner.scan(str(binary_file))

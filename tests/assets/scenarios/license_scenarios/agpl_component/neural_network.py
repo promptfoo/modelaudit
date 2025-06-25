@@ -20,9 +20,7 @@ import numpy as np
 class AGPLNeuralNetwork:
     def __init__(self, layers):
         self.layers = layers
-        self.weights = [
-            np.random.randn(layers[i], layers[i + 1]) for i in range(len(layers) - 1)
-        ]
+        self.weights = [np.random.randn(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
 
     def forward(self, x):
         for w in self.weights:

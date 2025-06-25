@@ -35,11 +35,7 @@ class TestJoblibScannerSecurity:
 
         # Should detect compression bomb
         assert result.success is False
-        bomb_issues = [
-            issue
-            for issue in result.issues
-            if "compression ratio" in issue.message.lower()
-        ]
+        bomb_issues = [issue for issue in result.issues if "compression ratio" in issue.message.lower()]
         assert len(bomb_issues) > 0
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in bomb_issues)
 
@@ -58,9 +54,7 @@ class TestJoblibScannerSecurity:
 
         # Should reject the large file
         assert result.success is False
-        size_issues = [
-            issue for issue in result.issues if "too large" in issue.message.lower()
-        ]
+        size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
     def test_decompressed_size_limit(self, tmp_path):
@@ -84,12 +78,7 @@ class TestJoblibScannerSecurity:
         assert result.success is False
         # Should be caught by either decompressed size limit or compression ratio
         security_issues = [
-            issue
-            for issue in result.issues
-            if (
-                "decompressed size too large" in issue.message.lower()
-                or "compression ratio" in issue.message.lower()
-            )
+            issue for issue in result.issues if ("decompressed size too large" in issue.message.lower() or "compression ratio" in issue.message.lower())
         ]
         assert len(security_issues) > 0
 
@@ -185,11 +174,7 @@ class TestJoblibScannerSecurity:
 
         # Should fail with decompression error
         assert result.success is False
-        decomp_issues = [
-            issue
-            for issue in result.issues
-            if "unable to decompress" in issue.message.lower()
-        ]
+        decomp_issues = [issue for issue in result.issues if "unable to decompress" in issue.message.lower()]
         assert len(decomp_issues) > 0
 
     def test_file_read_chunk_limit(self, tmp_path):
@@ -236,11 +221,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        validation_issues = [
-            issue
-            for issue in result.issues
-            if "negative dimension" in issue.message.lower()
-        ]
+        validation_issues = [issue for issue in result.issues if "negative dimension" in issue.message.lower()]
         assert len(validation_issues) > 0
 
     def test_too_many_dimensions_rejection(self, tmp_path):
@@ -258,11 +239,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        dim_issues = [
-            issue
-            for issue in result.issues
-            if "too many dimensions" in issue.message.lower()
-        ]
+        dim_issues = [issue for issue in result.issues if "too many dimensions" in issue.message.lower()]
         assert len(dim_issues) > 0
 
     def test_dimension_size_limit(self, tmp_path):
@@ -287,9 +264,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        size_issues = [
-            issue for issue in result.issues if "too large" in issue.message.lower()
-        ]
+        size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
     def test_dangerous_dtype_rejection(self, tmp_path):
@@ -312,11 +287,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        dtype_issues = [
-            issue
-            for issue in result.issues
-            if "dangerous dtype" in issue.message.lower()
-        ]
+        dtype_issues = [issue for issue in result.issues if "dangerous dtype" in issue.message.lower()]
         assert len(dtype_issues) > 0
 
     def test_array_size_overflow_protection(self, tmp_path):
@@ -342,11 +313,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        size_issues = [
-            issue
-            for issue in result.issues
-            if "array too large" in issue.message.lower()
-        ]
+        size_issues = [issue for issue in result.issues if "array too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
     def test_valid_numpy_array_still_works(self, tmp_path):
@@ -380,7 +347,7 @@ class TestNumPyScannerSecurity:
 
         # Allow structured arrays for this test
         config = {
-            "max_array_bytes": 10 * 1024 * 1024 * 1024
+            "max_array_bytes": 10 * 1024 * 1024 * 1024,
         }  # 10GB limit to allow large test array
         scanner = NumPyScanner(config)
         result = scanner.scan(str(npy_file))
@@ -410,11 +377,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        itemsize_issues = [
-            issue
-            for issue in result.issues
-            if "itemsize too large" in issue.message.lower()
-        ]
+        itemsize_issues = [issue for issue in result.issues if "itemsize too large" in issue.message.lower()]
         assert len(itemsize_issues) > 0
 
     def test_void_dtype_rejection(self, tmp_path):
@@ -437,11 +400,7 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        dtype_issues = [
-            issue
-            for issue in result.issues
-            if "dangerous dtype" in issue.message.lower()
-        ]
+        dtype_issues = [issue for issue in result.issues if "dangerous dtype" in issue.message.lower()]
         assert len(dtype_issues) > 0
 
     def test_unsupported_numpy_version(self, tmp_path):

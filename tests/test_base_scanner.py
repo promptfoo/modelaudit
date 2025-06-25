@@ -1,4 +1,5 @@
 import os
+from typing import ClassVar
 
 from modelaudit.scanners.base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -8,7 +9,7 @@ class MockScanner(BaseScanner):
 
     name = "test_scanner"
     description = "Test scanner for unit tests"
-    supported_extensions = [".test", ".tst"]
+    supported_extensions: ClassVar[list[str]] = [".test", ".tst"]
 
     def scan(self, path: str) -> ScanResult:
         result = self._create_result()
@@ -235,11 +236,7 @@ def test_base_scanner_file_type_validation(tmp_path):
     assert scan_result is not None
 
     # Check that we have a file type validation warning in the scan result
-    validation_issues = [
-        issue
-        for issue in scan_result.issues
-        if "file type validation failed" in issue.message.lower()
-    ]
+    validation_issues = [issue for issue in scan_result.issues if "file type validation failed" in issue.message.lower()]
     assert len(validation_issues) > 0
 
     # Should be WARNING level (not CRITICAL) to allow scan to continue

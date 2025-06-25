@@ -36,11 +36,11 @@ def collect_python_files(directory: Path, excluded_patterns: List[str]) -> List[
 def read_file_safe(file_path: Path) -> str:
     """Safely read file content with proper encoding handling."""
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8") as f:
             return f.read()
     except UnicodeDecodeError:
         try:
-            with open(file_path, "r", encoding="latin-1") as f:
+            with open(file_path, encoding="latin-1") as f:
                 return f.read()
         except Exception as e:
             return f"# ERROR: Could not read {file_path}: {e}\n"
@@ -49,7 +49,8 @@ def read_file_safe(file_path: Path) -> str:
 
 
 def generate_context_file(
-    output_path: str = "llm-context.txt", max_tokens: int = 180000
+    output_path: str = "llm-context.txt",
+    max_tokens: int = 180000,
 ):
     """Generate the LLM context file with README and source code."""
 
@@ -154,7 +155,7 @@ The ModelAudit project is organized as follows:
     for file_path in python_files:
         if total_tokens > max_tokens:
             print(
-                f"WARNING: Approaching token limit ({total_tokens:,}/{max_tokens:,}), stopping"
+                f"WARNING: Approaching token limit ({total_tokens:,}/{max_tokens:,}), stopping",
             )
             break
 
@@ -212,7 +213,7 @@ For development, testing, and deployment information, refer to the README sectio
 
         if total_tokens > max_tokens:
             print(
-                f"⚠️  WARNING: Estimated tokens ({total_tokens:,}) exceed target limit ({max_tokens:,})"
+                f"⚠️  WARNING: Estimated tokens ({total_tokens:,}) exceed target limit ({max_tokens:,})",
             )
         else:
             print(f"✓ Within token limit ({max_tokens:,})")

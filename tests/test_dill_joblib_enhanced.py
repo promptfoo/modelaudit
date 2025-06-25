@@ -29,7 +29,7 @@ class TestDillJoblibSecurity:
             # Create a pickle that references os.system directly
             f.write(b"cos\nsystem\n")  # os.system global reference
             f.write(
-                b"q\x00X\x04\x00\x00\x00testq\x01\x85q\x02Rq\x03."
+                b"q\x00X\x04\x00\x00\x00testq\x01\x85q\x02Rq\x03.",
             )  # Call with "test" arg
 
         scanner = PickleScanner()
@@ -161,7 +161,7 @@ class TestErrorHandling:
 
         # Mock the pickletools.genops to raise ValueError
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = ValueError("unknown opcode")
 
@@ -169,10 +169,7 @@ class TestErrorHandling:
 
             # Check detailed metadata
             assert result.metadata.get("truncated") is True
-            assert (
-                result.metadata.get("truncation_reason")
-                == "post_stop_data_or_format_issue"
-            )
+            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
             assert result.metadata.get("exception_type") == "ValueError"
             assert result.metadata.get("validated_format") is True
             assert "exception_message" in result.metadata
@@ -188,16 +185,14 @@ class TestErrorHandling:
 
         # Mock to raise a different type of error
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = RuntimeError("unexpected error")
 
             result = scanner.scan(str(suspicious_file))
 
             # Should still be treated as critical error
-            critical_issues = [
-                i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-            ]
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(critical_issues) > 0
             assert not result.metadata.get("truncated", False)
 
@@ -219,7 +214,7 @@ class TestErrorHandling:
         scanner = PickleScanner()
 
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = struct.error("unpack requires more data")
 
@@ -235,9 +230,7 @@ class TestErrorHandling:
             has_logged_messages = len(caplog.records) > 0
 
             # Should have at least one form of error handling
-            assert has_issues or has_truncation_metadata or has_logged_messages, (
-                "Should have some form of error handling (issues, truncation, or logging)"
-            )
+            assert has_issues or has_truncation_metadata or has_logged_messages, "Should have some form of error handling (issues, truncation, or logging)"
 
 
 class TestPerformanceAndEdgeCases:
@@ -324,7 +317,7 @@ class TestIntegration:
         scanner = PickleScanner()
 
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = ValueError("unknown opcode")
 
@@ -339,16 +332,11 @@ class TestIntegration:
 
             # Should contain truncation message for legitimate files
             error_messages = [str(issue.message) for issue in info_issues]
-            assert any(
-                "truncated due to format complexity" in msg for msg in error_messages
-            )
+            assert any("truncated due to format complexity" in msg for msg in error_messages)
 
             # Should have proper metadata
             assert result.metadata.get("truncated") is True
-            assert (
-                result.metadata.get("truncation_reason")
-                == "post_stop_data_or_format_issue"
-            )
+            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
 
     def test_backward_compatibility(self, tmp_path):
         """Test that regular pickle scanning still works unchanged."""
@@ -362,9 +350,7 @@ class TestIntegration:
 
         # Should work normally
         assert result.success is True
-        assert (
-            len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
-        )
+        assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""
@@ -379,7 +365,7 @@ class TestIntegration:
 
         # Test ValueError with keywords that should trigger benign handling
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = ValueError("unknown opcode at position 10")
             result = scanner.scan(str(test_file))
@@ -389,7 +375,7 @@ class TestIntegration:
 
         # Test struct.error
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = struct.error("unpack requires at least 4 bytes")
             result = scanner.scan(str(test_file))
@@ -398,16 +384,14 @@ class TestIntegration:
 
         # Test non-benign error
         with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops"
+            "modelaudit.scanners.pickle_scanner.pickletools.genops",
         ) as mock_genops:
             mock_genops.side_effect = KeyError("unexpected error type")
             result = scanner.scan(str(test_file))
             # Non-benign errors should definitely create issues
             assert len(result.issues) > 0
             # Should be critical error since KeyError is not in benign list
-            critical_issues = [
-                i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-            ]
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(critical_issues) > 0
 
 

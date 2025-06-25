@@ -63,10 +63,11 @@ class TestAssetInventoryIntegration:
 
             # Add another SafeTensors file inside the ZIP
             inner_safetensors_data = {
-                "optimizer.weight": np.random.randn(100, 768).astype(np.float32)
+                "optimizer.weight": np.random.randn(100, 768).astype(np.float32),
             }
             with tempfile.NamedTemporaryFile(
-                suffix=".safetensors", delete=False
+                suffix=".safetensors",
+                delete=False,
             ) as tmp:
                 save_file(inner_safetensors_data, tmp.name)
                 with open(tmp.name, "rb") as f:
@@ -102,9 +103,7 @@ class TestAssetInventoryIntegration:
         assert len(assets) >= 4
 
         # Check for SafeTensors file with tensor metadata
-        safetensors_assets = [
-            a for a in assets if a["path"].endswith("model.safetensors")
-        ]
+        safetensors_assets = [a for a in assets if a["path"].endswith("model.safetensors")]
         assert len(safetensors_assets) == 1
         st_asset = safetensors_assets[0]
         assert st_asset["type"] == "safetensors"
@@ -143,11 +142,7 @@ class TestAssetInventoryIntegration:
 
         # Check nested SafeTensors asset has tensor metadata
         nested_st = next(
-            (
-                c
-                for c in zip_asset["contents"]
-                if c["path"].endswith("optimizer.safetensors")
-            ),
+            (c for c in zip_asset["contents"] if c["path"].endswith("optimizer.safetensors")),
             None,
         )
         assert nested_st is not None
@@ -164,7 +159,7 @@ class TestAssetInventoryIntegration:
 
         # Should include files from subdirectories
         tokenizer_config_path = str(
-            complex_model_dir / "tokenizer" / "tokenizer_config.json"
+            complex_model_dir / "tokenizer" / "tokenizer_config.json",
         )
         assert tokenizer_config_path in asset_paths
 
@@ -201,7 +196,8 @@ class TestAssetInventoryIntegration:
         """Test that asset inventory appears correctly in CLI JSON output."""
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["scan", str(complex_model_dir), "--format", "json"]
+            cli,
+            ["scan", str(complex_model_dir), "--format", "json"],
         )
 
         # Should succeed or have warnings but not error
@@ -237,7 +233,8 @@ class TestAssetInventoryIntegration:
             # Add SafeTensors file to inner ZIP
             safetensors_data = {"weight": np.array([1, 2, 3, 4]).astype(np.float32)}
             with tempfile.NamedTemporaryFile(
-                suffix=".safetensors", delete=False
+                suffix=".safetensors",
+                delete=False,
             ) as tmp:
                 save_file(safetensors_data, tmp.name)
                 with open(tmp.name, "rb") as f:
@@ -245,9 +242,8 @@ class TestAssetInventoryIntegration:
                 os.unlink(tmp.name)
 
         outer_zip = tmp_path / "outer.zip"
-        with zipfile.ZipFile(outer_zip, "w") as outer_zf:
-            with open(inner_zip, "rb") as f:
-                outer_zf.writestr("models/inner.zip", f.read())
+        with zipfile.ZipFile(outer_zip, "w") as outer_zf, open(inner_zip, "rb") as f:
+            outer_zf.writestr("models/inner.zip", f.read())
 
         results = scan_model_directory_or_file(str(outer_zip))
 
@@ -380,23 +376,14 @@ class TestAssetInventoryIntegration:
         # Simulate a transformer model structure
         tensors = {}
         for layer in range(12):  # 12 transformer layers
-            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
-            )
-            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
-            )
-            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = (
-                np.random.randn(3072, 768).astype(np.float32)
-            )
+            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(np.float32)
             tensors[f"transformer.layer.{layer}.output.dense.weight"] = np.random.randn(
-                768, 3072
+                768,
+                3072,
             ).astype(np.float32)
 
         save_file(tensors, str(large_model))
@@ -483,7 +470,7 @@ class TestAssetInventoryIntegration:
         assert len(results["assets"]) == 50
 
         # Each asset should have correct metadata
-        for i, asset in enumerate(results["assets"]):
+        for _i, asset in enumerate(results["assets"]):
             assert asset["type"] == "manifest"
             assert "keys" in asset
             assert "id" in asset["keys"]

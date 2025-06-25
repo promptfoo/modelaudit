@@ -23,9 +23,7 @@ def test_issue_with_why_field():
     # Test serialization includes why field
     issue_dict = issue.to_dict()
     assert "why" in issue_dict
-    assert (
-        issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
-    )
+    assert issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
 
 
 def test_issue_without_why_field():
@@ -93,12 +91,7 @@ def test_pickle_scanner_includes_why():
         assert len(issues_with_why) > 0
 
         # Check that at least one issue mentions 'os' or 'posix' and has an explanation
-        system_issues = [
-            issue
-            for issue in result.issues
-            if ("os" in issue.message.lower() or "posix" in issue.message.lower())
-            and issue.why is not None
-        ]
+        system_issues = [issue for issue in result.issues if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None]
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system
@@ -128,7 +121,7 @@ def test_cli_output_format_includes_why():
                 "severity": "critical",
                 "location": "test.pkl",
                 "why": "The 'os' module provides direct access to operating system functions.",
-            }
+            },
         ],
     }
 

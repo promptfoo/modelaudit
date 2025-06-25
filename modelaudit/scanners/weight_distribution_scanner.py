@@ -1,6 +1,6 @@
 import os
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Optional
 
 import numpy as np
 from scipy import stats
@@ -34,10 +34,8 @@ class WeightDistributionScanner(BaseScanner):
     """Scanner that detects anomalous weight distributions potentially indicating trojaned models"""
 
     name = "weight_distribution"
-    description = (
-        "Analyzes weight distributions to detect potential backdoors or trojans"
-    )
-    supported_extensions = [
+    description = "Analyzes weight distributions to detect potential backdoors or trojans"
+    supported_extensions: ClassVar[list[str]] = [
         ".pt",
         ".pth",
         ".h5",
@@ -48,15 +46,17 @@ class WeightDistributionScanner(BaseScanner):
         ".safetensors",
     ]
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Configuration parameters
         self.z_score_threshold = self.config.get("z_score_threshold", 3.0)
         self.cosine_similarity_threshold = self.config.get(
-            "cosine_similarity_threshold", 0.7
+            "cosine_similarity_threshold",
+            0.7,
         )
         self.weight_magnitude_threshold = self.config.get(
-            "weight_magnitude_threshold", 3.0
+            "weight_magnitude_threshold",
+            3.0,
         )
         self.llm_vocab_threshold = self.config.get("llm_vocab_threshold", 10000)
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
@@ -76,10 +76,7 @@ class WeightDistributionScanner(BaseScanner):
             return False
         if ext in [".h5", ".keras", ".hdf5"] and not HAS_H5PY:
             return False
-        if ext == ".pb" and not HAS_TENSORFLOW:
-            return False
-
-        return True
+        return not (ext == ".pb" and not HAS_TENSORFLOW)
 
     def scan(self, path: str) -> ScanResult:
         """Scan a model file for weight distribution anomalies"""
@@ -148,7 +145,7 @@ class WeightDistributionScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error analyzing weight distributions: {str(e)}",
+                f"Error analyzing weight distributions: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -159,12 +156,12 @@ class WeightDistributionScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    def _extract_pytorch_weights(self, path: str) -> Dict[str, np.ndarray]:
+    def _extract_pytorch_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from PyTorch model files"""
         if not HAS_TORCH:
             return {}
 
-        weights_info: Dict[str, np.ndarray] = {}
+        weights_info: dict[str, np.ndarray] = {}
 
         try:
             # Load model with map_location to CPU to avoid GPU requirements
@@ -177,9 +174,8 @@ class WeightDistributionScanner(BaseScanner):
 
                 # Find final layer weights (classification head)
                 for key, value in state_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        # Look for final layer patterns
-                        if (
+                    if isinstance(value, torch.Tensor) and (
+                        (
                             any(
                                 pattern in key.lower()
                                 for pattern in [
@@ -191,13 +187,11 @@ class WeightDistributionScanner(BaseScanner):
                                 ]
                             )
                             and "weight" in key.lower()
-                        ):
-                            # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
-                            weights_info[key] = value.detach().cpu().numpy().T
-                        # Also include all weight tensors for comprehensive analysis
-                        elif "weight" in key.lower() and len(value.shape) >= 2:
-                            # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
-                            weights_info[key] = value.detach().cpu().numpy().T
+                        )
+                        or ("weight" in key.lower() and len(value.shape) >= 2)
+                    ):
+                        # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
+                        weights_info[key] = value.detach().cpu().numpy().T
 
             elif hasattr(model_data, "state_dict"):
                 # Full model format
@@ -222,21 +216,19 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_keras_weights(self, path: str) -> Dict[str, np.ndarray]:
+    def _extract_keras_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from Keras/TensorFlow H5 model files"""
         if not HAS_H5PY:
             return {}
 
-        weights_info: Dict[str, np.ndarray] = {}
+        weights_info: dict[str, np.ndarray] = {}
 
         try:
             with h5py.File(path, "r") as f:
                 # Navigate through the HDF5 structure to find weights
                 def extract_weights(name, obj):
-                    if isinstance(obj, h5py.Dataset):
-                        # Check if this is a weight array
-                        if "kernel" in name or "weight" in name:
-                            weights_info[name] = np.array(obj)
+                    if isinstance(obj, h5py.Dataset) and ("kernel" in name or "weight" in name):
+                        weights_info[name] = np.array(obj)
 
                 f.visititems(extract_weights)
 
@@ -245,12 +237,12 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_tensorflow_weights(self, path: str) -> Dict[str, np.ndarray]:
+    def _extract_tensorflow_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from TensorFlow SavedModel files"""
         if not HAS_TENSORFLOW:
             return {}
 
-        weights_info: Dict[str, np.ndarray] = {}
+        weights_info: dict[str, np.ndarray] = {}
 
         # TensorFlow SavedModel weight extraction is complex and would require
         # loading the full graph. For now, we'll return empty.
@@ -258,7 +250,7 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_onnx_weights(self, path: str) -> Dict[str, np.ndarray]:
+    def _extract_onnx_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from ONNX model files"""
         try:
             import onnx
@@ -270,7 +262,7 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_ONNX:
             return {}
 
-        weights_info: Dict[str, np.ndarray] = {}
+        weights_info: dict[str, np.ndarray] = {}
 
         try:
             model = onnx.load(path)
@@ -279,7 +271,7 @@ class WeightDistributionScanner(BaseScanner):
             for initializer in model.graph.initializer:
                 if "weight" in initializer.name.lower():
                     weights_info[initializer.name] = onnx.numpy_helper.to_array(
-                        initializer
+                        initializer,
                     )
 
         except Exception as e:
@@ -287,7 +279,7 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_safetensors_weights(self, path: str) -> Dict[str, np.ndarray]:
+    def _extract_safetensors_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from SafeTensors files"""
         try:
             from safetensors import safe_open
@@ -299,11 +291,11 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_SAFETENSORS:
             return {}
 
-        weights_info: Dict[str, np.ndarray] = {}
+        weights_info: dict[str, np.ndarray] = {}
 
         try:
             with safe_open(path, framework="numpy") as f:
-                for key in f.keys():
+                for key in f:
                     if "weight" in key.lower():
                         weights_info[key] = f.get_tensor(key)
 
@@ -313,8 +305,9 @@ class WeightDistributionScanner(BaseScanner):
         return weights_info
 
     def _analyze_weight_distributions(
-        self, weights_info: Dict[str, np.ndarray]
-    ) -> List[Dict[str, Any]]:
+        self,
+        weights_info: dict[str, np.ndarray],
+    ) -> list[dict[str, Any]]:
         """Analyze weight distributions for anomalies"""
         anomalies = []
 
@@ -334,17 +327,12 @@ class WeightDistributionScanner(BaseScanner):
                     ]
                 )
                 and "weight" in name.lower()
-            ):
-                if len(weights.shape) == 2:  # Ensure it's a 2D weight matrix
-                    final_layer_candidates[name] = weights
+            ) and len(weights.shape) == 2:  # Ensure it's a 2D weight matrix
+                final_layer_candidates[name] = weights
 
         # If no clear final layer found, analyze all 2D weight matrices
         if not final_layer_candidates:
-            final_layer_candidates = {
-                name: weights
-                for name, weights in weights_info.items()
-                if len(weights.shape) == 2
-            }
+            final_layer_candidates = {name: weights for name, weights in weights_info.items() if len(weights.shape) == 2}
 
         # Analyze each candidate layer
         for layer_name, weights in final_layer_candidates.items():
@@ -354,10 +342,12 @@ class WeightDistributionScanner(BaseScanner):
         return anomalies
 
     def _analyze_layer_weights(
-        self, layer_name: str, weights: np.ndarray
-    ) -> List[Dict[str, Any]]:
+        self,
+        layer_name: str,
+        weights: np.ndarray,
+    ) -> list[dict[str, Any]]:
         """Analyze a single layer's weights for anomalies"""
-        anomalies: List[Dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers
         if len(weights.shape) != 2:
@@ -368,8 +358,7 @@ class WeightDistributionScanner(BaseScanner):
         # Detect if this is likely an LLM vocabulary layer or large transformer model
         is_likely_llm = (
             n_outputs > self.llm_vocab_threshold  # Large vocab layer
-            or n_inputs
-            > 768  # Large hidden dimensions typical of LLMs (768+ for BERT/GPT)
+            or n_inputs > 768  # Large hidden dimensions typical of LLMs (768+ for BERT/GPT)
             or "transformer" in layer_name.lower()  # Transformer architecture
             or "attention" in layer_name.lower()  # Attention layers
             or "gpt" in layer_name.lower()  # GPT models
@@ -393,7 +382,8 @@ class WeightDistributionScanner(BaseScanner):
         if is_likely_llm:
             # For LLMs, only check for extreme outliers with much higher thresholds
             z_score_threshold = max(
-                8.0, self.z_score_threshold * 2.5
+                8.0,
+                self.z_score_threshold * 2.5,
             )  # Much higher threshold
             outlier_percentage_threshold = 0.0001  # 0.01% for LLMs - very restrictive
         else:
@@ -408,19 +398,14 @@ class WeightDistributionScanner(BaseScanner):
 
             # Only flag if the number of outliers is reasonable
             outlier_percentage = len(outlier_indices) / n_outputs
-            if (
-                len(outlier_indices) > 0
-                and outlier_percentage < outlier_percentage_threshold
-            ):
+            if len(outlier_indices) > 0 and outlier_percentage < outlier_percentage_threshold:
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with abnormal weight magnitudes",
                         "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
-                            "outlier_neurons": outlier_indices.tolist()[
-                                :10
-                            ],  # Limit to first 10
+                            "outlier_neurons": outlier_indices.tolist()[:10],  # Limit to first 10
                             "total_outliers": len(outlier_indices),
                             "outlier_percentage": float(outlier_percentage * 100),
                             "z_scores": z_scores[outlier_indices].tolist()[:10],
@@ -428,8 +413,11 @@ class WeightDistributionScanner(BaseScanner):
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
                         },
-                        "why": "Neurons with weight magnitudes significantly different from others in the same layer may indicate tampering, backdoors, or training anomalies. These outliers are flagged when their statistical z-score exceeds the threshold.",
-                    }
+                        "why": (
+                            "Neurons with weight magnitudes significantly different from others in the same layer may indicate "
+                            "tampering, backdoors, or training anomalies. These outliers are flagged when their statistical z-score exceeds the threshold."
+                        ),
+                    },
                 )
 
         # 2. Check for dissimilar weight vectors using cosine similarity
@@ -444,13 +432,9 @@ class WeightDistributionScanner(BaseScanner):
             for i in range(n_outputs):
                 # Get similarities to other neurons
                 other_similarities = np.concatenate(
-                    [similarities[i, :i], similarities[i, i + 1 :]]
+                    [similarities[i, :i], similarities[i, i + 1 :]],
                 )
-                max_similarity = (
-                    np.max(np.abs(other_similarities))
-                    if len(other_similarities) > 0
-                    else 0
-                )
+                max_similarity = np.max(np.abs(other_similarities)) if len(other_similarities) > 0 else 0
 
                 if max_similarity < self.cosine_similarity_threshold:
                     dissimilar_neurons.append((i, max_similarity))
@@ -469,8 +453,12 @@ class WeightDistributionScanner(BaseScanner):
                                 "weight_norm": float(output_norms[neuron_idx]),
                                 "total_outputs": n_outputs,
                             },
-                            "why": "Neurons with weight patterns completely unlike others in the same layer are uncommon in standard training. This dissimilarity (measured by cosine similarity below threshold) may indicate injected functionality or training irregularities.",
-                        }
+                            "why": (
+                                "Neurons with weight patterns completely unlike others in the same layer are uncommon in standard training. "
+                                "This dissimilarity (measured by cosine similarity below threshold) may indicate injected "
+                                "functionality or training irregularities."
+                            ),
+                        },
                     )
 
         # 3. Check for extreme weight values
@@ -491,17 +479,18 @@ class WeightDistributionScanner(BaseScanner):
                         "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
-                            "affected_neurons": neurons_with_extreme_weights.tolist()[
-                                :10
-                            ],  # Limit list
+                            "affected_neurons": neurons_with_extreme_weights.tolist()[:10],  # Limit list
                             "total_affected": len(neurons_with_extreme_weights),
                             "num_extreme_weights": len(extreme_weights[0]),
                             "threshold": float(threshold),
                             "max_weight": float(np.max(weight_magnitudes)),
                             "total_outputs": n_outputs,
                         },
-                        "why": "Weight values that are orders of magnitude larger than typical can cause numerical instability, overflow attacks, or may encode hidden data. The threshold is set at 100 times the mean magnitude.",
-                    }
+                        "why": (
+                            "Weight values that are orders of magnitude larger than typical can cause numerical instability, overflow attacks, "
+                            "or may encode hidden data. The threshold is set at 100 times the mean magnitude."
+                        ),
+                    },
                 )
 
         return anomalies

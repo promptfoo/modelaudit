@@ -122,7 +122,7 @@ def scan_command(
         title_styled = click.style(title, fg="blue", bold=True)
         padding = (78 - len(title)) // 2
         click.echo(
-            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║"
+            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║",
         )
 
         # Subtitle
@@ -130,11 +130,7 @@ def scan_command(
         subtitle_styled = click.style(subtitle, fg="cyan")
         padding = (78 - len(subtitle)) // 2
         click.echo(
-            "║"
-            + " " * padding
-            + subtitle_styled
-            + " " * (78 - padding - len(subtitle))
-            + "║"
+            "║" + " " * padding + subtitle_styled + " " * (78 - padding - len(subtitle)) + "║",
         )
 
         click.echo("║" + " " * 78 + "║")
@@ -206,7 +202,7 @@ def scan_command(
             progress_callback = None
             if spinner:
 
-                def update_progress(message, percentage):
+                def update_progress(message, percentage, spinner=spinner):
                     spinner.text = f"{message} ({percentage:.1f}%)"
 
                 progress_callback = update_progress
@@ -234,11 +230,7 @@ def scan_command(
 
             # Track scanner names
             for scanner in results.get("scanners", []):
-                if (
-                    scanner
-                    and scanner not in aggregated_results["scanner_names"]
-                    and scanner != "unknown"
-                ):
+                if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
                     aggregated_results["scanner_names"].append(scanner)
 
             # Show completion status if in text mode and not writing to a file
@@ -246,21 +238,13 @@ def scan_command(
                 if results.get("issues", []):
                     # Filter out DEBUG severity issues when not in verbose mode
                     visible_issues = [
-                        issue
-                        for issue in results.get("issues", [])
-                        if verbose
-                        or not isinstance(issue, dict)
-                        or issue.get("severity") != "debug"
+                        issue for issue in results.get("issues", []) if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
                     ]
                     issue_count = len(visible_issues)
                     spinner.text = f"Scanned {click.style(path, fg='cyan')}"
                     if issue_count > 0:
                         # Determine severity for coloring
-                        has_critical = any(
-                            issue.get("severity") == "critical"
-                            for issue in visible_issues
-                            if isinstance(issue, dict)
-                        )
+                        has_critical = any(issue.get("severity") == "critical" for issue in visible_issues if isinstance(issue, dict))
                         if has_critical:
                             spinner.fail(
                                 click.style(
@@ -289,8 +273,8 @@ def scan_command(
                 spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
                 spinner.fail(click.style("❌ Error", fg="red", bold=True))
 
-            logger.error(f"Error during scan of {path}: {str(e)}", exc_info=verbose)
-            click.echo(f"Error scanning {path}: {str(e)}", err=True)
+            logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
+            click.echo(f"Error scanning {path}: {e!s}", err=True)
             aggregated_results["has_errors"] = True
 
     # Calculate total duration
@@ -340,7 +324,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     metrics = []
 
     # Scanner info
-    if "scanner_names" in results and results["scanner_names"]:
+    if results.get("scanner_names"):
         scanner_names = results["scanner_names"]
         if len(scanner_names) == 1:
             metrics.append(("Scanner", scanner_names[0], "blue"))
@@ -350,10 +334,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Duration
     if "duration" in results:
         duration = results["duration"]
-        if duration < 0.01:
-            duration_str = f"{duration:.3f}s"
-        else:
-            duration_str = f"{duration:.2f}s"
+        duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
         metrics.append(("Duration", duration_str, "cyan"))
 
     # Files scanned
@@ -382,11 +363,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
-    visible_issues = [
-        issue
-        for issue in issues
-        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-    ]
+    visible_issues = [issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"]
 
     # Count issues by severity
     severity_counts = {
@@ -414,8 +391,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             summary_parts.append(
                 "  "
                 + click.style(
-                    f"🚨 {severity_counts['critical']} Critical", fg="red", bold=True
-                )
+                    f"🚨 {severity_counts['critical']} Critical",
+                    fg="red",
+                    bold=True,
+                ),
             )
         if severity_counts["warning"] > 0:
             summary_parts.append(
@@ -423,15 +402,15 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 + click.style(
                     f"⚠️  {severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}",
                     fg="yellow",
-                )
+                ),
             )
         if severity_counts["info"] > 0:
             summary_parts.append(
-                "  " + click.style(f"ℹ️  {severity_counts['info']} Info", fg="blue")
+                "  " + click.style(f"[i] {severity_counts['info']} Info", fg="blue"),
             )
         if verbose and severity_counts["debug"] > 0:
             summary_parts.append(
-                "  " + click.style(f"🐛 {severity_counts['debug']} Debug", fg="cyan")
+                "  " + click.style(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
             )
 
         output_lines.extend(summary_parts)
@@ -440,14 +419,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append("")
 
         # Display critical issues first
-        critical_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "critical"
-        ]
+        critical_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"]
         if critical_issues:
             output_lines.append(
-                click.style("  🚨 Critical Issues", fg="red", bold=True)
+                click.style("  🚨 Critical Issues", fg="red", bold=True),
             )
             output_lines.append("  " + "─" * 40)
             for issue in critical_issues:
@@ -455,11 +430,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display warnings
-        warning_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "warning"
-        ]
+        warning_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"]
         if warning_issues:
             if critical_issues:
                 output_lines.append("")
@@ -470,15 +441,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display info issues
-        info_issues = [
-            issue
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "info"
-        ]
+        info_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "info"]
         if info_issues:
             if critical_issues or warning_issues:
                 output_lines.append("")
-            output_lines.append(click.style("  ℹ️  Information", fg="blue", bold=True))
+            output_lines.append(click.style("  [i] Information", fg="blue", bold=True))
             output_lines.append("  " + "─" * 40)
             for issue in info_issues:
                 _format_issue(issue, output_lines, "info")
@@ -486,11 +453,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display debug issues if verbose
         if verbose:
-            debug_issues = [
-                issue
-                for issue in visible_issues
-                if isinstance(issue, dict) and issue.get("severity") == "debug"
-            ]
+            debug_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"]
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
                     output_lines.append("")
@@ -544,23 +507,17 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     # Determine overall status
     if visible_issues:
-        if any(
-            isinstance(issue, dict) and issue.get("severity") == "critical"
-            for issue in visible_issues
-        ):
+        if any(isinstance(issue, dict) and issue.get("severity") == "critical" for issue in visible_issues):
             status_icon = "❌"
             status_msg = "CRITICAL SECURITY ISSUES FOUND"
             status_color = "red"
-        elif any(
-            isinstance(issue, dict) and issue.get("severity") == "warning"
-            for issue in visible_issues
-        ):
+        elif any(isinstance(issue, dict) and issue.get("severity") == "warning" for issue in visible_issues):
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
         else:
             # Only info/debug issues
-            status_icon = "ℹ️"
+            status_icon = "[i]"
             status_msg = "INFORMATIONAL FINDINGS"
             status_color = "blue"
     else:
@@ -577,7 +534,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
 
 def _format_issue(
-    issue: dict[str, Any], output_lines: list[str], severity: str
+    issue: dict[str, Any],
+    output_lines: list[str],
+    severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
     message = issue.get("message", "Unknown issue")
@@ -587,7 +546,7 @@ def _format_issue(
     icons = {
         "critical": "    └─ 🚨",
         "warning": "    └─ ⚠️ ",
-        "info": "    └─ ℹ️ ",
+        "info": "    └─ [i] ",
         "debug": "    └─ 🐛",
     }
 
@@ -609,7 +568,10 @@ def _format_issue(
         import textwrap
 
         wrapped_why = textwrap.fill(
-            why, width=65, initial_indent="", subsequent_indent="           "
+            why,
+            width=65,
+            initial_indent="",
+            subsequent_indent="           ",
         )
         output_lines.append(f"       {why_label} {wrapped_why}")
 

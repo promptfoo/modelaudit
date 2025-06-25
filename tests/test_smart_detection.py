@@ -249,7 +249,10 @@ class TestContextAwareFiltering:
 
         for key, value, matches in tokenizer_keys:
             result = scanner._should_ignore_in_context(
-                key, value, matches, tokenizer_context
+                key,
+                value,
+                matches,
+                tokenizer_context,
             )
             assert result is True, f"Should ignore tokenizer key: {key}"
 
@@ -284,7 +287,10 @@ class TestContextAwareFiltering:
 
         for key, value, matches in suspicious_keys:
             result = scanner._should_ignore_in_context(
-                key, value, matches, non_ml_context
+                key,
+                value,
+                matches,
+                non_ml_context,
             )
             assert result is False, f"Should not ignore {key} in non-ML context"
 
@@ -321,9 +327,7 @@ class TestFilePathDetection:
         ]
 
         for path in absolute_paths:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect absolute path: {path}"
-            )
+            assert scanner._is_file_path_value(path) is True, f"Should detect absolute path: {path}"
 
     def test_is_file_path_value_relative_paths(self):
         """Test detection of relative file paths with separators."""
@@ -337,9 +341,7 @@ class TestFilePathDetection:
         ]
 
         for path in relative_paths:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect relative path: {path}"
-            )
+            assert scanner._is_file_path_value(path) is True, f"Should detect relative path: {path}"
 
     def test_is_file_path_value_file_extensions(self):
         """Test detection based on file extensions."""
@@ -355,9 +357,7 @@ class TestFilePathDetection:
         ]
 
         for filename in file_extensions:
-            assert scanner._is_file_path_value(filename) is True, (
-                f"Should detect file extension: {filename}"
-            )
+            assert scanner._is_file_path_value(filename) is True, f"Should detect file extension: {filename}"
 
     def test_is_file_path_value_common_path_indicators(self):
         """Test detection of common path indicators."""
@@ -372,9 +372,7 @@ class TestFilePathDetection:
         ]
 
         for path in path_indicators:
-            assert scanner._is_file_path_value(path) is True, (
-                f"Should detect path indicator: {path}"
-            )
+            assert scanner._is_file_path_value(path) is True, f"Should detect path indicator: {path}"
 
     def test_is_file_path_value_non_paths(self):
         """Test that non-path values are not detected as paths."""
@@ -393,9 +391,7 @@ class TestFilePathDetection:
         ]
 
         for value in non_paths:
-            assert scanner._is_file_path_value(value) is False, (
-                f"Should not detect as path: {value}"
-            )
+            assert scanner._is_file_path_value(value) is False, f"Should not detect as path: {value}"
 
 
 class TestSeverityAssignment:
@@ -413,7 +409,8 @@ class TestSeverityAssignment:
         # Even in ML context, execution should be ERROR
         severity_ml = scanner._get_context_aware_severity(execution_matches, ml_context)
         severity_non_ml = scanner._get_context_aware_severity(
-            execution_matches, non_ml_context
+            execution_matches,
+            non_ml_context,
         )
 
         assert severity_ml == IssueSeverity.CRITICAL
@@ -440,10 +437,12 @@ class TestSeverityAssignment:
         file_access_matches = ["file_access"]
 
         severity_high_ml = scanner._get_context_aware_severity(
-            file_access_matches, high_confidence_ml
+            file_access_matches,
+            high_confidence_ml,
         )
         severity_low = scanner._get_context_aware_severity(
-            file_access_matches, low_confidence_context
+            file_access_matches,
+            low_confidence_context,
         )
 
         assert severity_high_ml == IssueSeverity.INFO
@@ -457,7 +456,8 @@ class TestSeverityAssignment:
 
         network_matches = ["network_access"]
         severity = scanner._get_context_aware_severity(
-            network_matches, high_confidence_ml
+            network_matches,
+            high_confidence_ml,
         )
 
         assert severity == IssueSeverity.INFO
@@ -506,12 +506,8 @@ class TestIntegrationScenarios:
             errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
-            assert len(errors) == 0, (
-                f"Found unexpected errors: {[e.message for e in errors]}"
-            )
-            assert len(warnings) == 0, (
-                f"Found unexpected warnings: {[w.message for w in warnings]}"
-            )
+            assert len(errors) == 0, f"Found unexpected errors: {[e.message for e in errors]}"
+            assert len(warnings) == 0, f"Found unexpected warnings: {[w.message for w in warnings]}"
 
         finally:
             Path(test_file).unlink(missing_ok=True)
@@ -572,12 +568,8 @@ class TestIntegrationScenarios:
             warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
             # Should have errors for dangerous values
-            dangerous_value_errors = [
-                e for e in errors if e.details.get("analysis") == "value_based"
-            ]
-            assert (
-                len(dangerous_value_errors) >= 2
-            )  # initialization_script and custom_code
+            dangerous_value_errors = [e for e in errors if e.details.get("analysis") == "value_based"]
+            assert len(dangerous_value_errors) >= 2  # initialization_script and custom_code
 
             # Should have warnings for network access and credentials
             assert len(warnings) >= 1
@@ -609,12 +601,7 @@ class TestIntegrationScenarios:
             errors = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
 
             # Should have at least one error for dangerous value
-            dangerous_errors = [
-                e
-                for e in errors
-                if "init_script" in e.message
-                or e.details.get("analysis") == "value_based"
-            ]
+            dangerous_errors = [e for e in errors if "init_script" in e.message or e.details.get("analysis") == "value_based"]
             assert len(dangerous_errors) >= 1
 
         finally:
@@ -655,10 +642,10 @@ class TestEdgeCases:
                         "level4": {
                             "tokenizer_class": "BertTokenizer",
                             "dangerous_code": "exec('malicious')",
-                        }
-                    }
-                }
-            }
+                        },
+                    },
+                },
+            },
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -736,7 +723,10 @@ def scanner():
     ],
 )
 def test_framework_detection_parametrized(
-    scanner, framework, config_keys, expected_framework
+    scanner,
+    framework,
+    config_keys,
+    expected_framework,
 ):
     """Parametrized test for framework detection."""
     config = {key: f"test_{key}" for key in config_keys}
@@ -759,7 +749,9 @@ def test_framework_detection_parametrized(
     ],
 )
 def test_dangerous_value_detection_parametrized(
-    scanner, dangerous_value, should_detect
+    scanner,
+    dangerous_value,
+    should_detect,
 ):
     """Parametrized test for dangerous value detection."""
     result = scanner._is_actually_dangerous_value("test_key", dangerous_value)

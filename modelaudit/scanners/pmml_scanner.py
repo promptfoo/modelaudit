@@ -1,5 +1,6 @@
 import os
 import re
+from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -46,7 +47,7 @@ class PmmlScanner(BaseScanner):
 
     name = "pmml"
     description = "Scans PMML files for XML security issues and suspicious content"
-    supported_extensions = [".pmml"]
+    supported_extensions: ClassVar[list[str]] = [".pmml"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -144,7 +145,10 @@ class PmmlScanner(BaseScanner):
         return result
 
     def _check_dangerous_xml_constructs(
-        self, text: str, result: ScanResult, path: str
+        self,
+        text: str,
+        result: ScanResult,
+        path: str,
     ) -> None:
         """Check for dangerous XML constructs that could enable XXE attacks."""
         text_upper = text.upper()
