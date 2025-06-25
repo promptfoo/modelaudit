@@ -63,6 +63,8 @@ ModelAudit scans ML model files for:
 
 ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/) and requires **Python 3.9 or higher**.
 
+The `rich` library powers the colorful console view and is installed automatically.
+
 **Basic installation:**
 
 ```bash
@@ -199,6 +201,7 @@ Issues found: 2 critical, 1 warnings
 - **SBOM Generation**: CycloneDX Software Bill of Materials with license metadata
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
+- **Improved Console View**: Colorful tables rendered with `rich` for easy reading
 - **CI/CD Integration**: Clear exit codes for automated pipeline integration
 
 ### Security Detection

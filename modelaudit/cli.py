@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -6,6 +7,10 @@ import time
 from typing import Any
 
 import click
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.tree import Tree
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
@@ -287,49 +292,27 @@ def scan_command(
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
-    """Format scan results as human-readable text with colors"""
-    output_lines = []
+    """Format scan results as human-readable text using Rich."""
+    console = Console(file=io.StringIO(), record=True)
 
-    # Add summary information with styling
-    if "scanner_names" in results and results["scanner_names"]:
-        scanner_names = results["scanner_names"]
-        if len(scanner_names) == 1:
-            output_lines.append(
-                click.style(
-                    f"Active Scanner: {scanner_names[0]}", fg="blue", bold=True
-                ),
-            )
-        else:
-            output_lines.append(
-                click.style(
-                    f"Active Scanners: {', '.join(scanner_names)}",
-                    fg="blue",
-                    bold=True,
-                ),
-            )
-    if "duration" in results:
-        duration = results["duration"]
+    summary = Table(show_header=False, box=box.SIMPLE)
+
+    scanners = results.get("scanner_names")
+    if scanners:
+        label = "Active Scanner" if len(scanners) == 1 else "Active Scanners"
+        summary.add_row(label, ", ".join(scanners))
+
+    duration = results.get("duration")
+    if duration is not None:
         if duration < 0.01:
-            # For very fast scans, show more precision
-            output_lines.append(
-                click.style(
-                    f"Scan completed in {duration:.3f} seconds",
-                    fg="cyan",
-                ),
-            )
+            summary.add_row("Duration", f"{duration:.3f} seconds")
         else:
-            output_lines.append(
-                click.style(
-                    f"Scan completed in {duration:.2f} seconds",
-                    fg="cyan",
-                ),
-            )
+            summary.add_row("Duration", f"{duration:.2f} seconds")
+
     if "files_scanned" in results:
-        output_lines.append(
-            click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
-        )
+        summary.add_row("Files scanned", str(results["files_scanned"]))
+
     if "bytes_scanned" in results:
-        # Format bytes in a more readable way
         bytes_scanned = results["bytes_scanned"]
         if bytes_scanned >= 1024 * 1024 * 1024:
             size_str = f"{bytes_scanned / (1024 * 1024 * 1024):.2f} GB"
@@ -339,11 +322,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             size_str = f"{bytes_scanned / 1024:.2f} KB"
         else:
             size_str = f"{bytes_scanned} bytes"
-        output_lines.append(click.style(f"Scanned {size_str}", fg="cyan"))
+        summary.add_row("Scanned", size_str)
 
-    # Add issue details with color-coded severity
+    console.print(summary)
+
     issues = results.get("issues", [])
-    # Filter out DEBUG severity issues when not in verbose mode
     visible_issues = [
         issue
         for issue in issues
@@ -351,7 +334,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     ]
 
     if visible_issues:
-        # Count issues by severity (excluding DEBUG when not in verbose mode)
         error_count = sum(
             1
             for issue in visible_issues
@@ -373,129 +355,91 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             if isinstance(issue, dict) and issue.get("severity") == "debug"
         )
 
-        # Only show debug count in verbose mode
-        issue_summary = []
+        summary_parts = []
         if error_count:
-            issue_summary.append(
-                click.style(f"{error_count} critical", fg="red", bold=True),
-            )
+            summary_parts.append(f"[red bold]{error_count} critical[/]")
         if warning_count:
-            issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
+            summary_parts.append(f"[yellow]{warning_count} warnings[/]")
         if info_count:
-            issue_summary.append(click.style(f"{info_count} info", fg="blue"))
+            summary_parts.append(f"[blue]{info_count} info[/]")
         if verbose and debug_count:
-            issue_summary.append(click.style(f"{debug_count} debug", fg="cyan"))
+            summary_parts.append(f"[cyan]{debug_count} debug[/]")
+        if summary_parts:
+            console.print("Issues found: " + ", ".join(summary_parts))
 
-        if issue_summary:
-            output_lines.append(
-                click.style("Issues found: ", fg="white") + ", ".join(issue_summary),
-            )
+        issue_table = Table(box=box.SIMPLE)
+        issue_table.add_column("#", style="bold")
+        issue_table.add_column("Severity")
+        issue_table.add_column("Location")
+        issue_table.add_column("Message")
 
-        # Only display visible issues
         for i, issue in enumerate(visible_issues, 1):
             severity = issue.get("severity", "warning").lower()
-
-            # Skip debug issues if verbose is not enabled
-            if severity == "debug" and not verbose:
-                continue
-
-            message = issue.get("message", "Unknown issue")
-            location = issue.get("location", "")
-
-            # Color-code based on severity
             if severity == "critical":
-                severity_style = click.style("[CRITICAL]", fg="red", bold=True)
+                severity_text = "[bold red]CRITICAL[/]"
             elif severity == "warning":
-                severity_style = click.style("[WARNING]", fg="yellow")
+                severity_text = "[yellow]WARNING[/]"
             elif severity == "info":
-                severity_style = click.style("[INFO]", fg="blue")
-            elif severity == "debug":
-                severity_style = click.style("[DEBUG]", fg="bright_black")
-
-            # Format the issue line
-            issue_num = click.style(f"{i}.", fg="white", bold=True)
-            if location:
-                location_str = click.style(f"{location}", fg="cyan", bold=True)
-                output_lines.append(
-                    f"{issue_num} {location_str}: {severity_style} {message}",
-                )
+                severity_text = "[blue]INFO[/]"
             else:
-                output_lines.append(f"{issue_num} {severity_style} {message}")
+                severity_text = "[cyan]DEBUG[/]"
 
-            # Add "Why" explanation if available
+            location = issue.get("location", "")
+            message = issue.get("message", "Unknown issue")
+
+            issue_table.add_row(str(i), severity_text, location, message)
+
             why = issue.get("why")
             if why:
-                # Indent the explanation and style it
-                why_label = click.style("   Why:", fg="magenta", bold=True)
-                why_text = click.style(f" {why}", fg="bright_white")
-                output_lines.append(f"{why_label}{why_text}")
+                issue_table.add_row("", "", "", f"[magenta]Why:[/] {why}")
 
-            # Add a small separator between issues for readability
-            if i < len(visible_issues):
-                output_lines.append("")
+        console.print(issue_table)
     else:
-        output_lines.append(
-            "\n" + click.style("✓ No issues found", fg="green", bold=True),
-        )
+        console.print("[bold green]✓ No issues found")
 
-    # Asset list
     assets = results.get("assets", [])
     if assets:
-        output_lines.append("\nAssets encountered:")
+        tree = Tree("Assets encountered:")
 
-        def render_assets(items, indent=1):
-            lines = []
+        def add_assets(node: Tree, items: list[dict[str, Any]]):
             for asset in items:
-                prefix = "  " * indent + "- "
-                line = f"{prefix}{asset.get('path')}"
+                label = asset.get("path", "")
                 if asset.get("type"):
-                    line += f" ({asset['type']})"
+                    label += f" ({asset['type']})"
                 if asset.get("size"):
-                    line += f" [{asset['size']} bytes]"
-                lines.append(line)
+                    label += f" [{asset['size']} bytes]"
+                child = node.add(label)
                 if asset.get("tensors"):
-                    tline = (
-                        "  " * (indent + 1) + "Tensors: " + ", ".join(asset["tensors"])
-                    )
-                    lines.append(tline)
+                    child.add("Tensors: " + ", ".join(asset["tensors"]))
                 if asset.get("keys"):
-                    kline = (
-                        "  " * (indent + 1)
-                        + "Keys: "
-                        + ", ".join(map(str, asset["keys"]))
-                    )
-                    lines.append(kline)
+                    child.add("Keys: " + ", ".join(map(str, asset["keys"])))
                 if asset.get("contents"):
-                    lines.extend(render_assets(asset["contents"], indent + 1))
-            return lines
+                    add_assets(child, asset["contents"])
 
-        output_lines.extend(render_assets(assets))
+        add_assets(tree, assets)
+        console.print(tree)
 
-    # Add a footer
-    output_lines.append("─" * 80)
+    console.rule()
+
     if visible_issues:
         if any(
             isinstance(issue, dict) and issue.get("severity") == "critical"
             for issue in visible_issues
         ):
-            status = click.style("✗ Scan completed with findings", fg="red", bold=True)
+            status = "[bold red]✗ Scan completed with findings[/]"
         elif any(
             isinstance(issue, dict) and issue.get("severity") == "warning"
             for issue in visible_issues
         ):
-            status = click.style(
-                "⚠ Scan completed with warnings",
-                fg="yellow",
-                bold=True,
-            )
+            status = "[bold yellow]⚠ Scan completed with warnings[/]"
         else:
-            # Only info/debug issues
-            status = click.style("✓ Scan completed successfully", fg="green", bold=True)
+            status = "[bold green]✓ Scan completed successfully[/]"
     else:
-        status = click.style("✓ Scan completed successfully", fg="green", bold=True)
-    output_lines.append(status)
+        status = "[bold green]✓ Scan completed successfully[/]"
 
-    return "\n".join(output_lines)
+    console.print(status)
+
+    return console.export_text()
 
 
 def main():

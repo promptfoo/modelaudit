@@ -80,7 +80,7 @@ def test_cli_scan_directory(temp_model_dir):
     assert str(temp_model_dir) in result.output
 
     # Should mention the number of files scanned
-    assert "Files scanned: " in result.output
+    assert "Files scanned" in result.output
 
 
 def test_cli_json_output_parsing(temp_model_dir):

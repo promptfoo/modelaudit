@@ -31,6 +31,7 @@ dependencies = [
     "scipy>=1.5.0",
     "cyclonedx-python-lib>=10.2.0",
     "defusedxml>=0.7.1",
+    "rich>=14.0.0",
 ]
 
 [project.optional-dependencies]
