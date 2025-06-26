@@ -5,9 +5,11 @@ import tempfile
 
 from modelaudit.explanations import (
     COMMON_MESSAGE_EXPLANATIONS,
+    TF_OP_EXPLANATIONS,
     get_import_explanation,
     get_message_explanation,
     get_opcode_explanation,
+    get_tf_op_explanation,
 )
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -145,6 +147,132 @@ def test_cli_output_format_includes_why():
     clean_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
     normalized_output = " ".join(clean_output.split())
     assert "operating system functions" in normalized_output
+
+
+def test_tf_op_explanation_function():
+    """Test the get_tf_op_explanation function directly."""
+    # Test valid TensorFlow operation
+    explanation = get_tf_op_explanation("PyFunc")
+    assert explanation is not None
+    assert "executes arbitrary Python code" in explanation
+    assert "TensorFlow graph" in explanation
+
+    # Test another critical operation
+    explanation = get_tf_op_explanation("ShellExecute")
+    assert explanation is not None
+    assert "shell commands" in explanation
+    assert "compromising the host system" in explanation
+
+    # Test file operation
+    explanation = get_tf_op_explanation("ReadFile")
+    assert explanation is not None
+    assert "arbitrary files" in explanation
+    assert "exfiltrate secrets" in explanation
+
+    # Test invalid operation
+    explanation = get_tf_op_explanation("NonExistentOp")
+    assert explanation is None
+
+
+def test_all_tf_operations_have_explanations():
+    """Test that all TensorFlow operations in TF_OP_EXPLANATIONS have valid explanations."""
+    from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+
+    # Verify all SUSPICIOUS_OPS have explanations
+    for op in SUSPICIOUS_OPS:
+        explanation = get_tf_op_explanation(op)
+        assert explanation is not None, f"Missing explanation for TensorFlow operation: {op}"
+        assert isinstance(explanation, str), f"Explanation for {op} must be a string"
+        assert len(explanation) > 10, f"Explanation for {op} is too short: {explanation}"
+
+    # Verify all explanations are for operations in SUSPICIOUS_OPS
+    for op in TF_OP_EXPLANATIONS:
+        assert op in SUSPICIOUS_OPS, f"TF_OP_EXPLANATIONS contains {op} which is not in SUSPICIOUS_OPS"
+
+
+def test_tf_explanation_quality():
+    """Test that TensorFlow explanations meet quality standards."""
+    for op_name, explanation in TF_OP_EXPLANATIONS.items():
+        # Should be non-empty string
+        assert isinstance(explanation, str), f"Explanation for {op_name} must be a string"
+        assert len(explanation) > 20, f"Explanation for {op_name} is too short"
+
+        # Should mention security risk or attack vector
+        security_keywords = [
+            "attack",
+            "malicious",
+            "abuse",
+            "exploit",
+            "dangerous",
+            "risk",
+            "compromise",
+            "execute",
+            "system",
+            "arbitrary",
+            "vulnerabilities",
+        ]
+        assert any(keyword in explanation.lower() for keyword in security_keywords), (
+            f"Explanation for {op_name} should mention security risks: {explanation}"
+        )
+
+        # Should be properly formatted (no trailing/leading whitespace)
+        assert explanation == explanation.strip(), f"Explanation for {op_name} has improper whitespace"
+
+
+def test_tf_explanation_categories():
+    """Test that TensorFlow explanations are properly categorized by risk level."""
+    # Critical risk operations (code execution)
+    critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute", "SystemConfig"]
+    for op in critical_ops:
+        explanation = get_tf_op_explanation(op)
+        assert explanation is not None
+        # Should mention code execution or system compromise
+        critical_keywords = ["execute", "code", "system", "shell", "commands"]
+        assert any(keyword in explanation.lower() for keyword in critical_keywords), (
+            f"Critical operation {op} should mention code execution risks"
+        )
+
+    # File system operations
+    file_ops = ["ReadFile", "WriteFile", "Save", "SaveV2", "MergeV2Checkpoints"]
+    for op in file_ops:
+        explanation = get_tf_op_explanation(op)
+        assert explanation is not None
+        # Should mention file operations
+        file_keywords = ["file", "write", "read", "save", "overwrite"]
+        assert any(keyword in explanation.lower() for keyword in file_keywords), (
+            f"File operation {op} should mention file system risks"
+        )
+
+    # Data processing operations
+    data_ops = ["DecodeRaw", "DecodeJpeg", "DecodePng"]
+    for op in data_ops:
+        explanation = get_tf_op_explanation(op)
+        assert explanation is not None
+        # Should mention data processing risks
+        data_keywords = ["decode", "data", "malicious", "exploit", "vulnerabilities"]
+        assert any(keyword in explanation.lower() for keyword in data_keywords), (
+            f"Data operation {op} should mention data processing risks"
+        )
+
+
+def test_tf_explanation_unified_architecture():
+    """Test that TensorFlow explanations use the unified get_explanation architecture."""
+    from modelaudit.explanations import get_explanation
+
+    # Test that get_tf_op_explanation uses get_explanation internally
+    op_name = "PyFunc"
+    direct_explanation = get_tf_op_explanation(op_name)
+    unified_explanation = get_explanation("tf_op", op_name)
+
+    assert direct_explanation == unified_explanation, "get_tf_op_explanation should use get_explanation internally"
+
+    # Test all TF operations through unified interface
+    for op_name in TF_OP_EXPLANATIONS:
+        explanation = get_explanation("tf_op", op_name)
+        assert explanation is not None, f"get_explanation should work for tf_op category with {op_name}"
+        assert explanation == TF_OP_EXPLANATIONS[op_name], (
+            f"Unified explanation should match direct lookup for {op_name}"
+        )
 
 
 def test_common_message_explanations_coverage():

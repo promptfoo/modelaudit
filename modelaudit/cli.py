@@ -515,39 +515,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         )
         output_lines.append("")
 
-    # Asset list - simplified
-    assets = results.get("assets", [])
-    if assets:
-        output_lines.append(click.style("\n📦 SCANNED FILES", fg="white", bold=True))
-        output_lines.append("" + "─" * 60)
-
-        def render_assets(items, indent=1):
-            lines = []
-            for asset in items:
-                prefix = "  " * indent
-                path_str = asset.get("path", "")
-
-                # Add size if available
-                size_info = ""
-                if asset.get("size"):
-                    size = asset["size"]
-                    if size >= 1024 * 1024:
-                        size_info = f" ({size / (1024 * 1024):.1f} MB)"
-                    elif size >= 1024:
-                        size_info = f" ({size / 1024:.1f} KB)"
-                    else:
-                        size_info = f" ({size} bytes)"
-
-                line = f"{prefix}• {click.style(path_str, fg='cyan')}{click.style(size_info, fg='bright_black')}"
-                lines.append(line)
-
-                # Recursively show contents for archives
-                if asset.get("contents"):
-                    lines.extend(render_assets(asset["contents"], indent + 1))
-            return lines
-
-        output_lines.extend(render_assets(assets))
-
     # Add a footer with final status
     output_lines.append("")
     output_lines.append("═" * 80)
