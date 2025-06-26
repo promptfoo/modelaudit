@@ -93,6 +93,60 @@ jobs:
         run: |
           rye run pytest -n auto -m "slow or integration" --tb=short
 
+  test-numpy-compatibility:
+    name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+        numpy-mode: ["1.x", "2.x"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
+        with:
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
+
+      - name: Install with NumPy 1.x compatibility mode
+        if: matrix.numpy-mode == '1.x'
+        run: |
+          rye sync --no-dev
+          rye add --optional numpy1 'numpy>=1.19.0,<2.0'
+          rye sync --features numpy1
+
+      - name: Install with NumPy 2.x (default)
+        if: matrix.numpy-mode == '2.x'
+        run: |
+          rye sync --features all
+
+      - name: Check NumPy version
+        run: |
+          rye run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+
+      - name: Test scanner diagnostics
+        run: |
+          rye run modelaudit doctor --show-failed
+
+      - name: Test basic scanning functionality
+        run: |
+          # Create a test file to scan
+          echo "Testing basic scanning with NumPy ${{ matrix.numpy-mode }}"
+          rye run python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+          rye run modelaudit scan test_model.pkl --format json --output test_results.json
+          cat test_results.json
+
+      - name: Run NumPy compatibility tests
+        run: |
+          rye run pytest tests/test_numpy_scanner.py -v
+          rye run pytest tests/test_scanner_registry.py -v -k "numpy"
+
   build:
     name: Build and Package
     needs: [lint, type-check]
