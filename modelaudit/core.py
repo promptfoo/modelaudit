@@ -229,22 +229,20 @@ def scan_model_directory_or_file(
                 if dvc_targets:
                     target_files = dvc_targets
 
-            for idx, target in enumerate(target_files):
+            for _idx, target in enumerate(target_files):
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
 
                 file_size = os.path.getsize(target)
-                results["files_scanned"] = (
-                    cast(int, results.get("files_scanned", 0)) + 1
-                )
+                results["files_scanned"] = cast(int, results.get("files_scanned", 0)) + 1
 
                 if progress_callback is not None and file_size > 0:
-                    original_builtins_open = builtins.open
+                    # Capture variables to avoid closure issues
+                    callback = progress_callback
+                    current_file_size = file_size
 
-                    def progress_open(
-                        file_path: str, mode: str = "r", *args: Any, **kwargs: Any
-                    ) -> IO[Any]:
-                        file = original_builtins_open(file_path, mode, *args, **kwargs)
+                    def progress_open(file_path: str, mode: str = "r", *args: Any, **kwargs: Any) -> IO[Any]:
+                        file = builtins.open(file_path, mode, *args, **kwargs)
                         file_pos = 0
 
                         original_read = file.read
@@ -254,10 +252,10 @@ def scan_model_directory_or_file(
                             data = original_read(size)
                             if isinstance(data, (str, bytes)):
                                 file_pos += len(data)
-                            if progress_callback is not None:
-                                progress_callback(
+                            if callback is not None:
+                                callback(
                                     f"Reading file: {os.path.basename(file_path)}",
-                                    min(file_pos / file_size * 100, 100),
+                                    min(file_pos / current_file_size * 100, 100),
                                 )
                             return data
 
@@ -269,9 +267,7 @@ def scan_model_directory_or_file(
                 else:
                     file_result = scan_file(target, config)
 
-                results["bytes_scanned"] = (
-                    cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-                )
+                results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
 
                 scanner_name = file_result.scanner_name
                 scanners_list = cast(list[str], results["scanners"])
@@ -289,13 +285,13 @@ def scan_model_directory_or_file(
                 combined_metadata = {**file_result.metadata, **license_metadata}
                 file_meta[target] = combined_metadata
 
-                if (
-                    max_total_size > 0
-                    and cast(int, results["bytes_scanned"]) > max_total_size
-                ):
+                if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
                     issues_list.append(
                         {
-                            "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                            "message": (
+                                f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                                f"(max: {max_total_size})"
+                            ),
                             "severity": IssueSeverity.WARNING.value,
                             "location": target,
                             "details": {"max_total_size": max_total_size},

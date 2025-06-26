@@ -139,9 +139,7 @@ def scan_command(
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        click.echo(
-            f"Paths to scan: {click.style(', '.join(expanded_paths), fg='green')}"
-        )
+        click.echo(f"Paths to scan: {click.style(', '.join(expanded_paths), fg='green')}")
         if blacklist:
             click.echo(
                 f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
