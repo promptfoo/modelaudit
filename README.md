@@ -153,7 +153,7 @@ modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib mo
 modelaudit scan ./models/
 
 # Scan a model stored in the MLflow registry
-modelaudit scan-mlflow models:/MyModel/1
+modelaudit scan models:/MyModel/1
 
 # Scan a model from HuggingFace Hub
 modelaudit scan https://huggingface.co/gpt2
@@ -281,7 +281,7 @@ modelaudit scan model.pkl --sbom sbom.json
 modelaudit scan model.pkl --verbose
 
 # Scan a model from the MLflow registry
-modelaudit scan-mlflow models:/MyModel/Staging
+modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
 ```
 
 ### Exit Codes
