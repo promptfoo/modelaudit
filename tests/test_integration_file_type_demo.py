@@ -39,19 +39,13 @@ class TestFileTypeValidationDemo:
                 is_valid = validate_file_type(str(file_path))
                 result = scan_file(str(file_path))
 
-                validation_issues = [
-                    i
-                    for i in result.issues
-                    if "file type validation failed" in i.message.lower()
-                ]
+                validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
                 print(
-                    f"✅ {file_path.name}: Valid={is_valid}, Issues={len(validation_issues)}"
+                    f"✅ {file_path.name}: Valid={is_valid}, Issues={len(validation_issues)}",
                 )
                 assert is_valid, f"Legitimate file {file_path.name} should be valid"
-                assert len(validation_issues) == 0, (
-                    f"No validation issues expected for {file_path.name}"
-                )
+                assert len(validation_issues) == 0, f"No validation issues expected for {file_path.name}"
 
     def test_security_threat_detection_demo(self, tmp_path):
         """Demonstrate detection of file spoofing security threats."""
@@ -75,11 +69,7 @@ class TestFileTypeValidationDemo:
             is_valid = validate_file_type(str(attack_file))
             result = scan_file(str(attack_file))
 
-            validation_issues = [
-                i
-                for i in result.issues
-                if "file type validation failed" in i.message.lower()
-            ]
+            validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
             print(f"⚠️  {filename}: Valid={is_valid}, Issues={len(validation_issues)}")
 
@@ -116,21 +106,13 @@ class TestFileTypeValidationDemo:
             is_valid = validate_file_type(str(file_path))
             result = scan_file(str(file_path))
 
-            validation_issues = [
-                i
-                for i in result.issues
-                if "file type validation failed" in i.message.lower()
-            ]
+            validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
             print(
-                f"✅ {description}: Valid={is_valid}, Issues={len(validation_issues)}"
+                f"✅ {description}: Valid={is_valid}, Issues={len(validation_issues)}",
             )
-            assert is_valid, (
-                f"Legitimate cross-format file should be valid: {description}"
-            )
-            assert len(validation_issues) == 0, (
-                f"No validation issues expected for: {description}"
-            )
+            assert is_valid, f"Legitimate cross-format file should be valid: {description}"
+            assert len(validation_issues) == 0, f"No validation issues expected for: {description}"
 
     def test_directory_scan_demo(self, test_data_dir):
         """Demonstrate directory-level scanning with file type validation."""
@@ -153,9 +135,7 @@ class TestFileTypeValidationDemo:
             print(f"   Scan success: {results['success']}")
 
             assert results["success"], "Directory scan should succeed"
-            assert len(validation_warnings) == 0, (
-                "No validation warnings expected for legitimate directory"
-            )
+            assert len(validation_warnings) == 0, "No validation warnings expected for legitimate directory"
 
     def test_end_to_end_security_demo(self, test_data_dir, tmp_path):
         """End-to-end demonstration of security validation in mixed directory."""
@@ -178,17 +158,14 @@ class TestFileTypeValidationDemo:
         results = scan_model_directory_or_file(str(mixed_dir))
 
         validation_warnings = [
-            issue
-            for issue in results["issues"]
-            if "file type validation failed" in issue.get("message", "").lower()
+            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
         ]
 
         security_issues = [
             issue
             for issue in results["issues"]
             if any(
-                keyword in issue.get("message", "").lower()
-                for keyword in ["spoofing", "security", "validation failed"]
+                keyword in issue.get("message", "").lower() for keyword in ["spoofing", "security", "validation failed"]
             )
         ]
 
@@ -207,7 +184,7 @@ class TestFileTypeValidationDemo:
         assert exit_code == 1, f"Expected exit code 1 (warnings), got {exit_code}"
 
         print(
-            "   ✅ SECURITY THREATS DETECTED - File type validation working correctly!"
+            "   ✅ SECURITY THREATS DETECTED - File type validation working correctly!",
         )
 
     def _get_exit_code(self, results):

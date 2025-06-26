@@ -58,23 +58,24 @@ modelaudit/
 - **MyPy**: Static type checking
 - **pytest**: Testing framework with coverage
 
-**Formatting Standards:**
+**Code Quality Standards (matches CI workflow):**
 
 ```bash
-# PRODUCTION CODE (matches CI workflow):
-rye run ruff format modelaudit/       # Format production code
-rye run ruff check modelaudit/        # Lint production code
-rye run mypy modelaudit/             # Type check
+# PRE-COMMIT WORKFLOW (development - format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
 rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests
 
-# DEVELOPMENT (including tests):
-rye run ruff format modelaudit/ tests/  # Format code and tests
-rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
-rye run mypy modelaudit/             # Type check
-rye run pytest                      # Run all tests
-
-# CI FORMAT CHECK (read-only verification):
-rye run ruff format --check modelaudit/  # Verify formatting without changes
+# CI VERIFICATION COMMANDS (read-only, matches test.yml):
+rye run ruff check modelaudit/ tests/            # Lint check
+rye run ruff check --select I modelaudit/ tests/ # Import organization check
+rye run ruff format --check modelaudit/ tests/   # Format verification
+rye run mypy modelaudit/ tests/                  # Type checking
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests (main branch only in CI)
 ```
 
 ### Naming Conventions
@@ -202,24 +203,25 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
 ### Running Tests
 
 ```bash
-# Run all tests
-rye run pytest
-
-# Run fast tests (parallel execution, excludes slow/integration/performance tests)
+# Run fast tests (matches CI workflow - parallel execution, excludes slow/integration/performance tests)
 rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+
+# Run slow/integration tests (matches CI workflow - usually main branch only)
+rye run pytest -n auto -m "slow or integration" --tb=short
+
+# Run all tests (not recommended for regular development)
+rye run pytest
 
 # Run specific test file
 rye run pytest tests/test_my_scanner.py -v
 
-# Run with coverage
+# Run with coverage (already included in fast tests command above)
 rye run pytest --cov=modelaudit
 
-# Run slow/integration tests (usually CI-only on main branch)
-rye run pytest -n auto -m "slow or integration" --tb=short
-
-# Run tests for specific Python versions
+# Run tests for specific Python versions (matches CI matrix: 3.9, 3.10, 3.11, 3.12)
 rye sync --features all  # Install all dependencies first
-rye run pytest
+rye pin 3.11             # Pin to specific version (example)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
 ```
 
 ## 📦 Dependencies & Installation
@@ -257,6 +259,7 @@ The project uses optional dependencies for specific scanners:
 - `all`: All of the above dependencies
 
 Install specific extras as needed:
+
 ```bash
 # With pip
 pip install modelaudit[tensorflow,pytorch,h5]
@@ -378,11 +381,12 @@ When contributing code:
 ### Pre-commit Checklist
 
 ```bash
-# Run before every commit (development workflow):
-rye run ruff format modelaudit/ tests/
-rye run ruff check --fix modelaudit/ tests/
-rye run mypy modelaudit/
-rye run pytest
+# Run before every commit (matches CI workflow with format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
 ```
 
 ## 🔗 Key Files for AI Agents
