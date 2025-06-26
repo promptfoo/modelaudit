@@ -43,9 +43,7 @@ def test_manifest_scanner_json(tmp_path):
 
     # Check that suspicious keys were detected
     suspicious_keys = [
-        issue.details.get("key", "")
-        for issue in result.issues
-        if hasattr(issue, "details") and "key" in issue.details
+        issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details") and "key" in issue.details
     ]
     assert any("file_path" in key for key in suspicious_keys)
     assert any("api_key" in key for key in suspicious_keys)
