@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, ClassVar
 
 try:
     import msgpack  # type: ignore
@@ -18,15 +18,14 @@ class FlaxMsgpackScanner(BaseScanner):
     """Scanner for Flax msgpack checkpoint files with security threat detection."""
 
     name = "flax_msgpack"
-    description = (
-        "Scans Flax/JAX msgpack checkpoints for security threats and integrity issues"
-    )
-    supported_extensions = [".msgpack"]  # Removed .ckpt to avoid conflicts with PyTorch
+    description = "Scans Flax/JAX msgpack checkpoints for security threats and integrity issues"
+    supported_extensions: ClassVar[list[str]] = [".msgpack"]  # Removed .ckpt to avoid conflicts with PyTorch
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         self.max_blob_bytes = self.config.get(
-            "max_blob_bytes", 50 * 1024 * 1024
+            "max_blob_bytes",
+            50 * 1024 * 1024,
         )  # 50MB reasonable for model weights
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 10000)
@@ -70,12 +69,13 @@ class FlaxMsgpackScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
-        if ext in cls.supported_extensions and HAS_MSGPACK:
-            return True
-        return False
+        return bool(ext in cls.supported_extensions and HAS_MSGPACK)
 
     def _check_suspicious_strings(
-        self, value: str, location: str, result: ScanResult
+        self,
+        value: str,
+        location: str,
+        result: ScanResult,
     ) -> None:
         """Check string values for suspicious patterns that might indicate code injection."""
         for pattern in self.suspicious_patterns:
@@ -92,7 +92,10 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
 
     def _check_suspicious_keys(
-        self, key: str, location: str, result: ScanResult
+        self,
+        key: str,
+        location: str,
+        result: ScanResult,
     ) -> None:
         """Check dictionary keys for suspicious names that might indicate serialization attacks."""
         if key in self.suspicious_keys:
@@ -104,7 +107,11 @@ class FlaxMsgpackScanner(BaseScanner):
             )
 
     def _analyze_content(
-        self, value: Any, location: str, result: ScanResult, depth: int = 0
+        self,
+        value: Any,
+        location: str,
+        result: ScanResult,
+        depth: int = 0,
     ) -> None:
         """Recursively analyze msgpack content for security threats and anomalies."""
         if depth > self.max_recursion_depth:
@@ -132,7 +139,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 decoded = value.decode("utf-8", errors="ignore")
                 if len(decoded) > 50:  # Only check substantial text
                     self._check_suspicious_strings(
-                        decoded, f"{location}[decoded_binary]", result
+                        decoded,
+                        f"{location}[decoded_binary]",
+                        result,
                     )
             except Exception:  # pragma: no cover - encoding edge cases
                 pass
@@ -224,9 +233,7 @@ class FlaxMsgpackScanner(BaseScanner):
             )
 
         # Check for non-standard keys that might be suspicious
-        suspicious_top_level = (
-            found_keys - expected_keys - {"metadata", "config", "hyperparams"}
-        )
+        suspicious_top_level = found_keys - expected_keys - {"metadata", "config", "hyperparams"}
         if suspicious_top_level:
             result.add_issue(
                 f"Unusual top-level keys found: {suspicious_top_level}",
@@ -281,7 +288,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 msgpack.exceptions.OutOfData,
             ) as e:
                 result.add_issue(
-                    f"Invalid msgpack format: {str(e)}",
+                    f"Invalid msgpack format: {e!s}",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"msgpack_error": str(e)},
@@ -292,9 +299,7 @@ class FlaxMsgpackScanner(BaseScanner):
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__
             if isinstance(obj, dict):
-                result.metadata["top_level_keys"] = list(obj.keys())[
-                    :50
-                ]  # Limit for large dicts
+                result.metadata["top_level_keys"] = list(obj.keys())[:50]  # Limit for large dicts
                 result.metadata["key_count"] = len(obj.keys())
 
             # Validate Flax structure
@@ -314,7 +319,7 @@ class FlaxMsgpackScanner(BaseScanner):
             return result
         except Exception as e:
             result.add_issue(
-                f"Unexpected error processing Flax msgpack file: {str(e)}",
+                f"Unexpected error processing Flax msgpack file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"error_type": type(e).__name__, "error_message": str(e)},
