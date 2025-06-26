@@ -1,7 +1,7 @@
 import struct
 
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
-from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
+from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS
 
 
 def test_pytorch_binary_scanner_can_handle(tmp_path):
@@ -74,32 +74,79 @@ def test_pytorch_binary_scanner_code_patterns(tmp_path):
     assert found_system
 
 
-def test_pytorch_binary_scanner_executable_signatures(tmp_path):
-    """Test detection of executable signatures."""
+def test_pytorch_binary_scanner_executable_signatures_at_start(tmp_path):
+    """Test detection of executable signatures at file start."""
     scanner = PyTorchBinaryScanner()
 
-    # Create a binary file with executable signatures
-    binary_file = tmp_path / "with_exe.bin"
-    sigs = list(EXECUTABLE_SIGNATURES.keys())[:2]
-    data = b"\x00" * 50 + sigs[0] + b"\x00" * 100 + sigs[1] + b"\x00" * 100
+    # Create a binary file with Windows executable signature at the beginning
+    binary_file = tmp_path / "real_exe.bin"
+    # MZ header at offset 0 - should be detected
+    data = b"MZ" + b"\x00" * 1000
     binary_file.write_bytes(data)
 
     result = scanner.scan(str(binary_file))
 
     assert result.success
-    assert len(result.issues) >= 2
 
-    # Check that we found the signatures
+    # Should find the Windows executable at offset 0
     found_pe = False
-    found_elf = False
+    for issue in result.issues:
+        if "Windows executable" in issue.message and "(offset: 0)" in issue.location:
+            found_pe = True
+
+    assert found_pe, "Should detect Windows executable at offset 0"
+
+
+def test_pytorch_binary_scanner_no_false_positive_mz(tmp_path):
+    """Test that MZ signature in middle of file is not flagged (false positive fix)."""
+    scanner = PyTorchBinaryScanner()
+
+    # Create a binary file with MZ signature in the middle (like BERT weights might have)
+    binary_file = tmp_path / "bert_weights.bin"
+    # Random data that happens to contain MZ in the middle
+    import struct
+
+    # Create float data
+    floats = [0.1, 0.2, 0.3, 0.4, 0.5]
+    float_data = struct.pack("f" * len(floats), *floats)
+    # Add MZ signature in the middle of the file
+    data = b"\x00" * 500 + b"MZ" + b"\x00" * 500 + float_data
+    binary_file.write_bytes(data)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success
+
+    # Should NOT find Windows executable (MZ is not at offset 0)
+    found_pe = False
     for issue in result.issues:
         if "Windows executable" in issue.message:
             found_pe = True
+
+    assert not found_pe, "Should NOT detect Windows executable when MZ is in middle of file"
+
+
+def test_pytorch_binary_scanner_longer_signatures_still_detected(tmp_path):
+    """Test that longer executable signatures are still detected regardless of position."""
+    scanner = PyTorchBinaryScanner()
+
+    # Create a binary file with longer signatures in the middle
+    binary_file = tmp_path / "with_elf.bin"
+    # ELF signature is 4 bytes - should still be detected even in middle
+    data = b"\x00" * 100 + b"\x7fELF" + b"\x00" * 100
+    binary_file.write_bytes(data)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success
+
+    # Should find the ELF executable (longer signature)
+    found_elf = False
+    for issue in result.issues:
         if "Linux executable" in issue.message:
             found_elf = True
 
-    assert found_pe
-    assert found_elf
+    assert found_elf, "Should detect Linux executable (4-byte signature) even in middle of file"
 
 
 def test_pytorch_binary_scanner_blacklist_patterns(tmp_path):

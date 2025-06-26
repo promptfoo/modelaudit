@@ -252,6 +252,48 @@ class TestFalsePositiveFixes:
         has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme, "Should detect the injected anomaly"
 
+    def test_bert_model_no_false_positive_executables(self, tmp_path):
+        """Test that BERT models with random MZ bytes don't trigger false positives."""
+        if not HAS_TORCH:
+            pytest.skip("torch not installed")
+
+        # Create a realistic BERT model binary file
+        bert_file = tmp_path / "bert-base-uncased-pytorch_model.bin"
+
+        # Create model weights with realistic sizes
+        np.random.seed(42)
+        bert_weights = {
+            "embeddings.word_embeddings.weight": torch.randn(30522, 768) * 0.02,  # Vocab size x hidden size
+            "embeddings.position_embeddings.weight": torch.randn(512, 768) * 0.02,
+            "embeddings.token_type_embeddings.weight": torch.randn(2, 768) * 0.02,
+            "encoder.layer.0.attention.self.query.weight": torch.randn(768, 768) * 0.02,
+            "encoder.layer.0.attention.self.key.weight": torch.randn(768, 768) * 0.02,
+            "encoder.layer.0.attention.self.value.weight": torch.randn(768, 768) * 0.02,
+        }
+
+        # Save the model
+        torch.save(bert_weights, bert_file)
+
+        # Inject MZ bytes in the middle of the file to simulate random occurrence
+        with open(bert_file, "rb") as f:
+            data = f.read()
+
+        # Find a position in the middle and insert MZ
+        mid_point = len(data) // 2
+        modified_data = data[:mid_point] + b"MZ" + data[mid_point + 2 :]
+
+        with open(bert_file, "wb") as f:
+            f.write(modified_data)
+
+        # Scan the file
+        result = self._run_cli_scan(str(bert_file))
+
+        # Should not flag as executable
+        assert result["exit_code"] == 0, "BERT model with random MZ bytes should not be flagged"
+        assert not any("Windows executable" in issue.get("message", "") for issue in result.get("issues", [])), (
+            "Should not detect Windows executable in BERT model"
+        )
+
     def test_malicious_files_still_detected(self, tmp_path):
         """Regression test: ensure malicious files are still detected after false positive fixes."""
         # Test 1: Malicious pickle file
@@ -295,7 +337,25 @@ class TestFalsePositiveFixes:
             assert result["exit_code"] == 1, "Malicious Keras model should be detected"
             assert result["has_warnings"] is True or result["has_errors"] is True, "Malicious Keras should have issues"
 
-        # Test 3: Malicious manifest file (use ML-specific filename to ensure it's scanned)
+        # Test 3: Real executable at beginning of .bin file should still be detected
+        if True:  # Always run this test
+            exe_bin_path = tmp_path / "malicious_model.bin"
+            # Create a file that starts with a Windows executable
+            # This simulates someone renaming an .exe to .bin
+            with open(exe_bin_path, "wb") as f:
+                # Write actual PE header structure
+                f.write(b"MZ")  # DOS header
+                f.write(b"\x90\x00" * 30)  # DOS stub
+                f.write(b"This program cannot be run in DOS mode")
+                f.write(b"\x00" * 100)
+
+            result = self._run_cli_scan(str(exe_bin_path))
+            assert result["exit_code"] == 1, "Real executable disguised as .bin should be detected"
+            assert any("Windows executable" in issue.get("message", "") for issue in result.get("issues", [])), (
+                "Should detect Windows executable at start of file"
+            )
+
+        # Test 4: Malicious manifest file (use ML-specific filename to ensure it's scanned)
         evil_manifest_path = tmp_path / "config.json"  # Use standard config.json name
         malicious_manifest = {
             "model_name": "legitimate_model",
