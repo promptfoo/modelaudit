@@ -177,6 +177,64 @@ PATTERN_EXPLANATIONS = {
     ),
 }
 
+# Explanations for suspicious TensorFlow operations
+#
+# Risk Categories:
+# - CRITICAL: Code execution (PyFunc, PyCall, ExecuteOp, ShellExecute) & System access (SystemConfig)
+# - HIGH: File system operations (ReadFile, WriteFile, Save, SaveV2, MergeV2Checkpoints)
+# - MEDIUM: Data processing with potential exploits (DecodeRaw, DecodeJpeg, DecodePng)
+#
+# Threat Context: Malicious ML models embed these operations to execute during model loading/inference,
+# bypassing security tools that typically trust ML models. Used for RCE, data exfiltration, backdoors,
+# and supply chain attacks.
+TF_OP_EXPLANATIONS = {
+    # Code execution operations - CRITICAL RISK
+    "PyFunc": (
+        "The PyFunc operation executes arbitrary Python code in the TensorFlow graph, which attackers can "
+        "abuse to run system commands or other malicious code."
+    ),
+    "PyCall": (
+        "The PyCall operation invokes Python callbacks during graph execution, creating dangerous security risks "
+        "by allowing arbitrary code execution that could compromise the system."
+    ),
+    "ExecuteOp": (
+        "ExecuteOp allows running arbitrary operations and poses severe security risks by enabling "
+        "malicious code execution that could compromise the host system."
+    ),
+    # System operations - CRITICAL RISK
+    "ShellExecute": (
+        "ShellExecute runs shell commands from the TensorFlow graph, posing severe security risks by enabling "
+        "arbitrary command execution, potentially compromising the host system."
+    ),
+    "SystemConfig": (
+        "SystemConfig operations access or modify system configuration, creating dangerous security risks "
+        "by enabling reconnaissance or privilege escalation attacks."
+    ),
+    # File system operations - HIGH RISK
+    "ReadFile": (
+        "ReadFile retrieves data from arbitrary files; malicious models could exfiltrate secrets or read "
+        "sensitive files."
+    ),
+    "WriteFile": (
+        "WriteFile writes data to arbitrary locations, which could overwrite files or drop malicious payloads."
+    ),
+    "Save": (
+        "Save operations write checkpoint data. Attackers might use them to persist malicious data or "
+        "overwrite existing files."
+    ),
+    "SaveV2": ("SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution."),
+    "MergeV2Checkpoints": (
+        "MergeV2Checkpoints manipulates TensorFlow checkpoints by reading and writing checkpoint files, "
+        "which could be used to overwrite existing files or inject malicious parameters."
+    ),
+    # Data processing operations - MEDIUM RISK
+    "DecodeRaw": ("DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion."),
+    "DecodeJpeg": (
+        "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources."
+    ),
+    "DecodePng": ("DecodePng decodes PNG data, which could be abused with malformed inputs."),
+}
+
 
 # Function to get explanation for a security issue
 def get_explanation(category: str, specific_item: Optional[str] = None) -> Optional[str]:
@@ -184,8 +242,8 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
     Get a security explanation for a given category and item.
 
     Args:
-        category: The category of security issue ('import', 'opcode', 'pattern')
-        specific_item: The specific item (e.g., 'os', 'REDUCE', 'base64_payload')
+        category: The category of security issue ('import', 'opcode', 'pattern', 'tf_op')
+        specific_item: The specific item (e.g., 'os', 'REDUCE', 'base64_payload', 'PyFunc')
 
     Returns:
         A security-team-friendly explanation, or None if not found
@@ -196,6 +254,8 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
         return DANGEROUS_OPCODES[specific_item]
     elif category == "pattern" and specific_item in PATTERN_EXPLANATIONS:
         return PATTERN_EXPLANATIONS[specific_item]
+    elif category == "tf_op" and specific_item in TF_OP_EXPLANATIONS:
+        return TF_OP_EXPLANATIONS[specific_item]
 
     return None
 
@@ -216,6 +276,11 @@ def get_opcode_explanation(opcode_name: str) -> Optional[str]:
 def get_pattern_explanation(pattern_name: str) -> Optional[str]:
     """Get explanation for a suspicious pattern."""
     return get_explanation("pattern", pattern_name)
+
+
+def get_tf_op_explanation(op_name: str) -> Optional[str]:
+    """Get explanation for a suspicious TensorFlow operation."""
+    return get_explanation("tf_op", op_name)
 
 
 # Default explanations for common issue messages when no explicit "why"
