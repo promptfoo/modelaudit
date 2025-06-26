@@ -1,11 +1,17 @@
 import json
 import os
+import re
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
+
+
+def strip_ansi(text):
+    """Strip ANSI color codes from text for testing."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def test_cli_help():
@@ -93,9 +99,7 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert (
-        str(file1) in result.output or str(file2) in result.output
-    )  # Should mention at least one file path
+    assert str(file1) in result.output or str(file2) in result.output  # Should mention at least one file path
 
 
 def test_scan_with_blacklist(tmp_path):
@@ -233,15 +237,17 @@ def test_format_text_output():
 
     # Test normal output
     output = format_text_output(results, verbose=False)
-    assert "Files scanned: 5" in output
-    assert "Test issue" in output
-    assert "warning" in output.lower()
+    clean_output = strip_ansi(output)
+    assert "Files:" in clean_output and "5" in clean_output
+    assert "Test issue" in clean_output
+    assert "warning" in clean_output.lower()
 
     # Test verbose output
     output = format_text_output(results, verbose=True)
-    assert "Files scanned: 5" in output
-    assert "Test issue" in output
-    assert "warning" in output.lower()
+    clean_output = strip_ansi(output)
+    assert "Files:" in clean_output and "5" in clean_output
+    assert "Test issue" in clean_output
+    assert "warning" in clean_output.lower()
     # Verbose might include details, but we can't guarantee it
 
 
@@ -258,8 +264,9 @@ def test_format_text_output_only_debug_issues():
     }
 
     output = format_text_output(results, verbose=False)
-    assert "No issues found" in output
-    assert "Scan completed successfully" in output
+    clean_output = strip_ansi(output)
+    assert "No security issues detected" in clean_output
+    assert "NO ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_only_info_issues():
@@ -275,9 +282,10 @@ def test_format_text_output_only_info_issues():
     }
 
     output = format_text_output(results, verbose=False)
-    assert "1 info" in output
-    assert "Scan completed successfully" in output
-    assert "Scan completed with warnings" not in output
+    clean_output = strip_ansi(output)
+    assert "1 Info" in clean_output
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert "WARNINGS DETECTED" not in clean_output
 
 
 def test_format_text_output_debug_and_info_issues():
@@ -294,10 +302,11 @@ def test_format_text_output_debug_and_info_issues():
     }
 
     output = format_text_output(results, verbose=True)
-    assert "1 info" in output
-    assert "1 debug" in output
-    assert "Scan completed successfully" in output
-    assert "Scan completed with warnings" not in output
+    clean_output = strip_ansi(output)
+    assert "1 Info" in clean_output
+    assert "1 Debug" in clean_output
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert "WARNINGS DETECTED" not in clean_output
 
 
 def test_format_text_output_fast_scan_duration():
@@ -312,11 +321,12 @@ def test_format_text_output_fast_scan_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Scan completed in 0.005 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.005s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "No security issues detected" in clean_output
 
 
 def test_format_text_output_normal_scan_duration():
@@ -331,11 +341,12 @@ def test_format_text_output_normal_scan_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 2 decimal places for normal scans
-    assert "Scan completed in 0.25 seconds" in output
-    assert "Files scanned: 2" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.25s" in clean_output
+    assert "Files:" in clean_output and "2" in clean_output
+    assert "No security issues detected" in clean_output
 
 
 def test_format_text_output_edge_case_duration():
@@ -350,11 +361,12 @@ def test_format_text_output_edge_case_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 2 decimal places (>= 0.01 branch)
-    assert "Scan completed in 0.01 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.01s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "No security issues detected" in clean_output
 
 
 def test_format_text_output_very_fast_scan_with_issues():
@@ -376,11 +388,12 @@ def test_format_text_output_very_fast_scan_with_issues():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Scan completed in 0.003 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "Suspicious pattern detected" in output
+    assert "Duration:" in clean_output and "0.003s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "Suspicious pattern detected" in clean_output
     assert "warning" in output.lower()
 
 
@@ -402,15 +415,10 @@ def test_exit_code_clean_scan(tmp_path):
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert result.exit_code == 0, (
-        f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 0, f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     # The output might not say "No issues found" if there are debug messages,
     # so let's be less strict
-    assert (
-        "scan completed successfully" in result.output.lower()
-        or "no issues found" in result.output.lower()
-    )
+    assert "scan completed successfully" in result.output.lower() or "no issues found" in result.output.lower()
 
 
 def test_exit_code_security_issues(tmp_path):
@@ -431,9 +439,7 @@ def test_exit_code_security_issues(tmp_path):
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert result.exit_code == 1, (
-        f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 

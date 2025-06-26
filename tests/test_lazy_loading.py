@@ -336,7 +336,9 @@ class TestSpecificFileTypes:
 
         # Use a realistic ML config filename that manifest scanner will handle
         with tempfile.NamedTemporaryFile(
-            suffix="_config.json", mode="w", delete=False
+            suffix="_config.json",
+            mode="w",
+            delete=False,
         ) as f:
             f.write('{"model": "test", "tokenizer": "config"}')
             f.flush()
@@ -383,7 +385,8 @@ class TestSpecificFileTypes:
 
         # Test false positive case - should NOT match
         with tempfile.NamedTemporaryFile(
-            suffix="config.json.backup", delete=False
+            suffix="config.json.backup",
+            delete=False,
         ) as f:
             f.write(b'{"test": "backup"}')
             backup_path = f.name
