@@ -20,19 +20,20 @@ def test_scanner_registry_contains_all_scanners():
         assert scanner in scanner_classes, f"Core scanner {scanner} should always be available"
 
     # ML framework scanners that may fail due to compatibility issues
-    ml_scanners = [
-        "TensorFlowSavedModelScanner",
-        "KerasH5Scanner",
-        "OnnxScanner",
-        "TFLiteScanner",
-    ]
+    # Map scanner class names to their registry IDs for proper matching
+    ml_scanners_map = {
+        "TensorFlowSavedModelScanner": "tf_savedmodel",
+        "KerasH5Scanner": "keras_h5",
+        "OnnxScanner": "onnx",
+        "TFLiteScanner": "tflite",
+    }
 
-    for scanner in ml_scanners:
-        scanner_available = scanner in scanner_classes
-        scanner_failed = any(scanner.lower() in scanner_id.lower() for scanner_id in failed_scanners)
+    for scanner_class, scanner_id in ml_scanners_map.items():
+        scanner_available = scanner_class in scanner_classes
+        scanner_failed = scanner_id in failed_scanners
 
         assert scanner_available or scanner_failed, (
-            f"Scanner {scanner} should either be loaded or in failed scanners. "
+            f"Scanner {scanner_class} (ID: {scanner_id}) should either be loaded or in failed scanners. "
             f"Loaded: {scanner_classes}, Failed: {list(failed_scanners.keys())}"
         )
 
