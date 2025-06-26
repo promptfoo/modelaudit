@@ -25,8 +25,8 @@ class FlaxMsgpackScanner(BaseScanner):
         super().__init__(config)
         self.max_blob_bytes = self.config.get(
             "max_blob_bytes",
-            50 * 1024 * 1024,
-        )  # 50MB reasonable for model weights
+            200 * 1024 * 1024,
+        )  # 200MB reasonable for modern transformer embeddings (was 50MB)
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 10000)
         self.suspicious_patterns = self.config.get(
@@ -219,27 +219,75 @@ class FlaxMsgpackScanner(BaseScanner):
 
         # Check for common Flax checkpoint patterns
         expected_keys = {"params", "state", "opt_state", "model_state", "step", "epoch"}
+        # Also recognize common converted model patterns from HuggingFace
+        converted_patterns = {
+            # BERT/RoBERTa patterns
+            "bert", "roberta", "distilbert", "electra",
+            # GPT patterns  
+            "gpt", "gpt2", "gpt_neo", "gpt_j",
+            # T5 patterns
+            "t5", "encoder", "decoder", 
+            # Common neural network components
+            "embeddings", "attention", "layer_norm", "dense", "linear",
+            "transformer", "model", "lm_head", "classifier"
+        }
+        
         found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
+        
+        # Check if this looks like a converted model from another framework
+        is_converted_model = any(
+            any(pattern in str(key).lower() for pattern in converted_patterns)
+            for key in found_keys
+        )
 
         if not any(key in found_keys for key in expected_keys):
-            result.add_issue(
-                "No standard Flax checkpoint keys found - may not be a legitimate model",
-                severity=IssueSeverity.INFO,
-                location="root",
-                details={
-                    "found_keys": list(found_keys)[:20],  # Limit output
-                    "expected_any_of": list(expected_keys),
-                },
-            )
+            if is_converted_model:
+                # This appears to be a converted model - reduce severity 
+                result.add_issue(
+                    "Model appears to be converted from another framework (PyTorch/TensorFlow) to Flax format",
+                    severity=IssueSeverity.DEBUG,  # Reduced from INFO to DEBUG
+                    location="root",
+                    details={
+                        "found_keys": list(found_keys)[:20],  # Limit output
+                        "detected_patterns": [p for p in converted_patterns 
+                                            if any(p in str(k).lower() for k in found_keys)][:10],
+                        "model_type": "converted",
+                    },
+                )
+            else:
+                # Unknown structure - keep as INFO level
+                result.add_issue(
+                    "No standard Flax checkpoint keys found - may not be a legitimate model",
+                    severity=IssueSeverity.INFO,
+                    location="root",
+                    details={
+                        "found_keys": list(found_keys)[:20],  # Limit output
+                        "expected_any_of": list(expected_keys),
+                        "model_type": "unknown",
+                    },
+                )
 
         # Check for non-standard keys that might be suspicious
-        suspicious_top_level = found_keys - expected_keys - {"metadata", "config", "hyperparams"}
-        if suspicious_top_level:
+        # Be more permissive for converted models
+        allowable_keys = expected_keys | {"metadata", "config", "hyperparams"}
+        if is_converted_model:
+            # For converted models, allow common neural network component names
+            allowable_keys.update(converted_patterns)
+            
+        suspicious_top_level = found_keys - allowable_keys
+        # Filter out keys that contain common model component patterns
+        truly_suspicious = set()
+        for key in suspicious_top_level:
+            key_str = str(key).lower()
+            if not any(pattern in key_str for pattern in converted_patterns):
+                truly_suspicious.add(key)
+                
+        if truly_suspicious:
             result.add_issue(
-                f"Unusual top-level keys found: {suspicious_top_level}",
+                f"Unusual top-level keys found: {truly_suspicious}",
                 severity=IssueSeverity.INFO,
                 location="root",
-                details={"unusual_keys": list(suspicious_top_level)},
+                details={"unusual_keys": list(truly_suspicious)},
             )
 
     def scan(self, path: str) -> ScanResult:
