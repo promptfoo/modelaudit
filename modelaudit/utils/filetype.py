@@ -223,9 +223,8 @@ def find_sharded_files(directory: str) -> list[str]:
         [
             str(dir_path / fname)
             for fname in dir_path.iterdir()
-            if fname.is_file()
-            and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
-        ]
+            if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
+        ],
     )
 
 
@@ -341,9 +340,7 @@ def validate_file_type(path: str) -> bool:
         # unless the file is very small or empty (checked after format-specific rules)
         if header_format == "unknown":
             file_path = Path(path)
-            if file_path.is_file() and file_path.stat().st_size >= 4:
-                return False
-            return True  # Small files are acceptable
+            return not (file_path.is_file() and file_path.stat().st_size >= 4)  # Small files are acceptable
 
         # Default: exact match required
         return header_format == ext_format

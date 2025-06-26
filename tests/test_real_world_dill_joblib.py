@@ -46,14 +46,10 @@ class TestRealDillFiles:
         assert result.bytes_scanned > 0
         # Dill functions may trigger security warnings due to internal mechanisms
         # This is actually correct behavior - dill uses advanced serialization
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         if len(critical_issues) > 0:
             # Check that the issues are related to dill's internal mechanisms
-            dill_related = any(
-                "dill" in str(issue.message).lower() for issue in critical_issues
-            )
+            dill_related = any("dill" in str(issue.message).lower() for issue in critical_issues)
             assert dill_related, "Critical issues should be dill-related if present"
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
@@ -98,24 +94,14 @@ class TestRealDillFiles:
 
         # Should detect suspicious content - dill may serialize differently than expected
         # so we check for any critical issues that indicate malicious content detection
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
-        assert len(critical_issues) > 0, (
-            "Should detect suspicious content in malicious dill file"
-        )
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) > 0, "Should detect suspicious content in malicious dill file"
 
         # Check for either os.system detection or dill internal function detection
         malicious_detected = any(
             ("os" in str(i.message).lower() and "system" in str(i.message).lower())
-            or (
-                "dill" in str(i.message).lower()
-                and "_create_function" in str(i.message).lower()
-            )
-            or (
-                "suspicious" in str(i.message).lower()
-                and "module" in str(i.message).lower()
-            )
+            or ("dill" in str(i.message).lower() and "_create_function" in str(i.message).lower())
+            or ("suspicious" in str(i.message).lower() and "module" in str(i.message).lower())
             for i in critical_issues
         )
         assert malicious_detected, (
@@ -143,9 +129,7 @@ class TestRealJoblibFiles:
         assert result.success is True
         assert result.bytes_scanned > 0
         # Should not have critical security issues
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
@@ -168,12 +152,8 @@ class TestRealJoblibFiles:
         if result.bytes_scanned == 0:
             # Should have reported format issues
             assert len(result.issues) > 0
-            format_issues = [
-                i for i in result.issues if "opcode" in str(i.message).lower()
-            ]
-            assert len(format_issues) > 0, (
-                "Should report format/opcode issues for compressed files"
-            )
+            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower()]
+            assert len(format_issues) > 0, "Should report format/opcode issues for compressed files"
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
     def test_joblib_with_numpy_arrays(self, tmp_path):
@@ -195,31 +175,19 @@ class TestRealJoblibFiles:
         result = scanner.scan(str(numpy_file))
 
         # Joblib with numpy may use custom protocols/opcodes that aren't standard pickle
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
 
         # If bytes weren't scanned, it means the format wasn't recognized as standard pickle
         if result.bytes_scanned == 0:
             # Should have issues about unknown format/opcodes
-            assert len(critical_issues) > 0, (
-                "Should report issues when format isn't recognized"
-            )
-            opcode_issues = [
-                i for i in critical_issues if "opcode" in str(i.message).lower()
-            ]
-            assert len(opcode_issues) > 0, (
-                "Should report opcode issues for numpy joblib files"
-            )
+            assert len(critical_issues) > 0, "Should report issues when format isn't recognized"
+            opcode_issues = [i for i in critical_issues if "opcode" in str(i.message).lower()]
+            assert len(opcode_issues) > 0, "Should report opcode issues for numpy joblib files"
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
-                opcode_issues = [
-                    i for i in critical_issues if "opcode" in str(i.message).lower()
-                ]
-                assert len(opcode_issues) > 0, (
-                    "Critical issues should be opcode-related for numpy files"
-                )
+                opcode_issues = [i for i in critical_issues if "opcode" in str(i.message).lower()]
+                assert len(opcode_issues) > 0, "Critical issues should be opcode-related for numpy files"
 
 
 class TestPerformanceBenchmarks:
