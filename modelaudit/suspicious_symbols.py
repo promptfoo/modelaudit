@@ -396,7 +396,7 @@ def validate_patterns() -> list[str]:
             warnings.append(f"Executable signature must be bytes: {signature!r}")
         if not isinstance(description, str) or not description:
             warnings.append(
-                f"Description must be non-empty string for signature {signature!r}"
+                f"Description must be non-empty string for signature {signature!r}",
             )
 
     return warnings

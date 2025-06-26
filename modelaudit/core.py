@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, Type, cast
+from typing import IO, Any, Callable, Optional, cast
 from unittest.mock import patch
 
 from modelaudit.license_checker import (
@@ -28,7 +28,9 @@ _OPEN_PATCH_LOCK = Lock()
 
 
 def _add_asset_to_results(
-    results: dict[str, Any], file_path: str, file_result: ScanResult
+    results: dict[str, Any],
+    file_path: str,
+    file_result: ScanResult,
 ) -> None:
     """Helper function to add an asset entry to the results."""
     assets_list = cast(list[dict[str, Any]], results["assets"])
@@ -44,24 +46,20 @@ def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None
 def validate_scan_config(config: dict[str, Any]) -> None:
     """Validate configuration parameters for scanning."""
     timeout = config.get("timeout")
-    if timeout is not None:
-        if not isinstance(timeout, int) or timeout <= 0:
-            raise ValueError("timeout must be a positive integer")
+    if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
+        raise ValueError("timeout must be a positive integer")
 
     max_file_size = config.get("max_file_size")
-    if max_file_size is not None:
-        if not isinstance(max_file_size, int) or max_file_size < 0:
-            raise ValueError("max_file_size must be a non-negative integer")
+    if max_file_size is not None and (not isinstance(max_file_size, int) or max_file_size < 0):
+        raise ValueError("max_file_size must be a non-negative integer")
 
     max_total_size = config.get("max_total_size")
-    if max_total_size is not None:
-        if not isinstance(max_total_size, int) or max_total_size < 0:
-            raise ValueError("max_total_size must be a non-negative integer")
+    if max_total_size is not None and (not isinstance(max_total_size, int) or max_total_size < 0):
+        raise ValueError("max_total_size must be a non-negative integer")
 
     chunk_size = config.get("chunk_size")
-    if chunk_size is not None:
-        if not isinstance(chunk_size, int) or chunk_size <= 0:
-            raise ValueError("chunk_size must be a positive integer")
+    if chunk_size is not None and (not isinstance(chunk_size, int) or chunk_size <= 0):
+        raise ValueError("chunk_size must be a positive integer")
 
 
 def scan_model_directory_or_file(
@@ -148,7 +146,7 @@ def scan_model_directory_or_file(
                                 "severity": IssueSeverity.CRITICAL.value,
                                 "location": file_path,
                                 "details": {"resolved_path": str(resolved_file)},
-                            }
+                            },
                         )
                         continue
 
@@ -168,13 +166,8 @@ def scan_model_directory_or_file(
                     try:
                         file_result = scan_file(file_path, config)
                         # Use cast to help mypy understand the types
-                        results["bytes_scanned"] = (
-                            cast(int, results["bytes_scanned"])
-                            + file_result.bytes_scanned
-                        )
-                        results["files_scanned"] = (
-                            cast(int, results["files_scanned"]) + 1
-                        )  # Increment file count
+                        results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                        results["files_scanned"] = cast(int, results["files_scanned"]) + 1  # Increment file count
 
                         # Track scanner name
                         scanner_name = file_result.scanner_name
@@ -197,27 +190,25 @@ def scan_model_directory_or_file(
                         combined_metadata = {**file_result.metadata, **license_metadata}
                         file_meta[file_path] = combined_metadata
 
-                        if (
-                            max_total_size > 0
-                            and cast(int, results["bytes_scanned"]) > max_total_size
-                        ):
+                        if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
                             issues_list.append(
                                 {
-                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                                    f"(max: {max_total_size})",
                                     "severity": IssueSeverity.WARNING.value,
                                     "location": file_path,
                                     "details": {"max_total_size": max_total_size},
-                                }
+                                },
                             )
                             limit_reached = True
                             break
                     except Exception as e:
-                        logger.warning(f"Error scanning file {file_path}: {str(e)}")
+                        logger.warning(f"Error scanning file {file_path}: {e!s}")
                         # Add as an issue
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         issues_list.append(
                             {
-                                "message": f"Error scanning file: {str(e)}",
+                                "message": f"Error scanning file: {e!s}",
                                 "severity": IssueSeverity.WARNING.value,
                                 "location": file_path,
                                 "details": {"exception_type": type(e).__name__},
@@ -275,9 +266,7 @@ def scan_model_directory_or_file(
             else:
                 file_result = scan_file(path, config)
 
-            results["bytes_scanned"] = (
-                cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-            )
+            results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
 
             # Track scanner name
             scanner_name = file_result.scanner_name
@@ -300,27 +289,25 @@ def scan_model_directory_or_file(
             combined_metadata = {**file_result.metadata, **license_metadata}
             file_meta[path] = combined_metadata
 
-            if (
-                max_total_size > 0
-                and cast(int, results["bytes_scanned"]) > max_total_size
-            ):
+            if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
                 issues_list.append(
                     {
-                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                        f"(max: {max_total_size})",
                         "severity": IssueSeverity.WARNING.value,
                         "location": path,
                         "details": {"max_total_size": max_total_size},
-                    }
+                    },
                 )
 
             if progress_callback:
                 progress_callback(f"Completed scanning: {path}", 100.0)
 
     except Exception as e:
-        logger.exception(f"Error during scan: {str(e)}")
+        logger.exception(f"Error during scan: {e!s}")
         results["success"] = False
         issue_dict = {
-            "message": f"Error during scan: {str(e)}",
+            "message": f"Error during scan: {e!s}",
             "severity": IssueSeverity.WARNING.value,
             "details": {"exception_type": type(e).__name__},
         }
@@ -350,7 +337,7 @@ def scan_model_directory_or_file(
             }
             issues_list.append(issue_dict)
     except Exception as e:
-        logger.warning(f"Error checking license warnings: {str(e)}")
+        logger.warning(f"Error checking license warnings: {e!s}")
 
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
@@ -387,13 +374,9 @@ def scan_model_directory_or_file(
     issues_list = cast(list[dict[str, Any]], results["issues"])
     results["has_errors"] = (
         any(
-            any(
-                indicator in issue.get("message", "")
-                for indicator in operational_error_indicators
-            )
+            any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
             for issue in issues_list
-            if isinstance(issue, dict)
-            and issue.get("severity") == IssueSeverity.CRITICAL.value
+            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
         )
         or not results["success"]
     )
@@ -424,11 +407,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     issues = results.get("issues", [])
     if issues:
         # Filter out DEBUG level issues for exit code determination
-        non_debug_issues = [
-            issue
-            for issue in issues
-            if isinstance(issue, dict) and issue.get("severity") != "debug"
-        ]
+        non_debug_issues = [issue for issue in issues if isinstance(issue, dict) and issue.get("severity") != "debug"]
         if non_debug_issues:
             return 1
 
@@ -436,7 +415,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     return 0
 
 
-def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
+def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -488,23 +467,20 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
 
     if not file_type_valid:
         # File type validation failed - this is a security concern
-        discrepancy_msg = f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing or corruption."
+        discrepancy_msg = (
+            f"File type validation failed: extension indicates {ext_format} but magic bytes "
+            f"indicate {header_format}. This could indicate file spoofing or corruption."
+        )
         logger.warning(discrepancy_msg)
-    elif (
-        header_format != ext_format
-        and header_format != "unknown"
-        and ext_format != "unknown"
-    ):
+    elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
         # Don't warn about common PyTorch .bin files that are ZIP format internally
         # This is expected behavior for torch.save()
-        if not (
-            ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"
-        ):
+        if not (ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.warning(discrepancy_msg)
 
     # Prefer scanner based on header format using lazy loading
-    preferred_scanner: Optional[Type[BaseScanner]] = None
+    preferred_scanner: Optional[type[BaseScanner]] = None
 
     # Special handling for PyTorch files that are ZIP-based
     if header_format == "zip" and ext in [".pt", ".pth"]:
@@ -534,7 +510,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     result: Optional[ScanResult]
     if preferred_scanner and preferred_scanner.can_handle(path):
         logger.debug(
-            f"Using {preferred_scanner.name} scanner for {path} based on header"
+            f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
         scanner = preferred_scanner(config=config)  # type: ignore[abstract]
         result = scanner.scan(path)
@@ -587,10 +563,7 @@ def merge_scan_result(
         The updated results dictionary
     """
     # Convert scan_result to dict if it's a ScanResult object
-    if isinstance(scan_result, ScanResult):
-        scan_dict = scan_result.to_dict()
-    else:
-        scan_dict = scan_result
+    scan_dict = scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
 
     # Merge issues
     issues_list = cast(list[dict[str, Any]], results["issues"])

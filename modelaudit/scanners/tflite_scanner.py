@@ -1,4 +1,5 @@
 import os
+from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -19,16 +20,13 @@ class TFLiteScanner(BaseScanner):
 
     name = "tflite"
     description = "Scans TensorFlow Lite models for integrity and safety issues"
-    supported_extensions = [".tflite"]
+    supported_extensions: ClassVar[list[str]] = [".tflite"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not HAS_TFLITE:
             return False
-        return (
-            os.path.isfile(path)
-            and os.path.splitext(path)[1].lower() in cls.supported_extensions
-        )
+        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)

@@ -64,9 +64,9 @@ def make_security_keras_models(assets_dir: Path) -> None:
                 {
                     "class_name": "Lambda",
                     "config": {
-                        "function": "lambda x: eval('print(\"security test\")')"
+                        "function": "lambda x: eval('print(\"security test\")')",
                     },
-                }
+                },
             ],
         },
     }

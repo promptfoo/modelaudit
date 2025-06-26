@@ -2,7 +2,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -160,7 +160,7 @@ MODEL_EXTENSIONS = {
 }
 
 
-def scan_for_license_headers(file_path: str, max_lines: int = 50) -> List[LicenseInfo]:
+def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[LicenseInfo]:
     """
     Scan a file's header for license information.
 
@@ -171,10 +171,10 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> List[Licens
     Returns:
         List of detected license information
     """
-    licenses: List[LicenseInfo] = []
+    licenses: list[LicenseInfo] = []
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
             content = ""
             for i, line in enumerate(f):
                 if i >= max_lines:
@@ -196,9 +196,7 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> List[Licens
             license_info = LicenseInfo(
                 spdx_id=str(info["spdx_id"]) if info["spdx_id"] else None,
                 name=str(info["name"]) if info["name"] else None,
-                commercial_allowed=info["commercial_allowed"]
-                if isinstance(info["commercial_allowed"], bool)
-                else None,
+                commercial_allowed=info["commercial_allowed"] if isinstance(info["commercial_allowed"], bool) else None,
                 source="file_header",
                 confidence=0.8,  # High confidence for explicit patterns
             )
@@ -208,8 +206,9 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> List[Licens
 
 
 def extract_copyright_notices(
-    file_path: str, max_lines: int = 50
-) -> List[CopyrightInfo]:
+    file_path: str,
+    max_lines: int = 50,
+) -> list[CopyrightInfo]:
     """
     Extract copyright notices from a file.
 
@@ -220,10 +219,10 @@ def extract_copyright_notices(
     Returns:
         List of copyright information found
     """
-    copyrights: List[CopyrightInfo] = []
+    copyrights: list[CopyrightInfo] = []
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
             content = ""
             for i, line in enumerate(f):
                 if i >= max_lines:
@@ -240,14 +239,16 @@ def extract_copyright_notices(
                 year = match[0].strip()
                 holder = match[1].strip()
                 copyright_info = CopyrightInfo(
-                    holder=holder, year=year, text=f"Copyright {year} {holder}"
+                    holder=holder,
+                    year=year,
+                    text=f"Copyright {year} {holder}",
                 )
                 copyrights.append(copyright_info)
 
     return copyrights
 
 
-def find_license_files(directory: str) -> List[str]:
+def find_license_files(directory: str) -> list[str]:
     """
     Find license files in a directory.
 
@@ -257,7 +258,7 @@ def find_license_files(directory: str) -> List[str]:
     Returns:
         List of paths to license files
     """
-    license_files: List[str] = []
+    license_files: list[str] = []
 
     if not os.path.isdir(directory):
         return license_files
@@ -274,7 +275,7 @@ def find_license_files(directory: str) -> List[str]:
     return license_files
 
 
-def detect_unlicensed_datasets(file_paths: List[str]) -> List[str]:
+def detect_unlicensed_datasets(file_paths: list[str]) -> list[str]:
     """
     Detect dataset files that may lack proper licensing.
 
@@ -305,9 +306,7 @@ def detect_unlicensed_datasets(file_paths: List[str]) -> List[str]:
             # Check if there's a nearby license file
             dir_path = Path(file_path).parent
             try:
-                existing_files = {
-                    f.name.lower() for f in dir_path.iterdir() if f.is_file()
-                }
+                existing_files = {f.name.lower() for f in dir_path.iterdir() if f.is_file()}
                 has_license = bool(LICENSE_FILES & existing_files)
             except OSError:
                 has_license = False
@@ -349,7 +348,7 @@ def _is_ml_config_file(filename: str) -> bool:
     return filename in ml_config_patterns
 
 
-def _is_ml_model_directory(file_paths: List[str]) -> bool:
+def _is_ml_model_directory(file_paths: list[str]) -> bool:
     """
     Determine if the file paths represent an ML model directory.
 
@@ -383,20 +382,17 @@ def _is_ml_model_directory(file_paths: List[str]) -> bool:
 
     # Check for model weight files with typical patterns
     has_weight_files = any(
-        "model" in filename
-        and any(ext in filename for ext in [".bin", ".h5", ".safetensors"])
+        "model" in filename and any(ext in filename for ext in [".bin", ".h5", ".safetensors"])
         for filename in filenames
     )
 
     # Check for config files
-    has_config_files = any(
-        "config" in filename and filename.endswith(".json") for filename in filenames
-    )
+    has_config_files = any("config" in filename and filename.endswith(".json") for filename in filenames)
 
     return has_ml_files or (has_weight_files and has_config_files)
 
 
-def detect_agpl_components(scan_results: Dict[str, Any]) -> List[str]:
+def detect_agpl_components(scan_results: dict[str, Any]) -> list[str]:
     """
     Detect components that use AGPL licensing.
 
@@ -423,7 +419,7 @@ def detect_agpl_components(scan_results: Dict[str, Any]) -> List[str]:
     return agpl_files
 
 
-def check_commercial_use_warnings(scan_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 
@@ -442,14 +438,15 @@ def check_commercial_use_warnings(scan_results: Dict[str, Any]) -> List[Dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"AGPL-licensed components detected ({len(agpl_files)} files). Review network use restrictions for SaaS deployment.",
+                "message": f"AGPL-licensed components detected ({len(agpl_files)} files). Review network use "
+                f"restrictions for SaaS deployment.",
                 "details": {
                     "files": agpl_files[:5],  # Show first 5 files
                     "total_count": len(agpl_files),
                     "license_type": "AGPL",
                     "impact": "Requires source code disclosure for network services",
                 },
-            }
+            },
         )
 
     # Check for datasets with unspecified licenses
@@ -477,13 +474,14 @@ def check_commercial_use_warnings(scan_results: Dict[str, Any]) -> List[Dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"Datasets with unspecified licenses detected ({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
+                "message": f"Datasets with unspecified licenses detected "
+                f"({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
                 "details": {
                     "files": significant_unlicensed_datasets[:5],  # Show first 5 files
                     "total_count": len(significant_unlicensed_datasets),
                     "impact": "May restrict commercial use or redistribution",
                 },
-            }
+            },
         )
 
     # Check for non-commercial licenses
@@ -507,13 +505,14 @@ def check_commercial_use_warnings(scan_results: Dict[str, Any]) -> List[Dict[str
             {
                 "type": "license_warning",
                 "severity": "warning",
-                "message": f"Non-commercial licensed components detected ({len(nc_files)} files). These cannot be used commercially.",
+                "message": f"Non-commercial licensed components detected ({len(nc_files)} files). These cannot "
+                f"be used commercially.",
                 "details": {
                     "files": nc_files[:5],
                     "total_count": len(nc_files),
                     "impact": "Prohibited for commercial use",
                 },
-            }
+            },
         )
 
     # Check for strong copyleft licenses mixed with proprietary code
@@ -536,19 +535,20 @@ def check_commercial_use_warnings(scan_results: Dict[str, Any]) -> List[Dict[str
             {
                 "type": "license_warning",
                 "severity": "info",
-                "message": f"Strong copyleft licensed components detected ({len(copyleft_files)} files). May require derivative works to be open-sourced.",
+                "message": f"Strong copyleft licensed components detected ({len(copyleft_files)} files). May "
+                f"require derivative works to be open-sourced.",
                 "details": {
                     "files": copyleft_files[:5],
                     "total_count": len(copyleft_files),
                     "impact": "May require making derivative works available under the same license",
                 },
-            }
+            },
         )
 
     return warnings
 
 
-def collect_license_metadata(file_path: str) -> Dict[str, Any]:
+def collect_license_metadata(file_path: str) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
