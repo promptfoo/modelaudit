@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -19,7 +19,7 @@ class OnnxScanner(BaseScanner):
 
     name = "onnx"
     description = "Scans ONNX models for custom operators and integrity issues"
-    supported_extensions = [".onnx"]
+    supported_extensions: ClassVar[list[str]] = [".onnx"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -69,7 +69,7 @@ class OnnxScanner(BaseScanner):
                 "ir_version": model.ir_version,
                 "producer_name": model.producer_name,
                 "node_count": len(model.graph.node),
-            }
+            },
         )
 
         self._check_custom_ops(model, path, result)
@@ -126,7 +126,10 @@ class OnnxScanner(BaseScanner):
                     self._validate_external_size(tensor, external_path, result)
 
     def _validate_external_size(
-        self, tensor: Any, external_path: Path, result: ScanResult
+        self,
+        tensor: Any,
+        external_path: Path,
+        result: ScanResult,
     ) -> None:
         try:
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])

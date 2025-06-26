@@ -60,7 +60,8 @@ def example():
 
         # Check for copyright holders property
         copyright_prop = next(
-            (prop for prop in properties if prop["name"] == "copyright_holders"), None
+            (prop for prop in properties if prop["name"] == "copyright_holders"),
+            None,
         )
         assert copyright_prop is not None
         assert "Example Corp" in copyright_prop["value"]
@@ -84,26 +85,30 @@ def example():
 
         # Find dataset component
         dataset_component = next(
-            (comp for comp in components if "data.csv" in comp["name"]), None
+            (comp for comp in components if "data.csv" in comp["name"]),
+            None,
         )
         assert dataset_component is not None
 
         dataset_props = dataset_component.get("properties", [])
         is_dataset_prop = next(
-            (prop for prop in dataset_props if prop["name"] == "is_dataset"), None
+            (prop for prop in dataset_props if prop["name"] == "is_dataset"),
+            None,
         )
         assert is_dataset_prop is not None
         assert is_dataset_prop["value"] == "true"
 
         # Find model component
         model_component = next(
-            (comp for comp in components if "model.pkl" in comp["name"]), None
+            (comp for comp in components if "model.pkl" in comp["name"]),
+            None,
         )
         assert model_component is not None
 
         model_props = model_component.get("properties", [])
         is_model_prop = next(
-            (prop for prop in model_props if prop["name"] == "is_model"), None
+            (prop for prop in model_props if prop["name"] == "is_model"),
+            None,
         )
         assert is_model_prop is not None
         assert is_model_prop["value"] == "true"
@@ -129,7 +134,8 @@ name,value
 
         # Check for risk score property
         risk_score_prop = next(
-            (prop for prop in properties if prop["name"] == "risk_score"), None
+            (prop for prop in properties if prop["name"] == "risk_score"),
+            None,
         )
         assert risk_score_prop is not None
 

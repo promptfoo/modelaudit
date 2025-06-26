@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 from modelaudit.scanners.base import ScanResult
 
 
-def asset_from_scan_result(path: str, scan_result: ScanResult) -> Dict[str, Any]:
+def asset_from_scan_result(path: str, scan_result: ScanResult) -> dict[str, Any]:
     """Build an asset entry from a ScanResult."""
-    entry: Dict[str, Any] = {
+    entry: dict[str, Any] = {
         "path": path,
         "type": scan_result.scanner_name,
     }
