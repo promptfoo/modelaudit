@@ -210,7 +210,7 @@ class SafeTensorsScanner(BaseScanner):
                                     "attempts."
                                 ),
                             )
-                        
+
                         if isinstance(value, str):
                             lower_val = value.lower()
                             if any(s in lower_val for s in ["import ", "#!/", "\\"]):

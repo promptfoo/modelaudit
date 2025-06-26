@@ -82,6 +82,4 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(file_path))
 
-    assert any(
-        "suspicious metadata" in issue.message.lower() for issue in result.issues
-    )
+    assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
