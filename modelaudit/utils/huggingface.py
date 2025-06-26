@@ -12,7 +12,7 @@ def is_huggingface_url(url: str) -> bool:
     patterns = [
         r"^https?://huggingface\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
         r"^https?://hf\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
-        r"^hf://[\w\-\.]+/[\w\-\.]+/?$",
+        r"^hf://[\w\-\.]+(/[\w\-\.]+)?/?$",
     ]
     return any(re.match(pattern, url) for pattern in patterns)
 
@@ -32,9 +32,13 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     # Handle hf:// format
     if url.startswith("hf://"):
         parts = url[5:].strip("/").split("/")
-        if len(parts) != 2:
+        if len(parts) == 1 and parts[0]:
+            # Single component like "bert-base-uncased" - treat as model without namespace
+            return parts[0], ""
+        elif len(parts) == 2:
+            return parts[0], parts[1]
+        else:
             raise ValueError(f"Invalid HuggingFace URL format: {url}")
-        return parts[0], parts[1]
 
     # Handle https:// format
     parsed = urlparse(url)

@@ -67,13 +67,24 @@ class TestHuggingFaceURLParsing:
             namespace, repo = parse_huggingface_url(url)
             assert (namespace, repo) == expected, f"Failed to parse {url}"
 
+    def test_parse_single_component_urls(self):
+        """Test parsing single-component URLs (models without namespaces)."""
+        test_cases = [
+            ("https://huggingface.co/gpt2", ("gpt2", "")),
+            ("https://hf.co/bert-base-uncased", ("bert-base-uncased", "")),
+            ("hf://gpt2", ("gpt2", "")),
+            ("hf://bert-base-uncased", ("bert-base-uncased", "")),
+        ]
+        for url, expected in test_cases:
+            namespace, repo = parse_huggingface_url(url)
+            assert (namespace, repo) == expected, f"Failed to parse {url}"
+
     def test_parse_invalid_urls(self):
         """Test that invalid URLs raise ValueError."""
         invalid_urls = [
             "https://github.com/user/repo",
-            "hf://",
-            "hf://single-part",  # hf:// protocol requires namespace/repo format
-            "",
+            "hf://",  # Empty path
+            "",  # Empty string
         ]
         for url in invalid_urls:
             with pytest.raises(ValueError):
