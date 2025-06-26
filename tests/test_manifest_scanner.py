@@ -8,10 +8,10 @@ from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
 
-def test_manifest_scanner_json():
+def test_manifest_scanner_json(tmp_path):
     """Test the manifest scanner with a JSON file."""
-    # Create a temporary JSON file
-    test_file = "config.json"
+    # Create a temporary JSON file with unique name
+    test_file = tmp_path / "config.json"
     manifest_content = {
         "model_name": "test_model",
         "version": "1.0.0",
@@ -24,38 +24,31 @@ def test_manifest_scanner_json():
         },
     }
 
-    try:
-        with Path(test_file).open("w") as f:
-            json.dump(manifest_content, f)
+    with test_file.open("w") as f:
+        json.dump(manifest_content, f)
 
-        # Create scanner with blacklist patterns
-        scanner = ManifestScanner(
-            config={"blacklist_patterns": ["unsafe", "malicious"]},
-        )
+    # Create scanner with blacklist patterns
+    scanner = ManifestScanner(
+        config={"blacklist_patterns": ["unsafe", "malicious"]},
+    )
 
-        # Test can_handle
-        assert scanner.can_handle(test_file) is True
+    # Test can_handle
+    assert scanner.can_handle(str(test_file)) is True
 
-        # Test scan
-        result = scanner.scan(test_file)
+    # Test scan
+    result = scanner.scan(str(test_file))
 
-        # Verify scan completed successfully
-        assert result.success is True
+    # Verify scan completed successfully
+    assert result.success is True
 
-        # Check that suspicious keys were detected
-        suspicious_keys = [
-            issue.details.get("key", "")
-            for issue in result.issues
-            if hasattr(issue, "details") and "key" in issue.details
-        ]
-        assert any("file_path" in key for key in suspicious_keys)
-        assert any("api_key" in key for key in suspicious_keys)
-
-    finally:
-        # Clean up
-        test_file_path = Path(test_file)
-        if test_file_path.exists():
-            test_file_path.unlink()
+    # Check that suspicious keys were detected
+    suspicious_keys = [
+        issue.details.get("key", "")
+        for issue in result.issues
+        if hasattr(issue, "details") and "key" in issue.details
+    ]
+    assert any("file_path" in key for key in suspicious_keys)
+    assert any("api_key" in key for key in suspicious_keys)
 
 
 def test_manifest_scanner_blacklist():
