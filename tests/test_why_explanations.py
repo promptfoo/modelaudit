@@ -3,8 +3,13 @@
 import pickle
 import tempfile
 
-from modelaudit.explanations import get_import_explanation, get_opcode_explanation
-from modelaudit.scanners.base import Issue, IssueSeverity
+from modelaudit.explanations import (
+    COMMON_MESSAGE_EXPLANATIONS,
+    get_import_explanation,
+    get_message_explanation,
+    get_opcode_explanation,
+)
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
@@ -143,3 +148,267 @@ def test_cli_output_format_includes_why():
     clean_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
     normalized_output = " ".join(clean_output.split())
     assert "operating system functions" in normalized_output
+
+
+def test_common_message_explanations_coverage():
+    """Test that all COMMON_MESSAGE_EXPLANATIONS patterns work correctly."""
+    # Test that all defined patterns have explanations
+    assert len(COMMON_MESSAGE_EXPLANATIONS) > 0, (
+        "Should have common message explanations defined"
+    )
+
+    for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
+        assert explanation, f"Explanation for '{prefix}' should not be empty"
+        assert len(explanation) > 20, (
+            f"Explanation for '{prefix}' should be substantial"
+        )
+
+
+def test_get_message_explanation_exact_matches():
+    """Test get_message_explanation with exact prefix matches."""
+    test_cases = [
+        ("Maximum ZIP nesting depth", "zip bombs"),
+        ("ZIP file contains too many entries", "zip bomb"),
+        ("Archive entry", "path traversal"),
+        ("Symlink", "path traversal"),
+        ("File too small", "truncated"),
+        ("Not a valid zip file", "malformed"),
+        ("File too large", "denial-of-service"),
+        ("Too many", "overwhelm"),
+        ("Error scanning", "corrupted files"),
+        ("Decompressed size too large", "compression bombs"),
+        # New ML-specific patterns
+        ("Custom objects found", "arbitrary Python code"),
+        ("External reference", "sensitive data"),
+        ("Lambda layer", "arbitrary Python code"),
+        ("Custom layer", "untrusted code"),
+        ("Module not installed", "supply chain"),
+        ("Import error", "malicious modules"),
+        ("Missing metadata", "tampered models"),
+        ("Invalid metadata", "file tampering"),
+    ]
+
+    for prefix, expected_keyword in test_cases:
+        explanation = get_message_explanation(prefix)
+        assert explanation is not None, f"Should have explanation for '{prefix}'"
+        assert expected_keyword.lower() in explanation.lower(), (
+            f"Explanation for '{prefix}' should contain '{expected_keyword}'"
+        )
+
+
+def test_get_message_explanation_prefix_matching():
+    """Test that get_message_explanation works with prefix matching."""
+    test_cases = [
+        ("Maximum ZIP nesting depth exceeded at level 10", True),
+        ("ZIP file contains too many entries: 50000 found", True),
+        ("Archive entry would extract to ../../../etc/passwd", True),
+        ("Symlink pointing outside safe directory", True),
+        ("File too small: expected 1000, got 50 bytes", True),
+        ("Not a valid zip file: header corrupted", True),
+        ("File too large: 2GB exceeds 1GB limit", True),
+        ("Too many suspicious imports detected", True),
+        ("Error scanning model: pickle corruption", True),
+        ("Decompressed size too large: 10GB from 1MB", True),
+        ("Random message that doesn't match any pattern", False),
+        ("Different file format detected", False),
+    ]
+
+    for message, should_have_explanation in test_cases:
+        explanation = get_message_explanation(message)
+        if should_have_explanation:
+            assert explanation is not None, (
+                f"Should have explanation for message: '{message}'"
+            )
+        else:
+            assert explanation is None, (
+                f"Should not have explanation for message: '{message}'"
+            )
+
+
+def test_scan_result_auto_explanation_integration():
+    """Test that ScanResult.add_issue automatically adds explanations from COMMON_MESSAGE_EXPLANATIONS."""
+    result = ScanResult("test_scanner")
+
+    # Test messages that should get automatic explanations
+    test_messages = [
+        "Maximum ZIP nesting depth exceeded",
+        "File too large: 500MB",
+        "Error scanning corrupted model",
+        "Custom message without explanation",
+    ]
+
+    for message in test_messages:
+        result.add_issue(message, severity=IssueSeverity.WARNING)
+
+    # Check that the right issues got explanations
+    issues_with_explanation = [
+        issue for issue in result.issues if issue.why is not None
+    ]
+    issues_without_explanation = [issue for issue in result.issues if issue.why is None]
+
+    # Should have 3 with explanations, 1 without
+    assert len(issues_with_explanation) == 3
+    assert len(issues_without_explanation) == 1
+    assert issues_without_explanation[0].message == "Custom message without explanation"
+
+
+def test_scan_result_explicit_why_overrides_auto():
+    """Test that explicit 'why' parameter overrides automatic explanation lookup."""
+    result = ScanResult("test_scanner")
+
+    # Add an issue with a message that would normally get an auto-explanation,
+    # but provide an explicit 'why' parameter
+    explicit_why = "This is a custom explanation that should override the default"
+    result.add_issue(
+        "Maximum ZIP nesting depth exceeded",
+        severity=IssueSeverity.WARNING,
+        why=explicit_why,
+    )
+
+    # The explicit explanation should be used, not the automatic one
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.why == explicit_why
+
+    # Verify it's not the automatic explanation
+    auto_explanation = get_message_explanation("Maximum ZIP nesting depth exceeded")
+    assert issue.why != auto_explanation
+
+
+def test_common_message_explanations_security_focus():
+    """Test that all common message explanations focus on security implications."""
+    security_keywords = [
+        "malicious",
+        "attack",
+        "security",
+        "exploit",
+        "dangerous",
+        "overwhelm",
+        "exhaust",
+        "crash",
+        "compromise",
+        "overwrite",
+        "traversal",
+        "bomb",
+        "denial-of-service",
+        "tampering",
+        "corrupt",
+        "vulnerabilities",
+        "arbitrary",
+        "untrusted",
+        "bypass",
+        "hide",
+        "disguised",
+        "spoofing",
+        "tampered",
+        "execution",
+        "execute",
+    ]
+
+    for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
+        # Each explanation should contain at least one security-focused keyword
+        explanation_lower = explanation.lower()
+        has_security_keyword = any(
+            keyword in explanation_lower for keyword in security_keywords
+        )
+        assert has_security_keyword, (
+            f"Explanation for '{prefix}' should focus on security implications: {explanation}"
+        )
+
+
+def test_message_explanation_serialization():
+    """Test that issues with automatic explanations serialize correctly."""
+    result = ScanResult("test_scanner")
+    result.add_issue("File too large: exceeds limit", severity=IssueSeverity.WARNING)
+
+    # Test dictionary serialization
+    result_dict = result.to_dict()
+    assert len(result_dict["issues"]) == 1
+    issue_dict = result_dict["issues"][0]
+    assert "why" in issue_dict
+    assert "denial-of-service" in issue_dict["why"].lower()
+
+    # Test JSON serialization
+    json_str = result.to_json()
+    assert '"why"' in json_str
+    assert "denial-of-service" in json_str.lower()
+
+
+def test_context_aware_explanations():
+    """Test that explanations can be enhanced with context information."""
+    from modelaudit.explanations import get_message_explanation
+
+    # Test ML model context enhancement
+    basic_explanation = get_message_explanation("Custom objects found")
+    ml_context_explanation = get_message_explanation(
+        "Custom objects found", context="pickle_scanner"
+    )
+
+    assert basic_explanation is not None
+    assert ml_context_explanation is not None
+    # Context-aware explanation should be more specific
+    assert len(ml_context_explanation) > len(basic_explanation)
+    assert "pickle-based formats" in ml_context_explanation.lower()
+
+    # Test archive context enhancement
+    basic_archive_explanation = get_message_explanation(
+        "Archive entry would extract outside"
+    )
+    archive_context_explanation = get_message_explanation(
+        "Archive entry would extract outside", context="zip_scanner"
+    )
+
+    assert basic_archive_explanation is not None
+    assert archive_context_explanation is not None
+    # Should get enhanced explanation for archive context
+    assert "ML model deployments" in archive_context_explanation
+
+
+def test_scan_result_context_integration():
+    """Test that ScanResult passes scanner context for enhanced explanations."""
+    result = ScanResult("pickle_scanner")
+    result.add_issue("Custom objects found in model")
+
+    # Should get the enhanced pickle-specific explanation
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.why is not None
+    assert "pickle-based formats" in issue.why.lower()
+
+
+def test_ml_specific_message_patterns():
+    """Test that new ML-specific message patterns work correctly."""
+    ml_messages = [
+        "Custom objects found in TensorFlow model",
+        "External reference to /etc/passwd detected",
+        "Lambda layer with suspicious code",
+        "Custom layer implementation found",
+        "Module not installed: malicious_package",
+        "Import error: cannot load suspicious_module",
+        "Missing metadata in model file",
+        "Invalid metadata: corrupted JSON",
+        "Unexpected metadata field: __exec__",
+    ]
+
+    for message in ml_messages:
+        explanation = get_message_explanation(message)
+        assert explanation is not None, (
+            f"Should have explanation for ML message: '{message}'"
+        )
+        # All ML explanations should mention security implications
+        assert any(
+            keyword in explanation.lower()
+            for keyword in [
+                "malicious",
+                "attack",
+                "security",
+                "compromise",
+                "dangerous",
+                "exploit",
+                "arbitrary",
+                "untrusted",
+                "execute",
+                "execution",
+                "vulnerabilities",
+            ]
+        ), f"ML explanation should focus on security: '{explanation}'"

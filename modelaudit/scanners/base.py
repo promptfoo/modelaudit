@@ -82,7 +82,8 @@ class ScanResult:
     ) -> None:
         """Add an issue to the result"""
         if why is None:
-            why = get_message_explanation(message)
+            # Pass scanner name as context for more specific explanations
+            why = get_message_explanation(message, context=self.scanner_name)
         issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
         log_level = (
