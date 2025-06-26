@@ -429,6 +429,40 @@ class TestPickleScanner(unittest.TestCase):
             finally:
                 os.unlink(f.name)
 
+    def test_nested_pickle_detection(self):
+        """Scanner should detect nested pickle bytes and encoded payloads"""
+        scanner = PickleScanner()
+
+        import base64
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            try:
+                inner = {"a": 1}
+                inner_bytes = pickle.dumps(inner)
+                outer = {
+                    "raw": inner_bytes,
+                    "enc": base64.b64encode(inner_bytes).decode("ascii"),
+                }
+                pickle.dump(outer, f)
+                f.flush()
+
+                result = scanner.scan(f.name)
+
+                assert result.success
+
+                nested_issues = [
+                    i
+                    for i in result.issues
+                    if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+                ]
+                assert nested_issues
+                assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+
+            finally:
+                os.unlink(f.name)
+
 
 if __name__ == "__main__":
     unittest.main()
