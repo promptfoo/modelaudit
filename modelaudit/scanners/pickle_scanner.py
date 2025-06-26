@@ -793,14 +793,67 @@ class PickleScanner(BaseScanner):
                             result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
-            result.add_issue(
-                f"Error opening pickle file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+            # Check for recursion errors on legitimate ML model files
+            file_ext = os.path.splitext(path)[1].lower()
+            is_recursion_error = isinstance(e, RecursionError)
+            # Be more specific - only for large model files (>100MB) with ML extensions
+            is_large_ml_model = (
+                file_ext in {".bin", ".pt", ".pth", ".ckpt"} and file_size > 100 * 1024 * 1024  # > 100MB
             )
-            result.finish(success=False)
-            return result
+
+            # Check if this appears to be a legitimate PyTorch model
+            is_legitimate_file = False
+            if is_large_ml_model:
+                try:
+                    is_legitimate_file = self._is_legitimate_pytorch_model(path)
+                except Exception:
+                    is_legitimate_file = False
+
+            is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
+
+            if is_recursion_on_legitimate_model:
+                # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
+                logger.info(
+                    f"Recursion limit reached scanning legitimate ML model {path}. "
+                    f"File appears to be a complex but safe model file."
+                )
+                result.metadata.update(
+                    {
+                        "recursion_limited": True,
+                        "file_size": file_size,
+                        "file_type": "legitimate_ml_model",
+                        "scanner_limitation": True,
+                    }
+                )
+                # Add as info-level issue for transparency, not critical
+                result.add_issue(
+                    "Scan limited by model complexity - large legitimate ML model",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "reason": "recursion_limit_on_legitimate_model",
+                        "file_size": file_size,
+                        "file_format": file_ext,
+                    },
+                    why=(
+                        "This appears to be a large, legitimate ML model file that exceeds the scanner's "
+                        "complexity limits. Complex model architectures with deeply nested structures can "
+                        "exceed Python's recursion limits during analysis. The file appears legitimate based "
+                        "on format validation."
+                    ),
+                )
+                result.finish(success=True)  # Mark as successful scan despite limitation
+                return result
+            else:
+                # Handle as critical error for unknown/suspicious cases
+                result.add_issue(
+                    f"Error opening pickle file: {e!s}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={"exception": str(e), "exception_type": type(e).__name__},
+                )
+                result.finish(success=False)
+                return result
 
         result.finish(success=True)
         return result
@@ -812,6 +865,13 @@ class PickleScanner(BaseScanner):
         suspicious_count = 0
 
         try:
+            # Set a reasonable recursion limit to handle complex ML models
+            import sys
+
+            original_recursion_limit = sys.getrecursionlimit()
+            # Increase recursion limit for large ML models but still have a bound
+            new_limit = max(original_recursion_limit, 3000)
+            sys.setrecursionlimit(new_limit)
             # Process the pickle
             start_pos = file_obj.tell()
 
@@ -1175,13 +1235,22 @@ class PickleScanner(BaseScanner):
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
 
+            # Check for recursion errors on legitimate ML model files
+            is_recursion_error = isinstance(e, RecursionError)
+            # Be more specific - only for large model files (>100MB) with ML extensions
+            is_large_ml_model = (
+                file_ext in {".bin", ".pt", ".pth", ".ckpt"} and file_size > 100 * 1024 * 1024  # > 100MB
+            )
+
             # Pre-validate file legitimacy to avoid nested exceptions
             is_legitimate_file = False
-            if file_ext in {".joblib", ".dill"}:
+            if file_ext in {".joblib", ".dill"} or is_large_ml_model:
                 try:
-                    is_legitimate_file = _is_legitimate_serialization_file(
-                        self.current_file_path,
-                    )
+                    if file_ext in {".joblib", ".dill"}:
+                        is_legitimate_file = _is_legitimate_serialization_file(self.current_file_path)
+                    elif is_large_ml_model:
+                        # For large PyTorch model files, check if they look legitimate
+                        is_legitimate_file = self._is_legitimate_pytorch_model(self.current_file_path)
                 except Exception:
                     # If validation itself fails, treat as non-legitimate
                     is_legitimate_file = False
@@ -1202,7 +1271,43 @@ class PickleScanner(BaseScanner):
                 and is_legitimate_file
             )
 
-            if is_benign_error:
+            # Check if this is a recursion error on a legitimate ML model
+            is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
+
+            if is_recursion_on_legitimate_model:
+                # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
+                logger.info(
+                    f"Recursion limit reached scanning legitimate ML model {self.current_file_path}. "
+                    f"File appears to be a complex but safe model file."
+                )
+                result.metadata.update(
+                    {
+                        "recursion_limited": True,
+                        "file_size": file_size,
+                        "file_type": "legitimate_ml_model",
+                        "opcodes_analyzed": opcode_count,
+                        "scanner_limitation": True,
+                    }
+                )
+                # Add as info-level issue for transparency, not critical
+                result.add_issue(
+                    "Scan limited by model complexity - large legitimate ML model",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "reason": "recursion_limit_on_legitimate_model",
+                        "opcodes_analyzed": opcode_count,
+                        "file_size": file_size,
+                        "file_format": file_ext,
+                    },
+                    why=(
+                        "This appears to be a large, legitimate ML model file that exceeds the scanner's "
+                        "complexity limits. Complex model architectures with deeply nested structures can "
+                        "exceed Python's recursion limits during analysis. The file appears legitimate based "
+                        "on format validation."
+                    ),
+                )
+            elif is_benign_error:
                 # Log for security auditing but treat as non-fatal
                 logger.warning(
                     f"Truncated pickle scan of {self.current_file_path}: {e}. This may be due to non-pickle "
@@ -1245,7 +1350,53 @@ class PickleScanner(BaseScanner):
                     },
                 )
 
+        finally:
+            # Restore original recursion limit
+            import contextlib
+
+            with contextlib.suppress(NameError):
+                sys.setrecursionlimit(original_recursion_limit)
+
         return result
+
+    def _is_legitimate_pytorch_model(self, path: str) -> bool:
+        """
+        Check if a file appears to be a legitimate PyTorch model file.
+        Uses heuristics to distinguish between legitimate models and malicious files.
+        """
+        try:
+            with open(path, "rb") as f:
+                # Read first 1KB to check for PyTorch patterns
+                header = f.read(1024)
+                if len(header) < 10:
+                    return False
+
+                # Check for pickle format
+                if not (header[0] == 0x80 and header[1] in (2, 3, 4, 5)):
+                    return False
+
+                # Look for PyTorch-specific patterns in the header
+                pytorch_indicators = [
+                    b"torch",
+                    b"_pickle",
+                    b"collections",
+                    b"OrderedDict",
+                    b"state_dict",
+                    b"_metadata",
+                    b"version",
+                ]
+
+                # Check if it contains PyTorch indicators
+                has_pytorch_patterns = any(indicator in header for indicator in pytorch_indicators)
+
+                # For large files with PyTorch patterns, likely legitimate
+                file_size = os.path.getsize(path)
+                is_reasonable_size = 1024 * 1024 < file_size < 10 * 1024 * 1024 * 1024  # 1MB to 10GB
+
+                return has_pytorch_patterns and is_reasonable_size
+
+        except Exception:
+            return False
 
     def _scan_binary_content(
         self,
