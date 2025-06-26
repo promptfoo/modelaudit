@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import Any, BinaryIO, Dict, List, Optional, Union
+from typing import Any, BinaryIO, ClassVar, Optional, Union
 
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
@@ -24,7 +24,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 # ============================================================================
 
 # ML Framework Detection Patterns
-ML_FRAMEWORK_PATTERNS: Dict[str, Dict[str, Union[List[str], float]]] = {
+ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
     "pytorch": {
         "modules": [
             "torch",
@@ -83,7 +83,7 @@ ML_FRAMEWORK_PATTERNS: Dict[str, Dict[str, Union[List[str], float]]] = {
 }
 
 # Safe ML-specific global patterns
-ML_SAFE_GLOBALS: Dict[str, List[str]] = {
+ML_SAFE_GLOBALS: dict[str, list[str]] = {
     # PyTorch safe patterns
     "torch": ["*"],  # All torch functions are generally safe
     "torch.nn": ["*"],
@@ -151,7 +151,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     global_refs: dict[str, int] = {}
     total_global_opcodes = 0
 
-    for opcode, arg, pos in opcodes:
+    for opcode, arg, _pos in opcodes:
         if opcode.name == "GLOBAL" and isinstance(arg, str):
             total_global_opcodes += 1
             # Extract module name from global reference
@@ -207,9 +207,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
 
     # Calculate overall ML confidence - highest framework confidence
     if context["frameworks"]:
-        context["overall_confidence"] = max(
-            fw["confidence"] for fw in context["frameworks"].values()
-        )
+        context["overall_confidence"] = max(fw["confidence"] for fw in context["frameworks"].values())
         # Much more lenient threshold - any significant ML pattern detection
         context["is_ml_content"] = context["overall_confidence"] > 0.15  # Was 0.3
 
@@ -222,15 +220,10 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     and actual dangerous operations.
     """
     # If we have high ML confidence, be more lenient with "suspicious" globals
-    if (
-        ml_context.get("is_ml_content")
-        and ml_context.get("overall_confidence", 0) > 0.5
-    ):
-        # Check if this is a known safe ML global
-        if mod in ML_SAFE_GLOBALS:
-            safe_funcs = ML_SAFE_GLOBALS[mod]
-            if safe_funcs == ["*"] or func in safe_funcs:
-                return False
+    if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5 and mod in ML_SAFE_GLOBALS:
+        safe_funcs = ML_SAFE_GLOBALS[mod]
+        if safe_funcs == ["*"] or func in safe_funcs:
+            return False
 
     # Use original suspicious global check for genuinely suspicious patterns
     return is_suspicious_global(mod, func)
@@ -251,19 +244,13 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
             return pattern
 
     # If we have strong ML context, ignore common ML patterns
-    if (
-        ml_context.get("is_ml_content")
-        and ml_context.get("overall_confidence", 0) > 0.6
-    ):
+    if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.6:
         # Skip common ML magic method patterns
         if re.match(r"^__\w+__$", s):  # Simple magic methods like __call__, __init__
             return None
 
         # Skip tensor/layer names
-        if any(
-            term in s.lower()
-            for term in ["layer", "conv", "batch", "norm", "relu", "pool", "linear"]
-        ):
+        if any(term in s.lower() for term in ["layer", "conv", "batch", "norm", "relu", "pool", "linear"]):
             return None
 
     # Check for base64-like strings (still suspicious)
@@ -298,7 +285,8 @@ def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bo
 
 
 def _get_context_aware_severity(
-    base_severity: IssueSeverity, ml_context: dict
+    base_severity: IssueSeverity,
+    ml_context: dict,
 ) -> IssueSeverity:
     """
     Adjust severity based on ML context confidence.
@@ -314,9 +302,8 @@ def _get_context_aware_severity(
             return IssueSeverity.WARNING
         elif base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
-    elif confidence > 0.5:
-        if base_severity == IssueSeverity.CRITICAL:
-            return IssueSeverity.WARNING
+    elif confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
+        return IssueSeverity.WARNING
 
     return base_severity
 
@@ -375,7 +362,7 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 return True
 
         return False
-    except (OSError, IOError):
+    except OSError:
         # File doesn't exist or can't be read
         return False
     except Exception:
@@ -421,28 +408,19 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Check for GLOBAL followed by REDUCE - common in exploits
-        if (
-            opcode.name == "GLOBAL"
-            and i + 1 < len(opcodes)
-            and opcodes[i + 1][0].name == "REDUCE"
+        if (opcode.name == "GLOBAL" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "REDUCE") and isinstance(
+            arg, str
         ):
-            if isinstance(arg, str):
-                parts = (
-                    arg.split(" ", 1)
-                    if " " in arg
-                    else arg.rsplit(".", 1)
-                    if "." in arg
-                    else [arg, ""]
-                )
-                if len(parts) == 2:
-                    mod, func = parts
-                    return {
-                        "pattern": "GLOBAL+REDUCE",
-                        "module": mod,
-                        "function": func,
-                        "position": pos,
-                        "opcode": opcode.name,
-                    }
+            parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+            if len(parts) == 2:
+                mod, func = parts
+                return {
+                    "pattern": "GLOBAL+REDUCE",
+                    "module": mod,
+                    "function": func,
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
 
         # Check for INST or OBJ opcodes which can also be used for code execution
         if opcode.name in ["INST", "OBJ", "NEWOBJ"] and isinstance(arg, str):
@@ -454,11 +432,7 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
             }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
-        if (
-            opcode.name == "GETATTR"
-            and i + 1 < len(opcodes)
-            and opcodes[i + 1][0].name == "CALL"
-        ):
+        if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
             return {
                 "pattern": "GETATTR+CALL",
                 "attribute": arg,
@@ -487,7 +461,8 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]
 
 
 def check_opcode_sequence(
-    opcodes: list[tuple], ml_context: dict
+    opcodes: list[tuple],
+    ml_context: dict,
 ) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns
@@ -505,7 +480,7 @@ def check_opcode_sequence(
     consecutive_dangerous = 0
     max_consecutive = 0
 
-    for i, (opcode, arg, pos) in enumerate(opcodes):
+    for _i, (opcode, _arg, pos) in enumerate(opcodes):
         # Track dangerous opcodes
         if opcode.name in DANGEROUS_OPCODES:
             dangerous_opcode_count += 1
@@ -547,7 +522,7 @@ class PickleScanner(BaseScanner):
 
     name = "pickle"
     description = "Scans Python pickle files for suspicious code references"
-    supported_extensions = [
+    supported_extensions: ClassVar[list[str]] = [
         ".pkl",
         ".pickle",
         ".dill",
@@ -589,7 +564,7 @@ class PickleScanner(BaseScanner):
                     # File type validation failed - this could be suspicious
                     # Log but still allow scanning for now (let scanner handle the validation)
                     logger.warning(
-                        f"File type validation failed for potential pickle file: {path}"
+                        f"File type validation failed for potential pickle file: {path}",
                     )
 
                 return file_format == "pickle"
@@ -640,16 +615,16 @@ class PickleScanner(BaseScanner):
                         # as they contain tensor data that can trigger false positives
                         if is_pytorch and ml_confidence > 0.7:
                             result.metadata["binary_scan_skipped"] = True
-                            result.metadata["skip_reason"] = (
-                                "High-confidence PyTorch model detected"
-                            )
+                            result.metadata["skip_reason"] = "High-confidence PyTorch model detected"
                             result.bytes_scanned = file_size
                             result.metadata["pickle_bytes"] = pickle_end_pos
                             result.metadata["binary_bytes"] = remaining_bytes
                         else:
                             # Scan the binary content after pickle
                             binary_result = self._scan_binary_content(
-                                f, pickle_end_pos, file_size
+                                f,
+                                pickle_end_pos,
+                                file_size,
                             )
 
                             # Add binary scanning results
@@ -669,7 +644,7 @@ class PickleScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error opening pickle file: {str(e)}",
+                f"Error opening pickle file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -733,7 +708,10 @@ class PickleScanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
-                        why="The scan exceeded the configured time limit. Large or complex pickle files may take longer to analyze due to the number of opcodes that need to be processed.",
+                        why=(
+                            "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                            "longer to analyze due to the number of opcodes that need to be processed."
+                        ),
                     )
                     break
 
@@ -746,52 +724,49 @@ class PickleScanner(BaseScanner):
                     "ml_context": ml_context,
                     "opcode_count": opcode_count,
                     "suspicious_count": suspicious_count,
-                }
+                },
             )
 
             # Now analyze the collected opcodes with ML context awareness
             for opcode, arg, pos in opcodes:
                 # Check for GLOBAL opcodes that might reference suspicious modules
-                if opcode.name == "GLOBAL":
-                    if isinstance(arg, str):
-                        # Handle both "module function" and "module.function" formats
-                        parts = (
-                            arg.split(" ", 1)
-                            if " " in arg
-                            else arg.rsplit(".", 1)
-                            if "." in arg
-                            else [arg, ""]
-                        )
+                if opcode.name == "GLOBAL" and isinstance(arg, str):
+                    # Handle both "module function" and "module.function" formats
+                    parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
 
-                        if len(parts) == 2:
-                            mod, func = parts
-                            if _is_actually_dangerous_global(mod, func, ml_context):
-                                suspicious_count += 1
-                                severity = _get_context_aware_severity(
-                                    IssueSeverity.CRITICAL, ml_context
-                                )
-                                result.add_issue(
-                                    f"Suspicious reference {mod}.{func}",
-                                    severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details={
-                                        "module": mod,
-                                        "function": func,
-                                        "position": pos,
-                                        "opcode": opcode.name,
-                                        "ml_context_confidence": ml_context.get(
-                                            "overall_confidence", 0
-                                        ),
-                                    },
-                                    why=get_import_explanation(mod),
-                                )
+                    if len(parts) == 2:
+                        mod, func = parts
+                        if _is_actually_dangerous_global(mod, func, ml_context):
+                            suspicious_count += 1
+                            severity = _get_context_aware_severity(
+                                IssueSeverity.CRITICAL,
+                                ml_context,
+                            )
+                            result.add_issue(
+                                f"Suspicious reference {mod}.{func}",
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "module": mod,
+                                    "function": func,
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "ml_context_confidence": ml_context.get(
+                                        "overall_confidence",
+                                        0,
+                                    ),
+                                },
+                                why=get_import_explanation(mod),
+                            )
 
                 # SMART DETECTION: Only flag REDUCE opcodes if not clearly ML content
                 if opcode.name == "REDUCE" and not ml_context.get(
-                    "is_ml_content", False
+                    "is_ml_content",
+                    False,
                 ):
                     severity = _get_context_aware_severity(
-                        IssueSeverity.WARNING, ml_context
+                        IssueSeverity.WARNING,
+                        ml_context,
                     )
                     result.add_issue(
                         "Found REDUCE opcode - potential __reduce__ method execution",
@@ -801,7 +776,8 @@ class PickleScanner(BaseScanner):
                             "position": pos,
                             "opcode": opcode.name,
                             "ml_context_confidence": ml_context.get(
-                                "overall_confidence", 0
+                                "overall_confidence",
+                                0,
                             ),
                         },
                         why=get_opcode_explanation("REDUCE"),
@@ -810,10 +786,12 @@ class PickleScanner(BaseScanner):
                 # SMART DETECTION: Only flag other dangerous opcodes
                 # if not clearly ML content
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
-                    "is_ml_content", False
+                    "is_ml_content",
+                    False,
                 ):
                     severity = _get_context_aware_severity(
-                        IssueSeverity.WARNING, ml_context
+                        IssueSeverity.WARNING,
+                        ml_context,
                     )
                     result.add_issue(
                         f"Found {opcode.name} opcode - potential code execution",
@@ -824,7 +802,8 @@ class PickleScanner(BaseScanner):
                             "opcode": opcode.name,
                             "argument": str(arg),
                             "ml_context_confidence": ml_context.get(
-                                "overall_confidence", 0
+                                "overall_confidence",
+                                0,
                             ),
                         },
                         why=get_opcode_explanation(opcode.name),
@@ -840,7 +819,8 @@ class PickleScanner(BaseScanner):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
                         severity = _get_context_aware_severity(
-                            IssueSeverity.WARNING, ml_context
+                            IssueSeverity.WARNING,
+                            ml_context,
                         )
                         result.add_issue(
                             f"Suspicious string pattern: {suspicious_pattern}",
@@ -850,27 +830,32 @@ class PickleScanner(BaseScanner):
                                 "position": pos,
                                 "opcode": opcode.name,
                                 "pattern": suspicious_pattern,
-                                "string_preview": arg[:50]
-                                + ("..." if len(arg) > 50 else ""),
+                                "string_preview": arg[:50] + ("..." if len(arg) > 50 else ""),
                                 "ml_context_confidence": ml_context.get(
-                                    "overall_confidence", 0
+                                    "overall_confidence",
+                                    0,
                                 ),
                             },
                             why=get_pattern_explanation("encoded_strings")
                             if suspicious_pattern == "potential_base64"
-                            else "This string contains patterns that match known security risks such as shell commands, code execution functions, or encoded data.",
+                            else (
+                                "This string contains patterns that match known security risks such as shell commands, "
+                                "code execution functions, or encoded data."
+                            ),
                         )
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
-            for i, (opcode, arg, pos) in enumerate(opcodes):
+            for i, (opcode, _arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
                     # Find the two immediately preceding STRING-like opcodes
                     # STACK_GLOBAL expects exactly two strings on the stack:
                     # module and function
                     recent_strings: list[str] = []
                     for j in range(
-                        i - 1, max(0, i - 10), -1
+                        i - 1,
+                        max(0, i - 10),
+                        -1,
                     ):  # Look back at most 10 opcodes
                         prev_opcode, prev_arg, prev_pos = opcodes[j]
                         if prev_opcode.name in [
@@ -881,7 +866,8 @@ class PickleScanner(BaseScanner):
                             "UNICODE",
                         ] and isinstance(prev_arg, str):
                             recent_strings.insert(
-                                0, prev_arg
+                                0,
+                                prev_arg,
                             )  # Insert at beginning to maintain order
                             if len(recent_strings) >= 2:
                                 break
@@ -893,7 +879,8 @@ class PickleScanner(BaseScanner):
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL, ml_context
+                                IssueSeverity.CRITICAL,
+                                ml_context,
                             )
                             result.add_issue(
                                 f"Suspicious module reference found: {mod}.{func}",
@@ -905,7 +892,8 @@ class PickleScanner(BaseScanner):
                                     "position": pos,
                                     "opcode": opcode.name,
                                     "ml_context_confidence": ml_context.get(
-                                        "overall_confidence", 0
+                                        "overall_confidence",
+                                        0,
                                     ),
                                 },
                                 why=get_import_explanation(mod),
@@ -914,8 +902,7 @@ class PickleScanner(BaseScanner):
                         # Only warn about insufficient context if not ML content
                         if not ml_context.get("is_ml_content", False):
                             result.add_issue(
-                                "STACK_GLOBAL opcode found without "
-                                "sufficient string context",
+                                "STACK_GLOBAL opcode found without sufficient string context",
                                 severity=IssueSeverity.INFO,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
@@ -923,10 +910,15 @@ class PickleScanner(BaseScanner):
                                     "opcode": opcode.name,
                                     "stack_size": len(recent_strings),
                                     "ml_context_confidence": ml_context.get(
-                                        "overall_confidence", 0
+                                        "overall_confidence",
+                                        0,
                                     ),
                                 },
-                                why="STACK_GLOBAL requires two strings on the stack (module and function name) to import and access module attributes. Insufficient context prevents determining which module is being accessed.",
+                                why=(
+                                    "STACK_GLOBAL requires two strings on the stack (module and function name) to "
+                                    "import and access module attributes. Insufficient context prevents determining "
+                                    "which module is being accessed."
+                                ),
                             )
 
             # Check for dangerous patterns in the opcodes
@@ -934,20 +926,20 @@ class PickleScanner(BaseScanner):
             if dangerous_pattern and not ml_context.get("is_ml_content", False):
                 suspicious_count += 1
                 severity = _get_context_aware_severity(
-                    IssueSeverity.CRITICAL, ml_context
+                    IssueSeverity.CRITICAL,
+                    ml_context,
                 )
                 module_name = dangerous_pattern.get("module", "")
                 result.add_issue(
                     f"Detected dangerous __reduce__ pattern with "
-                    f"{dangerous_pattern.get('module', '')}."
-                    f"{dangerous_pattern.get('function', '')}",
+                    f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
                     severity=severity,
-                    location=f"{self.current_file_path} "
-                    f"(pos {dangerous_pattern.get('position', 0)})",
+                    location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
                     details={
                         **dangerous_pattern,
                         "ml_context_confidence": ml_context.get(
-                            "overall_confidence", 0
+                            "overall_confidence",
+                            0,
                         ),
                     },
                     why=get_import_explanation(module_name)
@@ -960,20 +952,24 @@ class PickleScanner(BaseScanner):
             for sequence in suspicious_sequences:
                 suspicious_count += 1
                 severity = _get_context_aware_severity(
-                    IssueSeverity.WARNING, ml_context
+                    IssueSeverity.WARNING,
+                    ml_context,
                 )
                 result.add_issue(
                     f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown')}",
                     severity=severity,
-                    location=f"{self.current_file_path} "
-                    f"(pos {sequence.get('position', 0)})",
+                    location=f"{self.current_file_path} (pos {sequence.get('position', 0)})",
                     details={
                         **sequence,
                         "ml_context_confidence": ml_context.get(
-                            "overall_confidence", 0
+                            "overall_confidence",
+                            0,
                         ),
                     },
-                    why="This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files.",
+                    why=(
+                        "This pickle contains an unusually high concentration of opcodes that can execute code "
+                        "(REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+                    ),
                 )
 
             # Update metadata
@@ -992,7 +988,7 @@ class PickleScanner(BaseScanner):
             if file_ext in {".joblib", ".dill"}:
                 try:
                     is_legitimate_file = _is_legitimate_serialization_file(
-                        self.current_file_path
+                        self.current_file_path,
                     )
                 except Exception:
                     # If validation itself fails, treat as non-legitimate
@@ -1017,8 +1013,8 @@ class PickleScanner(BaseScanner):
             if is_benign_error:
                 # Log for security auditing but treat as non-fatal
                 logger.warning(
-                    f"Truncated pickle scan of {self.current_file_path}: {e}. "
-                    f"This may be due to non-pickle data after STOP opcode."
+                    f"Truncated pickle scan of {self.current_file_path}: {e}. This may be due to non-pickle "
+                    f"data after STOP opcode."
                 )
                 result.metadata.update(
                     {
@@ -1027,7 +1023,7 @@ class PickleScanner(BaseScanner):
                         "exception_type": type(e).__name__,
                         "exception_message": str(e)[:100],  # Limit message length
                         "validated_format": True,
-                    }
+                    },
                 )
                 # Still add as info-level issue for transparency
                 result.add_issue(
@@ -1039,7 +1035,10 @@ class PickleScanner(BaseScanner):
                         "opcodes_analyzed": opcode_count,
                         "file_format": file_ext,
                     },
-                    why="This file contains data after the pickle STOP opcode or uses format features that cannot be fully analyzed. The analyzable portion was scanned for security issues.",
+                    why=(
+                        "This file contains data after the pickle STOP opcode or uses format features that cannot "
+                        "be fully analyzed. The analyzable portion was scanned for security issues."
+                    ),
                 )
             else:
                 # Treat as critical error for unknown/suspicious cases
@@ -1057,7 +1056,10 @@ class PickleScanner(BaseScanner):
         return result
 
     def _scan_binary_content(
-        self, file_obj: BinaryIO, start_pos: int, file_size: int
+        self,
+        file_obj: BinaryIO,
+        start_pos: int,
+        file_size: int,
     ) -> ScanResult:
         """Scan the binary content after pickle data for suspicious patterns"""
         result = self._create_result()
@@ -1069,9 +1071,7 @@ class PickleScanner(BaseScanner):
             # Executable signatures with additional validation
             # For PE files, we need to check for the full DOS header structure
             # to avoid false positives from random "MZ" bytes in model weights
-            executable_sigs = {
-                k: v for k, v in EXECUTABLE_SIGNATURES.items() if k != b"MZ"
-            }
+            executable_sigs = {k: v for k, v in EXECUTABLE_SIGNATURES.items() if k != b"MZ"}
 
             # Read in chunks
             chunk_size = 1024 * 1024  # 1MB chunks
@@ -1098,7 +1098,10 @@ class PickleScanner(BaseScanner):
                                 "offset": current_offset + pos,
                                 "section": "binary_data",
                             },
-                            why="Python code patterns found in binary sections of the file. Model weights are typically numeric data and should not contain readable code strings.",
+                            why=(
+                                "Python code patterns found in binary sections of the file. Model weights are "
+                                "typically numeric data and should not contain readable code strings."
+                            ),
                         )
 
                 # Check for executable signatures
@@ -1115,7 +1118,10 @@ class PickleScanner(BaseScanner):
                                 "offset": current_offset + pos,
                                 "section": "binary_data",
                             },
-                            why="Executable files embedded in model data can run arbitrary code on the system. Model files should contain only serialized weights and configuration data.",
+                            why=(
+                                "Executable files embedded in model data can run arbitrary code on the system. "
+                                "Model files should contain only serialized weights and configuration data."
+                            ),
                         )
 
                 # Special check for Windows PE files with more validation
@@ -1141,7 +1147,10 @@ class PickleScanner(BaseScanner):
                                     "offset": current_offset + pos,
                                     "section": "binary_data",
                                 },
-                                why="Windows executable files embedded in model data can run arbitrary code on the system. The presence of a valid DOS stub confirms this is an actual PE executable.",
+                                why=(
+                                    "Windows executable files embedded in model data can run arbitrary code on the "
+                                    "system. The presence of a valid DOS stub confirms this is an actual PE executable."
+                                ),
                             )
 
                 # Check for timeout
@@ -1154,7 +1163,10 @@ class PickleScanner(BaseScanner):
                             "bytes_scanned": start_pos + bytes_scanned,
                             "timeout": self.timeout,
                         },
-                        why="The binary content scan exceeded the configured time limit. Large model files may require more time to fully analyze.",
+                        why=(
+                            "The binary content scan exceeded the configured time limit. Large model files may "
+                            "require more time to fully analyze."
+                        ),
                     )
                     break
 
@@ -1162,7 +1174,7 @@ class PickleScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning binary content: {str(e)}",
+                f"Error scanning binary content: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"exception": str(e), "exception_type": type(e).__name__},

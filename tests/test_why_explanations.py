@@ -23,9 +23,7 @@ def test_issue_with_why_field():
     # Test serialization includes why field
     issue_dict = issue.to_dict()
     assert "why" in issue_dict
-    assert (
-        issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
-    )
+    assert issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
 
 
 def test_issue_without_why_field():
@@ -96,8 +94,7 @@ def test_pickle_scanner_includes_why():
         system_issues = [
             issue
             for issue in result.issues
-            if ("os" in issue.message.lower() or "posix" in issue.message.lower())
-            and issue.why is not None
+            if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None
         ]
         assert len(system_issues) > 0
 
@@ -112,6 +109,8 @@ def test_pickle_scanner_includes_why():
 
 def test_cli_output_format_includes_why():
     """Test that CLI output formatting includes 'why' explanations."""
+    import re
+
     from modelaudit.cli import format_text_output
 
     # Create test results with 'why' explanations
@@ -126,13 +125,18 @@ def test_cli_output_format_includes_why():
                 "severity": "critical",
                 "location": "test.pkl",
                 "why": "The 'os' module provides direct access to operating system functions.",
-            }
+            },
         ],
     }
 
     # Format the output
     output = format_text_output(test_results)
 
-    # Check that the output includes the "Why:" label and explanation
+    # Check that the output includes the "Why:" label
     assert "Why:" in output
-    assert "operating system functions" in output
+
+    # Check for the explanation text, accounting for line wrapping
+    # Remove ANSI codes and normalize whitespace
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    normalized_output = " ".join(clean_output.split())
+    assert "operating system functions" in normalized_output

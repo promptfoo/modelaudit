@@ -157,7 +157,7 @@ class TestPerformanceCharacteristics:
             # This might be slow due to tensorflow import
             from modelaudit.scanners import TensorFlowSavedModelScanner
 
-            _ = time.time() - start_time
+            _access_time = time.time() - start_time
 
             # This is expected to be slower due to tensorflow
             # But we can't assert exact time since it depends on system

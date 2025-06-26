@@ -55,9 +55,7 @@ def demonstrate_license_features():
         print(f"   📊 Bytes scanned: {data['bytes_scanned']}")
 
         # Check for any license issues
-        license_issues = [
-            i for i in data.get("issues", []) if i.get("type") == "license_warning"
-        ]
+        license_issues = [i for i in data.get("issues", []) if i.get("type") == "license_warning"]
         if license_issues:
             print(f"   ⚠️  License notices: {len(license_issues)}")
         else:
@@ -77,9 +75,7 @@ def demonstrate_license_features():
         print("✅ PASS: AGPL component triggered warnings as expected")
         data = json.loads(result.stdout)
 
-        license_issues = [
-            i for i in data.get("issues", []) if i.get("type") == "license_warning"
-        ]
+        license_issues = [i for i in data.get("issues", []) if i.get("type") == "license_warning"]
         print(f"   ⚠️  License warnings: {len(license_issues)}")
 
         agpl_issues = [i for i in license_issues if "AGPL" in i.get("message", "")]
@@ -88,9 +84,7 @@ def demonstrate_license_features():
             for issue in agpl_issues:
                 print(f"      - {issue['message']}")
 
-        copyleft_issues = [
-            i for i in license_issues if "copyleft" in i.get("message", "")
-        ]
+        copyleft_issues = [i for i in license_issues if "copyleft" in i.get("message", "")]
         if copyleft_issues:
             print("   📋 Copyleft obligations noted")
 
@@ -109,11 +103,7 @@ def demonstrate_license_features():
         print("✅ PASS: Unlicensed datasets triggered warnings")
         data = json.loads(result.stdout)
 
-        dataset_issues = [
-            i
-            for i in data.get("issues", [])
-            if "unspecified licenses" in i.get("message", "")
-        ]
+        dataset_issues = [i for i in data.get("issues", []) if "unspecified licenses" in i.get("message", "")]
         if dataset_issues:
             print("   📊 Unlicensed dataset warnings:")
             for issue in dataset_issues:
@@ -180,9 +170,7 @@ def demonstrate_license_features():
     result = run_cli_command(["scan", str(mixed_dir), "--format", "json"])
 
     data = json.loads(result.stdout)
-    license_issues = [
-        i for i in data.get("issues", []) if i.get("type") == "license_warning"
-    ]
+    license_issues = [i for i in data.get("issues", []) if i.get("type") == "license_warning"]
 
     print("✅ Mixed license analysis completed")
     print(f"   📁 Files scanned: {data['files_scanned']}")
