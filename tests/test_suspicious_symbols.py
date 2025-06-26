@@ -42,9 +42,7 @@ class TestSuspiciousGlobals:
 
         for module in critical_modules:
             assert module in SUSPICIOUS_GLOBALS or any(
-                module in funcs
-                for funcs in SUSPICIOUS_GLOBALS.values()
-                if isinstance(funcs, list)
+                module in funcs for funcs in SUSPICIOUS_GLOBALS.values() if isinstance(funcs, list)
             ), f"Critical module {module} not found in suspicious patterns"
 
     def test_builtins_functions(self) -> None:
@@ -130,9 +128,7 @@ class TestSuspiciousStringPatterns:
         ]
 
         for pattern, test_string in test_cases:
-            assert re.search(pattern, test_string), (
-                f"Pattern '{pattern}' failed to match '{test_string}'"
-            )
+            assert re.search(pattern, test_string), f"Pattern '{pattern}' failed to match '{test_string}'"
 
     def test_patterns_dont_match_safe_code(self) -> None:
         """Test that patterns don't match legitimate ML code."""
@@ -227,9 +223,7 @@ class TestSuspiciousConfigProperties:
         execution_props = ["eval", "exec", "function", "code"]
 
         for prop in execution_props:
-            assert prop in SUSPICIOUS_CONFIG_PROPERTIES, (
-                f"Execution property {prop} not flagged"
-            )
+            assert prop in SUSPICIOUS_CONFIG_PROPERTIES, f"Execution property {prop} not flagged"
 
 
 class TestSuspiciousConfigPatterns:
@@ -246,9 +240,7 @@ class TestSuspiciousConfigPatterns:
             "credentials",
         ]
         for category in expected_categories:
-            assert category in SUSPICIOUS_CONFIG_PATTERNS, (
-                f"Category {category} missing"
-            )
+            assert category in SUSPICIOUS_CONFIG_PATTERNS, f"Category {category} missing"
 
             patterns = SUSPICIOUS_CONFIG_PATTERNS[category]
             assert isinstance(patterns, list)
@@ -450,7 +442,7 @@ class TestPatternMaintenance:
         """Test that patterns are consistently documented."""
         all_patterns = get_all_suspicious_patterns()
 
-        for category, info in all_patterns.items():
+        for _category, info in all_patterns.items():
             # Each category should have required metadata
             assert "description" in info
             assert "risk_level" in info
