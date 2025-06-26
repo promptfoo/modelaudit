@@ -184,16 +184,35 @@ class PyTorchBinaryScanner(BaseScanner):
         for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
                 pos = chunk.find(sig)
-                result.add_issue(
-                    f"Executable signature found: {description}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (offset: {offset + pos})",
-                    details={
-                        "signature": sig.hex(),
-                        "description": description,
-                        "offset": offset + pos,
-                    },
-                )
+                absolute_offset = offset + pos
+
+                # Only flag if the signature appears at the beginning of the file
+                # Real executables start with their magic bytes at offset 0
+                # This reduces false positives from random byte sequences in model weights
+                if absolute_offset == 0:
+                    result.add_issue(
+                        f"Executable signature found: {description}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (offset: {absolute_offset})",
+                        details={
+                            "signature": sig.hex(),
+                            "description": description,
+                            "offset": absolute_offset,
+                        },
+                    )
+                elif len(sig) > 2:
+                    # For longer signatures (more than 2 bytes), also flag them
+                    # as they're less likely to be false positives
+                    result.add_issue(
+                        f"Executable signature found: {description}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (offset: {absolute_offset})",
+                        details={
+                            "signature": sig.hex(),
+                            "description": description,
+                            "offset": absolute_offset,
+                        },
+                    )
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
         """Validate that the file appears to have valid tensor structure"""
