@@ -66,6 +66,14 @@ def _write_ggml_file(path):
         f.write(b"\0" * 24)  # padding to minimum size
 
 
+def _write_ggml_variant_file(path, magic):
+    """Create a GGML variant file with custom magic."""
+    with open(path, "wb") as f:
+        f.write(magic)
+        f.write(struct.pack("<I", 1))
+        f.write(b"\0" * 24)
+
+
 def test_gguf_scanner_can_handle_gguf(tmp_path):
     """Test that scanner can handle GGUF files."""
     path = tmp_path / "model.gguf"
@@ -78,6 +86,14 @@ def test_gguf_scanner_can_handle_ggml(tmp_path):
     path = tmp_path / "model.ggml"
     _write_ggml_file(path)
     assert GgufScanner.can_handle(str(path))
+
+
+def test_gguf_scanner_can_handle_ggml_variants(tmp_path):
+    """Scanner handles GGML variant magic codes."""
+    for magic in [b"GGMF", b"GGJT"]:
+        path = tmp_path / f"model_{magic.decode().lower()}.ggml"
+        _write_ggml_variant_file(path, magic)
+        assert GgufScanner.can_handle(str(path))
 
 
 def test_gguf_scanner_rejects_invalid_files(tmp_path):
@@ -188,6 +204,16 @@ def test_ggml_scanner_basic(tmp_path):
     assert result.success
     assert result.metadata["format"] == "ggml"
     assert result.metadata["version"] == 1
+
+
+def test_ggml_variant_scanner_basic(tmp_path):
+    """Ensure GGML variants are scanned correctly."""
+    path = tmp_path / "model.ggmf"
+    _write_ggml_variant_file(path, b"GGMF")
+    result = GgufScanner().scan(str(path))
+    assert result.success
+    assert result.metadata["format"] == "ggml"
+    assert result.metadata.get("magic") == "GGMF"
 
 
 def test_ggml_scanner_suspicious_version(tmp_path):

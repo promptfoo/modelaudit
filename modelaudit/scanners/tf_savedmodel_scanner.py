@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 
+from modelaudit.explanations import get_tf_op_explanation
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -229,6 +230,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
                             ),
                         },
+                        why=get_tf_op_explanation(node.op),
                     )
 
         # Add operation counts to metadata

@@ -177,6 +177,64 @@ PATTERN_EXPLANATIONS = {
     ),
 }
 
+# Explanations for suspicious TensorFlow operations
+#
+# Risk Categories:
+# - CRITICAL: Code execution (PyFunc, PyCall, ExecuteOp, ShellExecute) & System access (SystemConfig)
+# - HIGH: File system operations (ReadFile, WriteFile, Save, SaveV2, MergeV2Checkpoints)
+# - MEDIUM: Data processing with potential exploits (DecodeRaw, DecodeJpeg, DecodePng)
+#
+# Threat Context: Malicious ML models embed these operations to execute during model loading/inference,
+# bypassing security tools that typically trust ML models. Used for RCE, data exfiltration, backdoors,
+# and supply chain attacks.
+TF_OP_EXPLANATIONS = {
+    # Code execution operations - CRITICAL RISK
+    "PyFunc": (
+        "The PyFunc operation executes arbitrary Python code in the TensorFlow graph, which attackers can "
+        "abuse to run system commands or other malicious code."
+    ),
+    "PyCall": (
+        "The PyCall operation invokes Python callbacks during graph execution, creating dangerous security risks "
+        "by allowing arbitrary code execution that could compromise the system."
+    ),
+    "ExecuteOp": (
+        "ExecuteOp allows running arbitrary operations and poses severe security risks by enabling "
+        "malicious code execution that could compromise the host system."
+    ),
+    # System operations - CRITICAL RISK
+    "ShellExecute": (
+        "ShellExecute runs shell commands from the TensorFlow graph, posing severe security risks by enabling "
+        "arbitrary command execution, potentially compromising the host system."
+    ),
+    "SystemConfig": (
+        "SystemConfig operations access or modify system configuration, creating dangerous security risks "
+        "by enabling reconnaissance or privilege escalation attacks."
+    ),
+    # File system operations - HIGH RISK
+    "ReadFile": (
+        "ReadFile retrieves data from arbitrary files; malicious models could exfiltrate secrets or read "
+        "sensitive files."
+    ),
+    "WriteFile": (
+        "WriteFile writes data to arbitrary locations, which could overwrite files or drop malicious payloads."
+    ),
+    "Save": (
+        "Save operations write checkpoint data. Attackers might use them to persist malicious data or "
+        "overwrite existing files."
+    ),
+    "SaveV2": ("SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution."),
+    "MergeV2Checkpoints": (
+        "MergeV2Checkpoints manipulates TensorFlow checkpoints by reading and writing checkpoint files, "
+        "which could be used to overwrite existing files or inject malicious parameters."
+    ),
+    # Data processing operations - MEDIUM RISK
+    "DecodeRaw": ("DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion."),
+    "DecodeJpeg": (
+        "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources."
+    ),
+    "DecodePng": ("DecodePng decodes PNG data, which could be abused with malformed inputs."),
+}
+
 
 # Function to get explanation for a security issue
 def get_explanation(category: str, specific_item: Optional[str] = None) -> Optional[str]:
@@ -184,8 +242,8 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
     Get a security explanation for a given category and item.
 
     Args:
-        category: The category of security issue ('import', 'opcode', 'pattern')
-        specific_item: The specific item (e.g., 'os', 'REDUCE', 'base64_payload')
+        category: The category of security issue ('import', 'opcode', 'pattern', 'tf_op')
+        specific_item: The specific item (e.g., 'os', 'REDUCE', 'base64_payload', 'PyFunc')
 
     Returns:
         A security-team-friendly explanation, or None if not found
@@ -196,6 +254,8 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
         return DANGEROUS_OPCODES[specific_item]
     elif category == "pattern" and specific_item in PATTERN_EXPLANATIONS:
         return PATTERN_EXPLANATIONS[specific_item]
+    elif category == "tf_op" and specific_item in TF_OP_EXPLANATIONS:
+        return TF_OP_EXPLANATIONS[specific_item]
 
     return None
 
@@ -216,3 +276,185 @@ def get_opcode_explanation(opcode_name: str) -> Optional[str]:
 def get_pattern_explanation(pattern_name: str) -> Optional[str]:
     """Get explanation for a suspicious pattern."""
     return get_explanation("pattern", pattern_name)
+
+
+def get_tf_op_explanation(op_name: str) -> Optional[str]:
+    """Get explanation for a suspicious TensorFlow operation."""
+    return get_explanation("tf_op", op_name)
+
+
+# Default explanations for common issue messages when no explicit "why"
+# is provided at the call site.
+COMMON_MESSAGE_EXPLANATIONS = {
+    # Archive and compression security issues
+    "Maximum ZIP nesting depth": (
+        "Deeply nested archives can be used to hide malicious content or create"
+        " zip bombs that exhaust system resources during extraction."
+    ),
+    "ZIP file contains too many entries": (
+        "Large numbers of archive entries may indicate a malicious zip bomb designed to"
+        " overwhelm the scanner or extraction process."
+    ),
+    "Archive entry": (
+        "Archive paths should never resolve outside the extraction directory as"
+        " this enables path traversal attacks where attackers can overwrite arbitrary files."
+    ),
+    "Symlink": (
+        "Symlinks inside archives can point to sensitive locations and enable path traversal attacks when extracted."
+    ),
+    "Decompressed size too large": (
+        "Maliciously crafted compressed data can expand to enormous sizes"
+        " (compression bombs) to exhaust system memory and crash the application."
+    ),
+    "Not a valid zip file": (
+        "Corrupted or malformed archives could be used to crash tools or hide malicious payloads."
+    ),
+    # File integrity and validation issues
+    "File too small": (
+        "Files smaller than expected may be truncated or corrupted, which is"
+        " often a sign of tampering or incomplete downloads."
+    ),
+    "File too large": (
+        "Extremely large files may be used for denial-of-service attacks by"
+        " exhausting system resources during processing."
+    ),
+    "File type validation failed": (
+        "Mismatched file headers and extensions may indicate file spoofing attacks"
+        " where malicious content is disguised as a legitimate model format."
+    ),
+    # ML-specific security patterns
+    "Custom objects found": (
+        "Custom objects in ML models can contain arbitrary Python code that executes"
+        " during model loading, potentially compromising the system."
+    ),
+    "External reference": (
+        "External file references in models can be used to access sensitive data"
+        " or load malicious content from outside the model file."
+    ),
+    "Lambda layer": (
+        "Lambda layers in neural networks can execute arbitrary Python code during"
+        " model inference, bypassing normal security controls."
+    ),
+    "Custom layer": (
+        "Custom layers may contain untrusted code that executes during model"
+        " operations, potentially performing malicious actions."
+    ),
+    "Unusual layer configuration": (
+        "Non-standard layer configurations may indicate model tampering or"
+        " hidden functionality designed to bypass security measures."
+    ),
+    "Custom metric": (
+        "Custom metrics can execute arbitrary code during training or evaluation,"
+        " potentially compromising the ML pipeline."
+    ),
+    "Custom loss function": (
+        "Custom loss functions may contain malicious code that executes during model training or inference."
+    ),
+    # Dependency and module issues
+    "Module not installed": (
+        "Missing required modules may indicate supply chain attacks where"
+        " attackers rely on users installing malicious packages."
+    ),
+    "Import error": (
+        "Import failures may indicate tampered dependencies or attempts to"
+        " load malicious modules not present in the environment."
+    ),
+    "Deprecated module": ("Deprecated modules may have unpatched security vulnerabilities that attackers can exploit."),
+    # General security and scanning issues
+    "Too many": (
+        "Excessive quantities of data structures may indicate a malicious attempt"
+        " to overwhelm the system or hide malicious content."
+    ),
+    "Error scanning": (
+        "Scanning errors may indicate corrupted files, unsupported formats, or"
+        " malicious content designed to crash security tools."
+    ),
+    "Timeout": (
+        "Processing timeouts may indicate maliciously crafted content designed"
+        " to cause denial-of-service by consuming excessive computational resources."
+    ),
+    "Memory limit exceeded": (
+        "Excessive memory usage may indicate malicious content designed to"
+        " crash the system or hide attacks within resource exhaustion."
+    ),
+    # Metadata and configuration issues
+    "Missing metadata": (
+        "Missing or incomplete metadata may indicate tampered models or attempts to hide malicious modifications."
+    ),
+    "Invalid metadata": (
+        "Corrupted metadata may indicate file tampering or malicious modifications to model configurations."
+    ),
+    "Unexpected metadata": (
+        "Unusual metadata fields may contain hidden payloads or indicate model tampering by malicious actors."
+    ),
+}
+
+
+def get_message_explanation(message: str, context: Optional[str] = None) -> Optional[str]:
+    """Return a default explanation for an issue message if available.
+
+    Args:
+        message: The issue message to find an explanation for
+        context: Optional context to provide more specific explanations
+                (e.g., scanner name, file type, etc.)
+
+    Returns:
+        An explanation string if a matching pattern is found, None otherwise
+    """
+    # First try to find a basic explanation
+    base_explanation = None
+    for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
+        if message.startswith(prefix):
+            base_explanation = explanation
+            break
+
+    # If no base explanation found, return None
+    if base_explanation is None:
+        return None
+
+    # If context is provided, try to enhance the explanation
+    if context:
+        enhanced_explanation = _enhance_explanation_with_context(message, base_explanation, context)
+        if enhanced_explanation:
+            return enhanced_explanation
+
+    return base_explanation
+
+
+def _enhance_explanation_with_context(message: str, base_explanation: str, context: str) -> Optional[str]:
+    """Enhance explanations based on context information."""
+    context_lower = context.lower()
+
+    # ML model-specific context enhancements
+    if any(scanner in context_lower for scanner in ["pickle", "pytorch", "keras", "tensorflow"]):
+        if message.startswith("Custom objects found"):
+            return (
+                "Custom objects in ML models can execute arbitrary Python code during model loading. "
+                "This is particularly dangerous in pickle-based formats where object deserialization "
+                "can trigger immediate code execution without user consent."
+            )
+        elif message.startswith("File too large"):
+            return (
+                "Extremely large model files may indicate embedded malicious data or denial-of-service "
+                "attacks. ML models with unexpectedly large sizes should be verified for legitimate "
+                "architectural reasons before deployment."
+            )
+
+    # Archive-specific context enhancements
+    elif any(scanner in context_lower for scanner in ["zip", "tar", "archive"]):
+        if message.startswith("Archive entry"):
+            return (
+                "Archive path traversal is especially dangerous in ML model deployments where "
+                "automated systems may extract models to predictable locations, enabling "
+                "attackers to overwrite critical system files or model configurations."
+            )
+
+    # ONNX/compiled model context
+    elif any(scanner in context_lower for scanner in ["onnx", "tflite", "compiled"]) and message.startswith("Custom"):
+        return (
+            base_explanation + " In compiled models, custom components may bypass "
+            "the sandboxing that interpreted models provide, making them particularly risky."
+        )
+
+    # Return None if no context-specific enhancement applies
+    return None

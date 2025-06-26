@@ -253,11 +253,125 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
         if any(term in s.lower() for term in ["layer", "conv", "batch", "norm", "relu", "pool", "linear"]):
             return None
 
-    # Check for base64-like strings (still suspicious)
-    if len(s) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", s):
+    # Check for base64-like strings (still suspicious), but avoid repeating patterns
+    if (
+        len(s) > 100
+        and re.match(r"^[A-Za-z0-9+/=]+$", s)
+        and not re.match(r"^(.)\1*$", s)  # Not all same character (e.g., "===...")
+        and len(set(s)) > 4  # Must have some character diversity
+    ):
         return "potential_base64"
 
     return None
+
+
+def _looks_like_pickle(data: bytes) -> bool:
+    """Check if the given bytes resemble a pickle payload with robust validation."""
+    import io
+
+    if not data or len(data) < 2:
+        return False
+
+    # Quick validation: Check for valid pickle protocol markers
+    first_byte = data[0]
+
+    # Protocol 2+ starts with \x80 followed by protocol number
+    if first_byte == 0x80:
+        if len(data) < 2:
+            return False
+        protocol = data[1]
+        if protocol not in (2, 3, 4, 5):
+            return False
+    # Protocol 0/1 must start with valid opcodes
+    elif first_byte not in (
+        ord("("),
+        ord("]"),
+        ord("}"),
+        ord("c"),
+        ord("l"),
+        ord("d"),
+        ord("t"),
+        ord("p"),
+        ord("q"),
+        ord("g"),
+        ord("I"),
+        ord("L"),
+        ord("F"),
+        ord("S"),
+        ord("U"),
+        ord("N"),
+        ord("V"),
+        ord("M"),  # Additional valid opcodes
+    ):
+        return False
+
+    try:
+        stream = io.BytesIO(data)
+        opcode_count = 0
+        valid_opcodes = 0
+
+        for opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(stream), 1):
+            # Count opcodes that are definitely pickle-specific
+            if opcode.name in {"MARK", "STOP", "TUPLE", "LIST", "DICT", "SETITEM", "BUILD", "REDUCE"}:
+                valid_opcodes += 1
+
+            # Need multiple valid opcodes to be confident
+            if opcode_count >= 3 and valid_opcodes >= 2:
+                return True
+
+            # Prevent infinite loops on malformed data
+            if opcode_count > 20:
+                break
+
+    except Exception:
+        return False
+
+    return False
+
+
+def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
+    """Attempt to decode a string from common encodings with stricter validation."""
+    import base64
+    import binascii
+    import re
+
+    candidates: list[tuple[str, bytes]] = []
+
+    # More strict base64 validation
+    try:
+        # Must be reasonable length and proper base64 format
+        if (
+            16 <= len(s) <= 10000  # Reasonable length bounds
+            and len(s) % 4 == 0
+            and re.fullmatch(r"[A-Za-z0-9+/]+=*", s)  # Proper base64 chars with padding
+            and s.count("=") <= 2  # At most 2 padding chars
+            and not s.replace("=", "").endswith("=")  # Padding only at end
+        ):
+            decoded = base64.b64decode(s)
+            # Additional validation: decoded should be reasonable binary data
+            if len(decoded) >= 8:  # At least 8 bytes for meaningful content
+                candidates.append(("base64", decoded))
+    except Exception:
+        pass
+
+    # More strict hex validation
+    try:
+        hex_str = s
+        if "\\x" in s:
+            hex_str = s.replace("\\x", "")
+        if (
+            16 <= len(hex_str) <= 5000  # Reasonable length
+            and len(hex_str) % 2 == 0
+            and re.fullmatch(r"[0-9a-fA-F]+", hex_str)
+            and not re.match(r"^(.)\1*$", hex_str)  # Not all same character
+        ):
+            decoded = binascii.unhexlify(hex_str)
+            if len(decoded) >= 8:  # At least 8 bytes
+                candidates.append(("hex", decoded))
+    except Exception:
+        pass
+
+    return candidates
 
 
 def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bool:
@@ -393,8 +507,13 @@ def is_suspicious_string(s: str) -> Optional[str]:
         if match:
             return pattern
 
-    # Check for base64-like strings (long strings with base64 charset)
-    if len(s) > 40 and re.match(r"^[A-Za-z0-9+/=]+$", s):
+    # Check for base64-like strings (long strings with base64 charset), but avoid repeating patterns
+    if (
+        len(s) > 40
+        and re.match(r"^[A-Za-z0-9+/=]+$", s)
+        and not re.match(r"^(.)\1*$", s)  # Not all same character
+        and len(set(s)) > 4  # Must have some character diversity
+    ):
         return "potential_base64"
 
     return None
@@ -480,7 +599,7 @@ def check_opcode_sequence(
     consecutive_dangerous = 0
     max_consecutive = 0
 
-    for _i, (opcode, _arg, pos) in enumerate(opcodes):
+    for i, (opcode, arg, pos) in enumerate(opcodes):
         # Track dangerous opcodes
         if opcode.name in DANGEROUS_OPCODES:
             dangerous_opcode_count += 1
@@ -513,6 +632,37 @@ def check_opcode_sequence(
             # Reset counter to avoid multiple alerts
             dangerous_opcode_count = 0
             max_consecutive = 0
+
+        # Detect decode-exec chains (e.g., base64.decode + pickle.loads/eval)
+        parsed = None
+        if opcode.name == "GLOBAL" and isinstance(arg, str):
+            if " " in arg:
+                mod, func = arg.split(" ", 1)
+            elif "." in arg:
+                mod, func = arg.rsplit(".", 1)
+            else:
+                mod = func = ""
+            parsed = (mod, func)
+
+        if parsed and parsed[0] in {"base64", "codecs", "binascii"} and "decode" in parsed[1]:
+            for j in range(i + 1, min(i + 6, len(opcodes))):
+                op2, arg2, pos2 = opcodes[j]
+                if op2.name == "GLOBAL" and isinstance(arg2, str):
+                    if " " in arg2:
+                        m2, f2 = arg2.split(" ", 1)
+                    elif "." in arg2:
+                        m2, f2 = arg2.rsplit(".", 1)
+                    else:
+                        continue
+                    if (m2 == "pickle" and f2 in {"loads", "load"}) or (m2 == "builtins" and f2 in {"eval", "exec"}):
+                        suspicious_patterns.append(
+                            {
+                                "pattern": "DECODE_EXEC_CHAIN",
+                                "modules": [f"{parsed[0]}.{parsed[1]}", f"{m2}.{f2}"],
+                                "position": pos,
+                            }
+                        )
+                        break
 
     return suspicious_patterns
 
@@ -815,6 +965,7 @@ class PickleScanner(BaseScanner):
                     "BINSTRING",
                     "SHORT_BINSTRING",
                     "UNICODE",
+                    "SHORT_BINUNICODE",
                 ] and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
@@ -843,6 +994,47 @@ class PickleScanner(BaseScanner):
                                 "code execution functions, or encoded data."
                             ),
                         )
+
+                # Detect nested pickle bytes
+                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, (bytes, bytearray)):
+                    sample = bytes(arg[:1024])  # limit
+                    if _looks_like_pickle(sample):
+                        severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                        result.add_issue(
+                            "Nested pickle payload detected",
+                            severity=severity,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            details={
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "sample_size": len(sample),
+                            },
+                            why=get_pattern_explanation("nested_pickle"),
+                        )
+
+                # Detect encoded nested pickle strings
+                if opcode.name in [
+                    "STRING",
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                    "UNICODE",
+                    "SHORT_BINUNICODE",
+                ] and isinstance(arg, str):
+                    for enc, decoded in _decode_string_to_bytes(arg):
+                        if _looks_like_pickle(decoded[:1024]):
+                            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                            result.add_issue(
+                                "Encoded pickle payload detected",
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "encoding": enc,
+                                    "decoded_size": len(decoded),
+                                },
+                                why=get_pattern_explanation("nested_pickle"),
+                            )
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
@@ -1065,6 +1257,12 @@ class PickleScanner(BaseScanner):
         result = self._create_result()
 
         try:
+            from modelaudit.utils.ml_context import (
+                analyze_binary_for_ml_context,
+                get_ml_context_explanation,
+                should_ignore_executable_signature,
+            )
+
             # Common patterns that might indicate embedded Python code
             code_patterns = BINARY_CODE_PATTERNS
 
@@ -1077,6 +1275,10 @@ class PickleScanner(BaseScanner):
             chunk_size = 1024 * 1024  # 1MB chunks
             bytes_scanned = 0
 
+            # Track patterns for ML context analysis
+            pattern_counts: dict[bytes, list[int]] = {}
+            first_chunk_ml_context = None
+
             while True:
                 chunk = file_obj.read(chunk_size)
                 if not chunk:
@@ -1084,6 +1286,10 @@ class PickleScanner(BaseScanner):
 
                 current_offset = start_pos + bytes_scanned
                 bytes_scanned += len(chunk)
+
+                # Analyze ML context on first significant chunk
+                if first_chunk_ml_context is None and len(chunk) >= 64 * 1024:  # 64KB minimum
+                    first_chunk_ml_context = analyze_binary_for_ml_context(chunk, file_size)
 
                 # Check for code patterns
                 for pattern in code_patterns:
@@ -1104,54 +1310,21 @@ class PickleScanner(BaseScanner):
                             ),
                         )
 
-                # Check for executable signatures
-                for sig, description in executable_sigs.items():
+                # Check for executable signatures with ML context awareness
+                for sig, _description in executable_sigs.items():
                     if sig in chunk:
-                        pos = chunk.find(sig)
-                        result.add_issue(
-                            f"Executable signature found in binary data: {description}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (offset: {current_offset + pos})",
-                            details={
-                                "signature": sig.hex(),
-                                "description": description,
-                                "offset": current_offset + pos,
-                                "section": "binary_data",
-                            },
-                            why=(
-                                "Executable files embedded in model data can run arbitrary code on the system. "
-                                "Model files should contain only serialized weights and configuration data."
-                            ),
-                        )
+                        # Count all occurrences in this chunk
+                        pos = 0
+                        while True:
+                            pos = chunk.find(sig, pos)
+                            if pos == -1:
+                                break
 
-                # Special check for Windows PE files with more validation
-                # to reduce false positives from random "MZ" bytes
-                pe_sig = b"MZ"
-                if pe_sig in chunk:
-                    pos = chunk.find(pe_sig)
-                    # For PE files, check if we have enough data to validate DOS header
-                    if pos + 64 <= len(chunk):  # DOS header is 64 bytes
-                        # Check for "This program cannot be run in DOS mode" string
-                        # which appears in all PE files
-                        dos_stub_msg = b"This program cannot be run in DOS mode"
-                        # Look for this message within reasonable distance from MZ
-                        search_end = min(pos + 512, len(chunk))
-                        if dos_stub_msg in chunk[pos:search_end]:
-                            result.add_issue(
-                                "Executable signature found in binary data: Windows executable (PE)",
-                                severity=IssueSeverity.CRITICAL,
-                                location=f"{self.current_file_path} (offset: {current_offset + pos})",
-                                details={
-                                    "signature": pe_sig.hex(),
-                                    "description": "Windows executable (PE) with valid DOS stub",
-                                    "offset": current_offset + pos,
-                                    "section": "binary_data",
-                                },
-                                why=(
-                                    "Windows executable files embedded in model data can run arbitrary code on the "
-                                    "system. The presence of a valid DOS stub confirms this is an actual PE executable."
-                                ),
-                            )
+                            # Track pattern counts
+                            if sig not in pattern_counts:
+                                pattern_counts[sig] = []
+                            pattern_counts[sig].append(current_offset + pos)
+                            pos += len(sig)
 
                 # Check for timeout
                 if time.time() - result.start_time > self.timeout:
@@ -1169,6 +1342,151 @@ class PickleScanner(BaseScanner):
                         ),
                     )
                     break
+
+            # Use default context if we couldn't analyze
+            if first_chunk_ml_context is None:
+                first_chunk_ml_context = {"appears_to_be_weights": False, "weight_confidence": 0.0}
+
+            # Process pattern findings with ML context awareness
+            for sig, positions in pattern_counts.items():
+                description = executable_sigs[sig]
+                pattern_density = len(positions) / max(bytes_scanned / (1024 * 1024), 1)  # patterns per MB
+
+                # Apply ML context filtering
+                filtered_positions = []
+                ignored_count = 0
+
+                for offset in positions:
+                    if should_ignore_executable_signature(
+                        sig, offset, first_chunk_ml_context, int(pattern_density), len(positions)
+                    ):
+                        ignored_count += 1
+                    else:
+                        filtered_positions.append(offset)
+
+                # Report significant patterns that weren't filtered out
+                for offset in filtered_positions[:10]:  # Limit to first 10 to avoid spam
+                    result.add_issue(
+                        f"Executable signature found in binary data: {description}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (offset: {offset})",
+                        details={
+                            "signature": sig.hex(),
+                            "description": description,
+                            "offset": offset,
+                            "section": "binary_data",
+                            "total_found": len(positions),
+                            "pattern_density_per_mb": round(pattern_density, 1),
+                            "ml_context_confidence": first_chunk_ml_context.get("weight_confidence", 0),
+                        },
+                        why=(
+                            "Executable files embedded in model data can run arbitrary code on the system. "
+                            "Model files should contain only serialized weights and configuration data."
+                        ),
+                    )
+
+                # Add informational note about ignored patterns if significant
+                if ignored_count > 0 and len(positions) > 10:
+                    explanation = get_ml_context_explanation(first_chunk_ml_context, len(positions))
+                    result.add_issue(
+                        f"Ignored {ignored_count} likely false positive {description} patterns in ML weight data",
+                        severity=IssueSeverity.INFO,
+                        location=f"{self.current_file_path}",
+                        details={
+                            "signature": sig.hex(),
+                            "ignored_count": ignored_count,
+                            "total_found": len(positions),
+                            "pattern_density_per_mb": round(pattern_density, 1),
+                            "ml_context_explanation": explanation,
+                            "ml_context_confidence": first_chunk_ml_context.get("weight_confidence", 0),
+                        },
+                        why=(
+                            f"These patterns were ignored because they appear in what looks like ML model weight data. "
+                            f"{explanation}"
+                        ),
+                    )
+
+            # Special check for Windows PE files with more validation
+            # Process PE signatures separately since they need DOS stub validation
+            pe_sig = b"MZ"
+            pe_positions = []
+
+            # Go back through all chunks to find PE signatures (we need to re-read for validation)
+            file_obj.seek(start_pos)
+            chunk_offset = 0
+            while chunk_offset < bytes_scanned:
+                chunk = file_obj.read(min(chunk_size, bytes_scanned - chunk_offset))
+                if not chunk:
+                    break
+
+                pos = 0
+                while True:
+                    pos = chunk.find(pe_sig, pos)
+                    if pos == -1:
+                        break
+
+                    # Check if we have enough data to validate DOS header
+                    if pos + 64 <= len(chunk):
+                        # Check for "This program cannot be run in DOS mode" string
+                        dos_stub_msg = b"This program cannot be run in DOS mode"
+                        search_end = min(pos + 512, len(chunk))
+                        if dos_stub_msg in chunk[pos:search_end]:
+                            pe_positions.append(start_pos + chunk_offset + pos)
+                    pos += len(pe_sig)
+
+                chunk_offset += len(chunk)
+
+            # Process PE findings with ML context
+            if pe_positions:
+                pattern_density = len(pe_positions) / max(bytes_scanned / (1024 * 1024), 1)
+                filtered_pe_positions = []
+                ignored_pe_count = 0
+
+                for offset in pe_positions:
+                    if should_ignore_executable_signature(
+                        pe_sig, offset, first_chunk_ml_context, int(pattern_density), len(pe_positions)
+                    ):
+                        ignored_pe_count += 1
+                    else:
+                        filtered_pe_positions.append(offset)
+
+                # Report valid PE signatures that weren't filtered
+                for offset in filtered_pe_positions[:5]:  # Limit PE reports more strictly
+                    result.add_issue(
+                        "Executable signature found in binary data: Windows executable (PE)",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (offset: {offset})",
+                        details={
+                            "signature": pe_sig.hex(),
+                            "description": "Windows executable (PE) with valid DOS stub",
+                            "offset": offset,
+                            "section": "binary_data",
+                            "total_found": len(pe_positions),
+                            "pattern_density_per_mb": round(pattern_density, 1),
+                        },
+                        why=(
+                            "Windows executable files embedded in model data can run arbitrary code on the "
+                            "system. The presence of a valid DOS stub confirms this is an actual PE executable."
+                        ),
+                    )
+
+                # Note about ignored PE patterns
+                if ignored_pe_count > 0:
+                    explanation = get_ml_context_explanation(first_chunk_ml_context, len(pe_positions))
+                    result.add_issue(
+                        f"Ignored {ignored_pe_count} likely false positive PE executable patterns in ML weight data",
+                        severity=IssueSeverity.INFO,
+                        location=f"{self.current_file_path}",
+                        details={
+                            "signature": pe_sig.hex(),
+                            "ignored_count": ignored_pe_count,
+                            "total_found": len(pe_positions),
+                            "ml_context_explanation": explanation,
+                        },
+                        why=(
+                            f"These PE patterns were ignored because they appear in ML model weight data. {explanation}"
+                        ),
+                    )
 
             result.bytes_scanned = bytes_scanned
 

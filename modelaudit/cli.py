@@ -86,7 +86,7 @@ def scan_command(
     max_file_size: int,
     max_total_size: int,
 ) -> None:
-    """Scan files or directories for malicious content.
+    """Scan files, directories, or HuggingFace models for malicious content.
 
     \b
     Usage:
@@ -116,46 +116,22 @@ def scan_command(
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
-        # Create a stylish header
-        click.echo("")
-        click.echo("╔" + "═" * 78 + "╗")
-        click.echo("║" + " " * 78 + "║")
-
-        # Title with icon
-        title = "🔐 ModelAudit Security Scanner"
-        title_styled = click.style(title, fg="blue", bold=True)
-        padding = (78 - len(title)) // 2
-        click.echo(
-            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║",
-        )
-
-        # Subtitle
-        subtitle = "Scanning for potential security issues in ML model files"
-        subtitle_styled = click.style(subtitle, fg="cyan")
-        padding = (78 - len(subtitle)) // 2
-        click.echo(
-            "║" + " " * padding + subtitle_styled + " " * (78 - padding - len(subtitle)) + "║",
-        )
-
-        click.echo("║" + " " * 78 + "║")
-        click.echo("╚" + "═" * 78 + "╝")
-        click.echo("")
-
-        # Scan configuration
-        click.echo(click.style("🎯 TARGET FILES", fg="white", bold=True))
-        click.echo("─" * 40)
-        for path in paths:
-            click.echo(f"  📄 {click.style(path, fg='green')}")
-
+        header = [
+            "─" * 80,
+            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
+            click.style(
+                "Scanning for potential security issues in ML model files",
+                fg="cyan",
+            ),
+            "─" * 80,
+        ]
+        click.echo("\n".join(header))
+        click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
-            click.echo("")
-            click.echo(click.style("🚫 BLACKLIST PATTERNS", fg="white", bold=True))
-            click.echo("─" * 40)
-            for pattern in blacklist:
-                click.echo(f"  • {click.style(pattern, fg='yellow')}")
-
-        click.echo("")
-        click.echo("═" * 80)
+            click.echo(
+                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
+            )
+        click.echo("─" * 80)
         click.echo("")
 
     # Set logging level based on verbosity
@@ -164,13 +140,13 @@ def scan_command(
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
-        "scanner_names": [],  # Track all scanner names used
-        "start_time": time.time(),
         "bytes_scanned": 0,
         "issues": [],
-        "has_errors": False,
         "files_scanned": 0,
-        "assets": [],  # Track all assets encountered
+        "assets": [],
+        "has_errors": False,
+        "scanner_names": [],
+        "start_time": time.time(),
     }
 
     # Scan each path
@@ -324,21 +300,21 @@ def scan_command(
                 click.echo(f"Error scanning {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
 
-            finally:
-                # Clean up temporary directory if we downloaded a model
-                if temp_dir and os.path.exists(temp_dir):
-                    try:
-                        shutil.rmtree(temp_dir)
-                        if verbose:
-                            logger.info(f"Cleaned up temporary directory: {temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
-
         except Exception as e:
             # Catch any other exceptions from the outer try block
             logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
             click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
             aggregated_results["has_errors"] = True
+
+        finally:
+            # Clean up temporary directory if we downloaded a model
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    if verbose:
+                        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
@@ -538,39 +514,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             "  " + click.style("✅ No security issues detected", fg="green", bold=True),
         )
         output_lines.append("")
-
-    # Asset list - simplified
-    assets = results.get("assets", [])
-    if assets:
-        output_lines.append(click.style("\n📦 SCANNED FILES", fg="white", bold=True))
-        output_lines.append("" + "─" * 60)
-
-        def render_assets(items, indent=1):
-            lines = []
-            for asset in items:
-                prefix = "  " * indent
-                path_str = asset.get("path", "")
-
-                # Add size if available
-                size_info = ""
-                if asset.get("size"):
-                    size = asset["size"]
-                    if size >= 1024 * 1024:
-                        size_info = f" ({size / (1024 * 1024):.1f} MB)"
-                    elif size >= 1024:
-                        size_info = f" ({size / 1024:.1f} KB)"
-                    else:
-                        size_info = f" ({size} bytes)"
-
-                line = f"{prefix}• {click.style(path_str, fg='cyan')}{click.style(size_info, fg='bright_black')}"
-                lines.append(line)
-
-                # Recursively show contents for archives
-                if asset.get("contents"):
-                    lines.extend(render_assets(asset["contents"], indent + 1))
-            return lines
-
-        output_lines.extend(render_assets(assets))
 
     # Add a footer with final status
     output_lines.append("")

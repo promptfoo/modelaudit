@@ -6,15 +6,12 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from huggingface_hub import snapshot_download
-
-
 def is_huggingface_url(url: str) -> bool:
     """Check if a URL is a HuggingFace model URL."""
     patterns = [
         r"^https?://huggingface\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
         r"^https?://hf\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
-        r"^hf://[\w\-\.]+/[\w\-\.]+/?$",
+        r"^hf://[\w\-\.]+(/[\w\-\.]+)?/?$",
     ]
     return any(re.match(pattern, url) for pattern in patterns)
 
@@ -34,9 +31,13 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     # Handle hf:// format
     if url.startswith("hf://"):
         parts = url[5:].strip("/").split("/")
-        if len(parts) != 2:
+        if len(parts) == 1 and parts[0]:
+            # Single component like "bert-base-uncased" - treat as model without namespace
+            return parts[0], ""
+        elif len(parts) == 2:
+            return parts[0], parts[1]
+        else:
             raise ValueError(f"Invalid HuggingFace URL format: {url}")
-        return parts[0], parts[1]
 
     # Handle https:// format
     parsed = urlparse(url)
@@ -67,6 +68,14 @@ def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
         ValueError: If URL is invalid
         Exception: If download fails
     """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
 

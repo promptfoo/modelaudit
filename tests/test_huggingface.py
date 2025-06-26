@@ -67,13 +67,24 @@ class TestHuggingFaceURLParsing:
             namespace, repo = parse_huggingface_url(url)
             assert (namespace, repo) == expected, f"Failed to parse {url}"
 
+    def test_parse_single_component_urls(self):
+        """Test parsing single-component URLs (models without namespaces)."""
+        test_cases = [
+            ("https://huggingface.co/gpt2", ("gpt2", "")),
+            ("https://hf.co/bert-base-uncased", ("bert-base-uncased", "")),
+            ("hf://gpt2", ("gpt2", "")),
+            ("hf://bert-base-uncased", ("bert-base-uncased", "")),
+        ]
+        for url, expected in test_cases:
+            namespace, repo = parse_huggingface_url(url)
+            assert (namespace, repo) == expected, f"Failed to parse {url}"
+
     def test_parse_invalid_urls(self):
         """Test that invalid URLs raise ValueError."""
         invalid_urls = [
             "https://github.com/user/repo",
-            "hf://",
-            "hf://single-part",  # hf:// protocol requires namespace/repo format
-            "",
+            "hf://",  # Empty path
+            "",  # Empty string
         ]
         for url in invalid_urls:
             with pytest.raises(ValueError):
@@ -83,7 +94,7 @@ class TestHuggingFaceURLParsing:
 class TestModelDownload:
     """Test model downloading functionality."""
 
-    @patch("modelaudit.utils.huggingface.snapshot_download")
+    @patch("huggingface_hub.snapshot_download")
     def test_download_model_success(self, mock_snapshot_download):
         """Test successful model download."""
         # Mock the snapshot_download to return a path
@@ -99,7 +110,7 @@ class TestModelDownload:
         assert call_args[1]["repo_id"] == "test/model"
         assert result == Path(mock_path)
 
-    @patch("modelaudit.utils.huggingface.snapshot_download")
+    @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_cache_dir(self, mock_snapshot_download):
         """Test model download with custom cache directory."""
         mock_path = "/cache/test/model"
@@ -113,7 +124,7 @@ class TestModelDownload:
         assert call_args[1]["cache_dir"] == str(cache_dir / "test" / "model")
         assert call_args[1]["local_dir"] == str(cache_dir / "test" / "model")
 
-    @patch("modelaudit.utils.huggingface.snapshot_download")
+    @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
     def test_download_model_cleanup_on_failure(self, mock_rmtree, mock_snapshot_download):
         """Test that temporary directory is cleaned up on download failure."""
@@ -131,3 +142,18 @@ class TestModelDownload:
         """Test that invalid URLs raise appropriate errors."""
         with pytest.raises(ValueError):
             download_model("https://github.com/user/repo")
+
+    @patch("builtins.__import__")
+    def test_missing_huggingface_hub_dependency(self, mock_import):
+        """Test error when huggingface-hub is not installed."""
+
+        # Mock the import to raise ImportError
+        def side_effect(name, *args, **kwargs):
+            if name == "huggingface_hub":
+                raise ImportError("No module named 'huggingface_hub'")
+            return __import__(name, *args, **kwargs)
+
+        mock_import.side_effect = side_effect
+
+        with pytest.raises(ImportError, match="huggingface-hub package is required"):
+            download_model("https://huggingface.co/test/model")
