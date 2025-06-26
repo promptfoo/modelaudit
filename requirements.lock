@@ -32,11 +32,13 @@ defusedxml==0.7.1
 dill==0.4.0
     # via modelaudit
 filelock==3.18.0
+    # via huggingface-hub
     # via torch
 flatbuffers==25.2.10
     # via tensorflow
     # via tflite
 fsspec==2025.5.1
+    # via huggingface-hub
     # via torch
 gast==0.6.0
     # via tensorflow
@@ -49,8 +51,14 @@ h5py==3.14.0
     # via keras
     # via modelaudit
     # via tensorflow
+hf-xet==1.1.5
+    # via huggingface-hub
+huggingface-hub==0.33.1
+    # via modelaudit
 idna==3.10
     # via requests
+importlib-metadata==8.7.0
+    # via markdown
 jinja2==3.1.6
     # via torch
 joblib==1.5.1
@@ -102,6 +110,7 @@ optree==0.16.0
 packageurl-python==0.17.1
     # via cyclonedx-python-lib
 packaging==25.0
+    # via huggingface-hub
     # via keras
     # via tensorboard
     # via tensorflow
@@ -114,8 +123,10 @@ py-serializable==2.0.0
 pygments==2.19.1
     # via rich
 pyyaml==6.0.2
+    # via huggingface-hub
     # via modelaudit
 requests==2.32.4
+    # via huggingface-hub
     # via tensorflow
 rich==14.0.0
     # via keras
@@ -155,9 +166,13 @@ threadpoolctl==3.6.0
     # via scikit-learn
 torch==2.7.1
     # via modelaudit
+tqdm==4.67.1
+    # via huggingface-hub
 typing-extensions==4.14.0
+    # via huggingface-hub
     # via onnx
     # via optree
+    # via rich
     # via tensorflow
     # via torch
 urllib3==2.5.0
@@ -170,3 +185,5 @@ wrapt==1.17.2
     # via tensorflow
 yaspin==3.1.0
     # via modelaudit
+zipp==3.23.0
+    # via importlib-metadata
