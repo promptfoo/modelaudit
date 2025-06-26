@@ -7,13 +7,15 @@ This PR implements robust nested pickle detection capabilities to identify multi
 ## 🛡️ Security Enhancements
 
 ### **Critical Bug Fixes**
+
 - **Fixed major false positive bug** in `_looks_like_pickle()` that incorrectly identified random text as pickle data
 - **Fixed undefined variable error** in decode-exec chain detection
 - **Improved regex validation** to prevent false positives on legitimate model data
 
 ### **New Security Features**
+
 - **Nested pickle detection**: Identifies pickle payloads embedded within other pickle files
-- **Encoded payload detection**: Detects base64/hex-encoded pickle data hiding malicious content  
+- **Encoded payload detection**: Detects base64/hex-encoded pickle data hiding malicious content
 - **Decode-exec chain detection**: Identifies patterns like `base64.decode` → `pickle.loads/eval`
 - **Robust protocol validation**: Proper pickle format verification with opcode analysis
 
@@ -27,6 +29,7 @@ This PR implements robust nested pickle detection capabilities to identify multi
 # 🧪 Test Instructions & Results
 
 ## ⚡ Performance Test
+
 ```bash
 # Run performance benchmark
 python -c "
@@ -41,9 +44,11 @@ end = time.time()
 print(f'2000 calls: {(end-start)*1000:.1f}ms')
 "
 ```
+
 **Result**: ✅ 2000 function calls: 3.4ms (excellent performance)
 
 ## 🛡️ False Positive Prevention
+
 ```bash
 # Test with realistic model data that could trigger false positives
 python -c "
@@ -58,7 +63,7 @@ with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
     }
     pickle.dump(model_data, f)
     f.flush()
-    
+
     scanner = PickleScanner()
     result = scanner.scan(f.name)
     false_positives = [i for i in result.issues if 'nested' in i.message.lower()]
@@ -66,9 +71,11 @@ with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
     os.unlink(f.name)
 "
 ```
+
 **Result**: ✅ False positives: 0 (expected: 0)
 
-## 🎯 Threat Detection  
+## 🎯 Threat Detection
+
 ```bash
 # Test detection of actual nested pickle payloads
 python -c "
@@ -80,7 +87,7 @@ with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
     outer = {'legitimate': 'data', 'hidden': inner}
     pickle.dump(outer, f)
     f.flush()
-    
+
     scanner = PickleScanner()
     result = scanner.scan(f.name)
     nested_issues = [i for i in result.issues if 'nested' in i.message.lower()]
@@ -90,15 +97,18 @@ with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
     os.unlink(f.name)
 "
 ```
+
 **Result**: ✅ Nested pickle threats detected: 1
-   - CRITICAL: Nested pickle payload detected
+
+- CRITICAL: Nested pickle payload detected
 
 ## 📊 Full Test Suite
+
 ```bash
 # Run all pickle scanner tests
 python -m pytest tests/test_pickle_scanner.py -v
 
-# Run core functionality tests  
+# Run core functionality tests
 python -m pytest tests/test_basic.py tests/test_cli.py -v
 
 # Run linting checks
@@ -107,12 +117,14 @@ python -m ruff format --check modelaudit/scanners/pickle_scanner.py
 ```
 
 **Results**:
+
 - ✅ **12/12 pickle scanner tests passed** in 0.04s
-- ✅ **37/37 core tests passed** in 0.16s  
+- ✅ **37/37 core tests passed** in 0.16s
 - ✅ **All linting checks passed**
 - ✅ **All files properly formatted**
 
 ## 🔍 Edge Case Validation
+
 ```bash
 # Test robustness against edge cases
 python -c "
@@ -129,14 +141,15 @@ test_cases = [
 for data, desc in test_cases:
     result = _looks_like_pickle(data)
     expected = 'Real pickle' in desc
-    status = '✅' if result == expected else '❌' 
+    status = '✅' if result == expected else '❌'
     print(f'{status} {desc}: {result}')
 "
 ```
 
 **Results**:
+
 - ✅ Empty data: False
-- ✅ Plain text: False  
+- ✅ Plain text: False
 - ✅ Random binary: False
 - ✅ Real pickle: True
 
@@ -149,6 +162,7 @@ for data, desc in test_cases:
 ## 🔧 Technical Implementation
 
 ### Robust Pickle Detection
+
 ```python
 def _looks_like_pickle(data: bytes) -> bool:
     """Check if bytes resemble pickle with robust validation."""
@@ -156,7 +170,8 @@ def _looks_like_pickle(data: bytes) -> bool:
     # Prevents false positives on random text/binary data
 ```
 
-### Enhanced Decode Function  
+### Enhanced Decode Function
+
 ```python
 def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
     """Decode strings with strict validation to prevent false positives."""
@@ -165,6 +180,7 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
 ```
 
 ### Security Integration
+
 - ML context awareness prevents false positives on legitimate models
 - Severity adjustment based on confidence levels
 - Comprehensive logging and detailed issue reporting
@@ -172,9 +188,10 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
 ## ✅ Ready for Production
 
 This implementation has been thoroughly tested and validated:
+
 - **Security**: Accurately detects threats without false positives
 - **Performance**: Sub-millisecond detection per call
 - **Reliability**: 100% test pass rate across all scenarios
 - **Quality**: All linting and formatting checks pass
 
-The nested pickle detection feature enhances ModelAudit's security capabilities while maintaining excellent performance and reliability. 
+The nested pickle detection feature enhances ModelAudit's security capabilities while maintaining excellent performance and reliability.
