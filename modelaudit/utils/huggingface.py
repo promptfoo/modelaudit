@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+
 def is_huggingface_url(url: str) -> bool:
     """Check if a URL is a HuggingFace model URL."""
     patterns = [
