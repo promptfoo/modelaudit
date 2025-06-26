@@ -150,15 +150,11 @@ def test_cli_output_format_includes_why():
 def test_common_message_explanations_coverage():
     """Test that all COMMON_MESSAGE_EXPLANATIONS patterns work correctly."""
     # Test that all defined patterns have explanations
-    assert len(COMMON_MESSAGE_EXPLANATIONS) > 0, (
-        "Should have common message explanations defined"
-    )
+    assert len(COMMON_MESSAGE_EXPLANATIONS) > 0, "Should have common message explanations defined"
 
     for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
         assert explanation, f"Explanation for '{prefix}' should not be empty"
-        assert len(explanation) > 20, (
-            f"Explanation for '{prefix}' should be substantial"
-        )
+        assert len(explanation) > 20, f"Explanation for '{prefix}' should be substantial"
 
 
 def test_get_message_explanation_exact_matches():
@@ -213,13 +209,9 @@ def test_get_message_explanation_prefix_matching():
     for message, should_have_explanation in test_cases:
         explanation = get_message_explanation(message)
         if should_have_explanation:
-            assert explanation is not None, (
-                f"Should have explanation for message: '{message}'"
-            )
+            assert explanation is not None, f"Should have explanation for message: '{message}'"
         else:
-            assert explanation is None, (
-                f"Should not have explanation for message: '{message}'"
-            )
+            assert explanation is None, f"Should not have explanation for message: '{message}'"
 
 
 def test_scan_result_auto_explanation_integration():
@@ -238,9 +230,7 @@ def test_scan_result_auto_explanation_integration():
         result.add_issue(message, severity=IssueSeverity.WARNING)
 
     # Check that the right issues got explanations
-    issues_with_explanation = [
-        issue for issue in result.issues if issue.why is not None
-    ]
+    issues_with_explanation = [issue for issue in result.issues if issue.why is not None]
     issues_without_explanation = [issue for issue in result.issues if issue.why is None]
 
     # Should have 3 with explanations, 1 without
@@ -305,12 +295,8 @@ def test_common_message_explanations_security_focus():
     for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
         # Each explanation should contain at least one security-focused keyword
         explanation_lower = explanation.lower()
-        has_security_keyword = any(
-            keyword in explanation_lower for keyword in security_keywords
-        )
-        assert has_security_keyword, (
-            f"Explanation for '{prefix}' should focus on security implications: {explanation}"
-        )
+        has_security_keyword = any(keyword in explanation_lower for keyword in security_keywords)
+        assert has_security_keyword, f"Explanation for '{prefix}' should focus on security implications: {explanation}"
 
 
 def test_message_explanation_serialization():
@@ -337,9 +323,7 @@ def test_context_aware_explanations():
 
     # Test ML model context enhancement
     basic_explanation = get_message_explanation("Custom objects found")
-    ml_context_explanation = get_message_explanation(
-        "Custom objects found", context="pickle_scanner"
-    )
+    ml_context_explanation = get_message_explanation("Custom objects found", context="pickle_scanner")
 
     assert basic_explanation is not None
     assert ml_context_explanation is not None
@@ -348,12 +332,8 @@ def test_context_aware_explanations():
     assert "pickle-based formats" in ml_context_explanation.lower()
 
     # Test archive context enhancement
-    basic_archive_explanation = get_message_explanation(
-        "Archive entry would extract outside"
-    )
-    archive_context_explanation = get_message_explanation(
-        "Archive entry would extract outside", context="zip_scanner"
-    )
+    basic_archive_explanation = get_message_explanation("Archive entry would extract outside")
+    archive_context_explanation = get_message_explanation("Archive entry would extract outside", context="zip_scanner")
 
     assert basic_archive_explanation is not None
     assert archive_context_explanation is not None
@@ -389,9 +369,7 @@ def test_ml_specific_message_patterns():
 
     for message in ml_messages:
         explanation = get_message_explanation(message)
-        assert explanation is not None, (
-            f"Should have explanation for ML message: '{message}'"
-        )
+        assert explanation is not None, f"Should have explanation for ML message: '{message}'"
         # All ML explanations should mention security implications
         assert any(
             keyword in explanation.lower()

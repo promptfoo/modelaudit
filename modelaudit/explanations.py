@@ -235,16 +235,14 @@ COMMON_MESSAGE_EXPLANATIONS = {
         " this enables path traversal attacks where attackers can overwrite arbitrary files."
     ),
     "Symlink": (
-        "Symlinks inside archives can point to sensitive locations and enable"
-        " path traversal attacks when extracted."
+        "Symlinks inside archives can point to sensitive locations and enable path traversal attacks when extracted."
     ),
     "Decompressed size too large": (
         "Maliciously crafted compressed data can expand to enormous sizes"
         " (compression bombs) to exhaust system memory and crash the application."
     ),
     "Not a valid zip file": (
-        "Corrupted or malformed archives could be used to crash tools or hide"
-        " malicious payloads."
+        "Corrupted or malformed archives could be used to crash tools or hide malicious payloads."
     ),
     # File integrity and validation issues
     "File too small": (
@@ -285,8 +283,7 @@ COMMON_MESSAGE_EXPLANATIONS = {
         " potentially compromising the ML pipeline."
     ),
     "Custom loss function": (
-        "Custom loss functions may contain malicious code that executes during"
-        " model training or inference."
+        "Custom loss functions may contain malicious code that executes during model training or inference."
     ),
     # Dependency and module issues
     "Module not installed": (
@@ -297,10 +294,7 @@ COMMON_MESSAGE_EXPLANATIONS = {
         "Import failures may indicate tampered dependencies or attempts to"
         " load malicious modules not present in the environment."
     ),
-    "Deprecated module": (
-        "Deprecated modules may have unpatched security vulnerabilities"
-        " that attackers can exploit."
-    ),
+    "Deprecated module": ("Deprecated modules may have unpatched security vulnerabilities that attackers can exploit."),
     # General security and scanning issues
     "Too many": (
         "Excessive quantities of data structures may indicate a malicious attempt"
@@ -320,23 +314,18 @@ COMMON_MESSAGE_EXPLANATIONS = {
     ),
     # Metadata and configuration issues
     "Missing metadata": (
-        "Missing or incomplete metadata may indicate tampered models or"
-        " attempts to hide malicious modifications."
+        "Missing or incomplete metadata may indicate tampered models or attempts to hide malicious modifications."
     ),
     "Invalid metadata": (
-        "Corrupted metadata may indicate file tampering or malicious"
-        " modifications to model configurations."
+        "Corrupted metadata may indicate file tampering or malicious modifications to model configurations."
     ),
     "Unexpected metadata": (
-        "Unusual metadata fields may contain hidden payloads or indicate"
-        " model tampering by malicious actors."
+        "Unusual metadata fields may contain hidden payloads or indicate model tampering by malicious actors."
     ),
 }
 
 
-def get_message_explanation(
-    message: str, context: Optional[str] = None
-) -> Optional[str]:
+def get_message_explanation(message: str, context: Optional[str] = None) -> Optional[str]:
     """Return a default explanation for an issue message if available.
 
     Args:
@@ -360,26 +349,19 @@ def get_message_explanation(
 
     # If context is provided, try to enhance the explanation
     if context:
-        enhanced_explanation = _enhance_explanation_with_context(
-            message, base_explanation, context
-        )
+        enhanced_explanation = _enhance_explanation_with_context(message, base_explanation, context)
         if enhanced_explanation:
             return enhanced_explanation
 
     return base_explanation
 
 
-def _enhance_explanation_with_context(
-    message: str, base_explanation: str, context: str
-) -> Optional[str]:
+def _enhance_explanation_with_context(message: str, base_explanation: str, context: str) -> Optional[str]:
     """Enhance explanations based on context information."""
     context_lower = context.lower()
 
     # ML model-specific context enhancements
-    if any(
-        scanner in context_lower
-        for scanner in ["pickle", "pytorch", "keras", "tensorflow"]
-    ):
+    if any(scanner in context_lower for scanner in ["pickle", "pytorch", "keras", "tensorflow"]):
         if message.startswith("Custom objects found"):
             return (
                 "Custom objects in ML models can execute arbitrary Python code during model loading. "
@@ -403,12 +385,11 @@ def _enhance_explanation_with_context(
             )
 
     # ONNX/compiled model context
-    elif any(scanner in context_lower for scanner in ["onnx", "tflite", "compiled"]):
-        if message.startswith("Custom"):
-            return (
-                base_explanation + " In compiled models, custom components may bypass "
-                "the sandboxing that interpreted models provide, making them particularly risky."
-            )
+    elif any(scanner in context_lower for scanner in ["onnx", "tflite", "compiled"]) and message.startswith("Custom"):
+        return (
+            base_explanation + " In compiled models, custom components may bypass "
+            "the sandboxing that interpreted models provide, making them particularly risky."
+        )
 
     # Return None if no context-specific enhancement applies
     return None
