@@ -599,8 +599,9 @@ class ManifestScanner(BaseScanner):
         # Special case for encoder-decoder transformer models (T5, BART, etc.)
         if ml_context.get("framework") == "huggingface" and "execution" in matches:
             # These are legitimate sequence-to-sequence model configuration patterns
-            # that contain "decoder" but are not actually execution-related
+            # that contain "decoder" or "encoder" but are not actually execution-related
             encoder_decoder_safe_patterns = [
+                # T5 specific patterns
                 "decoder_start_token_id",  # T5/seq2seq start token configuration
                 "is_encoder_decoder",  # Architecture flag for encoder-decoder models
                 "decoder_input_ids",  # Input configuration for decoder
@@ -615,6 +616,22 @@ class ManifestScanner(BaseScanner):
                 "decoder_start_token",  # Alternative start token naming
                 "decoder_config",  # Decoder-specific configuration
                 "encoder_config",  # Encoder-specific configuration
+                # BART specific patterns - architecture configuration
+                "decoder_attention_heads",  # Number of attention heads in decoder
+                "decoder_ffn_dim",  # Feed-forward network dimension in decoder
+                "decoder_layerdrop",  # Layer dropout rate for decoder
+                "decoder_layers",  # Number of decoder layers
+                "encoder_attention_heads",  # Number of attention heads in encoder
+                "encoder_ffn_dim",  # Feed-forward network dimension in encoder
+                "encoder_layerdrop",  # Layer dropout rate for encoder
+                "encoder_layers",  # Number of encoder layers
+                # Additional encoder-decoder patterns
+                "decoder_hidden_size",  # Hidden dimension size for decoder
+                "encoder_hidden_size",  # Hidden dimension size for encoder
+                "decoder_intermediate_size",  # Intermediate layer size for decoder
+                "encoder_intermediate_size",  # Intermediate layer size for encoder
+                "decoder_max_position_embeddings",  # Max position embeddings for decoder
+                "encoder_max_position_embeddings",  # Max position embeddings for encoder
             ]
 
             if any(pattern in key_lower for pattern in encoder_decoder_safe_patterns):

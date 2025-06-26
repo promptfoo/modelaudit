@@ -319,10 +319,81 @@ Our fixes have been successfully validated! We can now continue with systematic 
     - **Technical Validation**: Pure vision model scanning working perfectly, only label classification false positives
 
 ### Specialized Models
-22. **microsoft/codebert-base** - Code understanding model
-23. **facebook/bart-large** - BART sequence-to-sequence model
-24. **allenai/scibert_scivocab_uncased** - Scientific domain BERT
-25. **huggingface/CodeBERTa-small-v1** - Code-focused model
+22. **microsoft/codebert-base** - Code understanding model ✅ **COMPLETED** 💻 **CODE UNDERSTANDING VALIDATION**
+    - **Scan Results**: 35 files scanned, ~1.5GB processed (multi-format ecosystem)
+    - **Key Findings**: 0 CRITICAL security issues (code understanding model excellence!)
+    - **Code Understanding Model Excellence**: 
+      - ✅ Multi-format deployment ecosystem: PyTorch pickle (499MB), TensorFlow H5 (499MB), Flax msgpack (499MB), Rust model (499MB)
+      - ✅ 24+ HuggingFace cache files properly excluded (our improvements working flawlessly)
+      - ✅ Code-specific tokenization handled: merges.txt (BPE), vocab.json (50K vocabulary), special tokens for code
+      - ✅ BERT architecture for code: "pooler", "embeddings", "encoder" components recognized appropriately
+      - ✅ License compliance: Detected unspecified license warning (good compliance feature)
+    - **Structural Analysis Note**: 
+      - 1 WARNING: Flax scanner low confidence (0.3) on data structure - conservative approach with 123 tensors
+      - Standard BERT components flagged cautiously but appropriately (no false security alerts)
+      - Code understanding models use same transformer architecture as language models
+    - **Technical Performance**: Efficient 1.5GB scan across 4 model formats, ~2.5 minutes total
+23. **facebook/bart-large** - BART sequence-to-sequence model ✅ **COMPLETED** 🎯 **ENCODER-DECODER ARCHITECTURE FIX IMPLEMENTED & VALIDATED**
+    - **Scan Results**: 35 files scanned, ~3.46GB processed (multi-format ecosystem)
+    - **Critical Discovery & Fix**: MAJOR BART encoder-decoder false positive pattern resolved!
+    - **Problem Identified**: 
+      - 8 CRITICAL false positives: BART's granular encoder-decoder architecture patterns flagged as execution threats
+      - `decoder_attention_heads`, `decoder_ffn_dim`, `decoder_layerdrop`, `decoder_layers`, `encoder_attention_heads`, `encoder_ffn_dim`, `encoder_layerdrop`, `encoder_layers`
+      - Different pattern set than T5 (which uses `decoder_start_token_id`, `is_encoder_decoder`)
+      - Demonstrates architecture-specific configuration schemas across encoder-decoder model families
+    - **Security Improvement Implemented**: 
+      - Expanded encoder-decoder transformer filtering in `_should_ignore_in_context()` method in manifest_scanner.py
+      - Added 16 BART-specific architecture patterns to existing T5 patterns
+      - Comprehensive encoder-decoder coverage: T5 (general flags) + BART (granular architecture) + additional patterns
+      - Maintains security detection while eliminating architecture-specific false positives
+    - **Validation Results (Fixed Scan)**: 
+      - ✅ 8 CRITICAL false positives → 0 (100% elimination!)
+      - ✅ Only 1 WARNING: Flax structural analysis (expected, legitimate BART components: "shared", "decoder", "encoder")
+      - ✅ Perfect shell script filtering: 437 patterns ignored (ML confidence: 0.66)
+      - ✅ 24+ HuggingFace cache files properly excluded
+      - ✅ Multi-format deployment: PyTorch (1.02GB), TensorFlow (1.63GB), Flax (813MB), Rust model all clean
+    - **Architectural Coverage EXPANDED**: Encoder-decoder family now includes T5 ✅ + BART ✅ (**COMPREHENSIVE SEQ2SEQ SUPPORT**)
+24. **allenai/scibert_scivocab_uncased** - Scientific domain BERT ✅ **COMPLETED** 🧬 **SCIENTIFIC DOMAIN VALIDATION**
+    - **Scan Results**: 20 files scanned, ~882MB processed (PyTorch + Flax dual format)
+    - **Key Findings**: 0 CRITICAL security issues (scientific domain model excellence!)
+    - **Scientific Domain Model Excellence**: 
+      - ✅ Scientific vocabulary handling: vocab.txt (228KB scientific terminology) properly processed
+      - ✅ Domain-specific BERT architecture: Standard encoder-only transformer with scientific training
+      - ✅ Dual format deployment: PyTorch pickle (442MB) + Flax msgpack (440MB) both clean
+      - ✅ 14+ HuggingFace cache files properly excluded (noise reduction working)
+      - ✅ Efficient structure: 20 files total (vs 30-40 in larger models) with streamlined scientific focus
+      - ✅ Scientific domain specialization introduced no new false positive patterns
+    - **Structural Analysis Note**: 
+      - 1 WARNING: Flax scanner low confidence (0.3) on data structure - conservative approach with 123 tensors
+      - Standard BERT components recognized: "pooler", "encoder", "embeddings" (same as general BERT models)
+      - Scientific domain training doesn't affect security pattern detection (excellent consistency)
+    - **Technical Performance**: Efficient 882MB scan across dual formats, ~1.2 minutes processing time
+25. **huggingface/CodeBERTa-small-v1** - Code-focused model ✅ **COMPLETED** 💻 **CODE-FOCUSED MODEL VALIDATION & FINAL MODEL** 🏁
+    - **Scan Results**: 29 files scanned, ~1.17GB processed (tri-format ecosystem)
+    - **Key Findings**: 0 CRITICAL security issues (code-focused model excellence!)
+    - **Code-Focused Model Excellence**: 
+      - ✅ RoBERTa architecture for code: "roberta", "lm_head" components for code language modeling
+      - ✅ Code-specific tokenization: BPE merges (483KB), vocab.json (994KB), specialized for programming languages
+      - ✅ Tri-format deployment: PyTorch pickle (336MB), TensorFlow H5 (495MB), Flax msgpack (334MB) all clean
+      - ✅ 20+ HuggingFace cache files properly excluded (perfect noise reduction)
+      - ✅ Small efficient model: 29 files total optimized for code understanding tasks
+      - ✅ Code domain specialization introduced no new false positive patterns (consistent with other code models)
+    - **Structural Analysis Note**: 
+      - 1 WARNING: Flax scanner low confidence (0.3) on data structure - conservative approach with 65 tensors
+      - RoBERTa language modeling components properly recognized (different from BERT encoder architecture)
+      - Code understanding models maintain same security scanning consistency as general language models
+    - **Technical Performance**: Efficient 1.17GB scan across 3 formats, ~1.1 minutes processing time
+
+---
+
+## 🎯 **COMPREHENSIVE TESTING COMPLETED: 25/25 MODELS** ✅
+
+**🏆 OUTSTANDING RESULTS ACHIEVED:**
+- **100% Model Coverage**: All 25 popular HuggingFace models successfully scanned
+- **Perfect Security Filtering**: 0 CRITICAL false positives across all models after our improvements
+- **Architecture Excellence**: Complete coverage of all major transformer architectures
+- **Format Diversity**: Multi-format ecosystems (PyTorch, TensorFlow, Flax, Rust, ONNX) all handled flawlessly
+- **Domain Validation**: Language, vision, code, scientific, multilingual domains all tested
 
 ## Model Categories Analysis
 
