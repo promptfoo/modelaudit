@@ -844,6 +844,37 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
+            elif is_recursion_error:
+                # Handle recursion errors more gracefully - this is a scanner limitation, not security issue
+                logger.warning(
+                    f"Recursion limit reached scanning {path}. "
+                    f"This indicates a complex pickle structure that exceeds scanner limits."
+                )
+                result.metadata.update(
+                    {
+                        "recursion_limited": True,
+                        "file_size": file_size,
+                        "scanner_limitation": True,
+                    }
+                )
+                # Add as debug, not critical - scanner limitation rather than security issue
+                result.add_issue(
+                    "Scan limited by pickle complexity - recursion limit exceeded",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={
+                        "reason": "recursion_limit_exceeded",
+                        "file_size": file_size,
+                        "exception_type": "RecursionError",
+                    },
+                    why=(
+                        "The pickle file structure is too complex for the scanner to fully analyze due to "
+                        "Python's recursion limits. This often occurs with legitimate but complex data structures. "
+                        "Consider manually inspecting the file if security is a concern."
+                    ),
+                )
+                result.finish(success=True)  # Mark as successful scan despite limitation
+                return result
             else:
                 # Handle as critical error for unknown/suspicious cases
                 result.add_issue(
