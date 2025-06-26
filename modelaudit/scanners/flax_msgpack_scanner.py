@@ -222,35 +222,50 @@ class FlaxMsgpackScanner(BaseScanner):
         # Also recognize common converted model patterns from HuggingFace
         converted_patterns = {
             # BERT/RoBERTa patterns
-            "bert", "roberta", "distilbert", "electra",
-            # GPT patterns  
-            "gpt", "gpt2", "gpt_neo", "gpt_j",
+            "bert",
+            "roberta",
+            "distilbert",
+            "electra",
+            # GPT patterns
+            "gpt",
+            "gpt2",
+            "gpt_neo",
+            "gpt_j",
             # T5 patterns
-            "t5", "encoder", "decoder", 
+            "t5",
+            "encoder",
+            "decoder",
             # Common neural network components
-            "embeddings", "attention", "layer_norm", "dense", "linear",
-            "transformer", "model", "lm_head", "classifier"
+            "embeddings",
+            "attention",
+            "layer_norm",
+            "dense",
+            "linear",
+            "transformer",
+            "model",
+            "lm_head",
+            "classifier",
         }
-        
+
         found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
-        
+
         # Check if this looks like a converted model from another framework
         is_converted_model = any(
-            any(pattern in str(key).lower() for pattern in converted_patterns)
-            for key in found_keys
+            any(pattern in str(key).lower() for pattern in converted_patterns) for key in found_keys
         )
 
         if not any(key in found_keys for key in expected_keys):
             if is_converted_model:
-                # This appears to be a converted model - reduce severity 
+                # This appears to be a converted model - reduce severity
                 result.add_issue(
                     "Model appears to be converted from another framework (PyTorch/TensorFlow) to Flax format",
                     severity=IssueSeverity.DEBUG,  # Reduced from INFO to DEBUG
                     location="root",
                     details={
                         "found_keys": list(found_keys)[:20],  # Limit output
-                        "detected_patterns": [p for p in converted_patterns 
-                                            if any(p in str(k).lower() for k in found_keys)][:10],
+                        "detected_patterns": [
+                            p for p in converted_patterns if any(p in str(k).lower() for k in found_keys)
+                        ][:10],
                         "model_type": "converted",
                     },
                 )
@@ -273,7 +288,7 @@ class FlaxMsgpackScanner(BaseScanner):
         if is_converted_model:
             # For converted models, allow common neural network component names
             allowable_keys.update(converted_patterns)
-            
+
         suspicious_top_level = found_keys - allowable_keys
         # Filter out keys that contain common model component patterns
         truly_suspicious = set()
@@ -281,7 +296,7 @@ class FlaxMsgpackScanner(BaseScanner):
             key_str = str(key).lower()
             if not any(pattern in key_str for pattern in converted_patterns):
                 truly_suspicious.add(key)
-                
+
         if truly_suspicious:
             result.add_issue(
                 f"Unusual top-level keys found: {truly_suspicious}",

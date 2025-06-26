@@ -418,42 +418,39 @@ def determine_exit_code(results: dict[str, Any]) -> int:
 def _is_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
-    
+
     Args:
         path: File path to check
-        
+
     Returns:
         True if the file is a HuggingFace cache file that should be skipped
     """
     import os
-    
+
     filename = os.path.basename(path)
-    
+
     # HuggingFace cache file patterns - be more specific
     hf_cache_patterns = [
-        ".lock",        # Download lock files  
-        ".metadata",    # HuggingFace metadata files
+        ".lock",  # Download lock files
+        ".metadata",  # HuggingFace metadata files
     ]
-    
+
     # Check if file ends with cache patterns
     for pattern in hf_cache_patterns:
         if filename.endswith(pattern):
             return True
-    
+
     # Check for specific HuggingFace cache files
     if ".cache/huggingface" in path:
         # Skip all files in HuggingFace cache directories
         return True
-        
+
     # Check for Git-related files that are commonly cached
     if filename in [".gitignore", ".gitattributes", "main", "HEAD"]:
         return True
-    
+
     # Check if file is in models--* directories (HuggingFace model cache)
-    if "models--" in path and "/refs/" in path:
-        return True
-            
-    return False
+    return bool("models--" in path and "/refs/" in path)
 
 
 def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
@@ -470,12 +467,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     if config is None:
         config = {}
     validate_scan_config(config)
-    
+
     # Skip HuggingFace cache files to reduce noise
     if _is_huggingface_cache_file(path):
         sr = ScanResult(scanner_name="skipped")
         sr.add_issue(
-            f"Skipped HuggingFace cache file",
+            "Skipped HuggingFace cache file",
             severity=IssueSeverity.DEBUG,
             details={"path": path, "reason": "huggingface_cache_file"},
         )

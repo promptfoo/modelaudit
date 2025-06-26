@@ -118,8 +118,7 @@ def _should_ignore_shebang_pattern(
     """Specific logic for shell script shebang patterns in ML context."""
     # Strong indicators this is weight data
     weight_confidence = ml_context.get("weight_confidence", 0)
-    
-    
+
     # Lower threshold for shebang patterns since they're most common false positive
     # BERT has 0.69 confidence which should be ignored as false positive
     if weight_confidence > 0.6:  # Lowered from 0.7 to 0.6
@@ -141,7 +140,7 @@ def _should_ignore_shebang_pattern(
         # BERT shows 0.0 density with 8 patterns - this should be ignored
         if pattern_density < 2.0:  # Less than 2 patterns per MB is very sparse
             return True
-    
+
     # Even with moderate confidence (0.5-0.6), ignore if pattern density is extremely low
     # This handles cases like BERT with many patterns but spread across very large files
     if weight_confidence > 0.5 and pattern_density < 1.0:  # Less than 1 pattern per MB
