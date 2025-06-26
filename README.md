@@ -102,6 +102,9 @@ pip install modelaudit[joblib]
 # For Flax msgpack scanning
 pip install modelaudit[flax]
 
+# For scanning models stored in MLflow registries
+pip install modelaudit[mlflow]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 ```
@@ -147,6 +150,9 @@ modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib mo
 
 # Scan a directory
 modelaudit scan ./models/
+
+# Scan a model stored in the MLflow registry
+modelaudit scan-mlflow models:/MyModel/1
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
@@ -200,6 +206,7 @@ Issues found: 2 critical, 1 warnings
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Integration**: Clear exit codes for automated pipeline integration
+- **MLflow Support**: Scan models directly from the MLflow model registry
 
 ### Security Detection
 
@@ -259,6 +266,9 @@ modelaudit scan model.pkl --sbom sbom.json
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
+
+# Scan a model from the MLflow registry
+modelaudit scan-mlflow models:/MyModel/Staging
 ```
 
 ### Exit Codes

@@ -286,6 +286,35 @@ def scan_command(
     sys.exit(exit_code)
 
 
+@cli.command("scan-mlflow")
+@click.argument("model_uri", type=str, required=True)
+@click.option("--registry-uri", type=str, default=None, help="MLflow registry URI")
+@click.option("--timeout", "-t", type=int, default=300, help="Scan timeout in seconds")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+def scan_mlflow_command(model_uri, registry_uri, timeout, verbose):
+    """Scan a model from the MLflow registry."""
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        from .mlflow_integration import scan_mlflow_model
+
+        results = scan_mlflow_model(
+            model_uri,
+            registry_uri=registry_uri,
+            timeout=timeout,
+        )
+        output_text = format_text_output(results, verbose)
+        click.echo(output_text)
+        exit_code = determine_exit_code(results)
+    except Exception as e:  # pragma: no cover - error path
+        logger.error("Error scanning MLflow model: %s", e, exc_info=verbose)
+        click.echo(f"Error scanning MLflow model: {e}", err=True)
+        exit_code = 2
+
+    sys.exit(exit_code)
+
+
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
