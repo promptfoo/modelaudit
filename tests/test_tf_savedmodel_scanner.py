@@ -8,6 +8,7 @@ from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanne
 # Try to import tensorflow to check availability
 try:
     import tensorflow  # noqa: F401
+
     HAS_TENSORFLOW = True
 except ImportError:
     HAS_TENSORFLOW = False

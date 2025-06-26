@@ -212,15 +212,21 @@ TF_OP_EXPLANATIONS = {
         "abuse to run system commands or other malicious code."
     ),
     "PyCall": (
-        "The PyCall operation invokes Python callbacks during graph execution and may allow arbitrary code execution."
+        "The PyCall operation invokes Python callbacks during graph execution, creating dangerous security risks "
+        "by allowing arbitrary code execution that could compromise the system."
     ),
-    "ExecuteOp": ("ExecuteOp allows running arbitrary operations and may be leveraged for code execution."),
+    "ExecuteOp": (
+        "ExecuteOp allows running arbitrary operations and poses severe security risks by enabling "
+        "malicious code execution that could compromise the host system."
+    ),
     # System operations - CRITICAL RISK
     "ShellExecute": (
-        "ShellExecute runs shell commands from the TensorFlow graph, potentially compromising the host system."
+        "ShellExecute runs shell commands from the TensorFlow graph, posing severe security risks by enabling "
+        "arbitrary command execution, potentially compromising the host system."
     ),
     "SystemConfig": (
-        "SystemConfig operations access or modify system configuration, aiding reconnaissance or privilege escalation."
+        "SystemConfig operations access or modify system configuration, creating dangerous security risks "
+        "by enabling reconnaissance or privilege escalation attacks."
     ),
     # File system operations - HIGH RISK
     "ReadFile": (
@@ -236,7 +242,8 @@ TF_OP_EXPLANATIONS = {
     ),
     "SaveV2": ("SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution."),
     "MergeV2Checkpoints": (
-        "MergeV2Checkpoints manipulates TensorFlow checkpoints and could inject malicious parameters."
+        "MergeV2Checkpoints manipulates TensorFlow checkpoints by reading and writing checkpoint files, "
+        "which could be used to overwrite existing files or inject malicious parameters."
     ),
     # Data processing operations - MEDIUM RISK
     "DecodeRaw": ("DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion."),
