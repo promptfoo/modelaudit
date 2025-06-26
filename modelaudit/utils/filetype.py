@@ -1,6 +1,15 @@
 import re
 from pathlib import Path
 
+# Known GGML header variants (older formats like GGMF and GGJT)
+GGML_MAGIC_VARIANTS = {
+    b"GGML",
+    b"GGMF",
+    b"GGJT",
+    b"GGLA",
+    b"GGSA",
+}
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -50,7 +59,7 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if magic4 == b"GGUF":
         return "gguf"
-    if magic4 == b"GGML":
+    if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     if magic4.startswith(b"PK"):
@@ -126,7 +135,7 @@ def detect_file_format(path: str) -> str:
     # Check for GGUF/GGML magic bytes
     if magic4 == b"GGUF":
         return "gguf"
-    if magic4 == b"GGML":
+    if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     ext = file_path.suffix.lower()
@@ -183,11 +192,12 @@ def detect_file_format(path: str) -> str:
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
-    if ext in (".gguf", ".ggml"):
+    ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
+    if ext in (".gguf", *ggml_exts):
         # Check magic bytes first for accuracy
         if magic4 == b"GGUF":
             return "gguf"
-        elif magic4 == b"GGML":
+        elif magic4 in GGML_MAGIC_VARIANTS:
             return "ggml"
         # Fall back to extension-based detection
         return "gguf" if ext == ".gguf" else "ggml"
@@ -235,6 +245,10 @@ EXTENSION_FORMAT_MAP = {
     ".zip": "zip",
     ".gguf": "gguf",
     ".ggml": "ggml",
+    ".ggmf": "ggml",
+    ".ggjt": "ggml",
+    ".ggla": "ggml",
+    ".ggsa": "ggml",
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
