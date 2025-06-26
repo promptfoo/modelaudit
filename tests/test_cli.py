@@ -1,8 +1,7 @@
 import json
 import os
 import re
-import shutil
-from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -331,28 +330,129 @@ def test_format_text_output_fast_scan_duration():
     assert "No security issues detected" in clean_output
 
 
-def test_scan_hf_command(monkeypatch, tmp_path):
-    """Test scanning a model from HuggingFace Hub."""
+def test_scan_huggingface_url_help():
+    """Test that HuggingFace URL examples are in the help text."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--help"])
+    assert result.exit_code == 0
+    assert "https://huggingface.co/user/model" in result.output
+    assert "hf://user/model" in result.output
 
-    pytest.importorskip("huggingface_hub")
 
-    model_dir = tmp_path / "hf_model"
-    model_dir.mkdir()
-    (model_dir / "pytorch_model.bin").write_bytes(b"dummy")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    """Test successful scanning of a HuggingFace URL."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    # Create a real temp directory for the test
+    test_model_dir = tmp_path / "test_model"
+    test_model_dir.mkdir()
+    # Create a dummy file inside to make it look like a real model
+    (test_model_dir / "model.bin").write_text("dummy model")
 
-    def fake_snapshot_download(repo_id, revision="main", local_dir=None, **kwargs):
-        dest = Path(local_dir)
-        shutil.copytree(model_dir, dest, dirs_exist_ok=True)
-        return str(dest)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    mock_download.return_value = test_model_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 1024,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan-hf", "test/model", "--format", "json"])
+    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
 
-    assert result.exit_code in (0, 1)
-    out = json.loads(result.output)
-    assert out["files_scanned"] >= 1
+    # Should succeed
+    assert result.exit_code == 0
+    assert "Downloaded" in result.output or "Clean" in result.output
+
+    # Verify download was called
+    mock_download.assert_called_once()
+
+    # Verify scan was called with downloaded path
+    mock_scan.assert_called_once()
+    call_args = mock_scan.call_args
+    assert call_args[0][0] == str(test_model_dir)
+
+    # Verify cleanup was attempted
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
+    """Test handling of download failure for HuggingFace URL."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    mock_download.side_effect = Exception("Download failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+
+    # Should fail with error code 2
+    assert result.exit_code == 2
+    assert "Error downloading model" in result.output
+    assert "Download failed" in result.output
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    """Test scanning a HuggingFace URL that has security issues."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    # Create a real temp directory for the test
+    test_model_dir = tmp_path / "test_model"
+    test_model_dir.mkdir()
+    # Create a dummy file inside to make it look like a real model
+    (test_model_dir / "model.pkl").write_text("dummy model")
+
+    mock_download.return_value = test_model_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 2048,
+        "issues": [
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "model.pkl",
+            }
+        ],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["pickle_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "hf://test/malicious-model"])
+
+    # Should exit with code 1 (security issues found)
+    assert result.exit_code == 1
+    assert "Downloaded" in result.output or "issue" in result.output.lower()
+
+    # Verify cleanup was still attempted
+    mock_rmtree.assert_called()
+
+
+def test_scan_mixed_paths_and_urls():
+    """Test scanning both local paths and HuggingFace URLs in one command."""
+    runner = CliRunner()
+
+    with patch("modelaudit.cli.is_huggingface_url") as mock_is_hf, patch("os.path.exists") as mock_exists:
+        # Setup mocks - first arg is local path, second is URL
+        mock_is_hf.side_effect = [False, True]
+        mock_exists.return_value = False  # Local path doesn't exist
+
+        result = runner.invoke(cli, ["scan", "/local/path/model.pkl", "https://huggingface.co/test/model"])
+
+        # Should report error for missing local file
+        assert "Path does not exist: /local/path/model.pkl" in result.output
 
 
 def test_format_text_output_normal_scan_duration():

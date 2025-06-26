@@ -1,8 +1,8 @@
 import json
 import logging
 import os
+import shutil
 import sys
-import tempfile
 import time
 from typing import Any, Optional
 
@@ -12,6 +12,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .utils.huggingface import download_model, is_huggingface_url
 
 # Configure logging
 logging.basicConfig(
@@ -19,253 +20,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("modelaudit")
-
-
-# Common scan options that can be reused
-COMMON_SCAN_OPTIONS = [
-    click.option(
-        "--blacklist",
-        "-b",
-        multiple=True,
-        help="Additional blacklist patterns to check against model names",
-    ),
-    click.option(
-        "--format",
-        "-f",
-        type=click.Choice(["text", "json"]),
-        default="text",
-        help="Output format [default: text]",
-    ),
-    click.option(
-        "--output",
-        "-o",
-        type=click.Path(),
-        help="Output file path (prints to stdout if not specified)",
-    ),
-    click.option(
-        "--sbom",
-        type=click.Path(),
-        help="Write CycloneDX SBOM to the specified file",
-    ),
-    click.option(
-        "--timeout",
-        "-t",
-        type=int,
-        default=300,
-        help="Scan timeout in seconds [default: 300]",
-    ),
-    click.option("--verbose", "-v", is_flag=True, help="Enable verbose output"),
-    click.option(
-        "--max-file-size",
-        type=int,
-        default=0,
-        help="Maximum file size to scan in bytes [default: unlimited]",
-    ),
-    click.option(
-        "--max-total-size",
-        type=int,
-        default=0,
-        help="Maximum total bytes to scan before stopping [default: unlimited]",
-    ),
-]
-
-
-def add_common_options(func):
-    """Decorator to add common scan options to a command."""
-    for option in reversed(COMMON_SCAN_OPTIONS):
-        func = option(func)
-    return func
-
-
-class SpinnerManager:
-    """Context manager for handling spinners with proper cleanup."""
-
-    def __init__(self, text: str, show_spinner: bool = True):
-        self.text = text
-        self.show_spinner = show_spinner
-        self.spinner = None
-
-    def __enter__(self):
-        if self.show_spinner:
-            self.spinner = yaspin(Spinners.dots, text=self.text)
-            self.spinner.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.spinner:
-            if exc_type:
-                self.spinner.fail(click.style("❌ Error", fg="red", bold=True))
-            else:
-                self.spinner.ok(click.style("✅ Complete", fg="green", bold=True))
-
-    def update_text(self, text: str):
-        if self.spinner:
-            self.spinner.text = text
-
-    def success(self, message: str):
-        if self.spinner:
-            self.spinner.ok(click.style(message, fg="green", bold=True))
-            self.spinner = None
-
-    def failure(self, message: str):
-        if self.spinner:
-            self.spinner.fail(click.style(message, fg="red", bold=True))
-            self.spinner = None
-
-    def warning(self, message: str):
-        if self.spinner:
-            self.spinner.ok(click.style(message, fg="yellow", bold=True))
-            self.spinner = None
-
-
-def _setup_logging_and_header(
-    verbose: bool,
-    format: str,
-    output: Optional[str],
-    target_type: str,
-    target_info: dict,
-    blacklist: tuple[str, ...],
-) -> None:
-    """Setup logging and display header for scan commands."""
-    # Set logging level based on verbosity
-    if verbose:
-        logger.setLevel(logging.DEBUG)
-
-    # Print a nice header if not in JSON mode and not writing to a file
-    if format == "text" and not output:
-        # Create a stylish header
-        click.echo("")
-        click.echo("╔" + "═" * 78 + "╗")
-        click.echo("║" + " " * 78 + "║")
-
-        # Title with icon
-        title = "🔐 ModelAudit Security Scanner"
-        title_styled = click.style(title, fg="blue", bold=True)
-        padding = (78 - len(title)) // 2
-        click.echo(
-            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║",
-        )
-
-        # Subtitle
-        if target_type == "files":
-            subtitle = "Scanning for potential security issues in ML model files"
-        else:  # hf model
-            subtitle = "Scanning HuggingFace Hub model for security issues"
-
-        subtitle_styled = click.style(subtitle, fg="cyan")
-        padding = (78 - len(subtitle)) // 2
-        click.echo(
-            "║" + " " * padding + subtitle_styled + " " * (78 - padding - len(subtitle)) + "║",
-        )
-
-        click.echo("║" + " " * 78 + "║")
-        click.echo("╚" + "═" * 78 + "╝")
-        click.echo("")
-
-        # Scan configuration
-        if target_type == "files":
-            click.echo(click.style("🎯 TARGET FILES", fg="white", bold=True))
-            click.echo("─" * 40)
-            for path in target_info["paths"]:
-                click.echo(f"  📄 {click.style(path, fg='green')}")
-        else:  # hf model
-            click.echo(click.style("🎯 TARGET MODEL", fg="white", bold=True))
-            click.echo("─" * 40)
-            click.echo(f"  📦 {click.style(target_info['model_id'], fg='green')}")
-            revision_text = f"revision: {target_info['revision']}"
-            click.echo(f"  🏷️  {click.style(revision_text, fg='cyan')}")
-
-        if blacklist:
-            click.echo("")
-            click.echo(click.style("🚫 BLACKLIST PATTERNS", fg="white", bold=True))
-            click.echo("─" * 40)
-            for pattern in blacklist:
-                click.echo(f"  • {click.style(pattern, fg='yellow')}")
-
-        click.echo("")
-        click.echo("═" * 80)
-        click.echo("")
-
-
-def _handle_scan_output(
-    results: dict,
-    format: str,
-    output: Optional[str],
-    sbom: Optional[str],
-    verbose: bool,
-    paths_for_sbom: list[str],
-) -> None:
-    """Handle output formatting, SBOM generation, and file writing."""
-    # Format the output
-    output_text = json.dumps(results, indent=2) if format == "json" else format_text_output(results, verbose)
-
-    # Generate SBOM if requested
-    if sbom:
-        try:
-            from .sbom import generate_sbom
-            sbom_text = generate_sbom(paths_for_sbom, results)
-            with open(sbom, "w") as f:
-                f.write(sbom_text)
-        except Exception as e:
-            logger.error(f"Error generating SBOM: {e!s}", exc_info=verbose)
-            click.echo(f"Warning: Failed to generate SBOM: {e!s}", err=True)
-
-    # Send output to the specified destination
-    if output:
-        with open(output, "w") as f:
-            f.write(output_text)
-        click.echo(f"Results written to {output}")
-    else:
-        if format == "text":
-            click.echo("\n" + "─" * 80)
-        click.echo(output_text)
-
-
-def _update_scan_spinner_status(spinner, results, verbose):
-    """Update spinner status based on scan results."""
-    issues = results.get("issues", [])
-    if issues:
-        visible_issues = [
-            issue
-            for issue in issues
-            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-        ]
-        issue_count = len(visible_issues)
-        if issue_count > 0:
-            has_critical = any(
-                issue.get("severity") == "critical"
-                for issue in visible_issues
-                if isinstance(issue, dict)
-            )
-            if has_critical:
-                spinner.failure(f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)")
-            else:
-                spinner.warning(f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}")
-        else:
-            spinner.success("✅ Clean")
-    else:
-        spinner.success("✅ Clean")
-
-
-def _create_error_result(model_id, start_time, error):
-    """Create a standardized error result."""
-    return {
-        "path": model_id,
-        "duration": time.time() - start_time,
-        "files_scanned": 0,
-        "bytes_scanned": 0,
-        "issues": [
-            {
-                "message": f"Scan failed: {error!s}",
-                "severity": "critical",
-                "location": model_id,
-                "details": {"error_type": type(error).__name__},
-            }
-        ],
-        "has_errors": True,
-        "assets": [],
-        "scanners": [],
-    }
 
 
 @click.group()
@@ -276,7 +30,7 @@ def cli() -> None:
 
 
 @cli.command("scan")
-@click.argument("paths", nargs=-1, type=click.Path(exists=True), required=True)
+@click.argument("paths", nargs=-1, type=str, required=True)
 @click.option(
     "--blacklist",
     "-b",
@@ -332,11 +86,13 @@ def scan_command(
     max_file_size: int,
     max_total_size: int,
 ) -> None:
-    """Scan files or directories for malicious content.
+    """Scan files, directories, or HuggingFace models for malicious content.
 
     \b
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
+        modelaudit scan https://huggingface.co/user/model
+        modelaudit scan hf://user/model
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -360,46 +116,22 @@ def scan_command(
     """
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
-        # Create a stylish header
-        click.echo("")
-        click.echo("╔" + "═" * 78 + "╗")
-        click.echo("║" + " " * 78 + "║")
-
-        # Title with icon
-        title = "🔐 ModelAudit Security Scanner"
-        title_styled = click.style(title, fg="blue", bold=True)
-        padding = (78 - len(title)) // 2
-        click.echo(
-            "║" + " " * padding + title_styled + " " * (78 - padding - len(title)) + "║",
-        )
-
-        # Subtitle
-        subtitle = "Scanning for potential security issues in ML model files"
-        subtitle_styled = click.style(subtitle, fg="cyan")
-        padding = (78 - len(subtitle)) // 2
-        click.echo(
-            "║" + " " * padding + subtitle_styled + " " * (78 - padding - len(subtitle)) + "║",
-        )
-
-        click.echo("║" + " " * 78 + "║")
-        click.echo("╚" + "═" * 78 + "╝")
-        click.echo("")
-
-        # Scan configuration
-        click.echo(click.style("🎯 TARGET FILES", fg="white", bold=True))
-        click.echo("─" * 40)
-        for path in paths:
-            click.echo(f"  📄 {click.style(path, fg='green')}")
-
+        header = [
+            "─" * 80,
+            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
+            click.style(
+                "Scanning for potential security issues in ML model files",
+                fg="cyan",
+            ),
+            "─" * 80,
+        ]
+        click.echo("\n".join(header))
+        click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
-            click.echo("")
-            click.echo(click.style("🚫 BLACKLIST PATTERNS", fg="white", bold=True))
-            click.echo("─" * 40)
-            for pattern in blacklist:
-                click.echo(f"  • {click.style(pattern, fg='yellow')}")
-
-        click.echo("")
-        click.echo("═" * 80)
+            click.echo(
+                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
+            )
+        click.echo("─" * 80)
         click.echo("")
 
     # Set logging level based on verbosity
@@ -408,126 +140,181 @@ def scan_command(
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
-        "scanner_names": [],  # Track all scanner names used
-        "start_time": time.time(),
         "bytes_scanned": 0,
         "issues": [],
-        "has_errors": False,
         "files_scanned": 0,
-        "assets": [],  # Track all assets encountered
+        "assets": [],
+        "has_errors": False,
+        "scanner_names": [],
+        "start_time": time.time(),
     }
 
     # Scan each path
     for path in paths:
-        # Early exit for common non-model file extensions
-        # Note: Allow .json, .yaml, .yml as they can be model config files
-        if os.path.isfile(path):
-            _, ext = os.path.splitext(path)
-            ext = ext.lower()
-            if ext in (
-                ".md",
-                ".txt",
-                ".py",
-                ".js",
-                ".html",
-                ".css",
-            ):
-                if verbose:
-                    logger.info(f"Skipping non-model file: {path}")
-                click.echo(f"Skipping non-model file: {path}")
-                continue
+        # Track temp directory for cleanup
+        temp_dir = None
+        actual_path = path
 
-        # Show progress indicator if in text mode and not writing to a file
-        spinner = None
-        if format == "text" and not output:
-            spinner_text = f"Scanning {click.style(path, fg='cyan')}"
-            spinner = yaspin(Spinners.dots, text=spinner_text)
-            spinner.start()
-
-        # Perform the scan with the specified options
         try:
-            # Define progress callback if using spinner
-            progress_callback = None
-            if spinner:
+            # Check if this is a HuggingFace URL
+            if is_huggingface_url(path):
+                # Show download progress if in text mode
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
 
-                def update_progress(message, percentage, spinner=spinner):
-                    spinner.text = f"{message} ({percentage:.1f}%)"
+                try:
+                    # Download to a temporary directory
+                    download_path = download_model(path, cache_dir=None)
+                    actual_path = str(download_path)
+                    # Track the temp directory for cleanup
+                    temp_dir = str(download_path)
 
-                progress_callback = update_progress
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-            # Run the scan with progress reporting
-            results = scan_model_directory_or_file(
-                path,
-                blacklist_patterns=list(blacklist) if blacklist else None,
-                timeout=timeout,
-                max_file_size=max_file_size,
-                max_total_size=max_total_size,
-                progress_callback=progress_callback,
-            )
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-            # Aggregate results
-            aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-            aggregated_results["issues"].extend(results.get("issues", []))
-            aggregated_results["files_scanned"] += results.get(
-                "files_scanned",
-                1,
-            )  # Count each file scanned
-            aggregated_results["assets"].extend(results.get("assets", []))
-            if results.get("has_errors", False):
+                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+            else:
+                # For local paths, check if they exist
+                if not os.path.exists(path):
+                    click.echo(f"Error: Path does not exist: {path}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
+                # Early exit for common non-model file extensions
+                # Note: Allow .json, .yaml, .yml as they can be model config files
+                if os.path.isfile(path):
+                    _, ext = os.path.splitext(path)
+                    ext = ext.lower()
+                    if ext in (
+                        ".md",
+                        ".txt",
+                        ".py",
+                        ".js",
+                        ".html",
+                        ".css",
+                    ):
+                        if verbose:
+                            logger.info(f"Skipping non-model file: {path}")
+                        click.echo(f"Skipping non-model file: {path}")
+                        continue
+
+            # Show progress indicator if in text mode and not writing to a file
+            spinner = None
+            if format == "text" and not output:
+                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+                spinner = yaspin(Spinners.dots, text=spinner_text)
+                spinner.start()
+
+            # Perform the scan with the specified options
+            try:
+                # Define progress callback if using spinner
+                progress_callback = None
+                if spinner:
+
+                    def update_progress(message, percentage, spinner=spinner):
+                        spinner.text = f"{message} ({percentage:.1f}%)"
+
+                    progress_callback = update_progress
+
+                # Run the scan with progress reporting
+                results = scan_model_directory_or_file(
+                    actual_path,
+                    blacklist_patterns=list(blacklist) if blacklist else None,
+                    timeout=timeout,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                    progress_callback=progress_callback,
+                )
+
+                # Aggregate results
+                aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                aggregated_results["issues"].extend(results.get("issues", []))
+                aggregated_results["files_scanned"] += results.get(
+                    "files_scanned",
+                    1,
+                )  # Count each file scanned
+                aggregated_results["assets"].extend(results.get("assets", []))
+                if results.get("has_errors", False):
+                    aggregated_results["has_errors"] = True
+
+                # Track scanner names
+                for scanner in results.get("scanners", []):
+                    if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
+                        aggregated_results["scanner_names"].append(scanner)
+
+                # Show completion status if in text mode and not writing to a file
+                if spinner:
+                    if results.get("issues", []):
+                        # Filter out DEBUG severity issues when not in verbose mode
+                        visible_issues = [
+                            issue
+                            for issue in results.get("issues", [])
+                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                        ]
+                        issue_count = len(visible_issues)
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        if issue_count > 0:
+                            # Determine severity for coloring
+                            has_critical = any(
+                                issue.get("severity") == "critical"
+                                for issue in visible_issues
+                                if isinstance(issue, dict)
+                            )
+                            if has_critical:
+                                spinner.fail(
+                                    click.style(
+                                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                        fg="red",
+                                        bold=True,
+                                    ),
+                                )
+                            else:
+                                spinner.ok(
+                                    click.style(
+                                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                        fg="yellow",
+                                        bold=True,
+                                    ),
+                                )
+                        else:
+                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                    else:
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+
+            except Exception as e:
+                # Show error if in text mode and not writing to a file
+                if spinner:
+                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
+                    spinner.fail(click.style("❌ Error", fg="red", bold=True))
+
+                logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
+                click.echo(f"Error scanning {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
 
-            # Track scanner names
-            for scanner in results.get("scanners", []):
-                if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                    aggregated_results["scanner_names"].append(scanner)
-
-            # Show completion status if in text mode and not writing to a file
-            if spinner:
-                if results.get("issues", []):
-                    # Filter out DEBUG severity issues when not in verbose mode
-                    visible_issues = [
-                        issue
-                        for issue in results.get("issues", [])
-                        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                    ]
-                    issue_count = len(visible_issues)
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    if issue_count > 0:
-                        # Determine severity for coloring
-                        has_critical = any(
-                            issue.get("severity") == "critical" for issue in visible_issues if isinstance(issue, dict)
-                        )
-                        if has_critical:
-                            spinner.fail(
-                                click.style(
-                                    f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
-                                    fg="red",
-                                    bold=True,
-                                ),
-                            )
-                        else:
-                            spinner.ok(
-                                click.style(
-                                    f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
-                                    fg="yellow",
-                                    bold=True,
-                                ),
-                            )
-                    else:
-                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-                else:
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-
         except Exception as e:
-            # Show error if in text mode and not writing to a file
-            if spinner:
-                spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                spinner.fail(click.style("❌ Error", fg="red", bold=True))
-
-            logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
-            click.echo(f"Error scanning {path}: {e!s}", err=True)
+            # Catch any other exceptions from the outer try block
+            logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
+            click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
             aggregated_results["has_errors"] = True
+
+        finally:
+            # Clean up temporary directory if we downloaded a model
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    if verbose:
+                        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
@@ -562,118 +349,6 @@ def scan_command(
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(aggregated_results)
     sys.exit(exit_code)
-
-
-@cli.command("scan-hf")
-@click.argument("model_id", type=str, required=True)
-@click.option("--revision", "-r", default="main", help="Model revision to download")
-@add_common_options
-def scan_hf_command(
-    model_id: str,
-    revision: str,
-    blacklist: tuple[str, ...],
-    format: str,
-    output: Optional[str],
-    sbom: Optional[str],
-    timeout: int,
-    verbose: bool,
-    max_file_size: int,
-    max_total_size: int,
-):
-    """Download a model from HuggingFace Hub and scan it.
-
-    \b
-    Usage:
-        modelaudit scan-hf microsoft/DialoGPT-small
-        modelaudit scan-hf microsoft/DialoGPT-small --revision v1.0
-        modelaudit scan-hf microsoft/DialoGPT-small --format json --verbose
-
-    \b
-    Advanced options:
-        --revision, -r     Model revision to download [default: main]
-        --format, -f       Output format (text or json)
-        --output, -o       Write results to a file instead of stdout
-        --sbom             Write CycloneDX SBOM to file
-        --timeout, -t      Set scan timeout in seconds
-        --verbose, -v      Show detailed information during scanning
-        --max-file-size    Maximum file size to scan in bytes
-        --max-total-size   Maximum total bytes to scan before stopping
-
-    \b
-    Exit codes:
-        0 - Success, no security issues found
-        1 - Security issues found (scan completed successfully)
-        2 - Errors occurred during scanning
-    """
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as e:  # pragma: no cover - optional dependency
-        raise click.ClickException(
-            "huggingface-hub package is required for scan-hf. Install with 'pip install modelaudit[huggingface]'"
-        ) from e
-
-    # Setup logging and display header
-    target_info = {"model_id": model_id, "revision": revision}
-    _setup_logging_and_header(verbose, format, output, "hf", target_info, blacklist)
-
-    start_time = time.time()
-    show_progress = format == "text" and not output
-
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Download phase
-            with SpinnerManager(f"Downloading {click.style(model_id, fg='cyan')}", show_progress) as download_spinner:
-                try:
-                    snapshot_download(
-                        repo_id=model_id,
-                        revision=revision,
-                        local_dir=tmpdir,
-                        local_dir_use_symlinks=False,
-                    )
-                    if download_spinner:
-                        download_spinner.success("✅ Downloaded")
-                except Exception as e:
-                    if download_spinner:
-                        download_spinner.failure("❌ Download Failed")
-                    logger.error(f"Error downloading model {model_id}: {e!s}", exc_info=verbose)
-                    raise click.ClickException(f"Failed to download model {model_id}: {e!s}") from e
-
-            # Scan phase
-            with SpinnerManager(f"Scanning {click.style(model_id, fg='cyan')}", show_progress) as scan_spinner:
-                try:
-                    results = scan_model_directory_or_file(
-                        tmpdir,
-                        blacklist_patterns=list(blacklist) if blacklist else None,
-                        timeout=timeout,
-                        max_file_size=max_file_size,
-                        max_total_size=max_total_size,
-                    )
-
-                    # Add timing and metadata
-                    results["duration"] = time.time() - start_time
-                    results["path"] = model_id  # Set the model ID as the path for display
-
-                    if scan_spinner:
-                        _update_scan_spinner_status(scan_spinner, results, verbose)
-
-                except Exception as e:
-                    if scan_spinner:
-                        scan_spinner.failure("❌ Scan Failed")
-                    logger.error(f"Error scanning model {model_id}: {e!s}", exc_info=verbose)
-                    results = _create_error_result(model_id, start_time, e)
-
-            # Handle output
-            _handle_scan_output(results, format, output, sbom, verbose, [tmpdir])
-
-            # Exit with appropriate error code
-            exit_code = determine_exit_code(results)
-            sys.exit(exit_code)
-
-    except click.ClickException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in scan-hf: {e!s}", exc_info=verbose)
-        raise click.ClickException(f"Scan failed: {e!s}") from e
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
@@ -959,6 +634,3 @@ def _format_issue(
 
 def main() -> None:
     cli()
-
-
-
