@@ -1,11 +1,18 @@
 import json
 import os
+import re
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
+
+
+def strip_ansi(text):
+    """Strip ANSI color codes from text for testing."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def test_cli_help():
@@ -93,9 +100,7 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert (
-        str(file1) in result.output or str(file2) in result.output
-    )  # Should mention at least one file path
+    assert str(file1) in result.output or str(file2) in result.output  # Should mention at least one file path
 
 
 def test_scan_with_blacklist(tmp_path):
@@ -233,15 +238,17 @@ def test_format_text_output():
 
     # Test normal output
     output = format_text_output(results, verbose=False)
-    assert "Files scanned: 5" in output
-    assert "Test issue" in output
-    assert "warning" in output.lower()
+    clean_output = strip_ansi(output)
+    assert "Files:" in clean_output and "5" in clean_output
+    assert "Test issue" in clean_output
+    assert "warning" in clean_output.lower()
 
     # Test verbose output
     output = format_text_output(results, verbose=True)
-    assert "Files scanned: 5" in output
-    assert "Test issue" in output
-    assert "warning" in output.lower()
+    clean_output = strip_ansi(output)
+    assert "Files:" in clean_output and "5" in clean_output
+    assert "Test issue" in clean_output
+    assert "warning" in clean_output.lower()
     # Verbose might include details, but we can't guarantee it
 
 
@@ -258,8 +265,9 @@ def test_format_text_output_only_debug_issues():
     }
 
     output = format_text_output(results, verbose=False)
-    assert "No issues found" in output
-    assert "Scan completed successfully" in output
+    clean_output = strip_ansi(output)
+    assert "No security issues detected" in clean_output
+    assert "NO ISSUES FOUND" in clean_output
 
 
 def test_format_text_output_only_info_issues():
@@ -275,9 +283,10 @@ def test_format_text_output_only_info_issues():
     }
 
     output = format_text_output(results, verbose=False)
-    assert "1 info" in output
-    assert "Scan completed successfully" in output
-    assert "Scan completed with warnings" not in output
+    clean_output = strip_ansi(output)
+    assert "1 Info" in clean_output
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert "WARNINGS DETECTED" not in clean_output
 
 
 def test_format_text_output_debug_and_info_issues():
@@ -294,10 +303,11 @@ def test_format_text_output_debug_and_info_issues():
     }
 
     output = format_text_output(results, verbose=True)
-    assert "1 info" in output
-    assert "1 debug" in output
-    assert "Scan completed successfully" in output
-    assert "Scan completed with warnings" not in output
+    clean_output = strip_ansi(output)
+    assert "1 Info" in clean_output
+    assert "1 Debug" in clean_output
+    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert "WARNINGS DETECTED" not in clean_output
 
 
 def test_format_text_output_fast_scan_duration():
@@ -312,11 +322,137 @@ def test_format_text_output_fast_scan_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Scan completed in 0.005 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.005s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "No security issues detected" in clean_output
+
+
+def test_scan_huggingface_url_help():
+    """Test that HuggingFace URL examples are in the help text."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--help"])
+    assert result.exit_code == 0
+    assert "https://huggingface.co/user/model" in result.output
+    assert "hf://user/model" in result.output
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    """Test successful scanning of a HuggingFace URL."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    # Create a real temp directory for the test
+    test_model_dir = tmp_path / "test_model"
+    test_model_dir.mkdir()
+    # Create a dummy file inside to make it look like a real model
+    (test_model_dir / "model.bin").write_text("dummy model")
+
+    mock_download.return_value = test_model_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 1024,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+
+    # Should succeed
+    assert result.exit_code == 0
+    assert "Downloaded" in result.output or "Clean" in result.output
+
+    # Verify download was called
+    mock_download.assert_called_once()
+
+    # Verify scan was called with downloaded path
+    mock_scan.assert_called_once()
+    call_args = mock_scan.call_args
+    assert call_args[0][0] == str(test_model_dir)
+
+    # Verify cleanup was attempted
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
+    """Test handling of download failure for HuggingFace URL."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    mock_download.side_effect = Exception("Download failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+
+    # Should fail with error code 2
+    assert result.exit_code == 2
+    assert "Error downloading model" in result.output
+    assert "Download failed" in result.output
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    """Test scanning a HuggingFace URL that has security issues."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+    # Create a real temp directory for the test
+    test_model_dir = tmp_path / "test_model"
+    test_model_dir.mkdir()
+    # Create a dummy file inside to make it look like a real model
+    (test_model_dir / "model.pkl").write_text("dummy model")
+
+    mock_download.return_value = test_model_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 2048,
+        "issues": [
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "model.pkl",
+            }
+        ],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["pickle_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "hf://test/malicious-model"])
+
+    # Should exit with code 1 (security issues found)
+    assert result.exit_code == 1
+    assert "Downloaded" in result.output or "issue" in result.output.lower()
+
+    # Verify cleanup was still attempted
+    mock_rmtree.assert_called()
+
+
+def test_scan_mixed_paths_and_urls():
+    """Test scanning both local paths and HuggingFace URLs in one command."""
+    runner = CliRunner()
+
+    with patch("modelaudit.cli.is_huggingface_url") as mock_is_hf, patch("os.path.exists") as mock_exists:
+        # Setup mocks - first arg is local path, second is URL
+        mock_is_hf.side_effect = [False, True]
+        mock_exists.return_value = False  # Local path doesn't exist
+
+        result = runner.invoke(cli, ["scan", "/local/path/model.pkl", "https://huggingface.co/test/model"])
+
+        # Should report error for missing local file
+        assert "Path does not exist: /local/path/model.pkl" in result.output
 
 
 def test_format_text_output_normal_scan_duration():
@@ -331,11 +467,12 @@ def test_format_text_output_normal_scan_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 2 decimal places for normal scans
-    assert "Scan completed in 0.25 seconds" in output
-    assert "Files scanned: 2" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.25s" in clean_output
+    assert "Files:" in clean_output and "2" in clean_output
+    assert "No security issues detected" in clean_output
 
 
 def test_format_text_output_edge_case_duration():
@@ -350,11 +487,12 @@ def test_format_text_output_edge_case_duration():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 2 decimal places (>= 0.01 branch)
-    assert "Scan completed in 0.01 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "No issues found" in output
+    assert "Duration:" in clean_output and "0.01s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "No security issues detected" in clean_output
 
 
 def test_format_text_output_very_fast_scan_with_issues():
@@ -376,11 +514,12 @@ def test_format_text_output_very_fast_scan_with_issues():
     }
 
     output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
 
     # Should show 3 decimal places for very fast scans
-    assert "Scan completed in 0.003 seconds" in output
-    assert "Files scanned: 1" in output
-    assert "Suspicious pattern detected" in output
+    assert "Duration:" in clean_output and "0.003s" in clean_output
+    assert "Files:" in clean_output and "1" in clean_output
+    assert "Suspicious pattern detected" in clean_output
     assert "warning" in output.lower()
 
 
@@ -402,15 +541,10 @@ def test_exit_code_clean_scan(tmp_path):
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert result.exit_code == 0, (
-        f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 0, f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     # The output might not say "No issues found" if there are debug messages,
     # so let's be less strict
-    assert (
-        "scan completed successfully" in result.output.lower()
-        or "no issues found" in result.output.lower()
-    )
+    assert "scan completed successfully" in result.output.lower() or "no issues found" in result.output.lower()
 
 
 def test_exit_code_security_issues(tmp_path):
@@ -431,9 +565,7 @@ def test_exit_code_security_issues(tmp_path):
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert result.exit_code == 1, (
-        f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    )
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 

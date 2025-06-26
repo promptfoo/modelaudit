@@ -9,7 +9,7 @@ from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
 def create_safetensors_file(path: Path) -> None:
-    data = {
+    data: dict[str, np.ndarray] = {
         "t1": np.arange(10, dtype=np.float32),
         "t2": np.ones((2, 2), dtype=np.int64),
     }
@@ -46,10 +46,7 @@ def test_corrupted_header(tmp_path: Path) -> None:
     result = scanner.scan(str(corrupt_path))
 
     assert result.has_errors
-    assert any(
-        "json" in issue.message.lower() or "header" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert any("json" in issue.message.lower() or "header" in issue.message.lower() for issue in result.issues)
 
 
 def test_bad_offsets(tmp_path: Path) -> None:
@@ -63,7 +60,7 @@ def test_bad_offsets(tmp_path: Path) -> None:
         rest = f.read()
 
     header = json.loads(header_bytes.decode("utf-8"))
-    first = next(k for k in header.keys() if k != "__metadata__")
+    first = next(k for k in header if k != "__metadata__")
     header[first]["data_offsets"] = [0, 2]  # incorrect
     new_header_bytes = json.dumps(header).encode("utf-8")
     new_len = struct.pack("<Q", len(new_header_bytes))
