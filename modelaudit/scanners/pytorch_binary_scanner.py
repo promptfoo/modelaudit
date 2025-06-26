@@ -179,40 +179,86 @@ class PyTorchBinaryScanner(BaseScanner):
         result: ScanResult,
         offset: int,
     ) -> None:
-        """Check for executable file signatures"""
+        """Check for executable file signatures with ML context awareness"""
+        from modelaudit.utils.ml_context import (
+            analyze_binary_for_ml_context,
+            should_ignore_executable_signature,
+        )
+
+        # Analyze ML context for this chunk
+        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+
+        # Count patterns for density analysis
+        pattern_counts = {}
+
         # Common executable signatures
         for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
-                pos = chunk.find(sig)
-                absolute_offset = offset + pos
+                # Count all occurrences
+                positions = []
+                pos = 0
+                while True:
+                    pos = chunk.find(sig, pos)
+                    if pos == -1:
+                        break
+                    positions.append(offset + pos)
+                    pos += len(sig)
 
-                # Only flag if the signature appears at the beginning of the file
-                # Real executables start with their magic bytes at offset 0
-                # This reduces false positives from random byte sequences in model weights
-                if absolute_offset == 0:
-                    result.add_issue(
-                        f"Executable signature found: {description}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (offset: {absolute_offset})",
-                        details={
-                            "signature": sig.hex(),
-                            "description": description,
-                            "offset": absolute_offset,
-                        },
-                    )
-                elif len(sig) > 2:
-                    # For longer signatures (more than 2 bytes), also flag them
-                    # as they're less likely to be false positives
-                    result.add_issue(
-                        f"Executable signature found: {description}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (offset: {absolute_offset})",
-                        details={
-                            "signature": sig.hex(),
-                            "description": description,
-                            "offset": absolute_offset,
-                        },
-                    )
+                if positions:
+                    pattern_counts[sig] = (positions, description)
+
+        # Process findings with ML context filtering
+        for sig, (positions, description) in pattern_counts.items():
+            # Calculate pattern density more reasonably for small files
+            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            # Use at least 1MB for density calculation to avoid inflated densities in small files
+            effective_size_mb = max(file_size_mb, 1.0)
+            pattern_density = len(positions) / effective_size_mb
+
+            # Apply ML context filtering
+            filtered_positions = []
+            ignored_count = 0
+
+            for pos in positions:
+                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                    ignored_count += 1
+                else:
+                    filtered_positions.append(pos)
+
+            # Report significant patterns that weren't filtered out
+            for pos in filtered_positions[:10]:  # Limit to first 10
+                result.add_issue(
+                    f"Executable signature found: {description}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (offset: {pos})",
+                    details={
+                        "signature": sig.hex(),
+                        "description": description,
+                        "offset": pos,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_confidence": ml_context.get("weight_confidence", 0),
+                    },
+                )
+
+            # Add informational note about ignored patterns
+            if ignored_count > 0 and len(positions) > 5:
+                from modelaudit.utils.ml_context import get_ml_context_explanation
+
+                explanation = get_ml_context_explanation(ml_context, len(positions))
+                result.add_issue(
+                    f"Ignored {ignored_count} likely false positive {description} patterns",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path}",
+                    details={
+                        "signature": sig.hex(),
+                        "ignored_count": ignored_count,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_explanation": explanation,
+                    },
+                    why=f"These patterns were likely false positives in ML weight data. {explanation}",
+                )
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
         """Validate that the file appears to have valid tensor structure"""
