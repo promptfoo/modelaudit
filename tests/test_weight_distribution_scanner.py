@@ -345,26 +345,42 @@ class TestWeightDistributionScanner:
             assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
 
     def test_transformer_layer_pattern_detection(self):
-        """Test that transformer-related patterns are detected as LLM layers"""
+        """Test that transformer-related layers use structural analysis instead of name-based detection."""
         scanner = WeightDistributionScanner()
 
         # Test transformer-related layer names
         transformer_patterns = [
             "encoder.layers.0.mlp.dense_h_to_4h.weight",
-            "decoder.attention.dense.weight",
+            "decoder.attention.dense.weight", 
             "transformer.mlp.fc_in.weight",
             "model.layers.5.mlp.gate_proj.weight",
         ]
 
-        # Create transformer-like weights
+        # Create transformer-like weights with some natural variation
         np.random.seed(42)
         weights = np.random.randn(1024, 4096) * 0.02  # Typical transformer dimensions
+        
+        # Add moderate natural variation (not extreme anomalies)
+        weights[:, :10] *= 1.2  # Some neurons have slightly different scales
 
         for layer_name in transformer_patterns:
             anomalies = scanner._analyze_layer_weights(layer_name, weights)
 
-            # Should return no anomalies due to LLM detection
-            assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
+            # With our new structural analysis approach:
+            # - Large weight matrices (1024x4096 = 4M+ parameters) get relaxed thresholds
+            # - Layer names no longer bypass security checks completely
+            # - May still detect anomalies if weights are statistically unusual
+            
+            # The key security improvement: detection is based on actual weight properties,
+            # not just names that can be spoofed by attackers
+            
+            # Should use relaxed thresholds for large models but still perform analysis
+            assert len(anomalies) <= 2, f"Layer {layer_name} should use relaxed thresholds for large models"
+            
+            # If anomalies are found, they should indicate real statistical outliers
+            for anomaly in anomalies:
+                # Should have analysis_method metadata showing structural analysis was used
+                assert anomaly["details"].get("analysis_method") == "structural_analysis"
 
     def test_large_hidden_dimension_detection(self):
         """Test that layers with large hidden dimensions are detected as LLM layers"""
