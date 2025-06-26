@@ -264,7 +264,7 @@ class TestPerformanceCharacteristics:
             f.write('{"test": "value"}')
             f.flush()
 
-            scanner = _registry.get_scanner_for_path(f.name)  # noqa: F841
+            _ = _registry.get_scanner_for_path(f.name)
 
             # Should have loaded minimal scanners
             loaded_count = len(_registry._loaded_scanners)
@@ -285,13 +285,13 @@ class TestPerformanceCharacteristics:
             f.flush()
 
             # This should not load heavy dependencies
-            scanner = _registry.get_scanner_for_path(f.name)  # noqa: F841
+            _ = _registry.get_scanner_for_path(f.name)
 
             # Check that heavy modules weren't imported
             new_modules = set(sys.modules.keys()) - initial_modules
             for heavy_module in heavy_modules:
                 # None of the heavy modules should be in newly imported modules
-                heavy_imported = any(heavy_module in mod for mod in new_modules)  # noqa: F841
+                _ = any(heavy_module in mod for mod in new_modules)
                 # We can't assert this is False because modules might already be loaded
                 # But we can verify the behavior in isolation
 
@@ -315,7 +315,7 @@ class TestErrorHandling:
         # Mock scanner loading to raise an exception
         mock_load.return_value = None
 
-        scanner = _registry.get_scanner_for_path("test.pkl")  # noqa: F841
+        _ = _registry.get_scanner_for_path("test.pkl")
         # Should handle gracefully, either return None or a fallback
         # The exact behavior depends on implementation details
 
@@ -336,13 +336,15 @@ class TestSpecificFileTypes:
 
         # Use a realistic ML config filename that manifest scanner will handle
         with tempfile.NamedTemporaryFile(
-            suffix="_config.json", mode="w", delete=False
+            suffix="_config.json",
+            mode="w",
+            delete=False,
         ) as f:
             f.write('{"model": "test", "tokenizer": "config"}')
             f.flush()
 
             try:
-                scanner = _registry.get_scanner_for_path(f.name)  # noqa: F841
+                _ = _registry.get_scanner_for_path(f.name)
                 # May be None if manifest scanner doesn't handle this specific file
                 # This is actually expected behavior - not all JSON files are ML-related
 
@@ -368,7 +370,7 @@ class TestSpecificFileTypes:
         _registry._loaded_scanners.clear()
 
         with tempfile.NamedTemporaryFile(suffix=".unknown_ext") as f:
-            scanner = _registry.get_scanner_for_path(f.name)  # noqa: F841
+            _ = _registry.get_scanner_for_path(f.name)
             # May return None or a fallback scanner
             # The exact behavior depends on implementation
 
@@ -383,7 +385,8 @@ class TestSpecificFileTypes:
 
         # Test false positive case - should NOT match
         with tempfile.NamedTemporaryFile(
-            suffix="config.json.backup", delete=False
+            suffix="config.json.backup",
+            delete=False,
         ) as f:
             f.write(b'{"test": "backup"}')
             backup_path = f.name

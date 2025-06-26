@@ -1,5 +1,6 @@
 import json
 
+import h5py
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
@@ -7,7 +8,6 @@ from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 # Skip all tests if h5py is not available
 pytest.importorskip("h5py")
-import h5py  # noqa: E402
 
 
 def test_keras_h5_scanner_can_handle(tmp_path):
@@ -46,9 +46,7 @@ def create_mock_h5_file(tmp_path, *, malicious=False):
 
         if malicious:
             # Add a malicious layer - split the long line
-            malicious_function = (
-                'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
-            )
+            malicious_function = 'lambda x: eval(\'__import__("os").system("rm -rf /")\')'
             model_config["config"]["layers"].append(
                 {
                     "class_name": "Lambda",
@@ -82,9 +80,7 @@ def test_keras_h5_scanner_safe_model(tmp_path):
     assert result.bytes_scanned > 0
 
     # Check for issues - a safe model might still have some informational issues
-    error_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-    ]
+    error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert len(error_issues) == 0
 
 
@@ -96,14 +92,9 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
     result = scanner.scan(str(model_path))
 
     # The scanner should detect suspicious patterns
+    assert any(issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING) for issue in result.issues)
     assert any(
-        issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING)
-        for issue in result.issues
-    )
-    assert any(
-        "eval" in issue.message.lower()
-        or "system" in issue.message.lower()
-        or "suspicious" in issue.message.lower()
+        "eval" in issue.message.lower() or "system" in issue.message.lower() or "suspicious" in issue.message.lower()
         for issue in result.issues
     )
 
@@ -120,9 +111,7 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     # Should have an error about invalid H5
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
-        "invalid" in issue.message.lower()
-        or "not an hdf5" in issue.message.lower()
-        or "error" in issue.message.lower()
+        "invalid" in issue.message.lower() or "not an hdf5" in issue.message.lower() or "error" in issue.message.lower()
         for issue in result.issues
     )
 
@@ -164,8 +153,7 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
     blacklist_issues = [
         issue
         for issue in result.issues
-        if "suspicious_function" in issue.message.lower()
-        or "lambda" in issue.message.lower()
+        if "suspicious_function" in issue.message.lower() or "lambda" in issue.message.lower()
     ]
     assert len(blacklist_issues) > 0
 
@@ -217,29 +205,18 @@ def test_tensorflow_h5_file_detection(tmp_path):
     assert result.success is True
 
     # Should have a DEBUG message about TensorFlow H5, not WARNING
-    tensorflow_issues = [
-        issue
-        for issue in result.issues
-        if "tensorflow h5 model" in issue.message.lower()
-    ]
+    tensorflow_issues = [issue for issue in result.issues if "tensorflow h5 model" in issue.message.lower()]
 
     if tensorflow_issues:
         # Should be DEBUG level, not WARNING
         assert all(issue.severity == IssueSeverity.DEBUG for issue in tensorflow_issues)
-        assert any(
-            "tensorflow h5 model" in issue.message.lower()
-            for issue in tensorflow_issues
-        )
+        assert any("tensorflow h5 model" in issue.message.lower() for issue in tensorflow_issues)
 
     # Should NOT have any WARNING or CRITICAL issues
     high_severity_issues = [
-        issue
-        for issue in result.issues
-        if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
     ]
-    assert len(high_severity_issues) == 0, (
-        "TensorFlow H5 files should not generate warnings"
-    )
+    assert len(high_severity_issues) == 0, "TensorFlow H5 files should not generate warnings"
 
 
 def test_non_keras_h5_file_debug_only(tmp_path):
@@ -262,11 +239,7 @@ def test_non_keras_h5_file_debug_only(tmp_path):
     assert result.success is True
 
     # Should have a DEBUG message about not being a Keras model
-    keras_issues = [
-        issue
-        for issue in result.issues
-        if "does not appear to be a keras model" in issue.message.lower()
-    ]
+    keras_issues = [issue for issue in result.issues if "does not appear to be a keras model" in issue.message.lower()]
 
     if keras_issues:
         # Should be DEBUG level, not WARNING
@@ -274,13 +247,9 @@ def test_non_keras_h5_file_debug_only(tmp_path):
 
     # Should NOT have any WARNING or CRITICAL issues
     high_severity_issues = [
-        issue
-        for issue in result.issues
-        if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
     ]
-    assert len(high_severity_issues) == 0, (
-        "Generic H5 files should not generate warnings"
-    )
+    assert len(high_severity_issues) == 0, "Generic H5 files should not generate warnings"
 
 
 def test_actual_keras_model_still_scans_properly(tmp_path):
@@ -296,13 +265,9 @@ def test_actual_keras_model_still_scans_properly(tmp_path):
 
     # Should not have issues about missing model_config since this is a proper Keras file
     missing_config_issues = [
-        issue
-        for issue in result.issues
-        if "does not appear to be a keras model" in issue.message.lower()
+        issue for issue in result.issues if "does not appear to be a keras model" in issue.message.lower()
     ]
-    assert len(missing_config_issues) == 0, (
-        "Proper Keras models should not have missing config issues"
-    )
+    assert len(missing_config_issues) == 0, "Proper Keras models should not have missing config issues"
 
     # Should have proper metadata
     assert result.metadata.get("model_class") is not None
@@ -324,10 +289,7 @@ def test_malicious_keras_model_still_detected(tmp_path):
         issue
         for issue in result.issues
         if issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING)
-        and any(
-            keyword in issue.message.lower()
-            for keyword in ["suspicious", "lambda", "eval", "malicious"]
-        )
+        and any(keyword in issue.message.lower() for keyword in ["suspicious", "lambda", "eval", "malicious"])
     ]
     assert len(malicious_issues) > 0, "Malicious Keras models should still be detected"
 
@@ -370,12 +332,8 @@ def test_regression_no_false_positives_for_legitimate_files(tmp_path):
 
         # Should have NO WARNING or CRITICAL issues
         high_severity_issues = [
-            issue
-            for issue in result.issues
-            if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+            issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
         ]
-        assert len(high_severity_issues) == 0, (
-            f"{file_type} should not generate warnings/errors"
-        )
+        assert len(high_severity_issues) == 0, f"{file_type} should not generate warnings/errors"
 
         # DEBUG messages are OK for non-Keras files

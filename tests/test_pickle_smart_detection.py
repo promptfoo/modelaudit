@@ -4,16 +4,16 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
-# Add the parent directory to sys.path to allow importing modelaudit
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from modelaudit.scanners.base import IssueSeverity  # noqa: E402
-from modelaudit.scanners.pickle_scanner import (  # noqa: E402
+from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
     _detect_ml_context,
     _is_actually_dangerous_global,
     _should_ignore_opcode_sequence,
 )
+
+# Add the parent directory to sys.path to allow importing modelaudit
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # Define test classes at module level to make them picklable
@@ -95,8 +95,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             # (indicating smart filtering worked)
             self.assertTrue(
                 ml_context.get("is_ml_content", False) or len(result.issues) < 5,
-                f"Expected ML detection or low issue count, "
-                f"got {len(result.issues)} issues",
+                f"Expected ML detection or low issue count, got {len(result.issues)} issues",
             )
 
         finally:
@@ -118,7 +117,9 @@ class TestPickleSmartDetection(unittest.TestCase):
 
             # Should have fewer issues than without smart detection
             self.assertLess(
-                len(result.issues), 50, "YOLO model should have reduced warnings"
+                len(result.issues),
+                50,
+                "YOLO model should have reduced warnings",
             )
 
         finally:
@@ -130,32 +131,40 @@ class TestPickleSmartDetection(unittest.TestCase):
         # Test torch references
         self.assertFalse(
             _is_actually_dangerous_global(
-                "torch", "tensor", {"is_ml_content": True, "overall_confidence": 0.8}
-            )
+                "torch",
+                "tensor",
+                {"is_ml_content": True, "overall_confidence": 0.8},
+            ),
         )
         self.assertFalse(
             _is_actually_dangerous_global(
-                "torch.nn", "Linear", {"is_ml_content": True, "overall_confidence": 0.8}
-            )
+                "torch.nn",
+                "Linear",
+                {"is_ml_content": True, "overall_confidence": 0.8},
+            ),
         )
         self.assertFalse(
             _is_actually_dangerous_global(
                 "collections",
                 "OrderedDict",
                 {"is_ml_content": True, "overall_confidence": 0.8},
-            )
+            ),
         )
 
         # Test that genuinely dangerous references are still flagged
         self.assertTrue(
             _is_actually_dangerous_global(
-                "os", "system", {"is_ml_content": True, "overall_confidence": 0.8}
-            )
+                "os",
+                "system",
+                {"is_ml_content": True, "overall_confidence": 0.8},
+            ),
         )
         self.assertTrue(
             _is_actually_dangerous_global(
-                "subprocess", "call", {"is_ml_content": True, "overall_confidence": 0.8}
-            )
+                "subprocess",
+                "call",
+                {"is_ml_content": True, "overall_confidence": 0.8},
+            ),
         )
 
     def test_opcode_sequence_ignoring(self):
@@ -170,13 +179,13 @@ class TestPickleSmartDetection(unittest.TestCase):
         # Should ignore for high-confidence ML content
         high_confidence_context = {"is_ml_content": True, "overall_confidence": 0.8}
         self.assertTrue(
-            _should_ignore_opcode_sequence(mock_ml_opcodes, high_confidence_context)
+            _should_ignore_opcode_sequence(mock_ml_opcodes, high_confidence_context),
         )
 
         # Should not ignore for low-confidence content
         low_confidence_context = {"is_ml_content": False, "overall_confidence": 0.1}
         self.assertFalse(
-            _should_ignore_opcode_sequence(mock_ml_opcodes, low_confidence_context)
+            _should_ignore_opcode_sequence(mock_ml_opcodes, low_confidence_context),
         )
 
     def test_complex_pytorch_model_low_false_positives(self):
@@ -196,8 +205,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertLess(
                 len(result.issues),
                 50,
-                f"Expected < 50 issues, got {len(result.issues)}. "
-                f"Issues: {[i.message for i in result.issues]}",
+                f"Expected < 50 issues, got {len(result.issues)}. Issues: {[i.message for i in result.issues]}",
             )
 
             # Check ML context was detected or smart filtering worked
@@ -225,16 +233,11 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertTrue(result.success)
 
             # Any remaining issues should be INFO or WARNING level, not ERROR
-            error_issues = [
-                issue
-                for issue in result.issues
-                if issue.severity == IssueSeverity.CRITICAL
-            ]
+            error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
             self.assertEqual(
                 len(error_issues),
                 0,
-                f"Should not have ERROR level issues for ML content. "
-                f"Got: {[i.message for i in error_issues]}",
+                f"Should not have ERROR level issues for ML content. Got: {[i.message for i in error_issues]}",
             )
 
         finally:
@@ -276,11 +279,11 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertTrue(result.success)
 
             # Should not flag the __version__ string as suspicious in ML context
-            version_issues = [
-                issue for issue in result.issues if "__version__" in issue.message
-            ]
+            version_issues = [issue for issue in result.issues if "__version__" in issue.message]
             self.assertEqual(
-                len(version_issues), 0, "Should not flag __version__ in ML context"
+                len(version_issues),
+                0,
+                "Should not flag __version__ in ML context",
             )
 
         finally:
@@ -309,9 +312,7 @@ class TestPickleSmartDetection(unittest.TestCase):
 
             # Should have at least one ERROR or WARNING
             high_severity_issues = [
-                issue
-                for issue in result.issues
-                if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
+                issue for issue in result.issues if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             ]
             self.assertTrue(
                 len(high_severity_issues) > 0,

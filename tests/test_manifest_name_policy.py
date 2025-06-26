@@ -15,7 +15,4 @@ def test_manifest_scanner_model_name_blacklist(tmp_path):
     result = scanner.scan(str(test_file))
 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert any(
-        "model" in issue.message.lower() and "blocked" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert any("model" in issue.message.lower() and "blocked" in issue.message.lower() for issue in result.issues)

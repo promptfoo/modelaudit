@@ -7,7 +7,6 @@ Estimates token count to stay within Claude 4's context limits (~200k tokens).
 import fnmatch
 import sys
 from pathlib import Path
-from typing import List
 
 
 def estimate_tokens(text: str) -> int:
@@ -15,16 +14,13 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def should_include_file(file_path: Path, excluded_patterns: List[str]) -> bool:
+def should_include_file(file_path: Path, excluded_patterns: list[str]) -> bool:
     """Check if file should be included based on exclusion patterns."""
     file_str = str(file_path)
-    for pattern in excluded_patterns:
-        if fnmatch.fnmatch(file_str, pattern):
-            return False
-    return True
+    return all(not fnmatch.fnmatch(file_str, pattern) for pattern in excluded_patterns)
 
 
-def collect_python_files(directory: Path, excluded_patterns: List[str]) -> List[Path]:
+def collect_python_files(directory: Path, excluded_patterns: list[str]) -> list[Path]:
     """Recursively collect all Python files in directory."""
     python_files = []
     for file_path in directory.rglob("*.py"):
@@ -36,11 +32,11 @@ def collect_python_files(directory: Path, excluded_patterns: List[str]) -> List[
 def read_file_safe(file_path: Path) -> str:
     """Safely read file content with proper encoding handling."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, encoding="utf-8") as f:
             return f.read()
     except UnicodeDecodeError:
         try:
-            with open(file_path, 'r', encoding='latin-1') as f:
+            with open(file_path, encoding="latin-1") as f:
                 return f.read()
         except Exception as e:
             return f"# ERROR: Could not read {file_path}: {e}\n"
@@ -48,28 +44,31 @@ def read_file_safe(file_path: Path) -> str:
         return f"# ERROR: Could not read {file_path}: {e}\n"
 
 
-def generate_context_file(output_path: str = "llm-context.txt", max_tokens: int = 180000):
+def generate_context_file(
+    output_path: str = "llm-context.txt",
+    max_tokens: int = 180000,
+):
     """Generate the LLM context file with README and source code."""
-    
+
     # Get project root
     project_root = Path(__file__).parent
-    
+
     # Files/patterns to exclude
     excluded_patterns = [
-        "*/tests/*",           # Test files
-        "*/__pycache__/*",     # Python cache
-        "*/.*",                # Hidden files
-        "*/htmlcov/*",         # Coverage reports
-        "*/scratch/*",         # Scratch directory
-        "*/examples/*",        # Example files (can include if needed)
-        "*.pyc",               # Compiled Python
-        "*.pyo",               # Optimized Python
-        "*/.git/*",            # Git files
+        "*/tests/*",  # Test files
+        "*/__pycache__/*",  # Python cache
+        "*/.*",  # Hidden files
+        "*/htmlcov/*",  # Coverage reports
+        "*/scratch/*",  # Scratch directory
+        "*/examples/*",  # Example files (can include if needed)
+        "*.pyc",  # Compiled Python
+        "*.pyo",  # Optimized Python
+        "*/.git/*",  # Git files
     ]
-    
+
     content_parts = []
     total_tokens = 0
-    
+
     # Add header
     header = """# ModelAudit - LLM Context File
 # Generated automatically - contains README and all source code
@@ -78,7 +77,7 @@ def generate_context_file(output_path: str = "llm-context.txt", max_tokens: int 
 """
     content_parts.append(header)
     total_tokens += estimate_tokens(header)
-    
+
     # Add README
     readme_path = project_root / "README.md"
     if readme_path.exists():
@@ -93,7 +92,7 @@ def generate_context_file(output_path: str = "llm-context.txt", max_tokens: int 
         tokens = estimate_tokens(readme_section)
         total_tokens += tokens
         print(f"Added README.md: {tokens:,} tokens")
-    
+
     # Add project structure overview
     structure_content = """
 ## Project Structure Overview
@@ -122,15 +121,15 @@ The ModelAudit project is organized as follows:
 """
     content_parts.append(structure_content)
     total_tokens += estimate_tokens(structure_content)
-    
+
     # Collect all Python files from modelaudit package
     modelaudit_dir = project_root / "modelaudit"
     if not modelaudit_dir.exists():
         print(f"ERROR: modelaudit directory not found at {modelaudit_dir}")
         return
-        
+
     python_files = collect_python_files(modelaudit_dir, excluded_patterns)
-    
+
     # Sort files by importance/dependency order
     file_priority = {
         "__init__.py": 0,
@@ -139,24 +138,26 @@ The ModelAudit project is organized as follows:
         "base.py": 3,
         "filetype.py": 4,
     }
-    
+
     def get_priority(file_path: Path) -> int:
         filename = file_path.name
         return file_priority.get(filename, 10)
-    
+
     python_files.sort(key=get_priority)
-    
+
     print(f"Found {len(python_files)} Python files to include")
-    
+
     # Add each Python file
     for file_path in python_files:
         if total_tokens > max_tokens:
-            print(f"WARNING: Approaching token limit ({total_tokens:,}/{max_tokens:,}), stopping")
+            print(
+                f"WARNING: Approaching token limit ({total_tokens:,}/{max_tokens:,}), stopping",
+            )
             break
-            
+
         relative_path = file_path.relative_to(project_root)
         file_content = read_file_safe(file_path)
-        
+
         file_section = f"""
 ### {relative_path}
 
@@ -165,16 +166,16 @@ The ModelAudit project is organized as follows:
 ```
 
 """
-        
+
         tokens = estimate_tokens(file_section)
         if total_tokens + tokens > max_tokens:
             print(f"WARNING: Adding {relative_path} would exceed token limit, skipping")
             continue
-            
+
         content_parts.append(file_section)
         total_tokens += tokens
         print(f"Added {relative_path}: {tokens:,} tokens (total: {total_tokens:,})")
-    
+
     # Add footer with summary
     footer = f"""
 ## Summary
@@ -193,28 +194,30 @@ The ModelAudit tool is a security scanner for AI/ML models that detects:
 
 For development, testing, and deployment information, refer to the README section above.
 """
-    
+
     content_parts.append(footer)
     total_tokens += estimate_tokens(footer)
-    
+
     # Write the complete file
     output_file = project_root / output_path
     try:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(''.join(content_parts))
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write("".join(content_parts))
         print(f"\n✓ Successfully generated {output_path}")
         print(f"✓ Total estimated tokens: {total_tokens:,}")
         print(f"✓ File size: {output_file.stat().st_size:,} bytes")
-        
+
         if total_tokens > max_tokens:
-            print(f"⚠️  WARNING: Estimated tokens ({total_tokens:,}) exceed target limit ({max_tokens:,})")
+            print(
+                f"⚠️  WARNING: Estimated tokens ({total_tokens:,}) exceed target limit ({max_tokens:,})",
+            )
         else:
             print(f"✓ Within token limit ({max_tokens:,})")
-            
+
     except Exception as e:
         print(f"ERROR: Failed to write {output_path}: {e}")
         return False
-    
+
     return True
 
 
@@ -222,10 +225,10 @@ if __name__ == "__main__":
     # Allow custom output filename and token limit from command line
     output_file = sys.argv[1] if len(sys.argv) > 1 else "llm-context.txt"
     token_limit = int(sys.argv[2]) if len(sys.argv) > 2 else 180000
-    
+
     print(f"Generating LLM context file: {output_file}")
     print(f"Target token limit: {token_limit:,}")
     print("=" * 60)
-    
+
     success = generate_context_file(output_file, token_limit)
-    sys.exit(0 if success else 1) 
+    sys.exit(0 if success else 1)

@@ -94,7 +94,7 @@ class TestCoreIntegration:
                 file_path.write_text(content)
 
                 # Scan the file
-                result = core.scan_file(str(file_path))  # noqa: F841
+                _ = core.scan_file(str(file_path))
 
                 # Track how many scanners are loaded
                 loaded_counts.append(len(_registry._loaded_scanners))
@@ -123,7 +123,7 @@ class TestPerformanceCharacteristics:
 
         # Accessing the registry should also be fast
         start_time = time.time()
-        registry = scanners.SCANNER_REGISTRY  # noqa: F841
+        _ = scanners.SCANNER_REGISTRY
         access_time = time.time() - start_time
 
         # First access loads scanners, but should still be reasonable
@@ -149,7 +149,7 @@ class TestPerformanceCharacteristics:
         # First verify that we haven't loaded tensorflow yet
         import sys
 
-        tf_loaded_before = "tensorflow" in sys.modules  # noqa: F841
+        _ = "tensorflow" in sys.modules
 
         start_time = time.time()
 
@@ -157,7 +157,7 @@ class TestPerformanceCharacteristics:
             # This might be slow due to tensorflow import
             from modelaudit.scanners import TensorFlowSavedModelScanner
 
-            access_time = time.time() - start_time  # noqa: F841
+            _access_time = time.time() - start_time
 
             # This is expected to be slower due to tensorflow
             # But we can't assert exact time since it depends on system
