@@ -33,7 +33,7 @@ class TestNestedPickleIntegration:
 
     def get_malicious_nested_pickles(self, pickles_dir: Path) -> list[Path]:
         """Get all malicious nested pickle test files."""
-        malicious_files = []
+        malicious_files: list[Path] = []
 
         # Look for our generated malicious nested pickle files
         malicious_patterns = ["nested_pickle_*.pkl", "malicious_model_*.pkl", "decode_exec_*.pkl"]
@@ -45,7 +45,7 @@ class TestNestedPickleIntegration:
 
     def get_safe_nested_pickles(self, pickles_dir: Path) -> list[Path]:
         """Get all safe nested-like pickle files that should not trigger detection."""
-        safe_files = []
+        safe_files: list[Path] = []
 
         # Look for our safe test files
         safe_patterns = ["safe_*.pkl"]

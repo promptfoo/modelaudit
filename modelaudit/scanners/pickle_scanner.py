@@ -253,8 +253,13 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
         if any(term in s.lower() for term in ["layer", "conv", "batch", "norm", "relu", "pool", "linear"]):
             return None
 
-    # Check for base64-like strings (still suspicious)
-    if len(s) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", s):
+    # Check for base64-like strings (still suspicious), but avoid repeating patterns
+    if (
+        len(s) > 100
+        and re.match(r"^[A-Za-z0-9+/=]+$", s)
+        and not re.match(r"^(.)\1*$", s)  # Not all same character (e.g., "===...")
+        and len(set(s)) > 4  # Must have some character diversity
+    ):
         return "potential_base64"
 
     return None
@@ -502,8 +507,13 @@ def is_suspicious_string(s: str) -> Optional[str]:
         if match:
             return pattern
 
-    # Check for base64-like strings (long strings with base64 charset)
-    if len(s) > 40 and re.match(r"^[A-Za-z0-9+/=]+$", s):
+    # Check for base64-like strings (long strings with base64 charset), but avoid repeating patterns
+    if (
+        len(s) > 40
+        and re.match(r"^[A-Za-z0-9+/=]+$", s)
+        and not re.match(r"^(.)\1*$", s)  # Not all same character
+        and len(set(s)) > 4  # Must have some character diversity
+    ):
         return "potential_base64"
 
     return None

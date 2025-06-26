@@ -455,8 +455,7 @@ class TestPickleScanner(unittest.TestCase):
                 nested_issues = [
                     i
                     for i in result.issues
-                    if "nested pickle payload" in i.message.lower()
-                    or "encoded pickle payload" in i.message.lower()
+                    if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
                 ]
                 assert nested_issues
                 assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
