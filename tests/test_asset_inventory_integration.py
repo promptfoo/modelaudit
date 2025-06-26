@@ -180,17 +180,14 @@ class TestAssetInventoryIntegration:
         # Should succeed or have warnings but not error
         assert result.exit_code in [0, 1]
 
-        # Should contain asset section in output
-        assert "SCANNED FILES" in result.output
+        # Note: SCANNED FILES section was removed to reduce output verbosity
+        # The asset inventory is still available in JSON format
+        # Just verify that the scan completed successfully and mentioned the files
+        assert "SCAN SUMMARY" in result.output
+        assert "Files:" in result.output
 
-        # Should list the main files
-        assert "model.safetensors" in result.output
-        assert "config.json" in result.output
-        assert "weights.zip" in result.output
-        assert "tokenizer_config.json" in result.output
-
-        # Note: We simplified the asset display, so tensor and key details
-        # are no longer shown in the CLI output to reduce verbosity
+        # Should still show file paths in issues if any are found
+        # The files are still being scanned and processed, just not listed separately
 
     def test_asset_inventory_cli_json_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI JSON output."""
@@ -416,7 +413,7 @@ class TestAssetInventoryIntegration:
         assert "transformer.layer.11.output.dense.weight" in tensor_names
 
     def test_asset_inventory_cli_output_formatting(self, tmp_path: Path):
-        """Test that CLI asset output formatting is readable and well-structured."""
+        """Test that CLI output formatting is readable and well-structured."""
         # Create a model with various asset types
         model_dir = tmp_path / "formatting_test"
         model_dir.mkdir()
@@ -438,26 +435,14 @@ class TestAssetInventoryIntegration:
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", str(model_dir)])
 
-        output_lines = result.output.split("\n")
+        # Note: SCANNED FILES section was removed to reduce output verbosity
+        # Verify that the overall output structure is still well-formatted
+        assert "SCAN SUMMARY" in result.output
+        assert "Files:" in result.output
+        assert "SECURITY FINDINGS" in result.output
 
-        # Find the assets section
-        assets_start = None
-        for i, line in enumerate(output_lines):
-            if "SCANNED FILES" in line:
-                assets_start = i
-                break
-
-        assert assets_start is not None, "Assets section not found in output"
-
-        # Check formatting structure
-        assets_section = output_lines[assets_start:]
-
-        # Should have proper indentation and structure with bullet points
-        asset_lines = [line for line in assets_section if line.strip().startswith("•")]
-        assert len(asset_lines) >= 3  # Should list all three files
-
-        # Note: We simplified the asset display, so tensor and key details
-        # are no longer shown in the CLI output to reduce verbosity
+        # The asset inventory is still captured but not displayed in text format
+        # Users can use --format json to see detailed asset information
 
     def test_asset_inventory_performance_large_directory(self, tmp_path: Path):
         """Test asset inventory performance with many files."""
