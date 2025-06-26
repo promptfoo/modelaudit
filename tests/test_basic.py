@@ -121,9 +121,7 @@ def test_max_total_size(tmp_path):
     assert results["files_scanned"] == 2
 
     termination_messages = [
-        i
-        for i in results["issues"]
-        if "Scan terminated early due to total size limit" in i["message"]
+        i for i in results["issues"] if "Scan terminated early due to total size limit" in i["message"]
     ]
     assert len(termination_messages) == 1
 
