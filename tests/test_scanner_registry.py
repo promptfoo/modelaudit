@@ -7,30 +7,30 @@ def test_scanner_registry_contains_all_scanners():
     # Check that all expected scanners are either loaded or in failed scanners
     scanner_classes = [cls.__name__ for cls in SCANNER_REGISTRY]
     failed_scanners = _registry.get_failed_scanners()
-    
+
     # Core scanners that should always load (no heavy dependencies)
     core_scanners = [
         "PickleScanner",
-        "PyTorchZipScanner", 
+        "PyTorchZipScanner",
         "SafeTensorsScanner",
         "PmmlScanner",
     ]
-    
+
     for scanner in core_scanners:
         assert scanner in scanner_classes, f"Core scanner {scanner} should always be available"
-    
+
     # ML framework scanners that may fail due to compatibility issues
     ml_scanners = [
         "TensorFlowSavedModelScanner",
-        "KerasH5Scanner", 
+        "KerasH5Scanner",
         "OnnxScanner",
         "TFLiteScanner",
     ]
-    
+
     for scanner in ml_scanners:
         scanner_available = scanner in scanner_classes
-        scanner_failed = any(scanner.lower() in scanner_id.lower() for scanner_id in failed_scanners.keys())
-        
+        scanner_failed = any(scanner.lower() in scanner_id.lower() for scanner_id in failed_scanners)
+
         assert scanner_available or scanner_failed, (
             f"Scanner {scanner} should either be loaded or in failed scanners. "
             f"Loaded: {scanner_classes}, Failed: {list(failed_scanners.keys())}"
@@ -75,7 +75,7 @@ def test_scanner_registry_file_extension_coverage():
         ".pt",
         ".pth",
         ".h5",
-        ".hdf5", 
+        ".hdf5",
         ".keras",
         ".pb",
         ".onnx",
@@ -104,13 +104,13 @@ def test_scanner_registry_instantiation():
 def test_scanner_registry_graceful_fallback():
     """Test that scanner registry handles failed loads gracefully."""
     failed_scanners = _registry.get_failed_scanners()
-    
+
     # If there are failed scanners, they should have error messages
     for scanner_id, error_msg in failed_scanners.items():
         assert isinstance(error_msg, str)
         assert len(error_msg) > 0
         assert scanner_id in error_msg or "numpy" in error_msg.lower() or "tensorflow" in error_msg.lower()
-    
+
     # Registry should still function even with failed scanners
     assert len(SCANNER_REGISTRY) > 0, "Some scanners should still be available"
 
@@ -118,10 +118,10 @@ def test_scanner_registry_graceful_fallback():
 def test_numpy_compatibility_detection():
     """Test that NumPy compatibility status is properly detected."""
     numpy_compatible, numpy_status = _registry.get_numpy_status()
-    
+
     assert isinstance(numpy_compatible, bool)
     assert isinstance(numpy_status, str)
     assert "numpy" in numpy_status.lower()
-    
+
     # Should provide helpful information
     assert len(numpy_status) > 10
