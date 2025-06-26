@@ -209,8 +209,11 @@ class PyTorchBinaryScanner(BaseScanner):
 
         # Process findings with ML context filtering
         for sig, (positions, description) in pattern_counts.items():
-            chunk_size_mb = len(chunk) / (1024 * 1024)
-            pattern_density = len(positions) / max(chunk_size_mb, 0.001)  # patterns per MB
+            # Calculate pattern density more reasonably for small files
+            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            # Use at least 1MB for density calculation to avoid inflated densities in small files
+            effective_size_mb = max(file_size_mb, 1.0)
+            pattern_density = len(positions) / effective_size_mb
 
             # Apply ML context filtering
             filtered_positions = []

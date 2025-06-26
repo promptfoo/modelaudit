@@ -79,17 +79,27 @@ def should_ignore_executable_signature(
     Returns:
         True if the signature should be ignored as a likely false positive
     """
-    # Always flag actual executables at file start
-    if offset < 1024:  # First 1KB should not contain weight data
-        return False
+    # Handle specific signatures with custom logic first
+    if signature == b"MZ":
+        # MZ signatures in the middle of files are often false positives in weight data
+        # Be more permissive for MZ patterns not at file start
+        if offset > 100:  # Not at very beginning (allow for small headers)
+            return (
+                ml_context.get("weight_confidence", 0) > 0.3  # Lower threshold for MZ
+                or pattern_density < 5  # Very sparse patterns likely coincidental
+            )
+        return False  # Always flag MZ at file start
 
     # Shell script shebangs are the most common false positive in weight data
     if signature == b"#!/":
         return _should_ignore_shebang_pattern(ml_context, pattern_density, total_patterns)
 
-    # Other executable signatures are less likely to be coincidental
-    if signature in [b"MZ", b"\x7fELF"]:
-        # These need stronger evidence to ignore
+    # Always flag actual executables at file start (for other signatures)
+    if offset < 1024:  # First 1KB should not contain weight data
+        return False
+
+    if signature == b"\x7fELF":
+        # ELF signatures are longer and less likely to be coincidental
         return (
             ml_context.get("appears_to_be_weights", False)
             and ml_context.get("weight_confidence", 0) > 0.8
