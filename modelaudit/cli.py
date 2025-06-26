@@ -1,9 +1,10 @@
 import json
 import logging
 import os
+import shutil
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
 import click
 from yaspin import yaspin
@@ -11,6 +12,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .utils.huggingface import download_model, is_huggingface_url
 
 # Configure logging
 logging.basicConfig(
@@ -22,13 +24,13 @@ logger = logging.getLogger("modelaudit")
 
 @click.group()
 @click.version_option(__version__)
-def cli():
+def cli() -> None:
     """Static scanner for ML models"""
     pass
 
 
 @cli.command("scan")
-@click.argument("paths", nargs=-1, type=click.Path(exists=True), required=True)
+@click.argument("paths", nargs=-1, type=str, required=True)
 @click.option(
     "--blacklist",
     "-b",
@@ -74,21 +76,23 @@ def cli():
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
 def scan_command(
-    paths,
-    blacklist,
-    format,
-    output,
-    sbom,
-    timeout,
-    verbose,
-    max_file_size,
-    max_total_size,
-):
-    """Scan files or directories for malicious content.
+    paths: tuple[str, ...],
+    blacklist: tuple[str, ...],
+    format: str,
+    output: Optional[str],
+    sbom: Optional[str],
+    timeout: int,
+    verbose: bool,
+    max_file_size: int,
+    max_total_size: int,
+) -> None:
+    """Scan files, directories, or HuggingFace models for malicious content.
 
     \b
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
+        modelaudit scan https://huggingface.co/user/model
+        modelaudit scan hf://user/model
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -125,8 +129,7 @@ def scan_command(
         click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
         if blacklist:
             click.echo(
-                f"Additional blacklist patterns: "
-                f"{click.style(', '.join(blacklist), fg='yellow')}",
+                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
             )
         click.echo("─" * 80)
         click.echo("")
@@ -136,120 +139,182 @@ def scan_command(
         logger.setLevel(logging.DEBUG)
 
     # Aggregated results
-    aggregated_results = {
-        "scanner_names": [],  # Track all scanner names used
-        "start_time": time.time(),
+    aggregated_results: dict[str, Any] = {
         "bytes_scanned": 0,
         "issues": [],
-        "has_errors": False,
         "files_scanned": 0,
-        "assets": [],  # Track all assets encountered
+        "assets": [],
+        "has_errors": False,
+        "scanner_names": [],
+        "start_time": time.time(),
     }
 
     # Scan each path
     for path in paths:
-        # Early exit for common non-model file extensions
-        # Note: Allow .json, .yaml, .yml as they can be model config files
-        if os.path.isfile(path):
-            _, ext = os.path.splitext(path)
-            ext = ext.lower()
-            if ext in (
-                ".md",
-                ".txt",
-                ".py",
-                ".js",
-                ".html",
-                ".css",
-            ):
-                if verbose:
-                    logger.info(f"Skipping non-model file: {path}")
-                click.echo(f"Skipping non-model file: {path}")
-                continue
+        # Track temp directory for cleanup
+        temp_dir = None
+        actual_path = path
 
-        # Show progress indicator if in text mode and not writing to a file
-        spinner = None
-        if format == "text" and not output:
-            spinner_text = f"Scanning {click.style(path, fg='cyan')}"
-            spinner = yaspin(Spinners.dots, text=spinner_text)
-            spinner.start()
-
-        # Perform the scan with the specified options
         try:
-            # Define progress callback if using spinner
-            progress_callback = None
-            if spinner:
+            # Check if this is a HuggingFace URL
+            if is_huggingface_url(path):
+                # Show download progress if in text mode
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
 
-                def update_progress(message, percentage):
-                    spinner.text = f"{message} ({percentage:.1f}%)"
+                try:
+                    # Download to a temporary directory
+                    download_path = download_model(path, cache_dir=None)
+                    actual_path = str(download_path)
+                    # Track the temp directory for cleanup
+                    temp_dir = str(download_path)
 
-                progress_callback = update_progress
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-            # Run the scan with progress reporting
-            results = scan_model_directory_or_file(
-                path,
-                blacklist_patterns=list(blacklist) if blacklist else None,
-                timeout=timeout,
-                max_file_size=max_file_size,
-                max_total_size=max_total_size,
-                progress_callback=progress_callback,
-            )
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-            # Aggregate results
-            aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-            aggregated_results["issues"].extend(results.get("issues", []))
-            aggregated_results["files_scanned"] += results.get(
-                "files_scanned",
-                1,
-            )  # Count each file scanned
-            aggregated_results["assets"].extend(results.get("assets", []))
-            if results.get("has_errors", False):
+                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+            else:
+                # For local paths, check if they exist
+                if not os.path.exists(path):
+                    click.echo(f"Error: Path does not exist: {path}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
+                # Early exit for common non-model file extensions
+                # Note: Allow .json, .yaml, .yml as they can be model config files
+                if os.path.isfile(path):
+                    _, ext = os.path.splitext(path)
+                    ext = ext.lower()
+                    if ext in (
+                        ".md",
+                        ".txt",
+                        ".py",
+                        ".js",
+                        ".html",
+                        ".css",
+                    ):
+                        if verbose:
+                            logger.info(f"Skipping non-model file: {path}")
+                        click.echo(f"Skipping non-model file: {path}")
+                        continue
+
+            # Show progress indicator if in text mode and not writing to a file
+            spinner = None
+            if format == "text" and not output:
+                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+                spinner = yaspin(Spinners.dots, text=spinner_text)
+                spinner.start()
+
+            # Perform the scan with the specified options
+            try:
+                # Define progress callback if using spinner
+                progress_callback = None
+                if spinner:
+
+                    def update_progress(message, percentage, spinner=spinner):
+                        spinner.text = f"{message} ({percentage:.1f}%)"
+
+                    progress_callback = update_progress
+
+                # Run the scan with progress reporting
+                results = scan_model_directory_or_file(
+                    actual_path,
+                    blacklist_patterns=list(blacklist) if blacklist else None,
+                    timeout=timeout,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                    progress_callback=progress_callback,
+                )
+
+                # Aggregate results
+                aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                aggregated_results["issues"].extend(results.get("issues", []))
+                aggregated_results["files_scanned"] += results.get(
+                    "files_scanned",
+                    1,
+                )  # Count each file scanned
+                aggregated_results["assets"].extend(results.get("assets", []))
+                if results.get("has_errors", False):
+                    aggregated_results["has_errors"] = True
+
+                # Track scanner names
+                for scanner in results.get("scanners", []):
+                    if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
+                        aggregated_results["scanner_names"].append(scanner)
+
+                # Show completion status if in text mode and not writing to a file
+                if spinner:
+                    if results.get("issues", []):
+                        # Filter out DEBUG severity issues when not in verbose mode
+                        visible_issues = [
+                            issue
+                            for issue in results.get("issues", [])
+                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                        ]
+                        issue_count = len(visible_issues)
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        if issue_count > 0:
+                            # Determine severity for coloring
+                            has_critical = any(
+                                issue.get("severity") == "critical"
+                                for issue in visible_issues
+                                if isinstance(issue, dict)
+                            )
+                            if has_critical:
+                                spinner.fail(
+                                    click.style(
+                                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                        fg="red",
+                                        bold=True,
+                                    ),
+                                )
+                            else:
+                                spinner.ok(
+                                    click.style(
+                                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                        fg="yellow",
+                                        bold=True,
+                                    ),
+                                )
+                        else:
+                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                    else:
+                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+
+            except Exception as e:
+                # Show error if in text mode and not writing to a file
+                if spinner:
+                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
+                    spinner.fail(click.style("❌ Error", fg="red", bold=True))
+
+                logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
+                click.echo(f"Error scanning {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
 
-            # Track scanner names
-            for scanner in results.get("scanners", []):
-                if (
-                    scanner
-                    and scanner not in aggregated_results["scanner_names"]
-                    and scanner != "unknown"
-                ):
-                    aggregated_results["scanner_names"].append(scanner)
-
-            # Show completion status if in text mode and not writing to a file
-            if spinner:
-                if results.get("issues", []):
-                    # Filter out DEBUG severity issues when not in verbose mode
-                    visible_issues = [
-                        issue
-                        for issue in results.get("issues", [])
-                        if verbose
-                        or not isinstance(issue, dict)
-                        or issue.get("severity") != "debug"
-                    ]
-                    issue_count = len(visible_issues)
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    if issue_count > 0:
-                        spinner.ok(
-                            click.style(
-                                f"✓ Found {issue_count} issues!",
-                                fg="yellow",
-                                bold=True,
-                            ),
-                        )
-                    else:
-                        spinner.ok(click.style("✓", fg="green", bold=True))
-                else:
-                    spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                    spinner.ok(click.style("✓", fg="green", bold=True))
-
         except Exception as e:
-            # Show error if in text mode and not writing to a file
-            if spinner:
-                spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                spinner.fail(click.style("✗", fg="red", bold=True))
-
-            logger.error(f"Error during scan of {path}: {str(e)}", exc_info=verbose)
-            click.echo(f"Error scanning {path}: {str(e)}", err=True)
+            # Catch any other exceptions from the outer try block
+            logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
+            click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
             aggregated_results["has_errors"] = True
+
+        finally:
+            # Clean up temporary directory if we downloaded a model
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    if verbose:
+                        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
@@ -290,46 +355,33 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
-    # Add summary information with styling
-    if "scanner_names" in results and results["scanner_names"]:
+    # Add scan summary header
+    output_lines.append(click.style("\n📊 SCAN SUMMARY", fg="white", bold=True))
+    output_lines.append("" + "─" * 60)
+
+    # Add scan metrics in a grid format
+    metrics = []
+
+    # Scanner info
+    if results.get("scanner_names"):
         scanner_names = results["scanner_names"]
         if len(scanner_names) == 1:
-            output_lines.append(
-                click.style(
-                    f"Active Scanner: {scanner_names[0]}", fg="blue", bold=True
-                ),
-            )
+            metrics.append(("Scanner", scanner_names[0], "blue"))
         else:
-            output_lines.append(
-                click.style(
-                    f"Active Scanners: {', '.join(scanner_names)}",
-                    fg="blue",
-                    bold=True,
-                ),
-            )
+            metrics.append(("Scanners", ", ".join(scanner_names), "blue"))
+
+    # Duration
     if "duration" in results:
         duration = results["duration"]
-        if duration < 0.01:
-            # For very fast scans, show more precision
-            output_lines.append(
-                click.style(
-                    f"Scan completed in {duration:.3f} seconds",
-                    fg="cyan",
-                ),
-            )
-        else:
-            output_lines.append(
-                click.style(
-                    f"Scan completed in {duration:.2f} seconds",
-                    fg="cyan",
-                ),
-            )
+        duration_str = f"{duration:.3f}s" if duration < 0.01 else f"{duration:.2f}s"
+        metrics.append(("Duration", duration_str, "cyan"))
+
+    # Files scanned
     if "files_scanned" in results:
-        output_lines.append(
-            click.style(f"Files scanned: {results['files_scanned']}", fg="cyan"),
-        )
+        metrics.append(("Files", str(results["files_scanned"]), "cyan"))
+
+    # Data size
     if "bytes_scanned" in results:
-        # Format bytes in a more readable way
         bytes_scanned = results["bytes_scanned"]
         if bytes_scanned >= 1024 * 1024 * 1024:
             size_str = f"{bytes_scanned / (1024 * 1024 * 1024):.2f} GB"
@@ -339,186 +391,213 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             size_str = f"{bytes_scanned / 1024:.2f} KB"
         else:
             size_str = f"{bytes_scanned} bytes"
-        output_lines.append(click.style(f"Scanned {size_str}", fg="cyan"))
+        metrics.append(("Size", size_str, "cyan"))
 
-    # Add issue details with color-coded severity
+    # Display metrics in a formatted grid
+    for label, value, color in metrics:
+        label_str = click.style(f"  {label}:", fg="bright_black")
+        value_str = click.style(value, fg=color, bold=True)
+        output_lines.append(f"{label_str} {value_str}")
+
+    # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
     visible_issues = [
-        issue
-        for issue in issues
-        if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+        issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
     ]
 
+    # Count issues by severity
+    severity_counts = {
+        "critical": 0,
+        "warning": 0,
+        "info": 0,
+        "debug": 0,
+    }
+
+    for issue in issues:
+        if isinstance(issue, dict):
+            severity = issue.get("severity", "warning")
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+
+    # Display issue summary
+    output_lines.append("")
+    output_lines.append(click.style("\n🔍 SECURITY FINDINGS", fg="white", bold=True))
+    output_lines.append("" + "─" * 60)
+
     if visible_issues:
-        # Count issues by severity (excluding DEBUG when not in verbose mode)
-        error_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "critical"
-        )
-        warning_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "warning"
-        )
-        info_count = sum(
-            1
-            for issue in visible_issues
-            if isinstance(issue, dict) and issue.get("severity") == "info"
-        )
-        debug_count = sum(
-            1
-            for issue in issues
-            if isinstance(issue, dict) and issue.get("severity") == "debug"
-        )
-
-        # Only show debug count in verbose mode
-        issue_summary = []
-        if error_count:
-            issue_summary.append(
-                click.style(f"{error_count} critical", fg="red", bold=True),
+        # Show issue counts with icons
+        summary_parts = []
+        if severity_counts["critical"] > 0:
+            summary_parts.append(
+                "  "
+                + click.style(
+                    f"🚨 {severity_counts['critical']} Critical",
+                    fg="red",
+                    bold=True,
+                ),
             )
-        if warning_count:
-            issue_summary.append(click.style(f"{warning_count} warnings", fg="yellow"))
-        if info_count:
-            issue_summary.append(click.style(f"{info_count} info", fg="blue"))
-        if verbose and debug_count:
-            issue_summary.append(click.style(f"{debug_count} debug", fg="cyan"))
+        if severity_counts["warning"] > 0:
+            summary_parts.append(
+                "  "
+                + click.style(
+                    f"⚠️  {severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}",
+                    fg="yellow",
+                ),
+            )
+        if severity_counts["info"] > 0:
+            summary_parts.append(
+                "  " + click.style(f"[i] {severity_counts['info']} Info", fg="blue"),
+            )
+        if verbose and severity_counts["debug"] > 0:
+            summary_parts.append(
+                "  " + click.style(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
+            )
 
-        if issue_summary:
+        output_lines.extend(summary_parts)
+
+        # Group issues by severity for better organization
+        output_lines.append("")
+
+        # Display critical issues first
+        critical_issues = [
+            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"
+        ]
+        if critical_issues:
             output_lines.append(
-                click.style("Issues found: ", fg="white") + ", ".join(issue_summary),
+                click.style("  🚨 Critical Issues", fg="red", bold=True),
             )
-
-        from collections import OrderedDict
-
-        def _location_prefix(loc: str) -> str:
-            loc = loc or ""
-            idx_paren = loc.find(" (")
-            idx_colon = loc.find(":")
-            indices = [i for i in (idx_paren, idx_colon) if i != -1]
-            if indices:
-                return loc[: min(indices)].strip()
-            return loc.strip()
-
-        issues_by_file: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
-        for issue in visible_issues:
-            prefix = _location_prefix(str(issue.get("location", "")))
-            issues_by_file.setdefault(prefix, []).append(issue)
-
-        file_items = list(issues_by_file.items())
-        for file_index, (file_path, file_issues) in enumerate(file_items):
-            if file_path:
-                output_lines.append(click.style(file_path, fg="cyan", bold=True))
-            for i, issue in enumerate(file_issues, 1):
-                severity = issue.get("severity", "warning").lower()
-
-                if severity == "debug" and not verbose:
-                    continue
-
-                message = issue.get("message", "Unknown issue")
-                location = str(issue.get("location", ""))
-
-                if severity == "critical":
-                    severity_style = click.style("[CRITICAL]", fg="red", bold=True)
-                elif severity == "warning":
-                    severity_style = click.style("[WARNING]", fg="yellow")
-                elif severity == "info":
-                    severity_style = click.style("[INFO]", fg="blue")
-                elif severity == "debug":
-                    severity_style = click.style("[DEBUG]", fg="bright_black")
-
-                issue_num = click.style(f"{i}.", fg="white", bold=True)
-
-                suffix = (
-                    location[len(file_path) :].lstrip()
-                    if file_path and location.startswith(file_path)
-                    else location
-                )
-                if suffix:
-                    location_str = click.style(suffix, fg="cyan", bold=True)
-                    output_lines.append(
-                        f"{issue_num} {location_str}: {severity_style} {message}"
-                    )
-                else:
-                    output_lines.append(f"{issue_num} {severity_style} {message}")
-
-                why = issue.get("why")
-                if why:
-                    why_label = click.style("   Why:", fg="magenta", bold=True)
-                    why_text = click.style(f" {why}", fg="bright_white")
-                    output_lines.append(f"{why_label}{why_text}")
-
-                if i < len(file_issues):
-                    output_lines.append("")
-
-            if file_index < len(file_items) - 1:
+            output_lines.append("  " + "─" * 40)
+            for issue in critical_issues:
+                _format_issue(issue, output_lines, "critical")
                 output_lines.append("")
+
+        # Display warnings
+        warning_issues = [
+            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"
+        ]
+        if warning_issues:
+            if critical_issues:
+                output_lines.append("")
+            output_lines.append(click.style("  ⚠️  Warnings", fg="yellow", bold=True))
+            output_lines.append("  " + "─" * 40)
+            for issue in warning_issues:
+                _format_issue(issue, output_lines, "warning")
+                output_lines.append("")
+
+        # Display info issues
+        info_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "info"]
+        if info_issues:
+            if critical_issues or warning_issues:
+                output_lines.append("")
+            output_lines.append(click.style("  [i] Information", fg="blue", bold=True))
+            output_lines.append("  " + "─" * 40)
+            for issue in info_issues:
+                _format_issue(issue, output_lines, "info")
+                output_lines.append("")
+
+        # Display debug issues if verbose
+        if verbose:
+            debug_issues = [
+                issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"
+            ]
+            if debug_issues:
+                if critical_issues or warning_issues or info_issues:
+                    output_lines.append("")
+                output_lines.append(click.style("  🐛 Debug", fg="cyan", bold=True))
+                output_lines.append("  " + "─" * 40)
+                for issue in debug_issues:
+                    _format_issue(issue, output_lines, "debug")
+                    output_lines.append("")
     else:
         output_lines.append(
-            "\n" + click.style("✓ No issues found", fg="green", bold=True),
+            "  " + click.style("✅ No security issues detected", fg="green", bold=True),
         )
+        output_lines.append("")
 
-    # Asset list
-    assets = results.get("assets", [])
-    if assets:
-        output_lines.append("\nAssets encountered:")
+    # Add a footer with final status
+    output_lines.append("")
+    output_lines.append("═" * 80)
 
-        def render_assets(items, indent=1):
-            lines = []
-            for asset in items:
-                prefix = "  " * indent + "- "
-                line = f"{prefix}{asset.get('path')}"
-                if asset.get("type"):
-                    line += f" ({asset['type']})"
-                if asset.get("size"):
-                    line += f" [{asset['size']} bytes]"
-                lines.append(line)
-                if asset.get("tensors"):
-                    tline = (
-                        "  " * (indent + 1) + "Tensors: " + ", ".join(asset["tensors"])
-                    )
-                    lines.append(tline)
-                if asset.get("keys"):
-                    kline = (
-                        "  " * (indent + 1)
-                        + "Keys: "
-                        + ", ".join(map(str, asset["keys"]))
-                    )
-                    lines.append(kline)
-                if asset.get("contents"):
-                    lines.extend(render_assets(asset["contents"], indent + 1))
-            return lines
-
-        output_lines.extend(render_assets(assets))
-
-    # Add a footer
-    output_lines.append("─" * 80)
+    # Determine overall status
     if visible_issues:
-        if any(
-            isinstance(issue, dict) and issue.get("severity") == "critical"
-            for issue in visible_issues
-        ):
-            status = click.style("✗ Scan completed with findings", fg="red", bold=True)
-        elif any(
-            isinstance(issue, dict) and issue.get("severity") == "warning"
-            for issue in visible_issues
-        ):
-            status = click.style(
-                "⚠ Scan completed with warnings",
-                fg="yellow",
-                bold=True,
-            )
+        if any(isinstance(issue, dict) and issue.get("severity") == "critical" for issue in visible_issues):
+            status_icon = "❌"
+            status_msg = "CRITICAL SECURITY ISSUES FOUND"
+            status_color = "red"
+        elif any(isinstance(issue, dict) and issue.get("severity") == "warning" for issue in visible_issues):
+            status_icon = "⚠️"
+            status_msg = "WARNINGS DETECTED"
+            status_color = "yellow"
         else:
             # Only info/debug issues
-            status = click.style("✓ Scan completed successfully", fg="green", bold=True)
+            status_icon = "[i]"
+            status_msg = "INFORMATIONAL FINDINGS"
+            status_color = "blue"
     else:
-        status = click.style("✓ Scan completed successfully", fg="green", bold=True)
-    output_lines.append(status)
+        status_icon = "✅"
+        status_msg = "NO ISSUES FOUND"
+        status_color = "green"
+
+    # Display final status
+    status_line = click.style(f"{status_icon} {status_msg}", fg=status_color, bold=True)
+    output_lines.append(f"  {status_line}")
+    output_lines.append("═" * 80)
 
     return "\n".join(output_lines)
 
 
-def main():
+def _format_issue(
+    issue: dict[str, Any],
+    output_lines: list[str],
+    severity: str,
+) -> None:
+    """Format a single issue with proper indentation and styling"""
+    message = issue.get("message", "Unknown issue")
+    location = issue.get("location", "")
+
+    # Icon based on severity
+    icons = {
+        "critical": "    └─ 🚨",
+        "warning": "    └─ ⚠️ ",
+        "info": "    └─ [i] ",
+        "debug": "    └─ 🐛",
+    }
+
+    # Build the issue line
+    icon = icons.get(severity, "    └─ ")
+
+    if location:
+        location_str = click.style(f"[{location}]", fg="cyan", bold=True)
+        output_lines.append(f"{icon} {location_str}")
+        output_lines.append(f"       {click.style(message, fg='bright_white')}")
+    else:
+        output_lines.append(f"{icon} {click.style(message, fg='bright_white')}")
+
+    # Add "Why" explanation if available
+    why = issue.get("why")
+    if why:
+        why_label = click.style("Why:", fg="magenta", bold=True)
+        # Wrap long explanations
+        import textwrap
+
+        wrapped_why = textwrap.fill(
+            why,
+            width=65,
+            initial_indent="",
+            subsequent_indent="           ",
+        )
+        output_lines.append(f"       {why_label} {wrapped_why}")
+
+    # Add details if available
+    details = issue.get("details", {})
+    if details:
+        for key, value in details.items():
+            if value:  # Only show non-empty values
+                detail_label = click.style(f"{key}:", fg="bright_black")
+                detail_value = click.style(str(value), fg="bright_white")
+                output_lines.append(f"       {detail_label} {detail_value}")
+
+
+def main() -> None:
     cli()

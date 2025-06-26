@@ -76,13 +76,8 @@ class TestOciLayerScanner:
         assert result.success is True
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         # Check that location includes manifest:layer:file format
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
-        assert any(
-            "image.manifest:layer.tar.gz:malicious.pkl" in issue.location
-            for issue in critical_issues
-        )
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("image.manifest:layer.tar.gz:malicious.pkl" in issue.location for issue in critical_issues)
 
     def test_scan_yaml_manifest(self, tmp_path):
         """Test scanning a YAML manifest file."""
@@ -149,10 +144,7 @@ class TestOciLayerScanner:
 
         assert result.success is True
         assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
-        assert any(
-            "Layer not found: nonexistent.tar.gz" in issue.message
-            for issue in result.issues
-        )
+        assert any("Layer not found: nonexistent.tar.gz" in issue.message for issue in result.issues)
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""
@@ -240,7 +232,7 @@ class TestOciLayerScanner:
                     "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
                     "digest": "sha256:abc123",
                     "urls": ["layer.tar.gz"],
-                }
+                },
             ],
         }
         manifest_path = tmp_path / "nested.manifest"
@@ -341,9 +333,7 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         # Check location format: manifest:layer:file
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) > 0
 
         issue = critical_issues[0]
@@ -368,9 +358,7 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         assert result.success is True
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         # Should have issues from both model files
         assert len(critical_issues) >= 2
 
