@@ -100,9 +100,7 @@ def test_onnx_scanner_corrupted(tmp_path):
     # truncate file to corrupt it
     model_path.write_bytes(data[:10])
     result = OnnxScanner().scan(str(model_path))
-    assert not result.success or any(
-        i.severity == IssueSeverity.CRITICAL for i in result.issues
-    )
+    assert not result.success or any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
 def test_onnx_scanner_python_op(tmp_path):
