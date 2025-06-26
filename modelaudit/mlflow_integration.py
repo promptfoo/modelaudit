@@ -14,6 +14,9 @@ def scan_mlflow_model(
     *,
     registry_uri: Optional[str] = None,
     timeout: int = 300,
+    blacklist_patterns: Optional[list[str]] = None,
+    max_file_size: int = 0,
+    max_total_size: int = 0,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Download and scan a model from the MLflow model registry.
@@ -28,6 +31,12 @@ def scan_mlflow_model(
         called before downloading the model.
     timeout:
         Maximum time in seconds to spend scanning.
+    blacklist_patterns:
+        Optional list of blacklist patterns to check against model names.
+    max_file_size:
+        Maximum file size to scan in bytes (0 = unlimited).
+    max_total_size:
+        Maximum total bytes to scan before stopping (0 = unlimited).
     **kwargs:
         Additional arguments passed to :func:`scan_model_directory_or_file`.
 
@@ -53,14 +62,16 @@ def scan_mlflow_model(
     tmp_dir = tempfile.mkdtemp(prefix="modelaudit_mlflow_")
     try:
         logger.debug("Downloading MLflow model %s to %s", model_uri, tmp_dir)
-        local_path = mlflow.artifacts.download_artifacts(
-            artifact_uri=model_uri, dst_path=tmp_dir
-        )
+        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)
         # mlflow may return a file within tmp_dir; ensure directory path
-        if os.path.isfile(local_path):
-            download_path = os.path.dirname(local_path)
-        else:
-            download_path = local_path
-        return scan_model_directory_or_file(download_path, timeout=timeout, **kwargs)
+        download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        return scan_model_directory_or_file(
+            download_path,
+            timeout=timeout,
+            blacklist_patterns=blacklist_patterns,
+            max_file_size=max_file_size,
+            max_total_size=max_total_size,
+            **kwargs,
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
