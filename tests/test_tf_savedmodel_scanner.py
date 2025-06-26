@@ -5,11 +5,9 @@ import pytest
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
-# Try to import tensorflow and its core module
+# Try to import tensorflow to check availability
 try:
     import tensorflow  # noqa: F401
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F401
-
     HAS_TENSORFLOW = True
 except ImportError:
     HAS_TENSORFLOW = False
