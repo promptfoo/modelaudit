@@ -311,6 +311,10 @@ class WeightDistributionScanner(BaseScanner):
         """Analyze weight distributions for anomalies"""
         anomalies = []
 
+        # SECURITY FIX: Perform architecture analysis once with complete model information
+        # This provides accurate architectural classification instead of per-layer analysis
+        architecture_analysis = self._analyze_architecture_properties(weights_info)
+
         # Focus on final layer weights (classification heads)
         final_layer_candidates = {}
         for name, weights in weights_info.items():
@@ -336,9 +340,9 @@ class WeightDistributionScanner(BaseScanner):
                 name: weights for name, weights in weights_info.items() if len(weights.shape) == 2
             }
 
-        # Analyze each candidate layer
+        # Analyze each candidate layer with complete architectural context
         for layer_name, weights in final_layer_candidates.items():
-            layer_anomalies = self._analyze_layer_weights(layer_name, weights)
+            layer_anomalies = self._analyze_layer_weights(layer_name, weights, architecture_analysis)
             anomalies.extend(layer_anomalies)
 
         return anomalies
@@ -462,8 +466,9 @@ class WeightDistributionScanner(BaseScanner):
         self,
         layer_name: str,
         weights: np.ndarray,
+        architecture_analysis: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Analyze a single layer's weights for anomalies using structural analysis instead of name-based detection"""
+        """Analyze a single layer's weights for anomalies using pre-computed architectural analysis"""
         anomalies: list[dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers
@@ -472,9 +477,8 @@ class WeightDistributionScanner(BaseScanner):
 
         n_inputs, n_outputs = weights.shape
 
-        # Use structural analysis to determine if this is likely an LLM layer
-        # rather than relying on naming patterns that can be spoofed
-        architecture_analysis = self._analyze_architecture_properties({layer_name: weights})
+        # SECURITY FIX: Use pre-computed architecture analysis from complete model
+        # instead of incorrectly analyzing only a single layer
 
         # Determine appropriate thresholds based on structural properties, not names
         if architecture_analysis["is_likely_llm"] and not self.enable_llm_checks:
