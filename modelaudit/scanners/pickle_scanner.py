@@ -955,6 +955,7 @@ class PickleScanner(BaseScanner):
                     "BINSTRING",
                     "SHORT_BINSTRING",
                     "UNICODE",
+                    "SHORT_BINUNICODE",
                 ] and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
@@ -1007,6 +1008,7 @@ class PickleScanner(BaseScanner):
                     "BINSTRING",
                     "SHORT_BINSTRING",
                     "UNICODE",
+                    "SHORT_BINUNICODE",
                 ] and isinstance(arg, str):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
