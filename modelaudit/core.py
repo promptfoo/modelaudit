@@ -13,7 +13,7 @@ from modelaudit.license_checker import (
 )
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
-from modelaudit.utils import is_within_directory
+from modelaudit.utils import is_within_directory, resolve_dvc_file
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
@@ -231,90 +231,88 @@ def scan_model_directory_or_file(
             if limit_reached:
                 pass
         else:
-            # Scan a single file
-            if progress_callback:
-                progress_callback(f"Scanning file: {path}", 0.0)
+            # Scan a single file or DVC pointer
+            target_files = [path]
+            if path.endswith(".dvc"):
+                dvc_targets = resolve_dvc_file(path)
+                if dvc_targets:
+                    target_files = dvc_targets
 
-            # Get file size for progress reporting
-            file_size = os.path.getsize(path)
-            results["files_scanned"] = 1  # Single file scan
+            for idx, target in enumerate(target_files):
+                if progress_callback:
+                    progress_callback(f"Scanning file: {target}", 0.0)
 
-            # Create a wrapper for the file to report progress
-            if progress_callback is not None and file_size > 0:
-                original_builtins_open = builtins.open
-
-                def progress_open(
-                    file_path: str,
-                    mode: str = "r",
-                    *args: Any,
-                    **kwargs: Any,
-                ) -> IO[Any]:
-                    file = original_builtins_open(file_path, mode, *args, **kwargs)
-                    file_pos = 0
-
-                    # Override read method to report progress
-                    original_read = file.read
-
-                    def progress_read(size: int = -1) -> Any:
-                        nonlocal file_pos
-                        data = original_read(size)
-                        if isinstance(data, (str, bytes)):
-                            file_pos += len(data)
-                        if progress_callback is not None:
-                            progress_callback(
-                                f"Reading file: {os.path.basename(file_path)}",
-                                min(file_pos / file_size * 100, 100),
-                            )
-                        return data
-
-                    file.read = progress_read  # type: ignore[method-assign]
-                    return file
-
-                with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
-                    file_result = scan_file(path, config)
-            else:
-                file_result = scan_file(path, config)
-
-            results["bytes_scanned"] = (
-                cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-            )
-
-            # Track scanner name
-            scanner_name = file_result.scanner_name
-            scanners_list = cast(list[str], results["scanners"])
-            if scanner_name and scanner_name not in scanners_list:
-                scanners_list.append(scanner_name)
-
-            # Add issues from file scan
-            issues_list = cast(list[dict[str, Any]], results["issues"])
-            for issue in file_result.issues:
-                issues_list.append(issue.to_dict())
-
-            # Add to assets list for inventory
-            _add_asset_to_results(results, path, file_result)
-
-            # Save metadata for SBOM generation
-            file_meta = cast(dict[str, Any], results["file_metadata"])
-            # Merge scanner metadata with license metadata
-            license_metadata = collect_license_metadata(path)
-            combined_metadata = {**file_result.metadata, **license_metadata}
-            file_meta[path] = combined_metadata
-
-            if (
-                max_total_size > 0
-                and cast(int, results["bytes_scanned"]) > max_total_size
-            ):
-                issues_list.append(
-                    {
-                        "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
-                        "severity": IssueSeverity.WARNING.value,
-                        "location": path,
-                        "details": {"max_total_size": max_total_size},
-                    }
+                file_size = os.path.getsize(target)
+                results["files_scanned"] = (
+                    cast(int, results.get("files_scanned", 0)) + 1
                 )
 
-            if progress_callback:
-                progress_callback(f"Completed scanning: {path}", 100.0)
+                if progress_callback is not None and file_size > 0:
+                    original_builtins_open = builtins.open
+
+                    def progress_open(
+                        file_path: str, mode: str = "r", *args: Any, **kwargs: Any
+                    ) -> IO[Any]:
+                        file = original_builtins_open(file_path, mode, *args, **kwargs)
+                        file_pos = 0
+
+                        original_read = file.read
+
+                        def progress_read(size: int = -1) -> Any:
+                            nonlocal file_pos
+                            data = original_read(size)
+                            if isinstance(data, (str, bytes)):
+                                file_pos += len(data)
+                            if progress_callback is not None:
+                                progress_callback(
+                                    f"Reading file: {os.path.basename(file_path)}",
+                                    min(file_pos / file_size * 100, 100),
+                                )
+                            return data
+
+                        file.read = progress_read  # type: ignore[method-assign]
+                        return file
+
+                    with _OPEN_PATCH_LOCK, patch("builtins.open", progress_open):
+                        file_result = scan_file(target, config)
+                else:
+                    file_result = scan_file(target, config)
+
+                results["bytes_scanned"] = (
+                    cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                )
+
+                scanner_name = file_result.scanner_name
+                scanners_list = cast(list[str], results["scanners"])
+                if scanner_name and scanner_name not in scanners_list:
+                    scanners_list.append(scanner_name)
+
+                issues_list = cast(list[dict[str, Any]], results["issues"])
+                for issue in file_result.issues:
+                    issues_list.append(issue.to_dict())
+
+                _add_asset_to_results(results, target, file_result)
+
+                file_meta = cast(dict[str, Any], results["file_metadata"])
+                license_metadata = collect_license_metadata(target)
+                combined_metadata = {**file_result.metadata, **license_metadata}
+                file_meta[target] = combined_metadata
+
+                if (
+                    max_total_size > 0
+                    and cast(int, results["bytes_scanned"]) > max_total_size
+                ):
+                    issues_list.append(
+                        {
+                            "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes (max: {max_total_size})",
+                            "severity": IssueSeverity.WARNING.value,
+                            "location": target,
+                            "details": {"max_total_size": max_total_size},
+                        }
+                    )
+
+                if progress_callback:
+                    progress_callback(f"Completed scanning: {target}", 100.0)
 
     except Exception as e:
         logger.exception(f"Error during scan: {str(e)}")
