@@ -139,9 +139,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     )
 
     # Issues about PyFunc operations should include a 'why' explanation
-    pyfunc_issues = [
-        issue for issue in result.issues if "pyfunc" in issue.message.lower()
-    ]
+    pyfunc_issues = [issue for issue in result.issues if "pyfunc" in issue.message.lower()]
     assert any(issue.why is not None for issue in pyfunc_issues)
 
 
