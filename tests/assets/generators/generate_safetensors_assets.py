@@ -7,7 +7,7 @@ to test the enhanced detection capabilities of the SafeTensorsScanner.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -28,7 +28,7 @@ def generate_safetensors_assets() -> None:
     }
 
     # Test cases with suspicious metadata
-    test_cases: List[Dict[str, Any]] = [
+    test_cases: list[dict[str, Any]] = [
         {
             "filename": "malicious_import.safetensors",
             "metadata": {
@@ -86,7 +86,7 @@ def generate_safetensors_assets() -> None:
     ]
 
     # Generate safe model for comparison
-    safe_metadata: Dict[str, str] = {
+    safe_metadata: dict[str, str] = {
         "model_name": "transformer-small",
         "author": "Safe ML Team",
         "version": "1.2.3",
