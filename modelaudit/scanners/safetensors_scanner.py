@@ -213,6 +213,8 @@ class SafeTensorsScanner(BaseScanner):
 
                         if isinstance(value, str):
                             lower_val = value.lower()
+
+                            # Check for simple code-like patterns
                             if any(s in lower_val for s in ["import ", "#!/", "\\"]):
                                 result.add_issue(
                                     f"Suspicious metadata value for {key}",
@@ -224,16 +226,17 @@ class SafeTensorsScanner(BaseScanner):
                                         "injection attempts."
                                     ),
                                 )
-                            else:
-                                for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                                    if re.search(pattern, value):
-                                        result.add_issue(
-                                            f"Suspicious metadata value for {key}",
-                                            severity=IssueSeverity.INFO,
-                                            location=path,
-                                            why="Metadata matched known suspicious pattern",
-                                        )
-                                        break
+
+                            # Check for regex-based suspicious patterns (independent of above check)
+                            for pattern in SUSPICIOUS_METADATA_PATTERNS:
+                                if re.search(pattern, value):
+                                    result.add_issue(
+                                        f"Suspicious metadata value for {key}",
+                                        severity=IssueSeverity.INFO,
+                                        location=path,
+                                        why="Metadata matched known suspicious pattern",
+                                    )
+                                    break
 
                 # Bytes scanned = file size
                 result.bytes_scanned = file_size
