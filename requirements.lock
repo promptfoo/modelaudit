@@ -57,6 +57,8 @@ huggingface-hub==0.33.1
     # via modelaudit
 idna==3.10
     # via requests
+importlib-metadata==8.7.0
+    # via markdown
 jinja2==3.1.6
     # via torch
 joblib==1.5.1
@@ -170,6 +172,7 @@ typing-extensions==4.14.0
     # via huggingface-hub
     # via onnx
     # via optree
+    # via rich
     # via tensorflow
     # via torch
 urllib3==2.5.0
@@ -182,3 +185,5 @@ wrapt==1.17.2
     # via tensorflow
 yaspin==3.1.0
     # via modelaudit
+zipp==3.23.0
+    # via importlib-metadata
