@@ -1,6 +1,6 @@
 import os
 import struct
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
@@ -15,7 +15,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
     name = "pytorch_binary"
     description = "Scans PyTorch binary tensor files for suspicious patterns"
-    supported_extensions = [".bin"]
+    supported_extensions: ClassVar[list[str]] = [".bin"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -92,18 +92,24 @@ class PyTorchBinaryScanner(BaseScanner):
 
                     # Check for embedded Python code patterns
                     self._check_for_code_patterns(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
                     # Check for blacklisted patterns
                     if self.blacklist_patterns:
                         self._check_for_blacklist_patterns(
-                            chunk, result, bytes_scanned - len(chunk)
+                            chunk,
+                            result,
+                            bytes_scanned - len(chunk),
                         )
 
                     # Check for executable file signatures
                     self._check_for_executable_signatures(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
             result.bytes_scanned = bytes_scanned
@@ -113,7 +119,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning binary file: {str(e)}",
+                f"Error scanning binary file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -125,7 +131,10 @@ class PyTorchBinaryScanner(BaseScanner):
         return result
 
     def _check_for_code_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
@@ -144,7 +153,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 )
 
     def _check_for_blacklist_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for blacklisted patterns in the binary data"""
         for pattern in self.blacklist_patterns:
@@ -162,7 +174,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 )
 
     def _check_for_executable_signatures(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for executable file signatures"""
         # Common executable signatures
@@ -221,7 +236,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error validating tensor structure: {str(e)}",
+                f"Error validating tensor structure: {e!s}",
                 severity=IssueSeverity.DEBUG,
                 location=self.current_file_path,
                 details={"exception": str(e)},

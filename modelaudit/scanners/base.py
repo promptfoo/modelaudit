@@ -102,11 +102,7 @@ class ScanResult:
         self.bytes_scanned += other.bytes_scanned
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
-            if (
-                key in self.metadata
-                and isinstance(self.metadata[key], dict)
-                and isinstance(value, dict)
-            ):
+            if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
                 self.metadata[key].update(value)
             else:
                 self.metadata[key] = value
@@ -152,15 +148,9 @@ class ScanResult:
 
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
-        error_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL
-        )
-        warning_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.WARNING
-        )
-        info_count = sum(
-            1 for issue in self.issues if issue.severity == IssueSeverity.INFO
-        )
+        error_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
+        warning_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
+        info_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.INFO)
 
         result = []
         result.append(f"Scan completed in {self.duration:.2f}s")
@@ -168,8 +158,7 @@ class ScanResult:
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )
         result.append(
-            f"Found {len(self.issues)} issues ({error_count} critical, "
-            f"{warning_count} warnings, {info_count} info)",
+            f"Found {len(self.issues)} issues ({error_count} critical, {warning_count} warnings, {info_count} info)",
         )
 
         # If there are any issues, show them
@@ -273,7 +262,11 @@ class BaseScanner(ABC):
                     header_format = detect_file_format_from_magic(path)
                     ext_format = detect_format_from_extension(path)
                     result.add_issue(
-                        f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing, corruption, or a security threat.",
+                        (
+                            f"File type validation failed: extension indicates {ext_format} but magic bytes "
+                            f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
+                            f"security threat."
+                        ),
                         severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
                         location=path,
                         details={
@@ -285,7 +278,7 @@ class BaseScanner(ABC):
             except Exception as e:
                 # Don't fail the scan if file type validation has an error
                 result.add_issue(
-                    f"File type validation error: {str(e)}",
+                    f"File type validation error: {e!s}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
@@ -295,9 +288,7 @@ class BaseScanner(ABC):
         self._path_validation_result = result if result.issues else None
 
         # Only return result for CRITICAL issues that should stop the scan
-        critical_issues = [
-            issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
         if critical_issues:
             return result
 
@@ -318,11 +309,7 @@ class BaseScanner(ABC):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        if (
-            self.max_file_read_size
-            and self.max_file_read_size > 0
-            and file_size > self.max_file_read_size
-        ):
+        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
             result.add_issue(
                 f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.WARNING,
@@ -331,7 +318,8 @@ class BaseScanner(ABC):
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
-                why="Large files may consume excessive memory or processing time. Consider whether this file size is expected for your use case.",
+                why="Large files may consume excessive memory or processing time. Consider whether this file "
+                "size is expected for your use case.",
             )
             result.finish(success=False)
             return result
@@ -343,13 +331,9 @@ class BaseScanner(ABC):
         data = b""
         file_size = self.get_file_size(path)
 
-        if (
-            self.max_file_read_size
-            and self.max_file_read_size > 0
-            and file_size > self.max_file_read_size
-        ):
+        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
             raise ValueError(
-                f"File too large: {file_size} bytes (max: {self.max_file_read_size})"
+                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
             )
 
         with open(path, "rb") as f:
@@ -358,12 +342,8 @@ class BaseScanner(ABC):
                 if not chunk:
                     break
                 data += chunk
-                if (
-                    self.max_file_read_size
-                    and self.max_file_read_size > 0
-                    and len(data) > self.max_file_read_size
-                ):
+                if self.max_file_read_size and self.max_file_read_size > 0 and len(data) > self.max_file_read_size:
                     raise ValueError(
-                        f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})"
+                        f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})",
                     )
         return data
