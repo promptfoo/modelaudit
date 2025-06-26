@@ -1,15 +1,15 @@
 import struct
 from pathlib import Path
 
+import onnx
 import pytest
+from onnx import TensorProto, helper
+from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 pytest.importorskip("onnx")
-import onnx
-from onnx import TensorProto, helper
-from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 
 def create_onnx_model(
@@ -24,7 +24,11 @@ def create_onnx_model(
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
     node = (
         helper.make_node(
-            "CustomOp", ["input"], ["output"], domain="com.test", name="custom"
+            "CustomOp",
+            ["input"],
+            ["output"],
+            domain="com.test",
+            name="custom",
         )
         if custom
         else helper.make_node("Relu", ["input"], ["output"], name="relu")
@@ -75,10 +79,7 @@ def test_onnx_scanner_basic_model(tmp_path):
     result = scanner.scan(str(model_path))
     assert result.success
     assert result.bytes_scanned > 0
-    assert not any(
-        i.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING)
-        for i in result.issues
-    )
+    assert not any(i.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING) for i in result.issues)
 
 
 def test_onnx_scanner_custom_op(tmp_path):

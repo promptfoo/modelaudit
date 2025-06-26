@@ -39,12 +39,11 @@ class TestFileTypeValidationDemo:
                 is_valid = validate_file_type(str(file_path))
                 result = scan_file(str(file_path))
 
-                validation_issues = [
-                    i for i in result.issues
-                    if "file type validation failed" in i.message.lower()
-                ]
+                validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
-                print(f"✅ {file_path.name}: Valid={is_valid}, Issues={len(validation_issues)}")
+                print(
+                    f"✅ {file_path.name}: Valid={is_valid}, Issues={len(validation_issues)}",
+                )
                 assert is_valid, f"Legitimate file {file_path.name} should be valid"
                 assert len(validation_issues) == 0, f"No validation issues expected for {file_path.name}"
 
@@ -70,10 +69,7 @@ class TestFileTypeValidationDemo:
             is_valid = validate_file_type(str(attack_file))
             result = scan_file(str(attack_file))
 
-            validation_issues = [
-                i for i in result.issues
-                if "file type validation failed" in i.message.lower()
-            ]
+            validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
             print(f"⚠️  {filename}: Valid={is_valid}, Issues={len(validation_issues)}")
 
@@ -96,6 +92,7 @@ class TestFileTypeValidationDemo:
         # 2. PyTorch binary that contains pickle data
         pytorch_pickle = tmp_path / "weights.bin"
         import pickle
+
         data = {"layer_weights": [1.0, 2.0, 3.0]}
         with open(pytorch_pickle, "wb") as f:
             pickle.dump(data, f)
@@ -109,12 +106,11 @@ class TestFileTypeValidationDemo:
             is_valid = validate_file_type(str(file_path))
             result = scan_file(str(file_path))
 
-            validation_issues = [
-                i for i in result.issues
-                if "file type validation failed" in i.message.lower()
-            ]
+            validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
 
-            print(f"✅ {description}: Valid={is_valid}, Issues={len(validation_issues)}")
+            print(
+                f"✅ {description}: Valid={is_valid}, Issues={len(validation_issues)}",
+            )
             assert is_valid, f"Legitimate cross-format file should be valid: {description}"
             assert len(validation_issues) == 0, f"No validation issues expected for: {description}"
 
@@ -128,7 +124,8 @@ class TestFileTypeValidationDemo:
             results = scan_model_directory_or_file(str(mit_dir))
 
             validation_warnings = [
-                issue for issue in results["issues"]
+                issue
+                for issue in results["issues"]
                 if "file type validation failed" in issue.get("message", "").lower()
             ]
 
@@ -161,14 +158,15 @@ class TestFileTypeValidationDemo:
         results = scan_model_directory_or_file(str(mixed_dir))
 
         validation_warnings = [
-            issue for issue in results["issues"]
-            if "file type validation failed" in issue.get("message", "").lower()
+            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
         ]
 
         security_issues = [
-            issue for issue in results["issues"]
-            if any(keyword in issue.get("message", "").lower() 
-                   for keyword in ["spoofing", "security", "validation failed"])
+            issue
+            for issue in results["issues"]
+            if any(
+                keyword in issue.get("message", "").lower() for keyword in ["spoofing", "security", "validation failed"]
+            )
         ]
 
         print("📁 Mixed Directory (legitimate + malicious):")
@@ -185,14 +183,17 @@ class TestFileTypeValidationDemo:
         exit_code = self._get_exit_code(results)
         assert exit_code == 1, f"Expected exit code 1 (warnings), got {exit_code}"
 
-        print("   ✅ SECURITY THREATS DETECTED - File type validation working correctly!")
+        print(
+            "   ✅ SECURITY THREATS DETECTED - File type validation working correctly!",
+        )
 
     def _get_exit_code(self, results):
         """Helper to determine exit code from scan results."""
         from modelaudit.core import determine_exit_code
+
         return determine_exit_code(results)
 
 
 if __name__ == "__main__":
     # Allow running for demonstration
-    pytest.main([__file__, "-v", "-s"]) 
+    pytest.main([__file__, "-v", "-s"])

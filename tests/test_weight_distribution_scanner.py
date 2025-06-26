@@ -88,12 +88,8 @@ class TestWeightDistributionScanner:
         assert len(anomalies) > 0
 
         # Check for any type of anomaly (could be outlier or extreme value)
-        has_outlier = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_extreme = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_outlier = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme
 
         # If outlier detection worked, check the details
@@ -112,7 +108,7 @@ class TestWeightDistributionScanner:
         np.random.seed(42)
         base_vector = np.random.randn(100)
         weights = np.column_stack(
-            [base_vector + np.random.randn(100) * 0.1 for _ in range(9)]
+            [base_vector + np.random.randn(100) * 0.1 for _ in range(9)],
         )
 
         # Add one completely different vector (potential backdoor)
@@ -123,7 +119,8 @@ class TestWeightDistributionScanner:
 
         # Should detect the dissimilar vector
         dissimilar_anomaly = next(
-            (a for a in anomalies if "dissimilar weights" in a["description"]), None
+            (a for a in anomalies if "dissimilar weights" in a["description"]),
+            None,
         )
         assert dissimilar_anomaly is not None
         assert dissimilar_anomaly["details"]["neuron_index"] == 9
@@ -143,11 +140,7 @@ class TestWeightDistributionScanner:
 
         # Should detect extreme weights
         extreme_anomaly = next(
-            (
-                a
-                for a in anomalies
-                if "extremely large weight values" in a["description"]
-            ),
+            (a for a in anomalies if "extremely large weight values" in a["description"]),
             None,
         )
         assert extreme_anomaly is not None
@@ -168,9 +161,7 @@ class TestWeightDistributionScanner:
                 # Make one output neuron in fc2 anomalous
                 with torch.no_grad():
                     self.fc2.weight.data = torch.randn(10, 50) * 0.1
-                    self.fc2.weight.data[5] = (
-                        torch.randn(50) * 10.0
-                    )  # Backdoor class - more extreme
+                    self.fc2.weight.data[5] = torch.randn(50) * 10.0  # Backdoor class - more extreme
 
         model = SimpleModel()
 
@@ -191,14 +182,8 @@ class TestWeightDistributionScanner:
                 assert result.metadata.get("layers_analyzed", 0) >= 0
             else:
                 # Check that anomaly was detected - could be either type
-                has_magnitude = any(
-                    "abnormal weight magnitudes" in issue.message
-                    for issue in result.issues
-                )
-                has_extreme = any(
-                    "extremely large weight values" in issue.message
-                    for issue in result.issues
-                )
+                has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
+                has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
                 assert has_magnitude or has_extreme
 
         finally:
@@ -267,15 +252,9 @@ class TestWeightDistributionScanner:
         assert len(anomalies) >= 1
 
         # Check for any type of anomaly
-        has_magnitude_anomaly = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_dissimilar_anomaly = any(
-            "dissimilar weights" in a["description"] for a in anomalies
-        )
-        has_extreme_anomaly = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_magnitude_anomaly = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_dissimilar_anomaly = any("dissimilar weights" in a["description"] for a in anomalies)
+        has_extreme_anomaly = any("extremely large weight values" in a["description"] for a in anomalies)
 
         assert has_magnitude_anomaly or has_dissimilar_anomaly or has_extreme_anomaly
 
@@ -401,9 +380,7 @@ class TestWeightDistributionScanner:
             anomalies = scanner._analyze_layer_weights("some_layer.weight", weights)
 
             # Should return no anomalies due to LLM detection
-            assert len(anomalies) == 0, (
-                f"Layer with {hidden_dim} hidden dims should be detected as LLM"
-            )
+            assert len(anomalies) == 0, f"Layer with {hidden_dim} hidden dims should be detected as LLM"
 
     def test_non_llm_layers_still_analyzed(self):
         """Test that non-LLM layers are still properly analyzed for anomalies"""
@@ -419,17 +396,11 @@ class TestWeightDistributionScanner:
         anomalies = scanner._analyze_layer_weights("classifier.weight", weights)
 
         # Should detect the anomaly since this is not an LLM layer
-        assert len(anomalies) > 0, (
-            "Non-LLM layers should still be analyzed for anomalies"
-        )
+        assert len(anomalies) > 0, "Non-LLM layers should still be analyzed for anomalies"
 
         # Should find outlier neurons
-        has_outlier = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_extreme = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_outlier = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme
 
     def test_llm_enabled_with_extreme_outliers(self):
