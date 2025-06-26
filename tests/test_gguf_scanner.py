@@ -66,6 +66,14 @@ def _write_ggml_file(path):
         f.write(b"\0" * 24)  # padding to minimum size
 
 
+def _write_ggml_variant_file(path, magic):
+    """Create a GGML variant file with custom magic."""
+    with open(path, "wb") as f:
+        f.write(magic)
+        f.write(struct.pack("<I", 1))
+        f.write(b"\0" * 24)
+
+
 def test_gguf_scanner_can_handle_gguf(tmp_path):
     """Test that scanner can handle GGUF files."""
     path = tmp_path / "model.gguf"
@@ -78,6 +86,14 @@ def test_gguf_scanner_can_handle_ggml(tmp_path):
     path = tmp_path / "model.ggml"
     _write_ggml_file(path)
     assert GgufScanner.can_handle(str(path))
+
+
+def test_gguf_scanner_can_handle_ggml_variants(tmp_path):
+    """Scanner handles GGML variant magic codes."""
+    for magic in [b"GGMF", b"GGJT"]:
+        path = tmp_path / f"model_{magic.decode().lower()}.ggml"
+        _write_ggml_variant_file(path, magic)
+        assert GgufScanner.can_handle(str(path))
 
 
 def test_gguf_scanner_rejects_invalid_files(tmp_path):
@@ -143,9 +159,7 @@ def test_gguf_scanner_truncated_file(tmp_path):
         f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
 
     result = GgufScanner().scan(str(path))
-    assert not result.success or any(
-        i.severity == IssueSeverity.CRITICAL for i in result.issues
-    )
+    assert not result.success or any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
 def test_gguf_scanner_suspicious_key_paths(tmp_path):
@@ -190,6 +204,16 @@ def test_ggml_scanner_basic(tmp_path):
     assert result.success
     assert result.metadata["format"] == "ggml"
     assert result.metadata["version"] == 1
+
+
+def test_ggml_variant_scanner_basic(tmp_path):
+    """Ensure GGML variants are scanned correctly."""
+    path = tmp_path / "model.ggmf"
+    _write_ggml_variant_file(path, b"GGMF")
+    result = GgufScanner().scan(str(path))
+    assert result.success
+    assert result.metadata["format"] == "ggml"
+    assert result.metadata.get("magic") == "GGMF"
 
 
 def test_ggml_scanner_suspicious_version(tmp_path):
@@ -264,10 +288,7 @@ def test_gguf_scanner_tensor_dimension_limits(tmp_path):
         # Don't write the rest as it would be too long
 
     result = GgufScanner().scan(str(path))
-    assert any(
-        "suspicious" in i.message.lower() and "dimensions" in i.message.lower()
-        for i in result.issues
-    )
+    assert any("suspicious" in i.message.lower() and "dimensions" in i.message.lower() for i in result.issues)
 
 
 def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
@@ -307,9 +328,7 @@ def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
 
     # Should detect the DoS attempt
     assert any(
-        "excessive dimensions" in i.message.lower()
-        and i.severity == IssueSeverity.CRITICAL
-        for i in result.issues
+        "excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues
     )
 
     # Should mention skipping for security
@@ -443,16 +462,10 @@ def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
     warning_messages = [issue.message for issue in result.issues]
 
     # Check for zero dimension warning
-    assert any(
-        "tensor_with_zero" in msg and "invalid dimension: 0" in msg
-        for msg in warning_messages
-    )
+    assert any("tensor_with_zero" in msg and "invalid dimension: 0" in msg for msg in warning_messages)
 
     # Check for negative dimension warning (the exact value depends on how it's interpreted)
-    assert any(
-        "tensor_with_negative" in msg and "invalid dimension" in msg
-        for msg in warning_messages
-    )
+    assert any("tensor_with_negative" in msg and "invalid dimension" in msg for msg in warning_messages)
 
     # Should have exactly 2 warnings (one for each invalid dimension)
     dimension_warnings = [msg for msg in warning_messages if "invalid dimension" in msg]

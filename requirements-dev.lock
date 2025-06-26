@@ -36,11 +36,13 @@ dill==0.4.0
 execnet==2.1.1
     # via pytest-xdist
 filelock==3.18.0
+    # via huggingface-hub
     # via torch
 flatbuffers==25.2.10
     # via tensorflow
     # via tflite
 fsspec==2025.5.1
+    # via huggingface-hub
     # via torch
 gast==0.6.0
     # via tensorflow
@@ -53,6 +55,10 @@ h5py==3.14.0
     # via keras
     # via modelaudit
     # via tensorflow
+hf-xet==1.1.5
+    # via huggingface-hub
+huggingface-hub==0.33.1
+    # via modelaudit
 idna==3.10
     # via requests
 iniconfig==2.1.0
@@ -112,6 +118,7 @@ optree==0.16.0
 packageurl-python==0.17.1
     # via cyclonedx-python-lib
 packaging==25.0
+    # via huggingface-hub
     # via keras
     # via pytest
     # via tensorboard
@@ -136,8 +143,10 @@ pytest==8.4.1
 pytest-cov==6.2.1
 pytest-xdist==3.7.0
 pyyaml==6.0.2
+    # via huggingface-hub
     # via modelaudit
 requests==2.32.4
+    # via huggingface-hub
     # via tensorflow
 rich==14.0.0
     # via keras
@@ -178,6 +187,8 @@ threadpoolctl==3.6.0
     # via scikit-learn
 torch==2.7.1
     # via modelaudit
+tqdm==4.67.1
+    # via huggingface-hub
 types-protobuf==6.30.2.20250516
     # via types-tensorflow
 types-pyyaml==6.0.12.20250516
@@ -185,6 +196,7 @@ types-requests==2.32.4.20250611
     # via types-tensorflow
 types-tensorflow==2.18.0.20250516
 typing-extensions==4.14.0
+    # via huggingface-hub
     # via mypy
     # via onnx
     # via optree

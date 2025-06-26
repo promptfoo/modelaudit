@@ -44,6 +44,7 @@ ModelAudit scans ML model files for:
 - **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
 - **Potentially unsafe Keras Lambda layers** with arbitrary code execution
 - **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
+- **Nested pickle payloads** and multi-stage serialization attacks
 - **Custom ONNX operators** and external data integrity issues
 - **Encoded payloads** and suspicious string patterns
 - **Risky configurations** in model architectures
@@ -154,6 +155,10 @@ modelaudit scan ./models/
 # Scan a model stored in the MLflow registry
 modelaudit scan-mlflow models:/MyModel/1
 
+# Scan a model from HuggingFace Hub
+modelaudit scan https://huggingface.co/gpt2
+modelaudit scan hf://distilbert-base-uncased
+
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
 
@@ -186,6 +191,14 @@ Issues found: 2 critical, 1 warnings
 
 ────────────────────────────────────────────────────────────────────────────────
 ✗ Scan completed with findings
+```
+
+Some issues will also show a short **Why** paragraph explaining the security
+risk:
+
+```bash
+1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
+   Why: The 'os' module provides direct access to operating system functions.
 ```
 
 ## ✨ Features
@@ -224,7 +237,7 @@ ModelAudit provides specialized security scanners for different model formats:
 
 | Format              | File Extensions                                                                                          | What We Check                                                                                                      |
 | ------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Pickle**          | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                               | Malicious code execution, dangerous opcodes, suspicious imports                                                    |
+| **Pickle**          | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                               | Malicious code execution, dangerous opcodes, suspicious imports, nested pickle detection, decode-exec chains       |
 | **PyTorch Zip**     | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns                                                        |
 | **PyTorch Binary**  | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                                                                      |
 | **TensorFlow Lite** | `.tflite`                                                                                                | Extreme tensor shapes, custom ops, FlatBuffer integrity                                                            |
@@ -324,6 +337,18 @@ When using `--format json`, ModelAudit outputs structured results:
       "tensors": ["embedding.weight", "decoder.weight"]
     }
   ]
+}
+```
+
+Some issues also include a `why` field explaining **why** the finding is a
+problem:
+
+```json
+{
+  "message": "Dangerous import: os.system",
+  "severity": "critical",
+  "location": "test.pkl",
+  "why": "The 'os' module provides direct access to operating system functions."
 }
 ```
 

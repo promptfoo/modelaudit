@@ -1,7 +1,7 @@
 import importlib
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Optional
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -17,8 +17,8 @@ class ScannerRegistry:
     """
 
     def __init__(self):
-        self._scanners: Dict[str, Dict[str, Any]] = {}
-        self._loaded_scanners: Dict[str, Type[BaseScanner]] = {}
+        self._scanners: dict[str, dict[str, Any]] = {}
+        self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._lock = threading.Lock()
         self._init_registry()
 
@@ -40,7 +40,7 @@ class ScannerRegistry:
             "index.json",
             "tokenizer_config.json",
             "model_config.json",
-        ]
+        ],
     )
 
     def _init_registry(self):
@@ -212,7 +212,7 @@ class ScannerRegistry:
             },
         }
 
-    def _load_scanner(self, scanner_id: str) -> Optional[Type[BaseScanner]]:
+    def _load_scanner(self, scanner_id: str) -> Optional[type[BaseScanner]]:
         """Lazy load a scanner class (thread-safe)"""
         # Check if already loaded (fast path without lock)
         if scanner_id in self._loaded_scanners:
@@ -240,11 +240,11 @@ class ScannerRegistry:
                 return None
             except AttributeError as e:
                 logger.error(
-                    f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
+                    f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}",
                 )
                 return None
 
-    def get_scanner_classes(self) -> List[Type[BaseScanner]]:
+    def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
         scanner_classes = []
         # Sort by priority
@@ -257,7 +257,7 @@ class ScannerRegistry:
 
         return scanner_classes
 
-    def get_scanner_for_path(self, path: str) -> Optional[Type[BaseScanner]]:
+    def get_scanner_for_path(self, path: str) -> Optional[type[BaseScanner]]:
         """Get the best scanner for a given path (lazy loaded)"""
         import os
 
@@ -273,9 +273,7 @@ class ScannerRegistry:
 
             # Quick extension check before loading scanner
             extension_match = False
-            if file_ext in extensions:
-                extension_match = True
-            elif "" in extensions and os.path.isdir(path):  # Directory scanner
+            if file_ext in extensions or ("" in extensions and os.path.isdir(path)):
                 extension_match = True
             elif scanner_id == "manifest":
                 # Special handling for manifest scanner - check filename patterns
@@ -289,25 +287,22 @@ class ScannerRegistry:
 
         return None
 
-    def get_available_scanners(self) -> List[str]:
+    def get_available_scanners(self) -> list[str]:
         """Get list of available scanner IDs"""
         return list(self._scanners.keys())
 
-    def get_scanner_info(self, scanner_id: str) -> Optional[Dict[str, Any]]:
+    def get_scanner_info(self, scanner_id: str) -> Optional[dict[str, Any]]:
         """Get metadata about a scanner without loading it"""
         return self._scanners.get(scanner_id)
 
-    def load_scanner_by_id(self, scanner_id: str) -> Optional[Type[BaseScanner]]:
+    def load_scanner_by_id(self, scanner_id: str) -> Optional[type[BaseScanner]]:
         """Load a specific scanner by ID (public API)"""
         return self._load_scanner(scanner_id)
 
     def _is_aiml_manifest_file(self, filename: str) -> bool:
         """Check if filename matches AI/ML manifest patterns."""
         # Use exact filename matching to avoid false positives like "config.json.backup"
-        return any(
-            filename == pattern or filename.endswith(f"/{pattern}")
-            for pattern in self._AIML_MANIFEST_PATTERNS
-        )
+        return any(filename == pattern or filename.endswith(f"/{pattern}") for pattern in self._AIML_MANIFEST_PATTERNS)
 
 
 # Global registry instance
@@ -382,7 +377,7 @@ def __getattr__(name: str):
             return scanner_class
         else:
             raise ImportError(
-                f"Failed to load scanner '{name}' - dependencies may not be installed"
+                f"Failed to load scanner '{name}' - dependencies may not be installed",
             )
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
@@ -390,13 +385,13 @@ def __getattr__(name: str):
 
 # Export the registry for direct use
 __all__ = [
+    # Registry
+    "SCANNER_REGISTRY",
     # Base classes (already imported)
     "BaseScanner",
     "Issue",
     "IssueSeverity",
     "ScanResult",
-    # Registry
-    "SCANNER_REGISTRY",
     "_registry",
     # Scanner classes will be lazy loaded via __getattr__
 ]

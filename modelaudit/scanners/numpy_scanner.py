@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from typing import ClassVar
 
 import numpy.lib.format as fmt
 
@@ -12,13 +13,14 @@ class NumPyScanner(BaseScanner):
 
     name = "numpy"
     description = "Scans NumPy .npy files for integrity issues"
-    supported_extensions = [".npy"]
+    supported_extensions: ClassVar[list[str]] = [".npy"]
 
     def __init__(self, config=None):
         super().__init__(config)
         # Security limits
         self.max_array_bytes = self.config.get(
-            "max_array_bytes", 1024 * 1024 * 1024
+            "max_array_bytes",
+            1024 * 1024 * 1024,
         )  # 1GB
         self.max_dimensions = self.config.get("max_dimensions", 32)
         self.max_dimension_size = self.config.get("max_dimension_size", 100_000_000)
@@ -29,7 +31,7 @@ class NumPyScanner(BaseScanner):
         # Check number of dimensions
         if len(shape) > self.max_dimensions:
             raise ValueError(
-                f"Too many dimensions: {len(shape)} (max: {self.max_dimensions})"
+                f"Too many dimensions: {len(shape)} (max: {self.max_dimensions})",
             )
 
         # Check individual dimension sizes
@@ -38,7 +40,7 @@ class NumPyScanner(BaseScanner):
                 raise ValueError(f"Negative dimension at index {i}: {dim}")
             if dim > self.max_dimension_size:
                 raise ValueError(
-                    f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})"
+                    f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
     def _validate_dtype(self, dtype) -> None:
@@ -49,13 +51,13 @@ class NumPyScanner(BaseScanner):
 
         if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
             raise ValueError(
-                f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})"
+                f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})",
             )
 
         # Check for extremely large item sizes
         if dtype.itemsize > self.max_itemsize:
             raise ValueError(
-                f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})"
+                f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
     def _calculate_safe_array_size(self, shape: tuple, dtype) -> int:
@@ -67,7 +69,7 @@ class NumPyScanner(BaseScanner):
             # Check for overflow before multiplication
             if total_elements > max_elements // max(dim, 1):
                 raise ValueError(
-                    f"Array size would overflow: shape={shape}, dtype={dtype}"
+                    f"Array size would overflow: shape={shape}, dtype={dtype}",
                 )
 
             total_elements *= dim
@@ -76,8 +78,7 @@ class NumPyScanner(BaseScanner):
 
         if total_bytes > self.max_array_bytes:
             raise ValueError(
-                f"Array too large: {total_bytes} bytes "
-                f"(max: {self.max_array_bytes}) for shape={shape}, dtype={dtype}"
+                f"Array too large: {total_bytes} bytes (max: {self.max_array_bytes}) for shape={shape}, dtype={dtype}",
             )
 
         return total_bytes
@@ -116,7 +117,8 @@ class NumPyScanner(BaseScanner):
                     shape, fortran, dtype = fmt.read_array_header_2_0(f)
                 else:
                     shape, fortran, dtype = fmt._read_array_header(  # type: ignore[attr-defined]
-                        f, version=(major, minor)
+                        f,
+                        version=(major, minor),
                     )
                 data_offset = f.tell()
 
@@ -158,7 +160,7 @@ class NumPyScanner(BaseScanner):
 
                 result.bytes_scanned = file_size
                 result.metadata.update(
-                    {"shape": shape, "dtype": str(dtype), "fortran_order": fortran}
+                    {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
                 )
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_issue(
