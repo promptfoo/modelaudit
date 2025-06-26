@@ -150,8 +150,8 @@ modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib mo
 modelaudit scan ./models/
 
 # Scan a model from HuggingFace Hub
-modelaudit scan https://huggingface.co/bert-base-uncased
-modelaudit scan hf://microsoft/DialoGPT-small
+modelaudit scan https://huggingface.co/gpt2
+modelaudit scan hf://distilbert-base-uncased
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
