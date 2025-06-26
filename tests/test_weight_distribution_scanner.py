@@ -351,7 +351,7 @@ class TestWeightDistributionScanner:
         # Test transformer-related layer names
         transformer_patterns = [
             "encoder.layers.0.mlp.dense_h_to_4h.weight",
-            "decoder.attention.dense.weight", 
+            "decoder.attention.dense.weight",
             "transformer.mlp.fc_in.weight",
             "model.layers.5.mlp.gate_proj.weight",
         ]
@@ -359,7 +359,7 @@ class TestWeightDistributionScanner:
         # Create transformer-like weights with some natural variation
         np.random.seed(42)
         weights = np.random.randn(1024, 4096) * 0.02  # Typical transformer dimensions
-        
+
         # Add moderate natural variation (not extreme anomalies)
         weights[:, :10] *= 1.2  # Some neurons have slightly different scales
 
@@ -370,13 +370,13 @@ class TestWeightDistributionScanner:
             # - Large weight matrices (1024x4096 = 4M+ parameters) get relaxed thresholds
             # - Layer names no longer bypass security checks completely
             # - May still detect anomalies if weights are statistically unusual
-            
+
             # The key security improvement: detection is based on actual weight properties,
             # not just names that can be spoofed by attackers
-            
+
             # Should use relaxed thresholds for large models but still perform analysis
             assert len(anomalies) <= 2, f"Layer {layer_name} should use relaxed thresholds for large models"
-            
+
             # If anomalies are found, they should indicate real statistical outliers
             for anomaly in anomalies:
                 # Should have analysis_method metadata showing structural analysis was used

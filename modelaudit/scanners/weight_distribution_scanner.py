@@ -367,13 +367,15 @@ class WeightDistributionScanner(BaseScanner):
 
         for layer_name, weights in weights_info.items():
             if len(weights.shape) == 2:  # 2D weight matrices
-                weight_matrices.append({
-                    "name": layer_name,
-                    "shape": weights.shape,
-                    "params": weights.size,
-                    "input_dim": weights.shape[0],
-                    "output_dim": weights.shape[1]
-                })
+                weight_matrices.append(
+                    {
+                        "name": layer_name,
+                        "shape": weights.shape,
+                        "params": weights.size,
+                        "input_dim": weights.shape[0],
+                        "output_dim": weights.shape[1],
+                    }
+                )
                 total_params += weights.size
 
         analysis["total_parameters"] = total_params
@@ -451,7 +453,7 @@ class WeightDistributionScanner(BaseScanner):
             "transformer_dims": matching_dims,
             "repeated_dims": len(repeated_dims),
             "max_dimension": max(input_dims + output_dims) if input_dims + output_dims else 0,
-            "dimension_diversity": len(set(input_dims + output_dims))
+            "dimension_diversity": len(set(input_dims + output_dims)),
         }
 
         return analysis
@@ -523,7 +525,7 @@ class WeightDistributionScanner(BaseScanner):
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
                             "analysis_method": "structural_analysis",
-                            "architecture_confidence": architecture_analysis["confidence"]
+                            "architecture_confidence": architecture_analysis["confidence"],
                         },
                         "why": (
                             "Neurons with weight magnitudes significantly different from others in the same layer may "
@@ -567,7 +569,7 @@ class WeightDistributionScanner(BaseScanner):
                                 "max_similarity_to_others": float(max_sim),
                                 "weight_norm": float(output_norms[neuron_idx]),
                                 "total_outputs": n_outputs,
-                                "analysis_method": "structural_analysis"
+                                "analysis_method": "structural_analysis",
                             },
                             "why": (
                                 "Neurons with weight patterns completely unlike others in the same layer are "
@@ -601,7 +603,7 @@ class WeightDistributionScanner(BaseScanner):
                             "threshold": float(threshold),
                             "max_weight": float(np.max(weight_magnitudes)),
                             "total_outputs": n_outputs,
-                            "analysis_method": "structural_analysis"
+                            "analysis_method": "structural_analysis",
                         },
                         "why": (
                             "Weight values that are orders of magnitude larger than typical can cause numerical "

@@ -596,6 +596,46 @@ class ManifestScanner(BaseScanner):
             if any(safe_key in key_lower for safe_key in tokenizer_safe_keys):
                 return True
 
+        # Special case for encoder-decoder transformer models (T5, BART, etc.)
+        if ml_context.get("framework") == "huggingface" and "execution" in matches:
+            # These are legitimate sequence-to-sequence model configuration patterns
+            # that contain "decoder" but are not actually execution-related
+            encoder_decoder_safe_patterns = [
+                "decoder_start_token_id",  # T5/seq2seq start token configuration
+                "is_encoder_decoder",  # Architecture flag for encoder-decoder models
+                "decoder_input_ids",  # Input configuration for decoder
+                "decoder_attention_mask",  # Attention configuration for decoder
+                "decoder_head_mask",  # Head masking for decoder
+                "forced_decoder_ids",  # Forced decoding configuration
+                "suppress_tokens",  # Token suppression configuration
+                "begin_suppress_tokens",  # Begin token suppression
+                "forced_bos_token_id",  # Beginning of sequence token
+                "forced_eos_token_id",  # End of sequence token
+                "encoder_no_repeat_ngram_size",  # N-gram repetition control
+                "decoder_start_token",  # Alternative start token naming
+                "decoder_config",  # Decoder-specific configuration
+                "encoder_config",  # Encoder-specific configuration
+            ]
+
+            if any(pattern in key_lower for pattern in encoder_decoder_safe_patterns):
+                return True
+
+        # Special case for vision-language models (CLIP, ViLT, BLIP, etc.)
+        # Check CLIP specific patterns first - these are legitimate config keys
+        if "execution" in matches and "config" in key_lower:
+            clip_patterns = [
+                "text_config.is_decoder",
+                "text_config.pruned_heads",
+                "text_config.tie_encoder_decoder",
+                "text_config.torchscript",
+                "vision_config.is_decoder",
+                "vision_config.pruned_heads",
+                "vision_config.tie_encoder_decoder",
+                "vision_config.torchscript",
+            ]
+            if key_lower in clip_patterns:
+                return True
+
         return False
 
     def _is_file_path_value(self, value: Any) -> bool:

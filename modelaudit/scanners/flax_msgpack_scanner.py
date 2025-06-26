@@ -232,15 +232,18 @@ class FlaxMsgpackScanner(BaseScanner):
             elif isinstance(data, (list, tuple)):
                 for i, value in enumerate(data):
                     tensors.extend(collect_tensors(value, f"{path}[{i}]"))
-            elif isinstance(data, (bytes, bytearray)):
+            elif (
+                isinstance(data, (bytes, bytearray)) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0)
+            ):
                 # Check if binary data could be a serialized tensor
-                if len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0):
-                    tensors.append({
+                tensors.append(
+                    {
                         "path": path,
                         "size": len(data),
                         "type": "binary_blob",
                         "potential_elements": len(data) // 4,  # Assume float32
-                    })
+                    }
+                )
             return tensors
 
         tensors = collect_tensors(obj)
@@ -272,10 +275,12 @@ class FlaxMsgpackScanner(BaseScanner):
                         potential_shapes.append((dim1, dim2))
 
             if potential_shapes:
-                common_ml_sizes.append({
-                    "tensor": tensor,
-                    "potential_shapes": potential_shapes[:5],  # Limit output
-                })
+                common_ml_sizes.append(
+                    {
+                        "tensor": tensor,
+                        "potential_shapes": potential_shapes[:5],  # Limit output
+                    }
+                )
 
         if common_ml_sizes:
             analysis["evidence"].append(f"Found {len(common_ml_sizes)} tensors with ML-compatible dimensions")
@@ -322,7 +327,9 @@ class FlaxMsgpackScanner(BaseScanner):
             if tensor["size"] < 100:  # Very small tensors are suspicious for model weights
                 suspicious_data += 1
             elif tensor["size"] > 500 * 1024 * 1024:  # Extremely large (>500MB) single tensors
-                analysis["suspicious_patterns"].append(f"Extremely large single tensor: {tensor['size']//1024//1024}MB")
+                analysis["suspicious_patterns"].append(
+                    f"Extremely large single tensor: {tensor['size'] // 1024 // 1024}MB"
+                )
                 suspicious_data += 1
 
         if suspicious_data > len(tensors) * 0.5:  # More than 50% suspicious
@@ -364,7 +371,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 location="root",
                 details={
                     "found_standard_keys": [k for k in expected_keys if k in found_keys],
-                    "model_type": "standard_flax"
+                    "model_type": "standard_flax",
                 },
             )
             return
@@ -381,7 +388,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 details={
                     "analysis": ml_analysis,
                     "model_type": "converted_ml_model",
-                    "structural_evidence": ml_analysis["evidence"]
+                    "structural_evidence": ml_analysis["evidence"],
                 },
             )
         elif ml_analysis["confidence"] > 0.4:
@@ -393,7 +400,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 details={
                     "analysis": ml_analysis,
                     "model_type": "possible_ml_model",
-                    "recommendation": "Manual review recommended"
+                    "recommendation": "Manual review recommended",
                 },
             )
         else:
@@ -407,15 +414,27 @@ class FlaxMsgpackScanner(BaseScanner):
                     "found_keys": list(found_keys)[:20],
                     "expected_any_of": list(expected_keys),
                     "model_type": "suspicious",
-                    "suspicious_patterns": ml_analysis["suspicious_patterns"]
+                    "suspicious_patterns": ml_analysis["suspicious_patterns"],
                 },
             )
 
         # Always check for truly suspicious top-level keys regardless of ML confidence
         dangerous_keys = {
-            "__class__", "__module__", "__reduce__", "__getstate__", "__setstate__",
-            "__dict__", "__code__", "__globals__", "__builtins__", "__import__",
-            "eval", "exec", "subprocess", "os", "system"
+            "__class__",
+            "__module__",
+            "__reduce__",
+            "__getstate__",
+            "__setstate__",
+            "__dict__",
+            "__code__",
+            "__globals__",
+            "__builtins__",
+            "__import__",
+            "eval",
+            "exec",
+            "subprocess",
+            "os",
+            "system",
         }
 
         suspicious_top_level = found_keys & dangerous_keys
