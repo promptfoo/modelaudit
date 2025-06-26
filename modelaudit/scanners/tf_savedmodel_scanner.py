@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 
+from modelaudit.explanations import get_tf_op_explanation
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
 
-from ..explanations import get_tf_op_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import TensorFlow, but handle the case where it's not installed

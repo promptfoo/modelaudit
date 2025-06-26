@@ -179,32 +179,14 @@ PATTERN_EXPLANATIONS = {
 
 # Explanations for suspicious TensorFlow operations
 #
-# TensorFlow operations that pose security risks fall into several categories:
+# Risk Categories:
+# - CRITICAL: Code execution (PyFunc, PyCall, ExecuteOp, ShellExecute) & System access (SystemConfig)
+# - HIGH: File system operations (ReadFile, WriteFile, Save, SaveV2, MergeV2Checkpoints)
+# - MEDIUM: Data processing with potential exploits (DecodeRaw, DecodeJpeg, DecodePng)
 #
-# 1. CODE EXECUTION (CRITICAL): Operations that can execute arbitrary Python code or system commands
-#    - These are the highest risk as they provide direct code execution capabilities
-#    - Examples: PyFunc, PyCall, ExecuteOp, ShellExecute
-#
-# 2. SYSTEM INTERACTION (CRITICAL): Operations that access or modify system configuration
-#    - Can be used for reconnaissance or privilege escalation
-#    - Examples: SystemConfig
-#
-# 3. FILE SYSTEM ACCESS (HIGH): Operations that read from or write to arbitrary file locations
-#    - Can be used for data exfiltration, backdoor installation, or system compromise
-#    - Examples: ReadFile, WriteFile, Save, SaveV2, MergeV2Checkpoints
-#
-# 4. DATA PROCESSING (MEDIUM): Operations that process untrusted binary data
-#    - Can exploit vulnerabilities in parsing libraries or cause resource exhaustion
-#    - Examples: DecodeRaw, DecodeJpeg, DecodePng
-#
-# Threat Context:
-# Malicious ML models can embed these operations in TensorFlow graphs to execute during model loading
-# or inference. Unlike traditional executable files, ML models are often trusted and bypassed by
-# security tools, making this a particularly effective attack vector for:
-# - Remote code execution in ML inference pipelines
-# - Data exfiltration from ML training environments
-# - Backdoor installation in ML production systems
-# - Supply chain attacks through model repositories
+# Threat Context: Malicious ML models embed these operations to execute during model loading/inference,
+# bypassing security tools that typically trust ML models. Used for RCE, data exfiltration, backdoors,
+# and supply chain attacks.
 TF_OP_EXPLANATIONS = {
     # Code execution operations - CRITICAL RISK
     "PyFunc": (
