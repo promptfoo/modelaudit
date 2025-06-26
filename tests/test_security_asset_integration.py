@@ -87,7 +87,7 @@ class TestSecurityAssetIntegration:
                         "dill_func",
                         "path_traversal",
                         "nested_pickle",  # Our intentionally malicious nested pickle test files
-                        "decode_exec",    # Our intentionally malicious decode-exec test files
+                        "decode_exec",  # Our intentionally malicious decode-exec test files
                         "simple_nested",  # Our intentionally malicious simple nested pickle test file
                     ]
                     if (
@@ -146,10 +146,12 @@ class TestSecurityAssetIntegration:
 
             # Exit code should be 0 for clean files, or 1 for warnings-only (which is acceptable)
             assert exit_code in [0, 1], f"Unexpected exit code {exit_code} for {safe_file.name}: {results['issues']}"
-            
+
             # If exit code is 1, make sure it's only due to warnings or info, not high-severity issues
             if exit_code == 1:
-                assert len(high_severity_issues) == 0, f"Exit code 1 should only be for warnings, not high-severity issues in {safe_file.name}"
+                assert len(high_severity_issues) == 0, (
+                    f"Exit code 1 should only be for warnings, not high-severity issues in {safe_file.name}"
+                )
 
     def test_existing_pickle_assets(self, assets_dir):
         """Test existing pickle assets in the organized structure."""
