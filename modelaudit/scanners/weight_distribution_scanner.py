@@ -311,6 +311,10 @@ class WeightDistributionScanner(BaseScanner):
         """Analyze weight distributions for anomalies"""
         anomalies = []
 
+        # SECURITY FIX: Perform architecture analysis once with complete model information
+        # This provides accurate architectural classification instead of per-layer analysis
+        architecture_analysis = self._analyze_architecture_properties(weights_info)
+
         # Focus on final layer weights (classification heads)
         final_layer_candidates = {}
         for name, weights in weights_info.items():
@@ -336,19 +340,135 @@ class WeightDistributionScanner(BaseScanner):
                 name: weights for name, weights in weights_info.items() if len(weights.shape) == 2
             }
 
-        # Analyze each candidate layer
+        # Analyze each candidate layer with complete architectural context
         for layer_name, weights in final_layer_candidates.items():
-            layer_anomalies = self._analyze_layer_weights(layer_name, weights)
+            layer_anomalies = self._analyze_layer_weights(layer_name, weights, architecture_analysis)
             anomalies.extend(layer_anomalies)
 
         return anomalies
+
+    def _analyze_architecture_properties(self, weights_info: dict[str, np.ndarray]) -> dict[str, Any]:
+        """
+        Analyze the mathematical and architectural properties to determine model characteristics.
+        Uses structural analysis rather than name-based detection to avoid security bypasses.
+        """
+        analysis: dict[str, Any] = {
+            "is_likely_transformer": False,
+            "is_likely_llm": False,
+            "confidence": 0.0,
+            "evidence": [],
+            "architectural_features": {},
+            "total_parameters": 0,
+            "layer_count": 0,
+        }
+
+        if not weights_info:
+            return analysis
+
+        # Collect weight matrix information
+        weight_matrices: list[dict[str, Any]] = []
+        total_params = 0
+
+        for layer_name, weights in weights_info.items():
+            if len(weights.shape) == 2:  # 2D weight matrices
+                weight_matrices.append(
+                    {
+                        "name": layer_name,
+                        "shape": weights.shape,
+                        "params": weights.size,
+                        "input_dim": weights.shape[0],
+                        "output_dim": weights.shape[1],
+                    }
+                )
+                total_params += weights.size
+
+        analysis["total_parameters"] = total_params
+        analysis["layer_count"] = len(weight_matrices)
+
+        if len(weight_matrices) == 0:
+            analysis["evidence"].append("No 2D weight matrices found")
+            return analysis
+
+        # Analyze dimensional patterns typical of transformer architectures
+        input_dims = [w["input_dim"] for w in weight_matrices]
+        output_dims = [w["output_dim"] for w in weight_matrices]
+
+        # Check for common transformer dimensions (powers of 2, multiples of 64)
+        transformer_dims = [64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192]
+        matching_dims = 0
+
+        for dim in input_dims + output_dims:
+            if dim in transformer_dims or any(dim % td == 0 and dim // td <= 16 for td in transformer_dims):
+                matching_dims += 1
+
+        if matching_dims > len(weight_matrices) * 0.6:  # 60% of dimensions match transformer patterns
+            analysis["confidence"] += 0.3
+            analysis["evidence"].append(f"Found {matching_dims} dimensions matching transformer patterns")
+            analysis["is_likely_transformer"] = True
+
+        # Check for large vocabulary/embedding patterns (characteristic of LLMs)
+        large_vocab_evidence = 0
+        common_vocab_sizes = [30522, 50257, 32000, 28996, 51200, 65536, 100000]  # Known vocab sizes
+
+        for matrix in weight_matrices:
+            # Check if either dimension could be a vocabulary size
+            for vocab_size in common_vocab_sizes:
+                if abs(matrix["output_dim"] - vocab_size) < vocab_size * 0.05:  # 5% tolerance
+                    large_vocab_evidence += 1
+                    analysis["evidence"].append(f"Found vocabulary-sized layer: {matrix['output_dim']} ≈ {vocab_size}")
+                    break
+
+        # Check for very large hidden dimensions typical of modern LLMs
+        large_hidden_dims = [dim for dim in input_dims + output_dims if dim >= 768]
+        if large_hidden_dims:
+            analysis["confidence"] += 0.2
+            analysis["evidence"].append(f"Found large hidden dimensions: {set(large_hidden_dims)}")
+
+        # Check for architectural consistency (repeated dimension patterns)
+        dim_frequency: dict[int, int] = {}
+        for dim in input_dims + output_dims:
+            dim_frequency[dim] = dim_frequency.get(dim, 0) + 1
+
+        # Look for repeated dimensions (characteristic of structured architectures)
+        repeated_dims = [dim for dim, freq in dim_frequency.items() if freq >= 3]
+        if repeated_dims:
+            analysis["confidence"] += 0.2
+            analysis["evidence"].append(f"Found repeated architectural dimensions: {repeated_dims}")
+
+        # Check total parameter count (modern LLMs have millions/billions of parameters)
+        if total_params > 100_000_000:  # > 100M parameters
+            analysis["confidence"] += 0.3
+            analysis["evidence"].append(f"Large parameter count: {total_params:,} parameters")
+            analysis["is_likely_llm"] = True
+        elif total_params > 10_000_000:  # > 10M parameters
+            analysis["confidence"] += 0.2
+            analysis["evidence"].append(f"Medium parameter count: {total_params:,} parameters")
+
+        # Final classification based on structural evidence
+        if analysis["confidence"] > 0.7 and (large_vocab_evidence > 0 or total_params > 50_000_000):
+            analysis["is_likely_llm"] = True
+            analysis["evidence"].append("High confidence: Large Language Model based on structural analysis")
+        elif analysis["confidence"] > 0.5:
+            analysis["is_likely_transformer"] = True
+            analysis["evidence"].append("Moderate confidence: Transformer-based model")
+
+        analysis["architectural_features"] = {
+            "vocab_evidence": large_vocab_evidence,
+            "transformer_dims": matching_dims,
+            "repeated_dims": len(repeated_dims),
+            "max_dimension": max(input_dims + output_dims) if input_dims + output_dims else 0,
+            "dimension_diversity": len(set(input_dims + output_dims)),
+        }
+
+        return analysis
 
     def _analyze_layer_weights(
         self,
         layer_name: str,
         weights: np.ndarray,
+        architecture_analysis: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Analyze a single layer's weights for anomalies"""
+        """Analyze a single layer's weights for anomalies using pre-computed architectural analysis"""
         anomalies: list[dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers
@@ -357,40 +477,33 @@ class WeightDistributionScanner(BaseScanner):
 
         n_inputs, n_outputs = weights.shape
 
-        # Detect if this is likely an LLM vocabulary layer or large transformer model
-        is_likely_llm = (
-            n_outputs > self.llm_vocab_threshold  # Large vocab layer
-            or n_inputs > 768  # Large hidden dimensions typical of LLMs (768+ for BERT/GPT)
-            or "transformer" in layer_name.lower()  # Transformer architecture
-            or "attention" in layer_name.lower()  # Attention layers
-            or "gpt" in layer_name.lower()  # GPT models
-            or "bert" in layer_name.lower()  # BERT models
-            or "llama" in layer_name.lower()  # LLaMA models
-            or "t5" in layer_name.lower()  # T5 models
-            or
-            # GPT-style layer patterns
-            layer_name.startswith("h.")  # GPT-2 style layers (h.0, h.1, etc.)
-            or "mlp" in layer_name.lower()  # Multi-layer perceptron in transformers
-            or "c_fc" in layer_name.lower()  # GPT-2 feed-forward layers
-            or "c_attn" in layer_name.lower()  # GPT-2 attention layers
-            or "c_proj" in layer_name.lower()  # GPT-2 projection layers
-        )
+        # SECURITY FIX: Use pre-computed architecture analysis from complete model
+        # instead of incorrectly analyzing only a single layer
 
-        # Skip checks for LLMs if disabled (default behavior)
-        if is_likely_llm and not self.enable_llm_checks:
-            return []
-
-        # For LLMs, we need much stricter thresholds to avoid false positives
-        if is_likely_llm:
-            # For LLMs, only check for extreme outliers with much higher thresholds
-            z_score_threshold = max(
-                8.0,
-                self.z_score_threshold * 2.5,
-            )  # Much higher threshold
-            outlier_percentage_threshold = 0.0001  # 0.01% for LLMs - very restrictive
+        # Determine appropriate thresholds based on structural properties, not names
+        if architecture_analysis["is_likely_llm"] and not self.enable_llm_checks:
+            # For confirmed LLMs based on structural analysis, use relaxed thresholds
+            # but don't completely skip checks (that would be a security vulnerability)
+            z_score_threshold = max(8.0, self.z_score_threshold * 2.5)
+            outlier_percentage_threshold = 0.0001  # 0.01% for LLMs
+        elif (
+            # Large output dimensions (vocabulary layers)
+            n_outputs > self.llm_vocab_threshold
+            # Large input dimensions (hidden layers in large models)
+            or n_inputs > 2048
+            # Very large weight matrices (characteristic of large models)
+            or weights.size > 10_000_000
+        ):
+            # Moderate relaxation for large models based on size analysis
+            z_score_threshold = max(6.0, self.z_score_threshold * 1.8)
+            outlier_percentage_threshold = 0.001  # 0.1% for large models
         else:
+            # Standard thresholds for smaller models
             z_score_threshold = self.z_score_threshold
             outlier_percentage_threshold = 0.01  # 1% for classification models
+
+        # Always perform security checks regardless of model type
+        # (The original code had a security flaw where it would skip all checks for "LLMs")
 
         # 1. Check for outlier output neurons using Z-score
         output_norms = np.linalg.norm(weights, axis=0)  # L2 norm of each output neuron
@@ -415,18 +528,21 @@ class WeightDistributionScanner(BaseScanner):
                             "weight_norms": output_norms[outlier_indices].tolist()[:10],
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
+                            "analysis_method": "structural_analysis",
+                            "architecture_confidence": architecture_analysis["confidence"],
                         },
                         "why": (
                             "Neurons with weight magnitudes significantly different from others in the same layer may "
                             "indicate tampering, backdoors, or training anomalies. These outliers are flagged when "
-                            "their statistical z-score exceeds the threshold."
+                            "their statistical z-score exceeds the threshold. Thresholds are adjusted based on "
+                            "structural analysis of the model architecture."
                         ),
                     },
                 )
 
         # 2. Check for dissimilar weight vectors using cosine similarity
-        # Only perform this check for classification models (small number of outputs)
-        if 2 < n_outputs <= 1000:  # Skip for large vocabulary models
+        # Only perform this check for smaller output layers to avoid false positives in large vocab models
+        if 2 < n_outputs <= 1000:  # Skip for large vocabulary models based on size, not name
             # Compute pairwise cosine similarities
             normalized_weights = weights / (np.linalg.norm(weights, axis=0) + 1e-8)
             similarities = np.dot(normalized_weights.T, normalized_weights)
@@ -457,6 +573,7 @@ class WeightDistributionScanner(BaseScanner):
                                 "max_similarity_to_others": float(max_sim),
                                 "weight_norm": float(output_norms[neuron_idx]),
                                 "total_outputs": n_outputs,
+                                "analysis_method": "structural_analysis",
                             },
                             "why": (
                                 "Neurons with weight patterns completely unlike others in the same layer are "
@@ -490,11 +607,12 @@ class WeightDistributionScanner(BaseScanner):
                             "threshold": float(threshold),
                             "max_weight": float(np.max(weight_magnitudes)),
                             "total_outputs": n_outputs,
+                            "analysis_method": "structural_analysis",
                         },
                         "why": (
                             "Weight values that are orders of magnitude larger than typical can cause numerical "
-                            "instability, overflow attacks, or may encode hidden data. The threshold is set at "
-                            "100 times the mean magnitude."
+                            "instability, overflow attacks, or may encode hidden data. Detection uses statistical "
+                            "analysis rather than name-based classification to avoid security bypasses."
                         ),
                     },
                 )
