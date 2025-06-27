@@ -1,6 +1,7 @@
 import hashlib
 import os
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -18,7 +19,9 @@ def _file_sha256(path: str) -> str:
 
 
 def _component_for_file(
-    path: str, metadata: dict[str, Any], issues: Iterable[dict[str, Any]]
+    path: str,
+    metadata: dict[str, Any],
+    issues: Iterable[dict[str, Any]],
 ) -> Component:
     size = os.path.getsize(path)
     sha256 = _file_sha256(path)
@@ -84,21 +87,20 @@ def _component_for_file(
         # Add copyright information
         copyrights = metadata.get("copyright_notices", [])
         if copyrights:
-            copyright_holders = [
-                cr.get("holder", "") for cr in copyrights if isinstance(cr, dict)
-            ]
+            copyright_holders = [cr.get("holder", "") for cr in copyrights if isinstance(cr, dict)]
             if copyright_holders:
                 props.append(
                     Property(
-                        name="copyright_holders", value=", ".join(copyright_holders)
-                    )
+                        name="copyright_holders",
+                        value=", ".join(copyright_holders),
+                    ),
                 )
 
         # Add license files information
         license_files = metadata.get("license_files_nearby", [])
         if license_files:
             props.append(
-                Property(name="license_files_found", value=str(len(license_files)))
+                Property(name="license_files_found", value=str(len(license_files))),
             )
 
     component = Component(
