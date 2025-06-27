@@ -108,6 +108,24 @@ pip install modelaudit[mlflow]
 
 # Install all optional dependencies
 pip install modelaudit[all]
+
+# For NumPy 1.x compatibility (if you need all ML frameworks to work)
+pip install modelaudit[numpy1]
+```
+
+**NumPy Compatibility:**
+
+ModelAudit supports both NumPy 1.x and 2.x, with automatic graceful fallback when ML frameworks have compatibility issues:
+
+```bash
+# Default installation (works with NumPy 2.x, some ML framework scanners may not load)
+pip install modelaudit[all]
+
+# Full NumPy 1.x compatibility mode (ensures all ML frameworks work)
+pip install modelaudit[numpy1]
+
+# Check scanner compatibility status
+modelaudit doctor --show-failed
 ```
 
 **Development installation:**

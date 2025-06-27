@@ -25,8 +25,8 @@ class FlaxMsgpackScanner(BaseScanner):
         super().__init__(config)
         self.max_blob_bytes = self.config.get(
             "max_blob_bytes",
-            50 * 1024 * 1024,
-        )  # 50MB reasonable for model weights
+            200 * 1024 * 1024,
+        )  # 200MB reasonable for modern transformer embeddings (was 50MB)
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 10000)
         self.suspicious_patterns = self.config.get(
@@ -206,8 +206,148 @@ class FlaxMsgpackScanner(BaseScanner):
                     details={"value": value},
                 )
 
+    def _analyze_ml_structure(self, obj: Any, result: ScanResult) -> dict[str, Any]:
+        """
+        Analyze the mathematical and structural properties to determine if this looks like a legitimate ML model.
+        Returns analysis results with confidence scores based on actual model characteristics, not naming.
+        """
+        analysis: dict[str, Any] = {
+            "is_ml_model": False,
+            "confidence": 0.0,
+            "evidence": [],
+            "tensor_count": 0,
+            "weight_matrices": [],
+            "suspicious_patterns": [],
+        }
+
+        if not isinstance(obj, dict):
+            return analysis
+
+        # Recursively collect all numerical arrays that could be tensors
+        def collect_tensors(data: Any, path: str = "") -> list[dict[str, Any]]:
+            tensors: list[dict[str, Any]] = []
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    tensors.extend(collect_tensors(value, f"{path}/{key}" if path else key))
+            elif isinstance(data, (list, tuple)):
+                for i, value in enumerate(data):
+                    tensors.extend(collect_tensors(value, f"{path}[{i}]"))
+            elif (
+                isinstance(data, (bytes, bytearray)) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0)
+            ):
+                # Check if binary data could be a serialized tensor
+                tensors.append(
+                    {
+                        "path": path,
+                        "size": len(data),
+                        "type": "binary_blob",
+                        "potential_elements": len(data) // 4,  # Assume float32
+                    }
+                )
+            return tensors
+
+        tensors = collect_tensors(obj)
+        analysis["tensor_count"] = len(tensors)
+
+        if len(tensors) == 0:
+            analysis["suspicious_patterns"].append("No numerical data found - not a typical ML model")
+            return analysis
+
+        # Analyze tensor size patterns
+        large_tensors = [t for t in tensors if t["size"] > 1024]  # > 1KB
+        if not large_tensors:
+            analysis["suspicious_patterns"].append("No substantial weight matrices found")
+            return analysis
+
+        # Check for common ML model patterns in tensor sizes
+        common_ml_sizes: list[dict[str, Any]] = []
+        for tensor in large_tensors:
+            size = tensor["size"]
+            # Check if size could represent common ML architectures
+            elements = size // 4  # Assume float32
+
+            # Look for typical ML matrix dimensions (powers of 2, common vocab sizes, etc.)
+            potential_shapes: list[tuple[int, int]] = []
+            for dim1 in [64, 128, 256, 512, 768, 1024, 1536, 2048, 4096, 8192]:
+                if elements % dim1 == 0:
+                    dim2 = elements // dim1
+                    if 1 <= dim2 <= 100000:  # Reasonable range for ML dimensions
+                        potential_shapes.append((dim1, dim2))
+
+            if potential_shapes:
+                common_ml_sizes.append(
+                    {
+                        "tensor": tensor,
+                        "potential_shapes": potential_shapes[:5],  # Limit output
+                    }
+                )
+
+        if common_ml_sizes:
+            analysis["evidence"].append(f"Found {len(common_ml_sizes)} tensors with ML-compatible dimensions")
+            analysis["weight_matrices"] = common_ml_sizes
+            analysis["confidence"] += 0.4
+
+        # Check for hierarchical structure (multiple layers)
+        layer_evidence = 0
+        layer_keywords = ["layer", "block", "attention", "ffn", "mlp", "linear", "conv"]
+
+        for keyword in layer_keywords:
+            if keyword in str(obj).lower():
+                layer_evidence += 1
+
+        if layer_evidence >= 2:
+            analysis["evidence"].append(f"Found hierarchical layer structure ({layer_evidence} layer indicators)")
+            analysis["confidence"] += 0.3
+
+        # Check for embedding-like structures (large matrices typical of word embeddings)
+        embedding_evidence = 0
+        for tensor in large_tensors:
+            size = tensor["size"]
+            elements = size // 4
+
+            # Common embedding sizes: vocab_size x embedding_dim
+            # Common vocab sizes: 30522 (BERT), 50257 (GPT-2), 32000 (T5)
+            common_vocab_sizes = [30522, 50257, 32000, 28996, 51200]
+            common_embed_dims = [128, 256, 384, 512, 768, 1024, 1536, 2048]
+
+            for vocab_size in common_vocab_sizes:
+                for embed_dim in common_embed_dims:
+                    if abs(elements - (vocab_size * embed_dim)) < (vocab_size * embed_dim * 0.1):  # 10% tolerance
+                        embedding_evidence += 1
+                        analysis["evidence"].append(f"Found embedding-like matrix: ~{vocab_size}x{embed_dim}")
+                        break
+
+        if embedding_evidence > 0:
+            analysis["confidence"] += 0.3
+
+        # Penalize suspicious patterns
+        suspicious_data = 0
+        for tensor in tensors:
+            # Check for non-ML-like data patterns
+            if tensor["size"] < 100:  # Very small tensors are suspicious for model weights
+                suspicious_data += 1
+            elif tensor["size"] > 500 * 1024 * 1024:  # Extremely large (>500MB) single tensors
+                analysis["suspicious_patterns"].append(
+                    f"Extremely large single tensor: {tensor['size'] // 1024 // 1024}MB"
+                )
+                suspicious_data += 1
+
+        if suspicious_data > len(tensors) * 0.5:  # More than 50% suspicious
+            analysis["confidence"] *= 0.5
+
+        # Final confidence calculation
+        if analysis["confidence"] > 0.7:
+            analysis["is_ml_model"] = True
+            analysis["evidence"].append("High confidence this is a legitimate ML model based on structural analysis")
+        elif analysis["confidence"] > 0.4:
+            analysis["evidence"].append("Moderate confidence this could be an ML model")
+        else:
+            analysis["suspicious_patterns"].append("Low confidence in ML model structure - may be malicious data")
+
+        return analysis
+
     def _validate_flax_structure(self, obj: Any, result: ScanResult) -> None:
-        """Validate that the msgpack structure looks like a legitimate Flax checkpoint."""
+        """Validate that the msgpack structure looks like a legitimate Flax checkpoint using structural analysis."""
         if not isinstance(obj, dict):
             result.add_issue(
                 f"Unexpected top-level type: {type(obj).__name__} (expected dict)",
@@ -217,29 +357,93 @@ class FlaxMsgpackScanner(BaseScanner):
             )
             return
 
-        # Check for common Flax checkpoint patterns
+        # Check for standard Flax checkpoint patterns first
         expected_keys = {"params", "state", "opt_state", "model_state", "step", "epoch"}
         found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
 
-        if not any(key in found_keys for key in expected_keys):
+        has_standard_flax_keys = any(key in found_keys for key in expected_keys)
+
+        if has_standard_flax_keys:
+            # This looks like a standard Flax checkpoint
             result.add_issue(
-                "No standard Flax checkpoint keys found - may not be a legitimate model",
+                "Standard Flax checkpoint format detected",
+                severity=IssueSeverity.DEBUG,
+                location="root",
+                details={
+                    "found_standard_keys": [k for k in expected_keys if k in found_keys],
+                    "model_type": "standard_flax",
+                },
+            )
+            return
+
+        # If no standard keys, perform deep structural analysis
+        ml_analysis = self._analyze_ml_structure(obj, result)
+
+        if ml_analysis["is_ml_model"]:
+            # High confidence legitimate ML model based on structural analysis
+            result.add_issue(
+                f"Converted ML model detected (confidence: {ml_analysis['confidence']:.2f})",
+                severity=IssueSeverity.DEBUG,
+                location="root",
+                details={
+                    "analysis": ml_analysis,
+                    "model_type": "converted_ml_model",
+                    "structural_evidence": ml_analysis["evidence"],
+                },
+            )
+        elif ml_analysis["confidence"] > 0.4:
+            # Moderate confidence - flag for review but don't alarm
+            result.add_issue(
+                f"Possible ML model with moderate confidence ({ml_analysis['confidence']:.2f})",
                 severity=IssueSeverity.INFO,
                 location="root",
                 details={
-                    "found_keys": list(found_keys)[:20],  # Limit output
+                    "analysis": ml_analysis,
+                    "model_type": "possible_ml_model",
+                    "recommendation": "Manual review recommended",
+                },
+            )
+        else:
+            # Low confidence - this is suspicious
+            result.add_issue(
+                "Suspicious data structure - does not match known ML model patterns",
+                severity=IssueSeverity.WARNING,
+                location="root",
+                details={
+                    "analysis": ml_analysis,
+                    "found_keys": list(found_keys)[:20],
                     "expected_any_of": list(expected_keys),
+                    "model_type": "suspicious",
+                    "suspicious_patterns": ml_analysis["suspicious_patterns"],
                 },
             )
 
-        # Check for non-standard keys that might be suspicious
-        suspicious_top_level = found_keys - expected_keys - {"metadata", "config", "hyperparams"}
+        # Always check for truly suspicious top-level keys regardless of ML confidence
+        dangerous_keys = {
+            "__class__",
+            "__module__",
+            "__reduce__",
+            "__getstate__",
+            "__setstate__",
+            "__dict__",
+            "__code__",
+            "__globals__",
+            "__builtins__",
+            "__import__",
+            "eval",
+            "exec",
+            "subprocess",
+            "os",
+            "system",
+        }
+
+        suspicious_top_level = found_keys & dangerous_keys
         if suspicious_top_level:
             result.add_issue(
-                f"Unusual top-level keys found: {suspicious_top_level}",
-                severity=IssueSeverity.INFO,
+                f"Dangerous top-level keys detected: {suspicious_top_level}",
+                severity=IssueSeverity.CRITICAL,
                 location="root",
-                details={"unusual_keys": list(suspicious_top_level)},
+                details={"dangerous_keys": list(suspicious_top_level)},
             )
 
     def scan(self, path: str) -> ScanResult:

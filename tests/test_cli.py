@@ -717,3 +717,44 @@ def test_exit_code_scan_errors(tmp_path):
     # Should exit with code 2 for scan errors
     assert result.exit_code == 2
     assert "Error" in result.output
+
+
+def test_doctor_command():
+    """Test the doctor command for scanner diagnostics."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "ModelAudit System Diagnostics" in result.output
+    assert "Python version:" in result.output
+    assert "NumPy status:" in result.output
+    assert "Scanner Status:" in result.output
+    assert "Available:" in result.output
+    assert "Loaded:" in result.output
+    assert "Failed:" in result.output
+
+
+def test_doctor_command_with_show_failed():
+    """Test the doctor command with --show-failed flag."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["doctor", "--show-failed"])
+
+    assert result.exit_code == 0
+    assert "ModelAudit System Diagnostics" in result.output
+
+    # Should show failed scanners if any exist
+    if "Failed: 0" not in result.output:
+        assert "Failed Scanners:" in result.output or "Recommendations:" in result.output
+
+
+def test_doctor_command_numpy_status():
+    """Test that doctor command provides NumPy compatibility information."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "NumPy" in result.output
+
+    # Should provide either success message or recommendations
+    success_indicators = ["All scanners loaded successfully!", "Recommendations:"]
+    assert any(indicator in result.output for indicator in success_indicators)
