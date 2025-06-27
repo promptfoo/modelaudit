@@ -226,7 +226,17 @@ class TestFalsePositiveFixes:
             if weight_shape[1] > 1000:  # Large output dimension
                 weights[:, :100] *= 1.3  # Some outputs have different scales
 
-            anomalies = scanner._analyze_layer_weights(layer_name, weights)
+            # Create mock architecture analysis for LLM layers
+            architecture_analysis = {
+                "is_likely_transformer": True,
+                "is_likely_llm": True,
+                "confidence": 0.9,
+                "evidence": ["Mock LLM evidence"],
+                "architectural_features": {},
+                "total_parameters": 100_000_000,
+                "layer_count": 12,
+            }
+            anomalies = scanner._analyze_layer_weights(layer_name, weights, architecture_analysis)
 
             # Should return no anomalies due to LLM detection
             assert len(anomalies) == 0, f"LLM layer {layer_name} should not generate anomalies"
@@ -242,7 +252,17 @@ class TestFalsePositiveFixes:
         # Add a clear anomaly - one class with much larger weights (potential backdoor)
         weights[:, 5] = np.random.randn(512).astype(np.float32) * 3.0
 
-        anomalies = scanner._analyze_layer_weights("classifier.weight", weights)
+        # Create mock architecture analysis for small model
+        architecture_analysis = {
+            "is_likely_transformer": False,
+            "is_likely_llm": False,
+            "confidence": 0.3,
+            "evidence": ["Mock small model evidence"],
+            "architectural_features": {},
+            "total_parameters": 1_000_000,
+            "layer_count": 3,
+        }
+        anomalies = scanner._analyze_layer_weights("classifier.weight", weights, architecture_analysis)
 
         # Should detect the anomaly since this is not an LLM layer
         assert len(anomalies) > 0, "Non-LLM models should still be analyzed for anomalies"
