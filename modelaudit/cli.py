@@ -112,7 +112,8 @@ def scan_command(
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
 ) -> None:
-    """Scan files, directories, HuggingFace models, MLflow models, cloud storage, or JFrog artifacts for malicious content.
+    """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
+    or JFrog artifacts for security issues.
 
     \b
     Usage:
@@ -302,29 +303,6 @@ def scan_command(
 
                     logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
-
-            # Check if this is a cloud storage URL
-            elif is_cloud_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
-
-                try:
-                    download_path = download_from_cloud(path, cache_dir=None)
-                    actual_path = str(download_path)
-                    temp_dir = str(download_path)
-
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
-
-                except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
-
-                    logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading from {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
                     continue
 
