@@ -48,6 +48,7 @@ dill = ["dill>=0.3.0"]
 joblib = ["joblib>=1.0.0", "scikit-learn>=1.0.0"]
 flax = ["msgpack>=1.0.0"]
 tflite = ["tflite>=2.18.0"]
+mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
@@ -77,6 +78,7 @@ all = [
     "scikit-learn>=1.0.0",
     "msgpack>=1.0.0",
     "tflite>=2.18.0",
+    "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
 ]
 
