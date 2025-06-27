@@ -23,6 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger("modelaudit")
 
 
+def is_mlflow_uri(path: str) -> bool:
+    """Check if a path is an MLflow model URI."""
+    return path.startswith("models:/")
+
+
 @click.group()
 @click.version_option(__version__)
 def cli() -> None:
@@ -76,6 +81,11 @@ def cli() -> None:
     default=0,
     help="Maximum total bytes to scan before stopping [default: unlimited]",
 )
+@click.option(
+    "--registry-uri",
+    type=str,
+    help="MLflow registry URI (only used for MLflow model URIs)",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -86,14 +96,17 @@ def scan_command(
     verbose: bool,
     max_file_size: int,
     max_total_size: int,
+    registry_uri: Optional[str],
 ) -> None:
-    """Scan files, directories, or HuggingFace models for malicious content.
+    """Scan files, directories, HuggingFace models, or MLflow models for malicious content.
 
     \b
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
         modelaudit scan https://huggingface.co/user/model
         modelaudit scan hf://user/model
+        modelaudit scan models:/MyModel/1
+        modelaudit scan models:/MyModel/Production
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -108,6 +121,7 @@ def scan_command(
         --verbose, -v      Show detailed information during scanning
         --max-file-size    Maximum file size to scan in bytes
         --max-total-size   Maximum total bytes to scan before stopping
+        --registry-uri     MLflow registry URI (for MLflow models only)
 
     \b
     Exit codes:
@@ -194,6 +208,55 @@ def scan_command(
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
                     continue
+
+            # Check if this is an MLflow URI
+            elif is_mlflow_uri(path):
+                # Show download progress if in text mode
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
+
+                try:
+                    from .mlflow_integration import scan_mlflow_model
+
+                    # Use scan_mlflow_model to download and get scan results directly
+                    results = scan_mlflow_model(
+                        path,
+                        registry_uri=registry_uri,
+                        timeout=timeout,
+                        blacklist_patterns=list(blacklist) if blacklist else None,
+                        max_file_size=max_file_size,
+                        max_total_size=max_total_size,
+                    )
+
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
+
+                    # Aggregate results directly from MLflow scan
+                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                    aggregated_results["issues"].extend(results.get("issues", []))
+                    aggregated_results["files_scanned"] += results.get("files_scanned", 1)
+                    aggregated_results["assets"].extend(results.get("assets", []))
+                    if results.get("has_errors", False):
+                        aggregated_results["has_errors"] = True
+
+                    # Track scanner names
+                    for scanner in results.get("scanners", []):
+                        if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
+                            aggregated_results["scanner_names"].append(scanner)
+
+                    # Skip the normal scanning logic since we already have results
+                    continue
+
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
             else:
                 # For local paths, check if they exist
                 if not os.path.exists(path):
@@ -332,14 +395,6 @@ def scan_command(
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
 
-    # Format the output
-    if format == "json":
-        output_data = aggregated_results
-        output_text = json.dumps(output_data, indent=2)
-    else:
-        # Text format
-        output_text = format_text_output(aggregated_results, verbose)
-
     # Generate SBOM if requested
     if sbom:
         from .sbom import generate_sbom
@@ -347,6 +402,14 @@ def scan_command(
         sbom_text = generate_sbom(expanded_paths, aggregated_results)
         with open(sbom, "w") as f:
             f.write(sbom_text)
+
+    # Format the output
+    if format == "json":
+        output_data = aggregated_results
+        output_text = json.dumps(output_data, indent=2)
+    else:
+        # Text format
+        output_text = format_text_output(aggregated_results, verbose)
 
     # Send output to the specified destination
     if output:
