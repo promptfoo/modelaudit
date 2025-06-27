@@ -35,7 +35,7 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 50000)  # Increased for large models
-        
+
         # Enhanced suspicious patterns for JAX/Flax specific threats
         self.suspicious_patterns = self.config.get(
             "suspicious_patterns",
@@ -73,7 +73,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 r"from\s+os\s+import\s+system",
             ],
         )
-        
+
         self.suspicious_keys = self.config.get(
             "suspicious_keys",
             {
@@ -104,7 +104,7 @@ class FlaxMsgpackScanner(BaseScanner):
         )
 
         # JAX/Flax architecture patterns for better ML detection
-        self.jax_patterns = {
+        self.jax_patterns: dict[str, list[str]] = {
             "transformer_patterns": [
                 "attention", "self_attention", "multi_head", "mha", "mqa", "gqa",
                 "feed_forward", "ffn", "mlp", "dense", "linear",
@@ -133,31 +133,31 @@ class FlaxMsgpackScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
-        
+
         # Check file extension first
         if ext in cls.supported_extensions and HAS_MSGPACK:
             return True
-            
+
         # For files without clear extensions, check if they might be msgpack
         if HAS_MSGPACK and ext in [".ckpt", ""]:  # Some JAX checkpoints have no extension
             try:
                 with open(path, "rb") as f:
                     # Read first few bytes to check for msgpack format
                     header = f.read(32)
-                    if len(header) > 0:
-                        # Simple check for msgpack format markers
-                        if header[0:1] in [b"\x80", b"\x81", b"\x82", b"\x83", b"\x84", b"\x85", b"\x86", b"\x87",
-                                          b"\x88", b"\x89", b"\x8a", b"\x8b", b"\x8c", b"\x8d", b"\x8e", b"\x8f",
-                                          b"\xde", b"\xdf"]:  # Common msgpack format markers
-                            return True
+                    if len(header) > 0 and header[0:1] in [
+                        b"\x80", b"\x81", b"\x82", b"\x83", b"\x84", b"\x85", b"\x86", b"\x87",
+                        b"\x88", b"\x89", b"\x8a", b"\x8b", b"\x8c", b"\x8d", b"\x8e", b"\x8f",
+                        b"\xde", b"\xdf"  # Common msgpack format markers
+                    ]:
+                        return True
             except Exception:
                 pass
-                
+
         return False
 
     def _extract_jax_metadata(self, obj: Any, result: ScanResult) -> dict[str, Any]:
         """Extract JAX/Flax specific metadata from the checkpoint."""
-        metadata = {
+        metadata: dict[str, Any] = {
             "model_type": "unknown",
             "architecture_hints": [],
             "parameter_count": 0,
@@ -166,12 +166,12 @@ class FlaxMsgpackScanner(BaseScanner):
             "jax_version_hints": [],
             "orbax_format": False,
         }
-        
+
         if not isinstance(obj, dict):
             return metadata
-            
+
         # Check for Orbax format indicators
-        if any(key.startswith("__orbax") for key in obj.keys()):
+        if any(key.startswith("__orbax") for key in obj):
             metadata["orbax_format"] = True
             result.add_issue(
                 "Orbax checkpoint format detected",
@@ -179,14 +179,14 @@ class FlaxMsgpackScanner(BaseScanner):
                 location="root",
                 details={"checkpoint_format": "orbax"},
             )
-            
+
         # Analyze architecture patterns
         obj_str = str(obj).lower()
-        for pattern_type, patterns in self.jax_patterns.items():
+        for _pattern_type, patterns in self.jax_patterns.items():
             found_patterns = [p for p in patterns if p in obj_str]
             if found_patterns:
                 metadata["architecture_hints"].extend(found_patterns)
-                
+
         # Determine likely model type based on patterns
         if any(p in metadata["architecture_hints"] for p in self.jax_patterns["transformer_patterns"]):
             metadata["model_type"] = "transformer"
@@ -194,22 +194,22 @@ class FlaxMsgpackScanner(BaseScanner):
             metadata["model_type"] = "cnn"
         elif any(p in metadata["architecture_hints"] for p in self.jax_patterns["embedding_patterns"]):
             metadata["model_type"] = "embedding"
-            
+
         # Check for optimizer state
         opt_indicators = ["opt_state", "optimizer", "adam", "sgd", "learning_rate"]
         if any(indicator in obj_str for indicator in opt_indicators):
             metadata["has_optimizer_state"] = True
-            
+
         # Estimate parameter count and layer count
         def count_parameters(data: Any, path: str = "") -> int:
             count = 0
             if isinstance(data, dict):
                 # Count layers
-                layer_keys = [k for k in data.keys() if any(layer_word in str(k).lower() 
+                layer_keys = [k for k in data if any(layer_word in str(k).lower()
                              for layer_word in ["layer", "block", "level"])]
                 if layer_keys:
                     metadata["layer_count"] += len(layer_keys)
-                    
+
                 for key, value in data.items():
                     count += count_parameters(value, f"{path}/{key}" if path else key)
             elif isinstance(data, (list, tuple)):
@@ -220,9 +220,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 if len(data) >= 16 and len(data) % 4 == 0:
                     count += len(data) // 4
             return count
-            
+
         metadata["parameter_count"] = count_parameters(obj)
-        
+
         # Add metadata to scan result
         result.metadata.update({
             "jax_metadata": metadata,
@@ -230,25 +230,25 @@ class FlaxMsgpackScanner(BaseScanner):
             "model_architecture": metadata["model_type"],
             "layer_count": metadata["layer_count"],
         })
-        
+
         return metadata
 
     def _check_jax_specific_threats(self, obj: Any, result: ScanResult) -> None:
         """Check for JAX/Flax specific security threats."""
-        
+
         def check_jax_transforms(data: Any, path: str = "") -> None:
             """Check for potentially dangerous JAX transform usage."""
             if isinstance(data, dict):
                 for key, value in data.items():
                     key_str = str(key).lower()
                     value_str = str(value)
-                    
+
                     # Check for suspicious JAX transform patterns
                     dangerous_transforms = [
                         "jit_compile", "eval_jit", "exec_transform",
                         "dynamic_eval", "runtime_eval"
                     ]
-                    
+
                     for transform in dangerous_transforms:
                         if transform in key_str or transform in value_str.lower():
                             result.add_issue(
@@ -260,15 +260,15 @@ class FlaxMsgpackScanner(BaseScanner):
                                     "context": value_str[:200] if len(value_str) > 200 else value_str
                                 },
                             )
-                    
+
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
             elif isinstance(data, (list, tuple)):
                 for i, value in enumerate(data):
                     check_jax_transforms(value, f"{path}[{i}]")
-                    
+
         # Check for JAX-specific attack patterns
         check_jax_transforms(obj)
-        
+
         # Check for fake JAX arrays or suspicious array metadata
         def check_array_metadata(data: Any, path: str = "") -> None:
             if isinstance(data, dict):
@@ -280,7 +280,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         location=path,
                         details={"suspicious_key": "__jax_array__"},
                     )
-                
+
                 # Check for unusual shape specifications that might indicate attacks
                 if "shape" in data and isinstance(data["shape"], (list, tuple)):
                     shape = data["shape"]
@@ -298,10 +298,10 @@ class FlaxMsgpackScanner(BaseScanner):
                             location=path,
                             details={"shape": shape},
                         )
-                
+
                 for key, value in data.items():
                     check_array_metadata(value, f"{path}/{key}" if path else key)
-                    
+
         check_array_metadata(obj)
 
     def _check_suspicious_strings(
@@ -740,7 +740,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 result.metadata["key_count"] = len(obj.keys())
 
             # Extract JAX/Flax specific metadata and architecture information
-            jax_metadata = self._extract_jax_metadata(obj, result)
+            self._extract_jax_metadata(obj, result)
 
             # Validate Flax structure with enhanced analysis
             self._validate_flax_structure(obj, result)

