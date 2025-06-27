@@ -13,6 +13,7 @@ from yaspin.spinners import Spinners
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 from .utils.huggingface import download_model, is_huggingface_url
+from .utils.jfrog import download_artifact, is_jfrog_url
 
 # Configure logging
 logging.basicConfig(
@@ -86,13 +87,14 @@ def scan_command(
     max_file_size: int,
     max_total_size: int,
 ) -> None:
-    """Scan files, directories, or HuggingFace models for malicious content.
+    """Scan files, directories, or remote models for malicious content.
 
     \b
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
         modelaudit scan https://huggingface.co/user/model
         modelaudit scan hf://user/model
+        modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -156,7 +158,7 @@ def scan_command(
         actual_path = path
 
         try:
-            # Check if this is a HuggingFace URL
+            # Check if this is a HuggingFace or JFrog URL
             if is_huggingface_url(path):
                 # Show download progress if in text mode
                 if format == "text" and not output:
@@ -169,6 +171,27 @@ def scan_command(
                     actual_path = str(download_path)
                     # Track the temp directory for cleanup
                     temp_dir = str(download_path)
+
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+            elif is_jfrog_url(path):
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
+
+                try:
+                    download_path = download_artifact(path, cache_dir=None)
+                    actual_path = str(download_path)
+                    temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
                     if format == "text" and not output:
                         download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))

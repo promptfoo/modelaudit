@@ -171,6 +171,9 @@ modelaudit scan ./models/
 modelaudit scan https://huggingface.co/gpt2
 modelaudit scan hf://distilbert-base-uncased
 
+# Scan a model from JFrog Artifactory
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
 
