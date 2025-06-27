@@ -13,7 +13,9 @@ from yaspin.spinners import Spinners
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 from .utils import resolve_dvc_file
+from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
+from .utils.jfrog import download_artifact, is_jfrog_url
 
 # Configure logging
 logging.basicConfig(
@@ -86,6 +88,16 @@ def cli() -> None:
     type=str,
     help="MLflow registry URI (only used for MLflow model URIs)",
 )
+@click.option(
+    "--jfrog-api-token",
+    type=str,
+    help="JFrog API token for authentication (can also use JFROG_API_TOKEN env var or .env file)",
+)
+@click.option(
+    "--jfrog-access-token",
+    type=str,
+    help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -97,16 +109,30 @@ def scan_command(
     max_file_size: int,
     max_total_size: int,
     registry_uri: Optional[str],
+    jfrog_api_token: Optional[str],
+    jfrog_access_token: Optional[str],
 ) -> None:
-    """Scan files, directories, HuggingFace models, or MLflow models for malicious content.
+    """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
+    or JFrog artifacts for security issues.
 
     \b
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
         modelaudit scan https://huggingface.co/user/model
         modelaudit scan hf://user/model
+        modelaudit scan s3://my-bucket/models/
+        modelaudit scan gs://my-bucket/model.pt
         modelaudit scan models:/MyModel/1
         modelaudit scan models:/MyModel/Production
+        modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+    \b
+    JFrog Authentication (choose one method):
+        --jfrog-api-token      API token (recommended)
+        --jfrog-access-token   Access token
+
+    You can also set environment variables or create a .env file:
+        JFROG_API_TOKEN, JFROG_ACCESS_TOKEN
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -209,6 +235,29 @@ def scan_command(
                     aggregated_results["has_errors"] = True
                     continue
 
+            # Check if this is a cloud storage URL
+            elif is_cloud_url(path):
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
+
+                try:
+                    download_path = download_from_cloud(path, cache_dir=None)
+                    actual_path = str(download_path)
+                    temp_dir = str(download_path)
+
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                    logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
             # Check if this is an MLflow URI
             elif is_mlflow_uri(path):
                 # Show download progress if in text mode
@@ -247,6 +296,34 @@ def scan_command(
 
                     # Skip the normal scanning logic since we already have results
                     continue
+
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
+            # Check if this is a JFrog URL
+            elif is_jfrog_url(path):
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
+
+                try:
+                    download_path = download_artifact(
+                        path,
+                        cache_dir=None,
+                        api_token=jfrog_api_token,
+                        access_token=jfrog_access_token,
+                    )
+                    actual_path = str(download_path)
+                    temp_dir = str(download_path.parent if download_path.is_file() else download_path)
+
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
                 except Exception as e:
                     if format == "text" and not output:
