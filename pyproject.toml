@@ -32,6 +32,8 @@ dependencies = [
     "cyclonedx-python-lib>=10.2.0",
     "defusedxml>=0.7.1",
     "huggingface-hub>=0.20.0",
+    "requests>=2.25.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]

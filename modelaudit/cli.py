@@ -87,6 +87,16 @@ def cli() -> None:
     type=str,
     help="MLflow registry URI (only used for MLflow model URIs)",
 )
+@click.option(
+    "--jfrog-api-token",
+    type=str,
+    help="JFrog API token for authentication (can also use JFROG_API_TOKEN env var or .env file)",
+)
+@click.option(
+    "--jfrog-access-token",
+    type=str,
+    help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -98,6 +108,8 @@ def scan_command(
     max_file_size: int,
     max_total_size: int,
     registry_uri: Optional[str],
+    jfrog_api_token: Optional[str],
+    jfrog_access_token: Optional[str],
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, or JFrog artifacts for malicious content.
 
@@ -109,6 +121,14 @@ def scan_command(
         modelaudit scan models:/MyModel/1
         modelaudit scan models:/MyModel/Production
         modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+    \b
+    JFrog Authentication (choose one method):
+        --jfrog-api-token      API token (recommended)
+        --jfrog-access-token   Access token
+
+    You can also set environment variables or create a .env file:
+        JFROG_API_TOKEN, JFROG_ACCESS_TOKEN
 
     You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
 
@@ -266,7 +286,12 @@ def scan_command(
                     download_spinner.start()
 
                 try:
-                    download_path = download_artifact(path, cache_dir=None)
+                    download_path = download_artifact(
+                        path,
+                        cache_dir=None,
+                        api_token=jfrog_api_token,
+                        access_token=jfrog_access_token,
+                    )
                     actual_path = str(download_path)
                     temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
