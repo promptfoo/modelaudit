@@ -1,11 +1,44 @@
 import importlib
 import logging
 import threading
+import warnings
 from typing import Any, Optional
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
+
+
+def _check_numpy_compatibility() -> tuple[bool, str]:
+    """Check NumPy version compatibility and return status with message"""
+    try:
+        import numpy as np
+
+        numpy_version = np.__version__
+        major_version = int(numpy_version.split(".")[0])
+
+        if major_version >= 2:
+            return (
+                False,
+                f"NumPy {numpy_version} detected. Some ML frameworks may require NumPy < 2.0 for compatibility.",
+            )
+        else:
+            return True, f"NumPy {numpy_version} detected (compatible)."
+    except ImportError:
+        return False, "NumPy not available."
+
+
+def _is_numpy_compatibility_error(exception: Exception) -> bool:
+    """Check if an exception is related to NumPy compatibility issues"""
+    error_str = str(exception).lower()
+    numpy_indicators = [
+        "_array_api not found",
+        "numpy.dtype size changed",
+        "compiled using numpy 1.x cannot be run in numpy 2",
+        "compiled against numpy",
+        "binary incompatibility",
+    ]
+    return any(indicator in error_str for indicator in numpy_indicators)
 
 
 class ScannerRegistry:
@@ -19,7 +52,9 @@ class ScannerRegistry:
     def __init__(self):
         self._scanners: dict[str, dict[str, Any]] = {}
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
+        self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
+        self._numpy_compatible, self._numpy_status = _check_numpy_compatibility()
         self._init_registry()
 
     # Class-level constant for AI/ML manifest patterns
@@ -54,6 +89,7 @@ class ScannerRegistry:
                 "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
                 "priority": 1,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "pytorch_binary": {
                 "module": "modelaudit.scanners.pytorch_binary_scanner",
@@ -62,6 +98,7 @@ class ScannerRegistry:
                 "extensions": [".bin"],
                 "priority": 2,  # Must come before generic scanners for .bin files
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "tf_savedmodel": {
                 "module": "modelaudit.scanners.tf_savedmodel_scanner",
@@ -70,6 +107,7 @@ class ScannerRegistry:
                 "extensions": [".pb", ""],  # Empty string for directories
                 "priority": 3,
                 "dependencies": ["tensorflow"],  # Heavy dependency
+                "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
             },
             "keras_h5": {
                 "module": "modelaudit.scanners.keras_h5_scanner",
@@ -78,6 +116,7 @@ class ScannerRegistry:
                 "extensions": [".h5", ".hdf5", ".keras"],
                 "priority": 4,
                 "dependencies": ["h5py"],  # Heavy dependency
+                "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
             },
             "onnx": {
                 "module": "modelaudit.scanners.onnx_scanner",
@@ -86,6 +125,7 @@ class ScannerRegistry:
                 "extensions": [".onnx"],
                 "priority": 5,
                 "dependencies": ["onnx"],  # Heavy dependency
+                "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
             "pytorch_zip": {
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
@@ -94,6 +134,7 @@ class ScannerRegistry:
                 "extensions": [".pt", ".pth"],
                 "priority": 6,  # Must come before ZipScanner since .pt/.pth files are zip files
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "gguf": {
                 "module": "modelaudit.scanners.gguf_scanner",
@@ -102,6 +143,7 @@ class ScannerRegistry:
                 "extensions": [".gguf", ".ggml"],
                 "priority": 7,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "joblib": {
                 "module": "modelaudit.scanners.joblib_scanner",
@@ -110,6 +152,7 @@ class ScannerRegistry:
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "numpy": {
                 "module": "modelaudit.scanners.numpy_scanner",
@@ -118,6 +161,7 @@ class ScannerRegistry:
                 "extensions": [".npy", ".npz"],
                 "priority": 9,
                 "dependencies": [],  # numpy is core dependency
+                "numpy_sensitive": False,  # This scanner handles NumPy compatibility internally
             },
             "oci_layer": {
                 "module": "modelaudit.scanners.oci_layer_scanner",
@@ -126,6 +170,7 @@ class ScannerRegistry:
                 "extensions": [".manifest"],
                 "priority": 10,
                 "dependencies": [],  # pyyaml optional, handled gracefully
+                "numpy_sensitive": False,
             },
             "manifest": {
                 "module": "modelaudit.scanners.manifest_scanner",
@@ -146,6 +191,7 @@ class ScannerRegistry:
                 ],
                 "priority": 11,
                 "dependencies": [],  # pyyaml optional, handled gracefully
+                "numpy_sensitive": False,
             },
             "pmml": {
                 "module": "modelaudit.scanners.pmml_scanner",
@@ -154,6 +200,7 @@ class ScannerRegistry:
                 "extensions": [".pmml"],
                 "priority": 12,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "weight_distribution": {
                 "module": "modelaudit.scanners.weight_distribution_scanner",
@@ -177,6 +224,7 @@ class ScannerRegistry:
                     "onnx",
                     "safetensors",
                 ],  # Multiple heavy deps
+                "numpy_sensitive": True,  # Multiple ML frameworks
             },
             "safetensors": {
                 "module": "modelaudit.scanners.safetensors_scanner",
@@ -185,6 +233,7 @@ class ScannerRegistry:
                 "extensions": [".safetensors"],
                 "priority": 14,
                 "dependencies": [],  # No heavy dependencies for basic scanning
+                "numpy_sensitive": False,
             },
             "flax_msgpack": {
                 "module": "modelaudit.scanners.flax_msgpack_scanner",
@@ -193,6 +242,7 @@ class ScannerRegistry:
                 "extensions": [".msgpack"],
                 "priority": 15,
                 "dependencies": ["msgpack"],  # Light dependency
+                "numpy_sensitive": False,
             },
             "tflite": {
                 "module": "modelaudit.scanners.tflite_scanner",
@@ -201,6 +251,7 @@ class ScannerRegistry:
                 "extensions": [".tflite"],
                 "priority": 16,
                 "dependencies": ["tflite"],  # Heavy dependency
+                "numpy_sensitive": True,  # TensorFlow Lite can be sensitive
             },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
@@ -209,14 +260,19 @@ class ScannerRegistry:
                 "extensions": [".zip", ".npz"],
                 "priority": 99,  # Generic zip scanner should be last
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
         }
 
     def _load_scanner(self, scanner_id: str) -> Optional[type[BaseScanner]]:
-        """Lazy load a scanner class (thread-safe)"""
+        """Lazy load a scanner class (thread-safe) with enhanced error handling"""
         # Check if already loaded (fast path without lock)
         if scanner_id in self._loaded_scanners:
             return self._loaded_scanners[scanner_id]
+
+        # Check if already failed to load
+        if scanner_id in self._failed_scanners:
+            return None
 
         # Use lock for loading to prevent race conditions
         with self._lock:
@@ -224,24 +280,59 @@ class ScannerRegistry:
             if scanner_id in self._loaded_scanners:
                 return self._loaded_scanners[scanner_id]
 
+            if scanner_id in self._failed_scanners:
+                return None
+
             if scanner_id not in self._scanners:
                 return None
 
             scanner_info = self._scanners[scanner_id]
 
             try:
-                module = importlib.import_module(scanner_info["module"])
-                scanner_class = getattr(module, scanner_info["class"])
+                # Suppress warnings during import to avoid cluttering output
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    module = importlib.import_module(scanner_info["module"])
+                    scanner_class = getattr(module, scanner_info["class"])
+
                 self._loaded_scanners[scanner_id] = scanner_class
                 logger.debug(f"Loaded scanner: {scanner_id}")
                 return scanner_class
-            except ImportError as e:
-                logger.debug(f"Failed to load scanner {scanner_id}: {e}")
-                return None
-            except AttributeError as e:
-                logger.error(
-                    f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}",
-                )
+
+            except Exception as e:
+                # Enhanced error handling for all types of import failures
+                scanner_deps = scanner_info.get("dependencies", [])
+                is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
+
+                error_msg = f"Failed to load scanner {scanner_id}: {e}"
+
+                if _is_numpy_compatibility_error(e):
+                    if is_numpy_sensitive:
+                        error_msg = (
+                            f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
+                            f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
+                        )
+                    else:
+                        error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
+                elif isinstance(e, ImportError):
+                    if scanner_deps:
+                        error_msg = (
+                            f"Scanner {scanner_id} requires dependencies: {scanner_deps}. "
+                            f"Install with 'pip install modelaudit[{','.join(scanner_deps)}]'"
+                        )
+                    else:
+                        error_msg = f"Scanner {scanner_id} import failed: {e}"
+                elif isinstance(e, AttributeError):
+                    error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
+
+                # Store failure reason and log appropriately
+                self._failed_scanners[scanner_id] = error_msg
+
+                if is_numpy_sensitive and not self._numpy_compatible:
+                    logger.info(error_msg)  # Info level for expected NumPy issues
+                else:
+                    logger.debug(error_msg)  # Debug level for other issues
+
                 return None
 
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
@@ -298,6 +389,14 @@ class ScannerRegistry:
     def load_scanner_by_id(self, scanner_id: str) -> Optional[type[BaseScanner]]:
         """Load a specific scanner by ID (public API)"""
         return self._load_scanner(scanner_id)
+
+    def get_failed_scanners(self) -> dict[str, str]:
+        """Get information about scanners that failed to load"""
+        return self._failed_scanners.copy()
+
+    def get_numpy_status(self) -> tuple[bool, str]:
+        """Get NumPy compatibility status"""
+        return self._numpy_compatible, self._numpy_status
 
     def _is_aiml_manifest_file(self, filename: str) -> bool:
         """Check if filename matches AI/ML manifest patterns."""
