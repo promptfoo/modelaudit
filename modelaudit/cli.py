@@ -12,6 +12,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .utils import resolve_dvc_file
 from .utils.huggingface import download_model, is_huggingface_url
 
 # Configure logging
@@ -128,6 +129,18 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
+    # Expand DVC pointer files before scanning
+    expanded_paths = []
+    for p in paths:
+        if os.path.isfile(p) and p.endswith(".dvc"):
+            targets = resolve_dvc_file(p)
+            if targets:
+                expanded_paths.extend(targets)
+            else:
+                expanded_paths.append(p)
+        else:
+            expanded_paths.append(p)
+
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
         header = [
@@ -140,7 +153,7 @@ def scan_command(
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
+        click.echo(f"Paths to scan: {click.style(', '.join(expanded_paths), fg='green')}")
         if blacklist:
             click.echo(
                 f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
@@ -164,7 +177,7 @@ def scan_command(
     }
 
     # Scan each path
-    for path in paths:
+    for path in expanded_paths:
         # Track temp directory for cleanup
         temp_dir = None
         actual_path = path
@@ -386,7 +399,7 @@ def scan_command(
     if sbom:
         from .sbom import generate_sbom
 
-        sbom_text = generate_sbom(paths, aggregated_results)
+        sbom_text = generate_sbom(expanded_paths, aggregated_results)
         with open(sbom, "w") as f:
             f.write(sbom_text)
 
