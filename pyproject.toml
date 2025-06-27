@@ -31,9 +31,13 @@ dependencies = [
     "scipy>=1.5.0",
     "cyclonedx-python-lib>=10.2.0",
     "defusedxml>=0.7.1",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.optional-dependencies]
+# Note: ML frameworks may require NumPy < 2.0 for compatibility
+# If you encounter NumPy compatibility issues, consider using:
+# pip install "numpy<2.0" tensorflow h5py torch onnx
 tensorflow = ["tensorflow>=2.13.0"]
 h5 = ["h5py>=3.1"]
 pytorch = ["torch>=1.6"]
@@ -45,6 +49,22 @@ joblib = ["joblib>=1.0.0", "scikit-learn>=1.0.0"]
 flax = ["msgpack>=1.0.0"]
 tflite = ["tflite>=2.18.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
+# Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
+numpy1 = [
+    "numpy>=1.19.0,<2.0",
+    "tensorflow>=2.13.0",
+    "h5py>=3.1",
+    "torch>=1.6",
+    "pyyaml>=6.0",
+    "safetensors>=0.4.0",
+    "onnx>=1.12.0",
+    "dill>=0.3.0",
+    "joblib>=1.0.0",
+    "scikit-learn>=1.0.0",
+    "msgpack>=1.0.0",
+    "tflite>=2.18.0",
+    "huggingface-hub>=0.23.0",
+]
 all = [
     "tensorflow>=2.13.0",
     "h5py>=3.1",

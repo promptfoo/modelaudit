@@ -612,5 +612,75 @@ def _format_issue(
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
+@cli.command()
+@click.option(
+    "--show-failed",
+    is_flag=True,
+    help="Show detailed information about failed scanners",
+)
+def doctor(show_failed: bool):
+    """Diagnose scanner compatibility and system status"""
+    import sys
+
+    from .scanners import _registry
+
+    click.echo("ModelAudit System Diagnostics")
+    click.echo("=" * 40)
+
+    # System information
+    click.echo(f"Python version: {sys.version.split()[0]}")
+
+    # NumPy status
+    numpy_compatible, numpy_status = _registry.get_numpy_status()
+    numpy_color = "green" if numpy_compatible else "yellow"
+    click.echo("NumPy status: ", nl=False)
+    click.secho(numpy_status, fg=numpy_color)
+
+    # Scanner status
+    available_scanners = _registry.get_available_scanners()
+    failed_scanners = _registry.get_failed_scanners()
+    loaded_count = len(available_scanners) - len(failed_scanners)
+
+    click.echo("\nScanner Status:")
+    click.echo(f"  Available: {len(available_scanners)} total")
+    click.echo(f"  Loaded: {loaded_count}")
+    click.echo(f"  Failed: {len(failed_scanners)}")
+
+    if show_failed and failed_scanners:
+        click.echo("\nFailed Scanners:")
+        for scanner_id, error_msg in failed_scanners.items():
+            click.echo(f"  {scanner_id}: {error_msg}")
+
+    # Recommendations
+    if failed_scanners:
+        click.echo("\nRecommendations:")
+
+        # Check for NumPy compatibility issues
+        numpy_sensitive_failed = []
+        for scanner_id in failed_scanners:
+            scanner_info = _registry.get_scanner_info(scanner_id)
+            if scanner_info and scanner_info.get("numpy_sensitive", False):
+                numpy_sensitive_failed.append(scanner_id)
+
+        if numpy_sensitive_failed and not numpy_compatible:
+            click.echo("• NumPy compatibility issues detected:")
+            click.echo("  For NumPy 1.x compatibility: pip install 'numpy<2.0'")
+            click.echo("  Then reinstall ML frameworks: pip install --force-reinstall tensorflow torch h5py")
+
+        # Check for missing dependencies
+        missing_deps = set()
+        for scanner_id in failed_scanners:
+            scanner_info = _registry.get_scanner_info(scanner_id)
+            if scanner_info:
+                deps = scanner_info.get("dependencies", [])
+                missing_deps.update(deps)
+
+        if missing_deps:
+            click.echo(f"• Install missing dependencies: pip install modelaudit[{','.join(missing_deps)}]")
+
+    if not failed_scanners:
+        click.secho("✓ All scanners loaded successfully!", fg="green")
+
+
 def main() -> None:
     cli()
