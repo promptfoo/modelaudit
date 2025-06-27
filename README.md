@@ -184,6 +184,23 @@ modelaudit scan hf://distilbert-base-uncased
 modelaudit scan s3://my-bucket/models/
 modelaudit scan gs://my-bucket/model.pt
 
+# Scan a model from JFrog Artifactory
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+# With API token authentication (recommended)
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-api-token YOUR_API_TOKEN
+
+# With access token authentication
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-access-token YOUR_ACCESS_TOKEN
+
+# Using environment variables (recommended for CI/CD)
+export JFROG_API_TOKEN=your_token_here
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+# Using .env file (create a .env file in your project root)
+echo "JFROG_API_TOKEN=your_token_here" > .env
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
 
