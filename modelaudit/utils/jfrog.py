@@ -75,7 +75,7 @@ def download_artifact(
         env_api_token = os.getenv("JFROG_API_TOKEN")
         if env_api_token:
             headers["X-JFrog-Art-Api"] = env_api_token
-    
+
     # 2. Check for access token (only if API token not found)
     if "X-JFrog-Art-Api" not in headers:
         if access_token:
