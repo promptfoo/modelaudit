@@ -49,7 +49,7 @@ class TFLiteScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
                 result.bytes_scanned = len(data)
-            model = tflite.Model.Model.GetRootAsModel(data, 0)
+            model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
             result.add_issue(
                 f"Invalid TFLite file or parse error: {e}",
@@ -105,7 +105,7 @@ class TFLiteScanner(BaseScanner):
                     name = custom.decode("utf-8", "ignore") if custom else "unknown"
                     result.add_issue(
                         f"Model uses custom operator '{name}'",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.CRITICAL,
                         location=f"{path} (operator {o_index})",
                         details={"custom_op": name},
                     )
