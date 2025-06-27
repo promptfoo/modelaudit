@@ -1,12 +1,13 @@
-import pytest
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch
 
-from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tflite_scanner import TFLiteScanner, _MAX_COUNT, _MAX_DIM
+import pytest
+
+from modelaudit.scanners.tflite_scanner import _MAX_COUNT, _MAX_DIM, TFLiteScanner
 
 # Try to import tflite to check availability
 try:
     import tflite  # noqa: F401
+
     HAS_TFLITE = True
 except ImportError:
     HAS_TFLITE = False
@@ -16,7 +17,7 @@ def test_tflite_scanner_can_handle(tmp_path):
     """Test the can_handle method when tflite is available."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some content")
-    
+
     if HAS_TFLITE:
         assert TFLiteScanner.can_handle(str(path)) is True
     else:
@@ -42,7 +43,7 @@ def test_tflite_scanner_no_tflite_installed(tmp_path):
     """Test scanner behavior when tflite package is not installed."""
     path = tmp_path / "model.tflite"
     path.touch()
-    
+
     with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
@@ -55,9 +56,10 @@ def test_tflite_scanner_parsing_error(tmp_path):
     """Test scanner behavior with invalid tflite data."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"invalid tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root:
-        mock_get_root.side_effect = Exception("parsing error")
+
+    # Mock the tflite module to simulate parsing error
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
+        mock_tflite.Model.GetRootAsModel.side_effect = Exception("parsing error")
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert not result.success
@@ -69,12 +71,34 @@ def test_tflite_scanner_large_subgraph_count(tmp_path):
     """Test scanner behavior with excessive subgraph count."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root:
+
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = _MAX_COUNT + 1
-        mock_get_root.return_value = mock_model
-        
+
+        # Mock subgraphs to avoid iteration issues
+        mock_subgraph = MagicMock()
+        mock_subgraph.TensorsLength.return_value = 1
+        mock_subgraph.OperatorsLength.return_value = 1
+
+        # Mock tensor to avoid dimension checking issues
+        mock_tensor = MagicMock()
+        mock_tensor.ShapeLength.return_value = 1
+        mock_tensor.Shape.return_value = 1
+        mock_subgraph.Tensors.return_value = mock_tensor
+
+        # Mock operator to avoid opcode checking issues
+        mock_operator = MagicMock()
+        mock_operator.OpcodeIndex.return_value = 0
+        mock_subgraph.Operators.return_value = mock_operator
+
+        mock_opcode = MagicMock()
+        mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.ADD
+        mock_model.OperatorCodes.return_value = mock_opcode
+
+        mock_model.Subgraphs.return_value = mock_subgraph
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert not result.success
@@ -86,16 +110,16 @@ def test_tflite_scanner_large_tensor_count(tmp_path):
     """Test scanner behavior with excessive tensor count."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root:
+
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = 1
         mock_subgraph = MagicMock()
         mock_subgraph.TensorsLength.return_value = _MAX_COUNT + 1
         mock_subgraph.OperatorsLength.return_value = 1
         mock_model.Subgraphs.return_value = mock_subgraph
-        mock_get_root.return_value = mock_model
-        
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert not result.success
@@ -107,8 +131,8 @@ def test_tflite_scanner_large_tensor_dimension(tmp_path):
     """Test scanner behavior with excessive tensor dimensions."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root:
+
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = 1
         mock_subgraph = MagicMock()
@@ -119,8 +143,8 @@ def test_tflite_scanner_large_tensor_dimension(tmp_path):
         mock_tensor.Shape.return_value = _MAX_DIM + 1
         mock_subgraph.Tensors.return_value = mock_tensor
         mock_model.Subgraphs.return_value = mock_subgraph
-        mock_get_root.return_value = mock_model
-        
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert not result.success
@@ -132,10 +156,8 @@ def test_tflite_scanner_custom_operator(tmp_path):
     """Test scanner behavior with custom operators."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root, \
-         patch("tflite.BuiltinOperator") as mock_builtin_op:
-        
+
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = 1
         mock_subgraph = MagicMock()
@@ -149,12 +171,12 @@ def test_tflite_scanner_custom_operator(tmp_path):
         mock_operator.OpcodeIndex.return_value = 0
         mock_subgraph.Operators.return_value = mock_operator
         mock_opcode = MagicMock()
-        mock_opcode.BuiltinCode.return_value = mock_builtin_op.CUSTOM
+        mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.CUSTOM
         mock_opcode.CustomCode.return_value = b"my_custom_op"
         mock_model.OperatorCodes.return_value = mock_opcode
         mock_model.Subgraphs.return_value = mock_subgraph
-        mock_get_root.return_value = mock_model
-        
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert not result.success
@@ -167,10 +189,8 @@ def test_tflite_scanner_safe_model(tmp_path):
     """Test scanner behavior with safe model."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
-    with patch("tflite.Model.GetRootAsModel") as mock_get_root, \
-         patch("tflite.BuiltinOperator") as mock_builtin_op:
-        
+
+    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = 1
         mock_subgraph = MagicMock()
@@ -184,11 +204,11 @@ def test_tflite_scanner_safe_model(tmp_path):
         mock_operator.OpcodeIndex.return_value = 0
         mock_subgraph.Operators.return_value = mock_operator
         mock_opcode = MagicMock()
-        mock_opcode.BuiltinCode.return_value = mock_builtin_op.ADD
+        mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.ADD
         mock_model.OperatorCodes.return_value = mock_opcode
         mock_model.Subgraphs.return_value = mock_subgraph
-        mock_get_root.return_value = mock_model
-        
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert result.success
@@ -199,11 +219,9 @@ def test_tflite_scanner_metadata_collection(tmp_path):
     """Test that scanner collects appropriate metadata."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
-    
+
     if HAS_TFLITE:
-        with patch("tflite.Model.GetRootAsModel") as mock_get_root, \
-             patch("tflite.BuiltinOperator") as mock_builtin_op:
-            
+        with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
             mock_model = MagicMock()
             mock_model.SubgraphsLength.return_value = 2
             mock_subgraph = MagicMock()
@@ -217,14 +235,14 @@ def test_tflite_scanner_metadata_collection(tmp_path):
             mock_operator.OpcodeIndex.return_value = 0
             mock_subgraph.Operators.return_value = mock_operator
             mock_opcode = MagicMock()
-            mock_opcode.BuiltinCode.return_value = mock_builtin_op.ADD
+            mock_opcode.BuiltinCode.return_value = mock_tflite.BuiltinOperator.ADD
             mock_model.OperatorCodes.return_value = mock_opcode
             mock_model.Subgraphs.return_value = mock_subgraph
-            mock_get_root.return_value = mock_model
-            
+            mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
             scanner = TFLiteScanner()
             result = scanner.scan(str(path))
-            
+
             assert "subgraph_count" in result.metadata
             assert result.metadata["subgraph_count"] == 2
             assert "tensor_counts" in result.metadata
