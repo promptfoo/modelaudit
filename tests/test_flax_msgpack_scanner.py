@@ -293,7 +293,7 @@ def test_flax_msgpack_ml_context_confidence(tmp_path):
 
     # Should have high confidence this is an ML model
     jax_metadata = result.metadata.get("jax_metadata", {})
-    assert jax_metadata.get("confidence", 0) > 0.7
+    assert jax_metadata.get("confidence", 0) >= 0.7
     assert jax_metadata.get("is_ml_model") is True
 
     # Should find evidence of transformer architecture

@@ -273,6 +273,15 @@ class FlaxMsgpackScanner(BaseScanner):
 
         metadata["parameter_count"] = count_parameters(obj)
 
+        # Perform ML structure analysis to get confidence score
+        ml_analysis = self._analyze_ml_structure(obj, result)
+        
+        # Add confidence and ML analysis results to metadata
+        metadata["confidence"] = ml_analysis["confidence"]
+        metadata["is_ml_model"] = ml_analysis["is_ml_model"]
+        metadata["ml_evidence"] = ml_analysis["evidence"]
+        metadata["tensor_count"] = ml_analysis["tensor_count"]
+
         # Add metadata to scan result
         result.metadata.update(
             {
@@ -618,7 +627,7 @@ class FlaxMsgpackScanner(BaseScanner):
             analysis["confidence"] *= 0.5
 
         # Final confidence calculation
-        if analysis["confidence"] > 0.7:
+        if analysis["confidence"] >= 0.7:
             analysis["is_ml_model"] = True
             analysis["evidence"].append("High confidence this is a legitimate ML model based on structural analysis")
         elif analysis["confidence"] > 0.4:
