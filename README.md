@@ -191,6 +191,68 @@ modelaudit scan model.pkl --format json --output results.json
 modelaudit scan model.pkl --sbom sbom.json
 ```
 
+### Cloud Storage Authentication
+
+ModelAudit supports scanning models directly from cloud storage. Authentication is handled automatically using standard cloud provider credentials.
+
+#### Amazon S3
+
+**Environment Variables:**
+
+```bash
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_DEFAULT_REGION="us-east-1"  # Optional
+
+# Then scan
+modelaudit scan s3://my-bucket/model.pkl
+```
+
+**AWS Credentials File (`~/.aws/credentials`):**
+
+```ini
+[default]
+aws_access_key_id = your-access-key
+aws_secret_access_key = your-secret-key
+region = us-east-1
+```
+
+**IAM Roles:** Automatically detected when running on EC2 instances or other AWS services.
+
+#### Google Cloud Storage (GCS)
+
+**Service Account Key:**
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+
+# Then scan
+modelaudit scan gs://my-bucket/model.pt
+```
+
+**Application Default Credentials (ADC):**
+
+```bash
+# Authenticate with gcloud (for development)
+gcloud auth application-default login
+
+# Or use service account (for production)
+gcloud auth activate-service-account --key-file=/path/to/key.json
+```
+
+#### Cloudflare R2
+
+R2 uses S3-compatible authentication:
+
+```bash
+export AWS_ACCESS_KEY_ID="your-r2-access-key"
+export AWS_SECRET_ACCESS_KEY="your-r2-secret-key"
+export AWS_ENDPOINT_URL="https://your-account.r2.cloudflarestorage.com"
+
+# Then scan
+modelaudit scan r2://my-bucket/model.safetensors
+```
+
 **Example output:**
 
 ```bash
@@ -460,6 +522,27 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 ```bash
 # Increase file size limit and timeout for large models
 modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
+```
+
+**Cloud Storage Authentication:**
+
+```bash
+# Check AWS credentials
+aws sts get-caller-identity
+
+# Check GCS authentication
+gcloud auth list
+
+# Test S3 access
+aws s3 ls s3://your-bucket/
+
+# Test GCS access
+gsutil ls gs://your-bucket/
+
+# Common authentication errors:
+# - "NoCredentialsError": Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# - "DefaultCredentialsError": Set GOOGLE_APPLICATION_CREDENTIALS or run gcloud auth
+# - "Access Denied": Check bucket permissions and IAM roles
 ```
 
 **Testing:**
