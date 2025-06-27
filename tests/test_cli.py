@@ -440,7 +440,8 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     mock_rmtree.assert_called()
 
 
-def test_scan_mixed_paths_and_urls():
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_mixed_paths_and_urls(mock_scan):
     """Test scanning both local paths and HuggingFace URLs in one command."""
     runner = CliRunner()
 
@@ -453,6 +454,143 @@ def test_scan_mixed_paths_and_urls():
 
         # Should report error for missing local file
         assert "Path does not exist: /local/path/model.pkl" in result.output
+
+
+@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+def test_scan_mlflow_uri_success(mock_scan_mlflow):
+    """Test successful scanning of an MLflow URI."""
+    # Setup mock
+    mock_scan_mlflow.return_value = {
+        "bytes_scanned": 1024,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "models:/TestModel/1", "--registry-uri", "http://localhost:5000"])
+
+    # Should succeed
+    assert result.exit_code == 0
+    assert "Downloaded & Scanned" in result.output or "Clean" in result.output
+
+    # Verify MLflow scan was called with correct parameters
+    mock_scan_mlflow.assert_called_once_with(
+        "models:/TestModel/1",
+        registry_uri="http://localhost:5000",
+        timeout=300,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+    )
+
+
+@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
+    """Test MLflow URI scanning with additional options."""
+    # Setup mock
+    mock_scan_mlflow.return_value = {
+        "bytes_scanned": 2048,
+        "issues": [{"message": "Test issue", "severity": "warning"}],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "models:/TestModel/Production",
+            "--registry-uri",
+            "http://mlflow.example.com",
+            "--timeout",
+            "600",
+            "--blacklist",
+            "malicious",
+            "--blacklist",
+            "unsafe",
+            "--max-file-size",
+            "1000000",
+            "--max-total-size",
+            "5000000",
+            "--verbose",
+        ],
+    )
+
+    # Should succeed with findings
+    assert result.exit_code == 1  # Exit code 1 indicates issues found
+
+    # Verify MLflow scan was called with all options
+    mock_scan_mlflow.assert_called_once_with(
+        "models:/TestModel/Production",
+        registry_uri="http://mlflow.example.com",
+        timeout=600,
+        blacklist_patterns=["malicious", "unsafe"],
+        max_file_size=1000000,
+        max_total_size=5000000,
+    )
+
+
+@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+def test_scan_mlflow_uri_error(mock_scan_mlflow):
+    """Test error handling for MLflow URI scanning."""
+    # Setup mock to raise an error
+    mock_scan_mlflow.side_effect = Exception("MLflow connection failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "models:/TestModel/1"])
+
+    # Should fail with error code 2
+    assert result.exit_code == 2
+    assert "Error downloading model" in result.output
+    assert "MLflow connection failed" in result.output
+
+
+@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
+    """Test MLflow URI scanning with JSON output format."""
+    # Setup mock
+    mock_scan_mlflow.return_value = {
+        "bytes_scanned": 1024,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [{"path": "model.pkl", "type": "pickle"}],
+        "has_errors": False,
+        "scanners": ["pickle"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "models:/TestModel/1", "--format", "json"])
+
+    # Should succeed and output JSON
+    assert result.exit_code == 0
+
+    # Should contain JSON output
+    assert "bytes_scanned" in result.output
+    assert "files_scanned" in result.output
+    assert "assets" in result.output
+
+
+def test_is_mlflow_uri():
+    """Test the is_mlflow_uri helper function."""
+    from modelaudit.cli import is_mlflow_uri
+
+    # Test valid MLflow URIs
+    assert is_mlflow_uri("models:/MyModel/1")
+    assert is_mlflow_uri("models:/MyModel/Production")
+    assert is_mlflow_uri("models:/MyModel/Staging")
+
+    # Test invalid URIs
+    assert not is_mlflow_uri("/path/to/model.pkl")
+    assert not is_mlflow_uri("https://huggingface.co/model")
+    assert not is_mlflow_uri("hf://model")
+    assert not is_mlflow_uri("model.pkl")
+    assert not is_mlflow_uri("models:invalid")
 
 
 def test_format_text_output_normal_scan_duration():
