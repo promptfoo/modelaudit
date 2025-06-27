@@ -23,7 +23,7 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    import tensorflow as tf  # noqa: F401
+    import tensorflow as tf
 
     HAS_TENSORFLOW = True
 except ImportError:
@@ -65,9 +65,7 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
-            return HAS_TENSORFLOW and os.path.exists(
-                os.path.join(path, "saved_model.pb")
-            )
+            return HAS_TENSORFLOW and os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False
@@ -257,10 +255,7 @@ class WeightDistributionScanner(BaseScanner):
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
-                        if (
-                            "weight" not in name.lower()
-                            and "kernel" not in name.lower()
-                        ):
+                        if "weight" not in name.lower() and "kernel" not in name.lower():
                             continue
                         tensor = tf.train.load_variable(ckpt_prefix, name)
                         array = np.array(tensor)
@@ -276,7 +271,7 @@ class WeightDistributionScanner(BaseScanner):
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2
 
-                nodes = []
+                nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
                 try:
                     saved_model.ParseFromString(data)
@@ -289,7 +284,7 @@ class WeightDistributionScanner(BaseScanner):
                 if not nodes:
                     graph_def = graph_pb2.GraphDef()
                     graph_def.ParseFromString(data)
-                    nodes = graph_def.node
+                    nodes = list(graph_def.node)
 
                 for node in nodes:
                     if node.op == "Const" and "value" in node.attr:
@@ -301,10 +296,7 @@ class WeightDistributionScanner(BaseScanner):
                             and array.nbytes > self.max_file_read_size
                         ):
                             continue
-                        if (
-                            "weight" in node.name.lower()
-                            or "kernel" in node.name.lower()
-                        ) and len(array.shape) >= 2:
+                        if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")

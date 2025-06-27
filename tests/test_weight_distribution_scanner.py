@@ -22,7 +22,7 @@ except ImportError:
     HAS_H5PY = False
 
 try:
-    import tensorflow as tf  # noqa: F401
+    import tensorflow as tf
 
     HAS_TENSORFLOW = True
 except Exception:
