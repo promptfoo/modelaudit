@@ -337,6 +337,8 @@ def test_scan_huggingface_url_help():
     assert result.exit_code == 0
     assert "https://huggingface.co/user/model" in result.output
     assert "hf://user/model" in result.output
+    assert "s3://my-bucket/models/" in result.output
+    assert "models:/MyModel/1" in result.output
 
 
 def test_scan_jfrog_url_help():
@@ -471,6 +473,74 @@ def test_scan_mixed_paths_and_urls(mock_scan):
 
         # Should report error for missing local file
         assert "Path does not exist: /local/path/model.pkl" in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+    """Test scanning a cloud storage URL successfully."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud"
+    test_dir.mkdir()
+    (test_dir / "model.bin").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 123,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "s3://bucket/model.bin"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
+    """Test download failure for cloud storage URL."""
+    mock_is_cloud.return_value = True
+    mock_download.side_effect = Exception("boom")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "s3://bucket/model.bin"])
+
+    assert result.exit_code == 2
+    assert "Error downloading" in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+    """Test scanning a cloud storage URL that has issues."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud"
+    test_dir.mkdir()
+    (test_dir / "model.pkl").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 123,
+        "issues": [{"message": "bad", "severity": "critical", "location": "model.pkl"}],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["pickle"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "gs://bucket/model.pkl"])
+
+    assert result.exit_code == 1
+    mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.is_jfrog_url")
