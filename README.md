@@ -103,6 +103,9 @@ pip install modelaudit[joblib]
 # For Flax msgpack scanning
 pip install modelaudit[flax]
 
+# For S3/GCS/R2 cloud storage support
+pip install modelaudit[cloud]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 
@@ -170,6 +173,10 @@ modelaudit scan ./models/
 # Scan a model from HuggingFace Hub
 modelaudit scan https://huggingface.co/gpt2
 modelaudit scan hf://distilbert-base-uncased
+
+# Scan models from cloud storage
+modelaudit scan s3://my-bucket/models/
+modelaudit scan gs://my-bucket/model.pt
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
