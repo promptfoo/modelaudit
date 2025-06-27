@@ -637,6 +637,37 @@ class ManifestScanner(BaseScanner):
             if any(pattern in key_lower for pattern in encoder_decoder_safe_patterns):
                 return True
 
+        # Special case for GLM (General Language Model) architecture patterns
+        # GLM models use specific layer naming conventions that trigger false positives
+        # GLM models can be detected as "huggingface", "pytorch", or have null framework (SafeTensors)
+        if (ml_context.get("framework") in ["huggingface", "pytorch", None]) and "execution" in matches:
+            # GLM architecture patterns from models like ChatGLM, GLM-4, etc.
+            # These are legitimate transformer components with GLM-specific naming
+            # Note: keys include "weight_map." prefix from model index files
+            # IMPORTANT: All patterns must be lowercase since key_lower is used for matching
+            glm_safe_patterns = [
+                # GLM transformer layer patterns (with weight_map prefix) - LOWERCASE
+                "weight_map.transformer.encoder.layers.",  # GLM encoder layer prefix
+                "weight_map.transformer.encoder.final_layernorm",  # GLM final layer normalization
+                "weight_map.transformer.output_layer",  # GLM output layer
+                # GLM layer component patterns (can appear anywhere in key) - LOWERCASE
+                ".input_layernorm.weight",  # Input layer normalization weights
+                ".post_attention_layernorm.weight",  # Post-attention layer normalization
+                ".mlp.dense_4h_to_h.weight",  # MLP dense layer (4h to h dimension)
+                ".mlp.dense_h_to_4h.weight",  # MLP dense layer (h to 4h dimension)
+                ".self_attention.dense.weight",  # Self-attention dense projection
+                ".self_attention.query_key_value.weight",  # QKV projection weights
+                ".self_attention.query_key_value.bias",  # QKV projection bias
+                # Additional GLM-specific patterns (with weight_map prefix) - LOWERCASE
+                "weight_map.rotary_pos_emb",  # Rotary positional embeddings
+                "weight_map.word_embeddings",  # Word embedding layers
+                "weight_map.position_embeddings",  # Position embedding layers (if used)
+            ]
+
+            # Check for GLM patterns in the key
+            if any(pattern in key_lower for pattern in glm_safe_patterns):
+                return True
+
         # Special case for vision-language models (CLIP, ViLT, BLIP, etc.)
         # Check CLIP specific patterns first - these are legitimate config keys
         if "execution" in matches and "config" in key_lower:

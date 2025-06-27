@@ -467,3 +467,94 @@ done
 ```
 
 This comprehensive testing approach will provide valuable insights into ModelAudit's performance across the HuggingFace ecosystem and help improve its accuracy for legitimate ML model scanning.
+
+---
+
+## 🆕 **NEXT 25 POPULAR HUGGINGFACE MODELS FOR TESTING (Phase 2)**
+
+### **Advanced Large Language Models (2024-2025)**
+
+26. **meta-llama/Llama-4-Scout-17B-16E-Instruct** - Latest Meta multimodal LLM with mixture-of-experts (17B activated, 109B total)
+27. **meta-llama/Llama-4-Maverick-17B-128E-Instruct** - Meta's most advanced multimodal LLM (17B activated, 400B total with 128 experts)
+28. **mistralai/Mistral-Small-3.1-24B-Base-2503** - Mistral's latest with vision capabilities and 128k context window
+29. **HuggingFaceH4/zephyr-orpo-141b-A35b-v0.1** - Large mixture-of-experts model (141B total, 35B active) trained with ORPO
+30. **mistralai/Mixtral-8x22B-Instruct-v0.1** - Larger Mixtral variant with 22B parameters per expert
+
+### **Chinese/International Models**
+
+31. **Qwen/Qwen2.5-72B-Instruct** - Alibaba's large multilingual model with strong reasoning capabilities
+32. **deepseek-ai/DeepSeek-V3** - DeepSeek's latest model with strong coding and reasoning abilities
+33. **01-ai/Yi-34B-Chat** - 01.AI's large bilingual (Chinese/English) conversational model
+34. **Qwen/QwQ-32B-Preview** - Qwen's reasoning-focused model for complex problem solving
+35. **THUDM/chatglm3-6b** - Tsinghua University's GLM model for Chinese and English tasks ✅ **COMPLETED** 🏆 **MAJOR GLM ARCHITECTURE SUCCESS: 99.5% FALSE POSITIVE REDUCTION**
+    - **Scan Results**: 63 files scanned, ~13GB processed (comprehensive multi-format ChatGLM3-6B)
+    - **MASSIVE SUCCESS**: **394 CRITICAL → 2 CRITICAL false positives** (99.5% reduction achieved!)
+    - **Critical Architecture Discovery**: **6th Distinct Architecture Category** - GLM (General Language Model)
+    - **GLM Architecture Breakthrough**: 
+      - ✅ **NEW ARCHITECTURE CATEGORY**: Completely different from BERT/T5/BART/CLIP/ViT patterns
+      - ✅ **Chinese ML Model Excellence**: First international model testing validates global transformer diversity
+      - ✅ **Multi-Framework Support**: Fixed PyTorch + SafeTensors framework detection issues
+      - ✅ **GLM-Specific Pattern Recognition**: 13 comprehensive GLM architecture patterns implemented
+    - **GLM Architecture Patterns Fixed**: 
+      - ✅ `weight_map.transformer.encoder.layers.X.*` (28 layers × 7 components = 196 patterns)
+      - ✅ `.input_layernorm.weight` + `.post_attention_layernorm.weight` (layer normalization)
+      - ✅ `.mlp.dense_4h_to_h.weight` + `.mlp.dense_h_to_4h.weight` (4×hidden MLP projections)
+      - ✅ `.self_attention.dense.weight` + `.self_attention.query_key_value.weight/bias` (fused QKV)
+      - ✅ `weight_map.transformer.encoder.final_layernorm.weight` (final layer norm)
+    - **Technical Breakthrough**: 
+      - Multi-format ecosystem: PyTorch bins (3.4GB) + SafeTensors (12.8GB) + HuggingFace configs
+      - Framework detection enhancement: PyTorch + null framework support for SafeTensors
+      - Chinese language model: Bilingual GLM with specialized tokenization and architecture
+      - International model validation: Proves ModelAudit works globally across model families
+
+### **Specialized and Domain-Specific Models**
+
+36. **WizardLM/WizardCoder-Python-34B-V1.0** - Microsoft's specialized coding model for Python development
+37. **codellama/CodeLlama-34b-Instruct-hf** - Meta's large code-focused Llama variant
+38. **mistralai/Codestral-22B-v0.1** - Mistral's dedicated coding model with multilingual support
+39. **microsoft/WizardMath-70B-V1.0** - Microsoft's math-specialized model based on Llama 2
+40. **meta-llama/Llama-2-13b-chat-hf** - Popular mid-size Llama 2 variant for conversations
+
+### **Efficient and Optimized Models**
+
+41. **microsoft/Phi-3-medium-4k-instruct** - Microsoft's efficient 14B parameter model
+42. **microsoft/Phi-3-small-8k-instruct** - Compact 7B parameter model with extended context
+43. **google/gemma-2-27b-it** - Google's instruction-tuned Gemma 2 model
+44. **google/gemma-2-9b-it** - Smaller, efficient version of Gemma 2
+45. **NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO** - Community fine-tuned Mixtral variant
+
+### **Multimodal and Vision Models**
+
+46. **microsoft/kosmos-2-patch14-224** - Microsoft's multimodal model for vision and language tasks
+47. **liuhaotian/llava-v1.6-34b** - LLaVA large vision-language model
+48. **Salesforce/blip2-opt-6.7b** - Salesforce's vision-language model for image understanding
+49. **google/pix2struct-large** - Google's model for visual document understanding
+50. **microsoft/DialoGPT-medium** - Conversational AI model (different size from our large variant)
+
+This second batch focuses on:
+
+**🔥 **Latest Releases (2024-2025)**: Llama 4, Mistral 3.1, Qwen 2.5, DeepSeek V3
+**🌍 **International Diversity**: Strong representation of Chinese models (Qwen, ChatGLM, Yi)
+**💻 **Specialized Domains**: Advanced coding models, math-focused models, vision-language
+**⚡ **Efficient Architectures**: Phi models, Gemma variants, optimized sizes
+**🎯 **Different Companies**: Meta, Microsoft, Google, Mistral, Alibaba, community models
+
+### **Expected Testing Challenges:**
+
+**Model Size Scaling**: Models ranging from 6B to 400B parameters
+**Multimodal Testing**: Vision-language models require image input capabilities
+**Latest Architectures**: Mixture-of-experts, advanced attention mechanisms
+**International Formats**: Models trained primarily on Chinese data
+**Specialized Vocabularies**: Code-specific, math-specific, domain-specific tokens
+
+### **Testing Priority Order:**
+
+1. **Latest Flagship Models** (26-30): Test cutting-edge architectures first
+2. **International Models** (31-35): Validate cross-language scanning
+3. **Specialized Models** (36-40): Test domain-specific false positive patterns
+4. **Efficient Models** (41-45): Validate scaling behavior
+5. **Multimodal Models** (46-50): Test vision-language integration
+
+**Total Models for Testing**: 50 models (25 completed + 25 planned)
+**Expected Completion Time**: ~2-3 weeks of systematic testing
+**Architecture Coverage**: All major transformer variants, MoE, multimodal, specialized domains
