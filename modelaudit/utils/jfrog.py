@@ -71,13 +71,19 @@ def download_artifact(
     # 1. Check for API token (highest precedence)
     if api_token:
         headers["X-JFrog-Art-Api"] = api_token
-    elif os.getenv("JFROG_API_TOKEN"):
-        headers["X-JFrog-Art-Api"] = os.getenv("JFROG_API_TOKEN")
-    # 2. Check for access token
-    elif access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-    elif os.getenv("JFROG_ACCESS_TOKEN"):
-        headers["Authorization"] = f"Bearer {os.getenv('JFROG_ACCESS_TOKEN')}"
+    else:
+        env_api_token = os.getenv("JFROG_API_TOKEN")
+        if env_api_token:
+            headers["X-JFrog-Art-Api"] = env_api_token
+    
+    # 2. Check for access token (only if API token not found)
+    if "X-JFrog-Art-Api" not in headers:
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        else:
+            env_access_token = os.getenv("JFROG_ACCESS_TOKEN")
+            if env_access_token:
+                headers["Authorization"] = f"Bearer {env_access_token}"
 
     # If no authentication is provided, proceed without auth (for public repos)
     if not headers:
