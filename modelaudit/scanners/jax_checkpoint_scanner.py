@@ -24,10 +24,10 @@ class JaxCheckpointScanner(BaseScanner):
     name = "jax_checkpoint"
     description = "Scans JAX checkpoint files in various serialization formats"
     supported_extensions: ClassVar[list[str]] = [
-        ".ckpt",      # JAX checkpoint files (when not PyTorch)
-        ".checkpoint", # Explicit checkpoint files
+        ".ckpt",  # JAX checkpoint files (when not PyTorch)
+        ".checkpoint",  # Explicit checkpoint files
         ".orbax-checkpoint",  # Orbax checkpoint directories
-        ".pickle",    # JAX models saved as pickle (when context suggests JAX)
+        ".pickle",  # JAX models saved as pickle (when context suggests JAX)
     ]
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -74,13 +74,7 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Orbax checkpoint indicators
-        orbax_files = [
-            "checkpoint",
-            "checkpoint_0",
-            "metadata.json",
-            "_CHECKPOINT",
-            "orbax_checkpoint_metadata.json"
-        ]
+        orbax_files = ["checkpoint", "checkpoint_0", "metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
 
         # Check for Orbax files
         for orbax_file in orbax_files:
@@ -106,10 +100,7 @@ class JaxCheckpointScanner(BaseScanner):
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    jax_indicators = [
-                        "jax", "flax", "haiku", "orbax",
-                        "arrayimpl", "jaxlib", "device_array"
-                    ]
+                    jax_indicators = ["jax", "flax", "haiku", "orbax", "arrayimpl", "jaxlib", "device_array"]
 
                     return any(indicator in data_str for indicator in jax_indicators)
                 except Exception:
@@ -133,11 +124,7 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Check metadata files
-        metadata_files = [
-            "metadata.json",
-            "orbax_checkpoint_metadata.json",
-            "_CHECKPOINT"
-        ]
+        metadata_files = ["metadata.json", "orbax_checkpoint_metadata.json", "_CHECKPOINT"]
 
         for metadata_file in metadata_files:
             metadata_path = path_obj / metadata_file
@@ -193,11 +180,13 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Extract useful metadata
         if isinstance(metadata, dict):
-            result.metadata.update({
-                "orbax_version": metadata.get("version"),
-                "checkpoint_type": metadata.get("type", "unknown"),
-                "save_format": metadata.get("format", "unknown"),
-            })
+            result.metadata.update(
+                {
+                    "orbax_version": metadata.get("version"),
+                    "checkpoint_type": metadata.get("type", "unknown"),
+                    "save_format": metadata.get("format", "unknown"),
+                }
+            )
 
     def _scan_checkpoint_file(self, path: str, result: ScanResult) -> None:
         """Scan individual checkpoint file."""
@@ -248,11 +237,11 @@ class JaxCheckpointScanner(BaseScanner):
 
             # Check for dangerous pickle opcodes
             dangerous_opcodes = [
-                b"R",    # REDUCE
-                b"i",    # INST
-                b"o",    # OBJ
-                b"b",    # BUILD
-                b"c",    # GLOBAL
+                b"R",  # REDUCE
+                b"i",  # INST
+                b"o",  # OBJ
+                b"b",  # BUILD
+                b"c",  # GLOBAL
             ]
 
             for opcode in dangerous_opcodes:
@@ -371,9 +360,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_orbax_checkpoint(path, result)
 
                 # Calculate total size
-                total_size = sum(
-                    f.stat().st_size for f in Path(path).rglob("*") if f.is_file()
-                )
+                total_size = sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
                 result.bytes_scanned = total_size
                 result.metadata["total_size"] = total_size
 

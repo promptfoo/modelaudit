@@ -24,7 +24,7 @@ class FlaxMsgpackScanner(BaseScanner):
         ".msgpack",
         ".flax",
         ".orbax",  # Orbax checkpoint format
-        ".jax",    # Generic JAX model files
+        ".jax",  # Generic JAX model files
     ]
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -106,26 +106,60 @@ class FlaxMsgpackScanner(BaseScanner):
         # JAX/Flax architecture patterns for better ML detection
         self.jax_patterns: dict[str, list[str]] = {
             "transformer_patterns": [
-                "attention", "self_attention", "multi_head", "mha", "mqa", "gqa",
-                "feed_forward", "ffn", "mlp", "dense", "linear",
-                "layer_norm", "rms_norm", "batch_norm",
-                "encoder", "decoder", "transformer_block"
+                "attention",
+                "self_attention",
+                "multi_head",
+                "mha",
+                "mqa",
+                "gqa",
+                "feed_forward",
+                "ffn",
+                "mlp",
+                "dense",
+                "linear",
+                "layer_norm",
+                "rms_norm",
+                "batch_norm",
+                "encoder",
+                "decoder",
+                "transformer_block",
             ],
             "cnn_patterns": [
-                "conv1d", "conv2d", "conv3d", "convolution",
-                "batch_norm", "group_norm", "layer_norm",
-                "pool", "pooling", "max_pool", "avg_pool",
-                "dropout", "activation"
+                "conv1d",
+                "conv2d",
+                "conv3d",
+                "convolution",
+                "batch_norm",
+                "group_norm",
+                "layer_norm",
+                "pool",
+                "pooling",
+                "max_pool",
+                "avg_pool",
+                "dropout",
+                "activation",
             ],
             "embedding_patterns": [
-                "embedding", "embed", "token_embedding", "position_embedding",
-                "vocab_embedding", "word_embedding"
+                "embedding",
+                "embed",
+                "token_embedding",
+                "position_embedding",
+                "vocab_embedding",
+                "word_embedding",
             ],
             "optimization_patterns": [
-                "adam", "sgd", "rmsprop", "adagrad", "momentum",
-                "learning_rate", "lr", "optimizer", "opt_state",
-                "gradient", "grad"
-            ]
+                "adam",
+                "sgd",
+                "rmsprop",
+                "adagrad",
+                "momentum",
+                "learning_rate",
+                "lr",
+                "optimizer",
+                "opt_state",
+                "gradient",
+                "grad",
+            ],
         }
 
     @classmethod
@@ -145,9 +179,24 @@ class FlaxMsgpackScanner(BaseScanner):
                     # Read first few bytes to check for msgpack format
                     header = f.read(32)
                     if len(header) > 0 and header[0:1] in [
-                        b"\x80", b"\x81", b"\x82", b"\x83", b"\x84", b"\x85", b"\x86", b"\x87",
-                        b"\x88", b"\x89", b"\x8a", b"\x8b", b"\x8c", b"\x8d", b"\x8e", b"\x8f",
-                        b"\xde", b"\xdf"  # Common msgpack format markers
+                        b"\x80",
+                        b"\x81",
+                        b"\x82",
+                        b"\x83",
+                        b"\x84",
+                        b"\x85",
+                        b"\x86",
+                        b"\x87",
+                        b"\x88",
+                        b"\x89",
+                        b"\x8a",
+                        b"\x8b",
+                        b"\x8c",
+                        b"\x8d",
+                        b"\x8e",
+                        b"\x8f",
+                        b"\xde",
+                        b"\xdf",  # Common msgpack format markers
                     ]:
                         return True
             except Exception:
@@ -205,8 +254,9 @@ class FlaxMsgpackScanner(BaseScanner):
             count = 0
             if isinstance(data, dict):
                 # Count layers
-                layer_keys = [k for k in data if any(layer_word in str(k).lower()
-                             for layer_word in ["layer", "block", "level"])]
+                layer_keys = [
+                    k for k in data if any(layer_word in str(k).lower() for layer_word in ["layer", "block", "level"])
+                ]
                 if layer_keys:
                     metadata["layer_count"] += len(layer_keys)
 
@@ -224,12 +274,14 @@ class FlaxMsgpackScanner(BaseScanner):
         metadata["parameter_count"] = count_parameters(obj)
 
         # Add metadata to scan result
-        result.metadata.update({
-            "jax_metadata": metadata,
-            "estimated_parameters": metadata["parameter_count"],
-            "model_architecture": metadata["model_type"],
-            "layer_count": metadata["layer_count"],
-        })
+        result.metadata.update(
+            {
+                "jax_metadata": metadata,
+                "estimated_parameters": metadata["parameter_count"],
+                "model_architecture": metadata["model_type"],
+                "layer_count": metadata["layer_count"],
+            }
+        )
 
         return metadata
 
@@ -244,10 +296,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     value_str = str(value)
 
                     # Check for suspicious JAX transform patterns
-                    dangerous_transforms = [
-                        "jit_compile", "eval_jit", "exec_transform",
-                        "dynamic_eval", "runtime_eval"
-                    ]
+                    dangerous_transforms = ["jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval"]
 
                     for transform in dangerous_transforms:
                         if transform in key_str or transform in value_str.lower():
@@ -257,7 +306,7 @@ class FlaxMsgpackScanner(BaseScanner):
                                 location=f"{path}/{key}",
                                 details={
                                     "transform": transform,
-                                    "context": value_str[:200] if len(value_str) > 200 else value_str
+                                    "context": value_str[:200] if len(value_str) > 200 else value_str,
                                 },
                             )
 
