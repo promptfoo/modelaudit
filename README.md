@@ -236,6 +236,7 @@ risk:
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently
 - **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
+- **DVC Integration**: Automatically scan files referenced in `.dvc` pointer files
 
 ### Reporting & Integration
 
