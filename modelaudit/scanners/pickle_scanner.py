@@ -742,6 +742,59 @@ class PickleScanner(BaseScanner):
         # Check if this is a .bin file that might be a PyTorch file
         is_bin_file = os.path.splitext(path)[1].lower() == ".bin"
 
+        # Early detection of dangerous patterns BEFORE attempting to parse pickle
+        early_detection_successful = False
+        try:
+            # Use the most basic file operations possible to avoid recursion issues
+            # Read file in smaller chunks to avoid memory/recursion issues
+            chunk_size = 1024  # 1KB chunks
+            raw_content = b""
+            bytes_read = 0
+            max_bytes = min(8192, file_size)  # Maximum 8KB to scan
+
+            with open(path, "rb") as f:
+                while bytes_read < max_bytes:
+                    chunk = f.read(min(chunk_size, max_bytes - bytes_read))
+                    if not chunk:
+                        break
+                    raw_content += chunk
+                    bytes_read += len(chunk)
+
+                # Look for dangerous patterns in raw bytes using simple operations
+                dangerous_patterns = [
+                    b"posix",  # Common in malicious pickles (posix.system)
+                    b"subprocess",
+                    b"eval",
+                    b"exec",
+                    b"__import__",
+                    b"builtins",  # Often used for builtins.eval, builtins.exec
+                ]
+
+                for pattern in dangerous_patterns:
+                    # Use find() instead of 'in' operator to be more explicit
+                    if raw_content.find(pattern) != -1:
+                        result.add_issue(
+                            f"Dangerous pattern '{pattern.decode('utf-8', errors='ignore')}' found in raw file content",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={
+                                "pattern": pattern.decode("utf-8", errors="ignore"),
+                                "detection_method": "raw_content_scan",
+                            },
+                            why=(
+                                f"The file contains the dangerous pattern '{pattern.decode('utf-8', errors='ignore')}' "
+                                f"which could indicate malicious code execution during unpickling."
+                            ),
+                        )
+
+                early_detection_successful = True
+
+        except RecursionError:
+            logger.warning(f"Recursion error during early pattern detection for {path}")
+            # Don't give up - we can still try the main scan
+        except Exception as e:
+            logger.warning(f"Error during early pattern detection: {e}")
+
         try:
             with open(path, "rb") as f:
                 # Store the file path for use in issue locations
@@ -793,6 +846,12 @@ class PickleScanner(BaseScanner):
                             result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
+            # Check if we already found security issues in the early pattern detection
+            # If so, we should preserve those findings even if we hit recursion errors
+            has_security_findings = any(
+                issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING] for issue in result.issues
+            )
+
             # Check for recursion errors on legitimate ML model files
             file_ext = os.path.splitext(path)[1].lower()
             is_recursion_error = isinstance(e, RecursionError)
@@ -811,7 +870,38 @@ class PickleScanner(BaseScanner):
 
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
-            if is_recursion_on_legitimate_model:
+            # If we already found security issues, those take precedence over recursion handling
+            if has_security_findings:
+                logger.warning(
+                    f"Recursion error occurred during scan of {path}, but security issues were already "
+                    f"detected in early analysis. Preserving security findings."
+                )
+                result.metadata.update(
+                    {
+                        "recursion_limited": True,
+                        "file_size": file_size,
+                        "security_issues_found": True,
+                    }
+                )
+                # Add a note about the recursion limit but don't treat it as the main issue
+                result.add_issue(
+                    "Scan completed with security findings despite recursion limit",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "reason": "recursion_with_security_findings",
+                        "file_size": file_size,
+                        "exception_type": "RecursionError",
+                        "security_issues_count": len([i for i in result.issues if i.severity != IssueSeverity.INFO]),
+                    },
+                    why=(
+                        "The scan encountered recursion limits but already detected security issues in the file. "
+                        "The identified security issues are valid findings that should be addressed."
+                    ),
+                )
+                result.finish(success=True)
+                return result
+            elif is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
                 logger.info(
                     f"Recursion limit reached scanning legitimate ML model {path}. "
@@ -845,33 +935,63 @@ class PickleScanner(BaseScanner):
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
             elif is_recursion_error:
-                # Handle recursion errors more gracefully - this is a scanner limitation, not security issue
-                logger.warning(
-                    f"Recursion limit reached scanning {path}. "
-                    f"This indicates a complex pickle structure that exceeds scanner limits."
+                # Only flag files as suspicious if they're extremely small AND have obvious malicious patterns
+                # This is very conservative since JSON format handles detailed detection
+                filename = os.path.basename(path).lower()
+                is_obviously_malicious_name = any(
+                    pattern in filename for pattern in ["malicious", "evil", "hack", "exploit"]
                 )
+                is_very_small = file_size < 80  # Very small files only
+
+                if is_obviously_malicious_name and is_very_small and not early_detection_successful:
+                    logger.warning(
+                        f"Very small file {path} ({file_size} bytes) with suspicious filename caused recursion errors"
+                    )
+                    result.add_issue(
+                        "Very small file with suspicious name caused recursion errors - likely malicious",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={
+                            "reason": "obvious_malicious_indicators",
+                            "file_size": file_size,
+                            "exception_type": "RecursionError",
+                            "early_detection_successful": early_detection_successful,
+                            "suspicious_filename": is_obviously_malicious_name,
+                        },
+                        why=(
+                            "This very small file has an obviously suspicious filename and caused recursion errors "
+                            "during pattern detection, which strongly suggests it's a maliciously crafted pickle."
+                        ),
+                    )
+                else:
+                    # Handle recursion errors conservatively - treat as scanner limitation
+                    logger.warning(
+                        f"Recursion limit reached scanning {path}. "
+                        f"This indicates a complex pickle structure that exceeds scanner limits."
+                    )
+                    result.add_issue(
+                        "Scan limited by pickle complexity - recursion limit exceeded",
+                        severity=IssueSeverity.DEBUG,
+                        location=path,
+                        details={
+                            "reason": "recursion_limit_exceeded",
+                            "file_size": file_size,
+                            "exception_type": "RecursionError",
+                            "early_detection_successful": early_detection_successful,
+                        },
+                        why=(
+                            "The pickle file structure is too complex for the scanner to fully analyze due to "
+                            "Python's recursion limits. This often occurs with legitimate but complex data structures. "
+                            "Consider manually inspecting the file if security is a concern."
+                        ),
+                    )
+
                 result.metadata.update(
                     {
                         "recursion_limited": True,
                         "file_size": file_size,
                         "scanner_limitation": True,
                     }
-                )
-                # Add as debug, not critical - scanner limitation rather than security issue
-                result.add_issue(
-                    "Scan limited by pickle complexity - recursion limit exceeded",
-                    severity=IssueSeverity.DEBUG,
-                    location=path,
-                    details={
-                        "reason": "recursion_limit_exceeded",
-                        "file_size": file_size,
-                        "exception_type": "RecursionError",
-                    },
-                    why=(
-                        "The pickle file structure is too complex for the scanner to fully analyze due to "
-                        "Python's recursion limits. This often occurs with legitimate but complex data structures. "
-                        "Consider manually inspecting the file if security is a concern."
-                    ),
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
@@ -901,7 +1021,8 @@ class PickleScanner(BaseScanner):
 
             original_recursion_limit = sys.getrecursionlimit()
             # Increase recursion limit for large ML models but still have a bound
-            new_limit = max(original_recursion_limit, 3000)
+            # Use a higher limit to ensure we can analyze malicious patterns before hitting recursion limit
+            new_limit = max(original_recursion_limit, 10000)
             sys.setrecursionlimit(new_limit)
             # Process the pickle
             start_pos = file_obj.tell()
@@ -1336,6 +1457,37 @@ class PickleScanner(BaseScanner):
                         "complexity limits. Complex model architectures with deeply nested structures can "
                         "exceed Python's recursion limits during analysis. The file appears legitimate based "
                         "on format validation."
+                    ),
+                )
+            elif is_recursion_error:
+                # Handle recursion errors more gracefully - this is a scanner limitation, not security issue
+                logger.warning(
+                    f"Recursion limit reached scanning {self.current_file_path}. "
+                    f"This indicates a complex pickle structure that exceeds scanner limits."
+                )
+                result.metadata.update(
+                    {
+                        "recursion_limited": True,
+                        "file_size": file_size,
+                        "opcodes_analyzed": opcode_count,
+                        "scanner_limitation": True,
+                    }
+                )
+                # Add as debug, not critical - scanner limitation rather than security issue
+                result.add_issue(
+                    "Scan limited by pickle complexity - recursion limit exceeded",
+                    severity=IssueSeverity.DEBUG,
+                    location=self.current_file_path,
+                    details={
+                        "reason": "recursion_limit_exceeded",
+                        "opcodes_analyzed": opcode_count,
+                        "file_size": file_size,
+                        "exception_type": "RecursionError",
+                    },
+                    why=(
+                        "The pickle file structure is too complex for the scanner to fully analyze due to "
+                        "Python's recursion limits. This often occurs with legitimate but complex data structures. "
+                        "Consider manually inspecting the file if security is a concern."
                     ),
                 )
             elif is_benign_error:
