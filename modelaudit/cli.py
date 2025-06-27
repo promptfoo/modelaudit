@@ -13,6 +13,7 @@ from yaspin.spinners import Spinners
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 from .utils import resolve_dvc_file
+from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
 
 # Configure logging
@@ -105,6 +106,8 @@ def scan_command(
         modelaudit scan /path/to/model1 /path/to/model2 ...
         modelaudit scan https://huggingface.co/user/model
         modelaudit scan hf://user/model
+        modelaudit scan s3://my-bucket/models/
+        modelaudit scan gs://my-bucket/model.pt
         modelaudit scan models:/MyModel/1
         modelaudit scan models:/MyModel/Production
 
@@ -209,6 +212,29 @@ def scan_command(
                     aggregated_results["has_errors"] = True
                     continue
 
+            # Check if this is a cloud storage URL
+            elif is_cloud_url(path):
+                if format == "text" and not output:
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                    download_spinner.start()
+
+                try:
+                    download_path = download_from_cloud(path, cache_dir=None)
+                    actual_path = str(download_path)
+                    temp_dir = str(download_path)
+
+                    if format == "text" and not output:
+                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+
+                except Exception as e:
+                    if format == "text" and not output:
+                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                    logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error downloading from {path}: {e!s}", err=True)
+                    aggregated_results["has_errors"] = True
+                    continue
+
             # Check if this is an MLflow URI
             elif is_mlflow_uri(path):
                 # Show download progress if in text mode
@@ -256,7 +282,6 @@ def scan_command(
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
                     continue
-
             else:
                 # For local paths, check if they exist
                 if not os.path.exists(path):

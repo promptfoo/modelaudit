@@ -50,6 +50,7 @@ flax = ["msgpack>=1.0.0"]
 tflite = ["tflite>=2.18.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
+cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
     "numpy>=1.19.0,<2.0",
@@ -65,6 +66,9 @@ numpy1 = [
     "msgpack>=1.0.0",
     "tflite>=2.18.0",
     "huggingface-hub>=0.23.0",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
 ]
 all = [
     "tensorflow>=2.13.0",
@@ -80,6 +84,9 @@ all = [
     "tflite>=2.18.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
 ]
 
 [project.scripts]
