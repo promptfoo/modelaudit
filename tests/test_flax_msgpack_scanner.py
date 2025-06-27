@@ -112,7 +112,7 @@ def test_flax_msgpack_deep_nesting(tmp_path):
 
 
 def test_flax_msgpack_non_standard_structure(tmp_path):
-    """Test detection of non-standard Flax structures."""
+    """Test detection of non-standard Flax structures using structural analysis."""
     path = tmp_path / "nonstandard.msgpack"
     # Create structure that doesn't look like a Flax checkpoint
     data = {
@@ -125,8 +125,10 @@ def test_flax_msgpack_non_standard_structure(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert any("No standard Flax checkpoint keys found" in issue.message for issue in info_issues)
+    # With our new structural analysis, this should be flagged as suspicious
+    # because it has no numerical data that looks like ML weights
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    assert any("Suspicious data structure" in issue.message for issue in warning_issues)
 
 
 def test_flax_msgpack_corrupted(tmp_path):
@@ -168,10 +170,10 @@ def test_flax_msgpack_trailing_data(tmp_path):
 
 
 def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs."""
+    """Test detection of suspiciously large binary blobs with updated 200MB threshold."""
     path = tmp_path / "large_blob.msgpack"
-    # Create large binary blob (over 50MB default limit)
-    large_blob = b"X" * (60 * 1024 * 1024)  # 60MB
+    # Create large binary blob (over 200MB new threshold)
+    large_blob = b"X" * (250 * 1024 * 1024)  # 250MB - exceeds new 200MB threshold
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 

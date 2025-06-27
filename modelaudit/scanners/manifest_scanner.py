@@ -596,6 +596,94 @@ class ManifestScanner(BaseScanner):
             if any(safe_key in key_lower for safe_key in tokenizer_safe_keys):
                 return True
 
+        # Special case for encoder-decoder transformer models (T5, BART, etc.)
+        if ml_context.get("framework") == "huggingface" and "execution" in matches:
+            # These are legitimate sequence-to-sequence model configuration patterns
+            # that contain "decoder" or "encoder" but are not actually execution-related
+            encoder_decoder_safe_patterns = [
+                # T5 specific patterns
+                "decoder_start_token_id",  # T5/seq2seq start token configuration
+                "is_encoder_decoder",  # Architecture flag for encoder-decoder models
+                "decoder_input_ids",  # Input configuration for decoder
+                "decoder_attention_mask",  # Attention configuration for decoder
+                "decoder_head_mask",  # Head masking for decoder
+                "forced_decoder_ids",  # Forced decoding configuration
+                "suppress_tokens",  # Token suppression configuration
+                "begin_suppress_tokens",  # Begin token suppression
+                "forced_bos_token_id",  # Beginning of sequence token
+                "forced_eos_token_id",  # End of sequence token
+                "encoder_no_repeat_ngram_size",  # N-gram repetition control
+                "decoder_start_token",  # Alternative start token naming
+                "decoder_config",  # Decoder-specific configuration
+                "encoder_config",  # Encoder-specific configuration
+                # BART specific patterns - architecture configuration
+                "decoder_attention_heads",  # Number of attention heads in decoder
+                "decoder_ffn_dim",  # Feed-forward network dimension in decoder
+                "decoder_layerdrop",  # Layer dropout rate for decoder
+                "decoder_layers",  # Number of decoder layers
+                "encoder_attention_heads",  # Number of attention heads in encoder
+                "encoder_ffn_dim",  # Feed-forward network dimension in encoder
+                "encoder_layerdrop",  # Layer dropout rate for encoder
+                "encoder_layers",  # Number of encoder layers
+                # Additional encoder-decoder patterns
+                "decoder_hidden_size",  # Hidden dimension size for decoder
+                "encoder_hidden_size",  # Hidden dimension size for encoder
+                "decoder_intermediate_size",  # Intermediate layer size for decoder
+                "encoder_intermediate_size",  # Intermediate layer size for encoder
+                "decoder_max_position_embeddings",  # Max position embeddings for decoder
+                "encoder_max_position_embeddings",  # Max position embeddings for encoder
+            ]
+
+            if any(pattern in key_lower for pattern in encoder_decoder_safe_patterns):
+                return True
+
+        # Special case for GLM (General Language Model) architecture patterns
+        # GLM models use specific layer naming conventions that trigger false positives
+        # GLM models can be detected as "huggingface", "pytorch", or have null framework (SafeTensors)
+        if (ml_context.get("framework") in ["huggingface", "pytorch", None]) and "execution" in matches:
+            # GLM architecture patterns from models like ChatGLM, GLM-4, etc.
+            # These are legitimate transformer components with GLM-specific naming
+            # Note: keys include "weight_map." prefix from model index files
+            # IMPORTANT: All patterns must be lowercase since key_lower is used for matching
+            glm_safe_patterns = [
+                # GLM transformer layer patterns (with weight_map prefix) - LOWERCASE
+                "weight_map.transformer.encoder.layers.",  # GLM encoder layer prefix
+                "weight_map.transformer.encoder.final_layernorm",  # GLM final layer normalization
+                "weight_map.transformer.output_layer",  # GLM output layer
+                # GLM layer component patterns (can appear anywhere in key) - LOWERCASE
+                ".input_layernorm.weight",  # Input layer normalization weights
+                ".post_attention_layernorm.weight",  # Post-attention layer normalization
+                ".mlp.dense_4h_to_h.weight",  # MLP dense layer (4h to h dimension)
+                ".mlp.dense_h_to_4h.weight",  # MLP dense layer (h to 4h dimension)
+                ".self_attention.dense.weight",  # Self-attention dense projection
+                ".self_attention.query_key_value.weight",  # QKV projection weights
+                ".self_attention.query_key_value.bias",  # QKV projection bias
+                # Additional GLM-specific patterns (with weight_map prefix) - LOWERCASE
+                "weight_map.rotary_pos_emb",  # Rotary positional embeddings
+                "weight_map.word_embeddings",  # Word embedding layers
+                "weight_map.position_embeddings",  # Position embedding layers (if used)
+            ]
+
+            # Check for GLM patterns in the key
+            if any(pattern in key_lower for pattern in glm_safe_patterns):
+                return True
+
+        # Special case for vision-language models (CLIP, ViLT, BLIP, etc.)
+        # Check CLIP specific patterns first - these are legitimate config keys
+        if "execution" in matches and "config" in key_lower:
+            clip_patterns = [
+                "text_config.is_decoder",
+                "text_config.pruned_heads",
+                "text_config.tie_encoder_decoder",
+                "text_config.torchscript",
+                "vision_config.is_decoder",
+                "vision_config.pruned_heads",
+                "vision_config.tie_encoder_decoder",
+                "vision_config.torchscript",
+            ]
+            if key_lower in clip_patterns:
+                return True
+
         return False
 
     def _is_file_path_value(self, value: Any) -> bool:
