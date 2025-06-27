@@ -198,7 +198,7 @@ def scan_command(
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
                     continue
-            
+
             # Check if this is a cloud storage URL
             elif is_cloud_url(path):
                 if format == "text" and not output:
