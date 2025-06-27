@@ -220,7 +220,16 @@ def scan_model_directory_or_file(
                     break
             # Stop scanning if size limit reached
             if limit_reached:
-                pass
+                logger.info("Scan terminated early due to total size limit")
+                issues_list = cast(list[dict[str, Any]], results["issues"])
+                issues_list.append(
+                    {
+                        "message": "Scan terminated early due to total size limit",
+                        "severity": IssueSeverity.INFO.value,
+                        "location": path,
+                        "details": {"max_total_size": max_total_size},
+                    }
+                )
         else:
             # Scan a single file
             if progress_callback:
