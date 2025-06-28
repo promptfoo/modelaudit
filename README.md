@@ -361,24 +361,24 @@ ModelAudit provides **industry-leading security coverage** across all major ML m
 
 **Sorted by popularity in the ML ecosystem** - ModelAudit provides comprehensive security coverage across all major formats.
 
-| Format | Extensions | Framework | Primary Use | ModelAudit Protection | Security Assessment |
-|--------|------------|-----------|-------------|----------------------|-------------------|
-| **PyTorch** | `.pt`, `.pth` (ZIP) | PyTorch | Training/Research | 🔥 **Comprehensive**: Embedded pickle analysis, suspicious archives, path traversal protection | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization |
-| **SafeTensors** | `.safetensors` | Hugging Face (universal) | All uses | ✅ **Integrity Validation**: Metadata verification, tensor bounds checking | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security |
-| **GGUF/GGML** | `.gguf`, `.ggml` | llama.cpp, Ollama | LLM Inference | ✅ **Format Validation**: Header integrity, tensor alignment, DoS protection | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference |
-| **TensorFlow SavedModel** | `.pb`, directories | TensorFlow | Production/Serving | 🛡️ **Framework-Specific**: PyFunc detection, file I/O operations, custom operation validation | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations |
-| **ONNX** | `.onnx` | Cross-framework | Deployment/Interop | ✅ **Standards-Based**: Custom operator validation, external data integrity | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability |
-| **PyTorch Binary** | `.bin` (HuggingFace) | PyTorch/Transformers | Model weights | 🔥 **Binary Analysis**: Tensor validation, embedded content detection | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage |
-| **Keras H5** | `.h5`, `.hdf5`, `.keras` | Keras/TensorFlow | Training/Prototyping | 🛡️ **Layer-Aware**: Lambda layer detection, custom object analysis, dangerous configurations | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers |
-| **Core ML** | `.mlmodel` | Apple Core ML | iOS/macOS Apps | ✅ **Mobile Security**: Protobuf validation, custom layer checking | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution |
-| **TensorFlow Lite** | `.tflite` | TensorFlow | Mobile/Edge | ✅ **Mobile-Optimized**: FlatBuffer validation, custom delegate checking | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
-| **Pickle** | `.pkl`, `.pickle`, `.dill` | Python/scikit-learn | Legacy/Traditional ML | 🔥 **Advanced Detection**: Dangerous opcodes (REDUCE, INST, OBJ), malicious imports, nested payloads, decode-exec chains | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors |
-| **JAX/Flax** | `.msgpack`, `.flax`, `.orbax` | JAX/Flax | Research/Advanced ML | 🧠 **JAX-Specific**: Transform validation, compilation safety, decompression bomb protection | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms |
-| **NumPy** | `.npy`, `.npz` | NumPy (universal) | Data arrays/Embeddings | 🔢 **Array Security**: Object array detection, dtype validation, dimension overflow protection | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays |
-| **Joblib** | `.joblib` | scikit-learn | Traditional ML | 🔬 **ML-Aware**: Compression bomb detection, embedded pickle analysis, scikit-learn integration | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle |
-| **Model Configs** | `.json`, `.yaml`, `.toml` | Universal | Configuration | 🛡️ **Config Security**: Suspicious keys, credential exposure, injection patterns | 🟡 **LOW RISK** - ✅ **Config only** - No code execution |
-| **Archives** | `.zip`, `.tar`, `.gz` | Various | Model packages | 📦 **Archive Security**: Recursive scanning, path traversal, zip bomb detection, nested analysis | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files |
-| **PMML** | `.pmml` | Enterprise/Legacy | Production scoring | ✅ **XML Security**: External entity validation, suspicious extension detection | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format |
+| Format | Extensions | ModelAudit Protection | Security Assessment |
+|--------|------------|----------------------|-------------------|
+| **PyTorch** (PyTorch) | `.pt`, `.pth` (ZIP) | 🔥 **Comprehensive**: Embedded pickle analysis, suspicious archives, path traversal protection | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization |
+| **SafeTensors** (Hugging Face - universal) | `.safetensors` | ✅ **Integrity Validation**: Metadata verification, tensor bounds checking | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security |
+| **GGUF/GGML** (llama.cpp, Ollama) | `.gguf`, `.ggml` | ✅ **Format Validation**: Header integrity, tensor alignment, DoS protection | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference |
+| **TensorFlow SavedModel** (TensorFlow) | `.pb`, directories | 🛡️ **Framework-Specific**: PyFunc detection, file I/O operations, custom operation validation | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations |
+| **ONNX** (Cross-framework) | `.onnx` | ✅ **Standards-Based**: Custom operator validation, external data integrity | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability |
+| **PyTorch Binary** (PyTorch/Transformers) | `.bin` (HuggingFace) | 🔥 **Binary Analysis**: Tensor validation, embedded content detection | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage |
+| **Keras H5** (Keras/TensorFlow) | `.h5`, `.hdf5`, `.keras` | 🛡️ **Layer-Aware**: Lambda layer detection, custom object analysis, dangerous configurations | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers |
+| **Core ML** (Apple Core ML) | `.mlmodel` | ✅ **Mobile Security**: Protobuf validation, custom layer checking | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution |
+| **TensorFlow Lite** (TensorFlow) | `.tflite` | ✅ **Mobile-Optimized**: FlatBuffer validation, custom delegate checking | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
+| **Pickle** (Python/scikit-learn) | `.pkl`, `.pickle`, `.dill` | 🔥 **Advanced Detection**: Dangerous opcodes (REDUCE, INST, OBJ), malicious imports, nested payloads, decode-exec chains | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors |
+| **JAX/Flax** (JAX/Flax) | `.msgpack`, `.flax`, `.orbax` | 🧠 **JAX-Specific**: Transform validation, compilation safety, decompression bomb protection | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms |
+| **NumPy** (NumPy - universal) | `.npy`, `.npz` | 🔢 **Array Security**: Object array detection, dtype validation, dimension overflow protection | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays |
+| **Joblib** (scikit-learn) | `.joblib` | 🔬 **ML-Aware**: Compression bomb detection, embedded pickle analysis, scikit-learn integration | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle |
+| **Model Configs** (Universal) | `.json`, `.yaml`, `.toml` | 🛡️ **Config Security**: Suspicious keys, credential exposure, injection patterns | 🟡 **LOW RISK** - ✅ **Config only** - No code execution |
+| **Archives** (Various) | `.zip`, `.tar`, `.gz` | 📦 **Archive Security**: Recursive scanning, path traversal, zip bomb detection, nested analysis | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files |
+| **PMML** (Enterprise/Legacy) | `.pmml` | ✅ **XML Security**: External entity validation, suspicious extension detection | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format |
 
 ### 🎯 Advanced Security Features
 
