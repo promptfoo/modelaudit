@@ -26,8 +26,21 @@ A security scanner for AI models. Quickly check your AIML models for potential s
     - [Core Capabilities](#core-capabilities)
     - [Reporting \& Integration](#reporting--integration)
     - [Security Detection](#security-detection)
-  - [🛡️ Supported Model Formats](#️-supported-model-formats)
-    - [Weight Analysis](#weight-analysis)
+  - [🛡️ Comprehensive Model Format Security](#️-comprehensive-model-format-security)
+    - [📊 Complete Format Support Matrix](#-complete-format-support-matrix)
+    - [🎯 Advanced Security Features](#-advanced-security-features)
+      - [🧠 **ML-Aware Analysis**](#-ml-aware-analysis)
+      - [🔍 **Sophisticated Threat Detection**](#-sophisticated-threat-detection)
+      - [📊 **Enterprise-Grade Reporting**](#-enterprise-grade-reporting)
+  - [🏆 Why ModelAudit is Essential](#-why-modelaudit-is-essential)
+    - [**Comprehensive Coverage**](#comprehensive-coverage)
+    - [**Production-Ready**](#production-ready)
+    - [**Expert-Developed**](#expert-developed)
+  - [🚀 Format Recommendations by Use Case](#-format-recommendations-by-use-case)
+    - [**🏭 Production Deployment**](#-production-deployment)
+    - [**🔬 Research \& Development**](#-research--development)
+    - [**⚠️ Legacy Systems**](#️-legacy-systems)
+  - [🛠️ Integration Example](#️-integration-example)
   - [⚙️ Advanced Usage](#️-advanced-usage)
     - [Command Line Options](#command-line-options)
     - [Exit Codes](#exit-codes)
@@ -340,31 +353,96 @@ risk:
 - **License Compliance**: Identifies commercial use restrictions, AGPL network obligations, unlicensed datasets
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
-## 🛡️ Supported Model Formats
+## 🛡️ Comprehensive Model Format Security
 
-ModelAudit provides specialized security scanners for different model formats:
+ModelAudit provides **industry-leading security coverage** across all major ML model formats. Our scanners detect sophisticated attack vectors that other tools miss, from basic malicious imports to advanced multi-stage serialization attacks.
 
-| Format              | File Extensions                                                                                          | What We Check                                                                                                      |
-| ------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Pickle**          | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt`                                               | Malicious code execution, dangerous opcodes, suspicious imports, nested pickle detection, decode-exec chains       |
-| **PyTorch Zip**     | `.pt`, `.pth`                                                                                            | Embedded pickle analysis, suspicious files, custom patterns                                                        |
-| **PyTorch Binary**  | `.bin`                                                                                                   | Binary tensor data analysis, embedded content                                                                      |
-| **TensorFlow Lite** | `.tflite`                                                                                                | Extreme tensor shapes, custom ops, FlatBuffer integrity                                                            |
-| **TensorFlow**      | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution                                                                  |
-| **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
-| **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
-| **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
-| **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
-| **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
-| **Joblib**          | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering          |
-| **NumPy**           | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation                                                            |
-| **PMML**            | `.pmml`                                                                                                  | XML well-formedness, external entity checks, suspicious extensions                                                 |
-| **ZIP Archives**    | `.zip`                                                                                                   | Recursive content scanning, zip bombs, directory traversal                                                         |
-| **Manifests**       | `.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.cfg`, `.config`, `.manifest`, `.model`, `.metadata` | Suspicious keys, credential exposure, blacklisted patterns                                                         |
+### 📊 Complete Format Support Matrix
 
-### Weight Analysis
+**Sorted by popularity in the ML ecosystem** - ModelAudit provides comprehensive security coverage across all major formats.
 
-ModelAudit can detect anomalous weight patterns that may indicate trojaned models using statistical analysis. This feature is disabled by default for large language models to avoid false positives.
+| Format | Extensions | Framework | Primary Use | ModelAudit Protection | Security Assessment |
+|--------|------------|-----------|-------------|----------------------|-------------------|
+| **PyTorch** | `.pt`, `.pth` (ZIP) | PyTorch | Training/Research | 🔥 **Comprehensive**: Embedded pickle analysis, suspicious archives, path traversal protection | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization |
+| **SafeTensors** | `.safetensors` | Hugging Face (universal) | All uses | ✅ **Integrity Validation**: Metadata verification, tensor bounds checking | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security |
+| **GGUF/GGML** | `.gguf`, `.ggml` | llama.cpp, Ollama | LLM Inference | ✅ **Format Validation**: Header integrity, tensor alignment, DoS protection | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference |
+| **TensorFlow SavedModel** | `.pb`, directories | TensorFlow | Production/Serving | 🛡️ **Framework-Specific**: PyFunc detection, file I/O operations, custom operation validation | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations |
+| **ONNX** | `.onnx` | Cross-framework | Deployment/Interop | ✅ **Standards-Based**: Custom operator validation, external data integrity | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability |
+| **PyTorch Binary** | `.bin` (HuggingFace) | PyTorch/Transformers | Model weights | 🔥 **Binary Analysis**: Tensor validation, embedded content detection | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage |
+| **Keras H5** | `.h5`, `.hdf5`, `.keras` | Keras/TensorFlow | Training/Prototyping | 🛡️ **Layer-Aware**: Lambda layer detection, custom object analysis, dangerous configurations | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers |
+| **Core ML** | `.mlmodel` | Apple Core ML | iOS/macOS Apps | ✅ **Mobile Security**: Protobuf validation, custom layer checking | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution |
+| **TensorFlow Lite** | `.tflite` | TensorFlow | Mobile/Edge | ✅ **Mobile-Optimized**: FlatBuffer validation, custom delegate checking | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
+| **Pickle** | `.pkl`, `.pickle`, `.dill` | Python/scikit-learn | Legacy/Traditional ML | 🔥 **Advanced Detection**: Dangerous opcodes (REDUCE, INST, OBJ), malicious imports, nested payloads, decode-exec chains | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors |
+| **JAX/Flax** | `.msgpack`, `.flax`, `.orbax` | JAX/Flax | Research/Advanced ML | 🧠 **JAX-Specific**: Transform validation, compilation safety, decompression bomb protection | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms |
+| **NumPy** | `.npy`, `.npz` | NumPy (universal) | Data arrays/Embeddings | 🔢 **Array Security**: Object array detection, dtype validation, dimension overflow protection | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays |
+| **Joblib** | `.joblib` | scikit-learn | Traditional ML | 🔬 **ML-Aware**: Compression bomb detection, embedded pickle analysis, scikit-learn integration | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle |
+| **Model Configs** | `.json`, `.yaml`, `.toml` | Universal | Configuration | 🛡️ **Config Security**: Suspicious keys, credential exposure, injection patterns | 🟡 **LOW RISK** - ✅ **Config only** - No code execution |
+| **Archives** | `.zip`, `.tar`, `.gz` | Various | Model packages | 📦 **Archive Security**: Recursive scanning, path traversal, zip bomb detection, nested analysis | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files |
+| **PMML** | `.pmml` | Enterprise/Legacy | Production scoring | ✅ **XML Security**: External entity validation, suspicious extension detection | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format |
+
+### 🎯 Advanced Security Features
+
+**ModelAudit goes beyond basic scanning** with specialized detection capabilities:
+
+#### 🧠 **ML-Aware Analysis**
+- **Weight Distribution Anomalies**: Statistical analysis to detect trojaned models and backdoors
+- **Architecture Fingerprinting**: Identifies suspicious model structures and hidden functionality  
+- **ML Context Detection**: Reduces false positives by understanding legitimate ML patterns
+
+#### 🔍 **Sophisticated Threat Detection**
+- **Multi-Stage Attacks**: Detects complex nested serialization and encoding chains
+- **Obfuscation Detection**: Finds hidden payloads in base64, hex, and custom encodings
+- **Supply Chain Security**: Validates model integrity and detects tampering
+
+#### 📊 **Enterprise-Grade Reporting**
+- **Risk Scoring**: Quantified threat assessment from 0.0 to 1.0
+- **SBOM Generation**: Complete software bill of materials with license compliance
+- **Detailed Forensics**: Exact byte positions and attack vector explanations
+
+## 🏆 Why ModelAudit is Essential
+
+### **Comprehensive Coverage**
+Unlike basic antivirus tools, ModelAudit understands **ML-specific attack vectors** and provides deep format analysis that catches sophisticated threats other tools miss.
+
+### **Production-Ready**
+- **Fast Scanning**: Optimized for large models and batch processing
+- **CI/CD Integration**: Clear exit codes and JSON output for automated pipelines  
+- **Enterprise Features**: SBOM generation, compliance reporting, detailed audit trails
+
+### **Expert-Developed**
+Built by security researchers who understand both **ML engineering** and **cybersecurity**, ensuring comprehensive protection without breaking legitimate workflows.
+
+## 🚀 Format Recommendations by Use Case
+
+### **🏭 Production Deployment**
+1. **SafeTensors** - Best security, excellent performance
+2. **GGUF** - Optimized inference, strong safety guarantees
+3. **TensorFlow Lite** - Mobile deployment, compiled safety
+
+### **🔬 Research & Development**  
+1. **ONNX** - Cross-framework compatibility with good security
+2. **TensorFlow SavedModel** - Full framework features (scan for PyFunc)
+3. **JAX/Flax** - Advanced research (validate transforms)
+
+### **⚠️ Legacy Systems**
+1. **Pickle formats** - **Scan with ModelAudit**, migrate when possible
+2. **PyTorch .pt/.pth** - **Always scan**, consider SafeTensors conversion
+3. **Keras H5** - **Validate Lambda layers**, prefer SavedModel
+
+## 🛠️ Integration Example
+
+```bash
+# Validate before deployment
+modelaudit scan production_model.safetensors --format json --output security_report.json
+
+# CI/CD pipeline check
+modelaudit scan models/ --exit-code-on-issues --timeout 300
+
+# Complete audit with SBOM
+modelaudit scan model_package.zip --sbom compliance_report.json --verbose
+```
+
+**Result**: Comprehensive security validation that gives you confidence in your model deployments while maintaining development velocity.
 
 ## ⚙️ Advanced Usage
 
