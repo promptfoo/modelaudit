@@ -74,9 +74,9 @@ def test_flax_msgpack_suspicious_content(tmp_path):
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
-    # Create oversized containers
-    large_dict = {f"key_{i}": f"value_{i}" for i in range(20000)}  # Over default limit
-    large_list = list(range(15000))  # Over default limit
+    # Create oversized containers (over the default 50000 limit)
+    large_dict = {f"key_{i}": f"value_{i}" for i in range(60000)}  # Over default limit
+    large_list = list(range(55000))  # Over default limit
 
     data = {"params": {"large_dict": large_dict, "large_list": large_list}}
     create_msgpack_file(path, data)
@@ -236,8 +236,8 @@ def test_flax_msgpack_large_model_support(tmp_path):
     """Test support for large transformer models."""
     path = tmp_path / "large_model.msgpack"
 
-    # Simulate large model with 200MB+ embedding
-    large_embedding = b"\x00" * (250 * 1024 * 1024)  # 250MB
+    # Simulate large model with 600MB+ embedding (over the 500MB default threshold)
+    large_embedding = b"\x00" * (600 * 1024 * 1024)  # 600MB
 
     data = {
         "params": {
@@ -318,10 +318,10 @@ def test_flax_msgpack_trailing_data(tmp_path):
 
 
 def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs with updated 200MB threshold."""
+    """Test detection of suspiciously large binary blobs with updated 500MB threshold."""
     path = tmp_path / "large_blob.msgpack"
-    # Create large binary blob (over 200MB new threshold)
-    large_blob = b"X" * (250 * 1024 * 1024)  # 250MB - exceeds new 200MB threshold
+    # Create large binary blob (over 500MB threshold)
+    large_blob = b"X" * (600 * 1024 * 1024)  # 600MB - exceeds 500MB threshold
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 
