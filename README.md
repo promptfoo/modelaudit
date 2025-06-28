@@ -10,6 +10,17 @@
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
+## Table of Contents
+
+- [🚀 Quick Start](#-quick-start)
+- [🛡️ What Problems It Solves](#️-what-problems-it-solves)
+- [📊 Supported Model Formats](#-supported-model-formats)
+- [🎯 Common Use Cases](#-common-use-cases)
+- [⚙️ Advanced Usage](#️-advanced-usage)
+- [📋 Output Formats](#-output-formats)
+- [🔧 Troubleshooting](#-troubleshooting)
+- [📝 License](#-license)
+
 ## 🚀 Quick Start
 
 **Install and scan in 30 seconds:**
@@ -62,31 +73,6 @@ Validates model integrity and prevents tampering in your ML pipeline
 ### **Enforces License Compliance**
 
 Checks for license violations that could expose your company to legal risk
-
-## Table of Contents
-
-- [ModelAudit](#modelaudit)
-  - [🚀 Quick Start](#-quick-start)
-  - [🛡️ What Problems It Solves](#️-what-problems-it-solves)
-    - [**Prevents Code Execution Attacks**](#prevents-code-execution-attacks)
-    - [**Detects Model Backdoors**](#detects-model-backdoors)
-    - [**Ensures Supply Chain Security**](#ensures-supply-chain-security)
-    - [**Enforces License Compliance**](#enforces-license-compliance)
-  - [Table of Contents](#table-of-contents)
-  - [📊 Supported Model Formats](#-supported-model-formats)
-  - [🎯 Common Use Cases](#-common-use-cases)
-    - [**🔒 Pre-Deployment Security Checks**](#-pre-deployment-security-checks)
-    - [**🏭 CI/CD Pipeline Integration**](#-cicd-pipeline-integration)
-    - [**📦 Third-Party Model Validation**](#-third-party-model-validation)
-    - [**📋 Compliance \& Audit Reporting**](#-compliance--audit-reporting)
-  - [⚙️ Advanced Usage](#️-advanced-usage)
-    - [Installation Options](#installation-options)
-    - [Cloud Storage Scanning](#cloud-storage-scanning)
-    - [CI/CD Integration](#cicd-integration)
-    - [Command Line Options](#command-line-options)
-  - [📋 Output Formats](#-output-formats)
-  - [🔧 Troubleshooting](#-troubleshooting)
-  - [📝 License](#-license)
 
 ## 📊 Supported Model Formats
 
@@ -184,13 +170,7 @@ docker pull ghcr.io/promptfoo/modelaudit:latest
 docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
 ```
 
-**Development installation:**
 
-```bash
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
-rye sync --features all
-```
 
 ### Cloud Storage Scanning
 
@@ -262,7 +242,7 @@ modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
     modelaudit scan models/ --format json --output security-report.json
 
 - name: Upload Security Report
-  uses: actions/upload-artifact@v3
+  uses: actions/upload-artifact@v4
   with:
     name: security-report
     path: security-report.json
@@ -297,7 +277,6 @@ modelaudit scan model.pkl --verbose                     # Detailed output
 
 # Advanced scanning
 modelaudit scan models/ --exit-code-on-issues          # Fail CI on issues
-modelaudit scan model.pkl --why                        # Explain findings
 ```
 
 ## 📋 Output Formats
