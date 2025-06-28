@@ -262,6 +262,15 @@ class ScannerRegistry:
                 "dependencies": ["tflite"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow Lite can be sensitive
             },
+            "paddle": {
+                "module": "modelaudit.scanners.paddle_scanner",
+                "class": "PaddleScanner",
+                "description": "Scans PaddlePaddle model files",
+                "extensions": [".pdmodel", ".pdiparams"],
+                "priority": 17,
+                "dependencies": ["paddlepaddle"],
+                "numpy_sensitive": True,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -476,6 +485,7 @@ def __getattr__(name: str):
         "FlaxMsgpackScanner": "flax_msgpack",
         "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
+        "PaddleScanner": "paddle",
         "ZipScanner": "zip",
     }
 
