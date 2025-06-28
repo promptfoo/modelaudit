@@ -238,10 +238,19 @@ class ScannerRegistry:
             "flax_msgpack": {
                 "module": "modelaudit.scanners.flax_msgpack_scanner",
                 "class": "FlaxMsgpackScanner",
-                "description": "Scans Flax msgpack checkpoint files",
-                "extensions": [".msgpack"],
+                "description": "Scans Flax/JAX msgpack checkpoint files with enhanced security analysis",
+                "extensions": [".msgpack", ".flax", ".orbax", ".jax"],
                 "priority": 15,
                 "dependencies": ["msgpack"],  # Light dependency
+                "numpy_sensitive": False,
+            },
+            "jax_checkpoint": {
+                "module": "modelaudit.scanners.jax_checkpoint_scanner",
+                "class": "JaxCheckpointScanner",
+                "description": "Scans JAX checkpoint files in various serialization formats",
+                "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+                "priority": 15,  # Same priority as flax_msgpack, will be tried in order
+                "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
             "tflite": {
@@ -465,6 +474,7 @@ def __getattr__(name: str):
         "WeightDistributionScanner": "weight_distribution",
         "SafeTensorsScanner": "safetensors",
         "FlaxMsgpackScanner": "flax_msgpack",
+        "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
         "ZipScanner": "zip",
     }

@@ -152,6 +152,154 @@ def test_flax_msgpack_corrupted(tmp_path):
     )
 
 
+def test_flax_msgpack_enhanced_jax_support(tmp_path):
+    """Test enhanced JAX-specific functionality."""
+    path = tmp_path / "jax_model.flax"
+
+    # Create JAX model with transformer architecture
+    data = {
+        "params": {
+            "transformer": {
+                "attention": {"query": b"\x00" * 1000, "key": b"\x00" * 1000},
+                "feed_forward": {"dense": b"\x00" * 2000},
+            }
+        },
+        "opt_state": {"step": 1000, "learning_rate": 0.001},
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner()
+    result = scanner.scan(str(path))
+
+    assert result.success
+    # Should detect transformer architecture
+    assert result.metadata.get("model_architecture") == "transformer"
+    assert result.metadata.get("estimated_parameters") > 0
+
+    # Should detect optimizer state
+    jax_metadata = result.metadata.get("jax_metadata", {})
+    assert jax_metadata.get("has_optimizer_state") is True
+
+
+def test_flax_msgpack_orbax_format_detection(tmp_path):
+    """Test detection of Orbax checkpoint format."""
+    path = tmp_path / "orbax_checkpoint.orbax"
+
+    data = {
+        "__orbax_metadata__": {"version": "0.1.0", "format": "flax"},
+        "state": {"params": {"layer": b"\x00" * 1000}},
+        "metadata": {"step": 5000},
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner()
+    result = scanner.scan(str(path))
+
+    assert result.success
+
+    # Should detect Orbax format
+    jax_metadata = result.metadata.get("jax_metadata", {})
+    assert jax_metadata.get("orbax_format") is True
+
+    # Should have INFO issue about Orbax detection
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    assert any("Orbax checkpoint format detected" in issue.message for issue in info_issues)
+
+
+def test_flax_msgpack_jax_specific_threats(tmp_path):
+    """Test detection of JAX-specific security threats."""
+    path = tmp_path / "malicious_jax.jax"
+
+    data = {
+        "params": {"layer": b"\x00" * 100},
+        "__jax_array__": "fake_array_metadata",
+        "custom_transform": "jax.jit(eval(malicious_code))",
+        "shape": [-1, 100],  # Invalid negative dimension
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner()
+    result = scanner.scan(str(path))
+
+    # Should detect multiple threats
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+
+    # Check for JAX-specific threats
+    issues_messages = [issue.message for issue in critical_issues + warning_issues]
+
+    assert any("JAX array metadata" in msg for msg in issues_messages)
+    assert any("negative dimensions" in msg for msg in issues_messages)
+
+
+def test_flax_msgpack_large_model_support(tmp_path):
+    """Test support for large transformer models."""
+    path = tmp_path / "large_model.msgpack"
+
+    # Simulate large model with 200MB+ embedding
+    large_embedding = b"\x00" * (250 * 1024 * 1024)  # 250MB
+
+    data = {
+        "params": {
+            "embedding": {"vocab_embedding": large_embedding},
+            "transformer": {"layer_0": {"attention": b"\x00" * 1000}},
+        }
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner()
+    result = scanner.scan(str(path))
+
+    assert result.success
+
+    # Should handle large blobs without flagging as suspicious for legitimate models
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    # The large blob should be detected but at INFO level, not CRITICAL
+    large_blob_issues = [issue for issue in info_issues if "large binary blob" in issue.message.lower()]
+    assert len(large_blob_issues) >= 1
+
+
+def test_flax_msgpack_can_handle_extensions(tmp_path):
+    """Test that scanner can handle all JAX/Flax file extensions."""
+    extensions = [".msgpack", ".flax", ".orbax", ".jax"]
+
+    for ext in extensions:
+        test_file = tmp_path / f"test{ext}"
+        test_file.write_bytes(b"\x81\xa4test\xa5value")  # Simple msgpack
+
+        assert FlaxMsgpackScanner.can_handle(str(test_file))
+
+
+def test_flax_msgpack_ml_context_confidence(tmp_path):
+    """Test ML context confidence scoring."""
+    path = tmp_path / "ml_model.msgpack"
+
+    # Create data that strongly indicates ML model
+    data = {
+        "params": {
+            "transformer": {
+                "attention": {"query": b"\x00" * (768 * 768 * 4)},  # 768x768 matrix
+                "feed_forward": {"dense": b"\x00" * (768 * 3072 * 4)},  # 768x3072 matrix
+            },
+            "embedding": {"token_embedding": b"\x00" * (50257 * 768 * 4)},  # GPT-2 vocab size
+        }
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner()
+    result = scanner.scan(str(path))
+
+    assert result.success
+
+    # Should have high confidence this is an ML model
+    jax_metadata = result.metadata.get("jax_metadata", {})
+    assert jax_metadata.get("confidence", 0) >= 0.7
+    assert jax_metadata.get("is_ml_model") is True
+
+    # Should find evidence of transformer architecture
+    assert "transformer" in result.metadata.get("model_architecture", "")
+
+
 def test_flax_msgpack_trailing_data(tmp_path):
     """Test detection of trailing data after msgpack content."""
     path = tmp_path / "trailing.msgpack"

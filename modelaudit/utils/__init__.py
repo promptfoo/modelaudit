@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+from .dvc_utils import resolve_dvc_file
+
 
 def is_within_directory(base_dir: str, target: str) -> bool:
     """Return True if the target path is within the given base directory."""

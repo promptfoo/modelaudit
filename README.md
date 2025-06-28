@@ -18,6 +18,10 @@ A security scanner for AI models. Quickly check your AIML models for potential s
   - [🚀 Quick Start](#-quick-start)
     - [Installation](#installation)
     - [Basic Usage](#basic-usage)
+    - [Cloud Storage Authentication](#cloud-storage-authentication)
+      - [Amazon S3](#amazon-s3)
+      - [Google Cloud Storage (GCS)](#google-cloud-storage-gcs)
+      - [Cloudflare R2](#cloudflare-r2)
   - [✨ Features](#-features)
     - [Core Capabilities](#core-capabilities)
     - [Reporting \& Integration](#reporting--integration)
@@ -103,6 +107,12 @@ pip install modelaudit[joblib]
 # For Flax msgpack scanning
 pip install modelaudit[flax]
 
+# For S3/GCS/R2 cloud storage support
+pip install modelaudit[cloud]
+
+# For scanning models stored in MLflow registries
+pip install modelaudit[mlflow]
+
 # Install all optional dependencies
 pip install modelaudit[all]
 
@@ -161,21 +171,107 @@ modelaudit scan model.pkl
 # Scan an ONNX model
 modelaudit scan model.onnx
 
-# Scan multiple models (including enhanced dill/joblib support)
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-checkpoint.msgpack
+# Scan multiple models (including enhanced dill/joblib support and JAX/Flax)
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
 
 # Scan a directory
 modelaudit scan ./models/
 
+# Scan a model stored in the MLflow registry
+modelaudit scan models:/MyModel/1
+
 # Scan a model from HuggingFace Hub
 modelaudit scan https://huggingface.co/gpt2
 modelaudit scan hf://distilbert-base-uncased
+
+# Scan models from cloud storage
+modelaudit scan s3://my-bucket/models/
+modelaudit scan gs://my-bucket/model.pt
+
+# Scan a model from JFrog Artifactory
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+# With API token authentication (recommended)
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-api-token YOUR_API_TOKEN
+
+# With access token authentication
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-access-token YOUR_ACCESS_TOKEN
+
+# Using environment variables (recommended for CI/CD)
+export JFROG_API_TOKEN=your_token_here
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+# Using .env file (create a .env file in your project root)
+echo "JFROG_API_TOKEN=your_token_here" > .env
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
 
 # Generate Software Bill of Materials (SBOM) with license information
 modelaudit scan model.pkl --sbom sbom.json
+```
+
+### Cloud Storage Authentication
+
+ModelAudit supports scanning models directly from cloud storage. Authentication is handled automatically using standard cloud provider credentials.
+
+#### Amazon S3
+
+**Environment Variables:**
+
+```bash
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_DEFAULT_REGION="us-east-1"  # Optional
+
+# Then scan
+modelaudit scan s3://my-bucket/model.pkl
+```
+
+**AWS Credentials File (`~/.aws/credentials`):**
+
+```ini
+[default]
+aws_access_key_id = your-access-key
+aws_secret_access_key = your-secret-key
+region = us-east-1
+```
+
+**IAM Roles:** Automatically detected when running on EC2 instances or other AWS services.
+
+#### Google Cloud Storage (GCS)
+
+**Service Account Key:**
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+
+# Then scan
+modelaudit scan gs://my-bucket/model.pt
+```
+
+**Application Default Credentials (ADC):**
+
+```bash
+# Authenticate with gcloud (for development)
+gcloud auth application-default login
+
+# Or use service account (for production)
+gcloud auth activate-service-account --key-file=/path/to/key.json
+```
+
+#### Cloudflare R2
+
+R2 uses S3-compatible authentication:
+
+```bash
+export AWS_ACCESS_KEY_ID="your-r2-access-key"
+export AWS_SECRET_ACCESS_KEY="your-r2-secret-key"
+export AWS_ENDPOINT_URL="https://your-account.r2.cloudflarestorage.com"
+
+# Then scan
+modelaudit scan r2://my-bucket/model.safetensors
 ```
 
 **Example output:**
@@ -223,6 +319,7 @@ risk:
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently
 - **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
+- **DVC Integration**: Automatically scan files referenced in `.dvc` pointer files
 
 ### Reporting & Integration
 
@@ -231,6 +328,7 @@ risk:
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Integration**: Clear exit codes for automated pipeline integration
+- **MLflow Support**: Scan models directly from the MLflow model registry
 
 ### Security Detection
 
@@ -256,7 +354,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
 | **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
 | **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
-| **Flax**            | `.msgpack`                                                                                               | MessagePack integrity, suspicious code pattern detection, decompression bomb prevention, embedded content analysis |
+| **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
 | **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
 | **Joblib**          | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering          |
 | **NumPy**           | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation                                                            |
@@ -291,6 +389,9 @@ modelaudit scan model.pkl --sbom sbom.json
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
+
+# Scan a model from the MLflow registry
+modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
 ```
 
 ### Exit Codes
@@ -443,6 +544,27 @@ pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you
 ```bash
 # Increase file size limit and timeout for large models
 modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
+```
+
+**Cloud Storage Authentication:**
+
+```bash
+# Check AWS credentials
+aws sts get-caller-identity
+
+# Check GCS authentication
+gcloud auth list
+
+# Test S3 access
+aws s3 ls s3://your-bucket/
+
+# Test GCS access
+gsutil ls gs://your-bucket/
+
+# Common authentication errors:
+# - "NoCredentialsError": Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# - "DefaultCredentialsError": Set GOOGLE_APPLICATION_CREDENTIALS or run gcloud auth
+# - "Access Denied": Check bucket permissions and IAM roles
 ```
 
 **Testing:**
