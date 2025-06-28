@@ -136,6 +136,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "executorch": {
+                "module": "modelaudit.scanners.executorch_scanner",
+                "class": "ExecuTorchScanner",
+                "description": "Scans ExecuTorch mobile archives",
+                "extensions": [".ptl", ".pte"],
+                "priority": 6,  # Similar priority to PyTorch Zip
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "gguf": {
                 "module": "modelaudit.scanners.gguf_scanner",
                 "class": "GgufScanner",
@@ -465,6 +474,7 @@ def __getattr__(name: str):
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
         "PyTorchZipScanner": "pytorch_zip",
+        "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
         "NumPyScanner": "numpy",
