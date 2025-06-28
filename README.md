@@ -1,6 +1,6 @@
 # ModelAudit
 
-A security scanner for AI models. Quickly check your AIML models for potential security risks before deployment.
+**Secure your AI models before deployment.** Detects malicious code, backdoors, and security vulnerabilities in ML model files.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
@@ -10,281 +10,22 @@ A security scanner for AI models. Quickly check your AIML models for potential s
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
-## Table of Contents
-
-- [ModelAudit](#modelaudit)
-  - [Table of Contents](#table-of-contents)
-  - [🔍 What It Does](#-what-it-does)
-  - [🚀 Quick Start](#-quick-start)
-    - [Installation](#installation)
-    - [Basic Usage](#basic-usage)
-    - [Cloud Storage Authentication](#cloud-storage-authentication)
-      - [Amazon S3](#amazon-s3)
-      - [Google Cloud Storage (GCS)](#google-cloud-storage-gcs)
-      - [Cloudflare R2](#cloudflare-r2)
-  - [✨ Features](#-features)
-    - [Core Capabilities](#core-capabilities)
-    - [Reporting \& Integration](#reporting--integration)
-    - [Security Detection](#security-detection)
-  - [🛡️ Comprehensive Model Format Security](#️-comprehensive-model-format-security)
-    - [📊 Complete Format Support Matrix](#-complete-format-support-matrix)
-    - [🎯 Advanced Security Features](#-advanced-security-features)
-      - [🧠 **ML-Aware Analysis**](#-ml-aware-analysis)
-      - [🔍 **Sophisticated Threat Detection**](#-sophisticated-threat-detection)
-      - [📊 **Enterprise-Grade Reporting**](#-enterprise-grade-reporting)
-  - [🏆 Why ModelAudit is Essential](#-why-modelaudit-is-essential)
-    - [**Comprehensive Coverage**](#comprehensive-coverage)
-    - [**Production-Ready**](#production-ready)
-    - [**Expert-Developed**](#expert-developed)
-  - [🚀 Format Recommendations by Use Case](#-format-recommendations-by-use-case)
-    - [**🏭 Production Deployment**](#-production-deployment)
-    - [**🔬 Research \& Development**](#-research--development)
-    - [**⚠️ Legacy Systems**](#️-legacy-systems)
-  - [🛠️ Integration Example](#️-integration-example)
-  - [⚙️ Advanced Usage](#️-advanced-usage)
-    - [Command Line Options](#command-line-options)
-    - [Exit Codes](#exit-codes)
-  - [📋 JSON Output Format](#-json-output-format)
-  - [🔄 CI/CD Integration](#-cicd-integration)
-    - [Basic Integration](#basic-integration)
-    - [Platform Examples](#platform-examples)
-  - [🔧 Troubleshooting](#-troubleshooting)
-    - [Common Issues](#common-issues)
-  - [⚠️ Limitations](#️-limitations)
-  - [📝 License](#-license)
-
-## 🔍 What It Does
-
-ModelAudit scans ML model files for:
-
-- **Malicious code execution** (e.g., `os.system` calls in pickled models)
-- **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
-- **Potentially unsafe Keras Lambda layers** with arbitrary code execution
-- **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
-- **Nested pickle payloads** and multi-stage serialization attacks
-- **Custom ONNX operators** and external data integrity issues
-- **Encoded payloads** and suspicious string patterns
-- **Risky configurations** in model architectures
-- **Suspicious patterns** in model manifests and configuration files
-- **Models with blacklisted names** or content patterns
-- **Malicious content in ZIP archives** including nested archives and zip bombs
-- **Container-delivered models** in OCI/Docker layers and manifest files
-- **GGUF/GGML file integrity** and tensor alignment validation
-- **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
-- **License compliance issues** including commercial use restrictions and AGPL obligations
-- **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
-- **NumPy array integrity issues** (malformed headers, dangerous dtypes)
-
 ## 🚀 Quick Start
 
-### Installation
-
-ModelAudit is available on [PyPI](https://pypi.org/project/modelaudit/) and requires **Python 3.9 or higher**.
-
-**Basic installation:**
+**Install and scan in 30 seconds:**
 
 ```bash
-pip install modelaudit
-```
-
-**With optional dependencies for specific model formats:**
-
-```bash
-# For TensorFlow SavedModel scanning
-pip install modelaudit[tensorflow]
-
-# For Keras H5 model scanning
-pip install modelaudit[h5]
-
-# For PyTorch model scanning
-pip install modelaudit[pytorch]
-
-# For ONNX model scanning
-pip install modelaudit[onnx]
-
-# For TensorFlow Lite model scanning
-pip install modelaudit[tflite]
-
-# For YAML manifest scanning
-pip install modelaudit[yaml]
-
-# For SafeTensors model scanning
-pip install modelaudit[safetensors]
-
-# For enhanced pickle support (dill serialization with security validation)
-pip install modelaudit[dill]
-
-# For Joblib model scanning (includes scikit-learn integration)
-pip install modelaudit[joblib]
-
-# For Flax msgpack scanning
-pip install modelaudit[flax]
-
-# For S3/GCS/R2 cloud storage support
-pip install modelaudit[cloud]
-
-# For scanning models stored in MLflow registries
-pip install modelaudit[mlflow]
-
-# Install all optional dependencies
+# Install ModelAudit
 pip install modelaudit[all]
 
-# For NumPy 1.x compatibility (if you need all ML frameworks to work)
-pip install modelaudit[numpy1]
-```
-
-**NumPy Compatibility:**
-
-ModelAudit supports both NumPy 1.x and 2.x, with automatic graceful fallback when ML frameworks have compatibility issues:
-
-```bash
-# Default installation (works with NumPy 2.x, some ML framework scanners may not load)
-pip install modelaudit[all]
-
-# Full NumPy 1.x compatibility mode (ensures all ML frameworks work)
-pip install modelaudit[numpy1]
-
-# Check scanner compatibility status
-modelaudit doctor --show-failed
-```
-
-**Development installation:**
-
-```bash
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
-
-# Using Rye (recommended)
-rye sync --features all
-
-# Or using pip
-pip install -e .[all]
-```
-
-**Docker installation:**
-
-```bash
-# Pull from GitHub Container Registry
-docker pull ghcr.io/promptfoo/modelaudit:latest
-
-# Use specific variants
-docker pull ghcr.io/promptfoo/modelaudit:latest-full        # All ML frameworks
-docker pull ghcr.io/promptfoo/modelaudit:latest-tensorflow  # TensorFlow only
-
-# Run with Docker
-docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
-```
-
-### Basic Usage
-
-```bash
-# Scan a single model
+# Scan a model file
 modelaudit scan model.pkl
-
-# Scan an ONNX model
-modelaudit scan model.onnx
-
-# Scan multiple models (including enhanced dill/joblib support and JAX/Flax)
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
 
 # Scan a directory
 modelaudit scan ./models/
 
-# Scan a model stored in the MLflow registry
-modelaudit scan models:/MyModel/1
-
-# Scan a model from HuggingFace Hub
-modelaudit scan https://huggingface.co/gpt2
-modelaudit scan hf://distilbert-base-uncased
-
-# Scan models from cloud storage
-modelaudit scan s3://my-bucket/models/
-modelaudit scan gs://my-bucket/model.pt
-
-# Scan a model from JFrog Artifactory
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
-
-# With API token authentication (recommended)
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-api-token YOUR_API_TOKEN
-
-# With access token authentication
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt --jfrog-access-token YOUR_ACCESS_TOKEN
-
-# Using environment variables (recommended for CI/CD)
-export JFROG_API_TOKEN=your_token_here
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
-
-# Using .env file (create a .env file in your project root)
-echo "JFROG_API_TOKEN=your_token_here" > .env
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
-
-# Export results to JSON
+# Export results for CI/CD
 modelaudit scan model.pkl --format json --output results.json
-
-# Generate Software Bill of Materials (SBOM) with license information
-modelaudit scan model.pkl --sbom sbom.json
-```
-
-### Cloud Storage Authentication
-
-ModelAudit supports scanning models directly from cloud storage. Authentication is handled automatically using standard cloud provider credentials.
-
-#### Amazon S3
-
-**Environment Variables:**
-
-```bash
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export AWS_DEFAULT_REGION="us-east-1"  # Optional
-
-# Then scan
-modelaudit scan s3://my-bucket/model.pkl
-```
-
-**AWS Credentials File (`~/.aws/credentials`):**
-
-```ini
-[default]
-aws_access_key_id = your-access-key
-aws_secret_access_key = your-secret-key
-region = us-east-1
-```
-
-**IAM Roles:** Automatically detected when running on EC2 instances or other AWS services.
-
-#### Google Cloud Storage (GCS)
-
-**Service Account Key:**
-
-```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
-
-# Then scan
-modelaudit scan gs://my-bucket/model.pt
-```
-
-**Application Default Credentials (ADC):**
-
-```bash
-# Authenticate with gcloud (for development)
-gcloud auth application-default login
-
-# Or use service account (for production)
-gcloud auth activate-service-account --key-file=/path/to/key.json
-```
-
-#### Cloudflare R2
-
-R2 uses S3-compatible authentication:
-
-```bash
-export AWS_ACCESS_KEY_ID="your-r2-access-key"
-export AWS_SECRET_ACCESS_KEY="your-r2-secret-key"
-export AWS_ENDPOINT_URL="https://your-account.r2.cloudflarestorage.com"
-
-# Then scan
-modelaudit scan r2://my-bucket/model.safetensors
 ```
 
 **Example output:**
@@ -292,431 +33,357 @@ modelaudit scan r2://my-bucket/model.safetensors
 ```bash
 $ modelaudit scan suspicious_model.pkl
 
-────────────────────────────────────────────────────────────────────────────────
-ModelAudit Security Scanner
-Scanning for potential security issues in ML model files
-────────────────────────────────────────────────────────────────────────────────
-Paths to scan: suspicious_model.pkl
-────────────────────────────────────────────────────────────────────────────────
-
 ✓ Scanning suspicious_model.pkl
+Files scanned: 1 | Issues found: 2 critical, 1 warning
 
-Active Scanner: pickle
-Scan completed in 0.02 seconds
-Files scanned: 1
-Scanned 156 bytes
-Issues found: 2 critical, 1 warnings
+1. suspicious_model.pkl (pos 28): [CRITICAL] Malicious code execution attempt
+   Why: Contains os.system() call that could run arbitrary commands
 
-1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
-2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
+2. suspicious_model.pkl (pos 52): [WARNING] Dangerous pickle deserialization
+   Why: Could execute code when the model loads
 
-────────────────────────────────────────────────────────────────────────────────
-✗ Scan completed with findings
+✗ Security issues found - DO NOT deploy this model
 ```
 
-Some issues will also show a short **Why** paragraph explaining the security
-risk:
+## 🛡️ What Problems It Solves
+
+### **Prevents Code Execution Attacks**
+
+Stops malicious models that run arbitrary commands when loaded (common in PyTorch .pt files)
+
+### **Detects Model Backdoors**
+
+Identifies trojaned models with hidden functionality or suspicious weight patterns
+
+### **Ensures Supply Chain Security**
+
+Validates model integrity and prevents tampering in your ML pipeline
+
+### **Enforces License Compliance**
+
+Checks for license violations that could expose your company to legal risk
+
+## Table of Contents
+
+- [ModelAudit](#modelaudit)
+  - [🚀 Quick Start](#-quick-start)
+  - [🛡️ What Problems It Solves](#️-what-problems-it-solves)
+    - [**Prevents Code Execution Attacks**](#prevents-code-execution-attacks)
+    - [**Detects Model Backdoors**](#detects-model-backdoors)
+    - [**Ensures Supply Chain Security**](#ensures-supply-chain-security)
+    - [**Enforces License Compliance**](#enforces-license-compliance)
+  - [Table of Contents](#table-of-contents)
+  - [📊 Supported Model Formats](#-supported-model-formats)
+  - [🎯 Common Use Cases](#-common-use-cases)
+    - [**🔒 Pre-Deployment Security Checks**](#-pre-deployment-security-checks)
+    - [**🏭 CI/CD Pipeline Integration**](#-cicd-pipeline-integration)
+    - [**📦 Third-Party Model Validation**](#-third-party-model-validation)
+    - [**📋 Compliance \& Audit Reporting**](#-compliance--audit-reporting)
+  - [⚙️ Advanced Usage](#️-advanced-usage)
+    - [Installation Options](#installation-options)
+    - [Cloud Storage Scanning](#cloud-storage-scanning)
+    - [CI/CD Integration](#cicd-integration)
+    - [Command Line Options](#command-line-options)
+  - [📋 Output Formats](#-output-formats)
+  - [🔧 Troubleshooting](#-troubleshooting)
+  - [📝 License](#-license)
+
+## 📊 Supported Model Formats
+
+ModelAudit scans **all major ML model formats** with specialized security analysis for each:
+
+| Format                                     | Extensions                    | Security Assessment                                                            |
+| ------------------------------------------ | ----------------------------- | ------------------------------------------------------------------------------ |
+| **PyTorch** (PyTorch)                      | `.pt`, `.pth` (ZIP)           | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization          |
+| **SafeTensors** (Hugging Face - universal) | `.safetensors`                | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security             |
+| **GGUF/GGML** (llama.cpp, Ollama)          | `.gguf`, `.ggml`              | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference     |
+| **TensorFlow SavedModel** (TensorFlow)     | `.pb`, directories            | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations   |
+| **ONNX** (Cross-framework)                 | `.onnx`                       | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability    |
+| **PyTorch Binary** (PyTorch/Transformers)  | `.bin` (HuggingFace)          | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage                |
+| **Keras H5** (Keras/TensorFlow)            | `.h5`, `.hdf5`, `.keras`      | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers     |
+| **Core ML** (Apple Core ML)                | `.mlmodel`                    | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution    |
+| **TensorFlow Lite** (TensorFlow)           | `.tflite`                     | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
+| **Pickle** (Python/scikit-learn)           | `.pkl`, `.pickle`, `.dill`    | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors         |
+| **JAX/Flax** (JAX/Flax)                    | `.msgpack`, `.flax`, `.orbax` | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms                  |
+| **NumPy** (NumPy - universal)              | `.npy`, `.npz`                | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays                 |
+| **Joblib** (scikit-learn)                  | `.joblib`                     | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle              |
+| **Model Configs** (Universal)              | `.json`, `.yaml`, `.toml`     | 🟡 **LOW RISK** - ✅ **Config only** - No code execution                       |
+| **Archives** (Various)                     | `.zip`, `.tar`, `.gz`         | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files        |
+| **PMML** (Enterprise/Legacy)               | `.pmml`                       | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format              |
+
+## 🎯 Common Use Cases
+
+### **🔒 Pre-Deployment Security Checks**
 
 ```bash
-1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
-   Why: The 'os' module provides direct access to operating system functions.
-```
-
-## ✨ Features
-
-### Core Capabilities
-
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
-- **Automatic Format Detection**: Identifies model formats automatically
-- **Deep Security Analysis**: Examines model internals, not just metadata
-- **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
-- **Batch Processing**: Scan multiple files and directories efficiently
-- **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
-- **DVC Integration**: Automatically scan files referenced in `.dvc` pointer files
-
-### Reporting & Integration
-
-- **Multiple Output Formats**: Human-readable text and machine-readable JSON
-- **SBOM Generation**: CycloneDX Software Bill of Materials with license metadata
-- **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
-- **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
-- **CI/CD Integration**: Clear exit codes for automated pipeline integration
-- **MLflow Support**: Scan models directly from the MLflow model registry
-
-### Security Detection
-
-- **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
-- **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
-- **Enhanced Dill/Joblib Analysis**: ML-aware scanning with format validation and bypass prevention
-- **Model Integrity**: Checks for unexpected files, suspicious configurations
-- **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
-- **License Compliance**: Identifies commercial use restrictions, AGPL network obligations, unlicensed datasets
-- **Pattern Matching**: Custom blacklist patterns for organizational policies
-
-## 🛡️ Comprehensive Model Format Security
-
-ModelAudit provides **industry-leading security coverage** across all major ML model formats. Our scanners detect sophisticated attack vectors that other tools miss, from basic malicious imports to advanced multi-stage serialization attacks.
-
-### 📊 Complete Format Support Matrix
-
-**Sorted by popularity in the ML ecosystem** - ModelAudit provides comprehensive security coverage across all major formats.
-
-| Format | Extensions | ModelAudit Protection | Security Assessment |
-|--------|------------|----------------------|-------------------|
-| **PyTorch** (PyTorch) | `.pt`, `.pth` (ZIP) | 🔥 **Comprehensive**: Embedded pickle analysis, suspicious archives, path traversal protection | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization |
-| **SafeTensors** (Hugging Face - universal) | `.safetensors` | ✅ **Integrity Validation**: Metadata verification, tensor bounds checking | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security |
-| **GGUF/GGML** (llama.cpp, Ollama) | `.gguf`, `.ggml` | ✅ **Format Validation**: Header integrity, tensor alignment, DoS protection | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference |
-| **TensorFlow SavedModel** (TensorFlow) | `.pb`, directories | 🛡️ **Framework-Specific**: PyFunc detection, file I/O operations, custom operation validation | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations |
-| **ONNX** (Cross-framework) | `.onnx` | ✅ **Standards-Based**: Custom operator validation, external data integrity | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability |
-| **PyTorch Binary** (PyTorch/Transformers) | `.bin` (HuggingFace) | 🔥 **Binary Analysis**: Tensor validation, embedded content detection | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage |
-| **Keras H5** (Keras/TensorFlow) | `.h5`, `.hdf5`, `.keras` | 🛡️ **Layer-Aware**: Lambda layer detection, custom object analysis, dangerous configurations | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers |
-| **Core ML** (Apple Core ML) | `.mlmodel` | ✅ **Mobile Security**: Protobuf validation, custom layer checking | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution |
-| **TensorFlow Lite** (TensorFlow) | `.tflite` | ✅ **Mobile-Optimized**: FlatBuffer validation, custom delegate checking | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
-| **Pickle** (Python/scikit-learn) | `.pkl`, `.pickle`, `.dill` | 🔥 **Advanced Detection**: Dangerous opcodes (REDUCE, INST, OBJ), malicious imports, nested payloads, decode-exec chains | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors |
-| **JAX/Flax** (JAX/Flax) | `.msgpack`, `.flax`, `.orbax` | 🧠 **JAX-Specific**: Transform validation, compilation safety, decompression bomb protection | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms |
-| **NumPy** (NumPy - universal) | `.npy`, `.npz` | 🔢 **Array Security**: Object array detection, dtype validation, dimension overflow protection | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays |
-| **Joblib** (scikit-learn) | `.joblib` | 🔬 **ML-Aware**: Compression bomb detection, embedded pickle analysis, scikit-learn integration | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle |
-| **Model Configs** (Universal) | `.json`, `.yaml`, `.toml` | 🛡️ **Config Security**: Suspicious keys, credential exposure, injection patterns | 🟡 **LOW RISK** - ✅ **Config only** - No code execution |
-| **Archives** (Various) | `.zip`, `.tar`, `.gz` | 📦 **Archive Security**: Recursive scanning, path traversal, zip bomb detection, nested analysis | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files |
-| **PMML** (Enterprise/Legacy) | `.pmml` | ✅ **XML Security**: External entity validation, suspicious extension detection | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format |
-
-### 🎯 Advanced Security Features
-
-**ModelAudit goes beyond basic scanning** with specialized detection capabilities:
-
-#### 🧠 **ML-Aware Analysis**
-- **Weight Distribution Anomalies**: Statistical analysis to detect trojaned models and backdoors
-- **Architecture Fingerprinting**: Identifies suspicious model structures and hidden functionality  
-- **ML Context Detection**: Reduces false positives by understanding legitimate ML patterns
-
-#### 🔍 **Sophisticated Threat Detection**
-- **Multi-Stage Attacks**: Detects complex nested serialization and encoding chains
-- **Obfuscation Detection**: Finds hidden payloads in base64, hex, and custom encodings
-- **Supply Chain Security**: Validates model integrity and detects tampering
-
-#### 📊 **Enterprise-Grade Reporting**
-- **Risk Scoring**: Quantified threat assessment from 0.0 to 1.0
-- **SBOM Generation**: Complete software bill of materials with license compliance
-- **Detailed Forensics**: Exact byte positions and attack vector explanations
-
-## 🏆 Why ModelAudit is Essential
-
-### **Comprehensive Coverage**
-Unlike basic antivirus tools, ModelAudit understands **ML-specific attack vectors** and provides deep format analysis that catches sophisticated threats other tools miss.
-
-### **Production-Ready**
-- **Fast Scanning**: Optimized for large models and batch processing
-- **CI/CD Integration**: Clear exit codes and JSON output for automated pipelines  
-- **Enterprise Features**: SBOM generation, compliance reporting, detailed audit trails
-
-### **Expert-Developed**
-Built by security researchers who understand both **ML engineering** and **cybersecurity**, ensuring comprehensive protection without breaking legitimate workflows.
-
-## 🚀 Format Recommendations by Use Case
-
-### **🏭 Production Deployment**
-1. **SafeTensors** - Best security, excellent performance
-2. **GGUF** - Optimized inference, strong safety guarantees
-3. **TensorFlow Lite** - Mobile deployment, compiled safety
-
-### **🔬 Research & Development**  
-1. **ONNX** - Cross-framework compatibility with good security
-2. **TensorFlow SavedModel** - Full framework features (scan for PyFunc)
-3. **JAX/Flax** - Advanced research (validate transforms)
-
-### **⚠️ Legacy Systems**
-1. **Pickle formats** - **Scan with ModelAudit**, migrate when possible
-2. **PyTorch .pt/.pth** - **Always scan**, consider SafeTensors conversion
-3. **Keras H5** - **Validate Lambda layers**, prefer SavedModel
-
-## 🛠️ Integration Example
-
-```bash
-# Validate before deployment
+# Validate models before production deployment
 modelaudit scan production_model.safetensors --format json --output security_report.json
+```
 
-# CI/CD pipeline check
+### **🏭 CI/CD Pipeline Integration**
+
+```bash
+# Automatic scanning in your build pipeline
 modelaudit scan models/ --exit-code-on-issues --timeout 300
+```
 
-# Complete audit with SBOM
+### **📦 Third-Party Model Validation**
+
+```bash
+# Scan models from HuggingFace, cloud storage, or repositories
+modelaudit scan https://huggingface.co/gpt2
+modelaudit scan s3://my-bucket/downloaded-model.pt
+```
+
+### **📋 Compliance & Audit Reporting**
+
+```bash
+# Generate comprehensive audit reports with license compliance
 modelaudit scan model_package.zip --sbom compliance_report.json --verbose
 ```
 
-**Result**: Comprehensive security validation that gives you confidence in your model deployments while maintaining development velocity.
-
 ## ⚙️ Advanced Usage
+
+### Installation Options
+
+**Basic installation (recommended for most users):**
+
+```bash
+pip install modelaudit[all]
+```
+
+**Minimal installation with specific formats:**
+
+```bash
+# Basic installation
+pip install modelaudit
+
+# Add specific format support as needed
+pip install modelaudit[tensorflow]  # TensorFlow SavedModel
+pip install modelaudit[pytorch]     # PyTorch models
+pip install modelaudit[onnx]        # ONNX models
+pip install modelaudit[cloud]       # S3/GCS/R2 support
+pip install modelaudit[mlflow]      # MLflow integration
+```
+
+**NumPy compatibility:**
+
+```bash
+# For full compatibility with all ML frameworks
+pip install modelaudit[numpy1]
+
+# Check scanner compatibility status
+modelaudit doctor --show-failed
+```
+
+**Docker installation:**
+
+```bash
+# Pull and run with Docker
+docker pull ghcr.io/promptfoo/modelaudit:latest
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
+```
+
+**Development installation:**
+
+```bash
+git clone https://github.com/promptfoo/modelaudit.git
+cd modelaudit
+rye sync --features all
+```
+
+### Cloud Storage Scanning
+
+ModelAudit can scan models directly from cloud storage with automatic authentication.
+
+**Amazon S3:**
+
+```bash
+# Set credentials via environment variables
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_DEFAULT_REGION="us-east-1"
+
+# Scan from S3
+modelaudit scan s3://my-bucket/model.pkl
+```
+
+**Google Cloud Storage:**
+
+```bash
+# Authenticate with service account
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+
+# Scan from GCS
+modelaudit scan gs://my-bucket/model.pt
+```
+
+**Cloudflare R2:**
+
+```bash
+# R2 uses S3-compatible authentication
+export AWS_ACCESS_KEY_ID="your-r2-access-key"
+export AWS_SECRET_ACCESS_KEY="your-r2-secret-key"
+export AWS_ENDPOINT_URL="https://your-account.r2.cloudflarestorage.com"
+
+# Scan from R2
+modelaudit scan r2://my-bucket/model.safetensors
+```
+
+**HuggingFace Hub & Repositories:**
+
+```bash
+# Scan models from HuggingFace
+modelaudit scan https://huggingface.co/gpt2
+modelaudit scan hf://distilbert-base-uncased
+
+# Scan from JFrog Artifactory
+export JFROG_API_TOKEN=your_token_here
+modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+
+# Scan from MLflow registry
+modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
+```
+
+### CI/CD Integration
+
+**Exit codes for automation:**
+
+- `0`: Success - No security issues found
+- `1`: Security issues found (scan completed successfully)
+- `2`: Errors occurred during scanning
+
+**GitHub Actions example:**
+
+```yaml
+- name: Scan ML Models
+  run: |
+    pip install modelaudit[all]
+    modelaudit scan models/ --format json --output security-report.json
+
+- name: Upload Security Report
+  uses: actions/upload-artifact@v3
+  with:
+    name: security-report
+    path: security-report.json
+```
+
+**Jenkins pipeline example:**
+
+```groovy
+stage('Model Security Scan') {
+    steps {
+        sh 'pip install modelaudit[all]'
+        sh 'modelaudit scan models/ --exit-code-on-issues'
+    }
+}
+```
 
 ### Command Line Options
 
 ```bash
-# Set maximum file size to scan (1GB limit)
-modelaudit scan model.pkl --max-file-size 1073741824
+# Resource limits
+modelaudit scan model.pkl --max-file-size 1073741824    # 1GB limit
+modelaudit scan models/ --max-total-size 5368709120     # 5GB total
+modelaudit scan large_model.pkl --timeout 300           # 5 minute timeout
 
-# Stop scanning after a total of 5GB has been processed
-modelaudit scan models/ --max-total-size 5368709120
+# Custom security policies
+modelaudit scan model.pkl --blacklist "unsafe_pattern" --blacklist "malicious_func"
 
-# Add custom blacklist patterns
-modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
+# Output options
+modelaudit scan model.pkl --format json --output results.json
+modelaudit scan model.pkl --sbom sbom.json              # Generate SBOM
+modelaudit scan model.pkl --verbose                     # Detailed output
 
-# Set scan timeout (5 minutes)
-modelaudit scan large_model.pkl --timeout 300
-
-# Generate SBOM with license information
-modelaudit scan model.pkl --sbom sbom.json
-
-# Verbose output for debugging
-modelaudit scan model.pkl --verbose
-
-# Scan a model from the MLflow registry
-modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
+# Advanced scanning
+modelaudit scan models/ --exit-code-on-issues          # Fail CI on issues
+modelaudit scan model.pkl --why                        # Explain findings
 ```
 
-### Exit Codes
+## 📋 Output Formats
 
-ModelAudit uses different exit codes to indicate scan results:
+**Human-readable output (default):**
 
-- **0**: Success - No security issues found
-- **1**: Security issues found (scan completed successfully)
-- **2**: Errors occurred during scanning (e.g., file not found, scan failures)
+```bash
+$ modelaudit scan model.pkl
 
-## 📋 JSON Output Format
+✓ Scanning model.pkl
+Files scanned: 1 | Issues found: 1 critical
 
-When using `--format json`, ModelAudit outputs structured results:
+1. model.pkl (pos 28): [CRITICAL] Malicious code execution attempt
+   Why: Contains os.system() call that could run arbitrary commands
+```
+
+**JSON output for automation:**
+
+```bash
+modelaudit scan model.pkl --format json
+```
 
 ```json
 {
-  "scanner_names": ["pickle"],
-  "start_time": 1750168822.481906,
-  "bytes_scanned": 74,
+  "files_scanned": 1,
+  "bytes_scanned": 156,
   "issues": [
     {
-      "message": "Found REDUCE opcode - potential __reduce__ method execution",
-      "severity": "warning",
-      "location": "evil.pickle (pos 71)",
-      "details": {
-        "position": 71,
-        "opcode": "REDUCE",
-        "ml_context_confidence": 0.0
-      },
-      "timestamp": 1750168822.482304
-    },
-    {
-      "message": "Suspicious module reference found: posix.system",
+      "message": "Malicious code execution attempt",
       "severity": "critical",
-      "location": "evil.pickle (pos 28)",
+      "location": "model.pkl (pos 28)",
       "details": {
-        "module": "posix",
+        "module": "os",
         "function": "system",
-        "position": 28,
-        "opcode": "STACK_GLOBAL",
-        "ml_context_confidence": 0.0
-      },
-      "timestamp": 1750168822.482378
-    }
-  ],
-  "has_errors": false,
-  "files_scanned": 1,
-  "duration": 0.0005328655242919922,
-  "assets": [
-    {
-      "path": "model.safetensors",
-      "type": "safetensors",
-      "tensors": ["embedding.weight", "decoder.weight"]
+        "position": 28
+      }
     }
   ]
 }
 ```
 
-Some issues also include a `why` field explaining **why** the finding is a
-problem:
-
-```json
-{
-  "message": "Dangerous import: os.system",
-  "severity": "critical",
-  "location": "test.pkl",
-  "why": "The 'os' module provides direct access to operating system functions."
-}
-```
-
-Each issue includes a `message`, `severity` level (`critical`, `warning`, `info`, `debug`), `location`, and scanner-specific `details`.
-The `assets` array lists every file and component encountered during the scan, including nested archive members and tensor names.
-
-## 🔄 CI/CD Integration
-
-ModelAudit is designed to integrate seamlessly into CI/CD pipelines with clear exit codes:
-
-- **Exit Code 0**: No security issues found
-- **Exit Code 1**: Security issues found (fails the build)
-- **Exit Code 2**: Scan errors occurred (fails the build)
-
-### Basic Integration
+**SBOM (Software Bill of Materials):**
 
 ```bash
-# Install ModelAudit
-pip install modelaudit[all]
-
-# Scan models and fail build if issues found
-modelaudit scan models/ --format json --output scan-results.json
-
-# Optional: Upload scan-results.json as build artifact
+modelaudit scan model.pkl --sbom sbom.json
 ```
 
-### Platform Examples
-
-**GitHub Actions:**
-
-```yaml
-- name: Scan models
-  run: |
-    rye run modelaudit scan models/ --format json --output scan-results.json
-    if [ $? -eq 1 ]; then
-      echo "Security issues found in models!"
-      exit 1
-    fi
-```
-
-**GitLab CI:**
-
-```yaml
-model-security-scan:
-  script:
-    - pip install modelaudit[all]
-    - modelaudit scan models/ --format json --output results.json
-  artifacts:
-    paths: [results.json]
-```
-
-**Jenkins:**
-
-```groovy
-sh 'pip install modelaudit[all]'
-sh 'modelaudit scan models/ --format json --output results.json'
-```
+Generates CycloneDX-compliant SBOM with license compliance information.
 
 ## 🔧 Troubleshooting
 
-### Common Issues
-
-**Installation Problems:**
+**Scanner compatibility issues:**
 
 ```bash
-# If you get dependency conflicts
-pip install --upgrade pip setuptools wheel
-pip install modelaudit[all] --no-cache-dir
+# Check which scanners failed to load
+modelaudit doctor --show-failed
 
-# Install with Rye (recommended)
-rye sync --features all
-
-# Or with pip
-pip install -e .[all]
-
-# If optional dependencies fail, install base package first
-pip install modelaudit
-pip install tensorflow h5py torch pyyaml safetensors onnx joblib  # Add what you need
+# Install missing dependencies
+pip install modelaudit[tensorflow,pytorch,onnx]
 ```
 
-**Large Models:**
+**Large file timeouts:**
 
 ```bash
-# Increase file size limit and timeout for large models
-modelaudit scan large_model.pt --max-file-size 5000000000 --timeout 600 --max-total-size 10000000000
+# Increase timeout for large models
+modelaudit scan large_model.pt --timeout 600
 ```
 
-**Cloud Storage Authentication:**
+**Memory issues:**
 
 ```bash
-# Check AWS credentials
-aws sts get-caller-identity
-
-# Check GCS authentication
-gcloud auth list
-
-# Test S3 access
-aws s3 ls s3://your-bucket/
-
-# Test GCS access
-gsutil ls gs://your-bucket/
-
-# Common authentication errors:
-# - "NoCredentialsError": Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-# - "DefaultCredentialsError": Set GOOGLE_APPLICATION_CREDENTIALS or run gcloud auth
-# - "Access Denied": Check bucket permissions and IAM roles
+# Set file size limits
+modelaudit scan models/ --max-file-size 2147483648  # 2GB limit
 ```
 
-**Testing:**
+**Cloud authentication errors:**
 
 ```bash
-# Run all tests
-rye run pytest
+# Verify credentials are set
+echo $AWS_ACCESS_KEY_ID
+echo $GOOGLE_APPLICATION_CREDENTIALS
 
-# Run with coverage
-rye run pytest --cov=modelaudit
-
-# Run specific test categories
-rye run pytest tests/test_pickle_scanner.py -v
-rye run pytest tests/test_integration.py -v
-
-# Run tests with all optional dependencies
-rye sync --features all
-rye run pytest
-
-# Run comprehensive migration test (tests everything including Docker)
-./test_migration.sh
+# Test cloud access
+modelaudit scan s3://my-bucket/test.pkl --verbose
 ```
-
-**Debug Mode:**
-
-```bash
-# Enable verbose output for troubleshooting
-modelaudit scan model.pkl --verbose
-```
-
-**Development Commands:**
-
-```bash
-# Run linting and formatting with Ruff
-rye run ruff check modelaudit/          # Check for linting issues
-rye run ruff check --fix modelaudit/    # Fix auto-fixable issues
-rye run ruff format modelaudit/         # Format code
-
-# Type checking
-rye run mypy modelaudit/
-
-# Build package
-rye build
-
-# Publish (maintainers only)
-rye publish
-```
-
-**Getting Help:**
-
-- Use `--verbose` for detailed output
-- Use `--format json` to see all details
-- Check file permissions and format support
-- Report issues on the [promptfoo GitHub repository](https://github.com/promptfoo/promptfoo/issues)
-
-## ⚠️ Limitations
-
-ModelAudit is designed to find **obvious security risks** in model files, including direct code execution attempts, known dangerous patterns, malicious archive structures, and suspicious configurations.
-
-**What it cannot detect:**
-
-- Advanced adversarial attacks or subtle weight manipulation
-- Heavily encoded/encrypted malicious payloads
-- Runtime behavior that only triggers under specific conditions
-- Model poisoning through careful data manipulation
-- All possible license types or complex license arrangements
-
-**Recommendations:**
-
-- Use ModelAudit as one layer of your security strategy
-- Review flagged issues manually - not all warnings indicate malicious intent
-- Combine with other security practices like sandboxed execution and runtime monitoring
-- Consult legal counsel for license compliance requirements beyond technical detection
-- Implement automated scanning in CI/CD pipelines
 
 ## 📝 License
 
-This project is licensed under the [MIT License](https://opensource.org/licenses/MIT) - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
