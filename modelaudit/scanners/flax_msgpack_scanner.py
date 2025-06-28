@@ -275,7 +275,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
         # Perform ML structure analysis to get confidence score
         ml_analysis = self._analyze_ml_structure(obj, result)
-        
+
         # Add confidence and ML analysis results to metadata
         metadata["confidence"] = ml_analysis["confidence"]
         metadata["is_ml_model"] = ml_analysis["is_ml_model"]
