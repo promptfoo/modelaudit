@@ -171,8 +171,8 @@ modelaudit scan model.pkl
 # Scan an ONNX model
 modelaudit scan model.onnx
 
-# Scan multiple models (including enhanced dill/joblib support)
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-checkpoint.msgpack
+# Scan multiple models (including enhanced dill/joblib support and JAX/Flax)
+modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
 
 # Scan a directory
 modelaudit scan ./models/
@@ -354,7 +354,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
 | **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
 | **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
-| **Flax**            | `.msgpack`                                                                                               | MessagePack integrity, suspicious code pattern detection, decompression bomb prevention, embedded content analysis |
+| **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
 | **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
 | **Joblib**          | `.joblib`                                                                                                | File format validation, compression bomb detection, embedded pickle analysis, ML-aware security filtering          |
 | **NumPy**           | `.npy`, `.npz`                                                                                           | Array integrity, dangerous dtypes, dimension validation                                                            |
