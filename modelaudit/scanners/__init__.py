@@ -127,6 +127,15 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
+            "coreml": {
+                "module": "modelaudit.scanners.coreml_scanner",
+                "class": "CoreMLScanner",
+                "description": "Scans Apple Core ML model files",
+                "extensions": [".mlmodel"],
+                "priority": 5,
+                "dependencies": ["coreml"],  # Heavy dependency
+                "numpy_sensitive": True,
+            },
             "pytorch_zip": {
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
@@ -464,6 +473,7 @@ def __getattr__(name: str):
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
+        "CoreMLScanner": "coreml",
         "PyTorchZipScanner": "pytorch_zip",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
