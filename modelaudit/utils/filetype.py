@@ -252,6 +252,8 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".engine": "tensorrt",
+    ".plan": "tensorrt",
 }
 
 
