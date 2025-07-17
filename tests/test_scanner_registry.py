@@ -83,6 +83,8 @@ def test_scanner_registry_file_extension_coverage():
         ".safetensors",
         ".msgpack",
         ".tflite",
+        ".engine",
+        ".plan",
     ]
 
     for ext in common_extensions:

@@ -10,39 +10,30 @@
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
-## Table of Contents
-
-- [🚀 Quick Start](#-quick-start)
-- [🛡️ What Problems It Solves](#️-what-problems-it-solves)
-- [📊 Supported Model Formats](#-supported-model-formats)
-- [🎯 Common Use Cases](#-common-use-cases)
-- [⚙️ Advanced Usage](#️-advanced-usage)
-- [📋 Output Formats](#-output-formats)
-- [🔧 Troubleshooting](#-troubleshooting)
-- [📝 License](#-license)
+📖 **[Full Documentation](https://www.promptfoo.dev/docs/model-audit/)** | 🎯 **[Usage Examples](https://www.promptfoo.dev/docs/model-audit/usage/)** | 🔍 **[Supported Formats](https://www.promptfoo.dev/docs/model-audit/scanners/)**
 
 ## 🚀 Quick Start
 
 **Install and scan in 30 seconds:**
 
 ```bash
-# Install ModelAudit
+# Install ModelAudit with all ML framework support
 pip install modelaudit[all]
 
 # Scan a model file
-modelaudit scan model.pkl
+modelaudit model.pkl
 
 # Scan a directory
-modelaudit scan ./models/
+modelaudit ./models/
 
 # Export results for CI/CD
-modelaudit scan model.pkl --format json --output results.json
+modelaudit model.pkl --format json --output results.json
 ```
 
 **Example output:**
 
 ```bash
-$ modelaudit scan suspicious_model.pkl
+$ modelaudit suspicious_model.pkl
 
 ✓ Scanning suspicious_model.pkl
 Files scanned: 1 | Issues found: 2 critical, 1 warning
@@ -78,59 +69,50 @@ Checks for license violations that could expose your company to legal risk
 
 ModelAudit scans **all major ML model formats** with specialized security analysis for each:
 
-| Format                                     | Extensions                    | Security Assessment                                                            |
-| ------------------------------------------ | ----------------------------- | ------------------------------------------------------------------------------ |
-| **PyTorch** (PyTorch)                      | `.pt`, `.pth` (ZIP)           | 🔴 **HIGH RISK** - ⛔ **Always scan** - Contains pickle serialization          |
-| **SafeTensors** (Hugging Face - universal) | `.safetensors`                | 🟢 **SAFE** - 🏆 **Preferred choice** - Purpose-built for security             |
-| **GGUF/GGML** (llama.cpp, Ollama)          | `.gguf`, `.ggml`              | 🟢 **SAFE** - 🏆 **LLM standard** - Binary format, optimized for inference     |
-| **TensorFlow SavedModel** (TensorFlow)     | `.pb`, directories            | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Scan for dangerous operations   |
-| **ONNX** (Cross-framework)                 | `.onnx`                       | 🟢 **SAFE** - ✅ **Recommended** - Industry standard, good interoperability    |
-| **PyTorch Binary** (PyTorch/Transformers)  | `.bin` (HuggingFace)          | 🟡 **LOW RISK** - ✅ **Generally safe** - Simple tensor storage                |
-| **Keras H5** (Keras/TensorFlow)            | `.h5`, `.hdf5`, `.keras`      | 🟠 **MEDIUM RISK** - ⚠️ **Use with caution** - Check for executable layers     |
-| **Core ML** (Apple Core ML)                | `.mlmodel`                    | 🟢 **SAFE** - ✅ **Apple ecosystem** - Compiled format, sandboxed execution    |
-| **TensorFlow Lite** (TensorFlow)           | `.tflite`                     | 🟢 **SAFE** - ✅ **Mobile standard** - Compiled format, limited attack surface |
-| **Pickle** (Python/scikit-learn)           | `.pkl`, `.pickle`, `.dill`    | 🔴 **HIGH RISK** - ⛔ **Avoid in production** - Convert to SafeTensors         |
-| **JAX/Flax** (JAX/Flax)                    | `.msgpack`, `.flax`, `.orbax` | 🟡 **LOW RISK** - ✅ **Generally safe** - Validate transforms                  |
-| **NumPy** (NumPy - universal)              | `.npy`, `.npz`                | 🟡 **LOW RISK** - ✅ **Data format** - Watch for object arrays                 |
-| **Joblib** (scikit-learn)                  | `.joblib`                     | 🟡 **VARIABLE RISK** - ⚠️ **Scan carefully** - May contain pickle              |
-| **Model Configs** (Universal)              | `.json`, `.yaml`, `.toml`     | 🟡 **LOW RISK** - ✅ **Config only** - No code execution                       |
-| **Archives** (Various)                     | `.zip`, `.tar`, `.gz`         | 🟡 **VARIABLE RISK** - ⚠️ **Depends on contents** - Scan internal files        |
-| **PMML** (Enterprise/Legacy)               | `.pmml`                       | 🟢 **SAFE** - ✅ **Enterprise standard** - Declarative XML format              |
+| Format          | Extensions                 | Risk Level | Notes                                        |
+| --------------- | -------------------------- | ---------- | -------------------------------------------- |
+| **PyTorch**     | `.pt`, `.pth`              | 🔴 HIGH    | Contains pickle serialization - always scan  |
+| **Pickle**      | `.pkl`, `.pickle`, `.dill` | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
+| **SafeTensors** | `.safetensors`             | 🟢 SAFE    | Preferred secure format                      |
+| **GGUF/GGML**   | `.gguf`, `.ggml`           | 🟢 SAFE    | LLM standard, binary format                  |
+| **ONNX**        | `.onnx`                    | 🟢 SAFE    | Industry standard, good interoperability     |
+| **TensorFlow**  | `.pb`, SavedModel          | 🟠 MEDIUM  | Scan for dangerous operations                |
+| **Keras**       | `.h5`, `.keras`            | 🟠 MEDIUM  | Check for executable layers                  |
+| **JAX/Flax**    | `.msgpack`, `.orbax`       | 🟡 LOW     | Validate transforms                          |
+
+[View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
 ## 🎯 Common Use Cases
 
-### **🔒 Pre-Deployment Security Checks**
+### **Pre-Deployment Security Checks**
 
 ```bash
-# Validate models before production deployment
-modelaudit scan production_model.safetensors --format json --output security_report.json
+modelaudit production_model.safetensors --format json --output security_report.json
 ```
 
-### **🏭 CI/CD Pipeline Integration**
+### **CI/CD Pipeline Integration**
 
 ```bash
-# Automatic scanning in your build pipeline
-modelaudit scan models/ --exit-code-on-issues --timeout 300
+modelaudit models/ --exit-code-on-issues --timeout 300
 ```
 
-### **📦 Third-Party Model Validation**
+### **Third-Party Model Validation**
 
 ```bash
-# Scan models from HuggingFace, cloud storage, or repositories
-modelaudit scan https://huggingface.co/gpt2
-modelaudit scan s3://my-bucket/downloaded-model.pt
+# Scan models from HuggingFace or cloud storage
+modelaudit https://huggingface.co/gpt2
+modelaudit s3://my-bucket/downloaded-model.pt
 ```
 
-### **📋 Compliance & Audit Reporting**
+### **Compliance & Audit Reporting**
 
 ```bash
-# Generate comprehensive audit reports with license compliance
-modelaudit scan model_package.zip --sbom compliance_report.json --verbose
+modelaudit model_package.zip --sbom compliance_report.json --verbose
 ```
 
-## ⚙️ Advanced Usage
+[View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
-### Installation Options
+## ⚙️ Installation Options
 
 **Basic installation (recommended for most users):**
 
@@ -148,8 +130,6 @@ pip install modelaudit
 pip install modelaudit[tensorflow]  # TensorFlow SavedModel
 pip install modelaudit[pytorch]     # PyTorch models
 pip install modelaudit[onnx]        # ONNX models
-pip install modelaudit[cloud]       # S3/GCS/R2 support
-pip install modelaudit[mlflow]      # MLflow integration
 ```
 
 **NumPy compatibility:**
@@ -165,118 +145,8 @@ modelaudit doctor --show-failed
 **Docker installation:**
 
 ```bash
-# Pull and run with Docker
 docker pull ghcr.io/promptfoo/modelaudit:latest
-docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/model.pkl
-```
-
-
-
-### Cloud Storage Scanning
-
-ModelAudit can scan models directly from cloud storage with automatic authentication.
-
-**Amazon S3:**
-
-```bash
-# Set credentials via environment variables
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export AWS_DEFAULT_REGION="us-east-1"
-
-# Scan from S3
-modelaudit scan s3://my-bucket/model.pkl
-```
-
-**Google Cloud Storage:**
-
-```bash
-# Authenticate with service account
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
-
-# Scan from GCS
-modelaudit scan gs://my-bucket/model.pt
-```
-
-**Cloudflare R2:**
-
-```bash
-# R2 uses S3-compatible authentication
-export AWS_ACCESS_KEY_ID="your-r2-access-key"
-export AWS_SECRET_ACCESS_KEY="your-r2-secret-key"
-export AWS_ENDPOINT_URL="https://your-account.r2.cloudflarestorage.com"
-
-# Scan from R2
-modelaudit scan r2://my-bucket/model.safetensors
-```
-
-**HuggingFace Hub & Repositories:**
-
-```bash
-# Scan models from HuggingFace
-modelaudit scan https://huggingface.co/gpt2
-modelaudit scan hf://distilbert-base-uncased
-
-# Scan from JFrog Artifactory
-export JFROG_API_TOKEN=your_token_here
-modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
-
-# Scan from MLflow registry
-modelaudit scan models:/MyModel/Staging --registry-uri http://mlflow.example.com
-```
-
-### CI/CD Integration
-
-**Exit codes for automation:**
-
-- `0`: Success - No security issues found
-- `1`: Security issues found (scan completed successfully)
-- `2`: Errors occurred during scanning
-
-**GitHub Actions example:**
-
-```yaml
-- name: Scan ML Models
-  run: |
-    pip install modelaudit[all]
-    modelaudit scan models/ --format json --output security-report.json
-
-- name: Upload Security Report
-  uses: actions/upload-artifact@v4
-  with:
-    name: security-report
-    path: security-report.json
-```
-
-**Jenkins pipeline example:**
-
-```groovy
-stage('Model Security Scan') {
-    steps {
-        sh 'pip install modelaudit[all]'
-        sh 'modelaudit scan models/ --exit-code-on-issues'
-    }
-}
-```
-
-### Command Line Options
-
-```bash
-# Resource limits
-modelaudit scan model.pkl --max-file-size 1073741824    # 1GB limit
-modelaudit scan models/ --max-total-size 5368709120     # 5GB total
-modelaudit scan large_model.pkl --timeout 300           # 5 minute timeout
-
-# Custom security policies
-modelaudit scan model.pkl --blacklist "unsafe_pattern" --blacklist "malicious_func"
-
-# Output options
-modelaudit scan model.pkl --format json --output results.json
-modelaudit scan model.pkl --sbom sbom.json              # Generate SBOM
-modelaudit scan model.pkl --verbose                     # Detailed output
-
-# Advanced scanning
-modelaudit scan models/ --exit-code-on-issues          # Fail CI on issues
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 ## 📋 Output Formats
@@ -284,7 +154,7 @@ modelaudit scan models/ --exit-code-on-issues          # Fail CI on issues
 **Human-readable output (default):**
 
 ```bash
-$ modelaudit scan model.pkl
+$ modelaudit model.pkl
 
 ✓ Scanning model.pkl
 Files scanned: 1 | Issues found: 1 critical
@@ -295,72 +165,29 @@ Files scanned: 1 | Issues found: 1 critical
 
 **JSON output for automation:**
 
-```bash
-modelaudit scan model.pkl --format json
-```
-
 ```json
 {
   "files_scanned": 1,
-  "bytes_scanned": 156,
   "issues": [
     {
       "message": "Malicious code execution attempt",
       "severity": "critical",
-      "location": "model.pkl (pos 28)",
-      "details": {
-        "module": "os",
-        "function": "system",
-        "position": 28
-      }
+      "location": "model.pkl (pos 28)"
     }
   ]
 }
 ```
 
-**SBOM (Software Bill of Materials):**
+## 🔧 Getting Help
+
+- **Documentation**: [promptfoo.dev/docs/model-audit/](https://www.promptfoo.dev/docs/model-audit/)
+- **Troubleshooting**: [promptfoo.dev/docs/model-audit/troubleshooting/](https://www.promptfoo.dev/docs/model-audit/troubleshooting/)
+- **Issues**: [github.com/promptfoo/modelaudit/issues](https://github.com/promptfoo/modelaudit/issues)
+
+For scanner compatibility issues:
 
 ```bash
-modelaudit scan model.pkl --sbom sbom.json
-```
-
-Generates CycloneDX-compliant SBOM with license compliance information.
-
-## 🔧 Troubleshooting
-
-**Scanner compatibility issues:**
-
-```bash
-# Check which scanners failed to load
 modelaudit doctor --show-failed
-
-# Install missing dependencies
-pip install modelaudit[tensorflow,pytorch,onnx]
-```
-
-**Large file timeouts:**
-
-```bash
-# Increase timeout for large models
-modelaudit scan large_model.pt --timeout 600
-```
-
-**Memory issues:**
-
-```bash
-# Set file size limits
-modelaudit scan models/ --max-file-size 2147483648  # 2GB limit
-```
-
-**Cloud authentication errors:**
-
-```bash
-# Verify credentials are set
-echo $AWS_ACCESS_KEY_ID
-echo $GOOGLE_APPLICATION_CREDENTIALS
-
-# Test cloud access
-modelaudit scan s3://my-bucket/test.pkl --verbose
 ```
 
 ## 📝 License
