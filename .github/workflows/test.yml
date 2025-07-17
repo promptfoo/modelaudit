@@ -24,6 +24,17 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
       - name: Sync dependencies
         run: |
           rye sync --features all
@@ -51,6 +62,17 @@ jobs:
         uses: eifinger/setup-rye@v4
         with:
           enable-cache: true
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
 
       - name: Sync dependencies
         run: |
@@ -80,6 +102,18 @@ jobs:
       - name: Pin Python version
         run: |
           rye pin ${{ matrix.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
 
       - name: Sync dependencies
         run: |
@@ -115,6 +149,19 @@ jobs:
       - name: Pin Python version
         run: |
           rye pin ${{ matrix.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
 
       - name: Install with NumPy 1.x compatibility mode
         if: matrix.numpy-mode == '1.x'
@@ -161,6 +208,17 @@ jobs:
         uses: eifinger/setup-rye@v4
         with:
           enable-cache: true
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
 
       - name: Sync dependencies
         run: |
