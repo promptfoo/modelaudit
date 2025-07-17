@@ -381,7 +381,7 @@ class TestPerformanceBenchmarks:
         lower_bound = q1 - 1.5 * iqr
         upper_bound = q3 + 1.5 * iqr
         filtered_durations = [d for d in durations if lower_bound <= d <= upper_bound]
-        
+
         # Use filtered durations if we have enough data points
         if len(filtered_durations) >= 10:
             durations = filtered_durations
