@@ -127,6 +127,15 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
+            "openvino": {
+                "module": "modelaudit.scanners.openvino_scanner",
+                "class": "OpenVinoScanner",
+                "description": "Scans OpenVINO IR model files",
+                "extensions": [".xml"],
+                "priority": 5,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "pytorch_zip": {
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
@@ -473,6 +482,7 @@ def __getattr__(name: str):
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
+        "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
