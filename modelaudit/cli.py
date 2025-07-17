@@ -34,14 +34,9 @@ class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
     def get_command(self, ctx, cmd_name):
-        """Get command, defaulting to 'scan' if no command specified"""
-        rv = click.Group.get_command(self, ctx, cmd_name)
-        if rv is not None:
-            return rv
-        # If no command found and we have arguments, assume 'scan' command
-        if ctx.args:
-            return click.Group.get_command(self, ctx, "scan")
-        return None
+        """Get command by name, return None if not found"""
+        # Simply delegate to parent's get_command - no default logic here
+        return click.Group.get_command(self, ctx, cmd_name)
 
     def resolve_command(self, ctx, args):
         """Resolve command, using 'scan' as default when paths are provided"""
