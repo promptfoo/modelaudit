@@ -265,7 +265,9 @@ class WeightDistributionScanner(BaseScanner):
                             and array.nbytes > self.max_file_read_size
                         ):
                             continue
-                        weights_info[name] = array
+                        # Only include 2D+ tensors for consistency with .pb file handling
+                        if len(array.shape) >= 2:
+                            weights_info[name] = array
             else:
                 data = self._read_file_safely(path)
                 from tensorflow.core.framework import graph_pb2
