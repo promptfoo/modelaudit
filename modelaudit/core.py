@@ -7,6 +7,10 @@ from threading import Lock
 from typing import IO, Any, Callable, Optional, cast
 from unittest.mock import patch
 
+from modelaudit.license_checker import (
+    check_commercial_use_warnings,
+    collect_license_metadata,
+)
 from modelaudit.scanners import (
     SCANNER_REGISTRY,
     GgufScanner,
@@ -22,12 +26,31 @@ from modelaudit.scanners import (
 )
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory
-from modelaudit.utils.filetype import detect_file_format, detect_format_from_extension
+from modelaudit.utils.assets import asset_from_scan_result
+from modelaudit.utils.filetype import (
+    detect_file_format,
+    detect_format_from_extension,
+    validate_file_type,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
 # Lock to ensure thread-safe monkey patching of builtins.open
 _OPEN_PATCH_LOCK = Lock()
+
+
+def _add_asset_to_results(
+    results: dict[str, Any], file_path: str, file_result: ScanResult
+) -> None:
+    """Helper function to add an asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append(asset_from_scan_result(file_path, file_result))
+
+
+def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None:
+    """Helper function to add an error asset entry to the results."""
+    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list.append({"path": file_path, "type": "error"})
 
 
 def validate_scan_config(config: dict[str, Any]) -> None:
@@ -41,6 +64,11 @@ def validate_scan_config(config: dict[str, Any]) -> None:
     if max_file_size is not None:
         if not isinstance(max_file_size, int) or max_file_size < 0:
             raise ValueError("max_file_size must be a non-negative integer")
+
+    max_total_size = config.get("max_total_size")
+    if max_total_size is not None:
+        if not isinstance(max_total_size, int) or max_total_size < 0:
+            raise ValueError("max_total_size must be a non-negative integer")
 
     chunk_size = config.get("chunk_size")
     if chunk_size is not None:
@@ -85,6 +113,8 @@ def scan_model_directory_or_file(
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
+        "assets": [],
+        "file_metadata": {},  # Per-file metadata
     }
 
     # Configure scan options
@@ -169,6 +199,16 @@ def scan_model_directory_or_file(
                         for issue in file_result.issues:
                             issues_list.append(issue.to_dict())
 
+                        # Add to assets list for inventory
+                        _add_asset_to_results(results, file_path, file_result)
+
+                        # Save metadata for SBOM generation
+                        file_meta = cast(dict[str, Any], results["file_metadata"])
+                        # Merge scanner metadata with license metadata
+                        license_metadata = collect_license_metadata(file_path)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        file_meta[file_path] = combined_metadata
+
                         if (
                             max_total_size > 0
                             and cast(int, results["bytes_scanned"]) > max_total_size
@@ -195,6 +235,8 @@ def scan_model_directory_or_file(
                                 "details": {"exception_type": type(e).__name__},
                             },
                         )
+                        # Add error entry to assets
+                        _add_error_asset_to_results(results, file_path)
                 if limit_reached:
                     break
             # Stop scanning if size limit reached
@@ -260,6 +302,16 @@ def scan_model_directory_or_file(
             for issue in file_result.issues:
                 issues_list.append(issue.to_dict())
 
+            # Add to assets list for inventory
+            _add_asset_to_results(results, path, file_result)
+
+            # Save metadata for SBOM generation
+            file_meta = cast(dict[str, Any], results["file_metadata"])
+            # Merge scanner metadata with license metadata
+            license_metadata = collect_license_metadata(path)
+            combined_metadata = {**file_result.metadata, **license_metadata}
+            file_meta[path] = combined_metadata
+
             if (
                 max_total_size > 0
                 and cast(int, results["bytes_scanned"]) > max_total_size
@@ -281,11 +333,12 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {str(e)}",
-            "severity": IssueSeverity.CRITICAL.value,
+            "severity": IssueSeverity.WARNING.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
+        _add_error_asset_to_results(results, path)
 
     # Add final timing information
     results["finish_time"] = time.time()
@@ -293,6 +346,23 @@ def scan_model_directory_or_file(
         float,
         results["start_time"],
     )
+
+    # Add license warnings if any
+    try:
+        license_warnings = check_commercial_use_warnings(results)
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        for warning in license_warnings:
+            # Convert license warnings to issues
+            issue_dict = {
+                "message": warning["message"],
+                "severity": warning["severity"],
+                "location": "",  # License warnings are generally project-wide
+                "details": warning.get("details", {}),
+                "type": warning["type"],
+            }
+            issues_list.append(issue_dict)
+    except Exception as e:
+        logger.warning(f"Error checking license warnings: {str(e)}")
 
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
@@ -413,7 +483,7 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
             f"Error checking file size: {e}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
         return sr
@@ -424,8 +494,15 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
 
+    # Validate file type consistency as a security check
+    file_type_valid = validate_file_type(path)
     discrepancy_msg = None
-    if (
+
+    if not file_type_valid:
+        # File type validation failed - this is a security concern
+        discrepancy_msg = f"File type validation failed: extension indicates {ext_format} but magic bytes indicate {header_format}. This could indicate file spoofing or corruption."
+        logger.warning(discrepancy_msg)
+    elif (
         header_format != ext_format
         and header_format != "unknown"
         and ext_format != "unknown"
@@ -490,13 +567,16 @@ def scan_file(path: str, config: dict[str, Any] = None) -> ScanResult:
             result = sr
 
     if discrepancy_msg:
+        # Determine severity based on whether it's a validation failure or just a discrepancy
+        severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
         result.add_issue(
             discrepancy_msg + " Using header-based detection.",
-            severity=IssueSeverity.WARNING,
+            severity=severity,
             location=path,
             details={
                 "extension_format": ext_format,
                 "header_format": header_format,
+                "file_type_validation_failed": not file_type_valid,
             },
         )
 

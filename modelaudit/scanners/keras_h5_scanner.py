@@ -64,6 +64,10 @@ class KerasH5Scanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
@@ -255,7 +259,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_issue(
                             f"Suspicious configuration string found in {context}: "
                             f"'{suspicious_term}'",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
                                 "suspicious_term": suspicious_term,

@@ -2,7 +2,12 @@ import os
 import struct
 from typing import Any, Optional
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
+)
+
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
 class PyTorchBinaryScanner(BaseScanner):
@@ -30,9 +35,18 @@ class PyTorchBinaryScanner(BaseScanner):
 
         # Check if it's actually a pytorch binary file
         try:
-            from modelaudit.utils.filetype import detect_file_format
+            from modelaudit.utils.filetype import detect_file_format, validate_file_type
 
             file_format = detect_file_format(path)
+
+            # Validate file type for security, but be permissive for .bin files
+            # since they can contain various formats of legitimate binary data
+            if not validate_file_type(path):
+                # File type validation failed - log but don't reject immediately
+                # for .bin files since they can contain arbitrary binary data
+                logger.warning(f"File type validation failed for .bin file: {path}")
+                # Continue to check if it's still a valid pytorch_binary format
+
             return file_format == "pytorch_binary"
         except Exception:
             return False
@@ -43,6 +57,10 @@ class PyTorchBinaryScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -55,7 +73,7 @@ class PyTorchBinaryScanner(BaseScanner):
             if file_size < 100:
                 result.add_issue(
                     f"Suspiciously small binary file: {file_size} bytes",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"file_size": file_size},
                 )
@@ -111,34 +129,13 @@ class PyTorchBinaryScanner(BaseScanner):
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
-        code_patterns = [
-            b"import os",
-            b"import sys",
-            b"import subprocess",
-            b"eval(",
-            b"exec(",
-            b"__import__",
-            b"compile(",
-            b"globals()",
-            b"locals()",
-            b"open(",
-            b"file(",
-            b"input(",
-            b"raw_input(",
-            b"execfile(",
-            b"os.system",
-            b"subprocess.call",
-            b"subprocess.Popen",
-            b"socket.socket",
-        ]
-
-        for pattern in code_patterns:
+        for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 # Find the position within the chunk
                 pos = chunk.find(pattern)
                 result.add_issue(
                     f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern.decode("ascii", errors="ignore"),
@@ -169,16 +166,7 @@ class PyTorchBinaryScanner(BaseScanner):
     ) -> None:
         """Check for executable file signatures"""
         # Common executable signatures
-        executable_sigs = {
-            b"MZ": "Windows executable (PE)",
-            b"\x7fELF": "Linux executable (ELF)",
-            b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-            b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-            b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-            b"#!/": "Shell script shebang",
-        }
-
-        for sig, description in executable_sigs.items():
+        for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
                 pos = chunk.find(sig)
                 result.add_issue(
@@ -204,7 +192,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 if len(header) < 8:
                     result.add_issue(
                         "File too small to be a valid tensor file",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"header_size": len(header)},
                     )

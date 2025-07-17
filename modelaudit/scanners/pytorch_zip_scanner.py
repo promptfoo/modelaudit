@@ -1,5 +1,6 @@
 import io
 import os
+import tempfile
 import zipfile
 from typing import Any, Optional
 
@@ -49,6 +50,10 @@ class PyTorchZipScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -71,7 +76,8 @@ class PyTorchZipScanner(BaseScanner):
             with zipfile.ZipFile(path, "r") as z:
                 safe_entries: list[str] = []
                 for name in z.namelist():
-                    _, is_safe = sanitize_archive_path(name, "/tmp/extract")
+                    temp_base = os.path.join(tempfile.gettempdir(), "extract")
+                    _, is_safe = sanitize_archive_path(name, temp_base)
                     if not is_safe:
                         result.add_issue(
                             f"Archive entry {name} attempted path traversal outside the archive",
@@ -122,7 +128,7 @@ class PyTorchZipScanner(BaseScanner):
                     if name.endswith(".py"):
                         result.add_issue(
                             f"Python code file found in PyTorch model: {name}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
@@ -142,7 +148,7 @@ class PyTorchZipScanner(BaseScanner):
                     result.add_issue(
                         "PyTorch model is missing 'data.pkl', which is "
                         "unusual for standard PyTorch models.",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"missing_file": "data.pkl"},
                     )
@@ -167,7 +173,7 @@ class PyTorchZipScanner(BaseScanner):
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' "
                                             f"found in pickled file {name}",
-                                            severity=IssueSeverity.WARNING,
+                                            severity=IssueSeverity.CRITICAL,
                                             location=f"{self.current_file_path} "
                                             f"({name})",
                                             details={
@@ -185,7 +191,7 @@ class PyTorchZipScanner(BaseScanner):
                                             result.add_issue(
                                                 f"Blacklisted pattern '{pattern}' "
                                                 f"found in file {name}",
-                                                severity=IssueSeverity.WARNING,
+                                                severity=IssueSeverity.CRITICAL,
                                                 location=f"{self.current_file_path} "
                                                 f"({name})",
                                                 details={

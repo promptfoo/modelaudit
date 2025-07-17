@@ -3,7 +3,10 @@
 A security scanner for AI models. Quickly check your AIML models for potential security risks before deployment.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
+[![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
+[![Tests](https://github.com/promptfoo/modelaudit/actions/workflows/test.yml/badge.svg)](https://github.com/promptfoo/modelaudit/actions/workflows/test.yml)
+[![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
+[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
@@ -50,6 +53,7 @@ ModelAudit scans ML model files for:
 - **Container-delivered models** in OCI/Docker layers and manifest files
 - **GGUF/GGML file integrity** and tensor alignment validation
 - **Anomalous weight patterns** that may indicate trojaned models (statistical analysis)
+- **License compliance issues** including commercial use restrictions and AGPL obligations
 - **Enhanced joblib/dill security** (format validation, compression bombs, embedded pickle analysis, bypass prevention)
 - **NumPy array integrity issues** (malformed headers, dangerous dtypes)
 
@@ -146,6 +150,9 @@ modelaudit scan ./models/
 
 # Export results to JSON
 modelaudit scan model.pkl --format json --output results.json
+
+# Generate Software Bill of Materials (SBOM) with license information
+modelaudit scan model.pkl --sbom sbom.json
 ```
 
 **Example output:**
@@ -189,6 +196,7 @@ Issues found: 2 critical, 1 warnings
 ### Reporting & Integration
 
 - **Multiple Output Formats**: Human-readable text and machine-readable JSON
+- **SBOM Generation**: CycloneDX Software Bill of Materials with license metadata
 - **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
 - **Severity Levels**: CRITICAL, WARNING, INFO, DEBUG for flexible filtering
 - **CI/CD Integration**: Clear exit codes for automated pipeline integration
@@ -200,6 +208,7 @@ Issues found: 2 critical, 1 warnings
 - **Enhanced Dill/Joblib Analysis**: ML-aware scanning with format validation and bypass prevention
 - **Model Integrity**: Checks for unexpected files, suspicious configurations
 - **Archive Security**: Automatic Zip-Slip protection against directory traversal, zip bombs, malicious nested files
+- **License Compliance**: Identifies commercial use restrictions, AGPL network obligations, unlicensed datasets
 - **Pattern Matching**: Custom blacklist patterns for organizational policies
 
 ## 🛡️ Supported Model Formats
@@ -244,6 +253,9 @@ modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
 
 # Set scan timeout (5 minutes)
 modelaudit scan large_model.pkl --timeout 300
+
+# Generate SBOM with license information
+modelaudit scan model.pkl --sbom sbom.json
 
 # Verbose output for debugging
 modelaudit scan model.pkl --verbose
@@ -294,11 +306,19 @@ When using `--format json`, ModelAudit outputs structured results:
   ],
   "has_errors": false,
   "files_scanned": 1,
-  "duration": 0.0005328655242919922
+  "duration": 0.0005328655242919922,
+  "assets": [
+    {
+      "path": "model.safetensors",
+      "type": "safetensors",
+      "tensors": ["embedding.weight", "decoder.weight"]
+    }
+  ]
 }
 ```
 
 Each issue includes a `message`, `severity` level (`critical`, `warning`, `info`, `debug`), `location`, and scanner-specific `details`.
+The `assets` array lists every file and component encountered during the scan, including nested archive members and tensor names.
 
 ## 🔄 CI/CD Integration
 
@@ -444,12 +464,14 @@ ModelAudit is designed to find **obvious security risks** in model files, includ
 - Heavily encoded/encrypted malicious payloads
 - Runtime behavior that only triggers under specific conditions
 - Model poisoning through careful data manipulation
+- All possible license types or complex license arrangements
 
 **Recommendations:**
 
 - Use ModelAudit as one layer of your security strategy
 - Review flagged issues manually - not all warnings indicate malicious intent
 - Combine with other security practices like sandboxed execution and runtime monitoring
+- Consult legal counsel for license compliance requirements beyond technical detection
 - Implement automated scanning in CI/CD pipelines
 
 ## 📝 License

@@ -125,6 +125,7 @@ rye run pytest --durations=10 --tb=no
 ```
 
 **Test Speed Optimizations:**
+
 - Parallel execution with `-n auto` (37% faster)
 - Smart test markers: `slow`, `integration`, `unit`, `performance`
 - Optimized pytest configuration in `pyproject.toml`

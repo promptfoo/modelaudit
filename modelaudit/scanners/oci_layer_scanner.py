@@ -4,6 +4,7 @@ import tarfile
 import tempfile
 from typing import Any
 
+from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
@@ -41,6 +42,10 @@ class OciLayerScanner(BaseScanner):
         path_check = self._check_path(path)
         if path_check:
             return path_check
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         manifest_data: Any = None
@@ -80,10 +85,24 @@ class OciLayerScanner(BaseScanner):
 
         _search(manifest_data)
 
+        manifest_dir = os.path.dirname(path)
+
         for layer_ref in layer_paths:
-            layer_path = layer_ref
-            if not os.path.isabs(layer_path):
-                layer_path = os.path.join(os.path.dirname(path), layer_ref)
+            if os.path.isabs(layer_ref):
+                layer_path = layer_ref
+                is_safe = True
+            else:
+                layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
+
+            if not is_safe:
+                result.add_issue(
+                    f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path}:{layer_ref}",
+                    details={"layer": layer_ref},
+                )
+                continue
+
             if not os.path.exists(layer_path):
                 result.add_issue(
                     f"Layer not found: {layer_ref}",

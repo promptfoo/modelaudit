@@ -59,6 +59,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Store the file path for use in issue locations
         self.current_file_path = path
 
@@ -146,7 +150,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if file.endswith(".py"):
                     result.add_issue(
                         f"Python file found in SavedModel: {file}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(file_path),
                         details={"file": file, "directory": root},
                     )
@@ -182,7 +186,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         result.add_issue(
                                             f"Blacklisted pattern '{pattern}' "
                                             f"found in file {file}",
-                                            severity=IssueSeverity.WARNING,
+                                            severity=IssueSeverity.CRITICAL,
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )

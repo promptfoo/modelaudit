@@ -1,0 +1,15 @@
+{
+  "_license": "Creative Commons Attribution NonCommercial 4.0 International",
+  "_copyright": "© 2024 Research Institution. This work is licensed under CC BY-NC 4.0",
+  "_notice": "This dataset is for non-commercial use only",
+  "dataset_info": {
+    "name": "Research Dataset",
+    "description": "Academic research dataset for non-commercial use",
+    "samples": 50000,
+    "features": 100
+  },
+  "data": [
+    { "feature_1": 0.5, "feature_2": 0.3, "label": 1 },
+    { "feature_1": 0.8, "feature_2": 0.1, "label": 0 }
+  ]
+}

@@ -1,4 +1,3 @@
-import logging
 import os
 import pickletools
 import struct
@@ -6,6 +5,8 @@ import time
 from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
 )
@@ -16,9 +17,8 @@ from ..explanations import (
     get_pattern_explanation,
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
-logger = logging.getLogger(__name__)
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
 # ============================================================================
@@ -576,9 +576,22 @@ class PickleScanner(BaseScanner):
         if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
             try:
                 # Import here to avoid circular dependency
-                from modelaudit.utils.filetype import detect_file_format
+                from modelaudit.utils.filetype import (
+                    detect_file_format,
+                    validate_file_type,
+                )
 
                 file_format = detect_file_format(path)
+
+                # For security-sensitive pickle files, also validate file type
+                # This helps detect potential file spoofing attacks
+                if file_format == "pickle" and not validate_file_type(path):
+                    # File type validation failed - this could be suspicious
+                    # Log but still allow scanning for now (let scanner handle the validation)
+                    logger.warning(
+                        f"File type validation failed for potential pickle file: {path}"
+                    )
+
                 return file_format == "pickle"
             except Exception:
                 # If detection fails, fall back to extension check
@@ -592,6 +605,10 @@ class PickleScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -699,7 +716,7 @@ class PickleScanner(BaseScanner):
                 if opcode_count > self.max_opcodes:
                     result.add_issue(
                         f"Too many opcodes in pickle (> {self.max_opcodes})",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "opcode_count": opcode_count,
@@ -713,7 +730,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
                         why="The scan exceeded the configured time limit. Large or complex pickle files may take longer to analyze due to the number of opcodes that need to be processed.",
@@ -899,7 +916,7 @@ class PickleScanner(BaseScanner):
                             result.add_issue(
                                 "STACK_GLOBAL opcode found without "
                                 "sufficient string context",
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
                                     "position": pos,
@@ -1047,30 +1064,13 @@ class PickleScanner(BaseScanner):
 
         try:
             # Common patterns that might indicate embedded Python code
-            code_patterns = [
-                b"import os",
-                b"import sys",
-                b"import subprocess",
-                b"eval(",
-                b"exec(",
-                b"__import__",
-                b"compile(",
-                b"os.system",
-                b"subprocess.call",
-                b"subprocess.Popen",
-                b"socket.socket",
-            ]
+            code_patterns = BINARY_CODE_PATTERNS
 
             # Executable signatures with additional validation
             # For PE files, we need to check for the full DOS header structure
             # to avoid false positives from random "MZ" bytes in model weights
             executable_sigs = {
-                b"\x7fELF": "Linux executable (ELF)",
-                b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-                b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-                b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-                b"#!/bin/": "Shell script shebang",
-                b"#!/usr/bin/": "Shell script shebang",
+                k: v for k, v in EXECUTABLE_SIGNATURES.items() if k != b"MZ"
             }
 
             # Read in chunks
@@ -1091,7 +1091,7 @@ class PickleScanner(BaseScanner):
                         pos = chunk.find(pattern)
                         result.add_issue(
                             f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore')}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
                                 "pattern": pattern.decode("ascii", errors="ignore"),
@@ -1148,7 +1148,7 @@ class PickleScanner(BaseScanner):
                 if time.time() - result.start_time > self.timeout:
                     result.add_issue(
                         f"Binary scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
                             "bytes_scanned": start_pos + bytes_scanned,

@@ -16,14 +16,19 @@ absl-py==2.3.0
     # via tensorflow
 astunparse==1.6.3
     # via tensorflow
+boolean-py==5.0
+    # via license-expression
 certifi==2025.6.15
     # via requests
 charset-normalizer==3.4.2
     # via requests
-click==8.2.1
+click==8.1.8
+    # via modelaudit
+cyclonedx-python-lib==10.2.0
     # via modelaudit
 defusedxml==0.7.1
     # via modelaudit
+    # via py-serializable
 dill==0.4.0
     # via modelaudit
 filelock==3.18.0
@@ -55,6 +60,8 @@ keras==3.10.0
     # via tensorflow
 libclang==18.1.1
     # via tensorflow
+license-expression==30.4.1
+    # via cyclonedx-python-lib
 markdown==3.8.1
     # via tensorboard
 markdown-it-py==3.0.0
@@ -73,9 +80,9 @@ msgpack==1.1.1
     # via modelaudit
 namex==0.1.0
     # via keras
-networkx==3.5
+networkx==3.2.1
     # via torch
-numpy==2.1.3
+numpy==2.0.2
     # via h5py
     # via keras
     # via ml-dtypes
@@ -92,6 +99,8 @@ opt-einsum==3.4.0
     # via tensorflow
 optree==0.16.0
     # via keras
+packageurl-python==0.17.1
+    # via cyclonedx-python-lib
 packaging==25.0
     # via keras
     # via tensorboard
@@ -100,6 +109,8 @@ protobuf==5.29.5
     # via onnx
     # via tensorboard
     # via tensorflow
+py-serializable==2.0.0
+    # via cyclonedx-python-lib
 pygments==2.19.1
     # via rich
 pyyaml==6.0.2
@@ -110,9 +121,9 @@ rich==14.0.0
     # via keras
 safetensors==0.5.3
     # via modelaudit
-scikit-learn==1.7.0
+scikit-learn==1.6.1
     # via modelaudit
-scipy==1.15.3
+scipy==1.13.1
     # via modelaudit
     # via scikit-learn
 setuptools==80.9.0
@@ -123,6 +134,8 @@ six==1.17.0
     # via google-pasta
     # via tensorboard
     # via tensorflow
+sortedcontainers==2.4.0
+    # via cyclonedx-python-lib
 sympy==1.14.0
     # via torch
 tensorboard==2.19.0

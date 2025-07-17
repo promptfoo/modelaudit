@@ -142,7 +142,7 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
 
 def test_pytorch_pickle_file_unsupported(tmp_path):
     """Raw pickle files with .pt extension should be unsupported."""
-    from tests.evil_pickle import EvilClass
+    from tests.assets.generators.generate_evil_pickle import EvilClass
 
     file_path = tmp_path / "raw_pickle.pt"
     with file_path.open("wb") as f:
