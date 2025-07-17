@@ -178,6 +178,10 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
+    if ext in (".ptl", ".pte"):
+        if magic4.startswith(b"PK"):
+            return "executorch"
+        return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
@@ -188,6 +192,8 @@ def detect_file_format(path: str) -> str:
         return "tflite"
     if ext == ".safetensors":
         return "safetensors"
+    if ext in (".pdmodel", ".pdiparams"):
+        return "paddle"
     if ext in (".msgpack", ".flax", ".orbax", ".jax"):
         return "flax_msgpack"
     if ext == ".onnx":
@@ -251,10 +257,14 @@ EXTENSION_FORMAT_MAP = {
     ".ggjt": "ggml",
     ".ggla": "ggml",
     ".ggsa": "ggml",
+    ".ptl": "executorch",
+    ".pte": "executorch",
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
     ".mlmodel": "coreml",
+    ".pdmodel": "paddle",
+    ".pdiparams": "paddle",
     ".engine": "tensorrt",
     ".plan": "tensorrt",
 }
@@ -305,9 +315,13 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
-        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt when they're torch.save() files)
-        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary"}:
+        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
+        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
             return True
+
+        # ExecuTorch files should be zip archives
+        if ext_format == "executorch":
+            return header_format == "zip"
 
         # HDF5 files should always match
         if ext_format == "hdf5":

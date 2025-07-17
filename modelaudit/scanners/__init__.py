@@ -154,6 +154,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "executorch": {
+                "module": "modelaudit.scanners.executorch_scanner",
+                "class": "ExecuTorchScanner",
+                "description": "Scans ExecuTorch mobile archives",
+                "extensions": [".ptl", ".pte"],
+                "priority": 6,  # Similar priority to PyTorch Zip
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "gguf": {
                 "module": "modelaudit.scanners.gguf_scanner",
                 "class": "GgufScanner",
@@ -288,6 +297,15 @@ class ScannerRegistry:
                 "priority": 17,
                 "dependencies": [],
                 "numpy_sensitive": False,
+            },
+            "paddle": {
+                "module": "modelaudit.scanners.paddle_scanner",
+                "class": "PaddleScanner",
+                "description": "Scans PaddlePaddle model files",
+                "extensions": [".pdmodel", ".pdiparams"],
+                "priority": 18,
+                "dependencies": ["paddlepaddle"],
+                "numpy_sensitive": True,
             },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
@@ -494,6 +512,7 @@ def __getattr__(name: str):
         "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
+        "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
         "NumPyScanner": "numpy",
@@ -506,6 +525,7 @@ def __getattr__(name: str):
         "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
+        "PaddleScanner": "paddle",
         "ZipScanner": "zip",
     }
 
