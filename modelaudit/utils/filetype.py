@@ -188,6 +188,8 @@ def detect_file_format(path: str) -> str:
         return "tflite"
     if ext == ".safetensors":
         return "safetensors"
+    if ext in (".pdmodel", ".pdiparams"):
+        return "paddle"
     if ext in (".msgpack", ".flax", ".orbax", ".jax"):
         return "flax_msgpack"
     if ext == ".onnx":
@@ -209,6 +211,8 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
+    if ext == ".mlmodel":
+        return "coreml"
 
     return "unknown"
 
@@ -252,6 +256,11 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".mlmodel": "coreml",
+    ".pdmodel": "paddle",
+    ".pdiparams": "paddle",
+    ".engine": "tensorrt",
+    ".plan": "tensorrt",
 }
 
 
@@ -335,6 +344,12 @@ def validate_file_type(path: str) -> bool:
         # TensorFlow Lite files
         if ext_format == "tflite":
             return True  # TFLite format can be complex to validate
+
+        if ext_format == "coreml":
+            return True  # Core ML files are protobuf and lack clear magic bytes
+
+        if ext_format == "tensorrt":
+            return True  # TensorRT engine files have complex binary format
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
