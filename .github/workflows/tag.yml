@@ -13,7 +13,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # Don't cancel in-progress tagging
 
 jobs:
   tag:
@@ -23,20 +24,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # Fetch all history for git tags
+          token: ${{ secrets.GITHUB_TOKEN || github.token }}
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
+          enable-cache: true
 
       - name: Get package version from pyproject.toml
         id: get_version
         run: |
-          VERSION=$(poetry version --short)
+          # Extract version using rye
+          VERSION=$(rye version)
+          # Validate semantic versioning format
+          if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Package version: ${VERSION}"
 
       - name: Check if git tag exists
@@ -45,49 +51,70 @@ jobs:
           git fetch --tags
           if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
             echo "Git tag v${VERSION} already exists"
-            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "Git tag v${VERSION} does not exist"
-            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create git tag
-        if: env.TAG_EXISTS == 'false'
+      - name: Get previous tag
+        id: get_previous_tag
+        if: steps.check_tag.outputs.tag_exists == 'false'
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git tag "v${VERSION}" -m "Release version ${VERSION}"
-          echo "Created tag: v${VERSION}"
+          # Get the most recent tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found"
+            echo "previous_tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Previous tag: $PREVIOUS_TAG"
+            echo "previous_tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Push git tag
-        if: env.TAG_EXISTS == 'false'
+      - name: Generate release notes
+        id: generate_notes
+        if: steps.check_tag.outputs.tag_exists == 'false'
         run: |
-          git push origin "v${VERSION}"
-          echo "Pushed tag: v${VERSION}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          PREVIOUS_TAG="${{ steps.get_previous_tag.outputs.previous_tag }}"
+          
+          # Create release notes
+          NOTES="## modelaudit v${VERSION}\n\n"
+          
+          if [ -n "$PREVIOUS_TAG" ]; then
+            NOTES="${NOTES}### Changes since ${PREVIOUS_TAG}\n\n"
+            # Get commit messages since previous tag
+            COMMITS=$(git log --pretty=format:"- %s (%an)" ${PREVIOUS_TAG}..HEAD)
+            if [ -n "$COMMITS" ]; then
+              NOTES="${NOTES}${COMMITS}\n\n"
+            fi
+            NOTES="${NOTES}**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...v${VERSION}\n\n"
+          else
+            NOTES="${NOTES}Initial release\n\n"
+          fi
+          
+          NOTES="${NOTES}### Installation\n\n\`\`\`bash\npip install modelaudit==${VERSION}\n\`\`\`\n\n"
+          NOTES="${NOTES}### Usage\n\n\`\`\`bash\nmodelaudit scan your_model.pkl\n\`\`\`"
+          
+          # Save notes to file to preserve formatting
+          echo -e "$NOTES" > release_notes.md
+
+      - name: Create git tag
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git tag -a "v${{ steps.get_version.outputs.version }}" -m "Release version ${{ steps.get_version.outputs.version }}"
+          git push origin "v${{ steps.get_version.outputs.version }}"
+          echo "Created and pushed tag: v${{ steps.get_version.outputs.version }}"
 
       - name: Create GitHub Release
-        if: env.TAG_EXISTS == 'false'
-        uses: actions/create-release@v1
+        if: steps.check_tag.outputs.tag_exists == 'false'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ env.VERSION }}
-          release_name: Release v${{ env.VERSION }}
-          body: |
-            ## Changes
-
-            See the [CHANGELOG](https://github.com/promptfoo/modelaudit/compare/v${{ env.VERSION }}) for details.
-
-            ## Installation
-
-            ```bash
-            pip install modelaudit==${{ env.VERSION }}
-            ```
-
-            ## Usage
-
-            ```bash
-            modelaudit scan your_model.pkl
-            ```
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.get_version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "Release v${{ steps.get_version.outputs.version }}" \
+            --notes-file release_notes.md \
+            --verify-tag

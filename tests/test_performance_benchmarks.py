@@ -376,7 +376,9 @@ class TestPerformanceBenchmarks:
         import os
 
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        overhead_threshold = 2.0 if is_ci else 0.5  # Allow up to 200% variance in CI, 50% locally
+        overhead_threshold = (
+            2.0 if is_ci else 0.5
+        )  # Allow up to 200% variance in CI, 50% locally
         assert timeout_overhead < overhead_threshold, (
             f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
         )
