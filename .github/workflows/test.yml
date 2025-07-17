@@ -231,7 +231,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 10
         run: |
-          rye sync --features "h5 pytorch yaml safetensors onnx"
+          rye sync --features h5,pytorch,yaml,safetensors,onnx
 
       - name: Run tests with pytest
         run: |
