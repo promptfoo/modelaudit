@@ -37,7 +37,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Lint with Ruff
         run: |
@@ -76,7 +76,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Type checking
         run: |
@@ -117,7 +117,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Run fast tests (parallel execution)
         run: |
@@ -173,7 +173,7 @@ jobs:
       - name: Install with NumPy 2.x (default)
         if: matrix.numpy-mode == '2.x'
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Check NumPy version
         run: |
@@ -222,7 +222,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Build package
         run: |
