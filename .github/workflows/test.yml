@@ -93,7 +93,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         timeout-minutes: 15
         run: |
-          rye run pytest -n auto -m "slow or integration" --tb=short
+          rye run pytest -n 1 -m "slow or integration" --tb=short
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
