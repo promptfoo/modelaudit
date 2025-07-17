@@ -92,6 +92,9 @@ pip install modelaudit[onnx]
 # For TensorFlow Lite model scanning
 pip install modelaudit[tflite]
 
+# For Core ML model scanning
+pip install modelaudit[coreml]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
