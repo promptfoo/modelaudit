@@ -26,6 +26,9 @@ def test_scanner_registry_contains_all_scanners():
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
         "TFLiteScanner": "tflite",
+        "CoreMLScanner": "coreml",
+        "OpenVinoScanner": "openvino",
+        "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
     }
 
@@ -86,6 +89,8 @@ def test_scanner_registry_file_extension_coverage():
         ".tflite",
         ".pdmodel",
         ".pdiparams",
+        ".engine",
+        ".plan",
     ]
 
     for ext in common_extensions:
