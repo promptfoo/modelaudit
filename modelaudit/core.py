@@ -138,7 +138,32 @@ def scan_model_directory_or_file(
                 for file in files:
                     file_path = os.path.join(root, file)
                     resolved_file = Path(file_path).resolve()
-                    if not is_within_directory(str(base_dir), str(resolved_file)):
+
+                    # Check if this is a HuggingFace cache symlink scenario
+                    is_hf_cache_symlink = False
+                    if (
+                        os.path.islink(file_path)
+                        and ".cache/huggingface/hub" in str(base_dir)
+                        and "/snapshots/" in str(file_path)
+                    ):
+                        link_target = os.readlink(file_path)
+                        # Resolve the relative link target
+                        resolved_target = (Path(file_path).parent / link_target).resolve()
+                        # Check if target is in the blobs directory of the same model cache
+                        if "/blobs/" in str(resolved_target):
+                            # Extract the model cache root (e.g., models--distilbert-base-uncased)
+                            cache_parts = str(base_dir).split("/")
+                            for i, part in enumerate(cache_parts):
+                                if part.startswith("models--") and i > 0:
+                                    cache_root = "/".join(cache_parts[: i + 1])
+                                    # Check if the target is within the same model's cache structure
+                                    if str(resolved_target).startswith(cache_root):
+                                        is_hf_cache_symlink = True
+                                        # Update the resolved_file to the actual target for scanning
+                                        resolved_file = resolved_target
+                                    break
+
+                    if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         issues_list.append(
                             {
@@ -164,7 +189,8 @@ def scan_model_directory_or_file(
 
                     # Scan the file
                     try:
-                        file_result = scan_file(file_path, config)
+                        # Use resolved_file path for actual scanning (handles symlinks)
+                        file_result = scan_file(str(resolved_file), config)
                         # Use cast to help mypy understand the types
                         results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
                         results["files_scanned"] = cast(int, results["files_scanned"]) + 1  # Increment file count
@@ -452,17 +478,15 @@ def _is_huggingface_cache_file(path: str) -> bool:
         if filename.endswith(pattern):
             return True
 
-    # Check for specific HuggingFace cache files
-    if ".cache/huggingface" in path:
-        # Skip all files in HuggingFace cache directories
-        return True
+    # Check for specific HuggingFace cache metadata files
+    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
     if filename in [".gitignore", ".gitattributes", "main", "HEAD"]:
         return True
 
-    # Check if file is in models--* directories (HuggingFace model cache)
-    return bool("models--" in path and "/refs/" in path)
+    # Check if file is in refs directory (Git references, not actual model files)
+    return bool("/refs/" in path and filename in ["main", "HEAD"])
 
 
 def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
