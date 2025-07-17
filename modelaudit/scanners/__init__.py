@@ -271,6 +271,15 @@ class ScannerRegistry:
                 "dependencies": ["tflite"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow Lite can be sensitive
             },
+            "tensorrt": {
+                "module": "modelaudit.scanners.tensorrt_scanner",
+                "class": "TensorRTScanner",
+                "description": "Scans TensorRT engine files",
+                "extensions": [".engine", ".plan"],
+                "priority": 17,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -486,6 +495,7 @@ def __getattr__(name: str):
         "FlaxMsgpackScanner": "flax_msgpack",
         "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
+        "TensorRTScanner": "tensorrt",
         "ZipScanner": "zip",
     }
 

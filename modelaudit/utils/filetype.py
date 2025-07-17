@@ -255,6 +255,8 @@ EXTENSION_FORMAT_MAP = {
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
     ".mlmodel": "coreml",
+    ".engine": "tensorrt",
+    ".plan": "tensorrt",
 }
 
 
@@ -341,6 +343,9 @@ def validate_file_type(path: str) -> bool:
 
         if ext_format == "coreml":
             return True  # Core ML files are protobuf and lack clear magic bytes
+
+        if ext_format == "tensorrt":
+            return True  # TensorRT engine files have complex binary format
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
