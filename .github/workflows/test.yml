@@ -221,8 +221,8 @@ jobs:
         with:
           path: |
             .venv
-            ~/.cache/pip
-            ~/.cache/rye
+            ~/AppData/Local/pip/Cache
+            ~/AppData/Local/rye/cache
           key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
           restore-keys: |
             ${{ runner.os }}-rye-py${{ matrix.python-version }}-
