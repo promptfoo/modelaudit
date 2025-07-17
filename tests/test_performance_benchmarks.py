@@ -247,7 +247,10 @@ class TestPerformanceBenchmarks:
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
         if not is_ci:
             # Skip concurrency overhead check in local environments due to high variance
-            pytest.skip(f"Skipping concurrency overhead check in local environment (overhead={concurrency_overhead:.2f}x)")
+            pytest.skip(
+                f"Skipping concurrency overhead check in local environment "
+                f"(overhead={concurrency_overhead:.2f}x)"
+            )
         # Increased threshold for CI environments
         overhead_threshold = 15.0
         assert concurrency_overhead < overhead_threshold, f"Concurrency overhead too high: {concurrency_overhead:.2f}x"
