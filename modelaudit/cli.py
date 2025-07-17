@@ -30,7 +30,61 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
-@click.group()
+class DefaultCommandGroup(click.Group):
+    """Custom group that makes 'scan' the default command"""
+
+    def get_command(self, ctx, cmd_name):
+        """Get command, defaulting to 'scan' if no command specified"""
+        rv = click.Group.get_command(self, ctx, cmd_name)
+        if rv is not None:
+            return rv
+        # If no command found and we have arguments, assume 'scan' command
+        if ctx.args:
+            return click.Group.get_command(self, ctx, "scan")
+        return None
+
+    def resolve_command(self, ctx, args):
+        """Resolve command, using 'scan' as default when paths are provided"""
+        # If we have args and the first arg is not a known command, use 'scan' as default
+        if args and args[0] not in self.list_commands(ctx):
+            # Insert 'scan' at the beginning
+            args = ["scan", *list(args)]
+
+        return super().resolve_command(ctx, args)
+
+    def format_help(self, ctx, formatter):
+        """Show help with both commands but emphasize scan as primary"""
+        formatter.write_text("ModelAudit - Security scanner for ML model files")
+        formatter.write_paragraph()
+
+        formatter.write_text("Usage:")
+        with formatter.indentation():
+            formatter.write_text("modelaudit [OPTIONS] PATHS...  # Scan files (default command)")
+            formatter.write_text("modelaudit scan [OPTIONS] PATHS...  # Explicit scan command")
+
+        formatter.write_paragraph()
+        formatter.write_text("Examples:")
+        with formatter.indentation():
+            formatter.write_text("modelaudit model.pkl")
+            formatter.write_text("modelaudit /path/to/models/")
+            formatter.write_text("modelaudit https://huggingface.co/user/model")
+
+        formatter.write_paragraph()
+        formatter.write_text("Other commands:")
+        with formatter.indentation():
+            formatter.write_text("modelaudit doctor  # Diagnose scanner compatibility")
+
+        formatter.write_paragraph()
+        formatter.write_text("For detailed help on scanning:")
+        with formatter.indentation():
+            formatter.write_text("modelaudit scan --help")
+
+        formatter.write_paragraph()
+        formatter.write_text("Options:")
+        self.format_options(ctx, formatter)
+
+
+@click.group(cls=DefaultCommandGroup)
 @click.version_option(__version__)
 def cli() -> None:
     """Static scanner for ML models"""

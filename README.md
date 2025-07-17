@@ -164,18 +164,22 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/m
 
 ### Basic Usage
 
+**Note:** `scan` is the default command, so you can omit it for brevity.
+
 ```bash
 # Scan a single model
+modelaudit model.pkl
+# Or explicitly:
 modelaudit scan model.pkl
 
 # Scan an ONNX model
-modelaudit scan model.onnx
+modelaudit model.onnx
 
 # Scan multiple models (including enhanced dill/joblib support and JAX/Flax)
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
+modelaudit model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
 
 # Scan a directory
-modelaudit scan ./models/
+modelaudit ./models/
 
 # Scan a model stored in the MLflow registry
 modelaudit scan models:/MyModel/1
