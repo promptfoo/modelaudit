@@ -21,6 +21,13 @@ try:
 except ImportError:
     HAS_H5PY = False
 
+try:
+    import tensorflow as tf
+
+    HAS_TENSORFLOW = True
+except Exception:
+    HAS_TENSORFLOW = False
+
 
 class TestWeightDistributionScanner:
     """Test suite for weight distribution anomaly detection"""
@@ -44,17 +51,20 @@ class TestWeightDistributionScanner:
         assert scanner.z_score_threshold == 3.0
         assert scanner.cosine_similarity_threshold == 0.7
         assert scanner.weight_magnitude_threshold == 3.0
+        assert scanner.max_array_size == 100 * 1024 * 1024  # Default 100MB
 
         # Custom config
         config = {
             "z_score_threshold": 2.5,
             "cosine_similarity_threshold": 0.8,
             "weight_magnitude_threshold": 2.0,
+            "max_array_size": 50 * 1024 * 1024,  # 50MB
         }
         scanner = WeightDistributionScanner(config)
         assert scanner.z_score_threshold == 2.5
         assert scanner.cosine_similarity_threshold == 0.8
         assert scanner.weight_magnitude_threshold == 2.0
+        assert scanner.max_array_size == 50 * 1024 * 1024
 
     def test_can_handle(self):
         """Test file type detection"""
@@ -65,6 +75,8 @@ class TestWeightDistributionScanner:
             h5_path = f.name
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             txt_path = f.name
+        tf_dir = tempfile.mkdtemp()
+        open(os.path.join(tf_dir, "saved_model.pb"), "wb").close()
 
         try:
             # Should handle PyTorch files if torch is available
@@ -75,6 +87,9 @@ class TestWeightDistributionScanner:
             if HAS_H5PY:
                 assert WeightDistributionScanner.can_handle(h5_path)
 
+            if HAS_TENSORFLOW:
+                assert WeightDistributionScanner.can_handle(tf_dir)
+
             # Should not handle unsupported extensions
             assert not WeightDistributionScanner.can_handle(txt_path)
             assert not WeightDistributionScanner.can_handle("directory/")
@@ -82,6 +97,8 @@ class TestWeightDistributionScanner:
             os.unlink(pt_path)
             os.unlink(h5_path)
             os.unlink(txt_path)
+            os.unlink(os.path.join(tf_dir, "saved_model.pb"))
+            os.rmdir(tf_dir)
 
     def test_analyze_layer_weights_outlier_detection(self):
         """Test detection of outlier weight vectors"""
@@ -229,6 +246,25 @@ class TestWeightDistributionScanner:
 
         finally:
             os.unlink(temp_path)
+
+    @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+    def test_tensorflow_savedmodel_scan(self, tmp_path):
+        """Test scanning a TensorFlow SavedModel directory."""
+        import sys
+
+        # Skip on Python 3.12+ due to TensorFlow/typing compatibility issues
+        if sys.version_info >= (3, 12):
+            pytest.skip("TensorFlow SavedModel has compatibility issues with Python 3.12+")
+
+        scanner = WeightDistributionScanner()
+
+        model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])
+        saved_path = tmp_path / "tf_model"
+        tf.saved_model.save(model, str(saved_path))
+
+        result = scanner.scan(str(saved_path))
+        assert result.success
+        assert result.metadata.get("layers_analyzed", 0) > 0
 
     def test_empty_model_handling(self):
         """Test handling of models with no extractable weights"""
