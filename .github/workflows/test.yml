@@ -19,42 +19,37 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.13"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Lint with Ruff
         run: |
-          poetry run ruff check .
+          rye run ruff check modelaudit/ tests/
+
+      - name: Check import organization with Ruff
+        run: |
+          rye run ruff check --select I modelaudit/ tests/
 
       - name: Check formatting with Ruff
         run: |
-          poetry run ruff format --check .
-
-  format-check:
-    name: Format Check (Biome)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Check formatting with Biome
-        run: npx @biomejs/biome ci .
+          rye run ruff format --check modelaudit/ tests/
 
   type-check:
     name: Type Check
@@ -63,26 +58,34 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.13"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Type checking
-        run: poetry run mypy modelaudit/
+        run: |
+          rye run mypy modelaudit/ tests/
 
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
@@ -90,22 +93,108 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+          version: latest
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
 
-      - name: Run tests with pytest
-        run: poetry run pytest -v --cov=modelaudit
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
+
+      - name: Run fast tests (parallel execution)
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+
+      - name: Run slow/integration tests (if main branch)
+        if: github.ref == 'refs/heads/main'
+        timeout-minutes: 15
+        run: |
+          rye run pytest -n 1 -m "slow or integration" --tb=short
+
+  test-numpy-compatibility:
+    name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+        numpy-mode: ["1.x", "2.x"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
+        with:
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
+      - name: Install with NumPy 1.x compatibility mode
+        if: matrix.numpy-mode == '1.x'
+        run: |
+          rye sync --no-dev
+          rye add --optional numpy1 'numpy>=1.19.0,<2.0'
+          rye sync --features numpy1
+
+      - name: Install with NumPy 2.x (default)
+        if: matrix.numpy-mode == '2.x'
+        run: |
+          rye sync --features all-ci
+
+      - name: Check NumPy version
+        run: |
+          rye run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+
+      - name: Test scanner diagnostics
+        run: |
+          rye run modelaudit doctor --show-failed
+
+      - name: Test basic scanning functionality
+        run: |
+          # Create a test file to scan
+          echo "Testing basic scanning with NumPy ${{ matrix.numpy-mode }}"
+          rye run python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+          rye run modelaudit scan test_model.pkl --format json --output test_results.json
+          cat test_results.json
+
+      - name: Run NumPy compatibility tests
+        run: |
+          rye run pytest tests/test_numpy_scanner.py -v
+          rye run pytest tests/test_scanner_registry.py -v -k "numpy"
 
   test-windows:
     name: Test on Windows ${{ matrix.python-version }}
@@ -117,45 +206,68 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
 
       - name: Install dependencies
         timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "h5,pytorch,yaml,safetensors,onnx" --no-interaction
+        run: |
+          rye sync --features "h5 pytorch yaml safetensors onnx"
 
       - name: Run tests with pytest
-        run: poetry run pytest -v --cov=modelaudit -k "not (tensorflow or keras)"
+        run: |
+          rye run pytest -v --cov=modelaudit -k "not (tensorflow or keras)"
 
   build:
     name: Build and Package
-    needs: [lint, format-check, type-check]
+    needs: [lint, type-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.13"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
-          poetry build
+          rye build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

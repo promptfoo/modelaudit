@@ -25,6 +25,18 @@ except ImportError:
 class TestWeightDistributionScanner:
     """Test suite for weight distribution anomaly detection"""
 
+    def _create_mock_architecture_analysis(self, is_llm=False, is_transformer=False):
+        """Helper method to create mock architecture analysis for testing"""
+        return {
+            "is_likely_transformer": is_transformer,
+            "is_likely_llm": is_llm,
+            "confidence": 0.8 if is_llm else 0.5,
+            "evidence": ["Mock evidence for testing"],
+            "architectural_features": {},
+            "total_parameters": 100_000_000 if is_llm else 1_000_000,
+            "layer_count": 24 if is_llm else 3,
+        }
+
     def test_scanner_initialization(self):
         """Test scanner initialization with default and custom config"""
         # Default initialization
@@ -82,18 +94,15 @@ class TestWeightDistributionScanner:
         # Make one neuron an outlier with large weights - make it even more extreme
         normal_weights[:, 5] = np.random.randn(100) * 10.0  # Much larger weights
 
-        anomalies = scanner._analyze_layer_weights("test_layer", normal_weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=False)
+        anomalies = scanner._analyze_layer_weights("test_layer", normal_weights, architecture_analysis)
 
         # Should detect the outlier neuron
         assert len(anomalies) > 0
 
         # Check for any type of anomaly (could be outlier or extreme value)
-        has_outlier = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_extreme = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_outlier = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme
 
         # If outlier detection worked, check the details
@@ -112,18 +121,20 @@ class TestWeightDistributionScanner:
         np.random.seed(42)
         base_vector = np.random.randn(100)
         weights = np.column_stack(
-            [base_vector + np.random.randn(100) * 0.1 for _ in range(9)]
+            [base_vector + np.random.randn(100) * 0.1 for _ in range(9)],
         )
 
         # Add one completely different vector (potential backdoor)
         random_vector = np.random.randn(100) * 2
         weights = np.column_stack([weights, random_vector])
 
-        anomalies = scanner._analyze_layer_weights("test_layer", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=False)
+        anomalies = scanner._analyze_layer_weights("test_layer", weights, architecture_analysis)
 
         # Should detect the dissimilar vector
         dissimilar_anomaly = next(
-            (a for a in anomalies if "dissimilar weights" in a["description"]), None
+            (a for a in anomalies if "dissimilar weights" in a["description"]),
+            None,
         )
         assert dissimilar_anomaly is not None
         assert dissimilar_anomaly["details"]["neuron_index"] == 9
@@ -139,15 +150,12 @@ class TestWeightDistributionScanner:
         # Add extreme values to one neuron
         weights[50:55, 3] = 10.0  # Very large values
 
-        anomalies = scanner._analyze_layer_weights("test_layer", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=False)
+        anomalies = scanner._analyze_layer_weights("test_layer", weights, architecture_analysis)
 
         # Should detect extreme weights
         extreme_anomaly = next(
-            (
-                a
-                for a in anomalies
-                if "extremely large weight values" in a["description"]
-            ),
+            (a for a in anomalies if "extremely large weight values" in a["description"]),
             None,
         )
         assert extreme_anomaly is not None
@@ -168,9 +176,7 @@ class TestWeightDistributionScanner:
                 # Make one output neuron in fc2 anomalous
                 with torch.no_grad():
                     self.fc2.weight.data = torch.randn(10, 50) * 0.1
-                    self.fc2.weight.data[5] = (
-                        torch.randn(50) * 10.0
-                    )  # Backdoor class - more extreme
+                    self.fc2.weight.data[5] = torch.randn(50) * 10.0  # Backdoor class - more extreme
 
         model = SimpleModel()
 
@@ -191,14 +197,8 @@ class TestWeightDistributionScanner:
                 assert result.metadata.get("layers_analyzed", 0) >= 0
             else:
                 # Check that anomaly was detected - could be either type
-                has_magnitude = any(
-                    "abnormal weight magnitudes" in issue.message
-                    for issue in result.issues
-                )
-                has_extreme = any(
-                    "extremely large weight values" in issue.message
-                    for issue in result.issues
-                )
+                has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
+                has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
                 assert has_magnitude or has_extreme
 
         finally:
@@ -261,21 +261,16 @@ class TestWeightDistributionScanner:
         # Neuron 7: Dissimilar to others
         weights[:, 7] = np.random.randn(100) * 0.5 + 10.0
 
-        anomalies = scanner._analyze_layer_weights("test_layer", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=False)
+        anomalies = scanner._analyze_layer_weights("test_layer", weights, architecture_analysis)
 
         # Should detect at least one anomaly
         assert len(anomalies) >= 1
 
         # Check for any type of anomaly
-        has_magnitude_anomaly = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_dissimilar_anomaly = any(
-            "dissimilar weights" in a["description"] for a in anomalies
-        )
-        has_extreme_anomaly = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_magnitude_anomaly = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_dissimilar_anomaly = any("dissimilar weights" in a["description"] for a in anomalies)
+        has_extreme_anomaly = any("extremely large weight values" in a["description"] for a in anomalies)
 
         assert has_magnitude_anomaly or has_dissimilar_anomaly or has_extreme_anomaly
 
@@ -293,7 +288,8 @@ class TestWeightDistributionScanner:
         for i in range(100):
             weights[:, i] *= 1.2  # Some tokens might have slightly different scales
 
-        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
+        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights, architecture_analysis)
 
         # Should not flag many neurons in an LLM
         # With our new thresholds, we expect very few or no anomalies
@@ -312,7 +308,8 @@ class TestWeightDistributionScanner:
         # Create LLM-like weights
         weights = np.random.randn(4096, 32000) * 0.02
 
-        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
+        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights, architecture_analysis)
 
         # Should return no anomalies since LLM checks are disabled by default
         assert len(anomalies) == 0
@@ -329,7 +326,8 @@ class TestWeightDistributionScanner:
         weights[:, 0] = np.random.randn(4096) * 10.0
         weights[:, 1] = np.random.randn(4096) * 10.0
 
-        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
+        anomalies = scanner._analyze_layer_weights("lm_head.weight", weights, architecture_analysis)
 
         # With LLM checks enabled, might detect extreme outliers with strict thresholds
         # We made 2 extreme neurons, so could get up to 2 anomaly types (outlier + extreme)
@@ -359,14 +357,15 @@ class TestWeightDistributionScanner:
         # Add some natural variation
         weights[:, :10] *= 1.5  # Some neurons have different scales
 
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
         for layer_name in gpt2_layer_names:
-            anomalies = scanner._analyze_layer_weights(layer_name, weights)
+            anomalies = scanner._analyze_layer_weights(layer_name, weights, architecture_analysis)
 
             # Should return no anomalies due to LLM detection
             assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
 
     def test_transformer_layer_pattern_detection(self):
-        """Test that transformer-related patterns are detected as LLM layers"""
+        """Test that transformer-related layers use structural analysis instead of name-based detection."""
         scanner = WeightDistributionScanner()
 
         # Test transformer-related layer names
@@ -377,15 +376,32 @@ class TestWeightDistributionScanner:
             "model.layers.5.mlp.gate_proj.weight",
         ]
 
-        # Create transformer-like weights
+        # Create transformer-like weights with some natural variation
         np.random.seed(42)
         weights = np.random.randn(1024, 4096) * 0.02  # Typical transformer dimensions
 
-        for layer_name in transformer_patterns:
-            anomalies = scanner._analyze_layer_weights(layer_name, weights)
+        # Add moderate natural variation (not extreme anomalies)
+        weights[:, :10] *= 1.2  # Some neurons have slightly different scales
 
-            # Should return no anomalies due to LLM detection
-            assert len(anomalies) == 0, f"Layer {layer_name} should be detected as LLM"
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True, is_transformer=True)
+        for layer_name in transformer_patterns:
+            anomalies = scanner._analyze_layer_weights(layer_name, weights, architecture_analysis)
+
+            # With our new structural analysis approach:
+            # - Large weight matrices (1024x4096 = 4M+ parameters) get relaxed thresholds
+            # - Layer names no longer bypass security checks completely
+            # - May still detect anomalies if weights are statistically unusual
+
+            # The key security improvement: detection is based on actual weight properties,
+            # not just names that can be spoofed by attackers
+
+            # Should use relaxed thresholds for large models but still perform analysis
+            assert len(anomalies) <= 2, f"Layer {layer_name} should use relaxed thresholds for large models"
+
+            # If anomalies are found, they should indicate real statistical outliers
+            for anomaly in anomalies:
+                # Should have analysis_method metadata showing structural analysis was used
+                assert anomaly["details"].get("analysis_method") == "structural_analysis"
 
     def test_large_hidden_dimension_detection(self):
         """Test that layers with large hidden dimensions are detected as LLM layers"""
@@ -394,16 +410,15 @@ class TestWeightDistributionScanner:
         # Test various large hidden dimensions typical of LLMs
         large_dimensions = [768, 1024, 2048, 4096, 8192]
 
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
         for hidden_dim in large_dimensions:
             np.random.seed(42)
             weights = np.random.randn(hidden_dim, 100) * 0.02  # Input dimension > 768
 
-            anomalies = scanner._analyze_layer_weights("some_layer.weight", weights)
+            anomalies = scanner._analyze_layer_weights("some_layer.weight", weights, architecture_analysis)
 
             # Should return no anomalies due to LLM detection
-            assert len(anomalies) == 0, (
-                f"Layer with {hidden_dim} hidden dims should be detected as LLM"
-            )
+            assert len(anomalies) == 0, f"Layer with {hidden_dim} hidden dims should be detected as LLM"
 
     def test_non_llm_layers_still_analyzed(self):
         """Test that non-LLM layers are still properly analyzed for anomalies"""
@@ -416,20 +431,15 @@ class TestWeightDistributionScanner:
         # Add a clear anomaly
         weights[:, 5] = np.random.randn(512) * 5.0  # One class with much larger weights
 
-        anomalies = scanner._analyze_layer_weights("classifier.weight", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=False)
+        anomalies = scanner._analyze_layer_weights("classifier.weight", weights, architecture_analysis)
 
         # Should detect the anomaly since this is not an LLM layer
-        assert len(anomalies) > 0, (
-            "Non-LLM layers should still be analyzed for anomalies"
-        )
+        assert len(anomalies) > 0, "Non-LLM layers should still be analyzed for anomalies"
 
         # Should find outlier neurons
-        has_outlier = any(
-            "abnormal weight magnitudes" in a["description"] for a in anomalies
-        )
-        has_extreme = any(
-            "extremely large weight values" in a["description"] for a in anomalies
-        )
+        has_outlier = any("abnormal weight magnitudes" in a["description"] for a in anomalies)
+        has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme
 
     def test_llm_enabled_with_extreme_outliers(self):
@@ -444,7 +454,8 @@ class TestWeightDistributionScanner:
         # Make just 1 neuron extremely suspicious (potential backdoor)
         weights[:, 0] = np.random.randn(768) * 50.0  # Very extreme outlier
 
-        anomalies = scanner._analyze_layer_weights("h.0.attn.c_proj.weight", weights)
+        architecture_analysis = self._create_mock_architecture_analysis(is_llm=True)
+        anomalies = scanner._analyze_layer_weights("h.0.attn.c_proj.weight", weights, architecture_analysis)
 
         # With strict LLM thresholds, only extreme outliers should be flagged
         # Should detect at most 1-2 issues (outlier detection + extreme values)

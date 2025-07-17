@@ -10,29 +10,29 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 
 ```bash
 # Setup
-./setup-poetry.sh              # Interactive setup script
-poetry install --extras all    # Install all dependencies
+rye sync --features all        # Install all dependencies
 
-# Running the scanner
-poetry run modelaudit scan model.pkl
-poetry run modelaudit scan --format json --output results.json model.pkl
+# Running the scanner (scan is the default command)
+rye run modelaudit model.pkl
+rye run modelaudit --format json --output results.json model.pkl
+# Or explicitly with scan command:
+rye run modelaudit scan model.pkl
 
 # Testing
-poetry run pytest                          # Run all tests
-poetry run pytest tests/test_pickle_scanner.py  # Run specific test file
-poetry run pytest -k "test_pickle"         # Run tests matching pattern
+rye run pytest                          # Run all tests
+rye run pytest tests/test_pickle_scanner.py  # Run specific test file
+rye run pytest -k "test_pickle"         # Run tests matching pattern
 
-# Linting and Formatting (run ALL before committing)
-poetry run ruff format .                   # Format code with Ruff (alternative formatter)
-poetry run mypy modelaudit/                # Type checking
-
-# Quick format check
-poetry run ruff format --check .           # Check if Ruff formatting is needed
+# Linting and Formatting
+rye run ruff format modelaudit/ tests/   # Format code (ALWAYS run before committing)
+rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
+rye run mypy modelaudit/                 # Type checking
 
 # Recommended order before committing:
-# 2. poetry run ruff format .
-# 5. poetry run mypy modelaudit/
-# 6. poetry run pytest
+# 1. rye run ruff format modelaudit/ tests/
+# 2. rye run ruff check --fix modelaudit/ tests/
+# 3. rye run mypy modelaudit/
+# 4. rye run pytest
 ```
 
 ## Architecture
