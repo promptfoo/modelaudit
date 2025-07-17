@@ -74,9 +74,9 @@ def test_flax_msgpack_suspicious_content(tmp_path):
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
-    # Create oversized containers
-    large_dict = {f"key_{i}": f"value_{i}" for i in range(20000)}  # Over default limit
-    large_list = list(range(15000))  # Over default limit
+    # Create oversized containers (default limit is 50000)
+    large_dict = {f"key_{i}": f"value_{i}" for i in range(60000)}  # Over default limit of 50000
+    large_list = list(range(55000))  # Over default limit of 50000
 
     data = {"params": {"large_dict": large_dict, "large_list": large_list}}
     create_msgpack_file(path, data)
@@ -236,8 +236,11 @@ def test_flax_msgpack_large_model_support(tmp_path):
     """Test support for large transformer models."""
     path = tmp_path / "large_model.msgpack"
 
-    # Simulate large model with 200MB+ embedding
-    large_embedding = b"\x00" * (250 * 1024 * 1024)  # 250MB
+    # Create scanner with lower blob limit for testing
+    scanner = FlaxMsgpackScanner(config={"max_blob_bytes": 10 * 1024 * 1024})  # 10MB limit
+
+    # Simulate large model with 20MB embedding
+    large_embedding = b"\x00" * (20 * 1024 * 1024)  # 20MB
 
     data = {
         "params": {
@@ -247,7 +250,6 @@ def test_flax_msgpack_large_model_support(tmp_path):
     }
     create_msgpack_file(path, data)
 
-    scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
     assert result.success
