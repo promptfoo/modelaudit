@@ -51,17 +51,20 @@ class TestWeightDistributionScanner:
         assert scanner.z_score_threshold == 3.0
         assert scanner.cosine_similarity_threshold == 0.7
         assert scanner.weight_magnitude_threshold == 3.0
+        assert scanner.max_array_size == 100 * 1024 * 1024  # Default 100MB
 
         # Custom config
         config = {
             "z_score_threshold": 2.5,
             "cosine_similarity_threshold": 0.8,
             "weight_magnitude_threshold": 2.0,
+            "max_array_size": 50 * 1024 * 1024,  # 50MB
         }
         scanner = WeightDistributionScanner(config)
         assert scanner.z_score_threshold == 2.5
         assert scanner.cosine_similarity_threshold == 0.8
         assert scanner.weight_magnitude_threshold == 2.0
+        assert scanner.max_array_size == 50 * 1024 * 1024
 
     def test_can_handle(self):
         """Test file type detection"""

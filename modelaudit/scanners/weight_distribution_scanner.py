@@ -60,6 +60,8 @@ class WeightDistributionScanner(BaseScanner):
         )
         self.llm_vocab_threshold = self.config.get("llm_vocab_threshold", 10000)
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
+        # Use max_array_size for in-memory array size limits (default 100MB)
+        self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -259,11 +261,7 @@ class WeightDistributionScanner(BaseScanner):
                             continue
                         tensor = tf.train.load_variable(ckpt_prefix, name)
                         array = np.array(tensor)
-                        if (
-                            self.max_file_read_size
-                            and self.max_file_read_size > 0
-                            and array.nbytes > self.max_file_read_size
-                        ):
+                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         # Only include 2D+ tensors for consistency with .pb file handling
                         if len(array.shape) >= 2:
@@ -292,11 +290,7 @@ class WeightDistributionScanner(BaseScanner):
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
                         array = tf.make_ndarray(tensor_proto)
-                        if (
-                            self.max_file_read_size
-                            and self.max_file_read_size > 0
-                            and array.nbytes > self.max_file_read_size
-                        ):
+                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
