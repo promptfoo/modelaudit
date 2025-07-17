@@ -12,9 +12,11 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 # Setup
 rye sync --features all        # Install all dependencies
 
-# Running the scanner
+# Running the scanner (scan is the default command)
+rye run modelaudit model.pkl
+rye run modelaudit --format json --output results.json model.pkl
+# Or explicitly with scan command:
 rye run modelaudit scan model.pkl
-rye run modelaudit scan --format json --output results.json model.pkl
 
 # Testing
 rye run pytest                          # Run all tests
