@@ -317,9 +317,9 @@ risk:
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), OpenVINO (.xml, .bin), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently
 - **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
@@ -358,6 +358,8 @@ ModelAudit provides specialized security scanners for different model formats:
 | **TensorFlow**      | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution                                                                  |
 | **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
 | **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
+| **OpenVINO**        | `.xml`, `.bin`                                         
+                                                | Suspicious layers, external library references                            |
 | **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
 | **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
 | **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
