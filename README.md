@@ -92,6 +92,9 @@ pip install modelaudit[onnx]
 # For TensorFlow Lite model scanning
 pip install modelaudit[tflite]
 
+# For Core ML model scanning
+pip install modelaudit[coreml]
+
 # For YAML manifest scanning
 pip install modelaudit[yaml]
 
@@ -358,8 +361,8 @@ ModelAudit provides specialized security scanners for different model formats:
 | **TensorFlow**      | SavedModel dirs, `.pb`                                                                                   | Suspicious operations, file I/O, Python execution                                                                  |
 | **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
 | **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
-| **OpenVINO**        | `.xml`, `.bin`                                         
-                                                | Suspicious layers, external library references                            |
+| **Core ML**         | `.mlmodel`                                             | Custom models, custom layers, linked or serialized sub-models |
+| **OpenVINO**        | `.xml`, `.bin`                                         | Suspicious layers, external library references                            |
 | **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
 | **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
 | **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
