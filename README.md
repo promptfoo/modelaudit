@@ -69,16 +69,19 @@ Checks for license violations that could expose your company to legal risk
 
 ModelAudit scans **all major ML model formats** with specialized security analysis for each:
 
-| Format          | Extensions                 | Risk Level | Notes                                        |
-| --------------- | -------------------------- | ---------- | -------------------------------------------- |
-| **PyTorch**     | `.pt`, `.pth`              | 🔴 HIGH    | Contains pickle serialization - always scan  |
-| **Pickle**      | `.pkl`, `.pickle`, `.dill` | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
-| **SafeTensors** | `.safetensors`             | 🟢 SAFE    | Preferred secure format                      |
-| **GGUF/GGML**   | `.gguf`, `.ggml`           | 🟢 SAFE    | LLM standard, binary format                  |
-| **ONNX**        | `.onnx`                    | 🟢 SAFE    | Industry standard, good interoperability     |
-| **TensorFlow**  | `.pb`, SavedModel          | 🟠 MEDIUM  | Scan for dangerous operations                |
-| **Keras**       | `.h5`, `.keras`            | 🟠 MEDIUM  | Check for executable layers                  |
-| **JAX/Flax**    | `.msgpack`, `.orbax`       | 🟡 LOW     | Validate transforms                          |
+| Format          | Extensions                            | Risk Level | Notes                                        |
+| --------------- | ------------------------------------- | ---------- | -------------------------------------------- |
+| **PyTorch**     | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Contains pickle serialization - always scan  |
+| **Pickle**      | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
+| **Joblib**      | `.joblib`                             | 🔴 HIGH    | Can contain pickled objects                  |
+| **SafeTensors** | `.safetensors`                        | 🟢 SAFE    | Preferred secure format                      |
+| **GGUF/GGML**   | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard, binary format                  |
+| **ONNX**        | `.onnx`                               | 🟢 SAFE    | Industry standard, good interoperability     |
+| **TensorFlow**  | `.pb`, SavedModel                     | 🟠 MEDIUM  | Scan for dangerous operations                |
+| **Keras**       | `.h5`, `.keras`, `.hdf5`              | 🟠 MEDIUM  | Check for executable layers                  |
+| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟡 LOW     | Validate transforms                          |
+
+Plus 10+ additional formats including ExecuTorch, TensorFlow Lite, Core ML, and more.
 
 [View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
