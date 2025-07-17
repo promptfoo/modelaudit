@@ -19,6 +19,7 @@ concurrency:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -35,7 +36,7 @@ jobs:
         id: get_version
         run: |
           # Extract version using rye
-          VERSION=$(rye version)
+          VERSION=$(rye version) || { echo "Failed to get version from rye"; exit 1; }
           # Validate semantic versioning format
           if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'; then
             echo "Invalid version format: $VERSION"
@@ -97,7 +98,7 @@ jobs:
           NOTES="${NOTES}### Usage\n\n\`\`\`bash\nmodelaudit scan your_model.pkl\n\`\`\`"
           
           # Save notes to file to preserve formatting
-          echo -e "$NOTES" > release_notes.md
+          printf "%b\n" "$NOTES" > release_notes.md
 
       - name: Create git tag
         if: steps.check_tag.outputs.tag_exists == 'false'

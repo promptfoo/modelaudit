@@ -1,6 +1,15 @@
 name: PyPI package release
 run-name: modelaudit PyPI package release by @${{ github.actor }}
 
+# IMPORTANT: Before using this workflow, you must configure PyPI Trusted Publishing:
+# 1. Go to https://pypi.org/manage/project/modelaudit/settings/publishing/
+# 2. Add a new trusted publisher with:
+#    - Owner: promptfoo
+#    - Repository: modelaudit
+#    - Workflow name: release.yml
+#    - Environment: pypi (optional but recommended)
+# Without this configuration, the workflow will fail with authentication errors.
+
 on:
   release:
     types: [published]
@@ -14,6 +23,7 @@ jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
@@ -43,6 +53,7 @@ jobs:
   lint-and-type-check:
     name: Lint and type check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -73,6 +84,7 @@ jobs:
     name: Publish to PyPI
     needs: [test, lint-and-type-check]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: pypi
       url: https://pypi.org/p/modelaudit
@@ -95,12 +107,18 @@ jobs:
 
       - name: Verify package
         run: |
+          # Check that dist directory and wheel files exist
+          if [ ! -d "dist" ] || [ -z "$(ls -A dist/*.whl 2>/dev/null)" ]; then
+            echo "No wheel files found in dist/"
+            exit 1
+          fi
           # Check that the wheel is valid
           rye run python -m pip install --no-deps dist/*.whl
           # Verify version matches using the pyproject.toml version
-          PACKAGE_VERSION=$(rye version)
+          PACKAGE_VERSION=$(rye version) || { echo "Failed to get version from rye"; exit 1; }
           TAG_VERSION="${{ github.event.release.tag_name }}"
           TAG_VERSION="${TAG_VERSION#v}"  # Remove 'v' prefix if present
+          TAG_VERSION=$(echo "$TAG_VERSION" | tr -d '[:space:]')  # Remove whitespace
           if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
             echo "Package version ($PACKAGE_VERSION) does not match tag version ($TAG_VERSION)"
             exit 1
