@@ -289,6 +289,15 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "paddle": {
+                "module": "modelaudit.scanners.paddle_scanner",
+                "class": "PaddleScanner",
+                "description": "Scans PaddlePaddle model files",
+                "extensions": [".pdmodel", ".pdiparams"],
+                "priority": 18,
+                "dependencies": ["paddlepaddle"],
+                "numpy_sensitive": True,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -506,6 +515,7 @@ def __getattr__(name: str):
         "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
+        "PaddleScanner": "paddle",
         "ZipScanner": "zip",
     }
 
