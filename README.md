@@ -167,18 +167,22 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest scan /data/m
 
 ### Basic Usage
 
+**Note:** `scan` is the default command, so you can omit it for brevity.
+
 ```bash
 # Scan a single model
+modelaudit model.pkl
+# Or explicitly:
 modelaudit scan model.pkl
 
 # Scan an ONNX model
-modelaudit scan model.onnx
+modelaudit model.onnx
 
 # Scan multiple models (including enhanced dill/joblib support and JAX/Flax)
-modelaudit scan model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
+modelaudit model1.pkl model2.h5 model3.pt llama-model.gguf model4.joblib model5.dill model6.npy flax-model.msgpack jax-checkpoint.orbax
 
 # Scan a directory
-modelaudit scan ./models/
+modelaudit ./models/
 
 # Scan a model stored in the MLflow registry
 modelaudit scan models:/MyModel/1
@@ -316,9 +320,9 @@ risk:
 
 ### Core Capabilities
 
-- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Automatic Format Detection**: Identifies model formats automatically
 - **Deep Security Analysis**: Examines model internals, not just metadata
+- **Multiple Format Support**: PyTorch (.pt, .pth, .bin), TensorFlow (SavedModel, .pb), Keras (.h5, .hdf5, .keras), SafeTensors (.safetensors), GGUF/GGML (.gguf, .ggml), Pickle (.pkl, .pickle, .ckpt), Joblib (.joblib), NumPy (.npy, .npz), PMML (.pmml), OpenVINO (.xml, .bin), ZIP archives (.zip), Manifests (.json, .yaml, .xml, etc.), Flax (.msgpack, .ckpt)
 - **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
 - **Batch Processing**: Scan multiple files and directories efficiently
 - **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
@@ -358,6 +362,7 @@ ModelAudit provides specialized security scanners for different model formats:
 | **Keras**           | `.h5`, `.hdf5`, `.keras`                                                                                 | Lambda layers, custom objects, dangerous configurations                                                            |
 | **ONNX**            | `.onnx`                                                                                                  | Custom operators, external data validation, tensor integrity                                                       |
 | **Core ML**         | `.mlmodel`                                             | Custom models, custom layers, linked or serialized sub-models |
+| **OpenVINO**        | `.xml`, `.bin`                                         | Suspicious layers, external library references                            |
 | **SafeTensors**     | `.safetensors`                                                                                           | Metadata integrity, tensor validation                                                                              |
 | **Flax/JAX**        | `.msgpack`, `.flax`, `.orbax`, `.jax`                                                                   | Enhanced msgpack integrity, JAX-specific threat detection, Orbax checkpoint support, ML architecture analysis, decompression bomb prevention |
 | **GGUF/GGML**       | `.gguf`, `.ggml`                                                                                         | Header validation, tensor integrity, metadata security checks                                                      |
