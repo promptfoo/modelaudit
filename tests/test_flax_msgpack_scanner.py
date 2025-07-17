@@ -330,24 +330,36 @@ def test_flax_msgpack_trailing_data(tmp_path):
 
 
 def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs."""
+    """Test detection of suspiciously large binary blobs.
+
+    Uses smaller sizes in CI environments for faster test execution.
+    GitHub Actions automatically sets CI=true.
+    """
+    import os
+
+    # In CI, use smaller sizes for faster tests
+    if os.getenv("CI") == "true":
+        # Use 1MB threshold and 2MB blob for CI
+        threshold_mb = 1
+        blob_size_mb = 2
+    else:
+        # Use production-like sizes for local testing
+        threshold_mb = 500
+        blob_size_mb = 550
+
     path = tmp_path / "large_blob.msgpack"
-    
-    # Create scanner with lower blob limit for testing
-    is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-    blob_limit = 5 * 1024 * 1024 if is_ci else 10 * 1024 * 1024  # 5MB in CI, 10MB locally
-    scanner = FlaxMsgpackScanner(config={"max_blob_bytes": blob_limit})
-    
-    # Create large binary blob (exceeds our test threshold)
-    blob_size = 10 * 1024 * 1024 if is_ci else 20 * 1024 * 1024  # 10MB in CI, 20MB locally
-    large_blob = b"X" * blob_size
+    # Create large binary blob (exceeds threshold)
+    large_blob = b"X" * (blob_size_mb * 1024 * 1024)
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 
+    # Configure scanner with appropriate threshold
+    config = {"max_blob_bytes": threshold_mb * 1024 * 1024}
+    scanner = FlaxMsgpackScanner(config=config)
     result = scanner.scan(str(path))
 
     info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert any("large binary blob" in issue.message.lower() for issue in info_issues)
+    assert any("Suspiciously large binary blob" in issue.message for issue in info_issues)
 
 
 def test_flax_msgpack_custom_config(tmp_path):
