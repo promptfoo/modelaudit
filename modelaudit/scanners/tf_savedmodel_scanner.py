@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
+from modelaudit.explanations import get_tf_op_explanation
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -20,7 +21,7 @@ except ImportError:
     class SavedModel:  # type: ignore[no-redef]
         """Placeholder for SavedModel when TensorFlow is not installed"""
 
-        meta_graphs: list = []
+        meta_graphs: ClassVar[list] = []
 
     SavedModelType = SavedModel
 
@@ -30,7 +31,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     name = "tf_savedmodel"
     description = "Scans TensorFlow SavedModel for suspicious operations"
-    supported_extensions = [".pb", ""]  # Empty string for directories
+    supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -59,6 +60,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Store the file path for use in issue locations
         self.current_file_path = path
 
@@ -66,8 +71,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if not HAS_TENSORFLOW:
             result = self._create_result()
             result.add_issue(
-                "TensorFlow not installed, cannot scan SavedModel. Install with "
-                "'pip install modelaudit[tensorflow]'.",
+                "TensorFlow not installed, cannot scan SavedModel. Install with 'pip install modelaudit[tensorflow]'.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -108,7 +112,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning TF SavedModel file: {str(e)}",
+                f"Error scanning TF SavedModel file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -146,17 +150,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if file.endswith(".py"):
                     result.add_issue(
                         f"Python file found in SavedModel: {file}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(file_path),
                         details={"file": file, "directory": root},
                     )
 
                 # Check for blacklist patterns in text files
-                if (
-                    hasattr(self, "config")
-                    and self.config
-                    and "blacklist_patterns" in self.config
-                ):
+                if hasattr(self, "config") and self.config and "blacklist_patterns" in self.config:
                     blacklist_patterns = self.config["blacklist_patterns"]
                     try:
                         # Only check text files
@@ -180,15 +180,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 for pattern in blacklist_patterns:
                                     if pattern in content:
                                         result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' "
-                                            f"found in file {file}",
-                                            severity=IssueSeverity.WARNING,
+                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            severity=IssueSeverity.CRITICAL,
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
                     except Exception as e:
                         result.add_issue(
-                            f"Error reading file {file}: {str(e)}",
+                            f"Error reading file {file}: {e!s}",
                             severity=IssueSeverity.DEBUG,
                             location=str(file_path),
                             details={
@@ -228,11 +227,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             "op_type": node.op,
                             "node_name": node.name,
                             "meta_graph": (
-                                meta_graph.meta_info_def.tags[0]
-                                if meta_graph.meta_info_def.tags
-                                else "unknown"
+                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
                             ),
                         },
+                        why=get_tf_op_explanation(node.op),
                     )
 
         # Add operation counts to metadata

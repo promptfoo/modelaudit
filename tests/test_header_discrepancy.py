@@ -15,7 +15,4 @@ def test_header_extension_mismatch_warning(tmp_path):
     result = scan_file(str(file_path))
 
     assert result.scanner_name == "pickle"
-    assert any(
-        issue.severity == IssueSeverity.WARNING and "header" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert any(issue.severity == IssueSeverity.DEBUG and "header" in issue.message.lower() for issue in result.issues)

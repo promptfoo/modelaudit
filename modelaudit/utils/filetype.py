@@ -1,6 +1,15 @@
 import re
 from pathlib import Path
 
+# Known GGML header variants (older formats like GGMF and GGJT)
+GGML_MAGIC_VARIANTS = {
+    b"GGML",
+    b"GGMF",
+    b"GGJT",
+    b"GGLA",
+    b"GGSA",
+}
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -18,6 +27,74 @@ def is_zipfile(path: str) -> bool:
 def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
     with Path(path).open("rb") as f:
         return f.read(num_bytes)
+
+
+def detect_file_format_from_magic(path: str) -> str:
+    """Detect file format solely from magic bytes."""
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+
+    if not file_path.is_file():
+        return "unknown"
+
+    size = file_path.stat().st_size
+    if size < 4:
+        return "unknown"
+
+    magic4 = read_magic_bytes(path, 4)
+    magic8 = read_magic_bytes(path, 8)
+    magic16 = read_magic_bytes(path, 16)
+
+    hdf5_magic = b"\x89HDF\r\n\x1a\n"
+    if magic8 == hdf5_magic:
+        return "hdf5"
+
+    # NumPy magic check
+    numpy_magic = b"\x93NUMPY"
+    if magic8.startswith(numpy_magic):
+        return "numpy"
+
+    if magic4 == b"GGUF":
+        return "gguf"
+    if magic4 in GGML_MAGIC_VARIANTS:
+        return "ggml"
+
+    if magic4.startswith(b"PK"):
+        return "zip"
+
+    pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+    if any(magic4.startswith(m) for m in pickle_magics):
+        return "pickle"
+
+    # SafeTensors format check: 8-byte length header + JSON metadata
+    if size >= 12:  # Minimum: 8 bytes length + some JSON
+        try:
+            import struct
+
+            # Read 8 bytes as little-endian u64 for JSON length
+            json_length = struct.unpack("<Q", magic8)[0]
+            # Sanity check: JSON length should be reasonable
+            if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
+                # Read some bytes after the header to check for JSON
+                with open(path, "rb") as f:
+                    f.seek(8)  # Skip the 8-byte header
+                    json_start = f.read(min(32, json_length))
+                    if json_start.startswith(b"{") and b'"' in json_start:
+                        return "safetensors"
+        except (struct.error, OSError):
+            pass
+
+    # Fallback: check if it starts with JSON (for old safetensors or other JSON formats)
+    if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+        return "safetensors"
+
+    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+        return "onnx"
+
+    return "unknown"
 
 
 def detect_file_format(path: str) -> str:
@@ -58,7 +135,7 @@ def detect_file_format(path: str) -> str:
     # Check for GGUF/GGML magic bytes
     if magic4 == b"GGUF":
         return "gguf"
-    if magic4 == b"GGML":
+    if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     ext = file_path.suffix.lower()
@@ -101,6 +178,10 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
+    if ext in (".ptl", ".pte"):
+        if magic4.startswith(b"PK"):
+            return "executorch"
+        return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
@@ -111,15 +192,18 @@ def detect_file_format(path: str) -> str:
         return "tflite"
     if ext == ".safetensors":
         return "safetensors"
-    if ext == ".msgpack":
+    if ext in (".pdmodel", ".pdiparams"):
+        return "paddle"
+    if ext in (".msgpack", ".flax", ".orbax", ".jax"):
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
-    if ext in (".gguf", ".ggml"):
+    ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
+    if ext in (".gguf", *ggml_exts):
         # Check magic bytes first for accuracy
         if magic4 == b"GGUF":
             return "gguf"
-        elif magic4 == b"GGML":
+        elif magic4 in GGML_MAGIC_VARIANTS:
             return "ggml"
         # Fall back to extension-based detection
         return "gguf" if ext == ".gguf" else "ggml"
@@ -131,6 +215,8 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
+    if ext == ".mlmodel":
+        return "coreml"
 
     return "unknown"
 
@@ -145,9 +231,8 @@ def find_sharded_files(directory: str) -> list[str]:
         [
             str(dir_path / fname)
             for fname in dir_path.iterdir()
-            if fname.is_file()
-            and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
-        ]
+            if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
+        ],
     )
 
 
@@ -168,9 +253,20 @@ EXTENSION_FORMAT_MAP = {
     ".zip": "zip",
     ".gguf": "gguf",
     ".ggml": "ggml",
+    ".ggmf": "ggml",
+    ".ggjt": "ggml",
+    ".ggla": "ggml",
+    ".ggsa": "ggml",
+    ".ptl": "executorch",
+    ".pte": "executorch",
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".mlmodel": "coreml",
+    ".pdmodel": "paddle",
+    ".pdiparams": "paddle",
+    ".engine": "tensorrt",
+    ".plan": "tensorrt",
 }
 
 
@@ -182,3 +278,98 @@ def detect_format_from_extension(path: str) -> str:
             return "tensorflow_directory"
         return "directory"
     return EXTENSION_FORMAT_MAP.get(file_path.suffix.lower(), "unknown")
+
+
+def validate_file_type(path: str) -> bool:
+    """Validate that a file's magic bytes match its extension-based format."""
+    try:
+        header_format = detect_file_format_from_magic(path)
+        ext_format = detect_format_from_extension(path)
+
+        # If extension format is unknown, we can't validate - assume valid
+        if ext_format == "unknown":
+            return True
+
+        # Small files (< 4 bytes) are always valid - can't determine magic bytes reliably
+        file_path = Path(path)
+        if file_path.is_file() and file_path.stat().st_size < 4:
+            return True
+
+        # Handle special cases where different formats are compatible first
+        # before doing the unknown header check
+
+        # Pickle files can be stored in various ways
+        if ext_format == "pickle" and header_format in {"pickle", "zip"}:
+            return True
+
+        # PyTorch binary files are flexible in format
+        if ext_format == "pytorch_binary" and header_format in {
+            "pytorch_binary",
+            "pickle",
+            "zip",
+            "unknown",  # .bin files can contain arbitrary binary data
+        }:
+            return True
+
+        # TensorFlow protobuf files (.pb extension)
+        if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
+            return True
+
+        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
+        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
+            return True
+
+        # ExecuTorch files should be zip archives
+        if ext_format == "executorch":
+            return header_format == "zip"
+
+        # HDF5 files should always match
+        if ext_format == "hdf5":
+            return header_format == "hdf5"
+
+        # SafeTensors files should always match
+        if ext_format == "safetensors":
+            return header_format == "safetensors"
+
+        # GGUF/GGML files should match their format
+        if ext_format in {"gguf", "ggml"}:
+            return header_format == ext_format
+
+        # ONNX files (Protocol Buffer format - difficult to detect reliably)
+        if ext_format == "onnx":
+            return header_format in {"onnx", "unknown"}
+
+        # NumPy files should match
+        if ext_format == "numpy":
+            return header_format == "numpy"
+
+        # Flax msgpack files (less strict validation)
+        if ext_format == "flax_msgpack":
+            return True  # Hard to validate msgpack format reliably
+
+        # TensorFlow directories are special case
+        if ext_format == "tensorflow_directory":
+            return header_format == "tensorflow_directory"
+
+        # TensorFlow Lite files
+        if ext_format == "tflite":
+            return True  # TFLite format can be complex to validate
+
+        if ext_format == "coreml":
+            return True  # Core ML files are protobuf and lack clear magic bytes
+
+        if ext_format == "tensorrt":
+            return True  # TensorRT engine files have complex binary format
+
+        # If header format is unknown but extension is known, this might be suspicious
+        # unless the file is very small or empty (checked after format-specific rules)
+        if header_format == "unknown":
+            file_path = Path(path)
+            return not (file_path.is_file() and file_path.stat().st_size >= 4)  # Small files are acceptable
+
+        # Default: exact match required
+        return header_format == ext_format
+
+    except Exception:
+        # If validation fails due to error, assume valid to avoid breaking scans
+        return True

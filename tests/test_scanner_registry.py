@@ -1,20 +1,45 @@
-from modelaudit.scanners import SCANNER_REGISTRY
+from modelaudit.scanners import SCANNER_REGISTRY, _registry
 from modelaudit.scanners.base import BaseScanner
 
 
 def test_scanner_registry_contains_all_scanners():
-    """Test that the scanner registry contains all expected scanners."""
-    # Check that all expected scanners are in the registry
+    """Test that the scanner registry contains all expected scanners or tracks failed loads."""
+    # Check that all expected scanners are either loaded or in failed scanners
     scanner_classes = [cls.__name__ for cls in SCANNER_REGISTRY]
+    failed_scanners = _registry.get_failed_scanners()
 
-    assert "PickleScanner" in scanner_classes
-    assert "TensorFlowSavedModelScanner" in scanner_classes
-    assert "KerasH5Scanner" in scanner_classes
-    assert "PyTorchZipScanner" in scanner_classes
-    assert "OnnxScanner" in scanner_classes
-    assert "SafeTensorsScanner" in scanner_classes
-    assert "TFLiteScanner" in scanner_classes
-    assert "PmmlScanner" in scanner_classes
+    # Core scanners that should always load (no heavy dependencies)
+    core_scanners = [
+        "PickleScanner",
+        "PyTorchZipScanner",
+        "SafeTensorsScanner",
+        "PmmlScanner",
+    ]
+
+    for scanner in core_scanners:
+        assert scanner in scanner_classes, f"Core scanner {scanner} should always be available"
+
+    # ML framework scanners that may fail due to compatibility issues
+    # Map scanner class names to their registry IDs for proper matching
+    ml_scanners_map = {
+        "TensorFlowSavedModelScanner": "tf_savedmodel",
+        "KerasH5Scanner": "keras_h5",
+        "OnnxScanner": "onnx",
+        "TFLiteScanner": "tflite",
+        "CoreMLScanner": "coreml",
+        "OpenVinoScanner": "openvino",
+        "TensorRTScanner": "tensorrt",
+        "PaddleScanner": "paddle",
+    }
+
+    for scanner_class, scanner_id in ml_scanners_map.items():
+        scanner_available = scanner_class in scanner_classes
+        scanner_failed = scanner_id in failed_scanners
+
+        assert scanner_available or scanner_failed, (
+            f"Scanner {scanner_class} (ID: {scanner_id}) should either be loaded or in failed scanners. "
+            f"Loaded: {scanner_classes}, Failed: {list(failed_scanners.keys())}"
+        )
 
 
 def test_scanner_registry_instances():
@@ -37,9 +62,7 @@ def test_scanner_registry_unique_names():
     scanner_names = [cls.name for cls in SCANNER_REGISTRY]
 
     # Check for duplicates
-    assert len(scanner_names) == len(set(scanner_names)), (
-        "Duplicate scanner names found"
-    )
+    assert len(scanner_names) == len(set(scanner_names)), "Duplicate scanner names found"
 
 
 def test_scanner_registry_file_extension_coverage():
@@ -64,6 +87,10 @@ def test_scanner_registry_file_extension_coverage():
         ".safetensors",
         ".msgpack",
         ".tflite",
+        ".pdmodel",
+        ".pdiparams",
+        ".engine",
+        ".plan",
     ]
 
     for ext in common_extensions:
@@ -81,3 +108,29 @@ def test_scanner_registry_instantiation():
         custom_config = {"test_option": "test_value"}
         scanner = scanner_class(config=custom_config)
         assert scanner.config == custom_config
+
+
+def test_scanner_registry_graceful_fallback():
+    """Test that scanner registry handles failed loads gracefully."""
+    failed_scanners = _registry.get_failed_scanners()
+
+    # If there are failed scanners, they should have error messages
+    for scanner_id, error_msg in failed_scanners.items():
+        assert isinstance(error_msg, str)
+        assert len(error_msg) > 0
+        assert scanner_id in error_msg or "numpy" in error_msg.lower() or "tensorflow" in error_msg.lower()
+
+    # Registry should still function even with failed scanners
+    assert len(SCANNER_REGISTRY) > 0, "Some scanners should still be available"
+
+
+def test_numpy_compatibility_detection():
+    """Test that NumPy compatibility status is properly detected."""
+    numpy_compatible, numpy_status = _registry.get_numpy_status()
+
+    assert isinstance(numpy_compatible, bool)
+    assert isinstance(numpy_status, str)
+    assert "numpy" in numpy_status.lower()
+
+    # Should provide helpful information
+    assert len(numpy_status) > 10

@@ -2,8 +2,9 @@ import json
 import os
 import tarfile
 import tempfile
-from typing import Any
+from typing import Any, ClassVar
 
+from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
@@ -20,7 +21,7 @@ class OciLayerScanner(BaseScanner):
 
     name = "oci_layer"
     description = "Scans container manifests and embedded layers for model files"
-    supported_extensions = [".manifest"]
+    supported_extensions: ClassVar[list[str]] = [".manifest"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -31,7 +32,7 @@ class OciLayerScanner(BaseScanner):
             return False
         # Quick check for .tar.gz references to avoid conflicts with ManifestScanner
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, encoding="utf-8", errors="ignore") as f:
                 snippet = f.read(2048)
             return ".tar.gz" in snippet
         except Exception:
@@ -42,11 +43,15 @@ class OciLayerScanner(BaseScanner):
         if path_check:
             return path_check
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         manifest_data: Any = None
 
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, encoding="utf-8", errors="ignore") as f:
                 text = f.read()
             try:
                 manifest_data = json.loads(text)
@@ -80,10 +85,24 @@ class OciLayerScanner(BaseScanner):
 
         _search(manifest_data)
 
+        manifest_dir = os.path.dirname(path)
+
         for layer_ref in layer_paths:
-            layer_path = layer_ref
-            if not os.path.isabs(layer_path):
-                layer_path = os.path.join(os.path.dirname(path), layer_ref)
+            if os.path.isabs(layer_ref):
+                layer_path = layer_ref
+                is_safe = True
+            else:
+                layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
+
+            if not is_safe:
+                result.add_issue(
+                    f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path}:{layer_ref}",
+                    details={"layer": layer_ref},
+                )
+                continue
+
             if not os.path.exists(layer_path):
                 result.add_issue(
                     f"Layer not found: {layer_ref}",
@@ -106,7 +125,8 @@ class OciLayerScanner(BaseScanner):
                         if fileobj is None:
                             continue
                         with tempfile.NamedTemporaryFile(
-                            suffix=ext, delete=False
+                            suffix=ext,
+                            delete=False,
                         ) as tmp:
                             tmp.write(fileobj.read())
                             tmp_path = tmp.name
@@ -117,9 +137,7 @@ class OciLayerScanner(BaseScanner):
                             file_result = core.scan_file(tmp_path, self.config)
                             for issue in file_result.issues:
                                 if issue.location:
-                                    issue.location = (
-                                        f"{path}:{layer_ref}:{name} {issue.location}"
-                                    )
+                                    issue.location = f"{path}:{layer_ref}:{name} {issue.location}"
                                 else:
                                     issue.location = f"{path}:{layer_ref}:{name}"
                                 if issue.details is None:

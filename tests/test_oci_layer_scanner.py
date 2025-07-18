@@ -60,7 +60,7 @@ class TestOciLayerScanner:
     def test_scan_valid_json_manifest_with_malicious_pickle(self, tmp_path):
         """Test scanning a valid JSON manifest with malicious content."""
         # Create malicious pickle
-        evil_pickle = Path(__file__).parent / "evil.pickle"
+        evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
         layer_path = tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="malicious.pkl")
@@ -76,13 +76,8 @@ class TestOciLayerScanner:
         assert result.success is True
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         # Check that location includes manifest:layer:file format
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
-        assert any(
-            "image.manifest:layer.tar.gz:malicious.pkl" in issue.location
-            for issue in critical_issues
-        )
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("image.manifest:layer.tar.gz:malicious.pkl" in issue.location for issue in critical_issues)
 
     def test_scan_yaml_manifest(self, tmp_path):
         """Test scanning a YAML manifest file."""
@@ -149,10 +144,7 @@ class TestOciLayerScanner:
 
         assert result.success is True
         assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
-        assert any(
-            "Layer not found: nonexistent.tar.gz" in issue.message
-            for issue in result.issues
-        )
+        assert any("Layer not found: nonexistent.tar.gz" in issue.message for issue in result.issues)
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""
@@ -200,6 +192,27 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
+    def test_scan_manifest_with_traversal_layer_path(self, tmp_path):
+        """Test detection of path traversal in layer references."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+
+        evil_file = outside_dir / "evil.txt"
+        evil_file.write_text("bad")
+
+        layer_path = outside_dir / "evil.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_file, arcname="evil.txt")
+
+        manifest = {"layers": ["../outside/evil.tar.gz"]}
+        manifest_path = tmp_path / "traversal.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        scanner = OciLayerScanner()
+        result = scanner.scan(str(manifest_path))
+
+        assert any("path traversal" in i.message.lower() for i in result.issues)
+
     def test_scan_manifest_with_nested_layer_references(self, tmp_path):
         """Test scanning manifest with nested layer references."""
         safe_file = tmp_path / "safe.txt"
@@ -219,7 +232,7 @@ class TestOciLayerScanner:
                     "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
                     "digest": "sha256:abc123",
                     "urls": ["layer.tar.gz"],
-                }
+                },
             ],
         }
         manifest_path = tmp_path / "nested.manifest"
@@ -307,7 +320,7 @@ class TestOciLayerScanner:
 
     def test_issue_location_format(self, tmp_path):
         """Test that issues have correct location format."""
-        evil_pickle = Path(__file__).parent / "evil.pickle"
+        evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
         layer_path = tmp_path / "test_layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="model/evil.pkl")
@@ -320,9 +333,7 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         # Check location format: manifest:layer:file
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) > 0
 
         issue = critical_issues[0]
@@ -332,7 +343,7 @@ class TestOciLayerScanner:
 
     def test_layer_with_multiple_model_files(self, tmp_path):
         """Test layer containing multiple model files."""
-        evil_pickle = Path(__file__).parent / "evil.pickle"
+        evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
 
         layer_path = tmp_path / "multi_model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
@@ -347,9 +358,7 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         assert result.success is True
-        critical_issues = [
-            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
-        ]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         # Should have issues from both model files
         assert len(critical_issues) >= 2
 
@@ -361,7 +370,7 @@ class TestOciLayerScanner:
 # Keep the original test for backward compatibility
 def test_oci_layer_scanner_with_malicious_pickle(tmp_path):
     """Original test for backward compatibility."""
-    evil_pickle = Path(__file__).parent / "evil.pickle"
+    evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
     layer_path = tmp_path / "layer.tar.gz"
     with tarfile.open(layer_path, "w:gz") as tar:
         tar.add(evil_pickle, arcname="malicious.pkl")

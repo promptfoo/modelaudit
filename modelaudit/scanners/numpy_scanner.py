@@ -1,35 +1,68 @@
 from __future__ import annotations
 
 import sys
+import warnings
+from typing import ClassVar
 
-import numpy.lib.format as fmt
+# Import NumPy with compatibility handling
+try:
+    import numpy as np
+
+    # Handle NumPy format module imports with version compatibility
+    try:
+        import numpy.lib.format as fmt
+
+        NUMPY_FORMAT_AVAILABLE = True
+    except (ImportError, AttributeError):
+        # Fallback for potential import issues
+        NUMPY_FORMAT_AVAILABLE = False
+        fmt = None  # type: ignore
+
+    NUMPY_AVAILABLE = True
+    NUMPY_VERSION = getattr(np, "__version__", "unknown")
+    NUMPY_MAJOR_VERSION = int(NUMPY_VERSION.split(".")[0]) if NUMPY_VERSION != "unknown" else 1
+except ImportError:
+    NUMPY_AVAILABLE = False
+    NUMPY_FORMAT_AVAILABLE = False
+    NUMPY_VERSION = "not available"
+    NUMPY_MAJOR_VERSION = 0
+    np = None  # type: ignore
+    fmt = None  # type: ignore
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
 class NumPyScanner(BaseScanner):
-    """Scanner for NumPy binary files (.npy)."""
+    """Scanner for NumPy binary files (.npy) with cross-version compatibility."""
 
     name = "numpy"
-    description = "Scans NumPy .npy files for integrity issues"
-    supported_extensions = [".npy"]
+    description = f"Scans NumPy .npy files for integrity issues (NumPy {NUMPY_VERSION})"
+    supported_extensions: ClassVar[list[str]] = [".npy"]
 
     def __init__(self, config=None):
         super().__init__(config)
         # Security limits
         self.max_array_bytes = self.config.get(
-            "max_array_bytes", 1024 * 1024 * 1024
+            "max_array_bytes",
+            1024 * 1024 * 1024,
         )  # 1GB
         self.max_dimensions = self.config.get("max_dimensions", 32)
         self.max_dimension_size = self.config.get("max_dimension_size", 100_000_000)
         self.max_itemsize = self.config.get("max_itemsize", 1024)  # 1KB per element
+
+    @classmethod
+    def can_handle(cls, path: str) -> bool:
+        """Check if this scanner can handle the given path"""
+        if not NUMPY_AVAILABLE or not NUMPY_FORMAT_AVAILABLE:
+            return False
+        return super().can_handle(path)
 
     def _validate_array_dimensions(self, shape: tuple) -> None:
         """Validate array dimensions for security"""
         # Check number of dimensions
         if len(shape) > self.max_dimensions:
             raise ValueError(
-                f"Too many dimensions: {len(shape)} (max: {self.max_dimensions})"
+                f"Too many dimensions: {len(shape)} (max: {self.max_dimensions})",
             )
 
         # Check individual dimension sizes
@@ -38,7 +71,7 @@ class NumPyScanner(BaseScanner):
                 raise ValueError(f"Negative dimension at index {i}: {dim}")
             if dim > self.max_dimension_size:
                 raise ValueError(
-                    f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})"
+                    f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
     def _validate_dtype(self, dtype) -> None:
@@ -49,13 +82,13 @@ class NumPyScanner(BaseScanner):
 
         if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
             raise ValueError(
-                f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})"
+                f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})",
             )
 
         # Check for extremely large item sizes
         if dtype.itemsize > self.max_itemsize:
             raise ValueError(
-                f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})"
+                f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
     def _calculate_safe_array_size(self, shape: tuple, dtype) -> int:
@@ -67,7 +100,7 @@ class NumPyScanner(BaseScanner):
             # Check for overflow before multiplication
             if total_elements > max_elements // max(dim, 1):
                 raise ValueError(
-                    f"Array size would overflow: shape={shape}, dtype={dtype}"
+                    f"Array size would overflow: shape={shape}, dtype={dtype}",
                 )
 
             total_elements *= dim
@@ -76,92 +109,137 @@ class NumPyScanner(BaseScanner):
 
         if total_bytes > self.max_array_bytes:
             raise ValueError(
-                f"Array too large: {total_bytes} bytes "
-                f"(max: {self.max_array_bytes}) for shape={shape}, dtype={dtype}"
+                f"Array too large: {total_bytes} bytes (max: {self.max_array_bytes}) for shape={shape}, dtype={dtype}",
             )
 
         return total_bytes
 
     def scan(self, path: str) -> ScanResult:
+        # Check if NumPy and format module are available
+        if not NUMPY_AVAILABLE:
+            result = self._create_result()
+            result.add_issue(
+                "NumPy not available for scanning .npy files",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={"numpy_version": NUMPY_VERSION},
+            )
+            result.finish(success=False)
+            return result
+
+        if not NUMPY_FORMAT_AVAILABLE:
+            result = self._create_result()
+            result.add_issue(
+                f"NumPy format module not available (NumPy {NUMPY_VERSION}). May be a compatibility issue.",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={"numpy_version": NUMPY_VERSION, "numpy_major": NUMPY_MAJOR_VERSION},
+            )
+            result.finish(success=False)
+            return result
+
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        result.metadata["numpy_version"] = NUMPY_VERSION
+        result.metadata["numpy_major_version"] = NUMPY_MAJOR_VERSION
 
         try:
             self.current_file_path = path
-            with open(path, "rb") as f:
-                # Verify magic string
-                magic = f.read(6)
-                if magic != b"\x93NUMPY":
-                    result.add_issue(
-                        "Invalid NumPy file magic",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                    )
-                    result.finish(success=False)
-                    return result
-                f.seek(0)
-                major, minor = fmt.read_magic(f)
-                if (major, minor) == (1, 0):
-                    shape, fortran, dtype = fmt.read_array_header_1_0(f)
-                elif (major, minor) == (2, 0):
-                    shape, fortran, dtype = fmt.read_array_header_2_0(f)
-                else:
-                    shape, fortran, dtype = fmt._read_array_header(  # type: ignore[attr-defined]
-                        f, version=(major, minor)
-                    )
-                data_offset = f.tell()
+            with warnings.catch_warnings():
+                # Suppress NumPy warnings during scanning
+                warnings.simplefilter("ignore")
 
-                # Validate array dimensions and dtype for security
-                try:
-                    self._validate_array_dimensions(shape)
-                    self._validate_dtype(dtype)
-                    expected_data_size = self._calculate_safe_array_size(shape, dtype)
-                    expected_size = data_offset + expected_data_size
-                except ValueError as e:
-                    result.add_issue(
-                        f"Array validation failed: {e}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={
-                            "security_check": "array_validation",
-                            "shape": shape,
-                            "dtype": str(dtype),
-                        },
+                with open(path, "rb") as f:
+                    # Verify magic string
+                    magic = f.read(6)
+                    if magic != b"\x93NUMPY":
+                        result.add_issue(
+                            "Invalid NumPy file magic",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                        )
+                        result.finish(success=False)
+                        return result
+                    f.seek(0)
+
+                    # Use format module with version compatibility
+                    try:
+                        major, minor = fmt.read_magic(f)
+                        if (major, minor) == (1, 0):
+                            shape, fortran, dtype = fmt.read_array_header_1_0(f)
+                        elif (major, minor) == (2, 0):
+                            shape, fortran, dtype = fmt.read_array_header_2_0(f)
+                        else:
+                            # For newer versions, try the private method with fallback
+                            if hasattr(fmt, "_read_array_header"):
+                                shape, fortran, dtype = fmt._read_array_header(f, version=(major, minor))
+                            else:
+                                # Fallback for newer NumPy versions
+                                shape, fortran, dtype = fmt.read_array_header_2_0(f)
+                    except Exception as header_error:
+                        result.add_issue(
+                            f"Failed to read NumPy array header: {header_error}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
+                        )
+                        result.finish(success=False)
+                        return result
+
+                    data_offset = f.tell()
+
+                    # Validate array dimensions and dtype for security
+                    try:
+                        self._validate_array_dimensions(shape)
+                        self._validate_dtype(dtype)
+                        expected_data_size = self._calculate_safe_array_size(shape, dtype)
+                        expected_size = data_offset + expected_data_size
+                    except ValueError as e:
+                        result.add_issue(
+                            f"Array validation failed: {e}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={
+                                "security_check": "array_validation",
+                                "shape": shape,
+                                "dtype": str(dtype),
+                            },
+                        )
+                        result.finish(success=False)
+                        return result
+
+                    if file_size != expected_size:
+                        result.add_issue(
+                            "File size does not match header information",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={
+                                "expected_size": expected_size,
+                                "actual_size": file_size,
+                                "shape": shape,
+                                "dtype": str(dtype),
+                            },
+                        )
+
+                    result.bytes_scanned = file_size
+                    result.metadata.update(
+                        {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
                     )
-                    result.finish(success=False)
-                    return result
-
-                if file_size != expected_size:
-                    result.add_issue(
-                        "File size does not match header information",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={
-                            "expected_size": expected_size,
-                            "actual_size": file_size,
-                            "shape": shape,
-                            "dtype": str(dtype),
-                        },
-                    )
-
-                # Note: Dimension validation is now handled in _validate_array_dimensions
-                # which is called earlier and has configurable limits
-
-                result.bytes_scanned = file_size
-                result.metadata.update(
-                    {"shape": shape, "dtype": str(dtype), "fortran_order": fortran}
-                )
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_issue(
                 f"Error scanning NumPy file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={"exception": str(e), "exception_type": type(e).__name__, "numpy_version": NUMPY_VERSION},
             )
             result.finish(success=False)
             return result

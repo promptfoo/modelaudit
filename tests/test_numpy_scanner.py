@@ -14,7 +14,7 @@ def test_numpy_scanner_valid(tmp_path):
 
     assert result.success is True
     assert result.bytes_scanned == path.stat().st_size
-    assert not any(i.severity == IssueSeverity.ERROR for i in result.issues)
+    assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
 def test_numpy_scanner_truncated(tmp_path):

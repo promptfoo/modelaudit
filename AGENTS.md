@@ -41,7 +41,7 @@ modelaudit/
 │   ├── test_integration.py   # Integration tests
 │   ├── test_cli.py          # CLI tests
 │   └── conftest.py          # pytest configuration
-├── pyproject.toml           # Poetry configuration
+├── pyproject.toml           # Rye configuration
 ├── README.md                # Project documentation
 └── CLAUDE.md               # Claude-specific guidance
 ```
@@ -58,14 +58,24 @@ modelaudit/
 - **MyPy**: Static type checking
 - **pytest**: Testing framework with coverage
 
-**Formatting Standards:**
+**Code Quality Standards (matches CI workflow):**
 
 ```bash
-# ALWAYS run these before committing:
-poetry run ruff format .         # Format code
-poetry run ruff check .          # Lint code
-poetry run mypy modelaudit/      # Type check
-poetry run pytest               # Run tests
+# PRE-COMMIT WORKFLOW (development - format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests
+
+# CI VERIFICATION COMMANDS (read-only, matches test.yml):
+rye run ruff check modelaudit/ tests/            # Lint check
+rye run ruff check --select I modelaudit/ tests/ # Import organization check
+rye run ruff format --check modelaudit/ tests/   # Format verification
+rye run mypy modelaudit/ tests/                  # Type checking
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests (main branch only in CI)
 ```
 
 ### Naming Conventions
@@ -193,18 +203,25 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
 ### Running Tests
 
 ```bash
-# Run all tests
-poetry run pytest
+# Run fast tests (matches CI workflow - parallel execution, excludes slow/integration/performance tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+
+# Run slow/integration tests (matches CI workflow - usually main branch only)
+rye run pytest -n auto -m "slow or integration" --tb=short
+
+# Run all tests (not recommended for regular development)
+rye run pytest
 
 # Run specific test file
-poetry run pytest tests/test_my_scanner.py -v
+rye run pytest tests/test_my_scanner.py -v
 
-# Run with coverage
-poetry run pytest --cov=modelaudit
+# Run with coverage (already included in fast tests command above)
+rye run pytest --cov=modelaudit
 
-# Run tests for specific Python versions
-poetry install --extras all  # Install all dependencies first
-poetry run pytest
+# Run tests for specific Python versions (matches CI matrix: 3.9, 3.10, 3.11, 3.12)
+rye sync --features all  # Install all dependencies first
+rye pin 3.11             # Pin to specific version (example)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
 ```
 
 ## 📦 Dependencies & Installation
@@ -216,12 +233,13 @@ poetry run pytest
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Poetry (recommended)
-poetry install --extras all  # All optional dependencies
-poetry install --extras "tensorflow pytorch h5"  # Specific extras
+# Install with Rye (recommended) - matches CI workflow
+rye sync --features all  # All optional dependencies for comprehensive testing
+rye sync                 # Basic dependencies only
 
-# Or with pip
-pip install -e .[all]
+# Or with pip (alternative)
+pip install -e .[all]    # Install in development mode with all extras
+pip install -e .         # Basic installation
 ```
 
 ### Optional Dependencies
@@ -229,11 +247,26 @@ pip install -e .[all]
 The project uses optional dependencies for specific scanners:
 
 - `tensorflow`: TensorFlow SavedModel scanning
-- `h5py`: Keras H5 model scanning
-- `torch`: PyTorch model scanning
-- `pyyaml`: YAML manifest scanning
+- `h5`: Keras H5 model scanning (h5py)
+- `pytorch`: PyTorch model scanning (torch)
+- `yaml`: YAML manifest scanning (pyyaml)
 - `safetensors`: SafeTensors model scanning
 - `onnx`: ONNX model scanning
+- `dill`: Enhanced pickle support with security validation
+- `joblib`: Joblib model scanning with scikit-learn integration
+- `flax`: Flax msgpack scanning
+- `tflite`: TensorFlow Lite model scanning
+- `all`: All of the above dependencies
+
+Install specific extras as needed:
+
+```bash
+# With pip
+pip install modelaudit[tensorflow,pytorch,h5]
+
+# With rye (development)
+rye sync --features="tensorflow pytorch h5"
+```
 
 Always test that scanners gracefully handle missing optional dependencies.
 
@@ -348,11 +381,12 @@ When contributing code:
 ### Pre-commit Checklist
 
 ```bash
-# Run before every commit
-poetry run ruff format .
-poetry run ruff check .
-poetry run mypy modelaudit/
-poetry run pytest
+# Run before every commit (matches CI workflow with format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
 ```
 
 ## 🔗 Key Files for AI Agents

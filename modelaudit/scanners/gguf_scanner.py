@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import Any, BinaryIO, Dict, Optional
+from typing import Any, BinaryIO, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -44,20 +44,36 @@ _TYPE_SIZES = {
     12: 8,  # FLOAT64
 }
 
+# Accepted GGML variant magic bytes
+GGML_VARIANT_MAGICS = {
+    b"GGML",
+    b"GGMF",
+    b"GGJT",
+    b"GGLA",
+    b"GGSA",
+}
+
 
 class GgufScanner(BaseScanner):
     """Scanner for GGUF/GGML model files with comprehensive parsing and security checks."""
 
     name = "gguf"
-    description = (
-        "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
-    )
-    supported_extensions = [".gguf", ".ggml"]
+    description = "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
+    # Include common GGML variant extensions as well
+    supported_extensions: ClassVar[list[str]] = [
+        ".gguf",
+        ".ggml",
+        ".ggmf",
+        ".ggjt",
+        ".ggla",
+        ".ggsa",
+    ]
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_uncompressed = self.config.get(
-            "max_uncompressed", 2 * 1024 * 1024 * 1024
+            "max_uncompressed",
+            2 * 1024 * 1024 * 1024,
         )
 
     @classmethod
@@ -72,7 +88,7 @@ class GgufScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 magic = f.read(4)
-            return magic in (b"GGUF", b"GGML")
+            return magic == b"GGUF" or magic in GGML_VARIANT_MAGICS
         except Exception:
             return False
 
@@ -80,6 +96,10 @@ class GgufScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -90,7 +110,7 @@ class GgufScanner(BaseScanner):
                 magic = f.read(4)
                 if magic == b"GGUF":
                     self._scan_gguf(f, file_size, result)
-                elif magic == b"GGML":
+                elif magic in GGML_VARIANT_MAGICS:
                     self._scan_ggml(f, file_size, magic, result)
                 else:
                     result.add_issue(
@@ -102,7 +122,7 @@ class GgufScanner(BaseScanner):
                     return result
         except Exception as e:
             result.add_issue(
-                f"Error scanning GGUF/GGML file: {str(e)}",
+                f"Error scanning GGUF/GGML file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -111,7 +131,7 @@ class GgufScanner(BaseScanner):
             return result
 
         result.finish(
-            success=not any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+            success=not any(i.severity == IssueSeverity.CRITICAL for i in result.issues),
         )
         return result
 
@@ -138,7 +158,7 @@ class GgufScanner(BaseScanner):
                 "version": version,
                 "n_tensors": n_tensors,
                 "n_kv": n_kv,
-            }
+            },
         )
 
         # Security checks on header values
@@ -164,9 +184,9 @@ class GgufScanner(BaseScanner):
             return
 
         # Parse metadata with security checks
-        metadata: Dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
         try:
-            for i in range(min(n_kv, 10000)):  # Limit to prevent DoS
+            for _i in range(min(n_kv, 10000)):  # Limit to prevent DoS
                 key = self._read_string(f)
 
                 # Security check for suspicious keys
@@ -181,9 +201,7 @@ class GgufScanner(BaseScanner):
                 metadata[key] = value
 
                 # Security check for suspicious values
-                if isinstance(value, str) and any(
-                    p in value for p in ("/", "\\", ";", "&&", "|", "`")
-                ):
+                if isinstance(value, str) and any(p in value for p in ("/", "\\", ";", "&&", "|", "`")):
                     result.add_issue(
                         f"Suspicious metadata value for key '{key}': {value}",
                         severity=IssueSeverity.INFO,
@@ -214,7 +232,7 @@ class GgufScanner(BaseScanner):
         # Parse tensor information
         tensors = []
         try:
-            for i in range(min(n_tensors, 10000)):  # Limit to prevent DoS
+            for _i in range(min(n_tensors, 10000)):  # Limit to prevent DoS
                 t_name = self._read_string(f)
                 (nd,) = struct.unpack("<I", f.read(4))
 
@@ -244,13 +262,10 @@ class GgufScanner(BaseScanner):
                         "dims": dims,
                         "type": t_type,
                         "offset": offset,
-                    }
+                    },
                 )
 
-            result.metadata["tensors"] = [
-                {"name": t["name"], "type": t["type"], "dims": t["dims"]}
-                for t in tensors
-            ]
+            result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
         except Exception as e:
             result.add_issue(
                 f"GGUF tensor parse error: {e}",
@@ -305,11 +320,7 @@ class GgufScanner(BaseScanner):
                         )
 
                     expected = ((nelements + blck - 1) // blck) * ts
-                    next_offset = (
-                        tensors[idx + 1]["offset"]
-                        if idx + 1 < len(tensors)
-                        else file_size
-                    )
+                    next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
                     actual = next_offset - tensor["offset"]
 
                     if expected != actual:
@@ -327,7 +338,11 @@ class GgufScanner(BaseScanner):
         result.bytes_scanned = f.tell()
 
     def _scan_ggml(
-        self, f: BinaryIO, file_size: int, magic: bytes, result: ScanResult
+        self,
+        f: BinaryIO,
+        file_size: int,
+        magic: bytes,
+        result: ScanResult,
     ) -> None:
         """Basic GGML file validation with security checks."""
         result.metadata["format"] = "ggml"

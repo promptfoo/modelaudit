@@ -78,6 +78,7 @@ rye run pytest --durations=10 --tb=no
 ```
 
 **Test Speed Optimizations:**
+
 - Parallel execution with `-n auto` (37% faster)
 - Smart test markers: `slow`, `integration`, `unit`, `performance`
 - Optimized pytest configuration in `pyproject.toml`
@@ -239,7 +240,7 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 1. Update version in `pyproject.toml`
 2. Create release PR
 3. After merge, create GitHub release
-4. Poetry will automatically publish to PyPI
+4. Package will automatically publish to PyPI via GitHub Actions
 
 ## 🐛 Reporting Issues
 
