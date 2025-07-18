@@ -284,8 +284,23 @@ def scan_command(
                         if format == "text" and not output:
                             download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        error_msg = str(e)
+                        # Provide more helpful message for disk space errors
+                        if "insufficient disk space" in error_msg.lower():
+                            logger.error(f"Disk space error for {path}: {error_msg}")
+                            click.echo(click.style(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
+                            click.echo(
+                                click.style(
+                                    "💡 Tip: Free up disk space or use --cache-dir to specify a "
+                                    "directory with more space",
+                                    fg="cyan",
+                                ),
+                                err=True,
+                            )
+                        else:
+                            logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -309,8 +324,23 @@ def scan_command(
                         if format == "text" and not output:
                             download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-                        logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
-                        click.echo(f"Error downloading from {path}: {e!s}", err=True)
+                        error_msg = str(e)
+                        # Provide more helpful message for disk space errors
+                        if "insufficient disk space" in error_msg.lower():
+                            logger.error(f"Disk space error for {path}: {error_msg}")
+                            click.echo(click.style(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
+                            click.echo(
+                                click.style(
+                                    "💡 Tip: Free up disk space or use --cache-dir to specify a "
+                                    "directory with more space",
+                                    fg="cyan",
+                                ),
+                                err=True,
+                            )
+                        else:
+                            logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error downloading from {path}: {error_msg}", err=True)
+
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -528,18 +558,20 @@ def scan_command(
                             logger.info(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
-                        
+
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
                     logger.info("Stopping scan due to interrupt")
                     aggregated_results["success"] = False
                     issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
-                        issues_list.append({
-                            "message": "Scan interrupted by user",
-                            "severity": "info",
-                            "details": {"interrupted": True},
-                        })
+                        issues_list.append(
+                            {
+                                "message": "Scan interrupted by user",
+                                "severity": "info",
+                                "details": {"interrupted": True},
+                            }
+                        )
                     should_break = True
 
             # Break outside of finally block if interrupted
