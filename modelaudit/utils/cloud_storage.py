@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import click
 from yaspin import yaspin
 
+from modelaudit.utils.retry import retry_with_backoff
+
 
 def is_cloud_url(url: str) -> bool:
     """Return True if the URL points to a supported cloud storage provider."""
@@ -90,8 +92,12 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
     fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
 
     try:
-        # Get info about the target
-        info = fs.info(url)
+        # Get info about the target with retry
+        @retry_with_backoff(max_retries=3, verbose=True)
+        def get_info():
+            return fs.info(url)
+
+        info = get_info()
 
         # Check if it's a file or directory
         if info.get("type") == "file" or (info.get("type") != "directory" and "size" in info):
@@ -324,6 +330,7 @@ def download_from_cloud(
     use_cache: bool = True,
     show_progress: bool = True,
     selective: bool = True,
+    stream_analyze: bool = False,
 ) -> Path:
     """Download a file or directory from cloud storage to a local path."""
     try:
@@ -346,6 +353,20 @@ def download_from_cloud(
 
     # Analyze target
     metadata = asyncio.run(analyze_cloud_target(url))
+
+    # Check if we can use streaming analysis
+    if stream_analyze and metadata.get("type") == "file":
+        # Import here to avoid circular dependency
+        from modelaudit.utils.streaming import get_streaming_preview
+
+        # Try to get a preview first
+        preview = get_streaming_preview(url)
+        if preview and show_progress:
+            click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
+
+        # For streaming analysis, we don't need to download
+        # Return a special marker path
+        return Path(f"stream://{url}")
 
     # Check size limits
     size = metadata.get("total_size", metadata.get("size", 0))
@@ -398,18 +419,26 @@ def download_from_cloud(
             if show_progress:
                 click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
 
-            fs.get(file_url, str(local_path))
+            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            def download_file(url=file_url, path=local_path):
+                fs.get(url, str(path))
+
+            download_file()
     else:
         # Single file download
         file_name = Path(url).name
         local_file = download_path / file_name
 
+        @retry_with_backoff(max_retries=3, verbose=show_progress)
+        def download_single_file():
+            fs.get(url, str(local_file))
+
         if show_progress and size > 10_000_000:  # Show progress for files > 10MB
             with yaspin(text=f"Downloading {file_name}") as spinner:
-                fs.get(url, str(local_file))
+                download_single_file()
                 spinner.ok("✓")
         else:
-            fs.get(url, str(local_file))
+            download_single_file()
 
     # Cache the download
     if cache:

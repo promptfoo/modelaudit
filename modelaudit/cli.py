@@ -172,6 +172,11 @@ def cli() -> None:
     default=True,
     help="Download only scannable files from directories [default: selective]",
 )
+@click.option(
+    "--stream",
+    is_flag=True,
+    help="Use streaming analysis for large cloud files (experimental)",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -190,6 +195,7 @@ def scan_command(
     cache_dir: Optional[str],
     preview: bool,
     selective: bool,
+    stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -384,6 +390,7 @@ def scan_command(
                         use_cache=cache,
                         show_progress=verbose,
                         selective=selective,
+                        stream_analyze=stream,
                     )
                     actual_path = str(download_path)
                     temp_dir = str(download_path) if not cache else None  # Don't clean up cached files
