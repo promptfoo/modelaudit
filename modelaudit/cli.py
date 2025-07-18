@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import time
+from pathlib import Path
 from typing import Any, Optional, cast
 
 import click
@@ -148,6 +149,11 @@ def cli() -> None:
     type=str,
     help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
 )
+@click.option(
+    "--cache-dir",
+    type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
+    help="Directory to use for caching downloaded models (default: system temp directory)",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -161,6 +167,7 @@ def scan_command(
     registry_uri: Optional[str],
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
+    cache_dir: Optional[str],
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -271,8 +278,8 @@ def scan_command(
                         download_spinner.start()
 
                     try:
-                        # Download to a temporary directory
-                        download_path = download_model(path, cache_dir=None)
+                        # Download to cache directory or temporary directory
+                        download_path = download_model(path, cache_dir=Path(cache_dir) if cache_dir else None)
                         actual_path = str(download_path)
                         # Track the temp directory for cleanup
                         temp_dir = str(download_path)
@@ -313,7 +320,7 @@ def scan_command(
                         download_spinner.start()
 
                     try:
-                        download_path = download_from_cloud(path, cache_dir=None)
+                        download_path = download_from_cloud(path, cache_dir=Path(cache_dir) if cache_dir else None)
                         actual_path = str(download_path)
                         temp_dir = str(download_path)
 
@@ -405,7 +412,7 @@ def scan_command(
                     try:
                         download_path = download_artifact(
                             path,
-                            cache_dir=None,
+                            cache_dir=Path(cache_dir) if cache_dir else None,
                             api_token=jfrog_api_token,
                             access_token=jfrog_access_token,
                         )
@@ -551,7 +558,8 @@ def scan_command(
 
             finally:
                 # Clean up temporary directory if we downloaded a model
-                if temp_dir and os.path.exists(temp_dir):
+                # Only clean up if we didn't use a user-specified cache directory
+                if temp_dir and os.path.exists(temp_dir) and not cache_dir:
                     try:
                         shutil.rmtree(temp_dir)
                         if verbose:
