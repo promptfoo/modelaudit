@@ -1521,16 +1521,63 @@ class PickleScanner(BaseScanner):
                     ),
                 )
             else:
-                # Treat as critical error for unknown/suspicious cases
+                # Improve error messages for common cases
+                error_str = str(e).lower()
+
+                # Determine user-friendly error message and severity
+                if "pickle exhausted before seeing stop" in error_str:
+                    # Empty or incomplete pickle file
+                    if file_size == 0:
+                        message = "Empty file - not a valid pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = "The file is empty and contains no pickle data."
+                    else:
+                        message = "Incomplete or corrupted pickle file - missing STOP opcode"
+                        severity = IssueSeverity.WARNING
+                        why = (
+                            "The file appears to be truncated or corrupted. Valid pickle files must end with a "
+                            "STOP opcode."
+                        )
+                elif "expected" in error_str and "bytes" in error_str and "but only" in error_str:
+                    # File is truncated or not a pickle file
+                    if file_size < 10:
+                        message = "File too small to be a valid pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = "The file is too small to contain valid pickle data."
+                    else:
+                        message = "Invalid pickle format - file appears to be truncated or is not a pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = (
+                            "The file structure doesn't match the pickle format. It may be corrupted, truncated, "
+                            "or not a pickle file at all."
+                        )
+                elif "opcode" in error_str and "unknown" in error_str:
+                    # Unknown opcode - likely not a pickle file
+                    message = "Invalid pickle format - unrecognized opcode"
+                    severity = IssueSeverity.WARNING
+                    why = "The file contains invalid opcodes. This usually means the file is not a valid pickle file."
+                elif "no newline found" in error_str:
+                    # Text file misidentified as pickle
+                    message = "Not a valid pickle file - appears to be a text file"
+                    severity = IssueSeverity.WARNING
+                    why = "The file structure suggests this is a text file, not a pickle file."
+                else:
+                    # Generic error - still make it more user-friendly
+                    message = f"Unable to parse pickle file: {type(e).__name__}"
+                    severity = IssueSeverity.WARNING
+                    why = f"The file could not be parsed as a valid pickle file. Error: {str(e)[:100]}"
+
                 result.add_issue(
-                    f"Error analyzing pickle ops: {e}",
-                    severity=IssueSeverity.CRITICAL,
+                    message,
+                    severity=severity,
                     details={
                         "exception": str(e),
                         "exception_type": type(e).__name__,
                         "file_extension": file_ext,
                         "opcodes_analyzed": opcode_count,
+                        "file_size": file_size,
                     },
+                    why=why,
                 )
 
         finally:

@@ -17,6 +17,7 @@ from modelaudit.utils import is_within_directory, resolve_dvc_file
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
+    detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
 )
@@ -129,9 +130,21 @@ def scan_model_directory_or_file(
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
             # Scan all files in the directory
-            total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+            # Use lazy file counting for better performance on large directories
+            total_files = None  # Will be set to actual count if directory is small
             processed_files = 0
             limit_reached = False
+
+            # Quick check: count files only if directory seems reasonable in size
+            # This avoids the expensive rglob() on very large directories
+            try:
+                # Do a quick count of immediate children first
+                immediate_children = len(list(Path(path).iterdir()))
+                if immediate_children < 1000:  # Only count if not too many immediate children
+                    total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+            except (OSError, PermissionError):
+                # If we can't count, just proceed without progress percentage
+                total_files = None
 
             base_dir = Path(path).resolve()
             for root, _, files in os.walk(path, followlinks=False):
@@ -175,17 +188,28 @@ def scan_model_directory_or_file(
                         )
                         continue
 
+                    # Skip non-model files early
+                    if _should_skip_file(file_path):
+                        logger.debug(f"Skipping non-model file: {file_path}")
+                        continue
+
                     # Check timeout
                     if time.time() - start_time > timeout:
                         raise TimeoutError(f"Scan timeout after {timeout} seconds")
 
-                    # Update progress
-                    if progress_callback and total_files > 0:
-                        processed_files += 1
-                        progress_callback(
-                            f"Scanning file {processed_files}/{total_files}: {file}",
-                            processed_files / total_files * 100,
-                        )
+                    # Update progress before scanning
+                    if progress_callback:
+                        if total_files is not None and total_files > 0:
+                            progress_callback(
+                                f"Scanning file {processed_files + 1}/{total_files}: {file}",
+                                processed_files / total_files * 100,
+                            )
+                        else:
+                            # No total count available, just show file count
+                            progress_callback(
+                                f"Scanning file {processed_files + 1}: {file}",
+                                0.0,  # Can't calculate percentage without total
+                            )
 
                     # Scan the file
                     try:
@@ -194,6 +218,7 @@ def scan_model_directory_or_file(
                         # Use cast to help mypy understand the types
                         results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
                         results["files_scanned"] = cast(int, results["files_scanned"]) + 1  # Increment file count
+                        processed_files += 1  # Increment after successful scan
 
                         # Track scanner name
                         scanner_name = file_result.scanner_name
@@ -453,6 +478,122 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     return 0
 
 
+def _should_skip_file(path: str) -> bool:
+    """
+    Check if a file should be skipped based on its extension or name.
+
+    Args:
+        path: File path to check
+
+    Returns:
+        True if the file should be skipped
+    """
+    import os
+
+    filename = os.path.basename(path)
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+
+    # Skip common non-model file extensions
+    skip_extensions = {
+        # Documentation and text files
+        ".md",
+        ".txt",
+        ".rst",
+        ".doc",
+        ".docx",
+        ".pdf",
+        # Source code files
+        ".py",
+        ".js",
+        ".ts",
+        ".java",
+        ".cpp",
+        ".c",
+        ".h",
+        ".go",
+        ".rs",
+        # Web files
+        ".html",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        # Configuration files (but keep .json, .yaml, .yml as they can be model configs)
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".toml",
+        # Build and package files
+        ".lock",
+        ".log",
+        ".pid",
+        # Version control
+        ".gitignore",
+        ".gitattributes",
+        ".gitkeep",
+        # IDE files
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".so",
+        ".dylib",
+        ".dll",
+        # Archives (but keep .zip as it can contain models)
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        # Media files
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".svg",
+        ".ico",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".wmv",
+        ".flv",
+        # Temporary files
+        ".tmp",
+        ".temp",
+        ".swp",
+        ".bak",
+        "~",
+    }
+
+    if ext in skip_extensions:
+        return True
+
+    # Skip hidden files (starting with .) except for specific model extensions
+    if filename.startswith(".") and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt"}:
+        return True
+
+    # Skip specific filenames
+    skip_filenames = {
+        "LICENSE",
+        "README",
+        "CHANGELOG",
+        "AUTHORS",
+        "CONTRIBUTORS",
+        "Makefile",
+        "requirements.txt",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+    }
+
+    return filename in skip_filenames
+
+
 def _is_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
@@ -549,12 +690,15 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     # Validate file type consistency as a security check
     file_type_valid = validate_file_type(path)
     discrepancy_msg = None
+    magic_format = None
 
     if not file_type_valid:
         # File type validation failed - this is a security concern
+        # Get the actual magic bytes format for accurate error message
+        magic_format = detect_file_format_from_magic(path)
         discrepancy_msg = (
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
-            f"indicate {header_format}. This could indicate file spoofing or corruption."
+            f"indicate {magic_format}. This could indicate file spoofing or corruption."
         )
         logger.warning(discrepancy_msg)
     elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
@@ -619,13 +763,15 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy
         severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
+        # For validation failures, use the actual magic format
+        detail_header_format = magic_format if not file_type_valid else header_format
         result.add_issue(
             discrepancy_msg + " Using header-based detection.",
             severity=severity,
             location=path,
             details={
                 "extension_format": ext_format,
-                "header_format": header_format,
+                "header_format": detail_header_format,
                 "file_type_validation_failed": not file_type_valid,
             },
         )

@@ -521,6 +521,19 @@ def scan_command(
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
 
+    # Deduplicate issues based on message and severity
+    seen_issues = set()
+    deduplicated_issues = []
+    for issue in aggregated_results["issues"]:
+        # Create a unique key based on message and severity
+        if isinstance(issue, dict):
+            issue_key = (issue.get("message", ""), issue.get("severity", ""))
+            if issue_key not in seen_issues:
+                seen_issues.add(issue_key)
+                deduplicated_issues.append(issue)
+
+    aggregated_results["issues"] = deduplicated_issues
+
     # Generate SBOM if requested
     if sbom:
         from .sbom import generate_sbom
