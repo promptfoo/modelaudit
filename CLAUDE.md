@@ -107,7 +107,29 @@ ModelAudit supports multiple input sources:
 ## Environment Variables
 
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` - JFrog authentication
+- `NO_COLOR` - Disable color output (follows https://no-color.org standard)
 - `.env` file is automatically loaded if present
+
+## CI/CD Integration
+
+ModelAudit automatically adapts its output for CI environments:
+
+- **TTY Detection**: Spinners are disabled when output is not a terminal (piped, CI, etc.)
+- **Color Control**: Respects `NO_COLOR` environment variable to disable colors
+- **Recommended for CI**: Use `--format json` for machine-readable output
+- **Exit Codes**: 0 (no issues), 1 (issues found), 2 (scan errors)
+
+Example CI usage:
+```bash
+# JSON output for parsing (recommended)
+modelaudit model.pkl --format json --output results.json
+
+# Text output with automatic CI detection
+modelaudit model.pkl | tee results.txt
+
+# Explicitly disable colors
+NO_COLOR=1 modelaudit model.pkl
+```
 
 ## Additional Commands
 
