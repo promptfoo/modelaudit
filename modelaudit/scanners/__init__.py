@@ -127,6 +127,24 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
+            "coreml": {
+                "module": "modelaudit.scanners.coreml_scanner",
+                "class": "CoreMLScanner",
+                "description": "Scans Apple Core ML model files",
+                "extensions": [".mlmodel"],
+                "priority": 5,
+                "dependencies": ["coreml"],  # Heavy dependency
+                "numpy_sensitive": True,
+            },
+            "openvino": {
+                "module": "modelaudit.scanners.openvino_scanner",
+                "class": "OpenVinoScanner",
+                "description": "Scans OpenVINO IR model files",
+                "extensions": [".xml"],
+                "priority": 5,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "pytorch_zip": {
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
@@ -134,6 +152,15 @@ class ScannerRegistry:
                 "extensions": [".pt", ".pth"],
                 "priority": 6,  # Must come before ZipScanner since .pt/.pth files are zip files
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "executorch": {
+                "module": "modelaudit.scanners.executorch_scanner",
+                "class": "ExecuTorchScanner",
+                "description": "Scans ExecuTorch mobile archives",
+                "extensions": [".ptl", ".pte"],
+                "priority": 6,  # Similar priority to PyTorch Zip
+                "dependencies": [],
                 "numpy_sensitive": False,
             },
             "gguf": {
@@ -270,6 +297,15 @@ class ScannerRegistry:
                 "priority": 17,
                 "dependencies": [],
                 "numpy_sensitive": False,
+            },
+            "paddle": {
+                "module": "modelaudit.scanners.paddle_scanner",
+                "class": "PaddleScanner",
+                "description": "Scans PaddlePaddle model files",
+                "extensions": [".pdmodel", ".pdiparams"],
+                "priority": 18,
+                "dependencies": ["paddlepaddle"],
+                "numpy_sensitive": True,
             },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
@@ -473,7 +509,10 @@ def __getattr__(name: str):
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
+        "CoreMLScanner": "coreml",
+        "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
+        "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
         "NumPyScanner": "numpy",
@@ -486,6 +525,7 @@ def __getattr__(name: str):
         "JaxCheckpointScanner": "jax_checkpoint",
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
+        "PaddleScanner": "paddle",
         "ZipScanner": "zip",
     }
 

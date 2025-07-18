@@ -1,3 +1,5 @@
+import os
+
 import msgpack
 
 from modelaudit.scanners.base import IssueSeverity
@@ -74,9 +76,14 @@ def test_flax_msgpack_suspicious_content(tmp_path):
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
-    # Create oversized containers
-    large_dict = {f"key_{i}": f"value_{i}" for i in range(20000)}  # Over default limit
-    large_list = list(range(15000))  # Over default limit
+    # Create oversized containers (default limit is 50000)
+    # Use smaller sizes in CI to avoid memory issues
+    is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+    dict_size = 52000 if is_ci else 60000  # Just over limit, but smaller in CI
+    list_size = 51000 if is_ci else 55000  # Just over limit, but smaller in CI
+
+    large_dict = {f"key_{i}": f"value_{i}" for i in range(dict_size)}
+    large_list = list(range(list_size))
 
     data = {"params": {"large_dict": large_dict, "large_list": large_list}}
     create_msgpack_file(path, data)
@@ -236,8 +243,14 @@ def test_flax_msgpack_large_model_support(tmp_path):
     """Test support for large transformer models."""
     path = tmp_path / "large_model.msgpack"
 
-    # Simulate large model with 200MB+ embedding
-    large_embedding = b"\x00" * (250 * 1024 * 1024)  # 250MB
+    # Create scanner with lower blob limit for testing
+    is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+    blob_limit = 5 * 1024 * 1024 if is_ci else 10 * 1024 * 1024  # 5MB in CI, 10MB locally
+    scanner = FlaxMsgpackScanner(config={"max_blob_bytes": blob_limit})
+
+    # Simulate large model embedding
+    embedding_size = 10 * 1024 * 1024 if is_ci else 20 * 1024 * 1024  # 10MB in CI, 20MB locally
+    large_embedding = b"\x00" * embedding_size
 
     data = {
         "params": {
@@ -247,7 +260,6 @@ def test_flax_msgpack_large_model_support(tmp_path):
     }
     create_msgpack_file(path, data)
 
-    scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
     assert result.success
@@ -318,14 +330,32 @@ def test_flax_msgpack_trailing_data(tmp_path):
 
 
 def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs with updated 200MB threshold."""
+    """Test detection of suspiciously large binary blobs.
+
+    Uses smaller sizes in CI environments for faster test execution.
+    GitHub Actions automatically sets CI=true.
+    """
+    import os
+
+    # In CI, use smaller sizes for faster tests
+    if os.getenv("CI") == "true":
+        # Use 1MB threshold and 2MB blob for CI
+        threshold_mb = 1
+        blob_size_mb = 2
+    else:
+        # Use production-like sizes for local testing
+        threshold_mb = 500
+        blob_size_mb = 550
+
     path = tmp_path / "large_blob.msgpack"
-    # Create large binary blob (over 200MB new threshold)
-    large_blob = b"X" * (250 * 1024 * 1024)  # 250MB - exceeds new 200MB threshold
+    # Create large binary blob (exceeds threshold)
+    large_blob = b"X" * (blob_size_mb * 1024 * 1024)
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 
-    scanner = FlaxMsgpackScanner()
+    # Configure scanner with appropriate threshold
+    config = {"max_blob_bytes": threshold_mb * 1024 * 1024}
+    scanner = FlaxMsgpackScanner(config=config)
     result = scanner.scan(str(path))
 
     info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]

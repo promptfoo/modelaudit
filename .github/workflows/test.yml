@@ -24,9 +24,20 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Lint with Ruff
         run: |
@@ -52,9 +63,20 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Type checking
         run: |
@@ -63,6 +85,7 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
@@ -80,9 +103,21 @@ jobs:
         run: |
           rye pin ${{ matrix.python-version }}
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Run fast tests (parallel execution)
         run: |
@@ -90,8 +125,9 @@ jobs:
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'
+        timeout-minutes: 15
         run: |
-          rye run pytest -n auto -m "slow or integration" --tb=short
+          rye run pytest -n 1 -m "slow or integration" --tb=short
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
@@ -114,6 +150,19 @@ jobs:
         run: |
           rye pin ${{ matrix.python-version }}
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
       - name: Install with NumPy 1.x compatibility mode
         if: matrix.numpy-mode == '1.x'
         run: |
@@ -124,7 +173,7 @@ jobs:
       - name: Install with NumPy 2.x (default)
         if: matrix.numpy-mode == '2.x'
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Check NumPy version
         run: |
@@ -160,9 +209,20 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
       - name: Sync dependencies
         run: |
-          rye sync --features all
+          rye sync --features all-ci
 
       - name: Build package
         run: |
