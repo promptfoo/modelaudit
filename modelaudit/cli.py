@@ -25,6 +25,28 @@ logging.basicConfig(
 logger = logging.getLogger("modelaudit")
 
 
+def should_use_color() -> bool:
+    """Check if colors should be used in output."""
+    # Respect NO_COLOR environment variable
+    if os.getenv("NO_COLOR"):
+        return False
+    # Only use colors if output is a TTY
+    return sys.stdout.isatty()
+
+
+def should_show_spinner() -> bool:
+    """Check if spinners should be shown."""
+    # Only show spinners if output is a TTY
+    return sys.stdout.isatty()
+
+
+def style_text(text: str, **kwargs) -> str:
+    """Style text only if colors are enabled."""
+    if should_use_color():
+        return style_text(text, **kwargs)
+    return text
+
+
 def is_mlflow_uri(path: str) -> bool:
     """Check if a path is an MLflow model URI."""
     return path.startswith("models:/")
@@ -220,18 +242,18 @@ def scan_command(
     if format == "text" and not output:
         header = [
             "─" * 80,
-            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
-            click.style(
+            style_text("ModelAudit Security Scanner", fg="blue", bold=True),
+            style_text(
                 "Scanning for potential security issues in ML model files",
                 fg="cyan",
             ),
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        click.echo(f"Paths to scan: {click.style(', '.join(expanded_paths), fg='green')}")
+        click.echo(f"Paths to scan: {style_text(', '.join(expanded_paths), fg='green')}")
         if blacklist:
             click.echo(
-                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
+                f"Additional blacklist patterns: {style_text(', '.join(blacklist), fg='yellow')}",
             )
         click.echo("─" * 80)
         click.echo("")
@@ -261,9 +283,12 @@ def scan_command(
             # Check if this is a HuggingFace URL
             if is_huggingface_url(path):
                 # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                download_spinner = None
+                if format == "text" and not output and should_show_spinner():
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                     download_spinner.start()
+                elif format == "text" and not output:
+                    click.echo(f"Downloading from {path}...")
 
                 try:
                     # Download to a temporary directory
@@ -272,12 +297,16 @@ def scan_command(
                     # Track the temp directory for cleanup
                     temp_dir = str(download_path)
 
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                    if download_spinner:
+                        download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Downloaded successfully")
 
                 except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    if download_spinner:
+                        download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Download failed")
 
                     logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
@@ -286,21 +315,28 @@ def scan_command(
 
             # Check if this is a cloud storage URL
             elif is_cloud_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                download_spinner = None
+                if format == "text" and not output and should_show_spinner():
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                     download_spinner.start()
+                elif format == "text" and not output:
+                    click.echo(f"Downloading from {path}...")
 
                 try:
                     download_path = download_from_cloud(path, cache_dir=None)
                     actual_path = str(download_path)
                     temp_dir = str(download_path)
 
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                    if download_spinner:
+                        download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Downloaded successfully")
 
                 except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    if download_spinner:
+                        download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Download failed")
 
                     logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading from {path}: {e!s}", err=True)
@@ -310,9 +346,12 @@ def scan_command(
             # Check if this is an MLflow URI
             elif is_mlflow_uri(path):
                 # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                download_spinner = None
+                if format == "text" and not output and should_show_spinner():
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                     download_spinner.start()
+                elif format == "text" and not output:
+                    click.echo(f"Downloading from {path}...")
 
                 try:
                     from .mlflow_integration import scan_mlflow_model
@@ -327,8 +366,10 @@ def scan_command(
                         max_total_size=max_total_size,
                     )
 
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
+                    if download_spinner:
+                        download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Downloaded and scanned successfully")
 
                     # Aggregate results directly from MLflow scan
                     aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
@@ -347,8 +388,10 @@ def scan_command(
                     continue
 
                 except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    if download_spinner:
+                        download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Download failed")
 
                     logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
@@ -357,9 +400,12 @@ def scan_command(
 
             # Check if this is a JFrog URL
             elif is_jfrog_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
+                download_spinner = None
+                if format == "text" and not output and should_show_spinner():
+                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                     download_spinner.start()
+                elif format == "text" and not output:
+                    click.echo(f"Downloading from {path}...")
 
                 try:
                     download_path = download_artifact(
@@ -371,12 +417,16 @@ def scan_command(
                     actual_path = str(download_path)
                     temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                    if download_spinner:
+                        download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Downloaded successfully")
 
                 except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    if download_spinner:
+                        download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                    elif format == "text" and not output:
+                        click.echo("Download failed")
 
                     logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
@@ -410,10 +460,12 @@ def scan_command(
 
             # Show progress indicator if in text mode and not writing to a file
             spinner = None
-            if format == "text" and not output:
-                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+            if format == "text" and not output and should_show_spinner():
+                spinner_text = f"Scanning {style_text(path, fg='cyan')}"
                 spinner = yaspin(Spinners.dots, text=spinner_text)
                 spinner.start()
+            elif format == "text" and not output:
+                click.echo(f"Scanning {path}...")
 
             # Perform the scan with the specified options
             try:
@@ -453,7 +505,7 @@ def scan_command(
                         aggregated_results["scanner_names"].append(scanner)
 
                 # Show completion status if in text mode and not writing to a file
-                if spinner:
+                if format == "text" and not output:
                     if results.get("issues", []):
                         # Filter out DEBUG severity issues when not in verbose mode
                         visible_issues = [
@@ -462,7 +514,7 @@ def scan_command(
                             if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
                         ]
                         issue_count = len(visible_issues)
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+
                         if issue_count > 0:
                             # Determine severity for coloring
                             has_critical = any(
@@ -470,33 +522,51 @@ def scan_command(
                                 for issue in visible_issues
                                 if isinstance(issue, dict)
                             )
-                            if has_critical:
-                                spinner.fail(
-                                    click.style(
-                                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
-                                        fg="red",
-                                        bold=True,
-                                    ),
-                                )
+                            if spinner:
+                                spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                                if has_critical:
+                                    spinner.fail(
+                                        style_text(
+                                            f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                            fg="red",
+                                            bold=True,
+                                        ),
+                                    )
+                                else:
+                                    spinner.ok(
+                                        style_text(
+                                            f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                            fg="yellow",
+                                            bold=True,
+                                        ),
+                                    )
                             else:
-                                spinner.ok(
-                                    click.style(
-                                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
-                                        fg="yellow",
-                                        bold=True,
-                                    ),
-                                )
+                                if has_critical:
+                                    issues_str = "issue" if issue_count == 1 else "issues"
+                                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
+                                else:
+                                    issues_str = "issue" if issue_count == 1 else "issues"
+                                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str}")
                         else:
-                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                            if spinner:
+                                spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                                spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                            else:
+                                click.echo(f"Scanned {path}: Clean")
                     else:
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                        if spinner:
+                            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                            spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                        else:
+                            click.echo(f"Scanned {path}: Clean")
 
             except Exception as e:
                 # Show error if in text mode and not writing to a file
                 if spinner:
-                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                    spinner.fail(click.style("❌ Error", fg="red", bold=True))
+                    spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
+                    spinner.fail(style_text("❌ Error", fg="red", bold=True))
+                elif format == "text" and not output:
+                    click.echo(f"Error scanning {path}")
 
                 logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Error scanning {path}: {e!s}", err=True)
@@ -558,7 +628,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines = []
 
     # Add scan summary header
-    output_lines.append(click.style("\n📊 SCAN SUMMARY", fg="white", bold=True))
+    output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
     output_lines.append("" + "─" * 60)
 
     # Add scan metrics in a grid format
@@ -597,8 +667,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     # Display metrics in a formatted grid
     for label, value, color in metrics:
-        label_str = click.style(f"  {label}:", fg="bright_black")
-        value_str = click.style(value, fg=color, bold=True)
+        label_str = style_text(f"  {label}:", fg="bright_black")
+        value_str = style_text(value, fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
 
     # Add issue summary
@@ -624,7 +694,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     # Display issue summary
     output_lines.append("")
-    output_lines.append(click.style("\n🔍 SECURITY FINDINGS", fg="white", bold=True))
+    output_lines.append(style_text("\n🔍 SECURITY FINDINGS", fg="white", bold=True))
     output_lines.append("" + "─" * 60)
 
     if visible_issues:
@@ -633,7 +703,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if severity_counts["critical"] > 0:
             summary_parts.append(
                 "  "
-                + click.style(
+                + style_text(
                     f"🚨 {severity_counts['critical']} Critical",
                     fg="red",
                     bold=True,
@@ -642,18 +712,18 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if severity_counts["warning"] > 0:
             summary_parts.append(
                 "  "
-                + click.style(
+                + style_text(
                     f"⚠️  {severity_counts['warning']} Warning{'s' if severity_counts['warning'] > 1 else ''}",
                     fg="yellow",
                 ),
             )
         if severity_counts["info"] > 0:
             summary_parts.append(
-                "  " + click.style(f"[i] {severity_counts['info']} Info", fg="blue"),
+                "  " + style_text(f"[i] {severity_counts['info']} Info", fg="blue"),
             )
         if verbose and severity_counts["debug"] > 0:
             summary_parts.append(
-                "  " + click.style(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
+                "  " + style_text(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
             )
 
         output_lines.extend(summary_parts)
@@ -667,7 +737,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         ]
         if critical_issues:
             output_lines.append(
-                click.style("  🚨 Critical Issues", fg="red", bold=True),
+                style_text("  🚨 Critical Issues", fg="red", bold=True),
             )
             output_lines.append("  " + "─" * 40)
             for issue in critical_issues:
@@ -681,7 +751,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if warning_issues:
             if critical_issues:
                 output_lines.append("")
-            output_lines.append(click.style("  ⚠️  Warnings", fg="yellow", bold=True))
+            output_lines.append(style_text("  ⚠️  Warnings", fg="yellow", bold=True))
             output_lines.append("  " + "─" * 40)
             for issue in warning_issues:
                 _format_issue(issue, output_lines, "warning")
@@ -692,7 +762,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if info_issues:
             if critical_issues or warning_issues:
                 output_lines.append("")
-            output_lines.append(click.style("  [i] Information", fg="blue", bold=True))
+            output_lines.append(style_text("  [i] Information", fg="blue", bold=True))
             output_lines.append("  " + "─" * 40)
             for issue in info_issues:
                 _format_issue(issue, output_lines, "info")
@@ -706,14 +776,14 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
                     output_lines.append("")
-                output_lines.append(click.style("  🐛 Debug", fg="cyan", bold=True))
+                output_lines.append(style_text("  🐛 Debug", fg="cyan", bold=True))
                 output_lines.append("  " + "─" * 40)
                 for issue in debug_issues:
                     _format_issue(issue, output_lines, "debug")
                     output_lines.append("")
     else:
         output_lines.append(
-            "  " + click.style("✅ No security issues detected", fg="green", bold=True),
+            "  " + style_text("✅ No security issues detected", fg="green", bold=True),
         )
         output_lines.append("")
 
@@ -742,7 +812,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         status_color = "green"
 
     # Display final status
-    status_line = click.style(f"{status_icon} {status_msg}", fg=status_color, bold=True)
+    status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
     output_lines.append(f"  {status_line}")
     output_lines.append("═" * 80)
 
@@ -770,16 +840,16 @@ def _format_issue(
     icon = icons.get(severity, "    └─ ")
 
     if location:
-        location_str = click.style(f"[{location}]", fg="cyan", bold=True)
+        location_str = style_text(f"[{location}]", fg="cyan", bold=True)
         output_lines.append(f"{icon} {location_str}")
-        output_lines.append(f"       {click.style(message, fg='bright_white')}")
+        output_lines.append(f"       {style_text(message, fg='bright_white')}")
     else:
-        output_lines.append(f"{icon} {click.style(message, fg='bright_white')}")
+        output_lines.append(f"{icon} {style_text(message, fg='bright_white')}")
 
     # Add "Why" explanation if available
     why = issue.get("why")
     if why:
-        why_label = click.style("Why:", fg="magenta", bold=True)
+        why_label = style_text("Why:", fg="magenta", bold=True)
         # Wrap long explanations
         import textwrap
 
@@ -796,8 +866,8 @@ def _format_issue(
     if details:
         for key, value in details.items():
             if value:  # Only show non-empty values
-                detail_label = click.style(f"{key}:", fg="bright_black")
-                detail_value = click.style(str(value), fg="bright_white")
+                detail_label = style_text(f"{key}:", fg="bright_black")
+                detail_value = style_text(str(value), fg="bright_white")
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
