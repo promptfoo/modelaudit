@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import click
 from yaspin import yaspin
@@ -12,6 +12,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .interrupt_handler import interruptible_scan
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
@@ -251,144 +252,154 @@ def scan_command(
         "start_time": time.time(),
     }
 
-    # Scan each path
-    for path in expanded_paths:
-        # Track temp directory for cleanup
-        temp_dir = None
-        actual_path = path
+    # Scan each path with interrupt handling
+    with interruptible_scan() as interrupt_handler:
+        for path in expanded_paths:
+            # Track temp directory for cleanup
+            temp_dir = None
+            actual_path = path
+            should_break = False
 
-        try:
-            # Check if this is a HuggingFace URL
-            if is_huggingface_url(path):
-                # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
-
-                try:
-                    # Download to a temporary directory
-                    download_path = download_model(path, cache_dir=None)
-                    actual_path = str(download_path)
-                    # Track the temp directory for cleanup
-                    temp_dir = str(download_path)
-
+            try:
+                # Check if this is a HuggingFace URL
+                if is_huggingface_url(path):
+                    # Show download progress if in text mode
                     if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    try:
+                        # Download to a temporary directory
+                        download_path = download_model(path, cache_dir=None)
+                        actual_path = str(download_path)
+                        # Track the temp directory for cleanup
+                        temp_dir = str(download_path)
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-            # Check if this is a cloud storage URL
-            elif is_cloud_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-                try:
-                    download_path = download_from_cloud(path, cache_dir=None)
-                    actual_path = str(download_path)
-                    temp_dir = str(download_path)
-
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
-
-                except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
-
-                    logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
-
-            # Check if this is an MLflow URI
-            elif is_mlflow_uri(path):
-                # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
-
-                try:
-                    from .mlflow_integration import scan_mlflow_model
-
-                    # Use scan_mlflow_model to download and get scan results directly
-                    results = scan_mlflow_model(
-                        path,
-                        registry_uri=registry_uri,
-                        timeout=timeout,
-                        blacklist_patterns=list(blacklist) if blacklist else None,
-                        max_file_size=max_file_size,
-                        max_total_size=max_total_size,
-                    )
-
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
-
-                    # Aggregate results directly from MLflow scan
-                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                    aggregated_results["issues"].extend(results.get("issues", []))
-                    aggregated_results["files_scanned"] += results.get("files_scanned", 1)
-                    aggregated_results["assets"].extend(results.get("assets", []))
-                    if results.get("has_errors", False):
+                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
                         aggregated_results["has_errors"] = True
+                        continue
 
-                    # Track scanner names
-                    for scanner in results.get("scanners", []):
-                        if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                            aggregated_results["scanner_names"].append(scanner)
-
-                    # Skip the normal scanning logic since we already have results
-                    continue
-
-                except Exception as e:
+                # Check if this is a cloud storage URL
+                elif is_cloud_url(path):
                     if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                    try:
+                        download_path = download_from_cloud(path, cache_dir=None)
+                        actual_path = str(download_path)
+                        temp_dir = str(download_path)
 
-            # Check if this is a JFrog URL
-            elif is_jfrog_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-                try:
-                    download_path = download_artifact(
-                        path,
-                        cache_dir=None,
-                        api_token=jfrog_api_token,
-                        access_token=jfrog_access_token,
-                    )
-                    actual_path = str(download_path)
-                    temp_dir = str(download_path.parent if download_path.is_file() else download_path)
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
+                        logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading from {path}: {e!s}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                # Check if this is an MLflow URI
+                elif is_mlflow_uri(path):
+                    # Show download progress if in text mode
                     if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                except Exception as e:
+                    try:
+                        from .mlflow_integration import scan_mlflow_model
+
+                        # Use scan_mlflow_model to download and get scan results directly
+                        results = scan_mlflow_model(
+                            path,
+                            registry_uri=registry_uri,
+                            timeout=timeout,
+                            blacklist_patterns=list(blacklist) if blacklist else None,
+                            max_file_size=max_file_size,
+                            max_total_size=max_total_size,
+                        )
+
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
+
+                        # Aggregate results directly from MLflow scan
+                        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                        aggregated_results["issues"].extend(results.get("issues", []))
+                        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
+                        aggregated_results["assets"].extend(results.get("assets", []))
+                        if results.get("has_errors", False):
+                            aggregated_results["has_errors"] = True
+
+                        # Track scanner names
+                        for scanner in results.get("scanners", []):
+                            if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
+                                aggregated_results["scanner_names"].append(scanner)
+
+                        # Skip the normal scanning logic since we already have results
+                        continue
+
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                # Check if this is a JFrog URL
+                elif is_jfrog_url(path):
                     if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                    try:
+                        download_path = download_artifact(
+                            path,
+                            cache_dir=None,
+                            api_token=jfrog_api_token,
+                            access_token=jfrog_access_token,
+                        )
+                        actual_path = str(download_path)
+                        temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
-            else:
-                # For local paths, check if they exist
-                if not os.path.exists(path):
-                    click.echo(f"Error: Path does not exist: {path}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                else:
+                    # For local paths, check if they exist
+                    if not os.path.exists(path):
+                        click.echo(f"Error: Path does not exist: {path}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml as they can be model config files
@@ -408,115 +419,132 @@ def scan_command(
                         click.echo(f"Skipping non-model file: {path}")
                         continue
 
-            # Show progress indicator if in text mode and not writing to a file
-            spinner = None
-            if format == "text" and not output:
-                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
-                spinner = yaspin(Spinners.dots, text=spinner_text)
-                spinner.start()
+                # Show progress indicator if in text mode and not writing to a file
+                spinner = None
+                if format == "text" and not output:
+                    spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+                    spinner = yaspin(Spinners.dots, text=spinner_text)
+                    spinner.start()
 
-            # Perform the scan with the specified options
-            try:
-                # Define progress callback if using spinner
-                progress_callback = None
-                if spinner:
+                # Perform the scan with the specified options
+                try:
+                    # Define progress callback if using spinner
+                    progress_callback = None
+                    if spinner:
 
-                    def update_progress(message, percentage, spinner=spinner):
-                        spinner.text = f"{message} ({percentage:.1f}%)"
+                        def update_progress(message, percentage, spinner=spinner):
+                            spinner.text = f"{message} ({percentage:.1f}%)"
 
-                    progress_callback = update_progress
+                        progress_callback = update_progress
 
-                # Run the scan with progress reporting
-                results = scan_model_directory_or_file(
-                    actual_path,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    timeout=timeout,
-                    max_file_size=max_file_size,
-                    max_total_size=max_total_size,
-                    progress_callback=progress_callback,
-                )
+                    # Run the scan with progress reporting
+                    results = scan_model_directory_or_file(
+                        actual_path,
+                        blacklist_patterns=list(blacklist) if blacklist else None,
+                        timeout=timeout,
+                        max_file_size=max_file_size,
+                        max_total_size=max_total_size,
+                        progress_callback=progress_callback,
+                    )
 
-                # Aggregate results
-                aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                aggregated_results["issues"].extend(results.get("issues", []))
-                aggregated_results["files_scanned"] += results.get(
-                    "files_scanned",
-                    1,
-                )  # Count each file scanned
-                aggregated_results["assets"].extend(results.get("assets", []))
-                if results.get("has_errors", False):
+                    # Aggregate results
+                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                    aggregated_results["issues"].extend(results.get("issues", []))
+                    aggregated_results["files_scanned"] += results.get(
+                        "files_scanned",
+                        1,
+                    )  # Count each file scanned
+                    aggregated_results["assets"].extend(results.get("assets", []))
+                    if results.get("has_errors", False):
+                        aggregated_results["has_errors"] = True
+
+                    # Track scanner names
+                    for scanner in results.get("scanners", []):
+                        if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
+                            aggregated_results["scanner_names"].append(scanner)
+
+                    # Show completion status if in text mode and not writing to a file
+                    if spinner:
+                        if results.get("issues", []):
+                            # Filter out DEBUG severity issues when not in verbose mode
+                            visible_issues = [
+                                issue
+                                for issue in results.get("issues", [])
+                                if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                            ]
+                            issue_count = len(visible_issues)
+                            spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                            if issue_count > 0:
+                                # Determine severity for coloring
+                                has_critical = any(
+                                    issue.get("severity") == "critical"
+                                    for issue in visible_issues
+                                    if isinstance(issue, dict)
+                                )
+                                if has_critical:
+                                    spinner.fail(
+                                        click.style(
+                                            f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                            fg="red",
+                                            bold=True,
+                                        ),
+                                    )
+                                else:
+                                    spinner.ok(
+                                        click.style(
+                                            f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                            fg="yellow",
+                                            bold=True,
+                                        ),
+                                    )
+                            else:
+                                spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                        else:
+                            spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+
+                except Exception as e:
+                    # Show error if in text mode and not writing to a file
+                    if spinner:
+                        spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
+                        spinner.fail(click.style("❌ Error", fg="red", bold=True))
+
+                    logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error scanning {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
 
-                # Track scanner names
-                for scanner in results.get("scanners", []):
-                    if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                        aggregated_results["scanner_names"].append(scanner)
-
-                # Show completion status if in text mode and not writing to a file
-                if spinner:
-                    if results.get("issues", []):
-                        # Filter out DEBUG severity issues when not in verbose mode
-                        visible_issues = [
-                            issue
-                            for issue in results.get("issues", [])
-                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                        ]
-                        issue_count = len(visible_issues)
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                        if issue_count > 0:
-                            # Determine severity for coloring
-                            has_critical = any(
-                                issue.get("severity") == "critical"
-                                for issue in visible_issues
-                                if isinstance(issue, dict)
-                            )
-                            if has_critical:
-                                spinner.fail(
-                                    click.style(
-                                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
-                                        fg="red",
-                                        bold=True,
-                                    ),
-                                )
-                            else:
-                                spinner.ok(
-                                    click.style(
-                                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
-                                        fg="yellow",
-                                        bold=True,
-                                    ),
-                                )
-                        else:
-                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-                    else:
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-
             except Exception as e:
-                # Show error if in text mode and not writing to a file
-                if spinner:
-                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                    spinner.fail(click.style("❌ Error", fg="red", bold=True))
-
-                logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
-                click.echo(f"Error scanning {path}: {e!s}", err=True)
+                # Catch any other exceptions from the outer try block
+                logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
+                click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
 
-        except Exception as e:
-            # Catch any other exceptions from the outer try block
-            logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
-            click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
-            aggregated_results["has_errors"] = True
+            finally:
+                # Clean up temporary directory if we downloaded a model
+                if temp_dir and os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                        if verbose:
+                            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                        
+                # Check if we were interrupted and should stop processing more paths
+                if interrupt_handler.is_interrupted():
+                    logger.info("Stopping scan due to interrupt")
+                    aggregated_results["success"] = False
+                    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
+                    if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
+                        issues_list.append({
+                            "message": "Scan interrupted by user",
+                            "severity": "info",
+                            "details": {"interrupted": True},
+                        })
+                    should_break = True
 
-        finally:
-            # Clean up temporary directory if we downloaded a model
-            if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                    if verbose:
-                        logger.info(f"Cleaned up temporary directory: {temp_dir}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+            # Break outside of finally block if interrupted
+            if should_break:
+                break
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
