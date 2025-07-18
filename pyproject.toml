@@ -7,7 +7,8 @@ name = "modelaudit"
 version = "0.1.5"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
-    { name = "Ian Webster", email = "ian@promptfoo.dev" }
+    { name = "Ian Webster", email = "ian@promptfoo.dev" },
+    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
