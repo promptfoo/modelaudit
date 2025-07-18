@@ -147,6 +147,17 @@ def cli() -> None:
     type=str,
     help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
 )
+@click.option(
+    "--parallel/--no-parallel",
+    default=True,
+    help="Enable/disable parallel scanning for directories [default: enabled]",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of worker processes for parallel scanning [default: CPU count]",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -160,6 +171,8 @@ def scan_command(
     registry_uri: Optional[str],
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
+    parallel: bool,
+    workers: Optional[int],
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -434,6 +447,8 @@ def scan_command(
                     max_file_size=max_file_size,
                     max_total_size=max_total_size,
                     progress_callback=progress_callback,
+                    parallel=parallel,
+                    max_workers=workers,
                 )
 
                 # Aggregate results
@@ -451,6 +466,11 @@ def scan_command(
                 for scanner in results.get("scanners", []):
                     if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
                         aggregated_results["scanner_names"].append(scanner)
+
+                # Preserve parallel scan markers if present
+                if results.get("parallel_scan"):
+                    aggregated_results["parallel_scan"] = True
+                    aggregated_results["worker_count"] = results.get("worker_count")
 
                 # Show completion status if in text mode and not writing to a file
                 if spinner:

@@ -69,6 +69,8 @@ def scan_model_directory_or_file(
     max_file_size: int = 0,
     max_total_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    parallel: bool = True,
+    max_workers: Optional[int] = None,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -82,6 +84,8 @@ def scan_model_directory_or_file(
         max_total_size: Maximum total bytes to scan across all files
         progress_callback: Optional callback function to report progress
                           (message, percentage)
+        parallel: Enable parallel scanning for directories
+        max_workers: Number of worker processes for parallel scanning
         **kwargs: Additional arguments to pass to scanners
 
     Returns:
@@ -125,6 +129,91 @@ def scan_model_directory_or_file(
 
         # Check if path is a directory
         if os.path.isdir(path):
+            # Use parallel scanning if enabled and we have the parallel_directory module
+            logger.debug(f"Directory scan: parallel={parallel}, config keys={list(config.keys())}")
+            if parallel and "parallel" not in config:
+                try:
+                    from modelaudit.parallel_directory import scan_directory_parallel
+
+                    # Use parallel scanner for directory scanning
+                    parallel_results = scan_directory_parallel(
+                        path,
+                        config,
+                        progress_callback=progress_callback,
+                        max_workers=max_workers,
+                    )
+
+                    # Copy parallel results to our results dictionary
+                    results.update(parallel_results)
+                    logger.debug(f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}")
+
+                    # Add final timing information
+                    results["finish_time"] = time.time()
+                    results["duration"] = results["finish_time"] - results["start_time"]
+
+                    # Add license warnings if any
+                    try:
+                        license_warnings = check_commercial_use_warnings(results)
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        for warning in license_warnings:
+                            # Convert license warnings to issues
+                            issue_dict = {
+                                "message": warning["message"],
+                                "severity": warning["severity"],
+                                "location": "",  # License warnings are generally project-wide
+                                "details": warning.get("details", {}),
+                                "type": warning["type"],
+                            }
+                            issues_list.append(issue_dict)
+                    except Exception as e:
+                        logger.warning(f"Error checking license warnings: {e!s}")
+
+                    # Determine has_errors flag
+                    operational_error_indicators = [
+                        # Scanner execution errors
+                        "Error during scan",
+                        "Error checking file size",
+                        "Error scanning file",
+                        "Scanner crashed",
+                        "Scan timeout",
+                        # File system errors
+                        "Path does not exist",
+                        "Path is not readable",
+                        "Permission denied",
+                        "File not found",
+                        # Dependency/environment errors
+                        "not installed, cannot scan",
+                        "Missing dependency",
+                        "Import error",
+                        "Module not found",
+                        # File format/corruption errors
+                        "not a valid",
+                        "Invalid file format",
+                        "Corrupted file",
+                        "Bad file signature",
+                        "Unable to parse",
+                        # Resource/system errors
+                        "Out of memory",
+                        "Disk space",
+                        "Too many open files",
+                    ]
+
+                    issues_list = cast(list[dict[str, Any]], results["issues"])
+                    results["has_errors"] = (
+                        any(
+                            any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
+                            for issue in issues_list
+                            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+                        )
+                        or not results["success"]
+                    )
+
+                    return results
+
+                except ImportError:
+                    # Fall back to sequential scanning
+                    logger.debug("Parallel scanning not available, using sequential scanning")
+
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
