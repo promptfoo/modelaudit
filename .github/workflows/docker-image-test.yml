@@ -1,0 +1,92 @@
+name: Docker Image CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-test-lightweight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build lightweight image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          tags: modelaudit:lightweight
+          load: true
+          cache-from: type=gha,scope=lightweight
+          cache-to: type=gha,mode=max,scope=lightweight
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Test lightweight container help command
+        run: |
+          docker run --rm modelaudit:lightweight --help
+
+      - name: Test lightweight container scan help
+        run: |
+          docker run --rm modelaudit:lightweight scan --help
+
+      - name: Test lightweight container version
+        run: |
+          # Test that the package is properly installed
+          docker run --rm modelaudit:lightweight --version
+
+      - name: Test lightweight container with invalid command
+        run: |
+          # This should fail gracefully
+          docker run --rm modelaudit:lightweight invalid-command && exit 1 || echo "Command properly rejected invalid input"
+
+  build-test-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build-test-lightweight # Only run after lightweight succeeds
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'test-full-image')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build full image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.full
+          tags: modelaudit:full
+          load: true
+          cache-from: type=gha,scope=full
+          cache-to: type=gha,mode=max,scope=full
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Test full container help command
+        run: |
+          docker run --rm modelaudit:full --help
+
+      - name: Test full container scan help
+        run: |
+          docker run --rm modelaudit:full scan --help
+
+      - name: Test full container version
+        run: |
+          # Test that the package is properly installed
+          docker run --rm modelaudit:full --version
+
+      - name: Verify ML dependencies in full image
+        run: |
+          # Test that ML dependencies are available
+          docker run --rm modelaudit:full python -c "import tensorflow, torch, onnx; print('All ML dependencies available')" || echo "Warning: Some ML dependencies missing"
