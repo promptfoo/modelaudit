@@ -528,18 +528,20 @@ def scan_command(
                             logger.info(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
-                        
+
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
                     logger.info("Stopping scan due to interrupt")
                     aggregated_results["success"] = False
                     issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
-                        issues_list.append({
-                            "message": "Scan interrupted by user",
-                            "severity": "info",
-                            "details": {"interrupted": True},
-                        })
+                        issues_list.append(
+                            {
+                                "message": "Scan interrupted by user",
+                                "severity": "info",
+                                "details": {"interrupted": True},
+                            }
+                        )
                     should_break = True
 
             # Break outside of finally block if interrupted
@@ -740,17 +742,34 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                     _format_issue(issue, output_lines, "debug")
                     output_lines.append("")
     else:
-        output_lines.append(
-            "  " + click.style("✅ No security issues detected", fg="green", bold=True),
-        )
+        # Check if no files were scanned to show appropriate message
+        files_scanned = results.get("files_scanned", 0)
+        if files_scanned == 0:
+            output_lines.append(
+                "  " + click.style("⚠️  No model files found to scan", fg="yellow", bold=True),
+            )
+        else:
+            output_lines.append(
+                "  " + click.style("✅ No security issues detected", fg="green", bold=True),
+            )
         output_lines.append("")
 
     # Add a footer with final status
     output_lines.append("")
     output_lines.append("═" * 80)
 
+    # Check if no files were scanned
+    files_scanned = results.get("files_scanned", 0)
+    if files_scanned == 0:
+        status_icon = "❌"
+        status_msg = "NO FILES SCANNED"
+        status_color = "red"
+        output_lines.append(f"  {click.style(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(
+            f"  {click.style('Warning: No model files were found at the specified location.', fg='yellow')}"
+        )
     # Determine overall status
-    if visible_issues:
+    elif visible_issues:
         if any(isinstance(issue, dict) and issue.get("severity") == "critical" for issue in visible_issues):
             status_icon = "❌"
             status_msg = "CRITICAL SECURITY ISSUES FOUND"
@@ -764,14 +783,15 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_icon = "[i]"
             status_msg = "INFORMATIONAL FINDINGS"
             status_color = "blue"
+        status_line = click.style(f"{status_icon} {status_msg}", fg=status_color, bold=True)
+        output_lines.append(f"  {status_line}")
     else:
         status_icon = "✅"
         status_msg = "NO ISSUES FOUND"
         status_color = "green"
+        status_line = click.style(f"{status_icon} {status_msg}", fg=status_color, bold=True)
+        output_lines.append(f"  {status_line}")
 
-    # Display final status
-    status_line = click.style(f"{status_icon} {status_msg}", fg=status_color, bold=True)
-    output_lines.append(f"  {status_line}")
     output_lines.append("═" * 80)
 
     return "\n".join(output_lines)
