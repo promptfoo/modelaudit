@@ -12,9 +12,9 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 # Setup - Dependency Profiles
 rye sync --features all        # Install all dependencies (recommended for development)
 rye sync --features all-ci     # All dependencies except platform-specific (for CI)
-rye sync                       # Minimal dependencies
+rye sync                       # Minimal dependencies (pickle, numpy, zip)
 rye sync --features tensorflow # Specific framework support
-rye sync --features numpy1     # NumPy 1.x compatibility mode
+rye sync --features numpy1     # NumPy 1.x compatibility mode (when ML frameworks conflict)
 
 # Running the scanner (scan is the default command)
 rye run modelaudit model.pkl
@@ -121,6 +121,15 @@ rye build
 # Publishing (maintainers only)
 rye publish
 ```
+
+## Dependency Philosophy
+
+ModelAudit uses optional dependencies to keep the base installation lightweight while supporting many ML frameworks:
+
+- **Base install**: Only includes core dependencies (pickle, numpy, zip scanning)
+- **Feature-specific installs**: Add only what you need (e.g., `[tensorflow]`, `[pytorch]`)
+- **Graceful degradation**: Missing dependencies don't break the tool, just disable specific scanners
+- **Clear guidance**: Error messages tell you exactly what to install
 
 ## Docker Support
 
