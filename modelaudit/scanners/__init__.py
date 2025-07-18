@@ -199,6 +199,15 @@ class ScannerRegistry:
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
+            "text": {
+                "module": "modelaudit.scanners.text_scanner",
+                "class": "TextScanner",
+                "description": "Scans ML-related text files",
+                "extensions": [".txt", ".md", ".markdown", ".rst"],
+                "priority": 11,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "manifest": {
                 "module": "modelaudit.scanners.manifest_scanner",
                 "class": "ManifestScanner",
@@ -216,7 +225,7 @@ class ScannerRegistry:
                     ".model",
                     ".metadata",
                 ],
-                "priority": 11,
+                "priority": 12,
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },

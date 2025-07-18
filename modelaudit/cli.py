@@ -147,6 +147,16 @@ def cli() -> None:
     type=str,
     help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
 )
+@click.option(
+    "--cache/--no-cache",
+    default=True,
+    help="Use cache for downloaded models [default: cache]",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -160,6 +170,8 @@ def scan_command(
     registry_uri: Optional[str],
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
+    cache: bool,
+    cache_dir: Optional[str],
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -260,24 +272,56 @@ def scan_command(
         try:
             # Check if this is a HuggingFace URL
             if is_huggingface_url(path):
-                # Show download progress if in text mode
+                # Show initial message and get model info
                 if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
+                    click.echo(f"\n📥 Preparing to download from {click.style(path, fg='cyan')}")
+
+                    # Get model info for size preview
+                    try:
+                        from .utils.huggingface import get_model_info
+
+                        model_info = get_model_info(path)
+
+                        # Format size
+                        size_bytes = model_info["total_size"]
+                        if size_bytes >= 1024 * 1024 * 1024:
+                            size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                        elif size_bytes >= 1024 * 1024:
+                            size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+                        else:
+                            size_str = f"{size_bytes / 1024:.2f} KB"
+
+                        click.echo(f"   Model: {model_info['model_id']}")
+                        click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
+                    except Exception:
+                        # Don't fail if we can't get model info
+                        pass
 
                 try:
-                    # Download to a temporary directory
-                    download_path = download_model(path, cache_dir=None)
+                    # Convert cache_dir string to Path if provided
+                    from pathlib import Path
+
+                    hf_cache_dir = None
+                    if cache and cache_dir:
+                        hf_cache_dir = Path(cache_dir)
+                    elif cache:
+                        # Use default cache directory
+                        hf_cache_dir = Path.home() / ".modelaudit" / "cache"
+
+                    # Download with caching support and progress bar
+                    download_path = download_model(
+                        path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output)
+                    )
                     actual_path = str(download_path)
-                    # Track the temp directory for cleanup
-                    temp_dir = str(download_path)
+                    # Only track for cleanup if not using cache
+                    temp_dir = str(download_path) if not cache else None
 
                     if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                        click.echo(click.style("✅ Download complete", fg="green", bold=True))
 
                 except Exception as e:
                     if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                        click.echo(click.style("❌ Download failed", fg="red", bold=True))
 
                     logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error downloading model from {path}: {e!s}", err=True)
