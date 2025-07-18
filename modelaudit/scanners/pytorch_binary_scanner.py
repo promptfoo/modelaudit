@@ -241,14 +241,14 @@ class PyTorchBinaryScanner(BaseScanner):
                     },
                 )
 
-            # Add informational note about ignored patterns
+            # Add debug note about ignored patterns (only shown in verbose mode)
             if ignored_count > 0 and len(positions) > 5:
                 from modelaudit.utils.ml_context import get_ml_context_explanation
 
                 explanation = get_ml_context_explanation(ml_context, len(positions))
                 result.add_issue(
                     f"Ignored {ignored_count} likely false positive {description} patterns",
-                    severity=IssueSeverity.INFO,
+                    severity=IssueSeverity.DEBUG,
                     location=f"{self.current_file_path}",
                     details={
                         "signature": sig.hex(),
