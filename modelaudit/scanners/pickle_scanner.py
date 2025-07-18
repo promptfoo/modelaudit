@@ -1719,12 +1719,12 @@ class PickleScanner(BaseScanner):
                         ),
                     )
 
-                # Add informational note about ignored patterns if significant
+                # Add debug note about ignored patterns if significant (only shown in verbose mode)
                 if ignored_count > 0 and len(positions) > 10:
                     explanation = get_ml_context_explanation(first_chunk_ml_context, len(positions))
                     result.add_issue(
                         f"Ignored {ignored_count} likely false positive {description} patterns in ML weight data",
-                        severity=IssueSeverity.INFO,
+                        severity=IssueSeverity.DEBUG,
                         location=f"{self.current_file_path}",
                         details={
                             "signature": sig.hex(),
@@ -1804,12 +1804,12 @@ class PickleScanner(BaseScanner):
                         ),
                     )
 
-                # Note about ignored PE patterns
+                # Note about ignored PE patterns (only shown in verbose mode)
                 if ignored_pe_count > 0:
                     explanation = get_ml_context_explanation(first_chunk_ml_context, len(pe_positions))
                     result.add_issue(
                         f"Ignored {ignored_pe_count} likely false positive PE executable patterns in ML weight data",
-                        severity=IssueSeverity.INFO,
+                        severity=IssueSeverity.DEBUG,
                         location=f"{self.current_file_path}",
                         details={
                             "signature": pe_sig.hex(),
