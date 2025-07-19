@@ -170,9 +170,10 @@ class ManifestScanner(BaseScanner):
                     result.metadata["keys"] = list(content.keys())
 
                 # Extract license information if present
-                license_info = self._extract_license_info(content)
-                if license_info:
-                    result.metadata["license"] = license_info
+                if isinstance(content, dict):
+                    license_info = self._extract_license_info(content)
+                    if license_info:
+                        result.metadata["license"] = license_info
 
                 # Check for suspicious configuration patterns
                 self._check_suspicious_patterns(content, result)
