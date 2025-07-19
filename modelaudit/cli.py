@@ -5,7 +5,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional, cast, Dict, List
+from typing import Any, Optional, cast
 
 import click
 from yaspin import yaspin
@@ -165,7 +165,7 @@ def doctor_command(show_failed: bool, no_system_info: bool) -> None:
 
     if not failed_scanners:
         click.echo(click.style("✓ All scanners loaded successfully!", fg="green"))
-    
+
     sys.exit(0)
 
 
@@ -318,6 +318,26 @@ def scan_command(
     parallel = not no_parallel
     max_workers = concurrency
 
+    # Print a nice header if not in JSON mode and not writing to a file
+    if format == "text" and not output:
+        header = [
+            "─" * 80,
+            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
+            click.style(
+                "Scanning for potential security issues in ML model files",
+                fg="cyan",
+            ),
+            "─" * 80,
+        ]
+        click.echo("\n".join(header))
+        click.echo(f"Paths to scan: {click.style(', '.join(paths), fg='green')}")
+        if blacklist:
+            click.echo(
+                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
+            )
+        click.echo("─" * 80)
+        click.echo("")
+
     # Expand any directories in paths
     expanded_paths = []
     for path in paths:
@@ -350,7 +370,7 @@ def scan_command(
         sys.exit(1)
 
     # Initialize aggregated results
-    aggregated_results: Dict[str, Any] = {
+    aggregated_results: dict[str, Any] = {
         "success": True,
         "bytes_scanned": 0,
         "issues": [],
@@ -480,16 +500,16 @@ def scan_command(
 
                         # Aggregate results directly from MLflow scan
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+                        issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                         issues_list.extend(results.get("issues", []))
                         aggregated_results["files_scanned"] += results.get("files_scanned", 1)
-                        assets_list = cast(List[Dict[str, Any]], aggregated_results["assets"])
+                        assets_list = cast(list[dict[str, Any]], aggregated_results["assets"])
                         assets_list.extend(results.get("assets", []))
                         if results.get("has_errors", False):
                             aggregated_results["has_errors"] = True
 
                         # Track scanner names
-                        scanner_names = cast(List[str], aggregated_results["scanner_names"])
+                        scanner_names = cast(list[str], aggregated_results["scanner_names"])
                         for scanner in results.get("scanners", []):
                             if scanner and scanner not in scanner_names and scanner != "unknown":
                                 scanner_names.append(scanner)
@@ -610,19 +630,19 @@ def scan_command(
 
                     # Aggregate results
                     aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                    issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+                    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     issues_list.extend(results.get("issues", []))
                     aggregated_results["files_scanned"] += results.get(
                         "files_scanned",
                         1,
                     )  # Count each file scanned
-                    assets_list = cast(List[Dict[str, Any]], aggregated_results["assets"])
+                    assets_list = cast(list[dict[str, Any]], aggregated_results["assets"])
                     assets_list.extend(results.get("assets", []))
                     if results.get("has_errors", False):
                         aggregated_results["has_errors"] = True
 
                     # Track scanner names
-                    scanner_names = cast(List[str], aggregated_results["scanner_names"])
+                    scanner_names = cast(list[str], aggregated_results["scanner_names"])
                     for scanner in results.get("scanners", []):
                         if scanner and scanner not in scanner_names and scanner != "unknown":
                             scanner_names.append(scanner)
@@ -736,14 +756,12 @@ def scan_command(
             aggregated_results["has_errors"] = True
 
     # Determine if the scan succeeded overall
-    issues_list = cast(List[Dict[str, Any]], aggregated_results.get("issues", []))
-    aggregated_results["success"] = (
-        not aggregated_results["has_errors"] and len(issues_list) == 0
-    )
+    issues_list = cast(list[dict[str, Any]], aggregated_results.get("issues", []))
+    aggregated_results["success"] = not aggregated_results["has_errors"] and len(issues_list) == 0
 
     # Add summary information
-    issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
-    scanner_names = cast(List[str], aggregated_results["scanner_names"])
+    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
+    scanner_names = cast(list[str], aggregated_results["scanner_names"])
     aggregated_results["summary"] = {
         "total_files": aggregated_results["files_scanned"],
         "total_issues": len(issues_list),
@@ -757,14 +775,14 @@ def scan_command(
         click.echo(click.style("=== Scan Summary ===", fg="cyan", bold=True))
         click.echo(f"Files scanned: {aggregated_results['files_scanned']}")
         click.echo(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
-        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+        issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
         click.echo(f"Total issues: {len(issues_list)}")
         if aggregated_results.get("parallel_scan"):
             click.echo(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
         click.echo(f"Duration: {aggregated_results['duration']:.1f}s")
 
         # Show all issues in detail
-        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+        issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
         issues = list(issues_list)
         # Filter out DEBUG severity issues when not in verbose mode
         if not verbose:
@@ -810,7 +828,7 @@ def scan_command(
         elif format == "jsonl":
             # Output each issue as a separate JSON line
             lines = []
-            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
             for issue in issues_list:
                 lines.append(json.dumps(issue))
             output_text = "\n".join(lines)
@@ -818,14 +836,14 @@ def scan_command(
             lines = ["=== ModelAudit Scan Results ==="]
             lines.append(f"Files scanned: {aggregated_results['files_scanned']}")
             lines.append(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
-            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
             lines.append(f"Total issues: {len(issues_list)}")
             if aggregated_results.get("parallel_scan"):
                 lines.append(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
             lines.append(f"Duration: {aggregated_results['duration']:.1f}s")
             lines.append("")
 
-            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
             if issues_list:
                 lines.append("=== Issues Found ===")
                 for i, issue in enumerate(issues_list, 1):
@@ -863,7 +881,7 @@ def scan_command(
     sys.exit(determine_exit_code(aggregated_results))
 
 
-def format_text_output(results: Dict[str, Any], verbose: bool = False) -> str:
+def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
@@ -1060,8 +1078,8 @@ def format_text_output(results: Dict[str, Any], verbose: bool = False) -> str:
 
 
 def _format_issue(
-    issue: Dict[str, Any],
-    output_lines: List[str],
+    issue: dict[str, Any],
+    output_lines: list[str],
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""

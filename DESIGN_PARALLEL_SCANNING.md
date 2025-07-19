@@ -26,6 +26,7 @@ This document outlines the design for implementing parallel file scanning in Mod
 ### 1. Worker Pool Model
 
 Use Python's `concurrent.futures.ProcessPoolExecutor` for parallel processing:
+
 - Process-based to avoid GIL limitations
 - Better isolation for scanner crashes
 - Configurable worker count
@@ -39,7 +40,7 @@ with ProcessPoolExecutor(max_workers=num_workers) as executor:
     for file_path in files_to_scan:
         future = executor.submit(scan_file, file_path, config)
         futures.append((file_path, future))
-    
+
     # Collect results as they complete
     for file_path, future in futures:
         result = future.result(timeout=per_file_timeout)
@@ -64,6 +65,7 @@ with ProcessPoolExecutor(max_workers=num_workers) as executor:
 ### 5. Configuration Options
 
 New configuration parameters:
+
 - `parallel`: Enable/disable parallel scanning (default: True)
 - `max_workers`: Maximum number of worker processes (default: CPU count)
 - `chunk_size`: Number of files per work unit (default: 1)
@@ -71,23 +73,27 @@ New configuration parameters:
 ## Implementation Plan
 
 ### Phase 1: Core Infrastructure
+
 1. Create `ParallelScanner` class
 2. Implement worker pool management
 3. Add result aggregation logic
 4. Handle process communication
 
 ### Phase 2: Progress and Monitoring
+
 1. Implement parallel-aware progress callbacks
 2. Add worker status monitoring
 3. Show active file being scanned per worker
 
 ### Phase 3: Error Handling
+
 1. Handle worker process crashes
 2. Implement timeout per file
 3. Add retry logic for failed scans
 4. Graceful degradation to sequential mode
 
 ### Phase 4: Performance Tuning
+
 1. Optimize work distribution
 2. Implement file size-based chunking
 3. Add memory usage controls
@@ -96,6 +102,7 @@ New configuration parameters:
 ## API Changes
 
 ### CLI Options
+
 ```bash
 # New options
 --parallel / --no-parallel     Enable/disable parallel scanning
@@ -103,6 +110,7 @@ New configuration parameters:
 ```
 
 ### Function Signature
+
 ```python
 def scan_model_directory_or_file(
     path: str,
@@ -116,21 +124,25 @@ def scan_model_directory_or_file(
 ## Technical Considerations
 
 ### 1. Serialization
+
 - Ensure all config objects are picklable
 - Handle non-serializable callbacks
 - Manage scanner state transfer
 
 ### 2. Memory Management
+
 - Monitor memory usage per worker
 - Implement file queuing to avoid loading all paths
 - Add memory limit safeguards
 
 ### 3. Platform Compatibility
+
 - Test on Windows (process creation overhead)
 - Handle macOS fork safety
 - Linux-specific optimizations
 
 ### 4. Scanner Compatibility
+
 - Ensure all scanners are process-safe
 - No shared mutable state
 - Handle scanner initialization in workers
@@ -138,22 +150,26 @@ def scan_model_directory_or_file(
 ## Testing Strategy
 
 ### 1. Unit Tests
+
 - Test worker pool creation and management
 - Verify result aggregation correctness
 - Test error handling scenarios
 
 ### 2. Integration Tests
+
 - Compare results: parallel vs sequential
 - Verify no issues are missed
 - Test with various file types and sizes
 
 ### 3. Performance Tests
+
 - Benchmark different directory sizes
 - Measure speedup factors
 - Profile memory usage
 - Test CPU utilization
 
 ### 4. Stress Tests
+
 - Large directories (10k+ files)
 - Mixed file sizes
 - High error rate scenarios
