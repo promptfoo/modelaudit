@@ -61,19 +61,20 @@ def test_interrupt_during_scan():
 
     # Create test files
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Create several pickle files
-        for i in range(20):
+        # Create several pickle files with larger data to slow down scan
+        for i in range(50):  # More files
             file_path = Path(temp_dir) / f"model_{i}.pkl"
             with open(file_path, "wb") as f:
-                data = {"model_id": i, "weights": [0.1, 0.2, 0.3] * 100}
+                # Larger data to make scanning take longer
+                data = {"model_id": i, "weights": [0.1, 0.2, 0.3] * 10000, "large_data": list(range(10000))}
                 pickle.dump(data, f)
 
         # Start scan in subprocess
         cmd = [sys.executable, "-m", "modelaudit", "scan", temp_dir]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        # Give it time to start
-        time.sleep(0.5)
+        # Give it time to start scanning
+        time.sleep(1.0)  # Increased delay
 
         # Send interrupt
         process.send_signal(signal.SIGINT)
