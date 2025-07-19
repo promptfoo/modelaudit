@@ -754,6 +754,9 @@ class PickleScanner(BaseScanner):
 
             with open(path, "rb") as f:
                 while bytes_read < max_bytes:
+                    # Check for interrupts during file reading
+                    self.check_interrupted()
+
                     chunk = f.read(min(chunk_size, max_bytes - bytes_read))
                     if not chunk:
                         break
@@ -771,6 +774,9 @@ class PickleScanner(BaseScanner):
                 ]
 
                 for pattern in dangerous_patterns:
+                    # Check for interrupts during pattern scanning
+                    self.check_interrupted()
+
                     # Use find() instead of 'in' operator to be more explicit
                     if raw_content.find(pattern) != -1:
                         result.add_issue(
@@ -1033,6 +1039,10 @@ class PickleScanner(BaseScanner):
             string_stack = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
+                # Check for interrupts periodically during opcode processing
+                if opcode_count % 1000 == 0:  # Check every 1000 opcodes
+                    self.check_interrupted()
+
                 opcodes.append((opcode, arg, pos))
                 opcode_count += 1
 

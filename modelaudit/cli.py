@@ -4,7 +4,8 @@ import os
 import shutil
 import sys
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, cast, Dict, List
 
 import click
 from yaspin import yaspin
@@ -12,6 +13,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
+from .interrupt_handler import interruptible_scan
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
@@ -20,14 +22,14 @@ from .utils.jfrog import download_artifact, is_jfrog_url
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("modelaudit")
 
 
 def is_mlflow_uri(path: str) -> bool:
     """Check if a path is an MLflow model URI."""
-    return path.startswith("models:/")
+    return path.startswith("models:/") or path.startswith("mlflow://")
 
 
 class DefaultCommandGroup(click.Group):
@@ -80,57 +82,138 @@ class DefaultCommandGroup(click.Group):
 
 
 @click.group(cls=DefaultCommandGroup)
-@click.version_option(__version__)
+@click.version_option(version=__version__)
 def cli() -> None:
-    """Static scanner for ML models"""
+    """ModelAudit CLI - Security scanner for AI/ML models.
+
+    ModelAudit helps you identify potential security risks in AI/ML model files
+    before deployment. It supports various model formats and can scan both local
+    files and remote models from HuggingFace, cloud storage, and MLflow.
+    """
     pass
 
 
-@cli.command("scan")
-@click.argument("paths", nargs=-1, type=str, required=True)
+@cli.command(name="doctor")
+@click.option("--show-failed/--no-show-failed", default=False, help="Show failed checks instead of compatible ones")
 @click.option(
-    "--blacklist",
-    "-b",
-    multiple=True,
-    help="Additional blacklist patterns to check against model names",
+    "--no-system-info",
+    is_flag=True,
+    help="Skip system information output",
+)
+def doctor_command(show_failed: bool, no_system_info: bool) -> None:
+    """Check which scanners can run on your system.
+
+    This command performs a system compatibility check to determine which
+    model file formats can be scanned on your current environment.
+    """
+    from .scanners import _registry
+
+    click.echo("ModelAudit System Diagnostics")
+    click.echo("=" * 40)
+
+    if not no_system_info:
+        # System information
+        click.echo(f"Python version: {sys.version.split()[0]}")
+
+        # NumPy status
+        numpy_compatible, numpy_status = _registry.get_numpy_status()
+        numpy_color = "green" if numpy_compatible else "yellow"
+        click.echo("NumPy status: ", nl=False)
+        click.echo(click.style(numpy_status, fg=numpy_color))
+
+    # Scanner status
+    available_scanners = _registry.get_available_scanners()
+    failed_scanners = _registry.get_failed_scanners()
+    loaded_count = len(available_scanners) - len(failed_scanners)
+
+    click.echo("\nScanner Status:")
+    click.echo(f"  Available: {len(available_scanners)} total")
+    click.echo(f"  Loaded: {loaded_count}")
+    click.echo(f"  Failed: {len(failed_scanners)}")
+
+    if show_failed and failed_scanners:
+        click.echo("\nFailed Scanners:")
+        for scanner_id, error_msg in failed_scanners.items():
+            click.echo(f"  {scanner_id}: {error_msg}")
+
+    # Recommendations
+    if failed_scanners:
+        click.echo("\nRecommendations:")
+
+        # Check for NumPy compatibility issues
+        numpy_sensitive_failed = []
+        for scanner_id in failed_scanners:
+            scanner_info = _registry.get_scanner_info(scanner_id)
+            if scanner_info and scanner_info.get("numpy_sensitive", False):
+                numpy_sensitive_failed.append(scanner_id)
+
+        if numpy_sensitive_failed and not numpy_compatible:
+            click.echo("• NumPy compatibility issues detected:")
+            click.echo("  For NumPy 1.x compatibility: pip install 'numpy<2.0'")
+            click.echo("  Then reinstall ML frameworks: pip install --force-reinstall tensorflow torch h5py")
+
+        # Check for missing dependencies
+        missing_deps = set()
+        for scanner_id in failed_scanners:
+            scanner_info = _registry.get_scanner_info(scanner_id)
+            if scanner_info:
+                deps = scanner_info.get("dependencies", [])
+                missing_deps.update(deps)
+
+        if missing_deps:
+            click.echo(f"• Install missing dependencies: pip install modelaudit[{','.join(missing_deps)}]")
+
+    if not failed_scanners:
+        click.echo(click.style("✓ All scanners loaded successfully!", fg="green"))
+    
+    sys.exit(0)
+
+
+@cli.command(name="scan")
+@click.argument("paths", nargs=-1, required=True, type=str)
+@click.option(
+    "--output",
+    "-o",
+    type=str,
+    help="Output file path for results",
 )
 @click.option(
     "--format",
     "-f",
-    type=click.Choice(["text", "json"]),
+    type=click.Choice(["json", "yaml", "jsonl", "text"]),
     default="text",
     help="Output format [default: text]",
 )
 @click.option(
-    "--output",
-    "-o",
-    type=click.Path(),
-    help="Output file path (prints to stdout if not specified)",
+    "--blacklist",
+    "-b",
+    multiple=True,
+    help="Blacklist model name patterns to check against",
 )
 @click.option(
     "--sbom",
-    type=click.Path(),
-    help="Write CycloneDX SBOM to the specified file",
+    type=str,
+    help="Generate and save SBOM to the specified file (experimental)",
 )
 @click.option(
     "--timeout",
     "-t",
     type=int,
     default=300,
-    help="Scan timeout in seconds [default: 300]",
+    help="Timeout for individual file scans in seconds [default: 300]",
 )
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output with detailed logging")
 @click.option(
     "--max-file-size",
-    type=int,
-    default=0,
-    help="Maximum file size to scan in bytes [default: unlimited]",
+    type=click.IntRange(min=1),
+    default=4 * 1024 * 1024 * 1024,  # 4GB
+    help="Maximum file size to scan in bytes [default: 4294967296 (4GB)]",
 )
 @click.option(
     "--max-total-size",
-    type=int,
-    default=0,
-    help="Maximum total bytes to scan before stopping [default: unlimited]",
+    type=click.IntRange(min=1),
+    default=10 * 1024 * 1024 * 1024,  # 10GB
+    help="Maximum total size to scan across all files in bytes [default: 10737418240 (10GB)]",
 )
 @click.option(
     "--registry-uri",
@@ -148,15 +231,22 @@ def cli() -> None:
     help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
 )
 @click.option(
-    "--parallel/--no-parallel",
-    default=True,
-    help="Enable/disable parallel scanning for directories [default: enabled]",
+    "--cache-dir",
+    type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
+    help="Directory to use for caching downloaded models (default: system temp directory)",
 )
 @click.option(
-    "--workers",
+    "--concurrency",
+    "-j",
     type=int,
     default=None,
     help="Number of worker processes for parallel scanning [default: CPU count]",
+)
+@click.option(
+    "--no-parallel",
+    is_flag=True,
+    default=False,
+    help="Disable parallel scanning (scan files sequentially)",
 )
 def scan_command(
     paths: tuple[str, ...],
@@ -171,8 +261,9 @@ def scan_command(
     registry_uri: Optional[str],
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
-    parallel: bool,
-    workers: Optional[int],
+    cache_dir: Optional[str],
+    concurrency: Optional[int],
+    no_parallel: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -200,61 +291,67 @@ def scan_command(
 
         modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
 
-    \b
-    Advanced options:
-        --format, -f       Output format (text or json)
-        --output, -o       Write results to a file instead of stdout
-        --sbom             Write CycloneDX SBOM to file
-        --timeout, -t      Set scan timeout in seconds
-        --verbose, -v      Show detailed information during scanning
-        --max-file-size    Maximum file size to scan in bytes
-        --max-total-size   Maximum total bytes to scan before stopping
-        --registry-uri     MLflow registry URI (for MLflow models only)
+    You can control parallelism with ``--concurrency`` or ``-j``:
 
-    \b
-    Exit codes:
-        0 - Success, no security issues found
-        1 - Security issues found (scan completed successfully)
-        2 - Errors occurred during scanning
+        modelaudit scan /large/directory -j 8  # Use 8 workers
+        modelaudit scan /path/to/model --no-parallel  # Disable parallel scanning
     """
-    # Expand DVC pointer files before scanning
-    expanded_paths = []
-    for p in paths:
-        if os.path.isfile(p) and p.endswith(".dvc"):
-            targets = resolve_dvc_file(p)
-            if targets:
-                expanded_paths.extend(targets)
-            else:
-                expanded_paths.append(p)
-        else:
-            expanded_paths.append(p)
-
-    # Print a nice header if not in JSON mode and not writing to a file
-    if format == "text" and not output:
-        header = [
-            "─" * 80,
-            click.style("ModelAudit Security Scanner", fg="blue", bold=True),
-            click.style(
-                "Scanning for potential security issues in ML model files",
-                fg="cyan",
-            ),
-            "─" * 80,
-        ]
-        click.echo("\n".join(header))
-        click.echo(f"Paths to scan: {click.style(', '.join(expanded_paths), fg='green')}")
-        if blacklist:
-            click.echo(
-                f"Additional blacklist patterns: {click.style(', '.join(blacklist), fg='yellow')}",
-            )
-        click.echo("─" * 80)
-        click.echo("")
-
-    # Set logging level based on verbosity
     if verbose:
-        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
 
-    # Aggregated results
-    aggregated_results: dict[str, Any] = {
+    # Load environment variables from .env file if present
+    if os.path.exists(".env"):
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        if verbose:
+            logger.debug("Loaded environment variables from .env file")
+
+    # Check for auth tokens in environment if not provided via CLI
+    if not jfrog_api_token:
+        jfrog_api_token = os.environ.get("JFROG_API_TOKEN")
+    if not jfrog_access_token:
+        jfrog_access_token = os.environ.get("JFROG_ACCESS_TOKEN")
+
+    # Determine parallel settings
+    parallel = not no_parallel
+    max_workers = concurrency
+
+    # Expand any directories in paths
+    expanded_paths = []
+    for path in paths:
+        # Check if it's a URL (HuggingFace, cloud storage, MLflow, or JFrog)
+        if any(
+            check(path) for check in [is_huggingface_url, is_cloud_url, is_mlflow_uri, is_jfrog_url]
+        ) or path.startswith(("http://", "https://", "s3://", "gs://", "gcs://", "r2://", "models:/", "mlflow://")):
+            expanded_paths.append(path)
+        # Check if it's a DVC file
+        elif path.endswith(".dvc"):
+            try:
+                dvc_paths = resolve_dvc_file(path)
+                if dvc_paths:
+                    expanded_paths.extend(dvc_paths)
+                    if verbose:
+                        logger.info(f"Resolved DVC file {path} to {dvc_paths}")
+                else:
+                    click.echo(f"Warning: Could not resolve DVC file: {path}", err=True)
+            except Exception as e:
+                click.echo(f"Error resolving DVC file {path}: {e!s}", err=True)
+        elif os.path.isdir(path):
+            # For directories, just add as-is (scanning will handle recursion)
+            expanded_paths.append(path)
+        else:
+            # Single file
+            expanded_paths.append(path)
+
+    if not expanded_paths:
+        click.echo("Error: No valid paths to scan", err=True)
+        sys.exit(1)
+
+    # Initialize aggregated results
+    aggregated_results: Dict[str, Any] = {
+        "success": True,
         "bytes_scanned": 0,
         "issues": [],
         "files_scanned": 0,
@@ -264,144 +361,187 @@ def scan_command(
         "start_time": time.time(),
     }
 
-    # Scan each path
-    for path in expanded_paths:
-        # Track temp directory for cleanup
-        temp_dir = None
-        actual_path = path
+    # Scan each path with interrupt handling
+    with interruptible_scan() as interrupt_handler:
+        for path in expanded_paths:
+            # Track temp directory for cleanup
+            temp_dir = None
+            actual_path = path
+            should_break = False
 
-        try:
-            # Check if this is a HuggingFace URL
-            if is_huggingface_url(path):
-                # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
-
-                try:
-                    # Download to a temporary directory
-                    download_path = download_model(path, cache_dir=None)
-                    actual_path = str(download_path)
-                    # Track the temp directory for cleanup
-                    temp_dir = str(download_path)
-
+            try:
+                # Check if this is a HuggingFace URL
+                if is_huggingface_url(path):
+                    # Show download progress if in text mode
                     if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                    try:
+                        # Download to cache directory or temporary directory
+                        download_path = download_model(path, cache_dir=Path(cache_dir) if cache_dir else None)
+                        actual_path = str(download_path)
+                        # Track the temp directory for cleanup
+                        temp_dir = str(download_path)
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-            # Check if this is a cloud storage URL
-            elif is_cloud_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-                try:
-                    download_path = download_from_cloud(path, cache_dir=None)
-                    actual_path = str(download_path)
-                    temp_dir = str(download_path)
+                        error_msg = str(e)
+                        # Provide more helpful message for disk space errors
+                        if "insufficient disk space" in error_msg.lower():
+                            logger.error(f"Disk space error for {path}: {error_msg}")
+                            click.echo(click.style(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
+                            click.echo(
+                                click.style(
+                                    "💡 Tip: Free up disk space or use --cache-dir to specify a "
+                                    "directory with more space",
+                                    fg="cyan",
+                                ),
+                                err=True,
+                            )
+                        else:
+                            logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
 
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
-
-                except Exception as e:
-                    if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
-
-                    logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
-
-            # Check if this is an MLflow URI
-            elif is_mlflow_uri(path):
-                # Show download progress if in text mode
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
-
-                try:
-                    from .mlflow_integration import scan_mlflow_model
-
-                    # Use scan_mlflow_model to download and get scan results directly
-                    results = scan_mlflow_model(
-                        path,
-                        registry_uri=registry_uri,
-                        timeout=timeout,
-                        blacklist_patterns=list(blacklist) if blacklist else None,
-                        max_file_size=max_file_size,
-                        max_total_size=max_total_size,
-                    )
-
-                    if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
-
-                    # Aggregate results directly from MLflow scan
-                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                    aggregated_results["issues"].extend(results.get("issues", []))
-                    aggregated_results["files_scanned"] += results.get("files_scanned", 1)
-                    aggregated_results["assets"].extend(results.get("assets", []))
-                    if results.get("has_errors", False):
                         aggregated_results["has_errors"] = True
+                        continue
 
-                    # Track scanner names
-                    for scanner in results.get("scanners", []):
-                        if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                            aggregated_results["scanner_names"].append(scanner)
-
-                    # Skip the normal scanning logic since we already have results
-                    continue
-
-                except Exception as e:
+                # Check if this is a cloud storage URL
+                elif is_cloud_url(path):
                     if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                    try:
+                        download_path = download_from_cloud(path, cache_dir=Path(cache_dir) if cache_dir else None)
+                        actual_path = str(download_path)
+                        temp_dir = str(download_path)
 
-            # Check if this is a JFrog URL
-            elif is_jfrog_url(path):
-                if format == "text" and not output:
-                    download_spinner = yaspin(Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}")
-                    download_spinner.start()
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
 
-                try:
-                    download_path = download_artifact(
-                        path,
-                        cache_dir=None,
-                        api_token=jfrog_api_token,
-                        access_token=jfrog_access_token,
-                    )
-                    actual_path = str(download_path)
-                    temp_dir = str(download_path.parent if download_path.is_file() else download_path)
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
+                        error_msg = str(e)
+                        # Provide more helpful message for disk space errors
+                        if "insufficient disk space" in error_msg.lower():
+                            logger.error(f"Disk space error for {path}: {error_msg}")
+                            click.echo(click.style(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
+                            click.echo(
+                                click.style(
+                                    "💡 Tip: Free up disk space or use --cache-dir to specify a "
+                                    "directory with more space",
+                                    fg="cyan",
+                                ),
+                                err=True,
+                            )
+                        else:
+                            logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error downloading from {path}: {error_msg}", err=True)
+
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                # Check if this is an MLflow URI
+                elif is_mlflow_uri(path):
+                    # Show download progress if in text mode
                     if format == "text" and not output:
-                        download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                except Exception as e:
+                    try:
+                        from .mlflow_integration import scan_mlflow_model
+
+                        # Use scan_mlflow_model to download and get scan results directly
+                        results = scan_mlflow_model(
+                            path,
+                            registry_uri=registry_uri,
+                            timeout=timeout,
+                            blacklist_patterns=list(blacklist) if blacklist else None,
+                            max_file_size=max_file_size,
+                            max_total_size=max_total_size,
+                        )
+
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded & Scanned", fg="green", bold=True))
+
+                        # Aggregate results directly from MLflow scan
+                        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+                        issues_list.extend(results.get("issues", []))
+                        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
+                        assets_list = cast(List[Dict[str, Any]], aggregated_results["assets"])
+                        assets_list.extend(results.get("assets", []))
+                        if results.get("has_errors", False):
+                            aggregated_results["has_errors"] = True
+
+                        # Track scanner names
+                        scanner_names = cast(List[str], aggregated_results["scanner_names"])
+                        for scanner in results.get("scanners", []):
+                            if scanner and scanner not in scanner_names and scanner != "unknown":
+                                scanner_names.append(scanner)
+
+                        # Skip the normal scanning logic since we already have results
+                        continue
+
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                # Check if this is a JFrog URL
+                elif is_jfrog_url(path):
                     if format == "text" and not output:
-                        download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading from {click.style(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
 
-                    logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                    click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                    try:
+                        download_path = download_artifact(
+                            path,
+                            cache_dir=Path(cache_dir) if cache_dir else None,
+                            api_token=jfrog_api_token,
+                            access_token=jfrog_access_token,
+                        )
+                        actual_path = str(download_path)
+                        temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
-            else:
-                # For local paths, check if they exist
-                if not os.path.exists(path):
-                    click.echo(f"Error: Path does not exist: {path}", err=True)
-                    aggregated_results["has_errors"] = True
-                    continue
+                        if format == "text" and not output:
+                            download_spinner.ok(click.style("✅ Downloaded", fg="green", bold=True))
+
+                    except Exception as e:
+                        if format == "text" and not output:
+                            download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
+
+                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                else:
+                    # For local paths, check if they exist
+                    if not os.path.exists(path):
+                        click.echo(f"Error: Path does not exist: {path}", err=True)
+                        aggregated_results["has_errors"] = True
+                        continue
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml as they can be model config files
@@ -413,6 +553,23 @@ def scan_command(
                         ".txt",
                         ".py",
                         ".js",
+                        ".ts",
+                        ".java",
+                        ".cpp",
+                        ".c",
+                        ".h",
+                        ".go",
+                        ".rs",
+                        ".sh",
+                        ".bat",
+                        ".exe",
+                        ".dll",
+                        ".so",
+                        ".dylib",
+                        ".log",
+                        ".csv",
+                        ".tsv",
+                        ".xml",
                         ".html",
                         ".css",
                     ):
@@ -421,122 +578,145 @@ def scan_command(
                         click.echo(f"Skipping non-model file: {path}")
                         continue
 
-            # Show progress indicator if in text mode and not writing to a file
-            spinner = None
-            if format == "text" and not output:
-                spinner_text = f"Scanning {click.style(path, fg='cyan')}"
-                spinner = yaspin(Spinners.dots, text=spinner_text)
-                spinner.start()
+                # Show progress indicator if in text mode and not writing to a file
+                spinner = None
+                if format == "text" and not output:
+                    spinner_text = f"Scanning {click.style(path, fg='cyan')}"
+                    spinner = yaspin(Spinners.dots, text=spinner_text)
+                    spinner.start()
 
-            # Perform the scan with the specified options
-            try:
-                # Define progress callback if using spinner
-                progress_callback = None
-                if spinner:
+                # Perform the scan with the specified options
+                try:
+                    # Define progress callback if using spinner
+                    progress_callback = None
+                    if spinner:
 
-                    def update_progress(message, percentage, spinner=spinner):
-                        spinner.text = f"{message} ({percentage:.1f}%)"
+                        def update_progress(message, percentage, spinner=spinner):
+                            spinner.text = f"{message} ({percentage:.1f}%)"
 
-                    progress_callback = update_progress
+                        progress_callback = update_progress
 
-                # Run the scan with progress reporting
-                results = scan_model_directory_or_file(
-                    actual_path,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    timeout=timeout,
-                    max_file_size=max_file_size,
-                    max_total_size=max_total_size,
-                    progress_callback=progress_callback,
-                    parallel=parallel,
-                    max_workers=workers,
-                )
+                    # Run the scan with progress reporting
+                    results = scan_model_directory_or_file(
+                        actual_path,
+                        blacklist_patterns=list(blacklist) if blacklist else None,
+                        timeout=timeout,
+                        max_file_size=max_file_size,
+                        max_total_size=max_total_size,
+                        progress_callback=progress_callback,
+                        parallel=parallel,
+                        max_workers=max_workers,
+                    )
 
-                # Aggregate results
-                aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                aggregated_results["issues"].extend(results.get("issues", []))
-                aggregated_results["files_scanned"] += results.get(
-                    "files_scanned",
-                    1,
-                )  # Count each file scanned
-                aggregated_results["assets"].extend(results.get("assets", []))
-                if results.get("has_errors", False):
+                    # Aggregate results
+                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                    issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+                    issues_list.extend(results.get("issues", []))
+                    aggregated_results["files_scanned"] += results.get(
+                        "files_scanned",
+                        1,
+                    )  # Count each file scanned
+                    assets_list = cast(List[Dict[str, Any]], aggregated_results["assets"])
+                    assets_list.extend(results.get("assets", []))
+                    if results.get("has_errors", False):
+                        aggregated_results["has_errors"] = True
+
+                    # Track scanner names
+                    scanner_names = cast(List[str], aggregated_results["scanner_names"])
+                    for scanner in results.get("scanners", []):
+                        if scanner and scanner not in scanner_names and scanner != "unknown":
+                            scanner_names.append(scanner)
+
+                    # Preserve parallel scan markers if present
+                    if results.get("parallel_scan"):
+                        aggregated_results["parallel_scan"] = True
+                        aggregated_results["worker_count"] = results.get("worker_count")
+
+                    # Show completion status if in text mode and not writing to a file
+                    if spinner:
+                        if results.get("issues", []):
+                            # Filter out DEBUG severity issues when not in verbose mode
+                            visible_issues = [
+                                issue
+                                for issue in results.get("issues", [])
+                                if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                            ]
+                            issue_count = len(visible_issues)
+                            spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                            if issue_count > 0:
+                                # Determine severity for coloring
+                                has_critical = any(
+                                    issue.get("severity") == "critical"
+                                    for issue in visible_issues
+                                    if isinstance(issue, dict)
+                                )
+                                if has_critical:
+                                    spinner.fail(
+                                        click.style(
+                                            f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                                            fg="red",
+                                            bold=True,
+                                        ),
+                                    )
+                                else:
+                                    spinner.ok(
+                                        click.style(
+                                            f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                                            fg="yellow",
+                                            bold=True,
+                                        ),
+                                    )
+                            else:
+                                spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+                        else:
+                            spinner.text = f"Scanned {click.style(path, fg='cyan')}"
+                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
+
+                except Exception as e:
+                    # Show error if in text mode and not writing to a file
+                    if spinner:
+                        spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
+                        spinner.fail(click.style("❌ Error", fg="red", bold=True))
+
+                    logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
+                    click.echo(f"Error scanning {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
 
-                # Track scanner names
-                for scanner in results.get("scanners", []):
-                    if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                        aggregated_results["scanner_names"].append(scanner)
-
-                # Preserve parallel scan markers if present
-                if results.get("parallel_scan"):
-                    aggregated_results["parallel_scan"] = True
-                    aggregated_results["worker_count"] = results.get("worker_count")
-
-                # Show completion status if in text mode and not writing to a file
-                if spinner:
-                    if results.get("issues", []):
-                        # Filter out DEBUG severity issues when not in verbose mode
-                        visible_issues = [
-                            issue
-                            for issue in results.get("issues", [])
-                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                        ]
-                        issue_count = len(visible_issues)
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                        if issue_count > 0:
-                            # Determine severity for coloring
-                            has_critical = any(
-                                issue.get("severity") == "critical"
-                                for issue in visible_issues
-                                if isinstance(issue, dict)
-                            )
-                            if has_critical:
-                                spinner.fail(
-                                    click.style(
-                                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
-                                        fg="red",
-                                        bold=True,
-                                    ),
-                                )
-                            else:
-                                spinner.ok(
-                                    click.style(
-                                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
-                                        fg="yellow",
-                                        bold=True,
-                                    ),
-                                )
-                        else:
-                            spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-                    else:
-                        spinner.text = f"Scanned {click.style(path, fg='cyan')}"
-                        spinner.ok(click.style("✅ Clean", fg="green", bold=True))
-
             except Exception as e:
-                # Show error if in text mode and not writing to a file
-                if spinner:
-                    spinner.text = f"Error scanning {click.style(path, fg='cyan')}"
-                    spinner.fail(click.style("❌ Error", fg="red", bold=True))
-
-                logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
-                click.echo(f"Error scanning {path}: {e!s}", err=True)
+                # Catch any other exceptions from the outer try block
+                logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
+                click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
 
-        except Exception as e:
-            # Catch any other exceptions from the outer try block
-            logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
-            click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
-            aggregated_results["has_errors"] = True
+            finally:
+                # Clean up temporary directory if we downloaded a model
+                # Only clean up if we didn't use a user-specified cache directory
+                if temp_dir and os.path.exists(temp_dir) and not cache_dir:
+                    try:
+                        shutil.rmtree(temp_dir)
+                        if verbose:
+                            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
-        finally:
-            # Clean up temporary directory if we downloaded a model
-            if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                    if verbose:
-                        logger.info(f"Cleaned up temporary directory: {temp_dir}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                # Check if we were interrupted and should stop processing more paths
+                if interrupt_handler.is_interrupted():
+                    logger.info("Stopping scan due to interrupt")
+                    aggregated_results["success"] = False
+                    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
+                    if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
+                        issues_list.append(
+                            {
+                                "message": "Scan interrupted by user",
+                                "severity": "info",
+                                "details": {"interrupted": True},
+                            }
+                        )
+                    should_break = True
+
+            # Break outside of finally block if interrupted
+            if should_break:
+                break
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
@@ -546,34 +726,144 @@ def scan_command(
         from .sbom import generate_sbom
 
         sbom_text = generate_sbom(expanded_paths, aggregated_results)
-        with open(sbom, "w") as f:
-            f.write(sbom_text)
+        try:
+            with open(sbom, "w") as f:
+                f.write(sbom_text)
+            if verbose:
+                logger.info(f"SBOM written to {sbom}")
+        except Exception as e:
+            logger.error(f"Failed to write SBOM to {sbom}: {e!s}")
+            aggregated_results["has_errors"] = True
 
-    # Format the output
-    if format == "json":
-        output_data = aggregated_results
-        output_text = json.dumps(output_data, indent=2)
+    # Determine if the scan succeeded overall
+    issues_list = cast(List[Dict[str, Any]], aggregated_results.get("issues", []))
+    aggregated_results["success"] = (
+        not aggregated_results["has_errors"] and len(issues_list) == 0
+    )
+
+    # Add summary information
+    issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+    scanner_names = cast(List[str], aggregated_results["scanner_names"])
+    aggregated_results["summary"] = {
+        "total_files": aggregated_results["files_scanned"],
+        "total_issues": len(issues_list),
+        "scanners_used": scanner_names,
+    }
+
+    # Output results based on format
+    if format == "text" and not output:
+        # Display summary in console
+        click.echo()
+        click.echo(click.style("=== Scan Summary ===", fg="cyan", bold=True))
+        click.echo(f"Files scanned: {aggregated_results['files_scanned']}")
+        click.echo(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
+        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+        click.echo(f"Total issues: {len(issues_list)}")
+        if aggregated_results.get("parallel_scan"):
+            click.echo(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
+        click.echo(f"Duration: {aggregated_results['duration']:.1f}s")
+
+        # Show all issues in detail
+        issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+        issues = list(issues_list)
+        # Filter out DEBUG severity issues when not in verbose mode
+        if not verbose:
+            issues = [issue for issue in issues if not isinstance(issue, dict) or issue.get("severity") != "debug"]
+
+        if issues:
+            click.echo()
+            click.echo(click.style("=== Issues Found ===", fg="red", bold=True))
+            for i, issue in enumerate(issues, 1):
+                if isinstance(issue, dict):
+                    severity = issue.get("severity", "unknown")
+                    severity_colors = {
+                        "critical": "red",
+                        "high": "red",
+                        "medium": "yellow",
+                        "low": "blue",
+                        "info": "green",
+                        "debug": "white",
+                    }
+                    color = severity_colors.get(severity, "white")
+                    click.echo(
+                        f"\n{i}. {click.style(f'[{severity.upper()}]', fg=color, bold=True)} "
+                        f"{issue.get('message', 'Unknown issue')}"
+                    )
+                    if "file_path" in issue:
+                        click.echo(f"   File: {issue['file_path']}")
+                    if "scanner" in issue:
+                        click.echo(f"   Scanner: {issue['scanner']}")
+                    if "details" in issue and isinstance(issue["details"], dict):
+                        for key, value in issue["details"].items():
+                            click.echo(f"   {key}: {value}")
+                else:
+                    click.echo(f"\n{i}. {issue}")
+
     else:
-        # Text format
-        output_text = format_text_output(aggregated_results, verbose)
+        # Convert results to the requested format
+        if format == "json":
+            output_text = json.dumps(aggregated_results, indent=2)
+        elif format == "yaml":
+            import yaml
 
-    # Send output to the specified destination
-    if output:
-        with open(output, "w") as f:
-            f.write(output_text)
-        click.echo(f"Results written to {output}")
-    else:
-        # Add a separator line between debug output and scan results
-        if format == "text":
-            click.echo("\n" + "─" * 80)
-        click.echo(output_text)
+            output_text = yaml.dump(aggregated_results, default_flow_style=False)
+        elif format == "jsonl":
+            # Output each issue as a separate JSON line
+            lines = []
+            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            for issue in issues_list:
+                lines.append(json.dumps(issue))
+            output_text = "\n".join(lines)
+        else:  # text format with output file
+            lines = ["=== ModelAudit Scan Results ==="]
+            lines.append(f"Files scanned: {aggregated_results['files_scanned']}")
+            lines.append(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
+            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            lines.append(f"Total issues: {len(issues_list)}")
+            if aggregated_results.get("parallel_scan"):
+                lines.append(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
+            lines.append(f"Duration: {aggregated_results['duration']:.1f}s")
+            lines.append("")
 
-    # Exit with appropriate error code based on scan results
-    exit_code = determine_exit_code(aggregated_results)
-    sys.exit(exit_code)
+            issues_list = cast(List[Dict[str, Any]], aggregated_results["issues"])
+            if issues_list:
+                lines.append("=== Issues Found ===")
+                for i, issue in enumerate(issues_list, 1):
+                    if isinstance(issue, dict):
+                        lines.append(
+                            f"\n{i}. [{issue.get('severity', 'unknown').upper()}] "
+                            f"{issue.get('message', 'Unknown issue')}"
+                        )
+                        if "file_path" in issue:
+                            lines.append(f"   File: {issue['file_path']}")
+                        if "scanner" in issue:
+                            lines.append(f"   Scanner: {issue['scanner']}")
+                        if "details" in issue and isinstance(issue["details"], dict):
+                            for key, value in issue["details"].items():
+                                lines.append(f"   {key}: {value}")
+                    else:
+                        lines.append(f"\n{i}. {issue}")
+            output_text = "\n".join(lines)
+
+        # Write to file if output path specified
+        if output:
+            try:
+                with open(output, "w") as f:
+                    f.write(output_text)
+                if format == "text":
+                    click.echo(f"Results written to {output}")
+            except Exception as e:
+                logger.error(f"Failed to write output to {output}: {e!s}")
+                sys.exit(1)
+        else:
+            # Print to stdout
+            click.echo(output_text)
+
+    # Exit with appropriate code
+    sys.exit(determine_exit_code(aggregated_results))
 
 
-def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
+def format_text_output(results: Dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
 
@@ -770,8 +1060,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
 
 def _format_issue(
-    issue: dict[str, Any],
-    output_lines: list[str],
+    issue: Dict[str, Any],
+    output_lines: List[str],
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
@@ -821,75 +1111,10 @@ def _format_issue(
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
-@cli.command()
-@click.option(
-    "--show-failed",
-    is_flag=True,
-    help="Show detailed information about failed scanners",
-)
-def doctor(show_failed: bool):
-    """Diagnose scanner compatibility and system status"""
-    import sys
-
-    from .scanners import _registry
-
-    click.echo("ModelAudit System Diagnostics")
-    click.echo("=" * 40)
-
-    # System information
-    click.echo(f"Python version: {sys.version.split()[0]}")
-
-    # NumPy status
-    numpy_compatible, numpy_status = _registry.get_numpy_status()
-    numpy_color = "green" if numpy_compatible else "yellow"
-    click.echo("NumPy status: ", nl=False)
-    click.secho(numpy_status, fg=numpy_color)
-
-    # Scanner status
-    available_scanners = _registry.get_available_scanners()
-    failed_scanners = _registry.get_failed_scanners()
-    loaded_count = len(available_scanners) - len(failed_scanners)
-
-    click.echo("\nScanner Status:")
-    click.echo(f"  Available: {len(available_scanners)} total")
-    click.echo(f"  Loaded: {loaded_count}")
-    click.echo(f"  Failed: {len(failed_scanners)}")
-
-    if show_failed and failed_scanners:
-        click.echo("\nFailed Scanners:")
-        for scanner_id, error_msg in failed_scanners.items():
-            click.echo(f"  {scanner_id}: {error_msg}")
-
-    # Recommendations
-    if failed_scanners:
-        click.echo("\nRecommendations:")
-
-        # Check for NumPy compatibility issues
-        numpy_sensitive_failed = []
-        for scanner_id in failed_scanners:
-            scanner_info = _registry.get_scanner_info(scanner_id)
-            if scanner_info and scanner_info.get("numpy_sensitive", False):
-                numpy_sensitive_failed.append(scanner_id)
-
-        if numpy_sensitive_failed and not numpy_compatible:
-            click.echo("• NumPy compatibility issues detected:")
-            click.echo("  For NumPy 1.x compatibility: pip install 'numpy<2.0'")
-            click.echo("  Then reinstall ML frameworks: pip install --force-reinstall tensorflow torch h5py")
-
-        # Check for missing dependencies
-        missing_deps = set()
-        for scanner_id in failed_scanners:
-            scanner_info = _registry.get_scanner_info(scanner_id)
-            if scanner_info:
-                deps = scanner_info.get("dependencies", [])
-                missing_deps.update(deps)
-
-        if missing_deps:
-            click.echo(f"• Install missing dependencies: pip install modelaudit[{','.join(missing_deps)}]")
-
-    if not failed_scanners:
-        click.secho("✓ All scanners loaded successfully!", fg="green")
-
-
 def main() -> None:
+    """Main entry point"""
+    cli()
+
+
+if __name__ == "__main__":
     cli()

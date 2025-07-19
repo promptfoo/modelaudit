@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from .disk_space import check_disk_space
+
 
 def is_cloud_url(url: str) -> bool:
     """Return True if the URL points to a supported cloud storage provider."""
@@ -17,6 +19,34 @@ def is_cloud_url(url: str) -> bool:
         r"^https?://[^/]+\.r2\.cloudflarestorage\.com/.+",
     ]
     return any(re.match(p, url) for p in patterns)
+
+
+def get_cloud_object_size(fs, url: str) -> Optional[int]:
+    """Get the size of a cloud storage object or directory.
+
+    Args:
+        fs: fsspec filesystem instance
+        url: Cloud storage URL
+
+    Returns:
+        Total size in bytes, or None if size cannot be determined
+    """
+    try:
+        # Check if it's a single file or directory
+        info = fs.info(url)
+        if "size" in info:
+            return info["size"]
+
+        # If it's a directory, sum up all file sizes
+        total_size = 0
+        for item in fs.ls(url, detail=True):
+            if isinstance(item, dict) and "size" in item:
+                total_size += item["size"]
+
+        return total_size if total_size > 0 else None
+    except Exception:
+        # If we can't get the size, return None
+        return None
 
 
 def download_from_cloud(url: str, cache_dir: Optional[Path] = None) -> Path:
@@ -53,5 +83,25 @@ def download_from_cloud(url: str, cache_dir: Optional[Path] = None) -> Path:
         download_path = Path(cache_dir)
         download_path.mkdir(parents=True, exist_ok=True)
 
-    fs.get(url, str(download_path), recursive=True)
-    return download_path
+    # Check available disk space before downloading
+    object_size = get_cloud_object_size(fs, url)
+    if object_size:
+        has_space, message = check_disk_space(download_path, object_size)
+        if not has_space:
+            # Clean up temp directory if we created one
+            if cache_dir is None and download_path.exists():
+                import shutil
+
+                shutil.rmtree(download_path)
+            raise Exception(f"Cannot download from {url}: {message}")
+
+    try:
+        fs.get(url, str(download_path), recursive=True)
+        return download_path
+    except Exception:
+        # Clean up temp directory on failure if we created one
+        if cache_dir is None and download_path.exists():
+            import shutil
+
+            shutil.rmtree(download_path)
+        raise
