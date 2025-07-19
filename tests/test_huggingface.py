@@ -1,12 +1,13 @@
 """Tests for HuggingFace URL handling."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.huggingface import (
     download_model,
+    get_model_size,
     is_huggingface_url,
     parse_huggingface_url,
 )
@@ -157,3 +158,110 @@ class TestModelDownload:
 
         with pytest.raises(ImportError, match="huggingface-hub package is required"):
             download_model("https://huggingface.co/test/model")
+
+
+class TestModelSizeAndDiskSpace:
+    """Test model size retrieval and disk space checking."""
+
+    @patch("builtins.__import__")
+    def test_get_model_size_import_error(self, mock_import):
+        """Test get_model_size returns None when HfApi is not available."""
+
+        def side_effect(name, *args, **kwargs):
+            if name == "huggingface_hub":
+                raise ImportError("No module")
+            return __import__(name, *args, **kwargs)
+
+        mock_import.side_effect = side_effect
+        size = get_model_size("test/model")
+        assert size is None
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_size_success(self, mock_hf_api_class):
+        """Test successful model size retrieval."""
+        # Mock the API and model info
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+
+        # Create mock file info
+        mock_file1 = MagicMock()
+        mock_file1.size = 1024 * 1024  # 1 MB
+        mock_file2 = MagicMock()
+        mock_file2.size = 2048 * 1024  # 2 MB
+
+        mock_model_info = MagicMock()
+        mock_model_info.siblings = [mock_file1, mock_file2]
+        mock_api.model_info.return_value = mock_model_info
+
+        size = get_model_size("test/model")
+        assert size == 3 * 1024 * 1024  # 3 MB total
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_size_no_siblings(self, mock_hf_api_class):
+        """Test model size when no siblings info available."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+
+        mock_model_info = MagicMock()
+        mock_model_info.siblings = None
+        mock_api.model_info.return_value = mock_model_info
+
+        size = get_model_size("test/model")
+        assert size is None
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_size_api_error(self, mock_hf_api_class):
+        """Test model size returns None on API error."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.side_effect = Exception("API error")
+
+        size = get_model_size("test/model")
+        assert size is None
+
+    @patch("modelaudit.utils.huggingface.get_model_size")
+    @patch("modelaudit.utils.huggingface.check_disk_space")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_insufficient_disk_space(
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+    ):
+        """Test download fails gracefully when disk space is insufficient."""
+        # Mock model size
+        mock_get_model_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
+
+        # Mock disk space check to fail
+        mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
+
+        # Test download failure
+        with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
+            download_model("https://huggingface.co/test/model")
+
+        # Verify snapshot_download was not called
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.huggingface.get_model_size")
+    @patch("modelaudit.utils.huggingface.check_disk_space")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_with_disk_space_check(
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+    ):
+        """Test successful download with disk space check."""
+        # Mock model size
+        mock_get_model_size.return_value = 1024 * 1024 * 1024  # 1 GB
+
+        # Mock disk space check to pass
+        mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
+
+        # Mock snapshot download
+        mock_path = "/tmp/test_model"
+        mock_snapshot_download.return_value = mock_path
+
+        # Test download
+        result = download_model("https://huggingface.co/test/model")
+
+        # Verify disk space was checked
+        mock_check_disk_space.assert_called_once()
+
+        # Verify download proceeded
+        mock_snapshot_download.assert_called_once()
+        assert result == Path(mock_path)
