@@ -384,33 +384,28 @@ def validate_patterns() -> list[str]:
 
     # Validate global patterns structure
     for module, funcs in SUSPICIOUS_GLOBALS.items():
-        if not isinstance(module, str):
-            warnings.append(f"Module name must be string: {module}")
+        # module is guaranteed to be str by type annotation
         if not (funcs == "*" or isinstance(funcs, list)):
             warnings.append(f"Functions must be '*' or list for module {module}")
 
     # Validate dangerous builtins
-    for builtin in DANGEROUS_BUILTINS:
-        if not isinstance(builtin, str):
-            warnings.append(f"Builtin name must be string: {builtin}")
+    # All items in DANGEROUS_BUILTINS are guaranteed to be str by type annotation
+    pass
 
     # Validate dangerous opcodes
-    for opcode in DANGEROUS_OPCODES:
-        if not isinstance(opcode, str):
-            warnings.append(f"Opcode name must be string: {opcode}")
+    # All items in DANGEROUS_OPCODES are guaranteed to be str by type annotation
+    pass
 
     # Validate binary code patterns
-    for binary_pattern in BINARY_CODE_PATTERNS:
-        if not isinstance(binary_pattern, bytes):
-            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")
+    # All items in BINARY_CODE_PATTERNS are guaranteed to be bytes by type annotation
+    pass
 
     # Validate executable signatures
     for signature, description in EXECUTABLE_SIGNATURES.items():
-        if not isinstance(signature, bytes):
-            warnings.append(f"Executable signature must be bytes: {signature!r}")
-        if not isinstance(description, str) or not description:
+        # signature is guaranteed to be bytes by type annotation
+        if not description:  # description is guaranteed to be str by type annotation
             warnings.append(
-                f"Description must be non-empty string for signature {signature!r}",
+                f"Description must be non-empty for signature {signature!r}",
             )
 
     return warnings

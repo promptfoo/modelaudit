@@ -26,7 +26,7 @@ except ImportError:
 
 # Try to import yaml, but handle the case where it's not installed
 try:
-    import yaml  # type: ignore
+    import yaml
 
     HAS_YAML = True
 except ImportError:
@@ -277,8 +277,6 @@ class ManifestScanner(BaseScanner):
 
     def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
         """Return license string if found in manifest content"""
-        if not isinstance(content, dict):
-            return None
 
         potential_keys = ["license", "licence", "licenses"]
         for key in potential_keys:

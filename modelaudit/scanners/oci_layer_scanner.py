@@ -9,7 +9,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
 try:
-    import yaml  # type: ignore
+    import yaml
 
     HAS_YAML = True
 except Exception:
@@ -140,8 +140,6 @@ class OciLayerScanner(BaseScanner):
                                     issue.location = f"{path}:{layer_ref}:{name} {issue.location}"
                                 else:
                                     issue.location = f"{path}:{layer_ref}:{name}"
-                                if issue.details is None:
-                                    issue.details = {}
                                 issue.details["layer"] = layer_ref
                             result.merge(file_result)
                         finally:

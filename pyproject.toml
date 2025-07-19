@@ -134,6 +134,8 @@ dev-dependencies = [
     "ruff>=0.10.0",
     "types-PyYAML>=6.0.12.20250516",
     "types-tensorflow>=2.18.0.20250516",
+    "types-requests>=2.31.0",
+    "types-click>=8.1.0",
     "pytest-cov>=6.2.1",
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
@@ -201,9 +203,40 @@ filterwarnings = [
 
 [tool.mypy]
 python_version = "3.9"
-warn_return_any = false
-warn_unused_configs = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
+
+# Phase 1: Immediate improvements to catch real bugs
+warn_return_any = true         # Warn when returning Any from typed functions
+warn_unused_configs = true     # Warn about unused config options
+warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_redundant_casts = true    # Remove unnecessary casts
+warn_unreachable = true        # Detect unreachable code
+no_implicit_optional = true    # Require Optional[] for None defaults
+strict_equality = true         # Stricter comparison checks
+
+# Better error reporting
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+
+# Phase 2: To enable after fixing current issues
+# check_untyped_defs = true      # Type-check untyped function bodies
+# disallow_incomplete_defs = true # Functions with annotations must be fully annotated
+
+# Phase 3: Long-term strict typing goals
+# disallow_untyped_defs = true   # Require type annotations for all functions
+# disallow_any_generics = true   # Require type parameters for generics
+
+# Continue ignoring missing imports for now
 ignore_missing_imports = true
-no_implicit_optional = false
+
+# Per-module overrides for gradual adoption
+[[tool.mypy.overrides]]
+module = "modelaudit.tests.*"
+# Tests can be less strict
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "modelaudit.scanners.*"
+# Scanners use dynamic patterns that need Any
+warn_return_any = false

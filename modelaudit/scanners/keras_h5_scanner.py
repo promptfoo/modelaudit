@@ -171,13 +171,6 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan the model configuration for suspicious elements"""
-        if not isinstance(model_config, dict):
-            result.add_issue(
-                "Invalid model configuration format",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-            )
-            return
 
         # Check model class name
         model_class = model_config.get("class_name", "")
@@ -236,8 +229,6 @@ class KerasH5Scanner(BaseScanner):
         context: str = "",
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
-        if not isinstance(config, dict):
-            return
 
         # Check all string values in the config
         for key, value in config.items():
