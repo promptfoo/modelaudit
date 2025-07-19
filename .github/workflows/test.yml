@@ -302,13 +302,27 @@ jobs:
     steps:
       - name: Check if all jobs succeeded
         run: |
-          if [[ "${{ needs.lint.result }}" == "success" && 
-                "${{ needs.type-check.result }}" == "success" && 
-                "${{ needs.test.result }}" == "success" && 
-                "${{ needs.build.result }}" == "success" ]]; then
-            echo "All CI checks passed!"
-            exit 0
-          else
+          # A job is considered successful if it either succeeded or was skipped
+          # (skipped means the job's conditions weren't met, which is fine)
+          LINT_RESULT="${{ needs.lint.result }}"
+          TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
+          TEST_RESULT="${{ needs.test.result }}"
+          BUILD_RESULT="${{ needs.build.result }}"
+          
+          echo "Job results:"
+          echo "  lint: $LINT_RESULT"
+          echo "  type-check: $TYPE_CHECK_RESULT"
+          echo "  test: $TEST_RESULT"
+          echo "  build: $BUILD_RESULT"
+          
+          # Check if any job failed or was cancelled
+          if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
+                "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
+                "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
+                "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]]; then
             echo "Some CI checks failed!"
             exit 1
+          else
+            echo "All CI checks passed (or were skipped due to path filters)!"
+            exit 0
           fi

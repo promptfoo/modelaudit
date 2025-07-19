@@ -161,8 +161,13 @@ print('Created test model')
     steps:
       - name: Check if required jobs succeeded
         run: |
-          if [[ "${{ needs.build-test-lightweight.result }}" == "success" ]]; then
-            echo "Docker CI checks passed!"
+          LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"
+          echo "Lightweight Docker build result: $LIGHTWEIGHT_RESULT"
+          
+          # Success or skipped are both acceptable
+          # (skipped means the path filters determined the job wasn't needed)
+          if [[ "$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped" ]]; then
+            echo "Docker CI checks passed (or were skipped due to path filters)!"
             exit 0
           else
             echo "Docker CI checks failed!"
