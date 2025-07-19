@@ -37,10 +37,11 @@ npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, 
 
 # CI Checks - ALWAYS run these before committing:
 # 1. rye run ruff format modelaudit/ tests/
-# 2. rye run ruff check --fix modelaudit/ tests/
-# 3. rye run mypy modelaudit/
-# 4. rye run pytest
-# 5. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+# 2. rye run ruff check modelaudit/ tests/  # IMPORTANT: Check without --fix first!
+# 3. rye run ruff check --fix modelaudit/ tests/  # Then fix any issues
+# 4. rye run mypy modelaudit/
+# 5. rye run pytest -n auto -m "not slow and not integration"  # Fast tests first
+# 6. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
 ```
 
 ## Testing Requirements
