@@ -8,6 +8,7 @@ from typing import Any, ClassVar, Optional
 
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
+from ..context.unified_context import UnifiedMLContext
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -197,6 +198,7 @@ class BaseScanner(ABC):
             0,
         )  # Default unlimited
         self._path_validation_result: Optional[ScanResult] = None
+        self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -210,6 +212,18 @@ class BaseScanner(ABC):
     def scan(self, path: str) -> ScanResult:
         """Scan the model file or directory at the given path"""
         pass
+
+    def _initialize_context(self, path: str) -> None:
+        """Initialize the unified context for the current file."""
+        from pathlib import Path as PathlibPath
+        path_obj = PathlibPath(path)
+        file_size = self.get_file_size(path)
+        file_type = path_obj.suffix.lower()
+        self.context = UnifiedMLContext(
+            file_path=path_obj,
+            file_size=file_size,
+            file_type=file_type
+        )
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""

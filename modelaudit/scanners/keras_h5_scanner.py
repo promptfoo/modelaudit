@@ -63,6 +63,9 @@ class KerasH5Scanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a Keras model file for suspicious configurations"""
+        # Initialize context for this file
+        self._initialize_context(path)
+        
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -197,6 +200,8 @@ class KerasH5Scanner(BaseScanner):
 
         # Check each layer
         for layer in layers:
+            if not layer or not isinstance(layer, dict):
+                continue
             layer_class = layer.get("class_name", "")
 
             # Update layer count
@@ -241,6 +246,8 @@ class KerasH5Scanner(BaseScanner):
 
     def _check_lambda_layer(self, layer_config: dict[str, Any], result: ScanResult) -> None:
         """Check Lambda layer for executable Python code with validation"""
+        import re
+        
         # Lambda layers can contain Python code in several forms:
         # 1. As a string in 'function' field (serialized Python code)
         # 2. As a module + function reference
@@ -251,8 +258,24 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
+        # Common safe Lambda patterns for normalization
+        SAFE_LAMBDA_PATTERNS = [
+            r"lambda\s+x\s*:\s*x\s*/\s*\d+",  # lambda x: x / 255
+            r"lambda\s+x\s*:\s*x\s*\*\s*\d+",  # lambda x: x * 2
+            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)",  # lambda x: tf.nn.softmax(x)
+            r"lambda\s+x\s*:\s*K\.\w+\(x",  # lambda x: K.softmax(x)
+            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+",  # lambda x: (x - 128) / 128
+        ]
+
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
+            # First check if it matches safe patterns
+            is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
+            
+            if is_safe_pattern:
+                # This is a safe normalization lambda - don't flag it
+                return
+                
             # This might be serialized Python code
             is_valid, error = validate_python_syntax(function_str)
 
@@ -260,35 +283,37 @@ class KerasH5Scanner(BaseScanner):
                 # It's valid Python! Check if it's dangerous
                 is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
 
-                severity = IssueSeverity.CRITICAL if is_dangerous else IssueSeverity.WARNING
-                issue_msg = f"Lambda layer contains {'dangerous' if is_dangerous else 'executable'} Python code"
-
-                result.add_issue(
-                    issue_msg,
-                    severity=severity,
-                    location=self.current_file_path,
-                    details={
-                        "layer_class": "Lambda",
-                        "code_analysis": risk_desc if is_dangerous else "Contains executable code",
-                        "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
-                        "validation_status": "valid_python",
-                    },
-                    why=get_pattern_explanation("lambda_layer"),
-                )
+                # Only flag if actually dangerous
+                if is_dangerous:
+                    result.add_issue(
+                        f"Lambda layer contains dangerous Python code",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "code_analysis": risk_desc,
+                            "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
+                            "validation_status": "valid_python",
+                        },
+                        why=get_pattern_explanation("lambda_layer"),
+                    )
+                # Don't flag non-dangerous executable code in Lambda layers - it's expected!
             else:
-                # Not valid Python syntax but still suspicious
-                result.add_issue(
-                    "Lambda layer contains suspicious configuration",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={
-                        "layer_class": "Lambda",
-                        "description": self.suspicious_layer_types["Lambda"],
-                        "layer_config": layer_config,
-                        "validation_error": error,
-                    },
-                    why=get_pattern_explanation("lambda_layer"),
-                )
+                # Not valid Python syntax - might be a configuration issue
+                # Only flag if it looks like attempted code execution
+                if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
+                    result.add_issue(
+                        "Lambda layer contains suspicious configuration",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "description": self.suspicious_layer_types["Lambda"],
+                            "layer_config": layer_config,
+                            "validation_error": error,
+                        },
+                        why=get_pattern_explanation("lambda_layer"),
+                    )
         elif module_name or function_name:
             # Module/function reference - check for dangerous imports
             dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
@@ -304,32 +329,8 @@ class KerasH5Scanner(BaseScanner):
                     },
                     why=get_pattern_explanation("lambda_layer"),
                 )
-            else:
-                # Still flag Lambda layers even if we can't analyze the code
-                result.add_issue(
-                    "Lambda layer found (unable to analyze code)",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={
-                        "layer_class": "Lambda",
-                        "description": self.suspicious_layer_types["Lambda"],
-                        "layer_config": layer_config,
-                    },
-                    why=get_pattern_explanation("lambda_layer"),
-                )
-        else:
-            # Lambda layer without analyzable code
-            result.add_issue(
-                "Lambda layer found (configuration unclear)",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={
-                    "layer_class": "Lambda",
-                    "description": self.suspicious_layer_types["Lambda"],
-                    "layer_config": layer_config,
-                },
-                why=get_pattern_explanation("lambda_layer"),
-            )
+            # Don't flag safe module references
+        # Don't flag Lambda layers without code - they might just be placeholders
 
     def _check_config_for_suspicious_strings(
         self,
