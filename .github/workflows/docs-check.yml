@@ -3,20 +3,20 @@ name: Documentation Check
 on:
   pull_request:
     paths:
-      - '**.md'
-      - '**.txt'
-      - '**.rst'
-      - 'LICENSE*'
-      - '.github/workflows/docs-check.yml'
+      - "**.md"
+      - "**.txt"
+      - "**.rst"
+      - "LICENSE*"
+      - ".github/workflows/docs-check.yml"
   push:
     branches:
       - main
     paths:
-      - '**.md'
-      - '**.txt'
-      - '**.rst'
-      - 'LICENSE*'
-      - '.github/workflows/docs-check.yml'
+      - "**.md"
+      - "**.txt"
+      - "**.rst"
+      - "LICENSE*"
+      - ".github/workflows/docs-check.yml"
 
 jobs:
   format-check:
@@ -38,7 +38,7 @@ jobs:
       - name: Check for broken links in markdown
         uses: gaurav-nelson/github-action-markdown-link-check@v1
         with:
-          use-quiet-mode: 'yes'
-          use-verbose-mode: 'no'
-          config-file: '.github/markdown-link-check-config.json'
-        continue-on-error: true  # Don't fail on broken external links
+          use-quiet-mode: "yes"
+          use-verbose-mode: "no"
+          config-file: ".github/markdown-link-check-config.json"
+        continue-on-error: true # Don't fail on broken external links

@@ -5,10 +5,10 @@ on:
     types: [opened, edited, synchronize]
     # Only validate when PR title might have changed
     paths-ignore:
-      - '**.md'
-      - '**.txt'
-      - '**.rst'
-      - 'LICENSE*'
+      - "**.md"
+      - "**.txt"
+      - "**.rst"
+      - "LICENSE*"
   pull_request_target:
     types: [opened, edited]
 

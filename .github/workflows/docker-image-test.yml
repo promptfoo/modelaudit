@@ -3,12 +3,12 @@ name: Docker Image CI
 on:
   pull_request:
     paths:
-      - 'Dockerfile*'
-      - '.dockerignore'
-      - 'modelaudit/**'
-      - 'pyproject.toml'
-      - 'requirements*.lock'
-      - '.github/workflows/docker-image-test.yml'
+      - "Dockerfile*"
+      - ".dockerignore"
+      - "modelaudit/**"
+      - "pyproject.toml"
+      - "requirements*.lock"
+      - ".github/workflows/docker-image-test.yml"
   push:
     branches:
       - main
@@ -43,7 +43,7 @@ jobs:
     # Always run on main branch or if Docker-related files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Increased from 15
+    timeout-minutes: 20 # Increased from 15
     steps:
       - uses: actions/checkout@v4
 
@@ -90,7 +90,7 @@ jobs:
     name: Build and Test Full Docker Image
     needs: [changes, build-test-lightweight]
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # Increased from 45
+    timeout-minutes: 60 # Increased from 45
     # Only run if:
     # 1. On main branch and Docker files changed, OR
     # 2. PR has 'test-full-image' label, OR
@@ -119,7 +119,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=full
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-        timeout-minutes: 40  # Specific timeout for build step
+        timeout-minutes: 40 # Specific timeout for build step
 
       - name: Test full container help command
         run: |
@@ -142,13 +142,7 @@ jobs:
       - name: Test full container with ML model scan
         run: |
           # Create test models for different frameworks
-          docker run --rm -v $(pwd):/data modelaudit:full python -c "
-import pickle
-import numpy as np
-# Create a simple pickle model
-pickle.dump({'weights': np.random.rand(10, 10)}, open('/data/test_numpy.pkl', 'wb'))
-print('Created test model')
-"
+          docker run --rm -v $(pwd):/data modelaudit:full python -c "import pickle; import numpy as np; pickle.dump({'weights': np.random.rand(10, 10)}, open('/data/test_numpy.pkl', 'wb')); print('Created test model')"
           # Scan the model
           docker run --rm -v $(pwd):/data modelaudit:full /data/test_numpy.pkl
 
@@ -163,7 +157,7 @@ print('Created test model')
         run: |
           LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"
           echo "Lightweight Docker build result: $LIGHTWEIGHT_RESULT"
-          
+
           # Success or skipped are both acceptable
           # (skipped means the path filters determined the job wasn't needed)
           if [[ "$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped" ]]; then

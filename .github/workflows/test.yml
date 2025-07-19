@@ -3,11 +3,11 @@ name: Python CI
 on:
   pull_request:
     paths-ignore:
-      - '**.md'
-      - '**.txt'
-      - '**.rst'
-      - 'LICENSE*'
-      - '.github/workflows/docs-check.yml'
+      - "**.md"
+      - "**.txt"
+      - "**.rst"
+      - "LICENSE*"
+      - ".github/workflows/docs-check.yml"
   push:
     branches:
       - main
@@ -308,13 +308,13 @@ jobs:
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           TEST_RESULT="${{ needs.test.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
-          
+
           echo "Job results:"
           echo "  lint: $LINT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  test: $TEST_RESULT"
           echo "  build: $BUILD_RESULT"
-          
+
           # Check if any job failed or was cancelled
           if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
                 "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
