@@ -9,8 +9,6 @@ on:
       - "**.txt"
       - "**.rst"
       - "LICENSE*"
-  pull_request_target:
-    types: [opened, edited]
 
 permissions:
   pull-requests: read
