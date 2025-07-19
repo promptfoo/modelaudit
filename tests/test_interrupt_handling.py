@@ -69,7 +69,7 @@ def test_interrupt_during_scan():
                 pickle.dump(data, f)
 
         # Start scan in subprocess
-        cmd = [sys.executable, "-m", "modelaudit.cli", "scan", temp_dir]
+        cmd = [sys.executable, "-m", "modelaudit", "scan", temp_dir]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Give it time to start
