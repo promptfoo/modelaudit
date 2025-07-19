@@ -10,6 +10,10 @@ from modelaudit.suspicious_symbols import (
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
 )
+from modelaudit.utils.code_validation import (
+    is_code_potentially_dangerous,
+    validate_python_syntax,
+)
 
 from ..explanations import (
     get_import_explanation,
@@ -232,6 +236,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
+    Now includes py_compile validation to reduce false positives.
     """
     import re
 
@@ -240,8 +245,30 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
 
     # Check for ACTUAL dangerous patterns (not just ML magic methods)
     for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
-        if re.search(pattern, s, re.IGNORECASE):
-            return pattern
+        match = re.search(pattern, s, re.IGNORECASE)
+        if match:
+            # If we found a dangerous pattern, check if it's actually valid Python code
+            # This helps reduce false positives from data that just happens to contain these strings
+
+            # Try to extract a reasonable code snippet around the match
+            start = max(0, match.start() - 50)
+            end = min(len(s), match.end() + 50)
+            code_snippet = s[start:end].strip()
+
+            # Check if this looks like actual Python code
+            is_valid, _ = validate_python_syntax(code_snippet)
+            if is_valid:
+                # It's valid Python! Check if it's actually dangerous
+                is_dangerous, risk_desc = is_code_potentially_dangerous(code_snippet, "low")
+                if is_dangerous:
+                    return f"{pattern} (validated as executable code: {risk_desc})"
+            else:
+                # Not valid Python syntax, might be a false positive
+                # Still flag it if it's a very clear pattern
+                if pattern in [r"eval\s*\(", r"exec\s*\(", r"__import__\s*\("]:
+                    return f"{pattern} (suspicious pattern, not valid Python)"
+                # Otherwise, likely a false positive
+                continue
 
     # If we have strong ML context, ignore common ML patterns
     if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.6:
@@ -1257,6 +1284,40 @@ class PickleScanner(BaseScanner):
                                 },
                                 why=get_pattern_explanation("nested_pickle"),
                             )
+                        else:
+                            # Check if decoded content might be Python code
+                            try:
+                                decoded_str = decoded.decode("utf-8", errors="ignore")
+                                if len(decoded_str) > 10 and any(
+                                    pattern in decoded_str
+                                    for pattern in ["import ", "def ", "class ", "eval(", "exec(", "__import__"]
+                                ):
+                                    is_valid, _ = validate_python_syntax(decoded_str)
+                                    if is_valid:
+                                        is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
+                                        if is_dangerous:
+                                            severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+                                            result.add_issue(
+                                                f"Encoded Python code detected ({enc})",
+                                                severity=severity,
+                                                location=f"{self.current_file_path} (pos {pos})",
+                                                details={
+                                                    "position": pos,
+                                                    "opcode": opcode.name,
+                                                    "encoding": enc,
+                                                    "risk_analysis": risk_desc,
+                                                    "code_preview": decoded_str[:100] + "..."
+                                                    if len(decoded_str) > 100
+                                                    else decoded_str,
+                                                },
+                                                why=(
+                                                    "Encoded Python code was found that could be "
+                                                    "executed during unpickling."
+                                                ),
+                                            )
+                            except Exception:
+                                # Not valid UTF-8, skip Python code check
+                                pass
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)

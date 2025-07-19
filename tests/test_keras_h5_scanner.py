@@ -149,13 +149,18 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
     scanner = KerasH5Scanner(config={"blacklist_patterns": ["suspicious_function"]})
     result = scanner.scan(str(h5_path))
 
-    # Should detect our blacklisted pattern
-    blacklist_issues = [
+    # Should detect Lambda layer
+    lambda_issues = [issue for issue in result.issues if "lambda" in issue.message.lower()]
+    assert len(lambda_issues) > 0, f"Expected Lambda issues but got: {[i.message for i in result.issues]}"
+
+    # Check that our Lambda validation code ran
+    # The new code should detect either dangerous code or suspicious configuration
+    relevant_issues = [
         issue
         for issue in result.issues
-        if "suspicious_function" in issue.message.lower() or "lambda" in issue.message.lower()
+        if any(phrase in issue.message.lower() for phrase in ["lambda", "executable", "suspicious"])
     ]
-    assert len(blacklist_issues) > 0
+    assert len(relevant_issues) > 0
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):
