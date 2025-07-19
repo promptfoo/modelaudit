@@ -1,6 +1,5 @@
 """Test interrupt handling functionality."""
 
-import os
 import signal
 import subprocess
 import sys
@@ -70,10 +69,8 @@ def test_interrupt_during_scan():
                 pickle.dump(data, f)
 
         # Start scan in subprocess
-        cmd = [sys.executable, "-m", "modelaudit", "scan", temp_dir]
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        cmd = [sys.executable, "-m", "modelaudit.cli", "scan", temp_dir]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Give it time to start
         time.sleep(0.5)
@@ -85,9 +82,9 @@ def test_interrupt_during_scan():
         stdout, stderr = process.communicate(timeout=10)
 
         # Check for graceful shutdown
-        assert (
-            "Scan interrupted by user" in stdout or "Scan interrupted by user" in stderr
-        ), f"Interrupt message not found. stdout: {stdout}, stderr: {stderr}"
-        
+        assert "Scan interrupted by user" in stdout or "Scan interrupted by user" in stderr, (
+            f"Interrupt message not found. stdout: {stdout}, stderr: {stderr}"
+        )
+
         # Exit code should be 2 (errors) or 1 (issues found)
         assert process.returncode in [1, 2]

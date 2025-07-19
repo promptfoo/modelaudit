@@ -528,18 +528,20 @@ def scan_command(
                             logger.info(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
-                        
+
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
                     logger.info("Stopping scan due to interrupt")
                     aggregated_results["success"] = False
                     issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
-                        issues_list.append({
-                            "message": "Scan interrupted by user",
-                            "severity": "info",
-                            "details": {"interrupted": True},
-                        })
+                        issues_list.append(
+                            {
+                                "message": "Scan interrupted by user",
+                                "severity": "info",
+                                "details": {"interrupted": True},
+                            }
+                        )
                     should_break = True
 
             # Break outside of finally block if interrupted
