@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from .disk_space import check_disk_space
+
 
 def is_huggingface_url(url: str) -> bool:
     """Check if a URL is a HuggingFace model URL."""
@@ -55,6 +57,34 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
         raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
 
+def get_model_size(repo_id: str) -> Optional[int]:
+    """Get the total size of a HuggingFace model repository.
+
+    Args:
+        repo_id: Repository ID (e.g., "namespace/model-name")
+
+    Returns:
+        Total size in bytes, or None if size cannot be determined
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        model_info = api.model_info(repo_id)
+
+        # Calculate total size from all files
+        total_size = 0
+        if hasattr(model_info, "siblings") and model_info.siblings:
+            for file_info in model_info.siblings:
+                if hasattr(file_info, "size") and file_info.size:
+                    total_size += file_info.size
+
+        return total_size if total_size > 0 else None
+    except Exception:
+        # If we can't get the size, return None and proceed with download
+        return None
+
+
 def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
     """Download a model from HuggingFace.
 
@@ -86,6 +116,21 @@ def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
         download_path = Path(temp_dir)
     else:
         download_path = cache_dir / namespace / repo_name
+
+    # Check available disk space before downloading
+    model_size = get_model_size(repo_id)
+    if model_size:
+        # Ensure the parent directory exists for disk space check
+        download_path.mkdir(parents=True, exist_ok=True)
+
+        has_space, message = check_disk_space(download_path, model_size)
+        if not has_space:
+            # Clean up temp directory if we created one
+            if cache_dir is None and download_path.exists():
+                import shutil
+
+                shutil.rmtree(download_path)
+            raise Exception(f"Cannot download model from {url}: {message}")
 
     try:
         # Download the model snapshot
