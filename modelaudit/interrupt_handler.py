@@ -7,14 +7,14 @@ and allows scanners to check for interruption at safe points.
 Usage:
     # In scanning loops:
     from modelaudit.interrupt_handler import check_interrupted
-    
+
     for file in files:
         check_interrupted()  # Raises KeyboardInterrupt if interrupted
         scan_file(file)
-    
+
     # For main scanning context:
     from modelaudit.interrupt_handler import interruptible_scan
-    
+
     with interruptible_scan() as handler:
         # Signal handlers are installed
         perform_scanning()
@@ -32,10 +32,10 @@ logger = logging.getLogger("modelaudit.interrupt")
 
 class InterruptHandler:
     """Manages interrupt signals and provides a way to check if scanning should stop.
-    
+
     This class is thread-safe and handles proper installation/restoration of signal
     handlers. It uses a threading.Event to track interrupt state across threads.
-    
+
     Attributes:
         _interrupted: Threading event that is set when an interrupt is received
         _original_sigint_handler: Saved SIGINT handler to restore later
@@ -53,7 +53,7 @@ class InterruptHandler:
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """Handle interrupt signals.
-        
+
         Args:
             signum: Signal number (SIGINT=2, SIGTERM=15)
             frame: Current stack frame (unused)
@@ -63,7 +63,7 @@ class InterruptHandler:
 
     def is_interrupted(self) -> bool:
         """Check if an interrupt has been requested.
-        
+
         Returns:
             True if an interrupt signal was received, False otherwise
         """
@@ -75,10 +75,10 @@ class InterruptHandler:
 
     def check_interrupted(self) -> None:
         """Check if interrupted and raise KeyboardInterrupt if so.
-        
+
         This method should be called periodically during long-running operations
         to allow for graceful interruption.
-        
+
         Raises:
             KeyboardInterrupt: If an interrupt signal was received
         """
@@ -88,10 +88,10 @@ class InterruptHandler:
     @contextmanager
     def install_handlers(self):
         """Context manager to install and uninstall signal handlers.
-        
+
         This ensures signal handlers are properly restored even if an
         exception occurs. Handles nested contexts gracefully.
-        
+
         Yields:
             None
         """
@@ -124,7 +124,7 @@ _interrupt_handler = InterruptHandler()
 
 def get_interrupt_handler() -> InterruptHandler:
     """Get the global interrupt handler instance.
-    
+
     Returns:
         The singleton InterruptHandler instance used throughout the application
     """
@@ -133,13 +133,13 @@ def get_interrupt_handler() -> InterruptHandler:
 
 def check_interrupted() -> None:
     """Check if interrupted and raise KeyboardInterrupt if so.
-    
+
     This is a convenience function that uses the global interrupt handler.
     Call this periodically in long-running loops to enable graceful interruption.
-    
+
     Raises:
         KeyboardInterrupt: If an interrupt signal was received
-    
+
     Example:
         for item in large_list:
             check_interrupted()  # Allow interruption between items
@@ -150,10 +150,10 @@ def check_interrupted() -> None:
 
 def is_interrupted() -> bool:
     """Check if an interrupt has been requested.
-    
+
     This is a convenience function that uses the global interrupt handler.
     Unlike check_interrupted(), this does not raise an exception.
-    
+
     Returns:
         True if an interrupt signal was received, False otherwise
     """
@@ -162,7 +162,7 @@ def is_interrupted() -> bool:
 
 def reset_interrupt() -> None:
     """Reset the interrupt state.
-    
+
     Clears any pending interrupt flag. This is typically called at the
     start of a new scanning operation.
     """
@@ -172,14 +172,14 @@ def reset_interrupt() -> None:
 @contextmanager
 def interruptible_scan():
     """Context manager for interruptible scanning operations.
-    
+
     This installs signal handlers for SIGINT and SIGTERM, allowing the
     scanning operation to be interrupted gracefully. The interrupt state
     is reset at the start, and signal handlers are restored on exit.
-    
+
     Yields:
         InterruptHandler: The interrupt handler instance for checking state
-    
+
     Example:
         with interruptible_scan() as handler:
             for file in files_to_scan:
