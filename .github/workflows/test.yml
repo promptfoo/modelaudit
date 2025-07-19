@@ -2,6 +2,12 @@ name: Python CI
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - '**.rst'
+      - 'LICENSE*'
+      - '.github/workflows/docs-check.yml'
   push:
     branches:
       - main
@@ -12,9 +18,41 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # First, determine what changed to optimize subsequent jobs
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            python:
+              - '**.py'
+              - 'pyproject.toml'
+              - 'requirements*.lock'
+            docker:
+              - 'Dockerfile*'
+              - '.dockerignore'
+            workflows:
+              - '.github/workflows/**'
+            dependencies:
+              - 'pyproject.toml'
+              - 'requirements*.lock'
+
   lint:
     name: Lint and Format
+    needs: changes
+    # Always run on main branch, otherwise only if Python files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -53,7 +91,11 @@ jobs:
 
   type-check:
     name: Type Check
+    needs: [changes, lint]
+    # Only run if Python files changed and linting passed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -84,11 +126,16 @@ jobs:
 
   test:
     name: Test Python ${{ matrix.python-version }}
+    needs: [changes, lint]
+    # Only run if Python files changed and linting passed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # For PRs, only test min and max Python versions to save time
+        # For main branch, test all versions
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -135,10 +182,15 @@ jobs:
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    needs: [changes, lint]
+    # Only run on main branch or if dependencies changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
-        python-version: ["3.9", "3.11", "3.12"]
+        # Reduced matrix for PRs
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.9", "3.11", "3.12"]') }}
         numpy-mode: ["1.x", "2.x"]
     steps:
       - name: Checkout repo
@@ -202,8 +254,11 @@ jobs:
 
   build:
     name: Build and Package
-    needs: [lint, type-check]
+    needs: [changes, lint, type-check]
+    # Always build on main, otherwise only if Python files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -237,3 +292,23 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  # Summary job to ensure all required checks pass
+  ci-success:
+    name: CI Success
+    needs: [lint, type-check, test, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if all jobs succeeded
+        run: |
+          if [[ "${{ needs.lint.result }}" == "success" && 
+                "${{ needs.type-check.result }}" == "success" && 
+                "${{ needs.test.result }}" == "success" && 
+                "${{ needs.build.result }}" == "success" ]]; then
+            echo "All CI checks passed!"
+            exit 0
+          else
+            echo "Some CI checks failed!"
+            exit 1
+          fi
