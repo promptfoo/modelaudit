@@ -154,7 +154,7 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
     closed = {}
 
     class TrackedBytesIO(io.BytesIO):
-        def close(self) -> None:  # type: ignore[override]
+        def close(self) -> None:
             closed["closed"] = True
             super().close()
 

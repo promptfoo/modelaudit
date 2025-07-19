@@ -342,7 +342,7 @@ class TestUtilityFunctions:
         original_strings = SUSPICIOUS_STRING_PATTERNS.copy()
 
         try:
-            SUSPICIOUS_GLOBALS[123] = "*"  # type: ignore[assignment,index]
+            SUSPICIOUS_GLOBALS[123] = "*"  # type: ignore[index]
             SUSPICIOUS_GLOBALS["valid_module"] = 123  # type: ignore[assignment]
             DANGEROUS_BUILTINS.append(123)  # type: ignore[arg-type]
             DANGEROUS_OPCODES.add(123)  # type: ignore[arg-type]
