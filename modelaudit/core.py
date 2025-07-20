@@ -135,6 +135,7 @@ def scan_model_directory_or_file(
             limit_reached = False
 
             base_dir = Path(path).resolve()
+            scanned_paths: set[str] = set()
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -176,81 +177,98 @@ def scan_model_directory_or_file(
                         )
                         continue
 
-                    # Check for interrupts
-                    check_interrupted()
+                    target_paths = [resolved_file]
+                    if file.endswith(".dvc"):
+                        dvc_targets = resolve_dvc_file(file_path)
+                        if dvc_targets:
+                            target_paths = [Path(t).resolve() for t in dvc_targets]
 
-                    # Check timeout
-                    if time.time() - start_time > timeout:
-                        raise TimeoutError(f"Scan timeout after {timeout} seconds")
-
-                    # Update progress
-                    if progress_callback and total_files > 0:
-                        processed_files += 1
-                        progress_callback(
-                            f"Scanning file {processed_files}/{total_files}: {file}",
-                            processed_files / total_files * 100,
-                        )
-
-                    # Scan the file
-                    try:
-                        # Check for interrupts before scanning each file
-                        check_interrupted()
-
-                        # Use resolved_file path for actual scanning (handles symlinks)
-                        file_result = scan_file(str(resolved_file), config)
-                        # Use cast to help mypy understand the types
-                        results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-                        results["files_scanned"] = cast(int, results["files_scanned"]) + 1  # Increment file count
-
-                        # Track scanner name
-                        scanner_name = file_result.scanner_name
-                        scanners_list = cast(list[str], results["scanners"])
-                        if scanner_name and scanner_name not in scanners_list:
-                            scanners_list.append(scanner_name)
-
-                        # Add issues from file scan
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
-                        for issue in file_result.issues:
-                            issues_list.append(issue.to_dict())
-
-                        # Add to assets list for inventory
-                        _add_asset_to_results(results, file_path, file_result)
-
-                        # Save metadata for SBOM generation
-                        file_meta = cast(dict[str, Any], results["file_metadata"])
-                        # Merge scanner metadata with license metadata
-                        license_metadata = collect_license_metadata(file_path)
-                        combined_metadata = {**file_result.metadata, **license_metadata}
-                        file_meta[file_path] = combined_metadata
-
-                        if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
+                    for target_path in target_paths:
+                        target_str = str(target_path)
+                        if target_str in scanned_paths:
+                            continue
+                        scanned_paths.add(target_str)
+                        if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
+                            issues_list = cast(list[dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
-                                    "message": f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
-                                    f"(max: {max_total_size})",
-                                    "severity": IssueSeverity.WARNING.value,
-                                    "location": file_path,
-                                    "details": {"max_total_size": max_total_size},
+                                    "message": "Path traversal outside scanned directory",
+                                    "severity": IssueSeverity.CRITICAL.value,
+                                    "location": str(target_path),
+                                    "details": {"resolved_path": str(target_path)},
                                 },
                             )
-                            limit_reached = True
+                            continue
+
+                        # Check for interrupts
+                        check_interrupted()
+
+                        # Check timeout
+                        if time.time() - start_time > timeout:
+                            raise TimeoutError(f"Scan timeout after {timeout} seconds")
+
+                        # Update progress
+                        if progress_callback and total_files > 0:
+                            processed_files += 1
+                            progress_callback(
+                                f"Scanning file {processed_files}/{total_files}: {Path(target_path).name}",
+                                processed_files / total_files * 100,
+                            )
+
+                        try:
+                            # Check for interrupts before scanning each file
+                            check_interrupted()
+
+                            file_result = scan_file(str(target_path), config)
+                            results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                            results["files_scanned"] = cast(int, results["files_scanned"]) + 1
+
+                            scanner_name = file_result.scanner_name
+                            scanners_list = cast(list[str], results["scanners"])
+                            if scanner_name and scanner_name not in scanners_list:
+                                scanners_list.append(scanner_name)
+
+                            issues_list = cast(list[dict[str, Any]], results["issues"])
+                            for issue in file_result.issues:
+                                issues_list.append(issue.to_dict())
+
+                            _add_asset_to_results(results, str(target_path), file_result)
+
+                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            license_metadata = collect_license_metadata(str(target_path))
+                            combined_metadata = {**file_result.metadata, **license_metadata}
+                            file_meta[str(target_path)] = combined_metadata
+
+                            if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
+                                issues_list.append(
+                                    {
+                                        "message": (
+                                            f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                                            f"(max: {max_total_size})"
+                                        ),
+                                        "severity": IssueSeverity.WARNING.value,
+                                        "location": str(target_path),
+                                        "details": {"max_total_size": max_total_size},
+                                    }
+                                )
+                                limit_reached = True
+                                break
+                        except Exception as e:
+                            logger.warning(f"Error scanning file {target_path}: {e!s}")
+                            issues_list = cast(list[dict[str, Any]], results["issues"])
+                            issues_list.append(
+                                {
+                                    "message": f"Error scanning file: {e!s}",
+                                    "severity": IssueSeverity.WARNING.value,
+                                    "location": str(target_path),
+                                    "details": {"exception_type": type(e).__name__},
+                                }
+                            )
+                            _add_error_asset_to_results(results, str(target_path))
+                        if limit_reached:
                             break
-                    except Exception as e:
-                        logger.warning(f"Error scanning file {file_path}: {e!s}")
-                        # Add as an issue
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
-                        issues_list.append(
-                            {
-                                "message": f"Error scanning file: {e!s}",
-                                "severity": IssueSeverity.WARNING.value,
-                                "location": file_path,
-                                "details": {"exception_type": type(e).__name__},
-                            },
-                        )
-                        # Add error entry to assets
-                        _add_error_asset_to_results(results, file_path)
-                if limit_reached:
-                    break
+                    if limit_reached:
+                        break
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.info("Scan terminated early due to total size limit")
