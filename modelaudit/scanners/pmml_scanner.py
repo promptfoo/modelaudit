@@ -5,7 +5,7 @@ from typing import ClassVar
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
-    from defusedxml import ElementTree as DefusedET  # type: ignore
+    from defusedxml import ElementTree as DefusedET
 
     HAS_DEFUSEDXML = True
 except ImportError:  # pragma: no cover - defusedxml may not be installed
@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - defusedxml may not be installed
 
 # Only import unsafe XML as fallback
 if not HAS_DEFUSEDXML:
-    import xml.etree.ElementTree as UnsafeET  # type: ignore
+    import xml.etree.ElementTree as UnsafeET
 
 
 SUSPICIOUS_PATTERNS = [

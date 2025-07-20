@@ -243,9 +243,6 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     """
     import re
 
-    if not isinstance(s, str):
-        return None
-
     # Check for ACTUAL dangerous patterns (not just ML magic methods)
     for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
         match = re.search(pattern, s, re.IGNORECASE)
@@ -528,9 +525,6 @@ def is_suspicious_global(mod: str, func: str) -> bool:
 def is_suspicious_string(s: str) -> Optional[str]:
     """Check if a string contains suspicious patterns"""
     import re
-
-    if not isinstance(s, str):
-        return None
 
     for pattern in SUSPICIOUS_STRING_PATTERNS:
         match = re.search(pattern, s)

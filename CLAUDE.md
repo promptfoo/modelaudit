@@ -148,6 +148,7 @@ docker run -v $(pwd):/data modelaudit /data/model.pkl
 
 ## Commit Conventions
 
+- **NEVER commit directly to the main branch** - always create a feature branch
 - Use Conventional Commit format for ALL commit messages (e.g., `feat:`, `fix:`, `docs:`, `chore:`, `test:`, `refactor:`)
 - Keep commit messages concise and descriptive
 - Examples:
@@ -158,6 +159,7 @@ docker run -v $(pwd):/data modelaudit /data/model.pkl
 
 ## Pull Request Guidelines
 
+- **IMPORTANT**: Never push directly to main branch - always create a feature branch first
 - **Branch naming**: Use conventional commit format (e.g., `feat/scanner-improvements`, `fix/pickle-parsing`, `chore/update-deps`)
 - Create PRs using the GitHub CLI: `gh pr create`
 - Keep PR bodies short and focused

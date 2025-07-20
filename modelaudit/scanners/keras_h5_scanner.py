@@ -129,7 +129,14 @@ class KerasH5Scanner(BaseScanner):
                 model_config = json.loads(model_config_str)
 
                 # Scan model configuration
-                self._scan_model_config(model_config, result)
+                if isinstance(model_config, dict):
+                    self._scan_model_config(model_config, result)
+                else:
+                    result.add_issue(
+                        f"Invalid model config type: expected dict, got {type(model_config).__name__}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                    )
 
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
@@ -178,13 +185,6 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan the model configuration for suspicious elements"""
-        if not isinstance(model_config, dict):
-            result.add_issue(
-                "Invalid model configuration format",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-            )
-            return
 
         # Check model class name
         model_class = model_config.get("class_name", "")
@@ -193,14 +193,27 @@ class KerasH5Scanner(BaseScanner):
         # Collect all layers
         layers = []
         if "config" in model_config and "layers" in model_config["config"]:
-            layers = model_config["config"]["layers"]
+            layers_value = model_config["config"]["layers"]
+            if isinstance(layers_value, list):
+                layers = layers_value
+            else:
+                result.add_issue(
+                    f"Invalid layers type: expected list, got {type(layers_value).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
 
         # Check each layer
         for layer in layers:
-            if not layer or not isinstance(layer, dict):
+            if not isinstance(layer, dict):
+                result.add_issue(
+                    f"Invalid layer type: expected dict, got {type(layer).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                )
                 continue
             layer_class = layer.get("class_name", "")
 
@@ -238,7 +251,7 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # If there are nested models, scan them recursively
-            if layer_class == "Model" and "config" in layer and "layers" in layer["config"]:
+            if layer_class == "Model" and "config" in layer and "layers" in layer["config"] and isinstance(layer, dict):
                 self._scan_model_config(layer, result)
 
         # Add layer counts to metadata
@@ -334,11 +347,13 @@ class KerasH5Scanner(BaseScanner):
 
     def _check_config_for_suspicious_strings(
         self,
-        config: dict[str, Any],
+        config: Any,
         result: ScanResult,
         context: str = "",
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
+
+        # Validate config is actually a dict
         if not isinstance(config, dict):
             return
 
