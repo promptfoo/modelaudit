@@ -282,3 +282,17 @@ def test_base_scanner_small_file_handling(tmp_path):
 
     # Should return None (path is valid) - small files can't be validated
     assert result is None
+
+
+def test_base_scanner_read_file_safely(tmp_path):
+    """_read_file_safely should return bytes with chunking."""
+    scanner = MockScanner(config={"chunk_size": 4})
+
+    file_path = tmp_path / "data.test"
+    content = b"0123456789"
+    file_path.write_bytes(content)
+
+    data = scanner._read_file_safely(str(file_path))
+
+    assert isinstance(data, bytes)
+    assert data == content

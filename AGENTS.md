@@ -129,16 +129,25 @@ class MyScanner(BaseScanner):
 
 ### Scanner Registration
 
-Add new scanners to `SCANNER_REGISTRY` in `modelaudit/scanners/__init__.py`:
+Scanners are registered lazily via `ScannerRegistry` in
+`modelaudit/scanners/__init__.py`. `SCANNER_REGISTRY` exposes a lazy list of
+available scanner classes. To register a new scanner, add its metadata to the
+`_scanners` dictionary inside `ScannerRegistry._init_registry`:
 
 ```python
-SCANNER_REGISTRY = [
-    PickleScanner,
-    PyTorchZipScanner,
-    # ... existing scanners
-    MyScanner,  # Add here
-]
+self._scanners["my_scanner"] = {
+    "module": "modelaudit.scanners.my_scanner",
+    "class": "MyScanner",
+    "description": "Scans My format",
+    "extensions": [".my"],
+    "priority": 10,
+    "dependencies": [],
+    "numpy_sensitive": False,
+}
 ```
+
+After adding the entry, the scanner will appear in `SCANNER_REGISTRY` when it is
+first accessed.
 
 ### Issue Reporting
 
@@ -148,12 +157,12 @@ Use the `ScanResult` and `Issue` classes for consistent reporting:
 # Report security issues
 result.add_issue(
     "Detected malicious code execution",
-    severity=IssueSeverity.ERROR,
+    severity=IssueSeverity.CRITICAL,
     location=path,
     details={"pattern": "os.system", "position": 123}
 )
 
-# Severity levels: ERROR, WARNING, INFO, DEBUG
+# Valid severity levels: DEBUG, INFO, WARNING, CRITICAL
 ```
 
 ## 🧪 Testing Guidelines

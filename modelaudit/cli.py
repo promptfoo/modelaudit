@@ -757,7 +757,7 @@ def scan_command(
 
         sbom_text = generate_sbom(expanded_paths, aggregated_results)
         try:
-            with open(sbom, "w") as f:
+            with open(sbom, "w", encoding="utf-8") as f:
                 f.write(sbom_text)
             if verbose:
                 logger.info(f"SBOM written to {sbom}")
@@ -869,7 +869,7 @@ def scan_command(
         # Write to file if output path specified
         if output:
             try:
-                with open(output, "w") as f:
+                with open(output, "w", encoding="utf-8") as f:
                     f.write(output_text)
                 if format == "text":
                     click.echo(f"Results written to {output}")
