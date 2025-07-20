@@ -148,12 +148,12 @@ Use the `ScanResult` and `Issue` classes for consistent reporting:
 # Report security issues
 result.add_issue(
     "Detected malicious code execution",
-    severity=IssueSeverity.ERROR,
+    severity=IssueSeverity.CRITICAL,
     location=path,
     details={"pattern": "os.system", "position": 123}
 )
 
-# Severity levels: ERROR, WARNING, INFO, DEBUG
+# Valid severity levels: DEBUG, INFO, WARNING, CRITICAL
 ```
 
 ## 🧪 Testing Guidelines
