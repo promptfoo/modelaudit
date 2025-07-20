@@ -538,7 +538,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning
+    - 2: Operational errors occurred during scanning or no files scanned
 
     Args:
         results: Dictionary with scan results
@@ -548,6 +548,11 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     """
     # Check for operational errors first (highest priority)
     if results.get("has_errors", False):
+        return 2
+
+    # Check if no files were scanned
+    files_scanned = results.get("files_scanned", 0)
+    if files_scanned == 0:
         return 2
 
     # Check for any security findings (warnings, errors, or info issues)

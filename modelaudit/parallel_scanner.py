@@ -170,7 +170,10 @@ class ParallelScanner:
             future_to_work = {executor.submit(_scan_file_worker, item): item for item in work_items}
 
             # Process results as they complete
-            for future in as_completed(future_to_work, timeout=self.timeout_per_file * len(file_paths)):
+            # Use a reasonable overall timeout instead of cumulative per-file timeouts
+            # Add 60 seconds to the per-file timeout as a buffer for overall completion
+            overall_timeout = self.timeout_per_file + 60
+            for future in as_completed(future_to_work, timeout=overall_timeout):
                 work_item = future_to_work[future]
 
                 try:
