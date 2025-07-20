@@ -54,7 +54,7 @@ model:
 [tool_call: write_file to create 'modelaudit/scanners/newformat_scanner.py']
 [tool_call: write_file to create 'tests/test_newformat_scanner.py']
 Files created. Now, running verification...
-[tool_call: run_shell_command for 'pytest tests/test_newformat_scanner.py && black . && biome check --apply .']
+[tool_call: run_shell_command for 'pytest tests/test_newformat_scanner.py && black . && prettier --write .']
 (After verification passes)
 All checks passed. Would you like me to commit these changes?
 </example>
