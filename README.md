@@ -117,8 +117,9 @@ NO_COLOR=1 modelaudit models/
 ### **Third-Party Model Validation**
 
 ```bash
-# Scan models from HuggingFace or cloud storage
+# Scan models from HuggingFace, PyTorch Hub, or cloud storage
 modelaudit https://huggingface.co/gpt2
+modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
 modelaudit s3://my-bucket/downloaded-model.pt
 ```
 
