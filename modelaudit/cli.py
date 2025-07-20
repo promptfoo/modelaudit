@@ -326,7 +326,7 @@ def scan_command(
                     # Show download progress with spinner if appropriate
                     download_spinner = None
                     if format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text=f"Downloading model files...")
+                        download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
                         download_spinner.start()
 
                     try:

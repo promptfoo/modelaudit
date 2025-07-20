@@ -37,7 +37,9 @@ class TestCacheDirOption:
         result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
 
         # Verify download was called with the cache directory
-        mock_download_model.assert_called_once_with("hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=True)
+        mock_download_model.assert_called_once_with(
+            "hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=True
+        )
         assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_from_cloud")
