@@ -692,6 +692,16 @@ def scan_command(
                             spinner.text = f"Scanned {click.style(path, fg='cyan')}"
                             spinner.ok(click.style("✅ Clean", fg="green", bold=True))
 
+                except FileNotFoundError as e:
+                    # Show error if in text mode and not writing to a file
+                    if spinner:
+                        spinner.text = f"Path not found: {click.style(path, fg='cyan')}"
+                        spinner.fail(click.style("❌ Not Found", fg="red", bold=True))
+
+                    logger.error(f"Path does not exist: {path}")
+                    click.echo(str(e), err=True)
+                    aggregated_results["has_errors"] = True
+
                 except Exception as e:
                     # Show error if in text mode and not writing to a file
                     if spinner:

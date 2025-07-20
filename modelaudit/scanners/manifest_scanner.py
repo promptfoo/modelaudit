@@ -93,6 +93,7 @@ class ManifestScanner(BaseScanner):
             "feature_extractor_config.json",  # Feature extraction config
             "image_processor_config.json",  # Image processing config
             "scheduler_config.json",  # Learning rate scheduler config
+            "tokenizer_config.json",  # Tokenizer configuration
             # Model metadata and manifest files specific to ML
             "model_index.json",  # Diffusion model index
             "model_card.json",  # Model card metadata
@@ -115,19 +116,14 @@ class ManifestScanner(BaseScanner):
             return True
 
         # Additional check: files with "config" in name that are in ML model context
-        # (but exclude tokenizer configs and general software configs)
-        if (
-            "config" in filename
-            and "tokenizer" not in filename
-            and filename
-            not in [
-                "config.py",
-                "config.yaml",
-                "config.yml",
-                "config.ini",
-                "config.cfg",
-            ]
-        ):
+        # (but exclude general software configs)
+        if "config" in filename and filename not in [
+            "config.py",
+            "config.yaml",
+            "config.yml",
+            "config.ini",
+            "config.cfg",
+        ]:
             # Only if it's likely an ML model config
             # (has model-related terms in path or specific extensions)
             path_lower = path.lower()

@@ -301,14 +301,25 @@ class ParallelScanner:
                 results["issues"].append(issue)
 
             # Add to assets
-            results["assets"].append(
-                {
-                    "path": work_result.file_path,
-                    "type": "file",
-                    "scanned": True,
-                    "scanner": scanner_name,
-                }
-            )
+            asset_entry = {
+                "path": work_result.file_path,
+                "type": scanner_name,
+                "scanned": True,
+                "scanner": scanner_name,
+            }
+
+            # Add metadata keys if available
+            metadata = result_data.get("metadata", {})
+            if "keys" in metadata:
+                asset_entry["keys"] = metadata["keys"]
+            if "file_size" in metadata:
+                asset_entry["size"] = metadata["file_size"]
+            if "tensors" in metadata:
+                asset_entry["tensors"] = metadata["tensors"]
+            if "contents" in metadata:
+                asset_entry["contents"] = metadata["contents"]
+
+            results["assets"].append(asset_entry)
 
             # Store metadata
             results["file_metadata"][work_result.file_path] = result_data.get("metadata", {})

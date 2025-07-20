@@ -25,7 +25,6 @@ def _should_skip_file(file_path: str) -> bool:
         # Documentation
         ".md",
         ".rst",
-        ".txt",
         ".doc",
         ".docx",
         ".pdf",

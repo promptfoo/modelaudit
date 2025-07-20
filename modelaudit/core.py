@@ -132,7 +132,7 @@ def scan_model_directory_or_file(
         if os.path.isdir(path):
             # Use parallel scanning if enabled and we have the parallel_directory module
             logger.debug(f"Directory scan: parallel={parallel}, config keys={list(config.keys())}")
-            if parallel and "parallel" not in config:
+            if parallel:
                 try:
                     from modelaudit.parallel_directory import scan_directory_parallel
 
