@@ -45,7 +45,7 @@ def should_show_spinner() -> bool:
 def style_text(text: str, **kwargs) -> str:
     """Style text only if colors are enabled."""
     if should_use_color():
-        return style_text(text, **kwargs)
+        return click.style(text, **kwargs)
     return text
 
 
@@ -295,9 +295,7 @@ def scan_command(
                     # Show download progress if in text mode
                     download_spinner = None
                     if format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(
-                            Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}"
-                        )
+                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
                     elif format == "text" and not output:
                         click.echo(f"Downloading from {path}...")
@@ -309,12 +307,16 @@ def scan_command(
                         # Track the temp directory for cleanup
                         temp_dir = str(download_path)
 
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Downloaded successfully")
 
                     except Exception as e:
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Download failed")
 
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
@@ -338,23 +340,28 @@ def scan_command(
 
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
-                    if format == "text" and not output:
-                        download_spinner = yaspin(
-                            Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}"
-                        )
+                    download_spinner = None
+                    if format == "text" and not output and should_show_spinner():
+                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
+                    elif format == "text" and not output:
+                        click.echo(f"Downloading from {path}...")
 
                     try:
                         download_path = download_from_cloud(path, cache_dir=Path(cache_dir) if cache_dir else None)
                         actual_path = str(download_path)
                         temp_dir = str(download_path)
 
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Downloaded successfully")
 
                     except Exception as e:
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Download failed")
 
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
@@ -379,11 +386,12 @@ def scan_command(
                 # Check if this is an MLflow URI
                 elif is_mlflow_uri(path):
                     # Show download progress if in text mode
-                    if format == "text" and not output:
-                        download_spinner = yaspin(
-                            Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}"
-                        )
+                    download_spinner = None
+                    if format == "text" and not output and should_show_spinner():
+                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
+                    elif format == "text" and not output:
+                        click.echo(f"Downloading from {path}...")
 
                     try:
                         from .mlflow_integration import scan_mlflow_model
@@ -398,8 +406,10 @@ def scan_command(
                             max_total_size=max_total_size,
                         )
 
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
@@ -418,8 +428,10 @@ def scan_command(
                         continue
 
                     except Exception as e:
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Download failed")
 
                         logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                         click.echo(f"Error downloading model from {path}: {e!s}", err=True)
@@ -428,11 +440,12 @@ def scan_command(
 
                 # Check if this is a JFrog URL
                 elif is_jfrog_url(path):
-                    if format == "text" and not output:
-                        download_spinner = yaspin(
-                            Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}"
-                        )
+                    download_spinner = None
+                    if format == "text" and not output and should_show_spinner():
+                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
+                    elif format == "text" and not output:
+                        click.echo(f"Downloading from {path}...")
 
                     try:
                         download_path = download_artifact(
@@ -444,12 +457,16 @@ def scan_command(
                         actual_path = str(download_path)
                         temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Downloaded successfully")
 
                     except Exception as e:
-                        if format == "text" and not output:
+                        if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Download failed")
 
                         logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                         click.echo(f"Error downloading model from {path}: {e!s}", err=True)
@@ -483,10 +500,12 @@ def scan_command(
 
                 # Show progress indicator if in text mode and not writing to a file
                 spinner = None
-                if format == "text" and not output:
+                if format == "text" and not output and should_show_spinner():
                     spinner_text = f"Scanning {style_text(path, fg='cyan')}"
                     spinner = yaspin(Spinners.dots, text=spinner_text)
                     spinner.start()
+                elif format == "text" and not output:
+                    click.echo(f"Scanning {path}...")
 
                 # Perform the scan with the specified options
                 try:
@@ -535,7 +554,8 @@ def scan_command(
                                 if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
                             ]
                             issue_count = len(visible_issues)
-                            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                            if spinner:
+                                spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                             if issue_count > 0:
                                 # Determine severity for coloring
                                 has_critical = any(
@@ -562,14 +582,19 @@ def scan_command(
                             else:
                                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
                         else:
-                            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
-                            spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                            if spinner:
+                                spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                                spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                            elif format == "text" and not output:
+                                click.echo(f"Scanned {path}: Clean")
 
                 except Exception as e:
                     # Show error if in text mode and not writing to a file
                     if spinner:
                         spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
                         spinner.fail(style_text("❌ Error", fg="red", bold=True))
+                    elif format == "text" and not output:
+                        click.echo(f"Error scanning {path}")
 
                     logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error scanning {path}: {e!s}", err=True)

@@ -121,6 +121,7 @@ ModelAudit automatically adapts its output for CI environments:
 - **Exit Codes**: 0 (no issues), 1 (issues found), 2 (scan errors)
 
 Example CI usage:
+
 ```bash
 # JSON output for parsing (recommended)
 modelaudit model.pkl --format json --output results.json

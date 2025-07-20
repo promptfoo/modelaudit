@@ -108,6 +108,7 @@ NO_COLOR=1 modelaudit models/
 ```
 
 **CI-Friendly Features:**
+
 - 🚫 Spinners automatically disabled when output is piped or in CI
 - 🎨 Colors disabled when `NO_COLOR` environment variable is set
 - 📊 JSON output recommended for parsing in CI pipelines
