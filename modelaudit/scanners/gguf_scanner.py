@@ -385,33 +385,33 @@ class GgufScanner(BaseScanner):
         """Read a value of the specified type with security checks."""
         if vtype == 0:  # UINT8
             return struct.unpack("<B", f.read(1))[0]
-        elif vtype == 1:  # INT8
+        if vtype == 1:  # INT8
             return struct.unpack("<b", f.read(1))[0]
-        elif vtype == 2:  # UINT16
+        if vtype == 2:  # UINT16
             return struct.unpack("<H", f.read(2))[0]
-        elif vtype == 3:  # INT16
+        if vtype == 3:  # INT16
             return struct.unpack("<h", f.read(2))[0]
-        elif vtype == 4:  # UINT32
+        if vtype == 4:  # UINT32
             return struct.unpack("<I", f.read(4))[0]
-        elif vtype == 5:  # INT32
+        if vtype == 5:  # INT32
             return struct.unpack("<i", f.read(4))[0]
-        elif vtype == 6:  # FLOAT32
+        if vtype == 6:  # FLOAT32
             return struct.unpack("<f", f.read(4))[0]
-        elif vtype == 7:  # BOOL
+        if vtype == 7:  # BOOL
             return struct.unpack("<B", f.read(1))[0] != 0
-        elif vtype == 8:  # STRING
+        if vtype == 8:  # STRING
             return self._read_string(f)
-        elif vtype == 9:  # ARRAY
+        if vtype == 9:  # ARRAY
             subtype = struct.unpack("<I", f.read(4))[0]
             (count,) = struct.unpack("<Q", f.read(8))
             if count > 10000:  # Prevent DoS
                 raise ValueError(f"Array too large: {count} elements")
             return [self._read_value(f, subtype) for _ in range(count)]
-        elif vtype == 10:  # UINT64
+        if vtype == 10:  # UINT64
             return struct.unpack("<Q", f.read(8))[0]
-        elif vtype == 11:  # INT64
+        if vtype == 11:  # INT64
             return struct.unpack("<q", f.read(8))[0]
-        elif vtype == 12:  # FLOAT64
+        if vtype == 12:  # FLOAT64
             return struct.unpack("<d", f.read(8))[0]
-        else:
-            raise ValueError(f"Unknown metadata type {vtype}")
+
+        raise ValueError(f"Unknown metadata type {vtype}")
