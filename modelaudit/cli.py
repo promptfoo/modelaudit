@@ -172,9 +172,34 @@ def cli() -> None:
     help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
 )
 @click.option(
+    "--max-download-size",
+    type=str,
+    help="Maximum download size for cloud storage (e.g., 500MB, 2GB)",
+)
+@click.option(
+    "--cache/--no-cache",
+    default=True,
+    help="Use cache for downloaded cloud storage files [default: cache]",
+)
+@click.option(
     "--cache-dir",
     type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
     help="Directory to use for caching downloaded models (default: system temp directory)",
+)
+@click.option(
+    "--preview",
+    is_flag=True,
+    help="Preview what would be downloaded without actually downloading",
+)
+@click.option(
+    "--selective/--all-files",
+    default=True,
+    help="Download only scannable files from directories [default: selective]",
+)
+@click.option(
+    "--stream",
+    is_flag=True,
+    help="Use streaming analysis for large cloud files (experimental)",
 )
 def scan_command(
     paths: tuple[str, ...],
@@ -189,7 +214,12 @@ def scan_command(
     registry_uri: Optional[str],
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
+    max_download_size: Optional[str],
+    cache: bool,
     cache_dir: Optional[str],
+    preview: bool,
+    selective: bool,
+    stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -340,6 +370,59 @@ def scan_command(
 
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
+                    # Parse max download size if provided
+                    max_download_bytes = None
+                    if max_download_size:
+                        size_map = {"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}
+                        for unit, multiplier in size_map.items():
+                            if max_download_size.upper().endswith(unit):
+                                max_download_bytes = int(float(max_download_size[: -len(unit)]) * multiplier)
+                                break
+                        if max_download_bytes is None:
+                            # Try parsing as raw number
+                            try:
+                                max_download_bytes = int(max_download_size)
+                            except ValueError:
+                                click.echo(f"Invalid max download size: {max_download_size}", err=True)
+                                aggregated_results["has_errors"] = True
+                                continue
+
+                    # Handle preview mode
+                    if preview:
+                        import asyncio
+
+                        from .utils.cloud_storage import analyze_cloud_target
+
+                        try:
+                            metadata = asyncio.run(analyze_cloud_target(path))
+                            click.echo(f"\n📊 Preview for {style_text(path, fg='cyan')}:")
+                            click.echo(f"   Type: {metadata['type']}")
+
+                            if metadata["type"] == "file":
+                                click.echo(f"   Size: {metadata.get('human_size', 'unknown')}")
+                                click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
+                            elif metadata["type"] == "directory":
+                                click.echo(f"   Files: {metadata.get('file_count', 0)}")
+                                click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}")
+                                click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
+
+                                if selective:
+                                    from .utils.cloud_storage import filter_scannable_files
+
+                                    scannable = filter_scannable_files(metadata.get("files", []))
+                                    click.echo(
+                                        f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}"
+                                    )
+
+                            # Skip actual download in preview mode
+                            continue
+
+                        except Exception as e:
+                            click.echo(f"Error analyzing {path}: {e!s}", err=True)
+                            aggregated_results["has_errors"] = True
+                            continue
+
+                    # Normal download mode
                     download_spinner = None
                     if format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
@@ -348,9 +431,20 @@ def scan_command(
                         click.echo(f"Downloading from {path}...")
 
                     try:
-                        download_path = download_from_cloud(path, cache_dir=Path(cache_dir) if cache_dir else None)
+                        # Convert cache_dir string to Path if provided
+                        cache_path = Path(cache_dir) if cache_dir else None
+
+                        download_path = download_from_cloud(
+                            path,
+                            cache_dir=cache_path,
+                            max_size=max_download_bytes,
+                            use_cache=cache,
+                            show_progress=verbose,
+                            selective=selective,
+                            stream_analyze=stream,
+                        )
                         actual_path = str(download_path)
-                        temp_dir = str(download_path)
+                        temp_dir = str(download_path) if not cache else None  # Don't clean up cached files
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
