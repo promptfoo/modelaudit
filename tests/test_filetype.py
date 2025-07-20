@@ -49,6 +49,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
+        ".mlmodel": "coreml",
         ".unknown": "unknown",
     }
 
@@ -157,6 +158,16 @@ def test_detect_gguf_ggml_formats(tmp_path):
     fake_gguf_path.write_bytes(b"FAKE" + b"\x00" * 20)
     assert detect_file_format(str(fake_gguf_path)) == "gguf"  # Falls back to extension
     assert detect_format_from_extension(str(fake_gguf_path)) == "gguf"
+
+
+def test_detect_ggml_variant_formats(tmp_path):
+    """Ensure GGML variants are recognized."""
+    variants = [b"GGMF", b"GGJT"]
+    for magic in variants:
+        path = tmp_path / f"model_{magic.decode().lower()}.ggml"
+        path.write_bytes(magic + b"\x00" * 20)
+        assert detect_file_format(str(path)) == "ggml"
+        assert detect_format_from_extension(str(path)) == "ggml"
 
 
 def test_validate_file_type(tmp_path):

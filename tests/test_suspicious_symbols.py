@@ -5,12 +5,15 @@ import re
 import pytest
 
 from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
     DANGEROUS_BUILTINS,
     DANGEROUS_OPCODES,
+    EXECUTABLE_SIGNATURES,
     SUSPICIOUS_CONFIG_PATTERNS,
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_LAYER_TYPES,
+    SUSPICIOUS_METADATA_PATTERNS,
     SUSPICIOUS_OPS,
     SUSPICIOUS_STRING_PATTERNS,
     get_all_suspicious_patterns,
@@ -39,9 +42,7 @@ class TestSuspiciousGlobals:
 
         for module in critical_modules:
             assert module in SUSPICIOUS_GLOBALS or any(
-                module in funcs
-                for funcs in SUSPICIOUS_GLOBALS.values()
-                if isinstance(funcs, list)
+                module in funcs for funcs in SUSPICIOUS_GLOBALS.values() if isinstance(funcs, list)
             ), f"Critical module {module} not found in suspicious patterns"
 
     def test_builtins_functions(self) -> None:
@@ -79,6 +80,26 @@ class TestDangerousOpcodes:
             assert op in DANGEROUS_OPCODES
 
 
+class TestBinaryCodePatterns:
+    """Test BINARY_CODE_PATTERNS list."""
+
+    def test_binary_code_patterns_bytes(self) -> None:
+        assert isinstance(BINARY_CODE_PATTERNS, list)
+        for pattern in BINARY_CODE_PATTERNS:
+            assert isinstance(pattern, bytes)
+
+
+class TestExecutableSignatures:
+    """Test EXECUTABLE_SIGNATURES mapping."""
+
+    def test_executable_signatures_structure(self) -> None:
+        assert isinstance(EXECUTABLE_SIGNATURES, dict)
+        for signature, description in EXECUTABLE_SIGNATURES.items():
+            assert isinstance(signature, bytes)
+            assert isinstance(description, str)
+            assert len(description) > 0
+
+
 class TestSuspiciousStringPatterns:
     """Test SUSPICIOUS_STRING_PATTERNS regex patterns."""
 
@@ -102,13 +123,12 @@ class TestSuspiciousStringPatterns:
             ),
             (r"__[\w]+__", "__reduce__"),
             (r"base64\.b64decode", "base64.b64decode(encoded_payload)"),
+            (r"\bimport\s+[\w\.]+", "import os"),
             (r"\\x[0-9a-fA-F]{2}", "\\x41\\x42\\x43"),
         ]
 
         for pattern, test_string in test_cases:
-            assert re.search(pattern, test_string), (
-                f"Pattern '{pattern}' failed to match '{test_string}'"
-            )
+            assert re.search(pattern, test_string), f"Pattern '{pattern}' failed to match '{test_string}'"
 
     def test_patterns_dont_match_safe_code(self) -> None:
         """Test that patterns don't match legitimate ML code."""
@@ -117,6 +137,7 @@ class TestSuspiciousStringPatterns:
             "model.eval()",  # This might match eval( pattern - that's expected
             "data.shape",
             "model.parameters()",
+            "important_variable",  # Contains 'import' substring but isn't a module import
         ]
 
         # Count false positives for documentation
@@ -129,6 +150,17 @@ class TestSuspiciousStringPatterns:
         # Document known false positives but don't fail
         # (These are trade-offs between security and usability)
         print(f"Known false positives: {false_positives}")
+
+
+class TestSuspiciousMetadataPatterns:
+    """Test SUSPICIOUS_METADATA_PATTERNS regex patterns."""
+
+    def test_metadata_patterns_valid_regex(self) -> None:
+        for pattern in SUSPICIOUS_METADATA_PATTERNS:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                pytest.fail(f"Invalid regex pattern '{pattern}': {e}")
 
 
 class TestSuspiciousOps:
@@ -191,9 +223,7 @@ class TestSuspiciousConfigProperties:
         execution_props = ["eval", "exec", "function", "code"]
 
         for prop in execution_props:
-            assert prop in SUSPICIOUS_CONFIG_PROPERTIES, (
-                f"Execution property {prop} not flagged"
-            )
+            assert prop in SUSPICIOUS_CONFIG_PROPERTIES, f"Execution property {prop} not flagged"
 
 
 class TestSuspiciousConfigPatterns:
@@ -210,9 +240,7 @@ class TestSuspiciousConfigPatterns:
             "credentials",
         ]
         for category in expected_categories:
-            assert category in SUSPICIOUS_CONFIG_PATTERNS, (
-                f"Category {category} missing"
-            )
+            assert category in SUSPICIOUS_CONFIG_PATTERNS, f"Category {category} missing"
 
             patterns = SUSPICIOUS_CONFIG_PATTERNS[category]
             assert isinstance(patterns, list)
@@ -306,6 +334,36 @@ class TestUtilityFunctions:
         warnings = validate_patterns()
         assert isinstance(warnings, list)
 
+    def test_validate_patterns_with_invalid_entries(self) -> None:
+        """Inject invalid entries and verify warnings are produced."""
+        original_globals = SUSPICIOUS_GLOBALS.copy()
+        original_builtins = DANGEROUS_BUILTINS.copy()
+        original_opcodes = DANGEROUS_OPCODES.copy()
+        original_strings = SUSPICIOUS_STRING_PATTERNS.copy()
+
+        try:
+            SUSPICIOUS_GLOBALS[123] = "*"  # type: ignore[index]
+            SUSPICIOUS_GLOBALS["valid_module"] = 123  # type: ignore[assignment]
+            DANGEROUS_BUILTINS.append(123)  # type: ignore[arg-type]
+            DANGEROUS_OPCODES.add(123)  # type: ignore[arg-type]
+            SUSPICIOUS_STRING_PATTERNS.append("[")
+
+            warnings = validate_patterns()
+
+            # Since we removed unreachable type checks, we now only validate:
+            # 1. Functions must be '*' or list (for valid module names)
+            # 2. Invalid regex patterns
+            assert any("Functions must be '*'" in w for w in warnings)
+            assert any("Invalid regex pattern" in w for w in warnings)
+            assert len(warnings) >= 2
+        finally:
+            SUSPICIOUS_GLOBALS.clear()
+            SUSPICIOUS_GLOBALS.update(original_globals)
+            DANGEROUS_BUILTINS[:] = original_builtins
+            DANGEROUS_OPCODES.clear()
+            DANGEROUS_OPCODES.update(original_opcodes)
+            SUSPICIOUS_STRING_PATTERNS[:] = original_strings
+
 
 class TestSecurityCoverage:
     """Test that security patterns provide comprehensive coverage."""
@@ -384,7 +442,7 @@ class TestPatternMaintenance:
         """Test that patterns are consistently documented."""
         all_patterns = get_all_suspicious_patterns()
 
-        for category, info in all_patterns.items():
+        for _category, info in all_patterns.items():
             # Each category should have required metadata
             assert "description" in info
             assert "risk_level" in info

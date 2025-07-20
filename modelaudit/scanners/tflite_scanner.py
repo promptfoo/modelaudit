@@ -1,4 +1,5 @@
 import os
+from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -19,16 +20,13 @@ class TFLiteScanner(BaseScanner):
 
     name = "tflite"
     description = "Scans TensorFlow Lite models for integrity and safety issues"
-    supported_extensions = [".tflite"]
+    supported_extensions: ClassVar[list[str]] = [".tflite"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not HAS_TFLITE:
             return False
-        return (
-            os.path.isfile(path)
-            and os.path.splitext(path)[1].lower() in cls.supported_extensions
-        )
+        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -51,7 +49,7 @@ class TFLiteScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
                 result.bytes_scanned = len(data)
-            model = tflite.Model.Model.GetRootAsModel(data, 0)
+            model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
             result.add_issue(
                 f"Invalid TFLite file or parse error: {e}",
@@ -107,7 +105,7 @@ class TFLiteScanner(BaseScanner):
                     name = custom.decode("utf-8", "ignore") if custom else "unknown"
                     result.add_issue(
                         f"Model uses custom operator '{name}'",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.CRITICAL,
                         location=f"{path} (operator {o_index})",
                         details={"custom_op": name},
                     )

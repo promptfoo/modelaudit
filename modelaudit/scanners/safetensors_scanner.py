@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
-from typing import Any, Optional
+from typing import Any, ClassVar
+
+from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -30,7 +33,7 @@ class SafeTensorsScanner(BaseScanner):
 
     name = "safetensors"
     description = "Scans SafeTensors model files for integrity issues"
-    supported_extensions = [".safetensors"]
+    supported_extensions: ClassVar[list[str]] = [".safetensors"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -110,21 +113,19 @@ class SafeTensorsScanner(BaseScanner):
                     header = json.loads(header_bytes.decode("utf-8"))
                 except json.JSONDecodeError as e:
                     result.add_issue(
-                        f"Invalid JSON header: {str(e)}",
+                        f"Invalid JSON header: {e!s}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                     )
                     result.finish(success=False)
                     return result
 
-                tensor_names = [k for k in header.keys() if k != "__metadata__"]
+                tensor_names = [k for k in header if k != "__metadata__"]
                 result.metadata["tensor_count"] = len(tensor_names)
                 result.metadata["tensors"] = tensor_names
 
                 # Validate tensor offsets and sizes
-                tensor_entries: list[tuple[str, Any]] = [
-                    (k, v) for k, v in header.items() if k != "__metadata__"
-                ]
+                tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
 
                 data_size = file_size - (8 + header_len)
                 offsets = []
@@ -203,24 +204,46 @@ class SafeTensorsScanner(BaseScanner):
                                 f"Metadata value for {key} is very long",
                                 severity=IssueSeverity.INFO,
                                 location=path,
-                                why="Metadata fields over 1000 characters are unusual in model files. Long strings in metadata could contain encoded payloads, scripts, or data exfiltration attempts.",
+                                why=(
+                                    "Metadata fields over 1000 characters are unusual in model files. Long strings "
+                                    "in metadata could contain encoded payloads, scripts, or data exfiltration "
+                                    "attempts."
+                                ),
                             )
-                        if isinstance(value, str) and any(
-                            s in value.lower() for s in ["import ", "#!/", "\\"]
-                        ):
-                            result.add_issue(
-                                f"Suspicious metadata value for {key}",
-                                severity=IssueSeverity.INFO,
-                                location=path,
-                                why="Metadata containing code-like patterns (import statements, shebangs, escape sequences) is atypical for model files and may indicate embedded scripts or injection attempts.",
-                            )
+
+                        if isinstance(value, str):
+                            lower_val = value.lower()
+
+                            # Check for simple code-like patterns
+                            if any(s in lower_val for s in ["import ", "#!/", "\\"]):
+                                result.add_issue(
+                                    f"Suspicious metadata value for {key}",
+                                    severity=IssueSeverity.INFO,
+                                    location=path,
+                                    why=(
+                                        "Metadata containing code-like patterns (import statements, shebangs, escape "
+                                        "sequences) is atypical for model files and may indicate embedded scripts or "
+                                        "injection attempts."
+                                    ),
+                                )
+
+                            # Check for regex-based suspicious patterns (independent of above check)
+                            for pattern in SUSPICIOUS_METADATA_PATTERNS:
+                                if re.search(pattern, value):
+                                    result.add_issue(
+                                        f"Suspicious metadata value for {key}",
+                                        severity=IssueSeverity.INFO,
+                                        location=path,
+                                        why="Metadata matched known suspicious pattern",
+                                    )
+                                    break
 
                 # Bytes scanned = file size
                 result.bytes_scanned = file_size
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning SafeTensors file: {str(e)}",
+                f"Error scanning SafeTensors file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -232,7 +255,7 @@ class SafeTensorsScanner(BaseScanner):
         return result
 
     @staticmethod
-    def _expected_size(dtype: Optional[str], shape: list[int]) -> Optional[int]:
+    def _expected_size(dtype: str | None, shape: list[int]) -> int | None:
         """Return expected tensor byte size from dtype and shape."""
         if dtype not in _DTYPE_SIZES:
             return None

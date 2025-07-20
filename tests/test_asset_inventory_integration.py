@@ -63,10 +63,11 @@ class TestAssetInventoryIntegration:
 
             # Add another SafeTensors file inside the ZIP
             inner_safetensors_data = {
-                "optimizer.weight": np.random.randn(100, 768).astype(np.float32)
+                "optimizer.weight": np.random.randn(100, 768).astype(np.float32),
             }
             with tempfile.NamedTemporaryFile(
-                suffix=".safetensors", delete=False
+                suffix=".safetensors",
+                delete=False,
             ) as tmp:
                 save_file(inner_safetensors_data, tmp.name)
                 with open(tmp.name, "rb") as f:
@@ -102,9 +103,7 @@ class TestAssetInventoryIntegration:
         assert len(assets) >= 4
 
         # Check for SafeTensors file with tensor metadata
-        safetensors_assets = [
-            a for a in assets if a["path"].endswith("model.safetensors")
-        ]
+        safetensors_assets = [a for a in assets if a["path"].endswith("model.safetensors")]
         assert len(safetensors_assets) == 1
         st_asset = safetensors_assets[0]
         assert st_asset["type"] == "safetensors"
@@ -143,11 +142,7 @@ class TestAssetInventoryIntegration:
 
         # Check nested SafeTensors asset has tensor metadata
         nested_st = next(
-            (
-                c
-                for c in zip_asset["contents"]
-                if c["path"].endswith("optimizer.safetensors")
-            ),
+            (c for c in zip_asset["contents"] if c["path"].endswith("optimizer.safetensors")),
             None,
         )
         assert nested_st is not None
@@ -164,7 +159,7 @@ class TestAssetInventoryIntegration:
 
         # Should include files from subdirectories
         tokenizer_config_path = str(
-            complex_model_dir / "tokenizer" / "tokenizer_config.json"
+            complex_model_dir / "tokenizer" / "tokenizer_config.json",
         )
         assert tokenizer_config_path in asset_paths
 
@@ -185,29 +180,21 @@ class TestAssetInventoryIntegration:
         # Should succeed or have warnings but not error
         assert result.exit_code in [0, 1]
 
-        # Should contain asset section in output
-        assert "Assets encountered:" in result.output
+        # Note: SCANNED FILES section was removed to reduce output verbosity
+        # The asset inventory is still available in JSON format
+        # Just verify that the scan completed successfully and mentioned the files
+        assert "SCAN SUMMARY" in result.output
+        assert "Files:" in result.output
 
-        # Should list the main files
-        assert "model.safetensors" in result.output
-        assert "config.json" in result.output
-        assert "weights.zip" in result.output
-        assert "tokenizer_config.json" in result.output
-
-        # Should show tensor information for SafeTensors
-        assert "Tensors:" in result.output
-        assert "embedding.weight" in result.output
-        assert "decoder.weight" in result.output
-
-        # Should show keys for JSON files
-        assert "Keys:" in result.output
-        assert "model_type" in result.output
+        # Should still show file paths in issues if any are found
+        # The files are still being scanned and processed, just not listed separately
 
     def test_asset_inventory_cli_json_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI JSON output."""
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["scan", str(complex_model_dir), "--format", "json"]
+            cli,
+            ["scan", str(complex_model_dir), "--format", "json"],
         )
 
         # Should succeed or have warnings but not error
@@ -243,7 +230,8 @@ class TestAssetInventoryIntegration:
             # Add SafeTensors file to inner ZIP
             safetensors_data = {"weight": np.array([1, 2, 3, 4]).astype(np.float32)}
             with tempfile.NamedTemporaryFile(
-                suffix=".safetensors", delete=False
+                suffix=".safetensors",
+                delete=False,
             ) as tmp:
                 save_file(safetensors_data, tmp.name)
                 with open(tmp.name, "rb") as f:
@@ -251,9 +239,8 @@ class TestAssetInventoryIntegration:
                 os.unlink(tmp.name)
 
         outer_zip = tmp_path / "outer.zip"
-        with zipfile.ZipFile(outer_zip, "w") as outer_zf:
-            with open(inner_zip, "rb") as f:
-                outer_zf.writestr("models/inner.zip", f.read())
+        with zipfile.ZipFile(outer_zip, "w") as outer_zf, open(inner_zip, "rb") as f:
+            outer_zf.writestr("models/inner.zip", f.read())
 
         results = scan_model_directory_or_file(str(outer_zip))
 
@@ -386,23 +373,24 @@ class TestAssetInventoryIntegration:
         # Simulate a transformer model structure
         tensors = {}
         for layer in range(12):  # 12 transformer layers
-            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(
+                np.float32
             )
-            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(
+                np.float32
             )
-            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(
+                np.float32
             )
-            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = (
-                np.random.randn(768, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(
+                np.float32
             )
-            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = (
-                np.random.randn(3072, 768).astype(np.float32)
+            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(
+                np.float32
             )
             tensors[f"transformer.layer.{layer}.output.dense.weight"] = np.random.randn(
-                768, 3072
+                768,
+                3072,
             ).astype(np.float32)
 
         save_file(tensors, str(large_model))
@@ -425,7 +413,7 @@ class TestAssetInventoryIntegration:
         assert "transformer.layer.11.output.dense.weight" in tensor_names
 
     def test_asset_inventory_cli_output_formatting(self, tmp_path: Path):
-        """Test that CLI asset output formatting is readable and well-structured."""
+        """Test that CLI output formatting is readable and well-structured."""
         # Create a model with various asset types
         model_dir = tmp_path / "formatting_test"
         model_dir.mkdir()
@@ -447,30 +435,14 @@ class TestAssetInventoryIntegration:
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", str(model_dir)])
 
-        output_lines = result.output.split("\n")
+        # Note: SCANNED FILES section was removed to reduce output verbosity
+        # Verify that the overall output structure is still well-formatted
+        assert "SCAN SUMMARY" in result.output
+        assert "Files:" in result.output
+        assert "SECURITY FINDINGS" in result.output
 
-        # Find the assets section
-        assets_start = None
-        for i, line in enumerate(output_lines):
-            if "Assets encountered:" in line:
-                assets_start = i
-                break
-
-        assert assets_start is not None, "Assets section not found in output"
-
-        # Check formatting structure
-        assets_section = output_lines[assets_start:]
-
-        # Should have proper indentation and structure
-        asset_lines = [line for line in assets_section if line.strip().startswith("- ")]
-        assert len(asset_lines) >= 3  # Should list all three files
-
-        # Should have sub-items for tensors and keys
-        tensor_lines = [line for line in assets_section if "Tensors:" in line]
-        assert len(tensor_lines) >= 1
-
-        key_lines = [line for line in assets_section if "Keys:" in line]
-        assert len(key_lines) >= 1
+        # The asset inventory is still captured but not displayed in text format
+        # Users can use --format json to see detailed asset information
 
     def test_asset_inventory_performance_large_directory(self, tmp_path: Path):
         """Test asset inventory performance with many files."""
@@ -493,7 +465,7 @@ class TestAssetInventoryIntegration:
         assert len(results["assets"]) == 50
 
         # Each asset should have correct metadata
-        for i, asset in enumerate(results["assets"]):
+        for _i, asset in enumerate(results["assets"]):
             assert asset["type"] == "manifest"
             assert "keys" in asset
             assert "id" in asset["keys"]

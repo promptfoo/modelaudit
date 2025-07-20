@@ -1,6 +1,15 @@
 import re
 from pathlib import Path
 
+# Known GGML header variants (older formats like GGMF and GGJT)
+GGML_MAGIC_VARIANTS = {
+    b"GGML",
+    b"GGMF",
+    b"GGJT",
+    b"GGLA",
+    b"GGSA",
+}
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -50,7 +59,7 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if magic4 == b"GGUF":
         return "gguf"
-    if magic4 == b"GGML":
+    if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     if magic4.startswith(b"PK"):
@@ -126,7 +135,7 @@ def detect_file_format(path: str) -> str:
     # Check for GGUF/GGML magic bytes
     if magic4 == b"GGUF":
         return "gguf"
-    if magic4 == b"GGML":
+    if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     ext = file_path.suffix.lower()
@@ -169,6 +178,10 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
+    if ext in (".ptl", ".pte"):
+        if magic4.startswith(b"PK"):
+            return "executorch"
+        return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
     if ext == ".h5":
@@ -179,15 +192,18 @@ def detect_file_format(path: str) -> str:
         return "tflite"
     if ext == ".safetensors":
         return "safetensors"
-    if ext == ".msgpack":
+    if ext in (".pdmodel", ".pdiparams"):
+        return "paddle"
+    if ext in (".msgpack", ".flax", ".orbax", ".jax"):
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
-    if ext in (".gguf", ".ggml"):
+    ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
+    if ext in (".gguf", *ggml_exts):
         # Check magic bytes first for accuracy
         if magic4 == b"GGUF":
             return "gguf"
-        elif magic4 == b"GGML":
+        elif magic4 in GGML_MAGIC_VARIANTS:
             return "ggml"
         # Fall back to extension-based detection
         return "gguf" if ext == ".gguf" else "ggml"
@@ -199,6 +215,8 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
+    if ext == ".mlmodel":
+        return "coreml"
 
     return "unknown"
 
@@ -213,9 +231,8 @@ def find_sharded_files(directory: str) -> list[str]:
         [
             str(dir_path / fname)
             for fname in dir_path.iterdir()
-            if fname.is_file()
-            and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
-        ]
+            if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
+        ],
     )
 
 
@@ -236,9 +253,20 @@ EXTENSION_FORMAT_MAP = {
     ".zip": "zip",
     ".gguf": "gguf",
     ".ggml": "ggml",
+    ".ggmf": "ggml",
+    ".ggjt": "ggml",
+    ".ggla": "ggml",
+    ".ggsa": "ggml",
+    ".ptl": "executorch",
+    ".pte": "executorch",
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".mlmodel": "coreml",
+    ".pdmodel": "paddle",
+    ".pdiparams": "paddle",
+    ".engine": "tensorrt",
+    ".plan": "tensorrt",
 }
 
 
@@ -287,9 +315,13 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
-        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt when they're torch.save() files)
-        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary"}:
+        # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
+        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
             return True
+
+        # ExecuTorch files should be zip archives
+        if ext_format == "executorch":
+            return header_format == "zip"
 
         # HDF5 files should always match
         if ext_format == "hdf5":
@@ -323,13 +355,17 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "tflite":
             return True  # TFLite format can be complex to validate
 
+        if ext_format == "coreml":
+            return True  # Core ML files are protobuf and lack clear magic bytes
+
+        if ext_format == "tensorrt":
+            return True  # TensorRT engine files have complex binary format
+
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
         if header_format == "unknown":
             file_path = Path(path)
-            if file_path.is_file() and file_path.stat().st_size >= 4:
-                return False
-            return True  # Small files are acceptable
+            return not (file_path.is_file() and file_path.stat().st_size >= 4)  # Small files are acceptable
 
         # Default: exact match required
         return header_format == ext_format

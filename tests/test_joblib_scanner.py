@@ -1,11 +1,10 @@
+import joblib
 import numpy as np
 import pytest
 
-pytest.importorskip("joblib")
-
-import joblib
-
 from modelaudit.scanners.joblib_scanner import JoblibScanner
+
+pytest.importorskip("joblib")
 
 
 def test_joblib_scanner_basic(tmp_path):
@@ -26,7 +25,7 @@ def test_joblib_scanner_closes_bytesio(tmp_path, monkeypatch):
     closed = {}
 
     class TrackedBytesIO(io.BytesIO):
-        def close(self) -> None:  # type: ignore[override]
+        def close(self) -> None:
             closed["closed"] = True
             super().close()
 

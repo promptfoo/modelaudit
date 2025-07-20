@@ -130,13 +130,23 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"os\.system",  # Direct system command execution
     r"subprocess\.(?:Popen|call|check_output)",  # Process spawning
     # Dynamic imports - HIGH RISK
-    r"import ",  # Import statements in strings
+    # Match explicit module imports to reduce noise from unrelated "import" substrings
+    r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
     # Code construction - MEDIUM RISK
     r"lambda",  # Anonymous function creation
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
+]
+
+# Suspicious metadata patterns used by SafeTensorsScanner and others
+# Regex patterns that match unusual or potentially malicious metadata values
+SUSPICIOUS_METADATA_PATTERNS = [
+    r"https?://",  # Embedded URLs can be used for exfiltration
+    r"(?i)\bimport\s+(?:os|subprocess|sys)\b",  # Inline Python imports
+    r"(?i)(?:rm\s+-rf|wget\s|curl\s|chmod\s)",  # Shell command indicators
+    r"(?i)<script",  # Embedded HTML/JS content
 ]
 
 # Dangerous pickle opcodes that can lead to code execution
@@ -346,6 +356,11 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "description": "Manifest file security patterns",
             "risk_level": "MEDIUM",
         },
+        "metadata_strings": {
+            "patterns": SUSPICIOUS_METADATA_PATTERNS,
+            "description": "Regex patterns for suspicious metadata values in model files",
+            "risk_level": "MEDIUM",
+        },
     }
 
 
@@ -361,7 +376,7 @@ def validate_patterns() -> list[str]:
     warnings = []
 
     # Validate regex patterns
-    for pattern in SUSPICIOUS_STRING_PATTERNS:
+    for pattern in SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS:
         try:
             re.compile(pattern)
         except re.error as e:
@@ -370,18 +385,34 @@ def validate_patterns() -> list[str]:
     # Validate global patterns structure
     for module, funcs in SUSPICIOUS_GLOBALS.items():
         if not isinstance(module, str):
-            warnings.append(f"Module name must be string: {module}")
+            warnings.append(f"Module name must be string: {module}")  # pragma: no cover
         if not (funcs == "*" or isinstance(funcs, list)):
             warnings.append(f"Functions must be '*' or list for module {module}")
 
     # Validate dangerous builtins
     for builtin in DANGEROUS_BUILTINS:
         if not isinstance(builtin, str):
-            warnings.append(f"Builtin name must be string: {builtin}")
+            warnings.append(f"Builtin name must be string: {builtin}")  # pragma: no cover
 
     # Validate dangerous opcodes
     for opcode in DANGEROUS_OPCODES:
         if not isinstance(opcode, str):
-            warnings.append(f"Opcode name must be string: {opcode}")
+            warnings.append(f"Opcode name must be string: {opcode}")  # pragma: no cover
+
+    # Validate binary code patterns
+    for binary_pattern in BINARY_CODE_PATTERNS:
+        if not isinstance(binary_pattern, bytes):
+            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")  # pragma: no cover
+
+    # Validate executable signatures
+    for signature, description in EXECUTABLE_SIGNATURES.items():
+        if not isinstance(signature, bytes):
+            warnings.append(f"Signature must be bytes: {signature!r}")  # pragma: no cover
+        if not isinstance(description, str):
+            warnings.append(f"Description must be string for signature {signature!r}")  # pragma: no cover
+        if not description:
+            warnings.append(
+                f"Description must be non-empty for signature {signature!r}",
+            )
 
     return warnings

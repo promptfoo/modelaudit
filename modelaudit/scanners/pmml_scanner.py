@@ -1,10 +1,11 @@
 import os
 import re
+from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
-    from defusedxml import ElementTree as DefusedET  # type: ignore
+    from defusedxml import ElementTree as DefusedET
 
     HAS_DEFUSEDXML = True
 except ImportError:  # pragma: no cover - defusedxml may not be installed
@@ -13,7 +14,7 @@ except ImportError:  # pragma: no cover - defusedxml may not be installed
 
 # Only import unsafe XML as fallback
 if not HAS_DEFUSEDXML:
-    import xml.etree.ElementTree as UnsafeET  # type: ignore
+    import xml.etree.ElementTree as UnsafeET
 
 
 SUSPICIOUS_PATTERNS = [
@@ -46,7 +47,7 @@ class PmmlScanner(BaseScanner):
 
     name = "pmml"
     description = "Scans PMML files for XML security issues and suspicious content"
-    supported_extensions = [".pmml"]
+    supported_extensions: ClassVar[list[str]] = [".pmml"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -95,7 +96,8 @@ class PmmlScanner(BaseScanner):
                     "Non UTF-8 characters in PMML file",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate corruption or malicious content.",
+                    why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate "
+                    "corruption or malicious content.",
                 )
             except Exception as e:
                 result.add_issue(
@@ -120,7 +122,8 @@ class PmmlScanner(BaseScanner):
                     "Using unsafe XML parser - defusedxml not available",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. Install defusedxml for better security.",
+                    why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. "
+                    "Install defusedxml for better security.",
                 )
                 root = UnsafeET.fromstring(text)
         except Exception as e:
@@ -129,7 +132,10 @@ class PmmlScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
-                why="The file contains malformed XML that cannot be parsed. This may indicate corruption or malicious content.",
+                why=(
+                    "The file contains malformed XML that cannot be parsed. This may indicate corruption "
+                    "or malicious content."
+                ),
             )
             result.finish(success=False)
             return result
@@ -144,7 +150,10 @@ class PmmlScanner(BaseScanner):
         return result
 
     def _check_dangerous_xml_constructs(
-        self, text: str, result: ScanResult, path: str
+        self,
+        text: str,
+        result: ScanResult,
+        path: str,
     ) -> None:
         """Check for dangerous XML constructs that could enable XXE attacks."""
         text_upper = text.upper()
@@ -203,7 +212,10 @@ class PmmlScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"tag": elem.tag, "url_pattern": url_pattern},
-                        why="External references in PMML files may be used to exfiltrate data or perform network requests.",
+                        why=(
+                            "External references in PMML files may be used to exfiltrate data or perform "
+                            "network requests."
+                        ),
                     )
                     break
 
@@ -226,7 +238,10 @@ class PmmlScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={"tag": elem.tag, "pattern": pattern},
-                            why="Extension elements can contain arbitrary content and may be used to embed malicious code or scripts.",
+                            why=(
+                                "Extension elements can contain arbitrary content and may be used to embed "
+                                "malicious code or scripts."
+                            ),
                         )
                         break
 

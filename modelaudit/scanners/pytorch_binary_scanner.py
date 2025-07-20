@@ -1,6 +1,6 @@
 import os
 import struct
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
@@ -15,7 +15,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
     name = "pytorch_binary"
     description = "Scans PyTorch binary tensor files for suspicious patterns"
-    supported_extensions = [".bin"]
+    supported_extensions: ClassVar[list[str]] = [".bin"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -92,18 +92,24 @@ class PyTorchBinaryScanner(BaseScanner):
 
                     # Check for embedded Python code patterns
                     self._check_for_code_patterns(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
                     # Check for blacklisted patterns
                     if self.blacklist_patterns:
                         self._check_for_blacklist_patterns(
-                            chunk, result, bytes_scanned - len(chunk)
+                            chunk,
+                            result,
+                            bytes_scanned - len(chunk),
                         )
 
                     # Check for executable file signatures
                     self._check_for_executable_signatures(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
             result.bytes_scanned = bytes_scanned
@@ -113,7 +119,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning binary file: {str(e)}",
+                f"Error scanning binary file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -125,7 +131,10 @@ class PyTorchBinaryScanner(BaseScanner):
         return result
 
     def _check_for_code_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
@@ -144,7 +153,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 )
 
     def _check_for_blacklist_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for blacklisted patterns in the binary data"""
         for pattern in self.blacklist_patterns:
@@ -162,22 +174,90 @@ class PyTorchBinaryScanner(BaseScanner):
                 )
 
     def _check_for_executable_signatures(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
-        """Check for executable file signatures"""
+        """Check for executable file signatures with ML context awareness"""
+        from modelaudit.utils.ml_context import (
+            analyze_binary_for_ml_context,
+            should_ignore_executable_signature,
+        )
+
+        # Analyze ML context for this chunk
+        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+
+        # Count patterns for density analysis
+        pattern_counts = {}
+
         # Common executable signatures
         for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
-                pos = chunk.find(sig)
+                # Count all occurrences
+                positions = []
+                pos = 0
+                while True:
+                    pos = chunk.find(sig, pos)
+                    if pos == -1:
+                        break
+                    positions.append(offset + pos)
+                    pos += len(sig)
+
+                if positions:
+                    pattern_counts[sig] = (positions, description)
+
+        # Process findings with ML context filtering
+        for sig, (positions, description) in pattern_counts.items():
+            # Calculate pattern density more reasonably for small files
+            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            # Use at least 1MB for density calculation to avoid inflated densities in small files
+            effective_size_mb = max(file_size_mb, 1.0)
+            pattern_density = len(positions) / effective_size_mb
+
+            # Apply ML context filtering
+            filtered_positions = []
+            ignored_count = 0
+
+            for pos in positions:
+                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                    ignored_count += 1
+                else:
+                    filtered_positions.append(pos)
+
+            # Report significant patterns that weren't filtered out
+            for pos in filtered_positions[:10]:  # Limit to first 10
                 result.add_issue(
                     f"Executable signature found: {description}",
                     severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (offset: {offset + pos})",
+                    location=f"{self.current_file_path} (offset: {pos})",
                     details={
                         "signature": sig.hex(),
                         "description": description,
-                        "offset": offset + pos,
+                        "offset": pos,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_confidence": ml_context.get("weight_confidence", 0),
                     },
+                )
+
+            # Add debug note about ignored patterns (only shown in verbose mode)
+            if ignored_count > 0 and len(positions) > 5:
+                from modelaudit.utils.ml_context import get_ml_context_explanation
+
+                explanation = get_ml_context_explanation(ml_context, len(positions))
+                result.add_issue(
+                    f"Ignored {ignored_count} likely false positive {description} patterns",
+                    severity=IssueSeverity.DEBUG,
+                    location=f"{self.current_file_path}",
+                    details={
+                        "signature": sig.hex(),
+                        "ignored_count": ignored_count,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_explanation": explanation,
+                    },
+                    why=f"These patterns were likely false positives in ML weight data. {explanation}",
                 )
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
@@ -221,7 +301,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error validating tensor structure: {str(e)}",
+                f"Error validating tensor structure: {e!s}",
                 severity=IssueSeverity.DEBUG,
                 location=self.current_file_path,
                 details={"exception": str(e)},

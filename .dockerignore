@@ -33,10 +33,11 @@ docs/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+tests/
 
 # Scratch/development
 scratch/
 llm_context.txt
 
 # CI/CD
-.github/ 
+.github/

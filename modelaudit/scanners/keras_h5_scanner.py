@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from modelaudit.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
@@ -24,7 +24,7 @@ class KerasH5Scanner(BaseScanner):
 
     name = "keras_h5"
     description = "Scans Keras H5 model files for suspicious layer configurations"
-    supported_extensions = [".h5", ".hdf5", ".keras"]
+    supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -72,8 +72,7 @@ class KerasH5Scanner(BaseScanner):
         if not HAS_H5PY:
             result = self._create_result()
             result.add_issue(
-                "h5py not installed, cannot scan Keras H5 files. Install with "
-                "'pip install modelaudit[h5]'.",
+                "h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -98,22 +97,20 @@ class KerasH5Scanner(BaseScanner):
                     # Look for common TensorFlow H5 structure patterns
                     is_tensorflow_h5 = any(
                         key.startswith(
-                            ("model_weights", "optimizer_weights", "variables")
+                            ("model_weights", "optimizer_weights", "variables"),
                         )
-                        for key in f.keys()
+                        for key in f
                     )
 
                     if is_tensorflow_h5:
                         result.add_issue(
-                            "File appears to be a TensorFlow H5 model, not Keras format "
-                            "(no model_config attribute)",
+                            "File appears to be a TensorFlow H5 model, not Keras format (no model_config attribute)",
                             severity=IssueSeverity.DEBUG,  # Reduced severity - this is expected
                             location=self.current_file_path,
                         )
                     else:
                         result.add_issue(
-                            "File does not appear to be a Keras model "
-                            "(no model_config attribute)",
+                            "File does not appear to be a Keras model (no model_config attribute)",
                             severity=IssueSeverity.DEBUG,  # Reduced severity - not necessarily suspicious
                             location=self.current_file_path,
                         )
@@ -125,13 +122,19 @@ class KerasH5Scanner(BaseScanner):
                 model_config = json.loads(model_config_str)
 
                 # Scan model configuration
-                self._scan_model_config(model_config, result)
+                if isinstance(model_config, dict):
+                    self._scan_model_config(model_config, result)
+                else:
+                    result.add_issue(
+                        f"Invalid model config type: expected dict, got {type(model_config).__name__}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                    )
 
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
                     result.add_issue(
-                        "Model contains custom objects which could contain "
-                        "arbitrary code",
+                        "Model contains custom objects which could contain arbitrary code",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (model_config)",
                         details={"custom_objects": list(f.attrs["custom_objects"])},
@@ -150,8 +153,7 @@ class KerasH5Scanner(BaseScanner):
                                 "BinaryAccuracy",
                             ]:
                                 result.add_issue(
-                                    f"Model contains custom metric: "
-                                    f"{metric.get('class_name', 'unknown')}",
+                                    f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
                                     severity=IssueSeverity.WARNING,
                                     location=f"{self.current_file_path} (metrics)",
                                     details={"metric": metric},
@@ -159,7 +161,7 @@ class KerasH5Scanner(BaseScanner):
 
         except Exception as e:
             result.add_issue(
-                f"Error scanning Keras H5 file: {str(e)}",
+                f"Error scanning Keras H5 file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -176,13 +178,6 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan the model configuration for suspicious elements"""
-        if not isinstance(model_config, dict):
-            result.add_issue(
-                "Invalid model configuration format",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-            )
-            return
 
         # Check model class name
         model_class = model_config.get("class_name", "")
@@ -191,13 +186,28 @@ class KerasH5Scanner(BaseScanner):
         # Collect all layers
         layers = []
         if "config" in model_config and "layers" in model_config["config"]:
-            layers = model_config["config"]["layers"]
+            layers_value = model_config["config"]["layers"]
+            if isinstance(layers_value, list):
+                layers = layers_value
+            else:
+                result.add_issue(
+                    f"Invalid layers type: expected list, got {type(layers_value).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
 
         # Check each layer
         for layer in layers:
+            if not isinstance(layer, dict):
+                result.add_issue(
+                    f"Invalid layer type: expected dict, got {type(layer).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                )
+                continue
             layer_class = layer.get("class_name", "")
 
             # Update layer count
@@ -217,9 +227,7 @@ class KerasH5Scanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                         "layer_config": layer.get("config", {}),
                     },
-                    why=get_pattern_explanation("lambda_layer")
-                    if layer_class == "Lambda"
-                    else None,
+                    why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
                 )
 
             # Check layer configuration for suspicious strings
@@ -230,11 +238,7 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # If there are nested models, scan them recursively
-            if (
-                layer_class == "Model"
-                and "config" in layer
-                and "layers" in layer["config"]
-            ):
+            if layer_class == "Model" and "config" in layer and "layers" in layer["config"] and isinstance(layer, dict):
                 self._scan_model_config(layer, result)
 
         # Add layer counts to metadata
@@ -242,11 +246,13 @@ class KerasH5Scanner(BaseScanner):
 
     def _check_config_for_suspicious_strings(
         self,
-        config: dict[str, Any],
+        config: Any,
         result: ScanResult,
         context: str = "",
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
+
+        # Validate config is actually a dict
         if not isinstance(config, dict):
             return
 
@@ -257,8 +263,7 @@ class KerasH5Scanner(BaseScanner):
                 for suspicious_term in self.suspicious_config_props:
                     if suspicious_term in value.lower():
                         result.add_issue(
-                            f"Suspicious configuration string found in {context}: "
-                            f"'{suspicious_term}'",
+                            f"Suspicious configuration string found in {context}: '{suspicious_term}'",
                             severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
