@@ -204,29 +204,34 @@ class ZipScanner(BaseScanner):
                         "max_entry_size",
                         10485760,
                     )  # 10 MB default
-                    data = b""
-                    with z.open(name) as entry:
-                        while True:
-                            chunk = entry.read(4096)  # Read in 4 KB chunks
-                            if not chunk:
-                                break
-                            data += chunk
-                            if len(data) > max_entry_size:
-                                raise ValueError(
-                                    f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                )
+
+                    if name.lower().endswith(".zip"):
+                        suffix = ".zip"
+                    else:
+                        safe_name = re.sub(
+                            r"[^a-zA-Z0-9_.-]",
+                            "_",
+                            os.path.basename(name),
+                        )
+                        suffix = f"_{safe_name}"
+
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp_path = tmp.name
+                        total_size = 0
+                        with z.open(name) as entry:
+                            while True:
+                                chunk = entry.read(4096)
+                                if not chunk:
+                                    break
+                                total_size += len(chunk)
+                                if total_size > max_entry_size:
+                                    raise ValueError(
+                                        f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
+                                    )
+                                tmp.write(chunk)
 
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
-                        # Write to temporary file and scan recursively
-
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".zip",
-                            delete=False,
-                        ) as tmp:
-                            tmp.write(data)
-                            tmp_path = tmp.name
-
                         try:
                             nested_result = self._scan_zip_file(tmp_path, depth + 1)
                             # Update locations in nested results
@@ -254,22 +259,6 @@ class ZipScanner(BaseScanner):
                         # Try to scan the file with appropriate scanner
                         # Write to temporary file with proper extension and original filename
                         # This preserves the original filename for scanners that need it (like ManifestScanner)
-
-                        _, ext = os.path.splitext(name)
-                        # Create a more meaningful temporary filename that includes the original name
-                        # This helps scanners like ManifestScanner that depend on filename patterns
-                        # Use robust sanitization to handle special characters safely
-                        safe_name = re.sub(
-                            r"[^a-zA-Z0-9_.-]",
-                            "_",
-                            os.path.basename(name),
-                        )
-                        with tempfile.NamedTemporaryFile(
-                            suffix=f"_{safe_name}",
-                            delete=False,
-                        ) as tmp:
-                            tmp.write(data)
-                            tmp_path = tmp.name
 
                         try:
                             # Import core here to avoid circular import
@@ -311,7 +300,7 @@ class ZipScanner(BaseScanner):
 
                             # If no scanner handled the file, count the bytes ourselves
                             if file_result.scanner_name == "unknown":
-                                result.bytes_scanned += len(data)
+                                result.bytes_scanned += total_size
                         finally:
                             os.unlink(tmp_path)
 

@@ -7,15 +7,17 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
+from .base import BaseScanner, IssueSeverity, ScanResult
+
+np: Any
+
 try:
     import numpy as np
 
     HAS_NUMPY = True
 except ImportError:  # pragma: no cover
     HAS_NUMPY = False
-    np = None  # type: ignore[assignment]
-
-from .base import BaseScanner, IssueSeverity, ScanResult
+    np = None
 
 
 class JaxCheckpointScanner(BaseScanner):
