@@ -307,6 +307,7 @@ def scan_command(
                         else:
                             logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -346,6 +347,7 @@ def scan_command(
                         else:
                             logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading from {path}: {error_msg}", err=True)
+
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -579,6 +581,7 @@ def scan_command(
                             }
                         )
                     should_break = True
+
             # Break outside of finally block if interrupted
             if should_break:
                 break
