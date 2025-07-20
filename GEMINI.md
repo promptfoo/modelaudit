@@ -19,11 +19,12 @@ When tasked with fixing bugs, adding features, or refactoring:
 4.  **Verify (Tests):** This project has extensive tests. After any change, run the relevant tests to ensure correctness. The primary test command is `pytest`. You can run specific tests using `pytest tests/test_your_feature.py`.
 5.  **Verify (Standards):** After making code changes, run the project's linting and formatting commands.
     - For Python: `black .`
-    - For other files (Markdown, JSON): `biome check --apply .`
+    - For other files (Markdown, JSON): `prettier --write .`
       This ensures code quality and adherence to standards.
 
 # Git Repository
 
+- **Branching:** Always create a new branch before making any changes. Never commit directly to `main`. Start by running `git checkout -b your-branch-name`.
 - **Gather Context:** Before committing, use `git status`, `git diff HEAD`, and `git log -n 3` to understand the state of the repository and match the commit style.
 - **Propose Message:** Always propose a clear and concise commit message, focusing on the "why" of the change.
 - **Confirm Success:** After committing, run `git status` to confirm the commit was successful.
