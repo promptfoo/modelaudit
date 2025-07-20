@@ -357,6 +357,7 @@ class ParallelScanner:
 
             # Store metadata with license information
             from modelaudit.license_checker import collect_license_metadata
+
             scan_metadata = result_data.get("metadata", {})
             license_metadata = collect_license_metadata(work_result.file_path)
             combined_metadata = {**scan_metadata, **license_metadata}

@@ -972,6 +972,7 @@ def scan_command(
 
     # Finalize results (add license warnings and determine has_errors)
     from .core import _finalize_scan_results
+
     scan_config = {
         "strict_license": strict_license,
     }
