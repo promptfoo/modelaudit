@@ -265,15 +265,23 @@ def scan_model_directory_or_file(
                         max_workers=max_workers,
                     )
 
-                    # Copy parallel results to our results dictionary, preserving the original start_time
+                    # Copy parallel results to our results dictionary, preserving original fields
                     original_start_time = results["start_time"]
-                    results.update(parallel_results)
-                    results["start_time"] = original_start_time  # Restore original start time
-                    logger.debug(f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}")
+                    original_path = results["path"]
 
-                    # Add final timing information
-                    results["finish_time"] = time.time()
-                    results["duration"] = results["finish_time"] - results["start_time"]
+                    # Update with parallel results
+                    results.update(parallel_results)
+
+                    # Restore original fields that should not be overwritten
+                    results["start_time"] = original_start_time
+                    results["path"] = original_path
+
+                    # Use timing from parallel scan (which includes actual scan time)
+                    # The parallel scanner already calculates finish_time and duration correctly
+                    logger.debug(
+                        f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}, "
+                        f"duration={parallel_results.get('duration')}"
+                    )
 
                     # Finalize results (add license warnings and determine has_errors)
                     _finalize_scan_results(results)

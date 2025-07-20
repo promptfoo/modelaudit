@@ -295,7 +295,9 @@ def doctor_command(show_failed: bool, no_system_info: bool) -> None:
     is_flag=True,
     help="Use streaming analysis for large cloud files (experimental)",
 )
+@click.pass_context
 def scan_command(
+    ctx: click.Context,
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
     format: str,
@@ -997,7 +999,14 @@ def scan_command(
         if format == "json":
             output_text = json.dumps(aggregated_results, indent=2)
         elif format == "yaml":
-            import yaml
+            try:
+                import yaml
+            except ImportError:
+                click.echo(
+                    "Error: PyYAML is not installed. Install it with: pip install PyYAML",
+                    err=True,
+                )
+                ctx.exit(2)
 
             output_text = yaml.dump(aggregated_results, default_flow_style=False)
         elif format == "jsonl":
