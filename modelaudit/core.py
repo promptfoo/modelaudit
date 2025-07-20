@@ -21,6 +21,7 @@ from modelaudit.utils.filetype import (
     detect_format_from_extension,
     validate_file_type,
 )
+from modelaudit.utils.streaming import stream_analyze_file
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -116,7 +117,60 @@ def scan_model_directory_or_file(
     validate_scan_config(config)
 
     try:
-        # Check if path exists
+        # Handle streaming paths
+        if path.startswith("stream://"):
+            # Extract the actual URL
+            stream_url = path[9:]  # Remove "stream://" prefix
+            if progress_callback:
+                progress_callback(f"Streaming analysis: {stream_url}", 0.0)
+
+            # Perform streaming analysis
+            from modelaudit.scanners import get_scanner_for_file
+
+            scanner = get_scanner_for_file(stream_url, config=config)
+            if scanner:
+                scan_result, was_complete = stream_analyze_file(stream_url, scanner)
+                if scan_result:
+                    results["files_scanned"] = 1
+                    results["bytes_scanned"] = scan_result.metadata.get("file_size", 0)
+
+                    # Add scanner info
+                    scanners_list = cast(list[str], results["scanners"])
+                    if scan_result.scanner_name and scan_result.scanner_name not in scanners_list:
+                        scanners_list.append(scan_result.scanner_name)
+
+                    # Add issues
+                    issues_list = cast(list[dict[str, Any]], results["issues"])
+                    for issue in scan_result.issues:
+                        issues_list.append(issue.to_dict())
+
+                    # Add asset
+                    _add_asset_to_results(results, stream_url, scan_result)
+
+                    # Add metadata
+                    file_meta = cast(dict[str, Any], results["file_metadata"])
+                    file_meta[stream_url] = scan_result.metadata
+
+                    if not was_complete:
+                        issues_list.append(
+                            {
+                                "message": "Streaming analysis was partial - only analyzed file header",
+                                "severity": IssueSeverity.INFO.value,
+                                "location": stream_url,
+                                "details": {"analysis_complete": False},
+                            }
+                        )
+                else:
+                    raise ValueError(f"Streaming analysis failed for {stream_url}")
+            else:
+                raise ValueError(f"No scanner available for {stream_url}")
+
+            # Return early for streaming
+            results["finish_time"] = time.time()
+            results["duration"] = results["finish_time"] - results["start_time"]
+            return results
+
+        # Check if path exists (for non-streaming paths)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Path does not exist: {path}")
 

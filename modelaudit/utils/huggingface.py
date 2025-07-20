@@ -37,10 +37,9 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
         if len(parts) == 1 and parts[0]:
             # Single component like "bert-base-uncased" - treat as model without namespace
             return parts[0], ""
-        elif len(parts) == 2:
+        if len(parts) == 2:
             return parts[0], parts[1]
-        else:
-            raise ValueError(f"Invalid HuggingFace URL format: {url}")
+        raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
     # Handle https:// format
     parsed = urlparse(url)
@@ -51,10 +50,9 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     if len(path_parts) == 1 and path_parts[0]:
         # Single component like "bert-base-uncased" - treat as model without namespace
         return path_parts[0], ""
-    elif len(path_parts) >= 2:
+    if len(path_parts) >= 2:
         return path_parts[0], path_parts[1]
-    else:
-        raise ValueError(f"Invalid HuggingFace URL format: {url}")
+    raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
 
 def get_model_info(url: str) -> dict:

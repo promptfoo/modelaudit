@@ -23,8 +23,8 @@ def _check_numpy_compatibility() -> tuple[bool, str]:
                 False,
                 f"NumPy {numpy_version} detected. Some ML frameworks may require NumPy < 2.0 for compatibility.",
             )
-        else:
-            return True, f"NumPy {numpy_version} detected (compatible)."
+
+        return True, f"NumPy {numpy_version} detected (compatible)."
     except ImportError:
         return False, "NumPy not available."
 
@@ -544,12 +544,20 @@ def __getattr__(name: str) -> Any:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
             return scanner_class
-        else:
-            raise ImportError(
-                f"Failed to load scanner '{name}' - dependencies may not be installed",
-            )
+        raise ImportError(
+            f"Failed to load scanner '{name}' - dependencies may not be installed",
+        )
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+# Helper function for getting scanner for a file
+def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+    """Get an instantiated scanner for a given file path"""
+    scanner_class = _registry.get_scanner_for_path(path)
+    if scanner_class:
+        return scanner_class(config=config)
+    return None
 
 
 # Export the registry for direct use
@@ -562,5 +570,6 @@ __all__ = [
     "IssueSeverity",
     "ScanResult",
     "_registry",
+    "get_scanner_for_file",
     # Scanner classes will be lazy loaded via __getattr__
 ]
