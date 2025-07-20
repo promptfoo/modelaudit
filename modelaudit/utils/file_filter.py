@@ -1,9 +1,7 @@
 """File filtering utilities for ModelAudit."""
 
 import os
-from pathlib import Path
-from typing import Optional, Set
-
+from typing import Optional
 
 # Default extensions to skip when scanning directories
 DEFAULT_SKIP_EXTENSIONS = {
@@ -98,8 +96,8 @@ DEFAULT_SKIP_FILENAMES = {
 
 def should_skip_file(
     path: str,
-    skip_extensions: Optional[Set[str]] = None,
-    skip_filenames: Optional[Set[str]] = None,
+    skip_extensions: Optional[set[str]] = None,
+    skip_filenames: Optional[set[str]] = None,
     skip_hidden: bool = True,
 ) -> bool:
     """
