@@ -153,7 +153,7 @@ def _should_ignore_shebang_pattern(
 
     # Very high pattern density might indicate actual embedded content
     if pattern_density > 100:  # More than 100 patterns per MB
-        return weight_confidence > 0.5
+        return bool(weight_confidence > 0.5)
 
     return False
 

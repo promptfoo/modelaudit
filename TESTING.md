@@ -2,6 +2,19 @@
 
 This guide shows how to run tests efficiently in the modelaudit project.
 
+## Dependencies
+
+Before running the test suite, install the optional dependencies used in CI and
+development:
+
+```bash
+pip install -e .[all-ci]
+pip install -e .[dev-dependencies]
+```
+
+Run these commands prior to executing `pytest` so that all extras are
+available.
+
 ## 🎯 Quick Reference
 
 | Command                                                    | Use Case               | Speed              | Tests                            |

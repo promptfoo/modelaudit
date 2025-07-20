@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -32,7 +32,7 @@ def _component_for_file(
     for issue in issues:
         if issue.get("location") == path:
             severity = issue.get("severity")
-            if severity == "error":
+            if severity == "critical":
                 score += 5
             elif severity == "warning":
                 score += 2
@@ -137,4 +137,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
-    return outputter.output_as_string(indent=2)
+    return cast(  # type: ignore[redundant-cast]
+        str,
+        outputter.output_as_string(indent=2),
+    )

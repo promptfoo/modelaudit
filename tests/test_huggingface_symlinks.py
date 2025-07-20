@@ -1,10 +1,12 @@
 """Test HuggingFace cache symlink handling."""
 
 import os
+from pathlib import Path
 
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.scanners.base import IssueSeverity
 
 
 class TestHuggingFaceSymlinks:
@@ -125,3 +127,25 @@ class TestHuggingFaceSymlinks:
             issue for issue in results["issues"] if "path traversal" in issue.get("message", "").lower()
         ]
         assert len(path_traversal_issues) == 0
+
+    def test_broken_symlink_warning(self, tmp_path, monkeypatch):
+        """Broken HuggingFace symlinks should produce a warning."""
+        cache_root = tmp_path / ".cache" / "huggingface" / "hub" / "models--test"
+        snapshots = cache_root / "snapshots" / "abc"
+        snapshots.mkdir(parents=True)
+
+        broken_link = snapshots / "model.bin"
+        os.symlink("../../blobs/missing", broken_link)
+
+        monkeypatch.setattr(Path, "resolve", lambda self: Path(os.path.abspath(self)))
+
+        def _raise(path: str) -> str:  # pragma: no cover - simulate error
+            raise OSError("dangling link")
+
+        monkeypatch.setattr(os, "readlink", _raise)
+
+        results = scan_model_directory_or_file(str(snapshots))
+
+        broken_issues = [i for i in results["issues"] if "broken symlink" in i.get("message", "").lower()]
+        assert len(broken_issues) == 1
+        assert broken_issues[0]["severity"] == IssueSeverity.WARNING.value
