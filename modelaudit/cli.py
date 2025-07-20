@@ -553,7 +553,7 @@ def scan_command(
                             if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
                         ]
                         issue_count = len(visible_issues)
-                        
+
                         if issue_count > 0:
                             # Determine severity for coloring
                             has_critical = any(
@@ -580,10 +580,11 @@ def scan_command(
                                         ),
                                     )
                             elif format == "text" and not output:
+                                issues_str = "issue" if issue_count == 1 else "issues"
                                 if has_critical:
-                                    click.echo(f"Scanned {path}: Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)")
+                                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
                                 else:
-                                    click.echo(f"Scanned {path}: Found {issue_count} issue{'s' if issue_count > 1 else ''}")
+                                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str}")
                         else:
                             # No issues after filtering (all were DEBUG)
                             if spinner:
