@@ -35,13 +35,13 @@ def check_disk_space(path: Path, required_bytes: int, safety_margin: float = 1.2
 
     if free_bytes >= required_with_margin:
         return True, f"Sufficient disk space available ({format_bytes(free_bytes)})"
-    else:
-        return False, (
-            f"Insufficient disk space. "
-            f"Required: {format_bytes(required_with_margin)} "
-            f"(including {int((safety_margin - 1) * 100)}% safety margin), "
-            f"Available: {format_bytes(free_bytes)}"
-        )
+
+    return False, (
+        f"Insufficient disk space. "
+        f"Required: {format_bytes(required_with_margin)} "
+        f"(including {int((safety_margin - 1) * 100)}% safety margin), "
+        f"Available: {format_bytes(free_bytes)}"
+    )
 
 
 def format_bytes(num_bytes: int) -> str:
