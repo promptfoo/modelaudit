@@ -240,3 +240,13 @@ check_untyped_defs = true
 module = "modelaudit.scanners.*"
 # Scanners use dynamic patterns that need Any
 warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = "modelaudit.suspicious_symbols"
+# Runtime validation needs to check types even with annotations
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
+module = "modelaudit.scanners.oci_layer_scanner"
+# Runtime validation needs to check types even with annotations
+warn_unreachable = false

@@ -140,6 +140,8 @@ class OciLayerScanner(BaseScanner):
                                     issue.location = f"{path}:{layer_ref}:{name} {issue.location}"
                                 else:
                                     issue.location = f"{path}:{layer_ref}:{name}"
+                                if issue.details is None:
+                                    issue.details = {}
                                 issue.details["layer"] = layer_ref
                             result.merge(file_result)
                         finally:
