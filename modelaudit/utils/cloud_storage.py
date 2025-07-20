@@ -206,7 +206,8 @@ class GCSCache:
         if self.metadata_file.exists():
             try:
                 with open(self.metadata_file) as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    return dict(data)  # Ensure it's a dict for type checker
             except Exception:
                 return {}
         return {}
@@ -490,7 +491,13 @@ def download_from_cloud(
         else:
             download_single_file()
 
-    # Cache the download
+        # Cache the download
+        if cache:
+            cache.cache_file(url, download_path)
+
+        return local_file  # Return the actual file path for single files
+
+    # Cache the download (for directories)
     if cache:
         cache.cache_file(url, download_path)
 
