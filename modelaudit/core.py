@@ -127,7 +127,7 @@ def scan_model_directory_or_file(
             # Perform streaming analysis
             from modelaudit.scanners import get_scanner_for_file
 
-            scanner = get_scanner_for_file(stream_url)
+            scanner = get_scanner_for_file(stream_url, config=config)
             if scanner:
                 scan_result, was_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:

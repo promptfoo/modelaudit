@@ -493,7 +493,7 @@ def download_from_cloud(
 
         # Cache the download
         if cache:
-            cache.cache_file(url, download_path)
+            cache.cache_file(url, local_file)  # Cache the actual file, not the directory
 
         return local_file  # Return the actual file path for single files
 
