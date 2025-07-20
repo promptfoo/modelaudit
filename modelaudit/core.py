@@ -14,10 +14,11 @@ from modelaudit.license_checker import (
 )
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
-from modelaudit.utils import is_within_directory, resolve_dvc_file
+from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
+    detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
 )
@@ -144,6 +145,7 @@ def scan_model_directory_or_file(
     progress_callback: Optional[Callable[[str, float], None]] = None,
     parallel: bool = True,
     max_workers: Optional[int] = None,
+    skip_file_types: bool = True,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -160,6 +162,7 @@ def scan_model_directory_or_file(
                           (message, percentage)
         parallel: Enable parallel scanning for directories
         max_workers: Number of worker processes for parallel scanning
+        skip_file_types: Whether to skip non-model file types during directory scans
         **kwargs: Additional arguments to pass to scanners
 
     Returns:
@@ -187,6 +190,7 @@ def scan_model_directory_or_file(
         "max_file_size": max_file_size,
         "max_total_size": max_total_size,
         "timeout": timeout,
+        "skip_file_types": skip_file_types,
         "strict_license": strict_license,
         **kwargs,
     }
@@ -309,9 +313,21 @@ def scan_model_directory_or_file(
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
             # Scan all files in the directory
-            total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+            # Use lazy file counting for better performance on large directories
+            total_files = None  # Will be set to actual count if directory is small
             processed_files = 0
             limit_reached = False
+
+            # Quick check: count files only if directory seems reasonable in size
+            # This avoids the expensive rglob() on very large directories
+            try:
+                # Do a quick count of immediate children first
+                immediate_children = len(list(Path(path).iterdir()))
+                if immediate_children < 1000:  # Only count if not too many immediate children
+                    total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+            except (OSError, PermissionError):
+                # If we can't count, just proceed without progress percentage
+                total_files = None
 
             base_dir = Path(path).resolve()
             scanned_paths: set[str] = set()
@@ -369,6 +385,13 @@ def scan_model_directory_or_file(
                         )
                         continue
 
+                    # Skip non-model files early if filtering is enabled
+                    skip_file_types = config.get("skip_file_types", True)
+                    if skip_file_types and should_skip_file(file_path):
+                        logger.debug(f"Skipping non-model file: {file_path}")
+                        continue
+
+                    # Handle DVC files and get target paths
                     target_paths = [resolved_file]
                     if file.endswith(".dvc"):
                         dvc_targets = resolve_dvc_file(file_path)
@@ -380,8 +403,8 @@ def scan_model_directory_or_file(
                         if target_str in scanned_paths:
                             continue
                         scanned_paths.add(target_str)
+
                         if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
-                            issues_list = cast(list[dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
                                     "message": "Path traversal outside scanned directory",
@@ -400,12 +423,17 @@ def scan_model_directory_or_file(
                             raise TimeoutError(f"Scan timeout after {timeout} seconds")
 
                         # Update progress
-                        if progress_callback and total_files > 0:
-                            processed_files += 1
-                            progress_callback(
-                                f"Scanning file {processed_files}/{total_files}: {Path(target_path).name}",
-                                processed_files / total_files * 100,
-                            )
+                        if progress_callback:
+                            if total_files is not None and total_files > 0:
+                                progress_callback(
+                                    f"Scanning file {processed_files + 1}/{total_files}: {Path(target_path).name}",
+                                    processed_files / total_files * 100,
+                                )
+                            else:
+                                progress_callback(
+                                    f"Scanning file {processed_files + 1}: {Path(target_path).name}",
+                                    0.0,
+                                )
 
                         try:
                             # Check for interrupts before scanning each file
@@ -414,6 +442,7 @@ def scan_model_directory_or_file(
                             file_result = scan_file(str(target_path), config)
                             results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
                             results["files_scanned"] = cast(int, results["files_scanned"]) + 1
+                            processed_files += 1
 
                             scanner_name = file_result.scanner_name
                             scanners_list = cast(list[str], results["scanners"])
@@ -457,10 +486,19 @@ def scan_model_directory_or_file(
                                 }
                             )
                             _add_error_asset_to_results(results, str(target_path))
-                        if limit_reached:
-                            break
+
                     if limit_reached:
                         break
+
+                if limit_reached:
+                    break
+
+            # Final progress update for directory scan
+            if progress_callback and not limit_reached and total_files is not None and total_files > 0:
+                progress_callback(
+                    f"Completed scanning {processed_files} files",
+                    100.0,
+                )
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.info("Scan terminated early due to total size limit")
@@ -632,6 +670,9 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     return 0
 
 
+# _should_skip_file has been moved to utils.file_filter module
+
+
 def _is_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
@@ -728,12 +769,15 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     # Validate file type consistency as a security check
     file_type_valid = validate_file_type(path)
     discrepancy_msg = None
+    magic_format = None
 
     if not file_type_valid:
         # File type validation failed - this is a security concern
+        # Get the actual magic bytes format for accurate error message
+        magic_format = detect_file_format_from_magic(path)
         discrepancy_msg = (
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
-            f"indicate {header_format}. This could indicate file spoofing or corruption."
+            f"indicate {magic_format}. This could indicate file spoofing or corruption."
         )
         logger.warning(discrepancy_msg)
     elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
@@ -801,13 +845,15 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy
         severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
+        # For validation failures, use the actual magic format
+        detail_header_format = magic_format if not file_type_valid else header_format
         result.add_issue(
             discrepancy_msg + " Using header-based detection.",
             severity=severity,
             location=path,
             details={
                 "extension_format": ext_format,
-                "header_format": header_format,
+                "header_format": detail_header_format,
                 "file_type_validation_failed": not file_type_valid,
             },
         )
