@@ -1074,11 +1074,14 @@ def scan_command(
         if output:
             # Write to file
             output_text = "\n".join(lines)
+            # Continue to file writing logic below
         else:
             # Display on console
             for line in lines:
                 click.echo(line)
-            return  # Don't continue to file writing logic
+            # Exit early for console output
+            exit_code = determine_exit_code(aggregated_results)
+            ctx.exit(exit_code)
 
     else:
         # Convert results to the requested format
@@ -1103,18 +1106,19 @@ def scan_command(
                 lines.append(json.dumps(issue))
             output_text = "\n".join(lines)
 
-        # Write to file if output path specified
-        if output:
-            try:
-                with open(output, "w", encoding="utf-8") as f:
-                    f.write(output_text)
-                if format == "text":
-                    click.echo(f"Results written to {output}")
-            except Exception as e:
-                logger.error(f"Failed to write output to {output}: {e!s}")
-                sys.exit(1)
-        else:
-            # Print to stdout
+    # Write to file if output path specified
+    if output:
+        try:
+            with open(output, "w", encoding="utf-8") as f:
+                f.write(output_text)
+            if format == "text":
+                click.echo(f"Results written to {output}")
+        except Exception as e:
+            logger.error(f"Failed to write output to {output}: {e!s}")
+            sys.exit(1)
+    else:
+        # Print to stdout (only for non-text formats, text format already printed)
+        if format != "text":
             click.echo(output_text)
 
     # Exit with appropriate code

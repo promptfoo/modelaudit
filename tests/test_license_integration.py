@@ -190,8 +190,8 @@ class TestLicenseIntegration:
         """Test the specific AGPL detection function."""
         agpl_dir = test_data_dir / "agpl_component"
 
-        # Scan directory
-        results = scan_model_directory_or_file(str(agpl_dir))
+        # Scan directory (disable skip_file_types to scan Python files)
+        results = scan_model_directory_or_file(str(agpl_dir), skip_file_types=False)
 
         # Test AGPL detection function directly
         agpl_files = detect_agpl_components(results)
@@ -199,8 +199,6 @@ class TestLicenseIntegration:
         # Should find AGPL files
         agpl_python_files = [f for f in agpl_files if f.endswith(".py")]
         assert len(agpl_python_files) > 0, "Should detect AGPL Python files"
-
-        print(f"AGPL files detected: {agpl_files}")
 
     def test_unlicensed_dataset_detection_function(self, test_data_dir):
         """Test the specific unlicensed dataset detection function."""

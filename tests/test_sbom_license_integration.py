@@ -77,7 +77,7 @@ def example():
         model_file = tmp_path / "model.pkl"
         model_file.write_bytes(b"dummy model content")
 
-        results = scan_model_directory_or_file(str(tmp_path))
+        results = scan_model_directory_or_file(str(tmp_path), skip_file_types=False)
         sbom_json = generate_sbom([str(tmp_path)], results)
         sbom_data = json.loads(sbom_json)
 

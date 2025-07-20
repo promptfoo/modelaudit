@@ -81,8 +81,13 @@ def _scan_file_worker(work_item: WorkItem) -> WorkResult:
     try:
         # Import inside worker to ensure clean process state
         from modelaudit.core import scan_file
+        from modelaudit.license_checker import collect_license_metadata
 
         result = scan_file(work_item.file_path, work_item.config)
+
+        # Collect license metadata
+        license_metadata = collect_license_metadata(work_item.file_path)
+        combined_metadata = {**result.metadata, **license_metadata}
 
         # Convert ScanResult to dict for serialization
         result_dict = {
@@ -90,7 +95,7 @@ def _scan_file_worker(work_item: WorkItem) -> WorkResult:
             "success": result.success,
             "issues": [issue.to_dict() for issue in result.issues],
             "bytes_scanned": result.bytes_scanned,
-            "metadata": result.metadata,
+            "metadata": combined_metadata,
         }
 
         return WorkResult(
@@ -355,13 +360,8 @@ class ParallelScanner:
 
             results["assets"].append(asset_entry)
 
-            # Store metadata with license information
-            from modelaudit.license_checker import collect_license_metadata
-
-            scan_metadata = result_data.get("metadata", {})
-            license_metadata = collect_license_metadata(work_result.file_path)
-            combined_metadata = {**scan_metadata, **license_metadata}
-            results["file_metadata"][work_result.file_path] = combined_metadata
+            # Store metadata (already includes license information from worker)
+            results["file_metadata"][work_result.file_path] = result_data.get("metadata", {})
 
         else:
             # Handle scan failure
