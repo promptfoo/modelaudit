@@ -59,7 +59,7 @@ class TestCacheDirOption:
 
         # Verify download was called with the cache directory
         mock_download_cloud.assert_called_once_with(
-            "s3://bucket/model.pt", 
+            "s3://bucket/model.pt",
             cache_dir=Path(str(cache_dir)),
             max_size=None,
             use_cache=True,
