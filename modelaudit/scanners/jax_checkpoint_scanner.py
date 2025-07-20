@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover
     np = None
 
 
-
 class JaxCheckpointScanner(BaseScanner):
     """Scanner for JAX checkpoint files in various formats (Orbax, pickle-based, etc.)."""
 
