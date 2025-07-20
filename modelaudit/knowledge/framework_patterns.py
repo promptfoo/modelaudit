@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 
 class FrameworkType(Enum):
@@ -135,7 +135,7 @@ class FrameworkKnowledgeBase:
             },
         }
 
-    def _build_pytorch_patterns(self) -> List[FrameworkPattern]:
+    def _build_pytorch_patterns(self) -> list[FrameworkPattern]:
         """PyTorch-specific patterns."""
         return [
             # Safe patterns
@@ -190,7 +190,7 @@ class FrameworkKnowledgeBase:
             ),
         ]
 
-    def _build_tensorflow_patterns(self) -> List[FrameworkPattern]:
+    def _build_tensorflow_patterns(self) -> list[FrameworkPattern]:
         """TensorFlow-specific patterns."""
         return [
             # Safe patterns
@@ -229,7 +229,7 @@ class FrameworkKnowledgeBase:
             ),
         ]
 
-    def _build_keras_patterns(self) -> List[FrameworkPattern]:
+    def _build_keras_patterns(self) -> list[FrameworkPattern]:
         """Keras-specific patterns."""
         return [
             FrameworkPattern(
@@ -250,7 +250,7 @@ class FrameworkKnowledgeBase:
             ),
         ]
 
-    def _build_sklearn_patterns(self) -> List[FrameworkPattern]:
+    def _build_sklearn_patterns(self) -> list[FrameworkPattern]:
         """Scikit-learn specific patterns."""
         return [
             FrameworkPattern(
@@ -271,7 +271,7 @@ class FrameworkKnowledgeBase:
             ),
         ]
 
-    def _build_jax_patterns(self) -> List[FrameworkPattern]:
+    def _build_jax_patterns(self) -> list[FrameworkPattern]:
         """JAX-specific patterns."""
         return [
             FrameworkPattern(
@@ -293,8 +293,8 @@ class FrameworkKnowledgeBase:
         ]
 
     def is_pattern_safe_in_framework(
-        self, pattern: str, framework: FrameworkType, context: Dict[str, any]
-    ) -> Tuple[bool, str]:
+        self, pattern: str, framework: FrameworkType, context: dict[str, any]
+    ) -> tuple[bool, str]:
         """Check if a pattern is safe within a specific framework context."""
         if framework not in self.patterns:
             return False, "Unknown framework"
@@ -310,9 +310,8 @@ class FrameworkKnowledgeBase:
                         return True, f"{fw_pattern.explanation} (validated in context)"
 
         # Check if it's a known safe operation
-        if framework in self.safe_operations:
-            if pattern in self.safe_operations[framework]:
-                return True, f"Known safe operation in {framework.value}"
+        if framework in self.safe_operations and pattern in self.safe_operations[framework]:
+            return True, f"Known safe operation in {framework.value}"
 
         # Check false positive patterns
         for category, patterns in self.false_positive_patterns.items():
@@ -322,7 +321,7 @@ class FrameworkKnowledgeBase:
 
         return False, "Pattern not recognized as safe"
 
-    def _validate_context(self, pattern: FrameworkPattern, context: Dict[str, any]) -> bool:
+    def _validate_context(self, pattern: FrameworkPattern, context: dict[str, any]) -> bool:
         """Validate pattern safety based on context."""
         # Check if we're in the right context
         if pattern.context not in str(context):
@@ -334,13 +333,13 @@ class FrameworkKnowledgeBase:
             lambda_code = context.get("lambda_code", "")
             if lambda_code:
                 # Check against known safe lambda patterns
-                for arch, arch_patterns in self.architecture_patterns.items():
+                for _arch, arch_patterns in self.architecture_patterns.items():
                     if any(safe_lambda in lambda_code for safe_lambda in arch_patterns.get("safe_lambdas", [])):
                         return True
 
         return pattern.risk_level in ["safe", "low"]
 
-    def get_framework_from_imports(self, imports: List[str]) -> Optional[FrameworkType]:
+    def get_framework_from_imports(self, imports: list[str]) -> Optional[FrameworkType]:
         """Detect framework from import statements."""
         import_str = " ".join(imports).lower()
 
@@ -366,7 +365,7 @@ class FrameworkKnowledgeBase:
 
         return None
 
-    def get_safe_alternatives(self, dangerous_pattern: str, framework: FrameworkType) -> List[str]:
+    def get_safe_alternatives(self, dangerous_pattern: str, framework: FrameworkType) -> list[str]:
         """Suggest safe alternatives to dangerous patterns."""
         alternatives = {
             "eval": {
@@ -414,7 +413,7 @@ class FrameworkKnowledgeBase:
         return ["Consider using framework-specific serialization methods"]
 
     def should_skip_pattern_for_framework(
-        self, pattern: str, framework: FrameworkType, file_context: Dict[str, any]
+        self, pattern: str, framework: FrameworkType, file_context: dict[str, any]
     ) -> bool:
         """Determine if a pattern check should be skipped for a framework."""
         # Framework-specific skips

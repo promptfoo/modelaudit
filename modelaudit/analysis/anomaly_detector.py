@@ -2,7 +2,6 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy import stats
@@ -16,14 +15,14 @@ class StatisticalProfile:
     std: float
     min_val: float
     max_val: float
-    percentiles: Dict[int, float]  # 1, 5, 25, 50, 75, 95, 99
+    percentiles: dict[int, float]  # 1, 5, 25, 50, 75, 95, 99
     skewness: float
     kurtosis: float
     entropy: float
     zero_ratio: float
     sparsity: float
 
-    def is_anomalous(self, other: "StatisticalProfile", threshold: float = 3.0) -> Tuple[bool, float]:
+    def is_anomalous(self, other: "StatisticalProfile", threshold: float = 3.0) -> tuple[bool, float]:
         """Check if another profile is anomalous compared to this one."""
         # Calculate z-scores for each metric
         z_scores = []
@@ -186,7 +185,7 @@ class AnomalyDetector:
             sparsity=sparsity,
         )
 
-    def detect_weight_anomalies(self, weights: Dict[str, np.ndarray]) -> Dict[str, Dict[str, any]]:
+    def detect_weight_anomalies(self, weights: dict[str, np.ndarray]) -> dict[str, dict[str, any]]:
         """Detect anomalies in model weights."""
         anomalies = {}
 
@@ -221,7 +220,7 @@ class AnomalyDetector:
 
         return anomalies
 
-    def _infer_layer_type(self, layer_name: str, shape: Tuple[int, ...]) -> str:
+    def _infer_layer_type(self, layer_name: str, shape: tuple[int, ...]) -> str:
         """Infer layer type from name and shape."""
         layer_name_lower = layer_name.lower()
 
@@ -245,7 +244,7 @@ class AnomalyDetector:
 
         return "dense_weights"  # Default
 
-    def _check_suspicious_patterns(self, data: np.ndarray) -> List[Dict[str, any]]:
+    def _check_suspicious_patterns(self, data: np.ndarray) -> list[dict[str, any]]:
         """Check for specific suspicious patterns in data."""
         suspicious = []
         flat_data = data.flatten()
@@ -372,7 +371,7 @@ class AnomalyDetector:
 
         return False
 
-    def _analyze_anomaly(self, expected: StatisticalProfile, actual: StatisticalProfile) -> Dict[str, str]:
+    def _analyze_anomaly(self, expected: StatisticalProfile, actual: StatisticalProfile) -> dict[str, str]:
         """Analyze what makes the profile anomalous."""
         details = {}
 

@@ -4,7 +4,7 @@ import ast
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 
 class CodeRiskLevel(Enum):
@@ -21,13 +21,13 @@ class CodeRiskLevel(Enum):
 class CodeContext:
     """Context information for code analysis."""
 
-    imports: Set[str]
-    function_calls: Set[str]
-    class_definitions: Set[str]
-    variable_assignments: Dict[str, Any]
-    control_flow: List[str]
-    data_flow: Dict[str, List[str]]
-    external_calls: Set[str]
+    imports: set[str]
+    function_calls: set[str]
+    class_definitions: set[str]
+    variable_assignments: dict[str, Any]
+    control_flow: list[str]
+    data_flow: dict[str, list[str]]
+    external_calls: set[str]
 
 
 class SemanticAnalyzer:
@@ -89,7 +89,7 @@ class SemanticAnalyzer:
         """Extract comprehensive context from Python code."""
         try:
             tree = ast.parse(code)
-        except:
+        except (SyntaxError, ValueError):
             return None
 
         context = CodeContext(
@@ -126,12 +126,11 @@ class SemanticAnalyzer:
                     self.context.function_calls.add(call_name)
 
                     # Track data flow
-                    if isinstance(node.func, ast.Attribute):
-                        if isinstance(node.func.value, ast.Name):
-                            var_name = node.func.value.id
-                            if var_name not in self.context.data_flow:
-                                self.context.data_flow[var_name] = []
-                            self.context.data_flow[var_name].append(call_name)
+                    if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                        var_name = node.func.value.id
+                        if var_name not in self.context.data_flow:
+                            self.context.data_flow[var_name] = []
+                        self.context.data_flow[var_name].append(call_name)
 
                 self.generic_visit(node)
 
@@ -183,7 +182,7 @@ class SemanticAnalyzer:
 
         return context
 
-    def analyze_code_behavior(self, code: str, ml_context: Dict[str, Any]) -> Tuple[CodeRiskLevel, Dict[str, Any]]:
+    def analyze_code_behavior(self, code: str, ml_context: dict[str, Any]) -> tuple[CodeRiskLevel, dict[str, Any]]:
         """Analyze code behavior with ML context awareness."""
         context = self.extract_code_context(code)
         if not context:
@@ -221,11 +220,13 @@ class SemanticAnalyzer:
                 risk_factors.append(f"Potentially dangerous import: {imp}")
 
         # ML-specific analysis
-        if ml_context.get("framework") == "pytorch":
+        if (
+            ml_context.get("framework") == "pytorch"
+            and "torch.load" in context.function_calls
+            and self._is_safe_torch_load(code)
+        ):
             # PyTorch-specific safe patterns
-            if "torch.load" in context.function_calls:
-                if self._is_safe_torch_load(code):
-                    mitigating_factors.append("Safe torch.load usage")
+            mitigating_factors.append("Safe torch.load usage")
 
         # Calculate risk level
         risk_score = len(risk_factors) - (len(mitigating_factors) * 0.5)
@@ -249,10 +250,10 @@ class SemanticAnalyzer:
             "risk_score": risk_score,
         }
 
-    def _is_safe_usage(self, operation: str, code: str, context: CodeContext, ml_context: Dict[str, Any]) -> bool:
+    def _is_safe_usage(self, operation: str, code: str, context: CodeContext, ml_context: dict[str, Any]) -> bool:
         """Check if a potentially dangerous operation is used safely."""
         # Check against safe patterns
-        for pattern, usage_type in self.safe_patterns.items():
+        for pattern, _usage_type in self.safe_patterns.items():
             if re.search(pattern, code):
                 return True
 
@@ -278,7 +279,7 @@ class SemanticAnalyzer:
 
         return False
 
-    def _is_import_used_safely(self, import_name: str, context: CodeContext, ml_context: Dict[str, Any]) -> bool:
+    def _is_import_used_safely(self, import_name: str, context: CodeContext, ml_context: dict[str, Any]) -> bool:
         """Check if an import is used safely."""
         # Check if import is used at all
         import_calls = [call for call in context.function_calls if call.startswith(import_name)]
@@ -316,7 +317,7 @@ class SemanticAnalyzer:
 
         return False
 
-    def detect_obfuscation(self, code: str) -> Tuple[bool, List[str]]:
+    def detect_obfuscation(self, code: str) -> tuple[bool, list[str]]:
         """Detect code obfuscation techniques."""
         obfuscation_indicators = []
 

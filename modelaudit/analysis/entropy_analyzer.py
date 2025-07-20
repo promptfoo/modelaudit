@@ -3,7 +3,6 @@
 import math
 import struct
 from collections import Counter
-from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -36,7 +35,7 @@ class EntropyAnalyzer:
 
         return entropy
 
-    def calculate_sliding_window_entropy(self, data: bytes, window_size: int = 256) -> List[float]:
+    def calculate_sliding_window_entropy(self, data: bytes, window_size: int = 256) -> list[float]:
         """Calculate entropy using sliding window."""
         if len(data) < window_size:
             return [self.calculate_shannon_entropy(data)]
@@ -48,7 +47,7 @@ class EntropyAnalyzer:
 
         return entropies
 
-    def analyze_float_patterns(self, data: bytes) -> Dict[str, float]:
+    def analyze_float_patterns(self, data: bytes) -> dict[str, float]:
         """Analyze patterns specific to floating-point data."""
         if len(data) < 4:
             return {"float_ratio": 0.0, "float_entropy": 0.0}
@@ -64,7 +63,7 @@ class EntropyAnalyzer:
                 if -1e10 < value < 1e10 and not math.isnan(value) and not math.isinf(value):
                     float_values.append(value)
                     valid_floats += 1
-            except:
+            except (struct.error, ValueError):
                 pass
 
         float_ratio = valid_floats / (len(data) // 4) if len(data) >= 4 else 0
@@ -103,7 +102,7 @@ class EntropyAnalyzer:
             "valid_float_count": valid_floats,
         }
 
-    def detect_code_patterns(self, data: bytes) -> Dict[str, float]:
+    def detect_code_patterns(self, data: bytes) -> dict[str, float]:
         """Detect patterns indicative of code vs data."""
         if not data:
             return {"code_probability": 0.0}
@@ -183,7 +182,7 @@ class EntropyAnalyzer:
             "pattern_matches": pattern_matches,
         }
 
-    def classify_data_type(self, data: bytes) -> Tuple[str, float]:
+    def classify_data_type(self, data: bytes) -> tuple[str, float]:
         """Classify data type with confidence score."""
         if len(data) < 16:
             return "unknown", 0.0

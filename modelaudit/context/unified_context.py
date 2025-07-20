@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Optional
 
 
 class ModelArchitecture(Enum):
@@ -27,10 +27,10 @@ class TensorInfo:
     """Information about a tensor in the model."""
 
     name: str
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     dtype: str
     parameter_count: int
-    statistics: Dict[str, float] = field(default_factory=dict)  # mean, std, min, max, entropy
+    statistics: dict[str, float] = field(default_factory=dict)  # mean, std, min, max, entropy
 
 
 @dataclass
@@ -38,8 +38,8 @@ class LayerPattern:
     """Pattern information for a model layer."""
 
     layer_type: str
-    parameter_names: List[str]
-    activation_functions: List[str]
+    parameter_names: list[str]
+    activation_functions: list[str]
     has_batch_norm: bool = False
     has_dropout: bool = False
 
@@ -54,28 +54,28 @@ class UnifiedMLContext:
     file_type: str
 
     # ML Framework detection
-    frameworks: Dict[str, float] = field(default_factory=dict)  # framework -> confidence
+    frameworks: dict[str, float] = field(default_factory=dict)  # framework -> confidence
     primary_framework: Optional[str] = None
     framework_version: Optional[str] = None
 
     # Architecture analysis
     architecture: ModelArchitecture = ModelArchitecture.UNKNOWN
     architecture_confidence: float = 0.0
-    layer_patterns: List[LayerPattern] = field(default_factory=list)
+    layer_patterns: list[LayerPattern] = field(default_factory=list)
 
     # Tensor/Weight analysis
-    tensors: List[TensorInfo] = field(default_factory=list)
+    tensors: list[TensorInfo] = field(default_factory=list)
     total_parameters: int = 0
-    weight_statistics: Dict[str, float] = field(default_factory=dict)
+    weight_statistics: dict[str, float] = field(default_factory=dict)
 
     # Pattern analysis
-    suspicious_patterns_found: Set[str] = field(default_factory=set)
-    safe_patterns_found: Set[str] = field(default_factory=set)
-    pattern_locations: Dict[str, List[int]] = field(default_factory=dict)
+    suspicious_patterns_found: set[str] = field(default_factory=set)
+    safe_patterns_found: set[str] = field(default_factory=set)
+    pattern_locations: dict[str, list[int]] = field(default_factory=dict)
 
     # Risk scoring
-    risk_factors: Dict[str, float] = field(default_factory=dict)
-    confidence_adjustments: Dict[str, float] = field(default_factory=dict)
+    risk_factors: dict[str, float] = field(default_factory=dict)
+    confidence_adjustments: dict[str, float] = field(default_factory=dict)
 
     # Binary analysis
     has_weight_structure: bool = False
@@ -83,7 +83,7 @@ class UnifiedMLContext:
     float_pattern_ratio: float = 0.0
 
     # Code analysis results
-    validated_code_blocks: List[Dict[str, any]] = field(default_factory=list)
+    validated_code_blocks: list[dict[str, any]] = field(default_factory=list)
 
     def get_adjusted_severity(self, base_severity: float, pattern: str) -> float:
         """Get severity adjusted for ML context."""

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from modelaudit.analysis.anomaly_detector import AnomalyDetector
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -29,10 +29,10 @@ class IntegratedAnalysisResult:
     is_suspicious: bool
     confidence: float
     risk_level: str  # 'safe', 'low', 'medium', 'high', 'critical'
-    reasoning: List[str]
-    mitigations: List[str]
-    recommendations: List[str]
-    detailed_analysis: Dict[str, Any]
+    reasoning: list[str]
+    mitigations: list[str]
+    recommendations: list[str]
+    detailed_analysis: dict[str, Any]
 
 
 class IntegratedAnalyzer:
@@ -138,7 +138,7 @@ class IntegratedAnalyzer:
             detailed_analysis=detailed,
         )
 
-    def _analyze_ml_context(self, pattern: str, context: UnifiedMLContext) -> Dict[str, Any]:
+    def _analyze_ml_context(self, pattern: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Analyze pattern within ML context."""
         confidence_safe = 0.5  # Start neutral
         reasoning = []
@@ -174,7 +174,7 @@ class IntegratedAnalyzer:
             "architecture": context.architecture.value,
         }
 
-    def _analyze_entropy(self, data: bytes, pattern: str) -> Dict[str, Any]:
+    def _analyze_entropy(self, data: bytes, pattern: str) -> dict[str, Any]:
         """Analyze entropy characteristics."""
         confidence_safe = 0.5
         reasoning = []
@@ -211,7 +211,7 @@ class IntegratedAnalyzer:
             "code_probability": entropy_info.get("code_probability", 0),
         }
 
-    def _analyze_semantics(self, code: str, context: UnifiedMLContext) -> Dict[str, Any]:
+    def _analyze_semantics(self, code: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Perform semantic analysis."""
         confidence_safe = 0.5
         reasoning = []
@@ -250,7 +250,7 @@ class IntegratedAnalyzer:
             "analysis": analysis,
         }
 
-    def _analyze_anomalies(self, pattern: str, context: UnifiedMLContext) -> Dict[str, Any]:
+    def _analyze_anomalies(self, pattern: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Analyze statistical anomalies."""
         confidence_safe = 0.7  # Start assuming safe
         reasoning = []
@@ -280,7 +280,7 @@ class IntegratedAnalyzer:
 
         return {"confidence": max(0, confidence_safe), "reasoning": reasoning, "anomalies_found": len(reasoning) > 0}
 
-    def _analyze_framework_patterns(self, pattern: str, pattern_type: str, context: UnifiedMLContext) -> Dict[str, Any]:
+    def _analyze_framework_patterns(self, pattern: str, pattern_type: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Analyze using framework-specific knowledge."""
         confidence_safe = 0.5
         reasoning = []
@@ -327,7 +327,7 @@ class IntegratedAnalyzer:
             "framework": framework.value if framework else None,
         }
 
-    def _validate_code(self, code: str) -> Dict[str, Any]:
+    def _validate_code(self, code: str) -> dict[str, Any]:
         """Validate code syntax and safety."""
         confidence_safe = 0.5
         reasoning = []
@@ -356,7 +356,7 @@ class IntegratedAnalyzer:
             "syntax_error": error,
         }
 
-    def _calculate_risk_level(self, confidence: float, signals: Dict[str, float]) -> str:
+    def _calculate_risk_level(self, confidence: float, signals: dict[str, float]) -> str:
         """Calculate overall risk level."""
         # Invert confidence (high confidence in safety = low risk)
         risk_score = 1.0 - confidence
@@ -380,7 +380,7 @@ class IntegratedAnalyzer:
         else:
             return "critical"
 
-    def _get_recommendations(self, pattern: str, pattern_type: str, context: UnifiedMLContext) -> List[str]:
+    def _get_recommendations(self, pattern: str, pattern_type: str, context: UnifiedMLContext) -> list[str]:
         """Get specific recommendations."""
         recommendations = []
 
