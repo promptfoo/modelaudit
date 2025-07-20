@@ -94,13 +94,13 @@ def get_cloud_object_size(fs, url: str) -> Optional[int]:
         # Check if it's a single file or directory
         info = fs.info(url)
         if "size" in info:
-            return info["size"]
+            return int(info["size"])
 
         # If it's a directory, sum up all file sizes
         total_size = 0
         for item in fs.ls(url, detail=True):
             if isinstance(item, dict) and "size" in item:
-                total_size += item["size"]
+                total_size += int(item["size"])
 
         return total_size if total_size > 0 else None
     except Exception:

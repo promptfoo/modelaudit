@@ -44,7 +44,7 @@ class InterruptHandler:
         _active: Boolean indicating if handlers are currently installed
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._interrupted = threading.Event()
         self._original_sigint_handler: Optional[Callable[[int, Any], None]] = None
         self._original_sigterm_handler: Optional[Callable[[int, Any], None]] = None
