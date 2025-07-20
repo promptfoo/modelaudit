@@ -17,7 +17,7 @@ class TestCacheDirOption:
         result = runner.invoke(cli, ["scan", "--help"])
         assert result.exit_code == 0
         assert "--cache-dir" in result.output
-        assert "Directory to use for caching downloaded models" in result.output
+        assert "Directory for caching downloaded files" in result.output
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
@@ -37,7 +37,7 @@ class TestCacheDirOption:
         result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
 
         # Verify download was called with the cache directory
-        mock_download_model.assert_called_once_with("hf://test/model", cache_dir=Path(str(cache_dir)))
+        mock_download_model.assert_called_once_with("hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=True)
         assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_from_cloud")
@@ -100,7 +100,7 @@ class TestCacheDirOption:
 
         result = runner.invoke(
             cli,
-            ["scan", "hf://test/model"],  # No --cache-dir option
+            ["scan", "--no-cache", "hf://test/model"],  # No --cache-dir option, disable caching
         )
 
         # Verify cleanup WAS called since we didn't use a cache directory

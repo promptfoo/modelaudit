@@ -303,8 +303,6 @@ def scan_command(
 
                     try:
                         # Convert cache_dir string to Path if provided
-                        from pathlib import Path
-
                         hf_cache_dir = None
                         if cache and cache_dir:
                             hf_cache_dir = Path(cache_dir)
