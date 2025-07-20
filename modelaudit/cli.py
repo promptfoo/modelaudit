@@ -18,6 +18,7 @@ from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
 from .utils.jfrog import download_artifact, is_jfrog_url
+from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +88,7 @@ class DefaultCommandGroup(click.Group):
             formatter.write_text("modelaudit model.pkl")
             formatter.write_text("modelaudit /path/to/models/")
             formatter.write_text("modelaudit https://huggingface.co/user/model")
+            formatter.write_text("modelaudit https://pytorch.org/hub/pytorch_vision_resnet/")
 
         formatter.write_paragraph()
         formatter.write_text("Other commands:")
@@ -228,6 +230,7 @@ def scan_command(
     Usage:
         modelaudit scan /path/to/model1 /path/to/model2 ...
         modelaudit scan https://huggingface.co/user/model
+        modelaudit scan https://pytorch.org/hub/pytorch_vision_resnet/
         modelaudit scan hf://user/model
         modelaudit scan s3://my-bucket/models/
         modelaudit scan gs://my-bucket/model.pt
@@ -357,6 +360,55 @@ def scan_command(
                                 style_text(
                                     "💡 Tip: Free up disk space or use --cache-dir to specify a "
                                     "directory with more space",
+                                    fg="cyan",
+                                ),
+                                err=True,
+                            )
+                        else:
+                            logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+
+                        aggregated_results["has_errors"] = True
+                        continue
+
+                # Check if this is a PyTorch Hub URL
+                elif is_pytorch_hub_url(path):
+                    download_spinner = None
+                    if format == "text" and not output and should_show_spinner():
+                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                        download_spinner.start()
+                    elif format == "text" and not output:
+                        click.echo(f"Downloading from {path}...")
+
+                    try:
+                        download_path = download_pytorch_hub_model(
+                            path,
+                            cache_dir=Path(cache_dir) if cache_dir else None,
+                        )
+                        actual_path = str(download_path)
+                        temp_dir = str(download_path)
+
+                        if download_spinner:
+                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Downloaded successfully")
+
+                    except Exception as e:
+                        if download_spinner:
+                            download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo("Download failed")
+
+                        error_msg = str(e)
+                        if "insufficient disk space" in error_msg.lower():
+                            logger.error(f"Disk space error for {path}: {error_msg}")
+                            click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
+                            click.echo(
+                                style_text(
+                                    (
+                                        "💡 Tip: Free up disk space or use --cache-dir "
+                                        "to specify a directory with more space"
+                                    ),
                                     fg="cyan",
                                 ),
                                 err=True,

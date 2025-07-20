@@ -374,6 +374,7 @@ def test_scan_huggingface_url_help():
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
     assert "https://huggingface.co/user/model" in result.output
+    assert "https://pytorch.org/hub/pytorch_vision_resnet/" in result.output
     assert "hf://user/model" in result.output
     assert "s3://my-bucket/models/" in result.output
     assert "models:/MyModel/1" in result.output
@@ -521,6 +522,48 @@ def test_scan_mixed_paths_and_urls(mock_scan):
 
         # Should report error for missing local file
         assert "Path does not exist: /local/path/model.pkl" in result.output
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock_is_ph_url, tmp_path):
+    """Test scanning a PyTorch Hub URL successfully."""
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    (test_dir / "model.pt").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 1,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
+    """Test download failure for PyTorch Hub URL."""
+    mock_is_ph_url.return_value = True
+    mock_download.side_effect = Exception("boom")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+
+    assert result.exit_code == 2
+    assert "Error downloading model" in result.output
 
 
 @patch("modelaudit.cli.is_cloud_url")
