@@ -71,6 +71,7 @@ def scan_model_directory_or_file(
     timeout: int = 300,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    strict_license: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     skip_file_types: bool = True,
     **kwargs,
@@ -84,6 +85,7 @@ def scan_model_directory_or_file(
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
         max_total_size: Maximum total bytes to scan across all files
+        strict_license: Fail scan if incompatible licenses are found
         progress_callback: Optional callback function to report progress
                           (message, percentage)
         skip_file_types: Whether to skip non-model file types during directory scans
@@ -115,6 +117,7 @@ def scan_model_directory_or_file(
         "max_total_size": max_total_size,
         "timeout": timeout,
         "skip_file_types": skip_file_types,
+        "strict_license": strict_license,
         **kwargs,
     }
 
@@ -505,7 +508,7 @@ def scan_model_directory_or_file(
 
     # Add license warnings if any
     try:
-        license_warnings = check_commercial_use_warnings(results)
+        license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
         issues_list = cast(list[dict[str, Any]], results["issues"])
         for warning in license_warnings:
             # Convert license warnings to issues
