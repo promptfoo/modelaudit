@@ -143,6 +143,25 @@ name,value
         risk_score = int(risk_score_prop["value"])
         assert risk_score >= 0  # Should have some risk score
 
+    def test_sbom_risk_score_with_critical_issue(self, tmp_path):
+        """Critical issues should increase SBOM risk score."""
+        malicious_file = tmp_path / "malicious.pkl"
+        malicious_file.write_bytes(b"subprocess.call('ls')")
+
+        results = scan_model_directory_or_file(str(malicious_file))
+        sbom_json = generate_sbom([str(malicious_file)], results)
+        sbom_data = json.loads(sbom_json)
+
+        component = sbom_data["components"][0]
+        properties = component.get("properties", [])
+
+        risk_score_prop = next(
+            (prop for prop in properties if prop["name"] == "risk_score"),
+            None,
+        )
+        assert risk_score_prop is not None
+        assert int(risk_score_prop["value"]) >= 5
+
     def test_sbom_handles_files_without_license_metadata(self, tmp_path):
         """Test that SBOM handles files without license metadata gracefully."""
         test_file = tmp_path / "no_license.py"
