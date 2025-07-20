@@ -1,10 +1,6 @@
 """Tests for file filtering functionality."""
 
-import pytest
-
 from modelaudit.utils.file_filter import (
-    DEFAULT_SKIP_EXTENSIONS,
-    DEFAULT_SKIP_FILENAMES,
     should_skip_file,
 )
 

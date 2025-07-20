@@ -3,8 +3,6 @@
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from modelaudit.core import scan_model_directory_or_file
 
 
