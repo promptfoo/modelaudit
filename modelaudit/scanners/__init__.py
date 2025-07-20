@@ -542,6 +542,15 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
+# Helper function for getting scanner for a file
+def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+    """Get an instantiated scanner for a given file path"""
+    scanner_class = _registry.get_scanner_for_path(path)
+    if scanner_class:
+        return scanner_class(config=config)
+    return None
+
+
 # Export the registry for direct use
 __all__ = [
     # Registry
@@ -552,5 +561,6 @@ __all__ = [
     "IssueSeverity",
     "ScanResult",
     "_registry",
+    "get_scanner_for_file",
     # Scanner classes will be lazy loaded via __getattr__
 ]
