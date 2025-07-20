@@ -155,8 +155,13 @@ def stream_analyze_file(
 
     except Exception as e:
         # If streaming fails, return None to fall back to regular download
-        if click.get_current_context().params.get("verbose"):
-            click.echo(f"Streaming analysis failed: {e}")
+        try:
+            ctx = click.get_current_context(silent=True)
+            if ctx and ctx.params.get("verbose"):
+                click.echo(f"Streaming analysis failed: {e}")
+        except Exception:
+            # Not in a Click context, just log silently
+            pass
         return None, False
 
 

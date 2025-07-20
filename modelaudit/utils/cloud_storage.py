@@ -14,6 +14,8 @@ from yaspin import yaspin
 
 from modelaudit.utils.retry import retry_with_backoff
 
+from .disk_space import check_disk_space
+
 
 def is_cloud_url(url: str) -> bool:
     """Return True if the URL points to a supported cloud storage provider."""
@@ -76,6 +78,34 @@ def format_size(size_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} PB"
+
+
+def get_cloud_object_size(fs, url: str) -> Optional[int]:
+    """Get the size of a cloud storage object or directory.
+
+    Args:
+        fs: fsspec filesystem instance
+        url: Cloud storage URL
+
+    Returns:
+        Total size in bytes, or None if size cannot be determined
+    """
+    try:
+        # Check if it's a single file or directory
+        info = fs.info(url)
+        if "size" in info:
+            return info["size"]
+
+        # If it's a directory, sum up all file sizes
+        total_size = 0
+        for item in fs.ls(url, detail=True):
+            if isinstance(item, dict) and "size" in item:
+                total_size += item["size"]
+
+        return total_size if total_size > 0 else None
+    except Exception:
+        # If we can't get the size, return None
+        return None
 
 
 async def analyze_cloud_target(url: str) -> dict[str, Any]:
@@ -378,7 +408,7 @@ def download_from_cloud(
         click.echo(f"⚠️  Downloading {metadata['human_size']} (estimated time: {metadata['estimated_time']})")
 
     # Create download directory
-    if cache and cache_dir:
+    if cache:
         # When using cache, download directly to cache location
         cache_key = cache.get_cache_key(url)
         cache_subdir = cache.cache_dir / cache_key[:2] / cache_key[2:4]
@@ -394,6 +424,16 @@ def download_from_cloud(
     fs_protocol = get_fs_protocol(url)
     # Use anonymous access for public buckets
     fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+
+    # Check available disk space before downloading
+    object_size = get_cloud_object_size(fs, url)
+    if object_size:
+        has_space, message = check_disk_space(download_path, object_size)
+        if not has_space:
+            # Clean up temp directory if we created one
+            if cache_dir is None and download_path.exists():
+                shutil.rmtree(download_path)
+            raise Exception(f"Cannot download from {url}: {message}")
 
     # Download based on type
     if metadata["type"] == "directory":
@@ -412,7 +452,17 @@ def download_from_cloud(
         # Download files
         for file_info in files:
             file_url = file_info["path"]
-            relative_path = file_url.replace(url.rstrip("/") + "/", "")
+            # Calculate relative path more robustly
+            base_url = url.rstrip("/")
+            if file_url.startswith(base_url + "/"):
+                relative_path = file_url[len(base_url) + 1 :]
+            elif file_url.startswith(base_url):
+                # Handle case where file_url might be exactly base_url
+                relative_path = Path(file_url).name
+            else:
+                # Fallback to just the filename
+                relative_path = Path(file_url).name
+
             local_path = download_path / relative_path
             local_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -7,6 +7,7 @@ from threading import Lock
 from typing import IO, Any, Callable, Optional, cast
 from unittest.mock import patch
 
+from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
@@ -229,6 +230,9 @@ def scan_model_directory_or_file(
                         )
                         continue
 
+                    # Check for interrupts
+                    check_interrupted()
+
                     # Check timeout
                     if time.time() - start_time > timeout:
                         raise TimeoutError(f"Scan timeout after {timeout} seconds")
@@ -243,6 +247,9 @@ def scan_model_directory_or_file(
 
                     # Scan the file
                     try:
+                        # Check for interrupts before scanning each file
+                        check_interrupted()
+
                         # Use resolved_file path for actual scanning (handles symlinks)
                         file_result = scan_file(str(resolved_file), config)
                         # Use cast to help mypy understand the types
@@ -319,6 +326,9 @@ def scan_model_directory_or_file(
                     target_files = dvc_targets
 
             for _idx, target in enumerate(target_files):
+                # Check for interrupts
+                check_interrupted()
+
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
 
@@ -395,6 +405,16 @@ def scan_model_directory_or_file(
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)
 
+    except KeyboardInterrupt:
+        logger.info("Scan interrupted by user")
+        results["success"] = False
+        issue_dict = {
+            "message": "Scan interrupted by user",
+            "severity": IssueSeverity.INFO.value,
+            "details": {"interrupted": True},
+        }
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        issues_list.append(issue_dict)
     except Exception as e:
         logger.exception(f"Error during scan: {e!s}")
         results["success"] = False
@@ -483,7 +503,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning
+    - 2: Operational errors occurred during scanning or no files scanned
 
     Args:
         results: Dictionary with scan results
@@ -493,6 +513,11 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     """
     # Check for operational errors first (highest priority)
     if results.get("has_errors", False):
+        return 2
+
+    # Check if no files were scanned
+    files_scanned = results.get("files_scanned", 0)
+    if files_scanned == 0:
         return 2
 
     # Check for any security findings (warnings, errors, or info issues)
