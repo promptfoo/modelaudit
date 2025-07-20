@@ -173,6 +173,44 @@ def test_scan_sbom_output(tmp_path):
         pytest.fail("SBOM output is not valid JSON")
 
 
+def test_scan_output_utf8_locale(tmp_path):
+    """Ensure output file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    output_file = tmp_path / "output.txt"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)], env=env)
+
+    assert output_file.exists()
+    try:
+        output_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("Output file is not valid UTF-8")
+
+
+def test_scan_sbom_utf8_locale(tmp_path):
+    """Ensure SBOM file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    sbom_file = tmp_path / "sbom.json"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)], env=env)
+
+    assert sbom_file.exists()
+    try:
+        sbom_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("SBOM file is not valid UTF-8")
+
+
 def test_scan_verbose_mode(tmp_path):
     """Test scanning in verbose mode."""
     test_file = tmp_path / "test_file.dat"

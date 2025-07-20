@@ -147,7 +147,20 @@ def scan_model_directory_or_file(
                         and ".cache/huggingface/hub" in str(base_dir)
                         and "/snapshots/" in str(file_path)
                     ):
-                        link_target = os.readlink(file_path)
+                        try:
+                            link_target = os.readlink(file_path)
+                        except OSError as e:
+                            issues_list = cast(list[dict[str, Any]], results["issues"])
+                            issues_list.append(
+                                {
+                                    "message": "Broken symlink encountered",
+                                    "severity": IssueSeverity.WARNING.value,
+                                    "location": file_path,
+                                    "details": {"error": str(e)},
+                                }
+                            )
+                            continue
+
                         # Resolve the relative link target
                         resolved_target = (Path(file_path).parent / link_target).resolve()
                         # Check if target is in the blobs directory of the same model cache

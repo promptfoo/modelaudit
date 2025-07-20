@@ -644,7 +644,7 @@ def scan_command(
         from .sbom import generate_sbom
 
         sbom_text = generate_sbom(expanded_paths, aggregated_results)
-        with open(sbom, "w") as f:
+        with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
     # Format the output
@@ -657,7 +657,7 @@ def scan_command(
 
     # Send output to the specified destination
     if output:
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             f.write(output_text)
         click.echo(f"Results written to {output}")
     else:
