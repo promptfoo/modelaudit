@@ -58,7 +58,15 @@ class TestCacheDirOption:
         result = runner.invoke(cli, ["scan", "s3://bucket/model.pt", "--cache-dir", str(cache_dir)])
 
         # Verify download was called with the cache directory
-        mock_download_cloud.assert_called_once_with("s3://bucket/model.pt", cache_dir=Path(str(cache_dir)))
+        mock_download_cloud.assert_called_once_with(
+            "s3://bucket/model.pt", 
+            cache_dir=Path(str(cache_dir)),
+            max_size=None,
+            use_cache=True,
+            show_progress=False,
+            selective=True,
+            stream_analyze=False
+        )
         assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_model")
