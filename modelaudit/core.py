@@ -27,6 +27,36 @@ logger = logging.getLogger("modelaudit.core")
 # Lock to ensure thread-safe monkey patching of builtins.open
 _OPEN_PATCH_LOCK = Lock()
 
+# Operational error indicators used to determine has_errors flag
+OPERATIONAL_ERROR_INDICATORS = [
+    # Scanner execution errors
+    "Error during scan",
+    "Error checking file size",
+    "Error scanning file",
+    "Scanner crashed",
+    "Scan timeout",
+    # File system errors
+    "Path does not exist",
+    "Path is not readable",
+    "Permission denied",
+    "File not found",
+    # Dependency/environment errors
+    "not installed, cannot scan",
+    "Missing dependency",
+    "Import error",
+    "Module not found",
+    # File format/corruption errors
+    "not a valid",
+    "Invalid file format",
+    "Corrupted file",
+    "Bad file signature",
+    "Unable to parse",
+    # Resource/system errors
+    "Out of memory",
+    "Disk space",
+    "Too many open files",
+]
+
 
 def _add_asset_to_results(
     results: dict[str, Any],
@@ -42,6 +72,43 @@ def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None
     """Helper function to add an error asset entry to the results."""
     assets_list = cast(list[dict[str, Any]], results["assets"])
     assets_list.append({"path": file_path, "type": "error"})
+
+
+def _finalize_scan_results(results: dict[str, Any]) -> None:
+    """
+    Finalize scan results by adding license warnings and determining has_errors flag.
+
+    This function:
+    1. Adds license warnings to the issues list
+    2. Determines the has_errors flag based on operational errors
+
+    Args:
+        results: The scan results dictionary to finalize (modified in-place)
+    """
+    # Add license warnings if any
+    try:
+        license_warnings = check_commercial_use_warnings(results)
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        for warning in license_warnings:
+            # Convert license warnings to issues
+            issue_dict = {
+                "message": warning["message"],
+                "severity": warning["severity"],
+                "location": "",  # License warnings are generally project-wide
+                "details": warning.get("details", {}),
+                "type": warning["type"],
+            }
+            issues_list.append(issue_dict)
+    except Exception as e:
+        logger.warning(f"Error checking license warnings: {e!s}")
+
+    # Determine has_errors flag
+    issues_list = cast(list[dict[str, Any]], results["issues"])
+    results["has_errors"] = any(
+        any(indicator in issue.get("message", "") for indicator in OPERATIONAL_ERROR_INDICATORS)
+        for issue in issues_list
+        if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+    ) or not results.get("success", True)
 
 
 def validate_scan_config(config: dict[str, Any]) -> None:
@@ -152,62 +219,8 @@ def scan_model_directory_or_file(
                     results["finish_time"] = time.time()
                     results["duration"] = results["finish_time"] - results["start_time"]
 
-                    # Add license warnings if any
-                    try:
-                        license_warnings = check_commercial_use_warnings(results)
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
-                        for warning in license_warnings:
-                            # Convert license warnings to issues
-                            issue_dict = {
-                                "message": warning["message"],
-                                "severity": warning["severity"],
-                                "location": "",  # License warnings are generally project-wide
-                                "details": warning.get("details", {}),
-                                "type": warning["type"],
-                            }
-                            issues_list.append(issue_dict)
-                    except Exception as e:
-                        logger.warning(f"Error checking license warnings: {e!s}")
-
-                    # Determine has_errors flag
-                    operational_error_indicators = [
-                        # Scanner execution errors
-                        "Error during scan",
-                        "Error checking file size",
-                        "Error scanning file",
-                        "Scanner crashed",
-                        "Scan timeout",
-                        # File system errors
-                        "Path does not exist",
-                        "Path is not readable",
-                        "Permission denied",
-                        "File not found",
-                        # Dependency/environment errors
-                        "not installed, cannot scan",
-                        "Missing dependency",
-                        "Import error",
-                        "Module not found",
-                        # File format/corruption errors
-                        "not a valid",
-                        "Invalid file format",
-                        "Corrupted file",
-                        "Bad file signature",
-                        "Unable to parse",
-                        # Resource/system errors
-                        "Out of memory",
-                        "Disk space",
-                        "Too many open files",
-                    ]
-
-                    issues_list = cast(list[dict[str, Any]], results["issues"])
-                    results["has_errors"] = (
-                        any(
-                            any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
-                            for issue in issues_list
-                            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
-                        )
-                        or not results["success"]
-                    )
+                    # Finalize results (add license warnings and determine has_errors)
+                    _finalize_scan_results(results)
 
                     return results
 
@@ -469,64 +482,8 @@ def scan_model_directory_or_file(
         results["start_time"],
     )
 
-    # Add license warnings if any
-    try:
-        license_warnings = check_commercial_use_warnings(results)
-        issues_list = cast(list[dict[str, Any]], results["issues"])
-        for warning in license_warnings:
-            # Convert license warnings to issues
-            issue_dict = {
-                "message": warning["message"],
-                "severity": warning["severity"],
-                "location": "",  # License warnings are generally project-wide
-                "details": warning.get("details", {}),
-                "type": warning["type"],
-            }
-            issues_list.append(issue_dict)
-    except Exception as e:
-        logger.warning(f"Error checking license warnings: {e!s}")
-
-    # Determine if there were operational scan errors vs security findings
-    # has_errors should only be True for operational errors (scanner crashes,
-    # file not found, etc.) not for security findings detected in models
-    operational_error_indicators = [
-        # Scanner execution errors
-        "Error during scan",
-        "Error checking file size",
-        "Error scanning file",
-        "Scanner crashed",
-        "Scan timeout",
-        # File system errors
-        "Path does not exist",
-        "Path is not readable",
-        "Permission denied",
-        "File not found",
-        # Dependency/environment errors
-        "not installed, cannot scan",
-        "Missing dependency",
-        "Import error",
-        "Module not found",
-        # File format/corruption errors
-        "not a valid",
-        "Invalid file format",
-        "Corrupted file",
-        "Bad file signature",
-        "Unable to parse",
-        # Resource/system errors
-        "Out of memory",
-        "Disk space",
-        "Too many open files",
-    ]
-
-    issues_list = cast(list[dict[str, Any]], results["issues"])
-    results["has_errors"] = (
-        any(
-            any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
-            for issue in issues_list
-            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
-        )
-        or not results["success"]
-    )
+    # Finalize results (add license warnings and determine has_errors)
+    _finalize_scan_results(results)
 
     return results
 

@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 
 from modelaudit.core import _is_huggingface_cache_file
 from modelaudit.parallel_scanner import ParallelScanner
+from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils import is_within_directory
 
 logger = logging.getLogger("modelaudit.parallel_directory")
@@ -151,6 +152,9 @@ def scan_directory_parallel(
     base_dir = Path(path).resolve()
     files_to_scan = []
 
+    # Track path traversal issues
+    path_traversal_issues = []
+
     # Collect all files to scan
     for root, _, files in os.walk(path, followlinks=False):
         for file in files:
@@ -164,14 +168,47 @@ def scan_directory_parallel(
             if _is_huggingface_cache_file(file_path):
                 continue
 
-            # Check file is within base directory
             resolved_file = Path(file_path).resolve()
-            if not is_within_directory(str(base_dir), str(resolved_file)):
+
+            # Check if this is a HuggingFace cache symlink scenario
+            is_hf_cache_symlink = False
+            if (
+                os.path.islink(file_path)
+                and ".cache/huggingface/hub" in str(base_dir)
+                and "/snapshots/" in str(file_path)
+            ):
+                link_target = os.readlink(file_path)
+                # Resolve the relative link target
+                resolved_target = (Path(file_path).parent / link_target).resolve()
+                # Check if target is in the blobs directory of the same model cache
+                if "/blobs/" in str(resolved_target):
+                    # Extract the model cache root (e.g., models--distilbert-base-uncased)
+                    cache_parts = str(base_dir).split("/")
+                    for i, part in enumerate(cache_parts):
+                        if part.startswith("models--") and i > 0:
+                            cache_root = "/".join(cache_parts[: i + 1])
+                            # Check if the target is within the same model's cache structure
+                            if str(resolved_target).startswith(cache_root):
+                                is_hf_cache_symlink = True
+                                # Update the resolved_file to the actual target for scanning
+                                resolved_file = resolved_target
+                            break
+
+            # Check file is within base directory
+            if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
+                path_traversal_issues.append(
+                    {
+                        "message": "Path traversal outside scanned directory",
+                        "severity": "critical",
+                        "location": file_path,
+                        "details": {"resolved_path": str(resolved_file)},
+                    }
+                )
                 continue
 
             files_to_scan.append(str(resolved_file))
 
-    if not files_to_scan:
+    if not files_to_scan and not path_traversal_issues:
         # Return empty results
         return {
             "bytes_scanned": 0,
@@ -192,11 +229,35 @@ def scan_directory_parallel(
     )
 
     # Run parallel scan
-    results = scanner.scan_files(files_to_scan, config)
+    results = (
+        scanner.scan_files(files_to_scan, config)
+        if files_to_scan
+        else {
+            "bytes_scanned": 0,
+            "issues": [],
+            "files_scanned": 0,
+            "scanners": [],
+            "assets": [],
+            "file_metadata": {},
+            "has_errors": False,
+            "success": True,
+        }
+    )
+
+    # Add path traversal issues to results
+    if path_traversal_issues:
+        for issue in path_traversal_issues:
+            issue_dict = {
+                "message": issue["message"],
+                "severity": IssueSeverity.CRITICAL.value,
+                "location": issue["location"],
+                "details": issue["details"],
+            }
+            results["issues"].append(issue_dict)
 
     # Add parallel scan markers
     results["parallel_scan"] = True
-    results["worker_count"] = scanner.max_workers
+    results["worker_count"] = scanner.max_workers if files_to_scan else 0
 
     logger.debug(f"Parallel scan returning results with keys: {list(results.keys())}")
     logger.debug(f"parallel_scan={results.get('parallel_scan')}, worker_count={results.get('worker_count')}")
