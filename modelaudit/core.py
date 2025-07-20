@@ -104,7 +104,7 @@ def _finalize_scan_results(results: dict[str, Any], config: Optional[dict[str, A
             }
             issues_list.append(issue_dict)
     except Exception as e:
-        logger.warning(f"Error checking license warnings: {e!s}")
+        logger.error(f"Error checking license warnings: {e!s}", exc_info=True)
 
     # Determine has_errors flag
     issues_list = cast(list[dict[str, Any]], results["issues"])

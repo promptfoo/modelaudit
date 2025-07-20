@@ -451,6 +451,7 @@ def scan_command(
         "has_errors": False,
         "scanner_names": [],
         "start_time": time.time(),
+        "file_metadata": {},
     }
 
     # Scan each path with interrupt handling
@@ -690,6 +691,10 @@ def scan_command(
                         if results.get("has_errors", False):
                             aggregated_results["has_errors"] = True
 
+                        # Aggregate file metadata
+                        file_metadata = cast(dict[str, Any], aggregated_results["file_metadata"])
+                        file_metadata.update(results.get("file_metadata", {}))
+
                         # Track scanner names
                         scanner_names = cast(list[str], aggregated_results["scanner_names"])
                         for scanner in results.get("scanners", []):
@@ -833,6 +838,10 @@ def scan_command(
                     if results.get("has_errors", False):
                         aggregated_results["has_errors"] = True
 
+                    # Aggregate file metadata
+                    file_metadata = cast(dict[str, Any], aggregated_results["file_metadata"])
+                    file_metadata.update(results.get("file_metadata", {}))
+
                     # Track scanner names
                     scanner_names = cast(list[str], aggregated_results["scanner_names"])
                     for scanner in results.get("scanners", []):
@@ -960,6 +969,13 @@ def scan_command(
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
+
+    # Finalize results (add license warnings and determine has_errors)
+    from .core import _finalize_scan_results
+    scan_config = {
+        "strict_license": strict_license,
+    }
+    _finalize_scan_results(aggregated_results, scan_config)
 
     # Generate SBOM if requested
     if sbom:

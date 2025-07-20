@@ -355,8 +355,12 @@ class ParallelScanner:
 
             results["assets"].append(asset_entry)
 
-            # Store metadata
-            results["file_metadata"][work_result.file_path] = result_data.get("metadata", {})
+            # Store metadata with license information
+            from modelaudit.license_checker import collect_license_metadata
+            scan_metadata = result_data.get("metadata", {})
+            license_metadata = collect_license_metadata(work_result.file_path)
+            combined_metadata = {**scan_metadata, **license_metadata}
+            results["file_metadata"][work_result.file_path] = combined_metadata
 
         else:
             # Handle scan failure

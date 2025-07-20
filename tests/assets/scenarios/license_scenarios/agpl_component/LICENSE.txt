@@ -1,0 +1,25 @@
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2024 AGPL Neural Network Project
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+IMPORTANT: The GNU Affero General Public License is a free, copyleft license 
+for software and other kinds of works, specifically designed to ensure 
+cooperation with the community in the case of network server software.
+
+The license requires that any modified versions of the software that are 
+used to provide a service over a network must provide the source code to 
+users of that service. This includes SaaS applications.

@@ -1,0 +1,8 @@
+{
+  "model_type": "neural_network",
+  "hidden_size": 128,
+  "layers": [784, 128, 64, 10],
+  "license": "AGPL-3.0",
+  "copyright": "Copyright (C) 2024 AGPL Neural Network Project",
+  "description": "Neural network model with AGPL-3.0 license and network use restrictions"
+}
