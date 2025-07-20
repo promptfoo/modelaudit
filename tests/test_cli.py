@@ -544,7 +544,7 @@ def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_c
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "s3://bucket/model.bin"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "s3://bucket/model.bin"])
 
     assert result.exit_code == 0
     mock_download.assert_called_once()
@@ -585,7 +585,7 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "gs://bucket/model.pkl"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "gs://bucket/model.pkl"])
 
     assert result.exit_code == 1
     mock_rmtree.assert_called()

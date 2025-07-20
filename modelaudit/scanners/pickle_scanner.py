@@ -411,9 +411,9 @@ def _get_context_aware_severity(
     if confidence > 0.8:
         if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
-        elif base_severity == IssueSeverity.WARNING:
+        if base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
-    elif confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
+    if confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
         return IssueSeverity.WARNING
 
     return base_severity
@@ -467,7 +467,7 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 return any(marker in sample for marker in joblib_indicators)
 
             # For dill files, they're usually just enhanced pickle
-            elif path.lower().endswith(".dill"):
+            if path.lower().endswith(".dill"):
                 # Dill files should contain standard pickle format
                 # Additional validation could check for dill-specific patterns
                 return True
@@ -901,7 +901,7 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)
                 return result
-            elif is_recursion_on_legitimate_model:
+            if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
                 logger.info(
                     f"Recursion limit reached scanning legitimate ML model {path}. "
@@ -934,7 +934,7 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
-            elif is_recursion_error:
+            if is_recursion_error:
                 # Only flag files as suspicious if they're extremely small AND have obvious malicious patterns
                 # This is very conservative since JSON format handles detailed detection
                 filename = os.path.basename(path).lower()
@@ -995,16 +995,16 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
-            else:
-                # Handle as critical error for unknown/suspicious cases
-                result.add_issue(
-                    f"Error opening pickle file: {e!s}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"exception": str(e), "exception_type": type(e).__name__},
-                )
-                result.finish(success=False)
-                return result
+
+            # Handle as critical error for unknown/suspicious cases
+            result.add_issue(
+                f"Error opening pickle file: {e!s}",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            result.finish(success=False)
+            return result
 
         result.finish(success=True)
         return result
