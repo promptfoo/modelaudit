@@ -222,7 +222,8 @@ class TestParallelScannerIntegration:
             results = scanner.scan_files(files, {})
 
             assert results["files_scanned"] == 2
-            assert all(asset["type"] == "file" for asset in results["assets"])
+            # Assets should have scanner-specific types
+            assert all(asset["type"] in ["pickle", "numpy"] for asset in results["assets"])
 
     def test_performance_comparison(self):
         """Compare performance of parallel vs sequential scanning."""

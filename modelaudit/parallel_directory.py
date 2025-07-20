@@ -177,7 +177,18 @@ def scan_directory_parallel(
                 and ".cache/huggingface/hub" in str(base_dir)
                 and "/snapshots/" in str(file_path)
             ):
-                link_target = os.readlink(file_path)
+                try:
+                    link_target = os.readlink(file_path)
+                except OSError as e:
+                    path_traversal_issues.append(
+                        {
+                            "message": "Broken symlink encountered",
+                            "severity": "warning",
+                            "location": file_path,
+                            "details": {"error": str(e)},
+                        }
+                    )
+                    continue
                 # Resolve the relative link target
                 resolved_target = (Path(file_path).parent / link_target).resolve()
                 # Check if target is in the blobs directory of the same model cache

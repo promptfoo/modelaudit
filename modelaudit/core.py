@@ -211,8 +211,10 @@ def scan_model_directory_or_file(
                         max_workers=max_workers,
                     )
 
-                    # Copy parallel results to our results dictionary
+                    # Copy parallel results to our results dictionary, preserving the original start_time
+                    original_start_time = results["start_time"]
                     results.update(parallel_results)
+                    results["start_time"] = original_start_time  # Restore original start time
                     logger.debug(f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}")
 
                     # Add final timing information
