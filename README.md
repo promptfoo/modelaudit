@@ -118,29 +118,44 @@ modelaudit model_package.zip --sbom compliance_report.json --verbose
 
 **Basic installation (recommended for most users):**
 
+### Quick Install Decision Guide
+
+**🚀 Just want everything to work?**
+
 ```bash
 pip install modelaudit[all]
 ```
 
-**Minimal installation with specific formats:**
+**💡 Know what formats you need?**
 
 ```bash
-# Basic installation
+# Basic installation (pickle, joblib, numpy, zip files)
 pip install modelaudit
 
-# Add specific format support as needed
-pip install modelaudit[tensorflow]  # TensorFlow SavedModel
-pip install modelaudit[pytorch]     # PyTorch models
-pip install modelaudit[onnx]        # ONNX models
+# Add only what you need
+pip install modelaudit[tensorflow]  # TensorFlow SavedModel (.pb)
+pip install modelaudit[pytorch]     # PyTorch models (.pt, .pth)
+pip install modelaudit[h5]          # Keras/H5 models (.h5, .keras)
+pip install modelaudit[onnx]        # ONNX models (.onnx)
+pip install modelaudit[safetensors] # SafeTensors (.safetensors)
+
+# Multiple formats
+pip install modelaudit[tensorflow,pytorch,h5]
 ```
 
-**NumPy compatibility:**
+**☁️ Need cloud storage support?**
 
 ```bash
-# For full compatibility with all ML frameworks
+pip install modelaudit[cloud]  # S3, GCS, and Azure support
+```
+
+**⚠️ Having NumPy compatibility issues?**
+
+```bash
+# Some ML frameworks require NumPy < 2.0
 pip install modelaudit[numpy1]
 
-# Check scanner compatibility status
+# Check what's working
 modelaudit doctor --show-failed
 ```
 
@@ -150,6 +165,26 @@ modelaudit doctor --show-failed
 docker pull ghcr.io/promptfoo/modelaudit:latest
 docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
+
+### 📦 Dependency Reference
+
+<details>
+<summary><b>View all available extras and what they include</b></summary>
+
+| Extra           | Includes                      | Use When                                |
+| --------------- | ----------------------------- | --------------------------------------- |
+| `[tensorflow]`  | TensorFlow framework          | Scanning `.pb` SavedModel files         |
+| `[pytorch]`     | PyTorch framework             | Scanning `.pt`, `.pth` files            |
+| `[h5]`          | h5py library                  | Scanning `.h5`, `.keras`, `.hdf5` files |
+| `[onnx]`        | ONNX runtime                  | Scanning `.onnx` model files            |
+| `[safetensors]` | SafeTensors library           | Scanning `.safetensors` files           |
+| `[flax]`        | msgpack for JAX/Flax          | Scanning `.msgpack`, `.flax` files      |
+| `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure            |
+| `[mlflow]`      | MLflow library                | Scanning MLflow model registry          |
+| `[all]`         | All ML frameworks             | Maximum compatibility                   |
+| `[numpy1]`      | All ML frameworks + NumPy<2.0 | When facing NumPy conflicts             |
+
+</details>
 
 ## 📋 Output Formats
 
@@ -186,10 +221,32 @@ Files scanned: 1 | Issues found: 1 critical
 - **Troubleshooting**: [promptfoo.dev/docs/model-audit/troubleshooting/](https://www.promptfoo.dev/docs/model-audit/troubleshooting/)
 - **Issues**: [github.com/promptfoo/modelaudit/issues](https://github.com/promptfoo/modelaudit/issues)
 
-For scanner compatibility issues:
+### 🔍 Troubleshooting Common Issues
+
+**Scanner not working?**
 
 ```bash
+# Check which scanners are available
 modelaudit doctor --show-failed
+```
+
+**NumPy compatibility errors?**
+
+```bash
+# Option 1: Use the numpy1 compatibility mode
+pip install modelaudit[numpy1]
+
+# Option 2: Manually downgrade NumPy
+pip install "numpy<2.0" --force-reinstall
+pip install --force-reinstall tensorflow torch h5py  # Reinstall ML frameworks
+```
+
+**Missing scanner for your format?**
+
+```bash
+# ModelAudit will tell you exactly what to install
+modelaudit your-model.onnx
+# Output: "onnx not installed, cannot scan ONNX files. Install with 'pip install modelaudit[onnx]'"
 ```
 
 ## 📝 License
