@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, ClassVar, Optional
 
 from ..explanations import get_message_explanation
+from ..interrupt_handler import check_interrupted
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -339,6 +340,9 @@ class BaseScanner(ABC):
 
         with open(path, "rb") as f:
             while True:
+                # Check for interrupts during file reading
+                check_interrupted()
+
                 chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
@@ -348,3 +352,11 @@ class BaseScanner(ABC):
                         f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})",
                     )
         return data
+
+    def check_interrupted(self) -> None:
+        """Check if the scan has been interrupted.
+
+        Scanners should call this method periodically during long operations.
+        Raises KeyboardInterrupt if an interrupt has been requested.
+        """
+        check_interrupted()

@@ -235,9 +235,6 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     """
     import re
 
-    if not isinstance(s, str):
-        return None
-
     # Check for ACTUAL dangerous patterns (not just ML magic methods)
     for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
         if re.search(pattern, s, re.IGNORECASE):
@@ -499,9 +496,6 @@ def is_suspicious_string(s: str) -> Optional[str]:
     """Check if a string contains suspicious patterns"""
     import re
 
-    if not isinstance(s, str):
-        return None
-
     for pattern in SUSPICIOUS_STRING_PATTERNS:
         match = re.search(pattern, s)
         if match:
@@ -754,6 +748,9 @@ class PickleScanner(BaseScanner):
 
             with open(path, "rb") as f:
                 while bytes_read < max_bytes:
+                    # Check for interrupts during file reading
+                    self.check_interrupted()
+
                     chunk = f.read(min(chunk_size, max_bytes - bytes_read))
                     if not chunk:
                         break
@@ -771,6 +768,9 @@ class PickleScanner(BaseScanner):
                 ]
 
                 for pattern in dangerous_patterns:
+                    # Check for interrupts during pattern scanning
+                    self.check_interrupted()
+
                     # Use find() instead of 'in' operator to be more explicit
                     if raw_content.find(pattern) != -1:
                         result.add_issue(
@@ -1033,6 +1033,10 @@ class PickleScanner(BaseScanner):
             string_stack = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
+                # Check for interrupts periodically during opcode processing
+                if opcode_count % 1000 == 0:  # Check every 1000 opcodes
+                    self.check_interrupted()
+
                 opcodes.append((opcode, arg, pos))
                 opcode_count += 1
 
