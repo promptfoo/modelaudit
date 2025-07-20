@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import requests  # type: ignore
+import requests
 
 
 @dataclass
