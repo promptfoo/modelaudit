@@ -122,7 +122,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
     bom = Bom()
     issues = results.get("issues", [])
     file_meta: dict[str, Any] = results.get("file_metadata", {})
-    
+
     # Create a normalized path lookup for metadata
     normalized_meta: dict[str, Any] = {}
     for path, meta in file_meta.items():
