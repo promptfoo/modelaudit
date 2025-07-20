@@ -7,6 +7,7 @@ The Model Remediation tool will allow users to convert unsafe model formats to s
 ## Core Features (MVP - Phase 1)
 
 ### 1. Pickle to SafeTensors Conversion
+
 **Priority: CRITICAL** - This is the most common and dangerous format
 
 ```bash
@@ -21,12 +22,14 @@ modelaudit convert ./models/*.pkl --to safetensors --output-dir ./safe_models/
 ```
 
 **Implementation Details:**
+
 - Extract weights and architecture from pickle files
 - Handle PyTorch state_dicts, full models, and checkpoints
 - Preserve all tensor data, metadata, and model configuration
 - Validate numerical accuracy (< 1e-6 difference)
 
 ### 2. Dangerous Operation Removal
+
 **Priority: HIGH** - Make models safe without full conversion
 
 ```bash
@@ -38,6 +41,7 @@ modelaudit remediate model.pkl --interactive
 ```
 
 **Operations to Remove/Replace:**
+
 - `eval()`, `exec()`, `__import__`
 - `os.system()`, `subprocess` calls
 - Network operations
@@ -45,6 +49,7 @@ modelaudit remediate model.pkl --interactive
 - Lambda layers in Keras models
 
 ### 3. Safety Validation
+
 **Priority: HIGH** - Ensure conversions maintain model integrity
 
 ```bash
@@ -115,6 +120,7 @@ modelaudit validate <original> <converted> [options]
 ## Implementation Phases
 
 ### Phase 1: MVP (Week 1-2)
+
 1. **Pickle → SafeTensors converter**
    - Support PyTorch state_dict format
    - Basic weight extraction
@@ -132,6 +138,7 @@ modelaudit validate <original> <converted> [options]
    - Basic error handling
 
 ### Phase 2: Enhanced Safety (Week 3-4)
+
 1. **Advanced conversions**
    - Full PyTorch model → SafeTensors
    - Joblib → ONNX
@@ -148,6 +155,7 @@ modelaudit validate <original> <converted> [options]
    - Accuracy reports
 
 ### Phase 3: Production Features (Week 5-6)
+
 1. **Batch operations**
    - Directory scanning
    - Parallel processing
@@ -166,21 +174,25 @@ modelaudit validate <original> <converted> [options]
 ## Technical Considerations
 
 ### 1. Weight Extraction Challenges
+
 - **Problem**: Pickle files can contain arbitrary Python objects
 - **Solution**: Use restricted unpickler that only allows safe types
 - **Fallback**: Use pickle scanner to identify weight tensors
 
 ### 2. Metadata Preservation
+
 - **Problem**: Different formats store metadata differently
 - **Solution**: Common metadata schema that maps between formats
 - **Example**: Training config, optimizer state, epoch info
 
 ### 3. Large File Handling
+
 - **Problem**: Models can be many GBs
 - **Solution**: Streaming conversion, memory-mapped files
 - **Progress**: Show progress bars with ETA
 
 ### 4. Format Limitations
+
 - **Problem**: Not all conversions are possible
 - **Solution**: Clear compatibility matrix
 - **Example**: Can't convert custom PyTorch modules to ONNX
@@ -188,6 +200,7 @@ modelaudit validate <original> <converted> [options]
 ## User Experience
 
 ### Success Flow
+
 ```
 $ modelaudit convert suspicious_model.pkl --to safetensors --validate
 
@@ -213,17 +226,18 @@ $ modelaudit convert suspicious_model.pkl --to safetensors --validate
 ```
 
 ### Error Handling
+
 ```
 $ modelaudit convert complex_model.pkl --to onnx
 
 ❌ Conversion Error:
   This PyTorch model contains custom operations that cannot be
   converted to ONNX format.
-  
+
   Incompatible operations:
   - CustomAttentionLayer (line 234)
   - DynamicReshape (line 567)
-  
+
   Suggestions:
   1. Try converting to SafeTensors instead (preserves all PyTorch features)
   2. Use modelaudit remediate to make the pickle file safer
@@ -233,21 +247,25 @@ $ modelaudit convert complex_model.pkl --to onnx
 ## Testing Strategy
 
 ### 1. Unit Tests
+
 - Each converter class
 - Validation functions
 - Error handling paths
 
 ### 2. Integration Tests
+
 - End-to-end conversions
 - Real model files
 - Format compatibility
 
 ### 3. Security Tests
+
 - Verify dangerous ops removed
 - Scan converted files
 - Fuzzing with malicious inputs
 
 ### 4. Performance Tests
+
 - Large file handling (>1GB)
 - Memory usage
 - Conversion speed

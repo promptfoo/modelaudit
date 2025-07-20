@@ -4,7 +4,7 @@ import logging
 import pickle
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from modelaudit.remediation.base import BaseConverter, ConversionResult
 from modelaudit.remediation.converters import register_converter
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class RestrictedUnpickler(pickle.Unpickler):
     """Restricted unpickler that only allows safe types for weight extraction."""
 
-    SAFE_MODULES: set[str] = {
+    SAFE_MODULES: ClassVar[set[str]] = {
         "torch",
         "torch._utils",
         "torch.nn",

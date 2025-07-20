@@ -4,10 +4,7 @@ import os
 import shutil
 import sys
 import time
-<<<<<<< HEAD
-=======
 from pathlib import Path
->>>>>>> origin/main
 from typing import Any, Optional, cast
 
 import click
@@ -281,13 +278,8 @@ def scan_command(
                         download_spinner.start()
 
                     try:
-<<<<<<< HEAD
-                        # Download to a temporary directory
-                        download_path = download_model(path, cache_dir=None)
-=======
                         # Download to cache directory or temporary directory
                         download_path = download_model(path, cache_dir=Path(cache_dir) if cache_dir else None)
->>>>>>> origin/main
                         actual_path = str(download_path)
                         # Track the temp directory for cleanup
                         temp_dir = str(download_path)
@@ -299,10 +291,6 @@ def scan_command(
                         if format == "text" and not output:
                             download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-<<<<<<< HEAD
-                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-=======
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
                         if "insufficient disk space" in error_msg.lower():
@@ -320,7 +308,6 @@ def scan_command(
                             logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
 
->>>>>>> origin/main
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -333,11 +320,7 @@ def scan_command(
                         download_spinner.start()
 
                     try:
-<<<<<<< HEAD
-                        download_path = download_from_cloud(path, cache_dir=None)
-=======
                         download_path = download_from_cloud(path, cache_dir=Path(cache_dir) if cache_dir else None)
->>>>>>> origin/main
                         actual_path = str(download_path)
                         temp_dir = str(download_path)
 
@@ -348,10 +331,6 @@ def scan_command(
                         if format == "text" and not output:
                             download_spinner.fail(click.style("❌ Download failed", fg="red", bold=True))
 
-<<<<<<< HEAD
-                        logger.error(f"Failed to download from {path}: {e!s}", exc_info=verbose)
-                        click.echo(f"Error downloading from {path}: {e!s}", err=True)
-=======
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
                         if "insufficient disk space" in error_msg.lower():
@@ -369,7 +348,6 @@ def scan_command(
                             logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading from {path}: {error_msg}", err=True)
 
->>>>>>> origin/main
                         aggregated_results["has_errors"] = True
                         continue
 
@@ -580,34 +558,14 @@ def scan_command(
 
             finally:
                 # Clean up temporary directory if we downloaded a model
-<<<<<<< HEAD
-                if temp_dir and os.path.exists(temp_dir):
-=======
                 # Only clean up if we didn't use a user-specified cache directory
                 if temp_dir and os.path.exists(temp_dir) and not cache_dir:
->>>>>>> origin/main
                     try:
                         shutil.rmtree(temp_dir)
                         if verbose:
                             logger.info(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
-<<<<<<< HEAD
-                        
-                # Check if we were interrupted and should stop processing more paths
-                if interrupt_handler.is_interrupted():
-                    logger.info("Stopping scan due to interrupt")
-                    aggregated_results["success"] = False
-                    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
-                    if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
-                        issues_list.append({
-                            "message": "Scan interrupted by user",
-                            "severity": "info",
-                            "details": {"interrupted": True},
-                        })
-                    should_break = True
-
-=======
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -624,7 +582,6 @@ def scan_command(
                         )
                     should_break = True
 
->>>>>>> origin/main
             # Break outside of finally block if interrupted
             if should_break:
                 break
@@ -928,133 +885,6 @@ def _format_issue(
                 detail_label = click.style(f"{key}:", fg="bright_black")
                 detail_value = click.style(str(value), fg="bright_white")
                 output_lines.append(f"       {detail_label} {detail_value}")
-
-
-@cli.command()
-@click.argument("input_path", type=click.Path(exists=True))
-@click.option("--to", "target_format", required=True, help="Target format (e.g., safetensors, onnx)")
-@click.option("-o", "--output", type=click.Path(), help="Output file path")
-@click.option("--validate/--no-validate", default=True, help="Validate conversion accuracy")
-@click.option("--backup/--no-backup", default=True, help="Create backup before conversion")
-@click.option("--force", is_flag=True, help="Overwrite existing files")
-@click.option("--preserve-metadata/--no-preserve-metadata", default=True, help="Preserve model metadata")
-def convert(
-    input_path: str,
-    target_format: str,
-    output: Optional[str],
-    validate: bool,
-    backup: bool,
-    force: bool,
-    preserve_metadata: bool,
-):
-    """Convert model files between formats securely.
-    
-    Examples:
-        modelaudit convert model.pkl --to safetensors
-        modelaudit convert model.pt --to safetensors --output safe_model.safetensors
-        modelaudit convert model.pkl --to onnx --validate
-    """
-    from pathlib import Path
-    
-    from modelaudit.remediation import get_converter
-    
-    input_file = Path(input_path)
-    
-    # Determine output path
-    if output:
-        output_file = Path(output)
-    else:
-        # Generate output filename
-        output_file = input_file.with_suffix(f".{target_format}")
-    
-    # Check if output exists
-    if output_file.exists() and not force:
-        click.echo(f"❌ Output file already exists: {output_file}")
-        click.echo("   Use --force to overwrite")
-        sys.exit(1)
-    
-    # Get appropriate converter
-    converter = get_converter(input_file, target_format)
-    if not converter:
-        click.echo(f"❌ No converter available for {input_file.suffix} → {target_format}")
-        click.echo("\nSupported conversions:")
-        click.echo("  • .pkl/.pt/.pth → safetensors")
-        click.echo("\nTip: Install additional converters with:")
-        click.echo("  pip install modelaudit[all]")
-        sys.exit(1)
-    
-    # Show conversion plan
-    click.echo(f"🔍 Analyzing {input_file.name}...")
-    file_size_mb = input_file.stat().st_size / (1024 * 1024)
-    click.echo(f"  Format: {input_file.suffix[1:].upper()}")
-    click.echo(f"  Size: {file_size_mb:.1f} MB")
-    
-    # Run conversion with progress
-    click.echo(f"\n🔄 Converting to {target_format}...")
-    
-    with yaspin(Spinners.dots, text="Converting...") as spinner:
-        result = converter.convert(
-            input_file,
-            output_file,
-            validate=validate,
-            backup=backup,
-            preserve_metadata=preserve_metadata,
-        )
-    
-    if result.success:
-        click.echo("  ✓ Conversion successful")
-        
-        # Show details
-        if result.metadata:
-            tensors = result.metadata.get("tensors_converted", 0)
-            if tensors:
-                click.echo(f"  ✓ Converted {tensors} tensors")
-            
-            preserved = result.metadata.get("metadata_preserved", 0)
-            if preserved:
-                click.echo(f"  ✓ Preserved {preserved} metadata entries")
-        
-        if result.security_issues_removed:
-            click.echo(f"  ✓ Removed {result.security_issues_removed} security risks")
-        
-        # Validation results
-        if validate and result.validation_passed:
-            click.echo("\n✅ Validation:")
-            click.echo("  ✓ Numerical accuracy: PASS", nl=False)
-            if result.numerical_accuracy is not None:
-                click.echo(f" (max diff: {result.numerical_accuracy:.2e})")
-            else:
-                click.echo()
-        elif validate and not result.validation_passed:
-            click.echo("\n⚠️  Validation:")
-            click.echo("  ✗ Numerical accuracy: FAILED")
-            if result.numerical_accuracy is not None:
-                click.echo(f"    Max difference: {result.numerical_accuracy:.2e}")
-        
-        # File size comparison
-        if result.size_reduction is not None:
-            if result.size_reduction > 0:
-                click.echo(f"  ✓ File size: {result.size_reduction:.1f}% smaller")
-            elif result.size_reduction < 0:
-                click.echo(f"  ℹ File size: {abs(result.size_reduction):.1f}% larger")
-        
-        # Output info
-        click.echo(f"\n💾 Saved: {output_file}")
-        if backup and input_file.with_suffix(input_file.suffix + ".backup").exists():
-            click.echo(f"📋 Backup: {input_file}.backup")
-        
-        # Success message
-        click.echo("\n✨ Conversion successful! Your model is now in a secure format.")
-        
-        # Warnings
-        if result.warnings:
-            click.echo("\n⚠️  Warnings:")
-            for warning in result.warnings:
-                click.echo(f"  • {warning}")
-    
-    else:
-        click.echo(f"\n❌ Conversion failed: {result.error_message}")
-        sys.exit(1)
 
 
 @cli.command()

@@ -211,9 +211,9 @@ class TestPickleToSafeTensorsConverter:
         # Mock _is_tensor to return False for non-tensor values
         def mock_is_tensor(value):
             return value in ["tensor1", "tensor2"]
-        
+
         converter._is_tensor = MagicMock(side_effect=mock_is_tensor)
-        
+
         data2 = {
             "state_dict": {"weight": "tensor1"},
             "epoch": 10,
