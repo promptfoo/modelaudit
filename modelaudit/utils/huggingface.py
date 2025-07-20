@@ -55,6 +55,52 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
 
+def get_model_info(url: str) -> dict:
+    """Get information about a HuggingFace model without downloading it.
+
+    Args:
+        url: HuggingFace model URL
+
+    Returns:
+        Dictionary with model information including size
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    namespace, repo_name = parse_huggingface_url(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+
+    api = HfApi()
+    try:
+        # Get model info
+        model_info = api.model_info(repo_id)
+
+        # Calculate total size
+        total_size = 0
+        files = []
+        siblings = model_info.siblings or []
+        for sibling in siblings:
+            if sibling.rfilename not in [".gitattributes", "README.md"]:
+                total_size += sibling.size or 0
+                files.append({"name": sibling.rfilename, "size": sibling.size or 0})
+
+        return {
+            "repo_id": repo_id,
+            "total_size": total_size,
+            "file_count": len(files),
+            "files": files,
+            "model_id": getattr(model_info, "modelId", repo_id),
+            "author": model_info.author,
+        }
+    except Exception as e:
+        raise Exception(f"Failed to get model info for {url}: {e!s}") from e
+
+
 def get_model_size(repo_id: str) -> Optional[int]:
     """Get the total size of a HuggingFace model repository.
 
@@ -83,12 +129,13 @@ def get_model_size(repo_id: str) -> Optional[int]:
         return None
 
 
-def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
+def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
     """Download a model from HuggingFace.
 
     Args:
         url: HuggingFace model URL
         cache_dir: Optional cache directory for downloads
+        show_progress: Whether to show download progress
 
     Returns:
         Path to the downloaded model directory
@@ -108,12 +155,30 @@ def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
 
-    # Use a temporary directory if no cache_dir provided
-    if cache_dir is None:
+    # Use a cache directory structure if cache_dir is provided
+    if cache_dir is not None:
+        # Create a structured cache directory
+        download_path = cache_dir / "huggingface" / namespace
+        if repo_name:
+            download_path = download_path / repo_name
+        download_path.mkdir(parents=True, exist_ok=True)
+
+        # Check if model already exists in cache
+        if download_path.exists() and any(download_path.iterdir()):
+            # Verify it's a valid model directory
+            expected_files = [
+                "config.json",
+                "pytorch_model.bin",
+                "model.safetensors",
+                "flax_model.msgpack",
+                "tf_model.h5",
+            ]
+            if any((download_path / f).exists() for f in expected_files):
+                return download_path
+    else:
+        # Use temporary directory if no cache specified
         temp_dir = tempfile.mkdtemp(prefix="modelaudit_hf_")
         download_path = Path(temp_dir)
-    else:
-        download_path = cache_dir / namespace / repo_name
 
     # Check available disk space before downloading
     model_size = get_model_size(repo_id)
@@ -131,12 +196,25 @@ def download_model(url: str, cache_dir: Optional[Path] = None) -> Path:
             raise Exception(f"Cannot download model from {url}: {message}")
 
     try:
+        # Configure progress display based on environment
+        import os
+
+        from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
+        # Enable/disable progress bars based on parameter
+        if not show_progress:
+            disable_progress_bars()
+        else:
+            enable_progress_bars()
+            # Force progress bar to show even in non-TTY environments
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
+
         # Download the model snapshot
         local_path = snapshot_download(
             repo_id=repo_id,
             cache_dir=str(download_path),
             local_dir=str(download_path),
-            local_dir_use_symlinks=False,  # Copy files instead of symlinks
+            tqdm_class=None,  # Use default tqdm
         )
         return Path(local_path)
     except Exception as e:

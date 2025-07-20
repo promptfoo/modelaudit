@@ -184,7 +184,7 @@ def cli() -> None:
 @click.option(
     "--cache-dir",
     type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
-    help="Directory to use for caching downloaded models (default: system temp directory)",
+    help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
 )
 @click.option(
     "--preview",
@@ -322,31 +322,64 @@ def scan_command(
             try:
                 # Check if this is a HuggingFace URL
                 if is_huggingface_url(path):
-                    # Show download progress if in text mode
+                    # Show initial message and get model info
+                    if format == "text" and not output:
+                        click.echo(f"\n📥 Preparing to download from {style_text(path, fg='cyan')}")
+
+                        # Get model info for size preview
+                        try:
+                            from .utils.huggingface import get_model_info
+
+                            model_info = get_model_info(path)
+
+                            # Format size
+                            size_bytes = model_info["total_size"]
+                            if size_bytes >= 1024 * 1024 * 1024:
+                                size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                            elif size_bytes >= 1024 * 1024:
+                                size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+                            else:
+                                size_str = f"{size_bytes / 1024:.2f} KB"
+
+                            click.echo(f"   Model: {model_info['model_id']}")
+                            click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
+                        except Exception:
+                            # Don't fail if we can't get model info
+                            pass
+
+                    # Show download progress with spinner if appropriate
                     download_spinner = None
                     if format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                        download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
                         download_spinner.start()
-                    elif format == "text" and not output:
-                        click.echo(f"Downloading from {path}...")
 
                     try:
-                        # Download to cache directory or temporary directory
-                        download_path = download_model(path, cache_dir=Path(cache_dir) if cache_dir else None)
+                        # Convert cache_dir string to Path if provided
+                        hf_cache_dir = None
+                        if cache and cache_dir:
+                            hf_cache_dir = Path(cache_dir)
+                        elif cache:
+                            # Use default cache directory
+                            hf_cache_dir = Path.home() / ".modelaudit" / "cache"
+
+                        # Download with caching support and progress bar
+                        download_path = download_model(
+                            path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output)
+                        )
                         actual_path = str(download_path)
-                        # Track the temp directory for cleanup
-                        temp_dir = str(download_path)
+                        # Only track for cleanup if not using cache
+                        temp_dir = str(download_path) if not cache else None
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
                         elif format == "text" and not output:
-                            click.echo("Downloaded successfully")
+                            click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
                         elif format == "text" and not output:
-                            click.echo("Download failed")
+                            click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
