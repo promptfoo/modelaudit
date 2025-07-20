@@ -5,10 +5,12 @@ This module provides parallel file scanning capabilities to improve performance
 when scanning directories with multiple files.
 """
 
+import concurrent.futures
 import logging
 import multiprocessing
 import os
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -99,11 +101,16 @@ def _scan_file_worker(work_item: WorkItem) -> WorkResult:
         )
 
     except Exception as e:
+        error_details = {
+            "type": type(e).__name__,
+            "message": str(e),
+            "traceback": traceback.format_exc(),
+        }
         logger.error(f"Error scanning {work_item.file_path}: {e}", exc_info=True)
         return WorkResult(
             file_path=work_item.file_path,
             success=False,
-            error=str(e),
+            error=str(error_details),
             duration=time.time() - start_time,
         )
 
@@ -167,7 +174,8 @@ class ParallelScanner:
         self._progress = ParallelScanProgress(total_files=len(file_paths))
 
         # Use sequential scanning for small file counts
-        if len(file_paths) < 3 or self.max_workers == 1:
+        # Process creation overhead makes parallel scanning inefficient for < 10 files
+        if len(file_paths) < 10 or self.max_workers == 1:
             logger.debug(f"Using sequential scanning for {len(file_paths)} files")
             return self._scan_sequential(file_paths, config)
 
@@ -189,46 +197,72 @@ class ParallelScanner:
             # Calculate a reasonable overall timeout based on number of files and workers
             # Allow at least timeout_per_file for each batch of files that can run in parallel
             # Add 20% buffer for overhead
+            # Cap the timeout to a reasonable maximum (e.g., 1 hour)
             batches = (len(work_items) + self.max_workers - 1) // self.max_workers
-            overall_timeout = int(batches * self.timeout_per_file * 1.2)
+            calculated_timeout = int(batches * self.timeout_per_file * 1.2)
+            # Cap at 1 hour to prevent excessive wait times
+            overall_timeout = min(calculated_timeout, 3600)
             logger.debug(
                 f"Calculated overall timeout: {overall_timeout}s for {len(work_items)} files "
-                f"with {self.max_workers} workers"
+                f"with {self.max_workers} workers (capped from {calculated_timeout}s)"
             )
 
-            for future in as_completed(future_to_work, timeout=overall_timeout):
-                # Check for interrupt
-                if is_interrupted():
-                    logger.info("Parallel scan interrupted by user")
-                    # Cancel remaining futures
-                    for f in future_to_work:
-                        f.cancel()
-                    results["issues"].append(
-                        {
-                            "message": "Scan interrupted by user",
-                            "severity": IssueSeverity.INFO.value,
-                            "location": "",
-                            "details": {"interrupted": True},
-                        }
-                    )
-                    break
+            try:
+                for future in as_completed(future_to_work, timeout=overall_timeout):
+                    # Check for interrupt
+                    if is_interrupted():
+                        logger.info("Parallel scan interrupted by user")
+                        # Cancel remaining futures
+                        for f in future_to_work:
+                            f.cancel()
+                        results["issues"].append(
+                            {
+                                "message": "Scan interrupted by user",
+                                "severity": IssueSeverity.INFO.value,
+                                "location": "",
+                                "details": {"interrupted": True},
+                            }
+                        )
+                        break
 
-                work_item = future_to_work[future]
+                    work_item = future_to_work[future]
 
-                try:
-                    work_result = future.result(timeout=self.timeout_per_file)
-                    self._process_work_result(results, work_result)
+                    try:
+                        work_result = future.result(timeout=self.timeout_per_file)
+                        self._process_work_result(results, work_result)
 
-                except Exception as e:
-                    logger.error(f"Worker failed for {work_item.file_path}: {e}")
-                    self._add_scan_error(results, work_item.file_path, str(e))
+                    except Exception as e:
+                        logger.error(f"Worker failed for {work_item.file_path}: {e}")
+                        self._add_scan_error(results, work_item.file_path, str(e))
 
-                finally:
-                    # Update progress
-                    if self._progress:
-                        self._progress.completed_files += 1
-                        if self.progress_callback:
-                            self._report_progress()
+                    finally:
+                        # Update progress
+                        if self._progress:
+                            self._progress.completed_files += 1
+                            if self.progress_callback:
+                                self._report_progress()
+
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Overall scan timeout reached after {overall_timeout}s")
+                # Process any completed results
+                for future in future_to_work:
+                    if future.done():
+                        try:
+                            work_result = future.result(timeout=0)
+                            self._process_work_result(results, work_result)
+                        except Exception:
+                            pass  # Already logged or timed out
+                    else:
+                        future.cancel()
+
+                results["issues"].append(
+                    {
+                        "message": f"Scan timeout reached after {overall_timeout}s",
+                        "severity": IssueSeverity.WARNING.value,
+                        "location": "",
+                        "details": {"timeout": overall_timeout, "completed": results.get("files_scanned", 0)},
+                    }
+                )
 
         # Finalize results
         results["finish_time"] = time.time()

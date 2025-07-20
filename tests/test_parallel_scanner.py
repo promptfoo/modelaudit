@@ -42,9 +42,9 @@ class TestParallelScanner:
     def test_sequential_fallback_small_files(self):
         """Test that small file counts use sequential scanning."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create 2 test files
+            # Create 9 test files (below the 10 file threshold)
             files = []
-            for i in range(2):
+            for i in range(9):
                 file_path = Path(tmpdir) / f"model_{i}.pkl"
                 with open(file_path, "wb") as f:
                     pickle.dump({"data": f"test_{i}"}, f)
@@ -53,7 +53,7 @@ class TestParallelScanner:
             scanner = ParallelScanner(max_workers=4)
             results = scanner.scan_files(files, {})
 
-            assert results["files_scanned"] == 2
+            assert results["files_scanned"] == 9
             assert results["parallel_scan"] is False
             assert "bytes_scanned" in results
             assert results["success"] is True
@@ -61,9 +61,9 @@ class TestParallelScanner:
     def test_parallel_scanning(self):
         """Test parallel scanning with multiple files."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create 5 test files
+            # Create 10 test files (at the parallel threshold)
             files = []
-            for i in range(5):
+            for i in range(10):
                 file_path = Path(tmpdir) / f"model_{i}.pkl"
                 with open(file_path, "wb") as f:
                     pickle.dump({"data": f"test_{i}" * 100}, f)
@@ -72,11 +72,11 @@ class TestParallelScanner:
             scanner = ParallelScanner(max_workers=2)
             results = scanner.scan_files(files, {})
 
-            assert results["files_scanned"] == 5
+            assert results["files_scanned"] == 10
             assert results["parallel_scan"] is True
             assert results["worker_count"] == 2
             assert results["success"] is True
-            assert len(results["assets"]) == 5
+            assert len(results["assets"]) == 10
 
     def test_progress_callback(self):
         """Test progress callback functionality."""

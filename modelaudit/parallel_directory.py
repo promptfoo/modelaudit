@@ -258,9 +258,13 @@ def scan_directory_parallel(
     # Add path traversal issues to results
     if path_traversal_issues:
         for issue in path_traversal_issues:
+            # Map string severity to IssueSeverity enum
+            severity_str = issue.get("severity", "critical")
+            severity_value = IssueSeverity.WARNING.value if severity_str == "warning" else IssueSeverity.CRITICAL.value
+
             issue_dict = {
                 "message": issue["message"],
-                "severity": IssueSeverity.CRITICAL.value,
+                "severity": severity_value,
                 "location": issue["location"],
                 "details": issue["details"],
             }

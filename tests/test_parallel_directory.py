@@ -19,9 +19,9 @@ class TestShouldSkipFile:
     def test_skip_documentation_files(self):
         """Test that documentation files are skipped."""
         assert _should_skip_file("README.md") is True
-        assert _should_skip_file("doc.txt") is True
         assert _should_skip_file("manual.pdf") is True
         assert _should_skip_file("guide.rst") is True
+        assert _should_skip_file("doc.docx") is True
 
     def test_skip_code_files(self):
         """Test that code files are skipped."""
@@ -51,6 +51,9 @@ class TestShouldSkipFile:
         assert _should_skip_file("checkpoint.ckpt") is False
         assert _should_skip_file("model.onnx") is False
         assert _should_skip_file("model.safetensors") is False
+        # .txt files should not be skipped as they may contain model data
+        assert _should_skip_file("model.txt") is False
+        assert _should_skip_file("embeddings.txt") is False
 
     def test_case_insensitive_extensions(self):
         """Test that extension checking is case-insensitive."""
