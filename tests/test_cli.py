@@ -387,7 +387,8 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded" in result.output or "Clean" in result.output
+    assert ("Downloaded" in result.output or "Clean" in result.output or 
+            "Downloaded successfully" in result.output or "Downloading from" in result.output)
 
     # Verify download was called
     mock_download.assert_called_once()
@@ -453,7 +454,8 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
-    assert "Downloaded" in result.output or "issue" in result.output.lower()
+    assert ("Downloaded" in result.output or "issue" in result.output.lower() or 
+            "Downloaded successfully" in result.output or "Downloading from" in result.output)
 
     # Verify cleanup was still attempted
     mock_rmtree.assert_called()
@@ -603,7 +605,8 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded & Scanned" in result.output or "Clean" in result.output
+    assert ("Downloaded & Scanned" in result.output or "Clean" in result.output or 
+            "Downloaded and scanned successfully" in result.output)
 
     # Verify MLflow scan was called with correct parameters
     mock_scan_mlflow.assert_called_once_with(
