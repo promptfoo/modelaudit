@@ -545,24 +545,24 @@ def scan_command(
                             aggregated_results["scanner_names"].append(scanner)
 
                     # Show completion status if in text mode and not writing to a file
-                    if spinner:
-                        if results.get("issues", []):
-                            # Filter out DEBUG severity issues when not in verbose mode
-                            visible_issues = [
-                                issue
-                                for issue in results.get("issues", [])
-                                if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                            ]
-                            issue_count = len(visible_issues)
+                    if results.get("issues", []):
+                        # Filter out DEBUG severity issues when not in verbose mode
+                        visible_issues = [
+                            issue
+                            for issue in results.get("issues", [])
+                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                        ]
+                        issue_count = len(visible_issues)
+                        
+                        if issue_count > 0:
+                            # Determine severity for coloring
+                            has_critical = any(
+                                issue.get("severity") == "critical"
+                                for issue in visible_issues
+                                if isinstance(issue, dict)
+                            )
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
-                            if issue_count > 0:
-                                # Determine severity for coloring
-                                has_critical = any(
-                                    issue.get("severity") == "critical"
-                                    for issue in visible_issues
-                                    if isinstance(issue, dict)
-                                )
                                 if has_critical:
                                     spinner.fail(
                                         style_text(
@@ -579,14 +579,25 @@ def scan_command(
                                             bold=True,
                                         ),
                                     )
-                            else:
-                                spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                            elif format == "text" and not output:
+                                if has_critical:
+                                    click.echo(f"Scanned {path}: Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)")
+                                else:
+                                    click.echo(f"Scanned {path}: Found {issue_count} issue{'s' if issue_count > 1 else ''}")
                         else:
+                            # No issues after filtering (all were DEBUG)
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
                             elif format == "text" and not output:
                                 click.echo(f"Scanned {path}: Clean")
+                    else:
+                        # No issues at all
+                        if spinner:
+                            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+                            spinner.ok(style_text("✅ Clean", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo(f"Scanned {path}: Clean")
 
                 except Exception as e:
                     # Show error if in text mode and not writing to a file

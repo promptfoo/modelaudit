@@ -34,7 +34,6 @@ except ImportError:
     fmt = None
 
 
-
 class NumPyScanner(BaseScanner):
     """Scanner for NumPy binary files (.npy) with cross-version compatibility."""
 
