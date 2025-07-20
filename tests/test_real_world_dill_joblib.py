@@ -183,8 +183,7 @@ class TestRealJoblibFiles:
             # Should have issues about unknown format/opcodes (now as warnings)
             assert len(warning_issues) > 0, "Should report issues when format isn't recognized"
             opcode_issues = [
-                i for i in warning_issues
-                if "opcode" in str(i.message).lower() or "format" in str(i.message).lower()
+                i for i in warning_issues if "opcode" in str(i.message).lower() or "format" in str(i.message).lower()
             ]
             assert len(opcode_issues) > 0, "Should report opcode/format issues for numpy joblib files"
         else:
