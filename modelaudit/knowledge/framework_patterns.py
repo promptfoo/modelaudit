@@ -1,13 +1,14 @@
 """Framework-specific pattern knowledge base for reducing false positives."""
 
-from typing import Dict, List, Set, Tuple, Optional
+import re
 from dataclasses import dataclass
 from enum import Enum
-import re
+from typing import Dict, List, Optional, Tuple
 
 
 class FrameworkType(Enum):
     """Supported ML frameworks."""
+
     PYTORCH = "pytorch"
     TENSORFLOW = "tensorflow"
     KERAS = "keras"
@@ -23,6 +24,7 @@ class FrameworkType(Enum):
 @dataclass
 class FrameworkPattern:
     """Pattern specific to a framework."""
+
     pattern: str
     pattern_type: str  # 'module', 'function', 'attribute', 'file_structure'
     is_safe: bool
@@ -33,10 +35,10 @@ class FrameworkPattern:
 
 class FrameworkKnowledgeBase:
     """Knowledge base of framework-specific patterns."""
-    
+
     def __init__(self):
         self._build_knowledge_base()
-    
+
     def _build_knowledge_base(self):
         """Build comprehensive framework-specific patterns."""
         self.patterns = {
@@ -46,28 +48,45 @@ class FrameworkKnowledgeBase:
             FrameworkType.SKLEARN: self._build_sklearn_patterns(),
             FrameworkType.JAX: self._build_jax_patterns(),
         }
-        
+
         # Safe operations by framework
         self.safe_operations = {
             FrameworkType.PYTORCH: {
-                "torch.load", "torch.save", "torch.jit.load", "torch.jit.save",
-                "torch.onnx.export", "torch.utils.data.DataLoader",
-                "torch.nn.Module", "torch.optim", "torch.cuda",
-                "pickle.load", "pickle.dump"  # When used with torch objects
+                "torch.load",
+                "torch.save",
+                "torch.jit.load",
+                "torch.jit.save",
+                "torch.onnx.export",
+                "torch.utils.data.DataLoader",
+                "torch.nn.Module",
+                "torch.optim",
+                "torch.cuda",
+                "pickle.load",
+                "pickle.dump",  # When used with torch objects
             },
             FrameworkType.TENSORFLOW: {
-                "tf.saved_model.load", "tf.saved_model.save",
-                "tf.keras.models.load_model", "tf.keras.models.save_model",
-                "tf.lite.TFLiteConverter", "tf.data.Dataset",
-                "tf.function", "tf.Variable", "tf.GradientTape"
+                "tf.saved_model.load",
+                "tf.saved_model.save",
+                "tf.keras.models.load_model",
+                "tf.keras.models.save_model",
+                "tf.lite.TFLiteConverter",
+                "tf.data.Dataset",
+                "tf.function",
+                "tf.Variable",
+                "tf.GradientTape",
             },
             FrameworkType.SKLEARN: {
-                "joblib.load", "joblib.dump", "pickle.load", "pickle.dump",
-                "sklearn.externals.joblib", "sklearn.model_selection",
-                "sklearn.preprocessing", "sklearn.pipeline.Pipeline"
-            }
+                "joblib.load",
+                "joblib.dump",
+                "pickle.load",
+                "pickle.dump",
+                "sklearn.externals.joblib",
+                "sklearn.model_selection",
+                "sklearn.preprocessing",
+                "sklearn.pipeline.Pipeline",
+            },
         }
-        
+
         # Common false positive patterns
         self.false_positive_patterns = {
             # Documentation strings
@@ -94,29 +113,28 @@ class FrameworkKnowledgeBase:
                 r"['\"].*os\.system.*['\"].*['\"]",  # Nested quotes indicate string
                 r"logging\..*['\"].*eval.*['\"]",  # Log messages
                 r"print\(.*['\"].*exec.*['\"]",  # Print statements
-            ]
+            ],
         }
-        
+
         # Architecture-specific patterns
         self.architecture_patterns = {
             "transformer": {
-                "layers": ["attention", "multi_head_attention", "position_embedding", 
-                          "layer_norm", "feed_forward"],
+                "layers": ["attention", "multi_head_attention", "position_embedding", "layer_norm", "feed_forward"],
                 "params": ["num_heads", "hidden_size", "num_layers", "max_position_embeddings"],
-                "safe_lambdas": ["lambda x: x * 0.5", "lambda x: torch.sqrt(x)"]  # Common in attention
+                "safe_lambdas": ["lambda x: x * 0.5", "lambda x: torch.sqrt(x)"],  # Common in attention
             },
             "cnn": {
                 "layers": ["conv2d", "maxpool2d", "batchnorm2d", "dropout2d"],
                 "params": ["kernel_size", "stride", "padding", "dilation"],
-                "safe_lambdas": ["lambda x: F.relu(x)", "lambda x: x.view(-1)"]
+                "safe_lambdas": ["lambda x: F.relu(x)", "lambda x: x.view(-1)"],
             },
             "rnn": {
                 "layers": ["lstm", "gru", "rnn", "embedding"],
                 "params": ["hidden_size", "num_layers", "bidirectional", "dropout"],
-                "safe_lambdas": ["lambda x: x.squeeze()", "lambda x: x.unsqueeze(0)"]
-            }
+                "safe_lambdas": ["lambda x: x.squeeze()", "lambda x: x.unsqueeze(0)"],
+            },
         }
-    
+
     def _build_pytorch_patterns(self) -> List[FrameworkPattern]:
         """PyTorch-specific patterns."""
         return [
@@ -127,7 +145,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_loading",
                 risk_level="safe",
-                explanation="Standard PyTorch model loading"
+                explanation="Standard PyTorch model loading",
             ),
             FrameworkPattern(
                 pattern="pickle.load.*torch",
@@ -135,7 +153,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_loading",
                 risk_level="safe",
-                explanation="Pickle used for PyTorch serialization"
+                explanation="Pickle used for PyTorch serialization",
             ),
             FrameworkPattern(
                 pattern="torch.jit.load",
@@ -143,7 +161,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="jit_loading",
                 risk_level="safe",
-                explanation="TorchScript model loading"
+                explanation="TorchScript model loading",
             ),
             FrameworkPattern(
                 pattern="model.eval()",
@@ -151,7 +169,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_evaluation",
                 risk_level="safe",
-                explanation="Setting model to evaluation mode"
+                explanation="Setting model to evaluation mode",
             ),
             # Patterns that need context
             FrameworkPattern(
@@ -160,7 +178,7 @@ class FrameworkKnowledgeBase:
                 is_safe=False,
                 context="serialization",
                 risk_level="medium",
-                explanation="Can be exploited but commonly used in PyTorch"
+                explanation="Can be exploited but commonly used in PyTorch",
             ),
             FrameworkPattern(
                 pattern="Lambda",
@@ -168,10 +186,10 @@ class FrameworkKnowledgeBase:
                 is_safe=False,
                 context="layer_definition",
                 risk_level="low",
-                explanation="Lambda layers are common in PyTorch models"
+                explanation="Lambda layers are common in PyTorch models",
             ),
         ]
-    
+
     def _build_tensorflow_patterns(self) -> List[FrameworkPattern]:
         """TensorFlow-specific patterns."""
         return [
@@ -182,7 +200,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_loading",
                 risk_level="safe",
-                explanation="Standard TensorFlow SavedModel loading"
+                explanation="Standard TensorFlow SavedModel loading",
             ),
             FrameworkPattern(
                 pattern="tf.keras.models.load_model",
@@ -190,7 +208,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_loading",
                 risk_level="safe",
-                explanation="Keras model loading in TensorFlow"
+                explanation="Keras model loading in TensorFlow",
             ),
             FrameworkPattern(
                 pattern="tf.function",
@@ -198,7 +216,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="graph_compilation",
                 risk_level="safe",
-                explanation="TensorFlow function compilation"
+                explanation="TensorFlow function compilation",
             ),
             # Patterns needing context
             FrameworkPattern(
@@ -207,10 +225,10 @@ class FrameworkKnowledgeBase:
                 is_safe=False,
                 context="custom_operation",
                 risk_level="medium",
-                explanation="Executes Python code in TF graph"
+                explanation="Executes Python code in TF graph",
             ),
         ]
-    
+
     def _build_keras_patterns(self) -> List[FrameworkPattern]:
         """Keras-specific patterns."""
         return [
@@ -220,7 +238,7 @@ class FrameworkKnowledgeBase:
                 is_safe=False,
                 context="custom_layer",
                 risk_level="medium",
-                explanation="Lambda layers can contain arbitrary code"
+                explanation="Lambda layers can contain arbitrary code",
             ),
             FrameworkPattern(
                 pattern="model.load_weights",
@@ -228,10 +246,10 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="weight_loading",
                 risk_level="safe",
-                explanation="Standard Keras weight loading"
+                explanation="Standard Keras weight loading",
             ),
         ]
-    
+
     def _build_sklearn_patterns(self) -> List[FrameworkPattern]:
         """Scikit-learn specific patterns."""
         return [
@@ -241,7 +259,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_loading",
                 risk_level="safe",
-                explanation="Standard sklearn model loading"
+                explanation="Standard sklearn model loading",
             ),
             FrameworkPattern(
                 pattern="pickle.*sklearn",
@@ -249,10 +267,10 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_serialization",
                 risk_level="safe",
-                explanation="Pickle used for sklearn models"
+                explanation="Pickle used for sklearn models",
             ),
         ]
-    
+
     def _build_jax_patterns(self) -> List[FrameworkPattern]:
         """JAX-specific patterns."""
         return [
@@ -262,7 +280,7 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="model_serialization",
                 risk_level="safe",
-                explanation="Flax serialization for JAX models"
+                explanation="Flax serialization for JAX models",
             ),
             FrameworkPattern(
                 pattern="jax.tree_util",
@@ -270,16 +288,17 @@ class FrameworkKnowledgeBase:
                 is_safe=True,
                 context="tree_operations",
                 risk_level="safe",
-                explanation="JAX tree utilities for nested structures"
+                explanation="JAX tree utilities for nested structures",
             ),
         ]
-    
-    def is_pattern_safe_in_framework(self, pattern: str, framework: FrameworkType, 
-                                   context: Dict[str, any]) -> Tuple[bool, str]:
+
+    def is_pattern_safe_in_framework(
+        self, pattern: str, framework: FrameworkType, context: Dict[str, any]
+    ) -> Tuple[bool, str]:
         """Check if a pattern is safe within a specific framework context."""
         if framework not in self.patterns:
             return False, "Unknown framework"
-        
+
         # Check framework-specific patterns
         for fw_pattern in self.patterns[framework]:
             if re.search(fw_pattern.pattern, pattern, re.IGNORECASE):
@@ -289,26 +308,26 @@ class FrameworkKnowledgeBase:
                     # Check additional context
                     if self._validate_context(fw_pattern, context):
                         return True, f"{fw_pattern.explanation} (validated in context)"
-        
+
         # Check if it's a known safe operation
         if framework in self.safe_operations:
             if pattern in self.safe_operations[framework]:
                 return True, f"Known safe operation in {framework.value}"
-        
+
         # Check false positive patterns
         for category, patterns in self.false_positive_patterns.items():
             for fp_pattern in patterns:
                 if re.search(fp_pattern, pattern):
                     return True, f"False positive: {category}"
-        
+
         return False, "Pattern not recognized as safe"
-    
+
     def _validate_context(self, pattern: FrameworkPattern, context: Dict[str, any]) -> bool:
         """Validate pattern safety based on context."""
         # Check if we're in the right context
         if pattern.context not in str(context):
             return False
-        
+
         # Additional validation based on pattern type
         if pattern.pattern_type == "layer" and pattern.pattern == "Lambda":
             # Check if Lambda contains safe operations
@@ -318,13 +337,13 @@ class FrameworkKnowledgeBase:
                 for arch, arch_patterns in self.architecture_patterns.items():
                     if any(safe_lambda in lambda_code for safe_lambda in arch_patterns.get("safe_lambdas", [])):
                         return True
-        
+
         return pattern.risk_level in ["safe", "low"]
-    
+
     def get_framework_from_imports(self, imports: List[str]) -> Optional[FrameworkType]:
         """Detect framework from import statements."""
         import_str = " ".join(imports).lower()
-        
+
         framework_indicators = {
             FrameworkType.PYTORCH: ["torch", "torchvision", "pytorch"],
             FrameworkType.TENSORFLOW: ["tensorflow", "tf.", "keras"],
@@ -335,18 +354,18 @@ class FrameworkKnowledgeBase:
             FrameworkType.PADDLE: ["paddle", "paddlepaddle"],
             FrameworkType.MXNET: ["mxnet", "mx."],
         }
-        
+
         scores = {}
         for framework, indicators in framework_indicators.items():
             score = sum(1 for ind in indicators if ind in import_str)
             if score > 0:
                 scores[framework] = score
-        
+
         if scores:
             return max(scores, key=scores.get)
-        
+
         return None
-    
+
     def get_safe_alternatives(self, dangerous_pattern: str, framework: FrameworkType) -> List[str]:
         """Suggest safe alternatives to dangerous patterns."""
         alternatives = {
@@ -354,48 +373,49 @@ class FrameworkKnowledgeBase:
                 FrameworkType.PYTORCH: [
                     "Use torch.jit.script for dynamic computation",
                     "Use torch.compile for optimization",
-                    "Define functions explicitly instead of eval"
+                    "Define functions explicitly instead of eval",
                 ],
                 FrameworkType.TENSORFLOW: [
                     "Use tf.function for dynamic computation",
                     "Use tf.keras.layers.Lambda with explicit functions",
-                    "Use tf.py_function with careful validation"
+                    "Use tf.py_function with careful validation",
                 ],
             },
             "pickle.load": {
                 FrameworkType.PYTORCH: [
                     "Use torch.load with map_location specified",
                     "Use torch.jit.load for TorchScript models",
-                    "Validate file source before loading"
+                    "Validate file source before loading",
                 ],
                 FrameworkType.SKLEARN: [
                     "Use joblib.load instead of pickle",
                     "Implement model versioning",
-                    "Validate model source before loading"
+                    "Validate model source before loading",
                 ],
             },
             "__reduce__": {
                 FrameworkType.PYTORCH: [
                     "Use state_dict() for saving model weights only",
                     "Use TorchScript for model serialization",
-                    "Implement custom serialization without __reduce__"
+                    "Implement custom serialization without __reduce__",
                 ],
-            }
+            },
         }
-        
+
         pattern_key = None
         for key in alternatives:
             if key in dangerous_pattern:
                 pattern_key = key
                 break
-        
+
         if pattern_key and framework in alternatives.get(pattern_key, {}):
             return alternatives[pattern_key][framework]
-        
+
         return ["Consider using framework-specific serialization methods"]
-    
-    def should_skip_pattern_for_framework(self, pattern: str, framework: FrameworkType,
-                                        file_context: Dict[str, any]) -> bool:
+
+    def should_skip_pattern_for_framework(
+        self, pattern: str, framework: FrameworkType, file_context: Dict[str, any]
+    ) -> bool:
         """Determine if a pattern check should be skipped for a framework."""
         # Framework-specific skips
         skip_rules = {
@@ -413,18 +433,18 @@ class FrameworkKnowledgeBase:
                 "joblib.load": True,
                 "Pipeline": True,
                 "cross_val": True,
-            }
+            },
         }
-        
+
         if framework in skip_rules:
             for skip_pattern, should_skip in skip_rules[framework].items():
                 if re.search(skip_pattern, pattern, re.IGNORECASE) and should_skip:
                     return True
-        
+
         # Check if pattern appears in safe context
         safe_contexts = ["test_", "eval_", "validate_", "benchmark_"]
         if any(ctx in str(file_context.get("filename", "")).lower() for ctx in safe_contexts):
             # More lenient in test files
             return pattern in ["eval", "exec", "assert"]
-        
+
         return False

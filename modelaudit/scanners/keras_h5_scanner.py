@@ -65,7 +65,7 @@ class KerasH5Scanner(BaseScanner):
         """Scan a Keras model file for suspicious configurations"""
         # Initialize context for this file
         self._initialize_context(path)
-        
+
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -260,7 +260,7 @@ class KerasH5Scanner(BaseScanner):
     def _check_lambda_layer(self, layer_config: dict[str, Any], result: ScanResult) -> None:
         """Check Lambda layer for executable Python code with validation"""
         import re
-        
+
         # Lambda layers can contain Python code in several forms:
         # 1. As a string in 'function' field (serialized Python code)
         # 2. As a module + function reference
@@ -284,11 +284,11 @@ class KerasH5Scanner(BaseScanner):
         if function_str and isinstance(function_str, str):
             # First check if it matches safe patterns
             is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
-            
+
             if is_safe_pattern:
                 # This is a safe normalization lambda - don't flag it
                 return
-                
+
             # This might be serialized Python code
             is_valid, error = validate_python_syntax(function_str)
 
@@ -299,7 +299,7 @@ class KerasH5Scanner(BaseScanner):
                 # Only flag if actually dangerous
                 if is_dangerous:
                     result.add_issue(
-                        f"Lambda layer contains dangerous Python code",
+                        "Lambda layer contains dangerous Python code",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={

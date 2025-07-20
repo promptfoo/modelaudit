@@ -1,5 +1,5 @@
 """Context management for unified ML analysis."""
 
-from .unified_context import UnifiedMLContext, ModelArchitecture, TensorInfo, LayerPattern
+from .unified_context import LayerPattern, ModelArchitecture, TensorInfo, UnifiedMLContext
 
-__all__ = ["UnifiedMLContext", "ModelArchitecture", "TensorInfo", "LayerPattern"]
+__all__ = ["LayerPattern", "ModelArchitecture", "TensorInfo", "UnifiedMLContext"]

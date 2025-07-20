@@ -1,5 +1,5 @@
 """Framework-specific knowledge base."""
 
-from .framework_patterns import FrameworkKnowledgeBase, FrameworkType, FrameworkPattern
+from .framework_patterns import FrameworkKnowledgeBase, FrameworkPattern, FrameworkType
 
-__all__ = ["FrameworkKnowledgeBase", "FrameworkType", "FrameworkPattern"]
+__all__ = ["FrameworkKnowledgeBase", "FrameworkPattern", "FrameworkType"]

@@ -6,9 +6,9 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, ClassVar, Optional
 
+from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
-from ..context.unified_context import UnifiedMLContext
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -216,14 +216,11 @@ class BaseScanner(ABC):
     def _initialize_context(self, path: str) -> None:
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
+
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
-        self.context = UnifiedMLContext(
-            file_path=path_obj,
-            file_size=file_size,
-            file_type=file_type
-        )
+        self.context = UnifiedMLContext(file_path=path_obj, file_size=file_size, file_type=file_type)
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""

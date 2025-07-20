@@ -4,6 +4,9 @@ import struct
 import time
 from typing import Any, BinaryIO, ClassVar, Optional, Union
 
+from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
+from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
@@ -14,9 +17,6 @@ from modelaudit.utils.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
-from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
-from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
-from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 
 from ..explanations import (
     get_import_explanation,
@@ -762,7 +762,7 @@ class PickleScanner(BaseScanner):
         """Scan a pickle file for suspicious content"""
         # Initialize context for this file
         self._initialize_context(path)
-        
+
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -817,20 +817,20 @@ class PickleScanner(BaseScanner):
                     # Use find() instead of 'in' operator to be more explicit
                     if raw_content.find(pattern) != -1:
                         # Extract context around the pattern for semantic analysis
-                        pattern_str = pattern.decode('utf-8', errors='ignore')
+                        pattern_str = pattern.decode("utf-8", errors="ignore")
                         pattern_pos = raw_content.find(pattern)
                         context_start = max(0, pattern_pos - 100)
                         context_end = min(len(raw_content), pattern_pos + len(pattern) + 100)
-                        context = raw_content[context_start:context_end].decode('utf-8', errors='ignore')
-                        
+                        context = raw_content[context_start:context_end].decode("utf-8", errors="ignore")
+
                         # Use semantic analysis to check if this is actually dangerous
                         # For now, just check if it's in documentation or comments
                         is_safe = "documentation" in context.lower() or "#" in context
-                        
+
                         # Skip if semantic analysis says it's safe (e.g., in documentation)
                         if is_safe:
                             continue
-                            
+
                         result.add_issue(
                             f"Dangerous pattern '{pattern_str}' found in raw file content",
                             severity=IssueSeverity.CRITICAL,
@@ -1073,7 +1073,7 @@ class PickleScanner(BaseScanner):
         result = self._create_result()
         opcode_count = 0
         suspicious_count = 0
-        
+
         # Read the file data for entropy analysis
         current_pos = file_obj.tell()
         file_data = file_obj.read()
@@ -1198,11 +1198,11 @@ class PickleScanner(BaseScanner):
                     # Look at surrounding data to determine if it's weights
                     surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
                     data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
-                    
+
                     # Skip if it looks like ML weights with high confidence
                     if data_type == "ml_weights" and confidence > 0.7:
                         continue
-                    
+
                     severity = _get_context_aware_severity(
                         IssueSeverity.WARNING,
                         ml_context,
@@ -1233,15 +1233,18 @@ class PickleScanner(BaseScanner):
                     # Use entropy analysis to check if this is ML data
                     surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
                     data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
-                    
+
                     # Skip if it looks like ML weights with high confidence
                     if data_type == "ml_weights" and confidence > 0.7:
                         continue
-                    
+
                     # For sklearn models, NEWOBJ is expected for constructing objects
-                    if opcode.name == "NEWOBJ" and ml_context.get("frameworks", {}).get("sklearn", {}).get("confidence", 0) > 0.3:
+                    if (
+                        opcode.name == "NEWOBJ"
+                        and ml_context.get("frameworks", {}).get("sklearn", {}).get("confidence", 0) > 0.3
+                    ):
                         continue
-                        
+
                     severity = _get_context_aware_severity(
                         IssueSeverity.WARNING,
                         ml_context,

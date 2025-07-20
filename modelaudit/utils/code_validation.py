@@ -106,9 +106,9 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                         module = node.func.value.id
                         method = node.func.attr
 
-                        if module == "os" and method in ["system", "popen", "exec*"]:
-                            dangerous["subprocess_operations"].append(f"{module}.{method}")
-                        elif module == "subprocess" and method in ["run", "call", "Popen"]:
+                        if (module == "os" and method in ["system", "popen", "exec*"]) or (
+                            module == "subprocess" and method in ["run", "call", "Popen"]
+                        ):
                             dangerous["subprocess_operations"].append(f"{module}.{method}")
                         elif module == "socket" and method in ["socket", "connect"]:
                             dangerous["network_operations"].append(f"{module}.{method}")
