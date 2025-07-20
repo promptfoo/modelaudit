@@ -40,7 +40,7 @@ class TestLicenseIntegration:
         mit_dir = test_data_dir / "mit_model"
 
         # Scan the MIT model directory
-        results = scan_model_directory_or_file(str(mit_dir))
+        results = scan_model_directory_or_file(str(mit_dir), skip_file_types=False)
 
         # Should have no license warnings
         license_warnings = check_commercial_use_warnings(results)
@@ -76,7 +76,7 @@ class TestLicenseIntegration:
         agpl_dir = test_data_dir / "agpl_component"
 
         # Scan the AGPL component directory
-        results = scan_model_directory_or_file(str(agpl_dir))
+        results = scan_model_directory_or_file(str(agpl_dir), skip_file_types=False)
 
         # Should trigger AGPL warnings
         license_warnings = check_commercial_use_warnings(results)
@@ -99,7 +99,7 @@ class TestLicenseIntegration:
         unlicensed_dir = test_data_dir / "unlicensed_dataset"
 
         # Scan the unlicensed dataset directory
-        results = scan_model_directory_or_file(str(unlicensed_dir))
+        results = scan_model_directory_or_file(str(unlicensed_dir), skip_file_types=False)
 
         # Should trigger unlicensed dataset warnings
         license_warnings = check_commercial_use_warnings(results)
@@ -116,7 +116,7 @@ class TestLicenseIntegration:
         mixed_dir = test_data_dir / "mixed_licenses"
 
         # Scan the mixed licenses directory
-        results = scan_model_directory_or_file(str(mixed_dir))
+        results = scan_model_directory_or_file(str(mixed_dir), skip_file_types=False)
 
         # Should detect multiple license types
         license_warnings = check_commercial_use_warnings(results)
@@ -139,7 +139,7 @@ class TestLicenseIntegration:
         mit_dir = test_data_dir / "mit_model"
 
         # Scan and generate SBOM
-        results = scan_model_directory_or_file(str(mit_dir))
+        results = scan_model_directory_or_file(str(mit_dir), skip_file_types=False)
         sbom_json = generate_sbom([str(mit_dir)], results)
 
         # Parse SBOM
@@ -191,7 +191,7 @@ class TestLicenseIntegration:
         agpl_dir = test_data_dir / "agpl_component"
 
         # Scan directory
-        results = scan_model_directory_or_file(str(agpl_dir))
+        results = scan_model_directory_or_file(str(agpl_dir), skip_file_types=False)
 
         # Test AGPL detection function directly
         agpl_files = detect_agpl_components(results)
@@ -255,7 +255,7 @@ class TestLicenseIntegration:
 
         # Capture the scan results by calling the core function directly
         # (since scan_command calls sys.exit)
-        results = scan_model_directory_or_file(agpl_dir)
+        results = scan_model_directory_or_file(agpl_dir, skip_file_types=False)
 
         # Should have license warnings
         license_warnings = check_commercial_use_warnings(results)

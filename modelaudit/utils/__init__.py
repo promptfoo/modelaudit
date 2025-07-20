@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from .dvc_utils import resolve_dvc_file
+from .file_filter import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
 
 
 def is_within_directory(base_dir: str, target: str) -> bool:

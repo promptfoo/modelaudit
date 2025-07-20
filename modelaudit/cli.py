@@ -187,6 +187,11 @@ def cli() -> None:
     help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
 )
 @click.option(
+    "--no-skip-files/--skip-files",
+    default=False,
+    help="Whether to skip non-model file types during directory scans (default: skip)",
+)
+@click.option(
     "--strict-license",
     is_flag=True,
     help="Fail scan when incompatible or deprecated licenses are detected",
@@ -222,6 +227,7 @@ def scan_command(
     max_download_size: Optional[str],
     cache: bool,
     cache_dir: Optional[str],
+    no_skip_files: bool,
     strict_license: bool,
     preview: bool,
     selective: bool,
@@ -660,6 +666,7 @@ def scan_command(
                         max_total_size=max_total_size,
                         strict_license=strict_license,
                         progress_callback=progress_callback,
+                        skip_file_types=not no_skip_files,  # CLI flag is inverted (--no-skip-files)
                     )
 
                     # Aggregate results
@@ -784,6 +791,26 @@ def scan_command(
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
+
+    # Deduplicate issues based on message, severity, and location
+    seen_issues = set()
+    deduplicated_issues = []
+    for issue in aggregated_results["issues"]:
+        if isinstance(issue, dict):
+            # Include location in the deduplication key to avoid hiding issues in different files
+            issue_key = (
+                issue.get("message", ""),
+                issue.get("severity", ""),
+                issue.get("location", ""),
+            )
+            if issue_key not in seen_issues:
+                seen_issues.add(issue_key)
+                deduplicated_issues.append(issue)
+        else:
+            # Non-dict issues should be preserved as-is
+            deduplicated_issues.append(issue)
+
+    aggregated_results["issues"] = deduplicated_issues
 
     # Generate SBOM if requested
     if sbom:

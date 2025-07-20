@@ -75,8 +75,8 @@ def test_scan_directory(tmp_path):
     # Create a test directory with files
     test_dir = tmp_path / "test_dir"
     test_dir.mkdir()
-    (test_dir / "file1.txt").write_bytes(b"test content 1")
-    (test_dir / "file2.dat").write_bytes(b"test content 2")
+    (test_dir / "file1.pkl").write_bytes(b"test content 1")
+    (test_dir / "file2.bin").write_bytes(b"test content 2")
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_dir)], catch_exceptions=True)
