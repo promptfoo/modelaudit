@@ -130,6 +130,14 @@ modelaudit model_package.zip --sbom compliance_report.json --verbose
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
+### Static Scanning vs. Promptfoo Redteaming
+
+ModelAudit performs **static** analysis only. It examines model files for risky patterns
+without ever loading or executing them. Promptfoo's redteaming module is
+**dynamic**—it loads the model (locally or via API) and sends crafted prompts to
+probe runtime behavior. Use ModelAudit first to verify the model file itself,
+then run redteaming if you need to test how the model responds when invoked.
+
 ## ⚙️ Installation Options
 
 **Basic installation (recommended for most users):**
