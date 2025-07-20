@@ -97,6 +97,17 @@ LICENSE_PATTERNS = {
         "name": "Open Data Commons Public Domain Dedication",
         "commercial_allowed": True,
     },
+    # BigScience and RAIL licenses
+    r"BigScience\s+Open\s+RAIL(?:-M)?|BigScience\s+RAIL": {
+        "spdx_id": "BigScience-OpenRAIL-M",
+        "name": "BigScience Open RAIL License",
+        "commercial_allowed": True,
+    },
+    r"Responsible\s+AI\s+License|RAIL(?:\s+License)?|OpenRAIL": {
+        "spdx_id": "RAIL",
+        "name": "Responsible AI License",
+        "commercial_allowed": True,
+    },
 }
 
 # Copyright notice patterns

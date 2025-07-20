@@ -23,8 +23,8 @@ def _check_numpy_compatibility() -> tuple[bool, str]:
                 False,
                 f"NumPy {numpy_version} detected. Some ML frameworks may require NumPy < 2.0 for compatibility.",
             )
-        else:
-            return True, f"NumPy {numpy_version} detected (compatible)."
+
+        return True, f"NumPy {numpy_version} detected (compatible)."
     except ImportError:
         return False, "NumPy not available."
 
@@ -535,10 +535,9 @@ def __getattr__(name: str) -> Any:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
             return scanner_class
-        else:
-            raise ImportError(
-                f"Failed to load scanner '{name}' - dependencies may not be installed",
-            )
+        raise ImportError(
+            f"Failed to load scanner '{name}' - dependencies may not be installed",
+        )
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
