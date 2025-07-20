@@ -93,6 +93,37 @@ Some dataset content here...
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
 
+    def test_rail_license_detection(self, tmp_path):
+        """Test detection of RAIL license."""
+        test_file = tmp_path / "rail_file.py"
+        content = """# Released under the Responsible AI License
+# BigScience Open RAIL-M
+def do_something():
+    pass
+"""
+        test_file.write_text(content)
+
+        licenses = scan_for_license_headers(str(test_file))
+
+        assert len(licenses) >= 1
+        spdx_ids = {lic.spdx_id for lic in licenses}
+        assert "RAIL" in spdx_ids or "BigScience-OpenRAIL-M" in spdx_ids
+
+    def test_bigscience_dataset_notice_detection(self, tmp_path):
+        """Test detection of BigScience dataset license notice."""
+        dataset_file = tmp_path / "dataset.json"
+        content = """
+{
+  "_license": "BigScience Open RAIL-M",
+  "_notice": "Dataset released under BigScience Open RAIL-M"
+}
+"""
+        dataset_file.write_text(content)
+
+        licenses = scan_for_license_headers(str(dataset_file))
+
+        assert any(lic.spdx_id in {"RAIL", "BigScience-OpenRAIL-M"} for lic in licenses)
+
     def test_no_license_detection(self, tmp_path):
         """Test file with no license information."""
         test_file = tmp_path / "no_license.py"
