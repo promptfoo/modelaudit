@@ -1006,28 +1006,43 @@ def scan_command(
     }
 
     # Output results based on format
-    if format == "text" and not output:
-        # Display summary in console
-        click.echo()
-        click.echo(click.style("=== Scan Summary ===", fg="cyan", bold=True))
-        click.echo(f"Files scanned: {aggregated_results['files_scanned']}")
-        click.echo(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
+    if format == "text":
+        # Use the same formatting logic for both console and file output
+        # Only difference is whether to use colors/styles
+        use_color = not output  # Use color only for console output
+
+        # Generate formatted text output
+        lines = []
+
+        # Header
+        lines.append("")
+        if use_color:
+            lines.append(click.style("=== Scan Summary ===", fg="cyan", bold=True))
+        else:
+            lines.append("=== Scan Summary ===")
+
+        # Basic metrics
+        lines.append(f"Files scanned: {aggregated_results['files_scanned']}")
+        lines.append(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
         issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
-        click.echo(f"Total issues: {len(issues_list)}")
+        lines.append(f"Total issues: {len(issues_list)}")
         if aggregated_results.get("parallel_scan"):
-            click.echo(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
-        click.echo(f"Duration: {aggregated_results['duration']:.1f}s")
+            lines.append(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
+        lines.append(f"Duration: {aggregated_results['duration']:.1f}s")
 
         # Show all issues in detail
-        issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
         issues = list(issues_list)
         # Filter out DEBUG severity issues when not in verbose mode
         if not verbose:
             issues = [issue for issue in issues if not isinstance(issue, dict) or issue.get("severity") != "debug"]
 
         if issues:
-            click.echo()
-            click.echo(click.style("=== Issues Found ===", fg="red", bold=True))
+            lines.append("")
+            if use_color:
+                lines.append(click.style("=== Issues Found ===", fg="red", bold=True))
+            else:
+                lines.append("=== Issues Found ===")
+
             for i, issue in enumerate(issues, 1):
                 severity = issue.get("severity", "unknown")
                 severity_colors = {
@@ -1039,17 +1054,31 @@ def scan_command(
                     "debug": "white",
                 }
                 color = severity_colors.get(severity, "white")
-                click.echo(
-                    f"\n{i}. {click.style(f'[{severity.upper()}]', fg=color, bold=True)} "
-                    f"{issue.get('message', 'Unknown issue')}"
-                )
+
+                if use_color:
+                    severity_text = click.style(f"[{severity.upper()}]", fg=color, bold=True)
+                else:
+                    severity_text = f"[{severity.upper()}]"
+
+                lines.append(f"\n{i}. {severity_text} {issue.get('message', 'Unknown issue')}")
+
                 if "file_path" in issue:
-                    click.echo(f"   File: {issue['file_path']}")
+                    lines.append(f"   File: {issue['file_path']}")
                 if "scanner" in issue:
-                    click.echo(f"   Scanner: {issue['scanner']}")
-                if "details" in issue and isinstance(issue["details"], dict):
+                    lines.append(f"   Scanner: {issue['scanner']}")
+                if verbose and "details" in issue and isinstance(issue["details"], dict):
                     for key, value in issue["details"].items():
-                        click.echo(f"   {key}: {value}")
+                        lines.append(f"   {key}: {value}")
+
+        # Output to console or file
+        if output:
+            # Write to file
+            output_text = "\n".join(lines)
+        else:
+            # Display on console
+            for line in lines:
+                click.echo(line)
+            return  # Don't continue to file writing logic
 
     else:
         # Convert results to the requested format
@@ -1072,32 +1101,6 @@ def scan_command(
             issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
             for issue in issues_list:
                 lines.append(json.dumps(issue))
-            output_text = "\n".join(lines)
-        else:  # text format with output file
-            lines = ["=== ModelAudit Scan Results ==="]
-            lines.append(f"Files scanned: {aggregated_results['files_scanned']}")
-            lines.append(f"Total size: {aggregated_results['bytes_scanned'] / (1024 * 1024):.1f} MB")
-            issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
-            lines.append(f"Total issues: {len(issues_list)}")
-            if aggregated_results.get("parallel_scan"):
-                lines.append(f"Parallel scan: Enabled ({aggregated_results.get('worker_count', 'N/A')} workers)")
-            lines.append(f"Duration: {aggregated_results['duration']:.1f}s")
-            lines.append("")
-
-            issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
-            if issues_list:
-                lines.append("=== Issues Found ===")
-                for i, issue in enumerate(issues_list, 1):
-                    lines.append(
-                        f"\n{i}. [{issue.get('severity', 'unknown').upper()}] {issue.get('message', 'Unknown issue')}"
-                    )
-                    if "file_path" in issue:
-                        lines.append(f"   File: {issue['file_path']}")
-                    if "scanner" in issue:
-                        lines.append(f"   Scanner: {issue['scanner']}")
-                    if "details" in issue and isinstance(issue["details"], dict):
-                        for key, value in issue["details"].items():
-                            lines.append(f"   {key}: {value}")
             output_text = "\n".join(lines)
 
         # Write to file if output path specified

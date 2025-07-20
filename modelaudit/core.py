@@ -286,11 +286,14 @@ def scan_model_directory_or_file(
                     results["start_time"] = original_start_time
                     results["path"] = original_path
 
-                    # Use timing from parallel scan (which includes actual scan time)
-                    # The parallel scanner already calculates finish_time and duration correctly
+                    # Recalculate duration based on original start time to maintain consistency
+                    # This ensures duration = finish_time - start_time
+                    if "finish_time" in parallel_results:
+                        results["duration"] = parallel_results["finish_time"] - original_start_time
+
                     logger.debug(
                         f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}, "
-                        f"duration={parallel_results.get('duration')}"
+                        f"duration={results.get('duration')}"
                     )
 
                     # Finalize results (add license warnings and determine has_errors)
