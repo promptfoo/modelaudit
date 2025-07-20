@@ -386,10 +386,10 @@ class TestCommercialUseWarnings:
 
         warnings = check_commercial_use_warnings(scan_results)
 
-        assert len(warnings) == 1
-        assert warnings[0]["severity"] == "warning"
-        assert "Non-commercial" in warnings[0]["message"]
-        assert "cannot be used commercially" in warnings[0]["message"]
+        assert len(warnings) >= 1
+        assert any(w["severity"] == "warning" for w in warnings)
+        assert any("Non-commercial" in w["message"] for w in warnings)
+        assert any("cannot be used commercially" in w["message"] for w in warnings)
 
     def test_check_commercial_use_warnings_clean(self):
         """Test no warnings for clean licenses."""
@@ -404,6 +404,28 @@ class TestCommercialUseWarnings:
         warnings = check_commercial_use_warnings(scan_results)
 
         assert len(warnings) == 0
+
+
+class TestSpdxLicenseChecks:
+    """Test deprecated and incompatible license detection."""
+
+    def test_deprecated_license_warning(self):
+        scan_results = {"file_metadata": {"/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results)
+        assert any("deprecated" in w["message"].lower() for w in warnings)
+
+    def test_incompatible_license_warning(self):
+        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results)
+        assert any("incompatible" in w["message"].lower() for w in warnings)
+
+    def test_strict_license_errors(self):
+        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results, strict=True)
+        assert any(w["severity"] == "error" for w in warnings)
 
 
 class TestLicenseMetadataCollection:

@@ -154,6 +154,11 @@ def cli() -> None:
     type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
     help="Directory to use for caching downloaded models (default: system temp directory)",
 )
+@click.option(
+    "--strict-license",
+    is_flag=True,
+    help="Fail scan when incompatible or deprecated licenses are detected",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -168,6 +173,7 @@ def scan_command(
     jfrog_api_token: Optional[str],
     jfrog_access_token: Optional[str],
     cache_dir: Optional[str],
+    strict_license: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -481,6 +487,7 @@ def scan_command(
                         timeout=timeout,
                         max_file_size=max_file_size,
                         max_total_size=max_total_size,
+                        strict_license=strict_license,
                         progress_callback=progress_callback,
                     )
 

@@ -9,7 +9,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
 try:
-    import yaml
+    import yaml  # type: ignore
 
     HAS_YAML = True
 except Exception:

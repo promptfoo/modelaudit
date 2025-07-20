@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-import requests
+import requests  # type: ignore
 from dotenv import load_dotenv
 
 # Load environment variables from .env file if it exists

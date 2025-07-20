@@ -26,7 +26,7 @@ except ImportError:
 
 # Try to import yaml, but handle the case where it's not installed
 try:
-    import yaml
+    import yaml  # type: ignore
 
     HAS_YAML = True
 except ImportError:

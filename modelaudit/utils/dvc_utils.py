@@ -13,7 +13,7 @@ def resolve_dvc_file(file_path: str) -> list[str]:
     - Validates DVC file structure
     """
     try:
-        import yaml
+        import yaml  # type: ignore
     except Exception:
         logger.debug("pyyaml not installed, cannot parse DVC file")
         return []
