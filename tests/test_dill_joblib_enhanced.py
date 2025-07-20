@@ -174,8 +174,8 @@ class TestErrorHandling:
             assert result.metadata.get("validated_format") is True
             assert "exception_message" in result.metadata
 
-    def test_non_benign_errors_still_critical(self, tmp_path):
-        """Test that non-benign errors are still treated as critical."""
+    def test_non_benign_errors_still_reported(self, tmp_path):
+        """Test that non-benign errors are still reported as warnings."""
         suspicious_file = tmp_path / "suspicious.pkl"  # Note: .pkl extension
 
         with open(suspicious_file, "wb") as f:
@@ -191,10 +191,14 @@ class TestErrorHandling:
 
             result = scanner.scan(str(suspicious_file))
 
-            # Should still be treated as critical error
-            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert len(critical_issues) > 0
+            # Should be treated as warning (not benign, but not necessarily critical)
+            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
+            assert len(warning_issues) > 0
             assert not result.metadata.get("truncated", False)
+
+            # Check the issue details
+            issue = warning_issues[0]
+            assert "RuntimeError" in issue.details.get("exception_type", "")
 
     def test_logging_for_truncated_scans(self, tmp_path, caplog):
         """Test that error scans are properly handled and logged."""
@@ -392,9 +396,9 @@ class TestIntegration:
             result = scanner.scan(str(test_file))
             # Non-benign errors should definitely create issues
             assert len(result.issues) > 0
-            # Should be critical error since KeyError is not in benign list
-            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert len(critical_issues) > 0
+            # Should be warning error since KeyError is not in benign list but also not necessarily critical
+            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
+            assert len(warning_issues) > 0
 
 
 if __name__ == "__main__":

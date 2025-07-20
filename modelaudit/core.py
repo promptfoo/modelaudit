@@ -7,13 +7,14 @@ from threading import Lock
 from typing import IO, Any, Callable, Optional, cast
 from unittest.mock import patch
 
+from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
-from modelaudit.utils import is_within_directory, resolve_dvc_file
+from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
@@ -70,6 +71,7 @@ def scan_model_directory_or_file(
     max_file_size: int = 0,
     max_total_size: int = 0,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    skip_file_types: bool = True,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -83,6 +85,7 @@ def scan_model_directory_or_file(
         max_total_size: Maximum total bytes to scan across all files
         progress_callback: Optional callback function to report progress
                           (message, percentage)
+        skip_file_types: Whether to skip non-model file types during directory scans
         **kwargs: Additional arguments to pass to scanners
 
     Returns:
@@ -110,6 +113,7 @@ def scan_model_directory_or_file(
         "max_file_size": max_file_size,
         "max_total_size": max_total_size,
         "timeout": timeout,
+        "skip_file_types": skip_file_types,
         **kwargs,
     }
 
@@ -188,10 +192,14 @@ def scan_model_directory_or_file(
                         )
                         continue
 
-                    # Skip non-model files early
-                    if _should_skip_file(file_path):
+                    # Skip non-model files early if filtering is enabled
+                    skip_file_types = config.get("skip_file_types", True)
+                    if skip_file_types and should_skip_file(file_path):
                         logger.debug(f"Skipping non-model file: {file_path}")
                         continue
+
+                    # Check for interrupts
+                    check_interrupted()
 
                     # Check timeout
                     if time.time() - start_time > timeout:
@@ -213,6 +221,9 @@ def scan_model_directory_or_file(
 
                     # Scan the file
                     try:
+                        # Check for interrupts before scanning each file
+                        check_interrupted()
+
                         # Use resolved_file path for actual scanning (handles symlinks)
                         file_result = scan_file(str(resolved_file), config)
                         # Use cast to help mypy understand the types
@@ -269,6 +280,14 @@ def scan_model_directory_or_file(
                         _add_error_asset_to_results(results, file_path)
                 if limit_reached:
                     break
+
+            # Final progress update for directory scan
+            if progress_callback and not limit_reached and total_files is not None and total_files > 0:
+                progress_callback(
+                    f"Completed scanning {processed_files} files",
+                    100.0,
+                )
+
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.info("Scan terminated early due to total size limit")
@@ -290,6 +309,9 @@ def scan_model_directory_or_file(
                     target_files = dvc_targets
 
             for _idx, target in enumerate(target_files):
+                # Check for interrupts
+                check_interrupted()
+
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
 
@@ -366,6 +388,16 @@ def scan_model_directory_or_file(
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)
 
+    except KeyboardInterrupt:
+        logger.info("Scan interrupted by user")
+        results["success"] = False
+        issue_dict = {
+            "message": "Scan interrupted by user",
+            "severity": IssueSeverity.INFO.value,
+            "details": {"interrupted": True},
+        }
+        issues_list = cast(list[dict[str, Any]], results["issues"])
+        issues_list.append(issue_dict)
     except Exception as e:
         logger.exception(f"Error during scan: {e!s}")
         results["success"] = False
@@ -454,7 +486,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning
+    - 2: Operational errors occurred during scanning or no files scanned
 
     Args:
         results: Dictionary with scan results
@@ -464,6 +496,11 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     """
     # Check for operational errors first (highest priority)
     if results.get("has_errors", False):
+        return 2
+
+    # Check if no files were scanned
+    files_scanned = results.get("files_scanned", 0)
+    if files_scanned == 0:
         return 2
 
     # Check for any security findings (warnings, errors, or info issues)
@@ -478,120 +515,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     return 0
 
 
-def _should_skip_file(path: str) -> bool:
-    """
-    Check if a file should be skipped based on its extension or name.
-
-    Args:
-        path: File path to check
-
-    Returns:
-        True if the file should be skipped
-    """
-    import os
-
-    filename = os.path.basename(path)
-    _, ext = os.path.splitext(filename)
-    ext = ext.lower()
-
-    # Skip common non-model file extensions
-    skip_extensions = {
-        # Documentation and text files
-        ".md",
-        ".txt",
-        ".rst",
-        ".doc",
-        ".docx",
-        ".pdf",
-        # Source code files
-        ".py",
-        ".js",
-        ".ts",
-        ".java",
-        ".cpp",
-        ".c",
-        ".h",
-        ".go",
-        ".rs",
-        # Web files
-        ".html",
-        ".css",
-        ".scss",
-        ".sass",
-        ".less",
-        # Configuration files (but keep .json, .yaml, .yml as they can be model configs)
-        ".ini",
-        ".cfg",
-        ".conf",
-        ".toml",
-        # Build and package files
-        ".lock",
-        ".log",
-        ".pid",
-        # Version control
-        ".gitignore",
-        ".gitattributes",
-        ".gitkeep",
-        # IDE files
-        ".pyc",
-        ".pyo",
-        ".pyd",
-        ".so",
-        ".dylib",
-        ".dll",
-        # Archives (but keep .zip as it can contain models)
-        ".tar",
-        ".gz",
-        ".bz2",
-        ".xz",
-        ".7z",
-        ".rar",
-        # Media files
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".svg",
-        ".ico",
-        ".mp3",
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".wmv",
-        ".flv",
-        # Temporary files
-        ".tmp",
-        ".temp",
-        ".swp",
-        ".bak",
-        "~",
-    }
-
-    if ext in skip_extensions:
-        return True
-
-    # Skip hidden files (starting with .) except for specific model extensions
-    if filename.startswith(".") and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt"}:
-        return True
-
-    # Skip specific filenames
-    skip_filenames = {
-        "LICENSE",
-        "README",
-        "CHANGELOG",
-        "AUTHORS",
-        "CONTRIBUTORS",
-        "Makefile",
-        "requirements.txt",
-        "setup.py",
-        "setup.cfg",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-    }
-
-    return filename in skip_filenames
+# _should_skip_file has been moved to utils.file_filter module
 
 
 def _is_huggingface_cache_file(path: str) -> bool:

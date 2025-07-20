@@ -175,9 +175,9 @@ def test_assets_directory_scan_multiple_files(tmp_path: Path) -> None:
     with open(pickle_file, "wb") as f:
         pickle.dump({"state": "saved"}, f)
 
-    # Text file (should be handled by unknown scanner)
-    text_file = model_dir / "README.txt"
-    text_file.write_text("Model documentation")
+    # Binary file with unknown extension (should be handled by unknown scanner)
+    unknown_file = model_dir / "data.dat"
+    unknown_file.write_bytes(b"Binary data content")
 
     results = scan_model_directory_or_file(str(model_dir))
 
@@ -192,7 +192,7 @@ def test_assets_directory_scan_multiple_files(tmp_path: Path) -> None:
 
     # Verify each file is represented
     asset_paths = {Path(asset["path"]).name for asset in results["assets"]}
-    expected_files = {"weights.safetensors", "config.json", "state.pkl", "README.txt"}
+    expected_files = {"weights.safetensors", "config.json", "state.pkl", "data.dat"}
     assert asset_paths == expected_files
 
 
