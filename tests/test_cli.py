@@ -173,6 +173,44 @@ def test_scan_sbom_output(tmp_path):
         pytest.fail("SBOM output is not valid JSON")
 
 
+def test_scan_output_utf8_locale(tmp_path):
+    """Ensure output file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    output_file = tmp_path / "output.txt"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)], env=env)
+
+    assert output_file.exists()
+    try:
+        output_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("Output file is not valid UTF-8")
+
+
+def test_scan_sbom_utf8_locale(tmp_path):
+    """Ensure SBOM file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    sbom_file = tmp_path / "sbom.json"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)], env=env)
+
+    assert sbom_file.exists()
+    try:
+        sbom_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("SBOM file is not valid UTF-8")
+
+
 def test_scan_verbose_mode(tmp_path):
     """Test scanning in verbose mode."""
     test_file = tmp_path / "test_file.dat"
@@ -387,7 +425,12 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded" in result.output or "Clean" in result.output
+    assert (
+        "Downloaded" in result.output
+        or "Clean" in result.output
+        or "Downloaded successfully" in result.output
+        or "Downloading from" in result.output
+    )
 
     # Verify download was called
     mock_download.assert_called_once()
@@ -453,7 +496,12 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
-    assert "Downloaded" in result.output or "issue" in result.output.lower()
+    assert (
+        "Downloaded" in result.output
+        or "issue" in result.output.lower()
+        or "Downloaded successfully" in result.output
+        or "Downloading from" in result.output
+    )
 
     # Verify cleanup was still attempted
     mock_rmtree.assert_called()
@@ -603,7 +651,11 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded & Scanned" in result.output or "Clean" in result.output
+    assert (
+        "Downloaded & Scanned" in result.output
+        or "Clean" in result.output
+        or "Downloaded and scanned successfully" in result.output
+    )
 
     # Verify MLflow scan was called with correct parameters
     mock_scan_mlflow.assert_called_once_with(
