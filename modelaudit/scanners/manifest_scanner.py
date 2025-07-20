@@ -302,7 +302,7 @@ class ManifestScanner(BaseScanner):
         # STEP 1: Detect ML context for smart filtering
         ml_context = self._detect_ml_context(content)
 
-        def check_dict(d, prefix=""):
+        def check_dict(d, prefix: str = "") -> None:
             if not isinstance(d, dict):
                 return
 
@@ -350,6 +350,7 @@ class ManifestScanner(BaseScanner):
                     value,
                     matches,
                     ml_context,
+                    full_key,
                 ):
                     # STEP 5: Report with context-aware severity
                     severity = self._get_context_aware_severity(matches, ml_context)
@@ -483,6 +484,27 @@ class ManifestScanner(BaseScanner):
             "architectures",
         ]
 
+        vision_indicators = [
+            "image_size",
+            "img_size",
+            "num_channels",
+            "channels",
+            "resolution",
+            "input_shape",
+            "image_mean",
+            "image_std",
+            "vision_config",
+        ]
+
+        classification_keys = [
+            "imagenet_classes",
+            "labels",
+            "class_names",
+            "class_labels",
+            "label_map",
+            "label_names",
+        ]
+
         def check_indicators(d):
             if not isinstance(d, dict):
                 return
@@ -507,6 +529,18 @@ class ManifestScanner(BaseScanner):
                     indicators["is_model_config"] = True
                     indicators["confidence"] += 1
 
+                # Vision model indicators
+                if any(indicator in key_str for indicator in vision_indicators) or any(
+                    indicator in val_str for indicator in vision_indicators
+                ):
+                    indicators["model_type"] = "vision"
+                    indicators["confidence"] += 1
+
+                # Classification label keys
+                if key_str in classification_keys:
+                    indicators["model_type"] = "vision"
+                    indicators["confidence"] += 1
+
                 # Recursive check
                 if isinstance(val, dict):
                     check_indicators(val)
@@ -528,9 +562,11 @@ class ManifestScanner(BaseScanner):
         value: Any,
         matches: list[str],
         ml_context: dict,
+        full_key: str = "",
     ) -> bool:
         """Context-aware ignore logic combining smart patterns with value analysis"""
         key_lower = key.lower()
+        full_key_lower = full_key.lower() if full_key else key_lower
 
         # Special case for HuggingFace patterns - check this FIRST before other logic
         if ml_context.get("framework") == "huggingface" or "_name_or_path" in key_lower:
@@ -681,6 +717,22 @@ class ManifestScanner(BaseScanner):
                 "vision_config.torchscript",
             ]
             if key_lower in clip_patterns:
+                return True
+
+        # Classification labels for vision models can contain words like "shell"
+        # that match execution patterns. Ignore these when the context indicates
+        # a vision model.
+        if "execution" in matches and ml_context.get("model_type") == "vision":
+            label_container_keys = {
+                "imagenet_classes",
+                "labels",
+                "class_names",
+                "class_labels",
+                "label_map",
+                "label_names",
+            }
+            parts = full_key_lower.split(".")
+            if key_lower in label_container_keys or any(part in label_container_keys for part in parts[:-1]):
                 return True
 
         return False
