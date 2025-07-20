@@ -253,6 +253,10 @@ def scan_model_directory_or_file(
         if os.path.isdir(path):
             # Use parallel scanning if enabled and we have the parallel_directory module
             logger.debug(f"Directory scan: parallel={parallel}, config keys={list(config.keys())}")
+            # Disable parallel scanning if max_total_size is set (not supported in parallel mode)
+            if max_total_size > 0:
+                logger.debug("Disabling parallel scanning due to max_total_size constraint")
+                parallel = False
             if parallel:
                 try:
                     from modelaudit.parallel_directory import scan_directory_parallel

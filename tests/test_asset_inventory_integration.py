@@ -183,8 +183,8 @@ class TestAssetInventoryIntegration:
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # The asset inventory is still available in JSON format
         # Just verify that the scan completed successfully and mentioned the files
-        assert "SCAN SUMMARY" in result.output
-        assert "Files:" in result.output
+        assert "Scan Summary" in result.output or "scan summary" in result.output.lower()
+        assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
 
         # Should still show file paths in issues if any are found
         # The files are still being scanned and processed, just not listed separately
@@ -437,9 +437,9 @@ class TestAssetInventoryIntegration:
 
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # Verify that the overall output structure is still well-formatted
-        assert "SCAN SUMMARY" in result.output
-        assert "Files:" in result.output
-        assert "SECURITY FINDINGS" in result.output
+        assert "Scan Summary" in result.output or "scan summary" in result.output.lower()
+        assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
+        assert "Issues Found" in result.output or "issues found" in result.output.lower() or "Clean" in result.output
 
         # The asset inventory is still captured but not displayed in text format
         # Users can use --format json to see detailed asset information

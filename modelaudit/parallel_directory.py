@@ -15,8 +15,11 @@ from modelaudit.utils import is_within_directory
 logger = logging.getLogger("modelaudit.parallel_directory")
 
 
-def _should_skip_file(file_path: str) -> bool:
+def _should_skip_file(file_path: str, skip_file_types: bool = True) -> bool:
     """Check if a file should be skipped based on common non-model file patterns."""
+    if not skip_file_types:
+        return False
+
     # Get file extension
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
@@ -98,6 +101,8 @@ def _should_skip_file(file_path: str) -> bool:
         ".idea",
         ".vscode",
         ".project",
+        # DVC files (handled separately)
+        ".dvc",
         ".classpath",
     }
 
@@ -160,8 +165,9 @@ def scan_directory_parallel(
         for file in files:
             file_path = os.path.join(root, file)
 
-            # Skip non-model files
-            if _should_skip_file(file_path):
+            # Skip non-model files based on config
+            skip_file_types = config.get("skip_file_types", True)
+            if _should_skip_file(file_path, skip_file_types):
                 continue
 
             # Skip HuggingFace cache files

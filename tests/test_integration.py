@@ -69,8 +69,8 @@ def test_cli_scan_directory(temp_model_dir):
     assert str(temp_model_dir) in result.output
 
     # Should mention the number of files scanned
-    # Check for the new format - should contain "Files:" in the scan summary
-    assert "Files:" in result.output
+    # Check for the new format - should contain "Files scanned:" in the scan summary
+    assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
 
 
 def test_cli_json_output_parsing(temp_model_dir):

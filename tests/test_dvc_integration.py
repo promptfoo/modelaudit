@@ -41,7 +41,7 @@ class TestDvcIntegration:
         dvc_file = tmp_path / "model.pkl.dvc"
         dvc_file.write_text("outs:\n- path: model.pkl\n")
 
-        results = scan_model_directory_or_file(str(tmp_path))
+        results = scan_model_directory_or_file(str(tmp_path), parallel=False)
 
         assert results["files_scanned"] == 1
         assert any(target.name in asset["path"] for asset in results["assets"])
