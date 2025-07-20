@@ -11,11 +11,11 @@ from modelaudit.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
-    from defusedxml import ElementTree as DefusedET  # type: ignore
+    from defusedxml import ElementTree as DefusedET
 
     HAS_DEFUSEDXML = True
 except ImportError:  # pragma: no cover - optional dependency
-    import xml.etree.ElementTree as DefusedET  # type: ignore
+    import xml.etree.ElementTree as DefusedET
 
     HAS_DEFUSEDXML = False
 

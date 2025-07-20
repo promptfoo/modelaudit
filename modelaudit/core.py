@@ -449,7 +449,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning
+    - 2: Operational errors occurred during scanning or no files scanned
 
     Args:
         results: Dictionary with scan results
@@ -459,6 +459,11 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     """
     # Check for operational errors first (highest priority)
     if results.get("has_errors", False):
+        return 2
+
+    # Check if no files were scanned
+    files_scanned = results.get("files_scanned", 0)
+    if files_scanned == 0:
         return 2
 
     # Check for any security findings (warnings, errors, or info issues)
@@ -617,14 +622,14 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
-        scanner = preferred_scanner(config=config)  # type: ignore[abstract]
+        scanner = preferred_scanner(config=config)
         result = scanner.scan(path)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
         scanner_class = _registry.get_scanner_for_path(path)
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)  # type: ignore[abstract]
+            scanner = scanner_class(config=config)
             result = scanner.scan(path)
         else:
             format_ = header_format
