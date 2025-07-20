@@ -65,7 +65,7 @@ class TestCacheDirOption:
             use_cache=True,
             show_progress=False,
             selective=True,
-            stream_analyze=False
+            stream_analyze=False,
         )
         assert result.exit_code == 0
 
