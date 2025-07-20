@@ -792,30 +792,27 @@ def scan_command(
             click.echo()
             click.echo(click.style("=== Issues Found ===", fg="red", bold=True))
             for i, issue in enumerate(issues, 1):
-                if isinstance(issue, dict):
-                    severity = issue.get("severity", "unknown")
-                    severity_colors = {
-                        "critical": "red",
-                        "high": "red",
-                        "medium": "yellow",
-                        "low": "blue",
-                        "info": "green",
-                        "debug": "white",
-                    }
-                    color = severity_colors.get(severity, "white")
-                    click.echo(
-                        f"\n{i}. {click.style(f'[{severity.upper()}]', fg=color, bold=True)} "
-                        f"{issue.get('message', 'Unknown issue')}"
-                    )
-                    if "file_path" in issue:
-                        click.echo(f"   File: {issue['file_path']}")
-                    if "scanner" in issue:
-                        click.echo(f"   Scanner: {issue['scanner']}")
-                    if "details" in issue and isinstance(issue["details"], dict):
-                        for key, value in issue["details"].items():
-                            click.echo(f"   {key}: {value}")
-                else:
-                    click.echo(f"\n{i}. {issue}")
+                severity = issue.get("severity", "unknown")
+                severity_colors = {
+                    "critical": "red",
+                    "high": "red",
+                    "medium": "yellow",
+                    "low": "blue",
+                    "info": "green",
+                    "debug": "white",
+                }
+                color = severity_colors.get(severity, "white")
+                click.echo(
+                    f"\n{i}. {click.style(f'[{severity.upper()}]', fg=color, bold=True)} "
+                    f"{issue.get('message', 'Unknown issue')}"
+                )
+                if "file_path" in issue:
+                    click.echo(f"   File: {issue['file_path']}")
+                if "scanner" in issue:
+                    click.echo(f"   Scanner: {issue['scanner']}")
+                if "details" in issue and isinstance(issue["details"], dict):
+                    for key, value in issue["details"].items():
+                        click.echo(f"   {key}: {value}")
 
     else:
         # Convert results to the requested format
@@ -847,20 +844,16 @@ def scan_command(
             if issues_list:
                 lines.append("=== Issues Found ===")
                 for i, issue in enumerate(issues_list, 1):
-                    if isinstance(issue, dict):
-                        lines.append(
-                            f"\n{i}. [{issue.get('severity', 'unknown').upper()}] "
-                            f"{issue.get('message', 'Unknown issue')}"
-                        )
-                        if "file_path" in issue:
-                            lines.append(f"   File: {issue['file_path']}")
-                        if "scanner" in issue:
-                            lines.append(f"   Scanner: {issue['scanner']}")
-                        if "details" in issue and isinstance(issue["details"], dict):
-                            for key, value in issue["details"].items():
-                                lines.append(f"   {key}: {value}")
-                    else:
-                        lines.append(f"\n{i}. {issue}")
+                    lines.append(
+                        f"\n{i}. [{issue.get('severity', 'unknown').upper()}] {issue.get('message', 'Unknown issue')}"
+                    )
+                    if "file_path" in issue:
+                        lines.append(f"   File: {issue['file_path']}")
+                    if "scanner" in issue:
+                        lines.append(f"   Scanner: {issue['scanner']}")
+                    if "details" in issue and isinstance(issue["details"], dict):
+                        for key, value in issue["details"].items():
+                            lines.append(f"   {key}: {value}")
             output_text = "\n".join(lines)
 
         # Write to file if output path specified

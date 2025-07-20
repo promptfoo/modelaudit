@@ -13,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from modelaudit.interrupt_handler import is_interrupted
 from modelaudit.scanners.base import IssueSeverity
 
 logger = logging.getLogger("modelaudit.parallel_scanner")
@@ -124,7 +125,22 @@ class ParallelScanner:
             timeout_per_file: Timeout in seconds for each file scan
             progress_callback: Optional callback for progress updates
         """
-        self.max_workers = max_workers or multiprocessing.cpu_count()
+        # Validate and set max_workers
+        cpu_count = multiprocessing.cpu_count()
+        if max_workers is None:
+            self.max_workers = cpu_count
+        else:
+            # Ensure max_workers is within reasonable bounds
+            if max_workers < 1:
+                logger.warning(f"max_workers ({max_workers}) is less than 1, setting to 1")
+                self.max_workers = 1
+            elif max_workers > cpu_count * 4:
+                # Allow oversubscription but warn if excessive
+                logger.warning(f"max_workers ({max_workers}) is more than 4x CPU count ({cpu_count})")
+                self.max_workers = max_workers
+            else:
+                self.max_workers = max_workers
+
         self.timeout_per_file = timeout_per_file
         self.progress_callback = progress_callback
         self._progress: Optional[ParallelScanProgress] = None
@@ -170,10 +186,33 @@ class ParallelScanner:
             future_to_work = {executor.submit(_scan_file_worker, item): item for item in work_items}
 
             # Process results as they complete
-            # Use a reasonable overall timeout instead of cumulative per-file timeouts
-            # Add 60 seconds to the per-file timeout as a buffer for overall completion
-            overall_timeout = self.timeout_per_file + 60
+            # Calculate a reasonable overall timeout based on number of files and workers
+            # Allow at least timeout_per_file for each batch of files that can run in parallel
+            # Add 20% buffer for overhead
+            batches = (len(work_items) + self.max_workers - 1) // self.max_workers
+            overall_timeout = int(batches * self.timeout_per_file * 1.2)
+            logger.debug(
+                f"Calculated overall timeout: {overall_timeout}s for {len(work_items)} files "
+                f"with {self.max_workers} workers"
+            )
+
             for future in as_completed(future_to_work, timeout=overall_timeout):
+                # Check for interrupt
+                if is_interrupted():
+                    logger.info("Parallel scan interrupted by user")
+                    # Cancel remaining futures
+                    for f in future_to_work:
+                        f.cancel()
+                    results["issues"].append(
+                        {
+                            "message": "Scan interrupted by user",
+                            "severity": IssueSeverity.INFO.value,
+                            "location": "",
+                            "details": {"interrupted": True},
+                        }
+                    )
+                    break
+
                 work_item = future_to_work[future]
 
                 try:
@@ -209,6 +248,19 @@ class ParallelScanner:
         results["start_time"] = time.time()
 
         for i, file_path in enumerate(file_paths):
+            # Check for interrupt
+            if is_interrupted():
+                logger.info("Sequential scan interrupted by user")
+                results["issues"].append(
+                    {
+                        "message": "Scan interrupted by user",
+                        "severity": IssueSeverity.INFO.value,
+                        "location": "",
+                        "details": {"interrupted": True},
+                    }
+                )
+                break
+
             if self.progress_callback:
                 self.progress_callback(
                     f"Scanning file {i + 1}/{len(file_paths)}: {os.path.basename(file_path)}",
