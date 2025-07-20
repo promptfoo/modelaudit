@@ -74,7 +74,7 @@ def test_interrupt_during_scan():
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Give it time to start scanning
-        time.sleep(1.0)  # Increased delay
+        time.sleep(2.0)  # Increased delay to ensure scanning has started
 
         # Send interrupt
         process.send_signal(signal.SIGINT)
