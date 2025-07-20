@@ -176,13 +176,14 @@ class TestRealJoblibFiles:
 
         # Joblib with numpy may use custom protocols/opcodes that aren't standard pickle
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
 
         # If bytes weren't scanned, it means the format wasn't recognized as standard pickle
         if result.bytes_scanned == 0:
-            # Should have issues about unknown format/opcodes
-            assert len(critical_issues) > 0, "Should report issues when format isn't recognized"
-            opcode_issues = [i for i in critical_issues if "opcode" in str(i.message).lower()]
-            assert len(opcode_issues) > 0, "Should report opcode issues for numpy joblib files"
+            # Should have issues about unknown format/opcodes (now as warnings)
+            assert len(warning_issues) > 0, "Should report issues when format isn't recognized"
+            opcode_issues = [i for i in warning_issues if "opcode" in str(i.message).lower() or "format" in str(i.message).lower()]
+            assert len(opcode_issues) > 0, "Should report opcode/format issues for numpy joblib files"
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
