@@ -12,9 +12,9 @@ ModelAudit is a security scanner for AI/ML model files that detects potential se
 # Setup - Dependency Profiles
 rye sync --features all        # Install all dependencies (recommended for development)
 rye sync --features all-ci     # All dependencies except platform-specific (for CI)
-rye sync                       # Minimal dependencies
+rye sync                       # Minimal dependencies (pickle, numpy, zip)
 rye sync --features tensorflow # Specific framework support
-rye sync --features numpy1     # NumPy 1.x compatibility mode
+rye sync --features numpy1     # NumPy 1.x compatibility mode (when ML frameworks conflict)
 
 # Running the scanner (scan is the default command)
 rye run modelaudit model.pkl
@@ -37,10 +37,11 @@ npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, 
 
 # CI Checks - ALWAYS run these before committing:
 # 1. rye run ruff format modelaudit/ tests/
-# 2. rye run ruff check --fix modelaudit/ tests/
-# 3. rye run mypy modelaudit/
-# 4. rye run pytest
-# 5. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+# 2. rye run ruff check modelaudit/ tests/  # IMPORTANT: Check without --fix first!
+# 3. rye run ruff check --fix modelaudit/ tests/  # Then fix any issues
+# 4. rye run mypy modelaudit/
+# 5. rye run pytest -n auto -m "not slow and not integration"  # Fast tests first
+# 6. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
 ```
 
 ## Testing Requirements
@@ -121,6 +122,15 @@ rye build
 # Publishing (maintainers only)
 rye publish
 ```
+
+## Dependency Philosophy
+
+ModelAudit uses optional dependencies to keep the base installation lightweight while supporting many ML frameworks:
+
+- **Base install**: Only includes core dependencies (pickle, numpy, zip scanning)
+- **Feature-specific installs**: Add only what you need (e.g., `[tensorflow]`, `[pytorch]`)
+- **Graceful degradation**: Missing dependencies don't break the tool, just disable specific scanners
+- **Clear guidance**: Error messages tell you exactly what to install
 
 ## Docker Support
 
