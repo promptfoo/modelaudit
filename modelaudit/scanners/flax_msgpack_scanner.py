@@ -652,6 +652,10 @@ class FlaxMsgpackScanner(BaseScanner):
         expected_keys = {"params", "state", "opt_state", "model_state", "step", "epoch"}
         found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
 
+        # Also check for common transformer model patterns (BERT, GPT, T5, etc.)
+        transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
+        has_transformer_keys = any(key in found_keys for key in transformer_keys)
+
         has_standard_flax_keys = any(key in found_keys for key in expected_keys)
 
         if has_standard_flax_keys:
@@ -663,6 +667,21 @@ class FlaxMsgpackScanner(BaseScanner):
                 details={
                     "found_standard_keys": [k for k in expected_keys if k in found_keys],
                     "model_type": "standard_flax",
+                },
+            )
+            return
+
+        # Check if this is a transformer model (BERT, GPT, T5, etc.)
+        if has_transformer_keys:
+            # This looks like a transformer model checkpoint
+            result.add_issue(
+                "Transformer model format detected (BERT/GPT/T5 style)",
+                severity=IssueSeverity.DEBUG,
+                location="root",
+                details={
+                    "found_transformer_keys": [k for k in transformer_keys if k in found_keys],
+                    "model_type": "transformer_model",
+                    "all_keys": list(found_keys)[:20],  # Show first 20 keys
                 },
             )
             return

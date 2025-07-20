@@ -112,18 +112,18 @@ class TestModelDownload:
         assert result == Path(mock_path)
 
     @patch("huggingface_hub.snapshot_download")
-    def test_download_model_with_cache_dir(self, mock_snapshot_download):
+    def test_download_model_with_cache_dir(self, mock_snapshot_download, tmp_path):
         """Test model download with custom cache directory."""
-        mock_path = "/cache/test/model"
+        mock_path = str(tmp_path / "test" / "model")
         mock_snapshot_download.return_value = mock_path
 
-        cache_dir = Path("/custom/cache")
+        cache_dir = tmp_path / "custom_cache"
         download_model("hf://test/model", cache_dir=cache_dir)
 
         # Verify cache directory was used
         call_args = mock_snapshot_download.call_args
-        assert call_args[1]["cache_dir"] == str(cache_dir / "test" / "model")
-        assert call_args[1]["local_dir"] == str(cache_dir / "test" / "model")
+        assert call_args[1]["cache_dir"] == str(cache_dir / "huggingface" / "test" / "model")
+        assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
 
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")

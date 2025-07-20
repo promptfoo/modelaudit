@@ -75,7 +75,7 @@ def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None
     assets_list.append({"path": file_path, "type": "error"})
 
 
-def _finalize_scan_results(results: dict[str, Any]) -> None:
+def _finalize_scan_results(results: dict[str, Any], config: Optional[dict[str, Any]] = None) -> None:
     """
     Finalize scan results by adding license warnings and determining has_errors flag.
 
@@ -85,10 +85,13 @@ def _finalize_scan_results(results: dict[str, Any]) -> None:
 
     Args:
         results: The scan results dictionary to finalize (modified in-place)
+        config: Optional configuration dict containing strict_license flag
     """
     # Add license warnings if any
     try:
-        license_warnings = check_commercial_use_warnings(results)
+        if config is None:
+            config = {}
+        license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
         issues_list = cast(list[dict[str, Any]], results["issues"])
         for warning in license_warnings:
             # Convert license warnings to issues
@@ -137,6 +140,7 @@ def scan_model_directory_or_file(
     timeout: int = 300,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    strict_license: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     parallel: bool = True,
     max_workers: Optional[int] = None,
@@ -151,6 +155,7 @@ def scan_model_directory_or_file(
         timeout: Scan timeout in seconds
         max_file_size: Maximum file size to scan in bytes
         max_total_size: Maximum total bytes to scan across all files
+        strict_license: Fail scan if incompatible licenses are found
         progress_callback: Optional callback function to report progress
                           (message, percentage)
         parallel: Enable parallel scanning for directories
@@ -182,6 +187,7 @@ def scan_model_directory_or_file(
         "max_file_size": max_file_size,
         "max_total_size": max_total_size,
         "timeout": timeout,
+        "strict_license": strict_license,
         **kwargs,
     }
 
@@ -288,7 +294,7 @@ def scan_model_directory_or_file(
                     )
 
                     # Finalize results (add license warnings and determine has_errors)
-                    _finalize_scan_results(results)
+                    _finalize_scan_results(results, config)
 
                     return results
 
@@ -582,7 +588,7 @@ def scan_model_directory_or_file(
     )
 
     # Finalize results (add license warnings and determine has_errors)
-    _finalize_scan_results(results)
+    _finalize_scan_results(results, config)
 
     return results
 
@@ -728,9 +734,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         )
         logger.warning(discrepancy_msg)
     elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
-        # Don't warn about common PyTorch .bin files that are ZIP format internally
-        # This is expected behavior for torch.save()
-        if not (ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"):
+        # Don't warn about common PyTorch .bin files that are ZIP or pickle format internally
+        # This is expected behavior for torch.save() and HuggingFace models
+        if not (
+            (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
+            or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
+        ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.warning(discrepancy_msg)
 

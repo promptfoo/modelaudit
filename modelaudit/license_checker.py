@@ -1,8 +1,11 @@
+import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+import requests
 
 
 @dataclass
@@ -124,6 +127,36 @@ UNLICENSED_INDICATORS = [
     r"confidential",
     r"internal\s+use\s+only",
 ]
+
+# SPDX license metadata
+SPDX_LICENSE_PATH = Path(__file__).with_name("spdx_licenses.json")
+SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
+_SPDX_LICENSES: Optional[dict[str, Any]] = None
+
+
+def load_spdx_license_data(download: bool = False) -> dict[str, Any]:
+    """Load SPDX license metadata from bundled JSON or download if requested."""
+    global _SPDX_LICENSES
+    if _SPDX_LICENSES is not None and not download:
+        return _SPDX_LICENSES
+
+    if not SPDX_LICENSE_PATH.exists() or download:
+        try:
+            response = requests.get(SPDX_LICENSE_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            SPDX_LICENSE_PATH.write_text(json.dumps(data))
+        except Exception:
+            data = {}
+    else:
+        try:
+            data = json.loads(SPDX_LICENSE_PATH.read_text())
+        except Exception:
+            data = {}
+
+    _SPDX_LICENSES = {lic["licenseId"]: lic for lic in data.get("licenses", [])}
+    return _SPDX_LICENSES
+
 
 # File extensions that commonly contain license information
 LICENSE_FILES = {
@@ -430,12 +463,76 @@ def detect_agpl_components(scan_results: dict[str, Any]) -> list[str]:
     return agpl_files
 
 
-def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str, Any]]:
+def _get_spdx_info(spdx_id: str) -> Optional[dict[str, Any]]:
+    """Return SPDX metadata for a license ID if available."""
+    licenses = load_spdx_license_data()
+    return licenses.get(spdx_id)
+
+
+def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False) -> list[dict[str, Any]]:
+    """Check for deprecated or incompatible licenses using SPDX data."""
+    warnings: list[dict[str, Any]] = []
+    file_metadata = scan_results.get("file_metadata", {})
+    deprecated_files: list[str] = []
+    incompatible_files: list[str] = []
+
+    for file_path, metadata in file_metadata.items():
+        for license_info in metadata.get("license_info", []):
+            spdx_id = None
+            if isinstance(license_info, dict):
+                spdx_id = license_info.get("spdx_id")
+            elif hasattr(license_info, "spdx_id"):
+                spdx_id = license_info.spdx_id
+
+            if not spdx_id:
+                continue
+
+            info = _get_spdx_info(spdx_id)
+            if not info:
+                continue
+
+            if info.get("isDeprecatedLicenseId"):
+                deprecated_files.append(file_path)
+
+            if not info.get("isOsiApproved", True):
+                incompatible_files.append(file_path)
+
+    if deprecated_files:
+        warnings.append(
+            {
+                "type": "license_warning",
+                "severity": "error" if strict else "warning",
+                "message": (f"Deprecated licenses detected ({len(deprecated_files)} files)."),
+                "details": {
+                    "files": deprecated_files[:5],
+                    "total_count": len(deprecated_files),
+                },
+            }
+        )
+
+    if incompatible_files:
+        warnings.append(
+            {
+                "type": "license_warning",
+                "severity": "error" if strict else "warning",
+                "message": (f"Incompatible licenses detected ({len(incompatible_files)} files)."),
+                "details": {
+                    "files": incompatible_files[:5],
+                    "total_count": len(incompatible_files),
+                },
+            }
+        )
+
+    return warnings
+
+
+def check_commercial_use_warnings(scan_results: dict[str, Any], *, strict: bool = False) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 
     Args:
         scan_results: Scan results dictionary
+        strict: Treat incompatible licenses as errors
 
     Returns:
         List of warning dictionaries
@@ -555,6 +652,9 @@ def check_commercial_use_warnings(scan_results: dict[str, Any]) -> list[dict[str
                 },
             },
         )
+
+    # Append SPDX license warnings
+    warnings.extend(check_spdx_license_issues(scan_results, strict=strict))
 
     return warnings
 

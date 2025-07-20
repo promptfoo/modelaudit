@@ -421,7 +421,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "https://huggingface.co/test/model"])
 
     # Should succeed
     assert result.exit_code == 0
@@ -440,7 +440,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     call_args = mock_scan.call_args
     assert call_args[0][0] == str(test_model_dir)
 
-    # Verify cleanup was attempted
+    # Verify cleanup was attempted (only when not using cache)
     mock_rmtree.assert_called()
 
 
@@ -492,7 +492,7 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "hf://test/malicious-model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/malicious-model"])
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
