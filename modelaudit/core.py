@@ -712,9 +712,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         )
         logger.warning(discrepancy_msg)
     elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
-        # Don't warn about common PyTorch .bin files that are ZIP format internally
-        # This is expected behavior for torch.save()
-        if not (ext_format == "pytorch_binary" and header_format == "zip" and ext == ".bin"):
+        # Don't warn about common PyTorch .bin files that are ZIP or pickle format internally
+        # This is expected behavior for torch.save() and HuggingFace models
+        if not (
+            (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
+            or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
+        ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.warning(discrepancy_msg)
 
