@@ -32,7 +32,7 @@ def _component_for_file(
     for issue in issues:
         if issue.get("location") == path:
             severity = issue.get("severity")
-            if severity == "error":
+            if severity == "critical":
                 score += 5
             elif severity == "warning":
                 score += 2
