@@ -122,17 +122,24 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
     bom = Bom()
     issues = results.get("issues", [])
     file_meta: dict[str, Any] = results.get("file_metadata", {})
+    
+    # Create a normalized path lookup for metadata
+    normalized_meta: dict[str, Any] = {}
+    for path, meta in file_meta.items():
+        # Use realpath to resolve symlinks
+        normalized_meta[os.path.realpath(path)] = meta
 
     for input_path in paths:
         if os.path.isdir(input_path):
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
-                    meta = file_meta.get(fp, {})
+                    # Try both the original path and the normalized path
+                    meta = file_meta.get(fp, {}) or normalized_meta.get(os.path.realpath(fp), {})
                     component = _component_for_file(fp, meta, issues)
                     bom.components.add(component)
         else:
-            meta = file_meta.get(input_path, {})
+            meta = file_meta.get(input_path, {}) or normalized_meta.get(os.path.realpath(input_path), {})
             component = _component_for_file(input_path, meta, issues)
             bom.components.add(component)
 
