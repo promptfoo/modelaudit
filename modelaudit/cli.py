@@ -187,6 +187,11 @@ def cli() -> None:
     help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
 )
 @click.option(
+    "--strict-license",
+    is_flag=True,
+    help="Fail scan when incompatible or deprecated licenses are detected",
+)
+@click.option(
     "--preview",
     is_flag=True,
     help="Preview what would be downloaded without actually downloading",
@@ -217,6 +222,7 @@ def scan_command(
     max_download_size: Optional[str],
     cache: bool,
     cache_dir: Optional[str],
+    strict_license: bool,
     preview: bool,
     selective: bool,
     stream: bool,
@@ -652,6 +658,7 @@ def scan_command(
                         timeout=timeout,
                         max_file_size=max_file_size,
                         max_total_size=max_total_size,
+                        strict_license=strict_license,
                         progress_callback=progress_callback,
                     )
 
