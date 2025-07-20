@@ -128,7 +128,7 @@ def should_skip_file(
         return True
 
     # Skip hidden files (starting with .) except for specific model extensions
-    if skip_hidden and filename.startswith(".") and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt"}:
+    if skip_hidden and filename.startswith(".") and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt", ".npz", ".dvc", ".safetensors"}:
         return True
 
     # Skip specific filenames
