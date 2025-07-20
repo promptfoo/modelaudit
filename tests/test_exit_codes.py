@@ -5,7 +5,7 @@ from modelaudit.core import determine_exit_code
 
 def test_exit_code_clean_scan():
     """Test exit code 0 for clean scan with no issues."""
-    results = {"success": True, "has_errors": False, "issues": []}
+    results = {"success": True, "has_errors": False, "issues": [], "files_scanned": 1}
     assert determine_exit_code(results) == 0
 
 
@@ -17,6 +17,7 @@ def test_exit_code_clean_scan_with_debug_issues():
         "issues": [
             {"message": "Debug info", "severity": "debug", "location": "test.pkl"},
         ],
+        "files_scanned": 1,
     }
     assert determine_exit_code(results) == 0
 
@@ -33,6 +34,7 @@ def test_exit_code_security_issues():
                 "location": "test.pkl",
             },
         ],
+        "files_scanned": 1,
     }
     assert determine_exit_code(results) == 1
 
@@ -49,6 +51,7 @@ def test_exit_code_security_errors():
                 "location": "test.pkl",
             },
         ],
+        "files_scanned": 1,
     }
     assert determine_exit_code(results) == 1
 
@@ -106,6 +109,7 @@ def test_exit_code_mixed_severity():
                 "location": "test.pkl",
             },
         ],
+        "files_scanned": 1,
     }
     # Should return 1 because there are non-debug issues
     assert determine_exit_code(results) == 1
@@ -123,6 +127,7 @@ def test_exit_code_info_level_issues():
                 "location": "test.pkl",
             },
         ],
+        "files_scanned": 1,
     }
     assert determine_exit_code(results) == 1
 
@@ -130,4 +135,60 @@ def test_exit_code_info_level_issues():
 def test_exit_code_empty_results():
     """Test exit code with minimal results structure."""
     results = {}
+    assert determine_exit_code(results) == 2  # Changed: no files scanned means exit code 2
+
+
+def test_exit_code_no_files_scanned():
+    """Test exit code 2 when no files are scanned."""
+    results = {
+        "success": True,
+        "has_errors": False,
+        "issues": [],
+        "files_scanned": 0,
+    }
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_no_files_scanned_with_issues():
+    """Test exit code 2 when no files are scanned even with issues."""
+    results = {
+        "success": True,
+        "has_errors": False,
+        "issues": [
+            {
+                "message": "Some issue",
+                "severity": "warning",
+                "location": "test.pkl",
+            },
+        ],
+        "files_scanned": 0,
+    }
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_files_scanned_clean():
+    """Test exit code 0 when files are scanned and clean."""
+    results = {
+        "success": True,
+        "has_errors": False,
+        "issues": [],
+        "files_scanned": 5,
+    }
     assert determine_exit_code(results) == 0
+
+
+def test_exit_code_files_scanned_with_issues():
+    """Test exit code 1 when files are scanned with issues."""
+    results = {
+        "success": True,
+        "has_errors": False,
+        "issues": [
+            {
+                "message": "Security issue",
+                "severity": "warning",
+                "location": "test.pkl",
+            },
+        ],
+        "files_scanned": 5,
+    }
+    assert determine_exit_code(results) == 1
