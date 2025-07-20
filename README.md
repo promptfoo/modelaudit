@@ -94,9 +94,25 @@ modelaudit production_model.safetensors --format json --output security_report.j
 
 ### **CI/CD Pipeline Integration**
 
+ModelAudit automatically detects CI environments and adjusts output accordingly:
+
 ```bash
-modelaudit models/ --exit-code-on-issues --timeout 300
+# Recommended: Use JSON format for machine-readable output
+modelaudit models/ --format json --output results.json
+
+# Text output automatically adapts to CI (no spinners, plain text)
+modelaudit models/ --timeout 300
+
+# Disable colors explicitly with NO_COLOR environment variable
+NO_COLOR=1 modelaudit models/
 ```
+
+**CI-Friendly Features:**
+
+- 🚫 Spinners automatically disabled when output is piped or in CI
+- 🎨 Colors disabled when `NO_COLOR` environment variable is set
+- 📊 JSON output recommended for parsing in CI pipelines
+- 🔍 Exit codes: 0 (clean), 1 (issues found), 2 (errors)
 
 ### **Third-Party Model Validation**
 
