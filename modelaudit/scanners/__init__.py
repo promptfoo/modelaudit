@@ -2,6 +2,7 @@ import importlib
 import logging
 import threading
 import warnings
+from collections.abc import Iterator
 from typing import Any, Optional
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
@@ -49,7 +50,7 @@ class ScannerRegistry:
     used by scanners, see modelaudit.suspicious_symbols module.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._scanners: dict[str, dict[str, Any]] = {}
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
@@ -78,7 +79,7 @@ class ScannerRegistry:
         ],
     )
 
-    def _init_registry(self):
+    def _init_registry(self) -> None:
         """Initialize the scanner registry with metadata"""
         # Order matters - more specific scanners should come before generic ones
         self._scanners = {
@@ -474,12 +475,12 @@ _registry = ScannerRegistry()
 class _LazyList:
     """Lazy list that loads scanners only when accessed (thread-safe)"""
 
-    def __init__(self, registry):
+    def __init__(self, registry: ScannerRegistry) -> None:
         self._registry = registry
-        self._cached_list = None
+        self._cached_list: Optional[list[type[BaseScanner]]] = None
         self._lock = threading.Lock()
 
-    def _get_list(self):
+    def _get_list(self) -> list[type[BaseScanner]]:
         # Fast path without lock
         if self._cached_list is not None:
             return self._cached_list
@@ -491,16 +492,16 @@ class _LazyList:
                 self._cached_list = self._registry.get_scanner_classes()
             return self._cached_list
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[type[BaseScanner]]:
         return iter(self._get_list())
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._get_list())
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> type[BaseScanner]:
         return self._get_list()[index]
 
-    def __contains__(self, item):
+    def __contains__(self, item: Any) -> bool:
         return item in self._get_list()
 
 
@@ -509,7 +510,7 @@ SCANNER_REGISTRY = _LazyList(_registry)
 
 
 # Export scanner classes with lazy loading
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazy loading for scanner classes"""
     # Map class names to scanner IDs
     class_to_id = {

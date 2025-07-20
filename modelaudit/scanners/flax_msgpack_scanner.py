@@ -5,7 +5,7 @@ import re
 from typing import Any, ClassVar
 
 try:
-    import msgpack  # type: ignore
+    import msgpack
 
     HAS_MSGPACK = True
 except Exception:  # pragma: no cover - optional dependency missing
