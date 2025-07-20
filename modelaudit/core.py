@@ -224,7 +224,7 @@ def scan_model_directory_or_file(
                         if target_str in scanned_paths:
                             continue
                         scanned_paths.add(target_str)
-                        
+
                         if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
                             issues_list.append(
                                 {
@@ -307,10 +307,10 @@ def scan_model_directory_or_file(
                                 }
                             )
                             _add_error_asset_to_results(results, str(target_path))
-                    
+
                     if limit_reached:
                         break
-                
+
                 if limit_reached:
                     break
 
