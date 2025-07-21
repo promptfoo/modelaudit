@@ -626,7 +626,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 layer_evidence += 1
 
         if layer_evidence >= 2:
-            analysis["evidence"].append(f"Found hierarchical layer structure ({layer_evidence} layer indicators)")
+            analysis["evidence"].append(
+                f"Found hierarchical layer structure ({layer_evidence} layer indicators)"
+            )
             analysis["confidence"] += 0.5
 
         # Check for embedding-like structures (large matrices typical of word embeddings)

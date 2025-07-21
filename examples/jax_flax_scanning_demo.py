@@ -168,7 +168,7 @@ def demo_flax_msgpack_scanning():
     """Demonstrate Flax msgpack scanning capabilities."""
     print("\n" + "=" * 60)
     print("🔬 FLAX MSGPACK SCANNER DEMO")
-    print("="*60)
+    print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Test 1: Legitimate Flax checkpoint
@@ -191,7 +191,9 @@ def demo_flax_msgpack_scanning():
             # Show JAX-specific metadata
             jax_metadata = result.metadata.get("jax_metadata", {})
             print(f"  🎯 ML confidence: {jax_metadata.get('confidence', 0):.2f}")
-            print(f"  🔧 Has optimizer: {jax_metadata.get('has_optimizer_state', False)}")
+            print(
+                f"  🔧 Has optimizer: {jax_metadata.get('has_optimizer_state', False)}"
+            )
 
         # Test 2: Suspicious JAX checkpoint
         print("\n📁 Test 2: Scanning suspicious JAX checkpoint")
@@ -229,7 +231,7 @@ def demo_jax_checkpoint_scanning():
     """Demonstrate JAX checkpoint scanning capabilities."""
     print("\n" + "=" * 60)
     print("🔬 JAX CHECKPOINT SCANNER DEMO")
-    print("="*60)
+    print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Test 1: Orbax checkpoint directory
@@ -279,7 +281,7 @@ def demo_security_threat_detection():
     """Demonstrate security threat detection in JAX/Flax models."""
     print("\n" + "=" * 60)
     print("🛡️  SECURITY THREAT DETECTION DEMO")
-    print("="*60)
+    print("=" * 60)
 
     threats = [
         {
@@ -332,8 +334,12 @@ def demo_security_threat_detection():
 
             result = scanner.scan(threat_path)
 
-            critical_issues = [issue for issue in result.issues if issue.severity.value == "critical"]
-            warning_issues = [issue for issue in result.issues if issue.severity.value == "warning"]
+            critical_issues = [
+                issue for issue in result.issues if issue.severity.value == "critical"
+            ]
+            warning_issues = [
+                issue for issue in result.issues if issue.severity.value == "warning"
+            ]
 
             if critical_issues or warning_issues:
                 print(
@@ -360,11 +366,7 @@ def main():
         demo_jax_checkpoint_scanning()
         demo_security_threat_detection()
 
-<<<<<<< HEAD
         print("\n" + "=" * 60)
-=======
-        print("\n" + "="*60)
->>>>>>> origin/main
         print("✅ Demo completed successfully!")
         print("=" * 60)
         print("\nKey features demonstrated:")
