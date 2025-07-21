@@ -65,12 +65,12 @@ class TestHuggingFaceSymlinks:
         scan_dir.mkdir()
 
         # Create a file outside the scan directory
-        outside_file = tmp_path / "outside.txt"
+        outside_file = tmp_path / "outside.pkl"
         with open(outside_file, "w") as f:
             f.write("Malicious content")
 
         # Create a symlink pointing outside
-        symlink = scan_dir / "bad_link.txt"
+        symlink = scan_dir / "bad_link.pkl"
         os.symlink(str(outside_file), symlink)
 
         # Scan the directory

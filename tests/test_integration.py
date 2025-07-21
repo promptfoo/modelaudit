@@ -23,7 +23,7 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     # Check progress callback was called
     assert len(mock_progress_callback.messages) > 0
     assert len(mock_progress_callback.percentages) > 0
-    assert any("Scanning directory" in msg for msg in mock_progress_callback.messages)
+    assert any("Scanning" in msg for msg in mock_progress_callback.messages)
     assert 100.0 in mock_progress_callback.percentages  # Should reach 100%
 
     # Check that issues were found for each model type

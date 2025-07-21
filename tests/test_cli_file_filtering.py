@@ -15,7 +15,7 @@ def test_cli_skip_files_default():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Create test files
-        (Path(tmp_dir) / "README.txt").write_text("documentation")
+        (Path(tmp_dir) / "README.md").write_text("documentation")
         (Path(tmp_dir) / "model.pkl").write_bytes(b"model data")
         (Path(tmp_dir) / "script.py").write_text("print('hello')")
 
@@ -35,7 +35,7 @@ def test_cli_no_skip_files():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Create test files
-        (Path(tmp_dir) / "README.txt").write_text("documentation")
+        (Path(tmp_dir) / "README.md").write_text("documentation")
         (Path(tmp_dir) / "model.pkl").write_bytes(b"model data")
         (Path(tmp_dir) / "script.py").write_text("print('hello')")
 
@@ -86,4 +86,4 @@ def test_cli_skip_message_in_verbose():
 
         # With skip files enabled, should only scan 1 file
         if "--format" not in result.output:  # text format
-            assert "Files: 1" in result.output
+            assert "Files scanned: 1" in result.output

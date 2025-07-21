@@ -8,9 +8,9 @@ def test_symlink_outside_directory(tmp_path):
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
 
-    (outside_dir / "secret.txt").write_text("secret")
-    (base_dir / "safe.txt").write_text("safe")
-    (base_dir / "link.txt").symlink_to(outside_dir / "secret.txt")
+    (outside_dir / "secret.pkl").write_text("secret")
+    (base_dir / "safe.pkl").write_text("safe")
+    (base_dir / "link.pkl").symlink_to(outside_dir / "secret.pkl")
 
     results = scan_model_directory_or_file(str(base_dir))
 

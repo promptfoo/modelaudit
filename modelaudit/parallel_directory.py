@@ -15,125 +15,14 @@ from modelaudit.utils import is_within_directory
 logger = logging.getLogger("modelaudit.parallel_directory")
 
 
+from modelaudit.utils.file_filter import should_skip_file
+
+
 def _should_skip_file(file_path: str, skip_file_types: bool = True) -> bool:
     """Check if a file should be skipped based on common non-model file patterns."""
     if not skip_file_types:
         return False
-
-    # Get file extension
-    _, ext = os.path.splitext(file_path)
-    ext = ext.lower()
-
-    # Skip common non-model file extensions
-    skip_extensions = {
-        # Documentation
-        ".md",
-        ".rst",
-        ".doc",
-        ".docx",
-        ".pdf",
-        # Code
-        ".py",
-        ".js",
-        ".java",
-        ".cpp",
-        ".c",
-        ".h",
-        ".hpp",
-        ".go",
-        ".rs",
-        ".rb",
-        ".php",
-        ".sh",
-        ".bash",
-        ".bat",
-        ".ps1",
-        # Web
-        ".html",
-        ".htm",
-        ".css",
-        ".scss",
-        ".sass",
-        ".less",
-        # Data files (but not model formats)
-        ".csv",
-        ".tsv",
-        ".xlsx",
-        ".xls",
-        # Media
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".svg",
-        ".ico",
-        ".mp3",
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".wav",
-        # Archives (we'll scan specific model archives)
-        ".tar",
-        ".gz",
-        ".bz2",
-        ".xz",
-        # System
-        ".lock",
-        ".log",
-        ".cache",
-        ".tmp",
-        ".temp",
-        ".git",
-        ".gitignore",
-        ".gitattributes",
-        ".DS_Store",
-        ".env",
-        ".venv",
-        # Build artifacts
-        ".o",
-        ".so",
-        ".dylib",
-        ".dll",
-        ".exe",
-        ".class",
-        # IDE
-        ".idea",
-        ".vscode",
-        ".project",
-        # DVC files (handled separately)
-        ".dvc",
-        ".classpath",
-    }
-
-    if ext in skip_extensions:
-        return True
-
-    # Skip specific filenames
-    skip_filenames = {
-        "LICENSE",
-        "README",
-        "CHANGELOG",
-        "AUTHORS",
-        "CONTRIBUTORS",
-        "Makefile",
-        "requirements.txt",
-        "setup.py",
-        "setup.cfg",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "Pipfile",
-        "Pipfile.lock",
-        "poetry.lock",
-    }
-
-    basename = os.path.basename(file_path)
-    if basename in skip_filenames:
-        return True
-
-    # Skip hidden files and directories
-    return basename.startswith(".")
+    return should_skip_file(file_path)
 
 
 def scan_directory_parallel(

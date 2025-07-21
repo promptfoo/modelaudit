@@ -275,6 +275,9 @@ class ParallelScanner:
         results["parallel_scan"] = True
         results["worker_count"] = self.max_workers
 
+        if self.progress_callback:
+            self.progress_callback("Completed parallel scan", 100.0)
+
         return results
 
     def _scan_sequential(
@@ -313,6 +316,9 @@ class ParallelScanner:
         results["finish_time"] = time.time()
         results["duration"] = results["finish_time"] - results["start_time"]
         results["parallel_scan"] = False
+
+        if self.progress_callback:
+            self.progress_callback("Completed sequential scan", 100.0)
 
         return results
 
