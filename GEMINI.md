@@ -18,8 +18,8 @@ When tasked with fixing bugs, adding features, or refactoring:
 3.  **Implement:** Use the available tools to act on the plan, adhering to project conventions.
 4.  **Verify (Tests):** This project has extensive tests. After any change, run the relevant tests to ensure correctness. The primary test command is `pytest`. You can run specific tests using `pytest tests/test_your_feature.py`.
 5.  **Verify (Standards):** After making code changes, run the project's linting and formatting commands.
-    - For Python: `black .`
-    - For other files (Markdown, JSON): `prettier --write .`
+    - For Python: `ruff check . --fix`
+    - For other files (Markdown, JSON): `npx prettier@latest --write .`
       This ensures code quality and adherence to standards.
 
 # Git Repository

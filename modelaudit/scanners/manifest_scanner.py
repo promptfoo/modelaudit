@@ -308,6 +308,8 @@ class ManifestScanner(BaseScanner):
                 return
 
             for key, value in d.items():
+                if key in ["label2id", "text_config", "vision_config"]:
+                    continue
                 key_lower = key.lower()
                 full_key = f"{prefix}.{key}" if prefix else key
 
