@@ -139,7 +139,9 @@ class PyTorchZipScanner(BaseScanner):
                         )
 
                 # Check for missing data.pkl (common in PyTorch models)
-                if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_files]:
+                if not pickle_files or "data.pkl" not in [
+                    os.path.basename(f) for f in pickle_files
+                ]:
                     result.add_issue(
                         "PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models.",
                         severity=IssueSeverity.INFO,
@@ -148,7 +150,11 @@ class PyTorchZipScanner(BaseScanner):
                     )
 
                 # Check for blacklist patterns in all files
-                if hasattr(self, "config") and self.config and "blacklist_patterns" in self.config:
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                ):
                     blacklist_patterns = self.config["blacklist_patterns"]
                     for name in safe_entries:
                         try:

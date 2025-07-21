@@ -24,7 +24,9 @@ try:
 
     NUMPY_AVAILABLE = True
     NUMPY_VERSION = getattr(np, "__version__", "unknown")
-    NUMPY_MAJOR_VERSION = int(NUMPY_VERSION.split(".")[0]) if NUMPY_VERSION != "unknown" else 1
+    NUMPY_MAJOR_VERSION = (
+        int(NUMPY_VERSION.split(".")[0]) if NUMPY_VERSION != "unknown" else 1
+    )
 except ImportError:
     NUMPY_AVAILABLE = False
     NUMPY_FORMAT_AVAILABLE = False
@@ -135,7 +137,10 @@ class NumPyScanner(BaseScanner):
                 f"NumPy format module not available (NumPy {NUMPY_VERSION}). May be a compatibility issue.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"numpy_version": NUMPY_VERSION, "numpy_major": NUMPY_MAJOR_VERSION},
+                details={
+                    "numpy_version": NUMPY_VERSION,
+                    "numpy_major": NUMPY_MAJOR_VERSION,
+                },
             )
             result.finish(success=False)
             return result
@@ -183,7 +188,9 @@ class NumPyScanner(BaseScanner):
                         else:
                             # For newer versions, try the private method with fallback
                             if hasattr(fmt, "_read_array_header"):
-                                shape, fortran, dtype = fmt._read_array_header(f, version=(major, minor))
+                                shape, fortran, dtype = fmt._read_array_header(
+                                    f, version=(major, minor)
+                                )
                             else:
                                 # Fallback for newer NumPy versions
                                 shape, fortran, dtype = fmt.read_array_header_2_0(f)
@@ -192,7 +199,10 @@ class NumPyScanner(BaseScanner):
                             f"Failed to read NumPy array header: {header_error}",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
+                            details={
+                                "numpy_version": NUMPY_VERSION,
+                                "header_error": str(header_error),
+                            },
                         )
                         result.finish(success=False)
                         return result
@@ -203,7 +213,9 @@ class NumPyScanner(BaseScanner):
                     try:
                         self._validate_array_dimensions(shape)
                         self._validate_dtype(dtype)
-                        expected_data_size = self._calculate_safe_array_size(shape, dtype)
+                        expected_data_size = self._calculate_safe_array_size(
+                            shape, dtype
+                        )
                         expected_size = data_offset + expected_data_size
                     except ValueError as e:
                         result.add_issue(
@@ -241,7 +253,11 @@ class NumPyScanner(BaseScanner):
                 f"Error scanning NumPy file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__, "numpy_version": NUMPY_VERSION},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "numpy_version": NUMPY_VERSION,
+                },
             )
             result.finish(success=False)
             return result

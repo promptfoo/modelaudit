@@ -62,7 +62,13 @@ class TestFileFilter:
 
     def test_skip_specific_filenames(self):
         """Test that specific filenames are skipped."""
-        skip_names = ["LICENSE", "README", "Makefile", "requirements.txt", "package.json"]
+        skip_names = [
+            "LICENSE",
+            "README",
+            "Makefile",
+            "requirements.txt",
+            "package.json",
+        ]
 
         for name in skip_names:
             assert should_skip_file(name), f"Should skip {name}"

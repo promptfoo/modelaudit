@@ -17,7 +17,9 @@ def test_scanner_registry_contains_all_scanners():
     ]
 
     for scanner in core_scanners:
-        assert scanner in scanner_classes, f"Core scanner {scanner} should always be available"
+        assert (
+            scanner in scanner_classes
+        ), f"Core scanner {scanner} should always be available"
 
     # ML framework scanners that may fail due to compatibility issues
     # Map scanner class names to their registry IDs for proper matching
@@ -62,7 +64,9 @@ def test_scanner_registry_unique_names():
     scanner_names = [cls.name for cls in SCANNER_REGISTRY]
 
     # Check for duplicates
-    assert len(scanner_names) == len(set(scanner_names)), "Duplicate scanner names found"
+    assert len(scanner_names) == len(
+        set(scanner_names)
+    ), "Duplicate scanner names found"
 
 
 def test_scanner_registry_file_extension_coverage():
@@ -118,7 +122,11 @@ def test_scanner_registry_graceful_fallback():
     for scanner_id, error_msg in failed_scanners.items():
         assert isinstance(error_msg, str)
         assert len(error_msg) > 0
-        assert scanner_id in error_msg or "numpy" in error_msg.lower() or "tensorflow" in error_msg.lower()
+        assert (
+            scanner_id in error_msg
+            or "numpy" in error_msg.lower()
+            or "tensorflow" in error_msg.lower()
+        )
 
     # Registry should still function even with failed scanners
     assert len(SCANNER_REGISTRY) > 0, "Some scanners should still be available"

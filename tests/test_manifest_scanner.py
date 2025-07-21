@@ -43,7 +43,9 @@ def test_manifest_scanner_json(tmp_path):
 
     # Check that suspicious keys were detected
     suspicious_keys = [
-        issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details") and "key" in issue.details
+        issue.details.get("key", "")
+        for issue in result.issues
+        if hasattr(issue, "details") and "key" in issue.details
     ]
     assert any("file_path" in key for key in suspicious_keys)
     assert any("api_key" in key for key in suspicious_keys)
@@ -76,14 +78,20 @@ def test_manifest_scanner_blacklist():
 
         # Check that blacklisted term was detected
         blacklist_issues = [
-            issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message
+            issue
+            for issue in result.issues
+            if hasattr(issue, "message") and "Blacklisted term" in issue.message
         ]
         assert len(blacklist_issues) > 0
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in blacklist_issues)
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL for issue in blacklist_issues
+        )
 
         # Verify the specific blacklisted term was identified
         blacklisted_terms = [
-            issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")
+            issue.details.get("blacklisted_term", "")
+            for issue in blacklist_issues
+            if hasattr(issue, "details")
         ]
         assert "unsafe" in blacklisted_terms
 
@@ -111,7 +119,9 @@ def test_manifest_scanner_case_insensitive_blacklist():
 
         # Check that the mixed-case term was detected
         blacklist_issues = [
-            issue for issue in result.issues if hasattr(issue, "message") and "Blacklisted term" in issue.message
+            issue
+            for issue in result.issues
+            if hasattr(issue, "message") and "Blacklisted term" in issue.message
         ]
         assert len(blacklist_issues) > 0
 
@@ -164,7 +174,11 @@ def test_manifest_scanner_nested_structures():
         assert result.success is True
 
         # Check that suspicious keys were detected in nested structures
-        suspicious_keys = [issue.details.get("key", "") for issue in result.issues if hasattr(issue, "details")]
+        suspicious_keys = [
+            issue.details.get("key", "")
+            for issue in result.issues
+            if hasattr(issue, "details")
+        ]
         assert any("url" in key for key in suspicious_keys)
         assert any("code" in key for key in suspicious_keys)
 
@@ -184,7 +198,10 @@ def test_parse_file_logs_warning(caplog, capsys):
         content = scanner._parse_file("nonexistent.json", ".json", result)
 
     assert content is None
-    assert any("Error parsing file nonexistent.json" in record.getMessage() for record in caplog.records)
+    assert any(
+        "Error parsing file nonexistent.json" in record.getMessage()
+        for record in caplog.records
+    )
     assert capsys.readouterr().out == ""
     assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
 
@@ -217,9 +234,13 @@ def test_huggingface_name_or_path_pattern():
         suspicious_issues = [
             issue
             for issue in result.issues
-            if hasattr(issue, "message") and "suspicious" in issue.message.lower() and "_name_or_path" in issue.message
+            if hasattr(issue, "message")
+            and "suspicious" in issue.message.lower()
+            and "_name_or_path" in issue.message
         ]
-        assert len(suspicious_issues) == 0, "HuggingFace _name_or_path should not be flagged"
+        assert (
+            len(suspicious_issues) == 0
+        ), "HuggingFace _name_or_path should not be flagged"
 
         # Also check that it wasn't flagged as file_access category
         file_access_issues = [
@@ -229,7 +250,9 @@ def test_huggingface_name_or_path_pattern():
             and issue.details.get("categories") == ["file_access"]
             and "_name_or_path" in issue.details.get("key", "")
         ]
-        assert len(file_access_issues) == 0, "_name_or_path should not be flagged as file access"
+        assert (
+            len(file_access_issues) == 0
+        ), "_name_or_path should not be flagged as file access"
 
     finally:
         test_file_path = Path(test_file)
@@ -285,9 +308,12 @@ def test_huggingface_patterns_ignored_in_context():
         suspicious_issues = [
             issue
             for issue in result.issues
-            if hasattr(issue, "details") and "api_endpoint" in issue.details.get("key", "")
+            if hasattr(issue, "details")
+            and "api_endpoint" in issue.details.get("key", "")
         ]
-        assert len(suspicious_issues) > 0, "Real suspicious patterns should still be detected"
+        assert (
+            len(suspicious_issues) > 0
+        ), "Real suspicious patterns should still be detected"
 
     finally:
         test_file_path = Path(test_file)
@@ -343,7 +369,9 @@ def test_tokenizer_config_patterns():
 
         # But credentials should still be flagged
         credential_issues = [
-            issue for issue in result.issues if hasattr(issue, "details") and "api_key" in issue.details.get("key", "")
+            issue
+            for issue in result.issues
+            if hasattr(issue, "details") and "api_key" in issue.details.get("key", "")
         ]
         assert len(credential_issues) > 0, "Real credential patterns should be detected"
 
@@ -386,10 +414,13 @@ def test_ml_context_detection():
             for issue in result.issues
             if hasattr(issue, "details")
             and any(
-                pattern in issue.details.get("key", "") for pattern in ["model_input_names", "hidden_", "attention_"]
+                pattern in issue.details.get("key", "")
+                for pattern in ["model_input_names", "hidden_", "attention_"]
             )
         ]
-        assert len(ml_pattern_issues) == 0, "ML patterns should be ignored in ML context"
+        assert (
+            len(ml_pattern_issues) == 0
+        ), "ML patterns should be ignored in ML context"
 
     finally:
         test_file_path = Path(test_file)
@@ -433,7 +464,9 @@ def test_non_ml_context_still_flags_suspicious_patterns():
                 ]
             )
         ]
-        assert len(suspicious_issues) > 0, "Suspicious patterns should be flagged in non-ML context"
+        assert (
+            len(suspicious_issues) > 0
+        ), "Suspicious patterns should be flagged in non-ML context"
 
     finally:
         test_file_path = Path(test_file)

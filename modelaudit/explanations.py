@@ -72,7 +72,9 @@ DANGEROUS_IMPORTS = {
         "The 'shutil' module provides high-level file operations. Functions like 'rmtree' can recursively delete "
         "directories, potentially causing data loss."
     ),
-    "tempfile": ("Unsafe temp file creation (like 'mktemp') can lead to race conditions and security vulnerabilities."),
+    "tempfile": (
+        "Unsafe temp file creation (like 'mktemp') can lead to race conditions and security vulnerabilities."
+    ),
     "runpy": (
         "The 'runpy' module executes Python modules as scripts, potentially running malicious code embedded in the "
         "model."
@@ -222,22 +224,30 @@ TF_OP_EXPLANATIONS = {
         "Save operations write checkpoint data. Attackers might use them to persist malicious data or "
         "overwrite existing files."
     ),
-    "SaveV2": ("SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution."),
+    "SaveV2": (
+        "SaveV2 is a variant of Save with similar risks of writing arbitrary files during graph execution."
+    ),
     "MergeV2Checkpoints": (
         "MergeV2Checkpoints manipulates TensorFlow checkpoints by reading and writing checkpoint files, "
         "which could be used to overwrite existing files or inject malicious parameters."
     ),
     # Data processing operations - MEDIUM RISK
-    "DecodeRaw": ("DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion."),
+    "DecodeRaw": (
+        "DecodeRaw processes raw binary data that may be malicious or cause resource exhaustion."
+    ),
     "DecodeJpeg": (
         "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources."
     ),
-    "DecodePng": ("DecodePng decodes PNG data, which could be abused with malformed inputs."),
+    "DecodePng": (
+        "DecodePng decodes PNG data, which could be abused with malformed inputs."
+    ),
 }
 
 
 # Function to get explanation for a security issue
-def get_explanation(category: str, specific_item: Optional[str] = None) -> Optional[str]:
+def get_explanation(
+    category: str, specific_item: Optional[str] = None
+) -> Optional[str]:
     """
     Get a security explanation for a given category and item.
 
@@ -359,7 +369,9 @@ COMMON_MESSAGE_EXPLANATIONS = {
         "Import failures may indicate tampered dependencies or attempts to"
         " load malicious modules not present in the environment."
     ),
-    "Deprecated module": ("Deprecated modules may have unpatched security vulnerabilities that attackers can exploit."),
+    "Deprecated module": (
+        "Deprecated modules may have unpatched security vulnerabilities that attackers can exploit."
+    ),
     # General security and scanning issues
     "Too many": (
         "Excessive quantities of data structures may indicate a malicious attempt"
@@ -390,7 +402,9 @@ COMMON_MESSAGE_EXPLANATIONS = {
 }
 
 
-def get_message_explanation(message: str, context: Optional[str] = None) -> Optional[str]:
+def get_message_explanation(
+    message: str, context: Optional[str] = None
+) -> Optional[str]:
     """Return a default explanation for an issue message if available.
 
     Args:
@@ -414,19 +428,26 @@ def get_message_explanation(message: str, context: Optional[str] = None) -> Opti
 
     # If context is provided, try to enhance the explanation
     if context:
-        enhanced_explanation = _enhance_explanation_with_context(message, base_explanation, context)
+        enhanced_explanation = _enhance_explanation_with_context(
+            message, base_explanation, context
+        )
         if enhanced_explanation:
             return enhanced_explanation
 
     return base_explanation
 
 
-def _enhance_explanation_with_context(message: str, base_explanation: str, context: str) -> Optional[str]:
+def _enhance_explanation_with_context(
+    message: str, base_explanation: str, context: str
+) -> Optional[str]:
     """Enhance explanations based on context information."""
     context_lower = context.lower()
 
     # ML model-specific context enhancements
-    if any(scanner in context_lower for scanner in ["pickle", "pytorch", "keras", "tensorflow"]):
+    if any(
+        scanner in context_lower
+        for scanner in ["pickle", "pytorch", "keras", "tensorflow"]
+    ):
         if message.startswith("Custom objects found"):
             return (
                 "Custom objects in ML models can execute arbitrary Python code during model loading. "
@@ -450,7 +471,9 @@ def _enhance_explanation_with_context(message: str, base_explanation: str, conte
             )
 
     # ONNX/compiled model context
-    elif any(scanner in context_lower for scanner in ["onnx", "tflite", "compiled"]) and message.startswith("Custom"):
+    elif any(
+        scanner in context_lower for scanner in ["onnx", "tflite", "compiled"]
+    ) and message.startswith("Custom"):
         return (
             base_explanation + " In compiled models, custom components may bypass "
             "the sandboxing that interpreted models provide, making them particularly risky."

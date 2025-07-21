@@ -87,7 +87,10 @@ def exponential_backoff(
                 time.sleep(delay)
 
         # All retries exhausted
-        raise RetryError(f"Failed after {max_retries + 1} attempts: {func.__name__}", last_error=last_exception)
+        raise RetryError(
+            f"Failed after {max_retries + 1} attempts: {func.__name__}",
+            last_error=last_exception,
+        )
 
     return wrapper
 

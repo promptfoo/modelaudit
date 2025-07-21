@@ -21,7 +21,11 @@ def test_unknown_file(tmp_path):
     assert results["success"] is True
 
     # Should have an issue about unknown format
-    unknown_format_issues = [issue for issue in results["issues"] if "Unknown or unhandled format" in issue["message"]]
+    unknown_format_issues = [
+        issue
+        for issue in results["issues"]
+        if "Unknown or unhandled format" in issue["message"]
+    ]
     assert len(unknown_format_issues) > 0
 
 
@@ -59,7 +63,11 @@ def test_directory_scan(tmp_path):
     # assert results["bytes_scanned"] > 0
 
     # Check for unknown format issues (only .dat should be unknown)
-    unknown_format_issues = [issue for issue in results["issues"] if "Unknown or unhandled format" in issue["message"]]
+    unknown_format_issues = [
+        issue
+        for issue in results["issues"]
+        if "Unknown or unhandled format" in issue["message"]
+    ]
     assert len(unknown_format_issues) == 1  # .dat file
 
     # The .pkl file should be handled by PickleScanner
@@ -82,7 +90,11 @@ def test_max_file_size(tmp_path):
     assert results["files_scanned"] == 1
 
     # Should have an issue about file being too large
-    large_file_issues = [issue for issue in results["issues"] if "File too large to scan" in issue["message"]]
+    large_file_issues = [
+        issue
+        for issue in results["issues"]
+        if "File too large to scan" in issue["message"]
+    ]
     assert len(large_file_issues) == 1
 
     # Scan with max_file_size larger than the file
@@ -94,7 +106,11 @@ def test_max_file_size(tmp_path):
     # assert results["bytes_scanned"] > 0
 
     # Should not have an issue about file being too large
-    large_file_issues = [issue for issue in results["issues"] if "File too large to scan" in issue["message"]]
+    large_file_issues = [
+        issue
+        for issue in results["issues"]
+        if "File too large to scan" in issue["message"]
+    ]
     assert len(large_file_issues) == 0
 
 
@@ -118,13 +134,17 @@ def test_max_total_size(tmp_path):
 
     assert results["success"] is True
 
-    limit_issues = [i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]]
+    limit_issues = [
+        i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]
+    ]
     assert len(limit_issues) == 1
 
     assert results["files_scanned"] == 2
 
     termination_messages = [
-        i for i in results["issues"] if "Scan terminated early due to total size limit" in i["message"]
+        i
+        for i in results["issues"]
+        if "Scan terminated early due to total size limit" in i["message"]
     ]
     assert len(termination_messages) == 1
 
@@ -287,9 +307,9 @@ def test_version_consistency():
     except PackageNotFoundError:
         # Package is not installed, so we can't compare versions
         # This is expected in development environments
-        assert modelaudit.__version__ == "unknown", (
-            f"Expected __version__ to be 'unknown' when package is not installed, but got '{modelaudit.__version__}'"
-        )
+        assert (
+            modelaudit.__version__ == "unknown"
+        ), f"Expected __version__ to be 'unknown' when package is not installed, but got '{modelaudit.__version__}'"
 
 
 def test_version_is_semver():
@@ -315,12 +335,16 @@ def test_version_is_semver():
 
     # Additional basic checks
     parts = version.split(".")
-    assert len(parts) >= 3, f"Version '{version}' must have at least 3 parts (major.minor.patch)"
+    assert (
+        len(parts) >= 3
+    ), f"Version '{version}' must have at least 3 parts (major.minor.patch)"
 
     # Ensure major, minor, patch are numeric (before any pre-release suffix)
     major = parts[0]
     minor = parts[1]
-    patch_part = parts[2].split("-")[0].split("+")[0]  # Remove pre-release/build metadata
+    patch_part = (
+        parts[2].split("-")[0].split("+")[0]
+    )  # Remove pre-release/build metadata
 
     assert major.isdigit(), f"Major version '{major}' must be numeric"
     assert minor.isdigit(), f"Minor version '{minor}' must be numeric"

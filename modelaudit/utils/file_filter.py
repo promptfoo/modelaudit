@@ -129,7 +129,8 @@ def should_skip_file(
     if (
         skip_hidden
         and filename.startswith(".")
-        and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt", ".npz", ".dvc", ".safetensors"}
+        and ext
+        not in {".pkl", ".pt", ".pth", ".h5", ".ckpt", ".npz", ".dvc", ".safetensors"}
     ):
         return True
 

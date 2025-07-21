@@ -137,7 +137,9 @@ class OciLayerScanner(BaseScanner):
                             file_result = core.scan_file(tmp_path, self.config)
                             for issue in file_result.issues:
                                 if issue.location:
-                                    issue.location = f"{path}:{layer_ref}:{name} {issue.location}"
+                                    issue.location = (
+                                        f"{path}:{layer_ref}:{name} {issue.location}"
+                                    )
                                 else:
                                     issue.location = f"{path}:{layer_ref}:{name}"
                                 if issue.details is None:

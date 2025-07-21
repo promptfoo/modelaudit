@@ -62,9 +62,13 @@ def scan_mlflow_model(
     tmp_dir = tempfile.mkdtemp(prefix="modelaudit_mlflow_")
     try:
         logger.debug("Downloading MLflow model %s to %s", model_uri, tmp_dir)
-        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)
+        local_path = mlflow.artifacts.download_artifacts(
+            artifact_uri=model_uri, dst_path=tmp_dir
+        )
         # mlflow may return a file within tmp_dir; ensure directory path
-        download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        download_path = (
+            os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        )
         return scan_model_directory_or_file(
             download_path,
             timeout=timeout,

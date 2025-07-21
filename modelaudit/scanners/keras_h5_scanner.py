@@ -227,7 +227,9 @@ class KerasH5Scanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                         "layer_config": layer.get("config", {}),
                     },
-                    why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
+                    why=get_pattern_explanation("lambda_layer")
+                    if layer_class == "Lambda"
+                    else None,
                 )
 
             # Check layer configuration for suspicious strings
@@ -238,7 +240,12 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # If there are nested models, scan them recursively
-            if layer_class == "Model" and "config" in layer and "layers" in layer["config"] and isinstance(layer, dict):
+            if (
+                layer_class == "Model"
+                and "config" in layer
+                and "layers" in layer["config"]
+                and isinstance(layer, dict)
+            ):
                 self._scan_model_config(layer, result)
 
         # Add layer counts to metadata

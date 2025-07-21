@@ -36,7 +36,12 @@ def resolve_dvc_file(file_path: str) -> list[str]:
     # Limit number of outputs to prevent resource exhaustion
     MAX_OUTPUTS = 100
     if len(outs) > MAX_OUTPUTS:
-        logger.warning("DVC file %s has too many outputs (%d), limiting to %d", file_path, len(outs), MAX_OUTPUTS)
+        logger.warning(
+            "DVC file %s has too many outputs (%d), limiting to %d",
+            file_path,
+            len(outs),
+            MAX_OUTPUTS,
+        )
         outs = outs[:MAX_OUTPUTS]
 
     resolved: list[str] = []
@@ -49,7 +54,9 @@ def resolve_dvc_file(file_path: str) -> list[str]:
 
         out_path = out["path"]
         if not isinstance(out_path, str):
-            logger.debug("Invalid path type in DVC file %s: %s", file_path, type(out_path))
+            logger.debug(
+                "Invalid path type in DVC file %s: %s", file_path, type(out_path)
+            )
             continue
 
         # Security: Resolve target path and validate it's within safe boundaries
@@ -81,7 +88,11 @@ def resolve_dvc_file(file_path: str) -> list[str]:
                 current_check = current_check.parent
 
             if not is_safe:
-                logger.warning("DVC target path outside safe boundaries: %s -> %s", file_path, target)
+                logger.warning(
+                    "DVC target path outside safe boundaries: %s -> %s",
+                    file_path,
+                    target,
+                )
                 continue
 
             if target.exists():

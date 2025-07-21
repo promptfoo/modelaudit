@@ -22,7 +22,9 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_huggingface_download_with_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_huggingface_download_with_cache_dir(
+        self, mock_scan, mock_is_hf_url, mock_download_model, tmp_path
+    ):
         """Test HuggingFace download uses specified cache directory."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -34,7 +36,9 @@ class TestCacheDirOption:
         runner = CliRunner()
         cache_dir = tmp_path / "my_cache"
 
-        result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
+        result = runner.invoke(
+            cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)]
+        )
 
         # Verify download was called with the cache directory
         mock_download_model.assert_called_once_with(
@@ -45,7 +49,9 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cloud_download_with_cache_dir(self, mock_scan, mock_is_cloud_url, mock_download_cloud, tmp_path):
+    def test_cloud_download_with_cache_dir(
+        self, mock_scan, mock_is_cloud_url, mock_download_cloud, tmp_path
+    ):
         """Test cloud storage download uses specified cache directory."""
         # Setup mocks
         mock_is_cloud_url.return_value = True
@@ -57,7 +63,9 @@ class TestCacheDirOption:
         runner = CliRunner()
         cache_dir = tmp_path / "cloud_cache"
 
-        result = runner.invoke(cli, ["scan", "s3://bucket/model.pt", "--cache-dir", str(cache_dir)])
+        result = runner.invoke(
+            cli, ["scan", "s3://bucket/model.pt", "--cache-dir", str(cache_dir)]
+        )
 
         # Verify download was called with the cache directory
         mock_download_cloud.assert_called_once_with(
@@ -75,7 +83,9 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_no_cleanup_with_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_no_cleanup_with_cache_dir(
+        self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path
+    ):
         """Test that temporary directories are not cleaned up when using --cache-dir."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -87,7 +97,9 @@ class TestCacheDirOption:
 
         runner = CliRunner()
 
-        result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
+        result = runner.invoke(
+            cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)]
+        )
 
         # Verify cleanup was NOT called since we used a cache directory
         mock_rmtree.assert_not_called()
@@ -97,7 +109,9 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_cleanup_without_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_cleanup_without_cache_dir(
+        self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path
+    ):
         """Test that temporary directories ARE cleaned up when NOT using --cache-dir."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -110,7 +124,11 @@ class TestCacheDirOption:
 
         result = runner.invoke(
             cli,
-            ["scan", "--no-cache", "hf://test/model"],  # No --cache-dir option, disable caching
+            [
+                "scan",
+                "--no-cache",
+                "hf://test/model",
+            ],  # No --cache-dir option, disable caching
         )
 
         # Verify cleanup WAS called since we didn't use a cache directory
@@ -119,7 +137,9 @@ class TestCacheDirOption:
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
-    def test_disk_space_error_message_mentions_cache_dir(self, mock_is_hf_url, mock_download_model):
+    def test_disk_space_error_message_mentions_cache_dir(
+        self, mock_is_hf_url, mock_download_model
+    ):
         """Test that disk space error messages mention --cache-dir option."""
         # Setup mocks
         mock_is_hf_url.return_value = True

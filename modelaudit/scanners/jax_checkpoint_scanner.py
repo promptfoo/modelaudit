@@ -34,7 +34,9 @@ class JaxCheckpointScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self.max_file_size = self.config.get("max_file_size", 2 * 1024 * 1024 * 1024)  # 2GB limit
+        self.max_file_size = self.config.get(
+            "max_file_size", 2 * 1024 * 1024 * 1024
+        )  # 2GB limit
 
         # JAX-specific suspicious patterns
         self.jax_suspicious_patterns = [
@@ -76,7 +78,13 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Orbax checkpoint indicators
-        orbax_files = ["checkpoint", "checkpoint_0", "metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
+        orbax_files = [
+            "checkpoint",
+            "checkpoint_0",
+            "metadata.json",
+            "_CHECKPOINT",
+            "orbax_checkpoint_metadata.json",
+        ]
 
         # Check for Orbax files
         for orbax_file in orbax_files:
@@ -102,7 +110,15 @@ class JaxCheckpointScanner(BaseScanner):
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    jax_indicators = ["jax", "flax", "haiku", "orbax", "arrayimpl", "jaxlib", "device_array"]
+                    jax_indicators = [
+                        "jax",
+                        "flax",
+                        "haiku",
+                        "orbax",
+                        "arrayimpl",
+                        "jaxlib",
+                        "device_array",
+                    ]
 
                     return any(indicator in data_str for indicator in jax_indicators)
                 except Exception:
@@ -126,7 +142,11 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Check metadata files
-        metadata_files = ["metadata.json", "orbax_checkpoint_metadata.json", "_CHECKPOINT"]
+        metadata_files = [
+            "metadata.json",
+            "orbax_checkpoint_metadata.json",
+            "_CHECKPOINT",
+        ]
 
         for metadata_file in metadata_files:
             metadata_path = path_obj / metadata_file
@@ -157,7 +177,9 @@ class JaxCheckpointScanner(BaseScanner):
             if checkpoint_file.is_file():
                 self._scan_checkpoint_file(str(checkpoint_file), result)
 
-    def _analyze_orbax_metadata(self, metadata: dict[str, Any], path: str, result: ScanResult) -> None:
+    def _analyze_orbax_metadata(
+        self, metadata: dict[str, Any], path: str, result: ScanResult
+    ) -> None:
         """Analyze Orbax metadata for security issues."""
 
         # Check for suspicious restore functions
@@ -362,7 +384,9 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_orbax_checkpoint(path, result)
 
                 # Calculate total size
-                total_size = sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+                total_size = sum(
+                    f.stat().st_size for f in Path(path).rglob("*") if f.is_file()
+                )
                 result.bytes_scanned = total_size
                 result.metadata["total_size"] = total_size
 

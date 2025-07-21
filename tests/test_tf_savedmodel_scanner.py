@@ -32,7 +32,9 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
     if HAS_TENSORFLOW:
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is True  # Now accepts any .pb file
+        assert (
+            TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+        )  # Now accepts any .pb file
     else:
         # When TensorFlow is not installed, can_handle returns False
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
@@ -112,7 +114,9 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
     assert result.bytes_scanned > 0
 
     # Check for issues - a safe model might still have some informational issues
-    error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    error_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+    ]
     assert len(error_issues) == 0
 
 
@@ -138,7 +142,9 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     )
 
     # Issues about PyFunc operations should include a 'why' explanation
-    pyfunc_issues = [issue for issue in result.issues if issue.message and "PyFunc" in issue.message]
+    pyfunc_issues = [
+        issue for issue in result.issues if issue.message and "PyFunc" in issue.message
+    ]
     assert any(issue.why is not None for issue in pyfunc_issues)
 
 
@@ -181,7 +187,11 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
     result = scanner.scan(str(model_dir))
 
     # Should detect our blacklisted pattern
-    blacklist_issues = [issue for issue in result.issues if "suspicious_function" in issue.message.lower()]
+    blacklist_issues = [
+        issue
+        for issue in result.issues
+        if "suspicious_function" in issue.message.lower()
+    ]
     assert len(blacklist_issues) > 0
 
 
@@ -278,26 +288,41 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
         suspicious_issues = [
             issue
             for issue in result.issues
-            if issue.message and op_name in issue.message and issue.severity == IssueSeverity.CRITICAL
+            if issue.message
+            and op_name in issue.message
+            and issue.severity == IssueSeverity.CRITICAL
         ]
 
-        assert len(suspicious_issues) > 0, f"Failed to detect suspicious TensorFlow operation: {op_name}"
+        assert (
+            len(suspicious_issues) > 0
+        ), f"Failed to detect suspicious TensorFlow operation: {op_name}"
 
         # Check that explanation is provided
         for issue in suspicious_issues:
-            assert issue.why is not None, f"Missing explanation for suspicious TF operation: {op_name}"
+            assert (
+                issue.why is not None
+            ), f"Missing explanation for suspicious TF operation: {op_name}"
 
             # Verify the explanation matches what we expect
             expected_explanation = get_tf_op_explanation(op_name)
-            assert issue.why == expected_explanation, (
-                f"Explanation mismatch for {op_name}. Expected: {expected_explanation}, Got: {issue.why}"
-            )
+            assert (
+                issue.why == expected_explanation
+            ), f"Explanation mismatch for {op_name}. Expected: {expected_explanation}, Got: {issue.why}"
 
             # Verify explanation quality
-            assert len(issue.why) > 20, f"Explanation too short for {op_name}: {issue.why}"
+            assert (
+                len(issue.why) > 20
+            ), f"Explanation too short for {op_name}: {issue.why}"
             assert any(
                 keyword in issue.why.lower()
-                for keyword in ["attack", "malicious", "abuse", "exploit", "dangerous", "risk"]
+                for keyword in [
+                    "attack",
+                    "malicious",
+                    "abuse",
+                    "exploit",
+                    "dangerous",
+                    "risk",
+                ]
             ), f"Explanation for {op_name} should mention security risks: {issue.why}"
 
 
@@ -307,22 +332,35 @@ def test_tf_scanner_explanation_categories(tmp_path):
     # Test critical risk operations (code execution)
     critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute"]
     for op_name in critical_ops:
-        model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"critical_test_{op_name.lower()}")
+        model_path = _create_test_savedmodel_with_op(
+            tmp_path, op_name, f"critical_test_{op_name.lower()}"
+        )
 
         scanner = TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
 
         # Find issues related to this operation
-        op_issues = [issue for issue in result.issues if issue.message and op_name in issue.message]
+        op_issues = [
+            issue
+            for issue in result.issues
+            if issue.message and op_name in issue.message
+        ]
         assert len(op_issues) > 0, f"No issues found for critical operation {op_name}"
 
         for issue in op_issues:
             if issue.why:  # Check explanations when provided
                 # Critical operations should mention code execution or system risks
-                critical_keywords = ["execute", "code", "system", "shell", "commands", "arbitrary"]
-                assert any(keyword in issue.why.lower() for keyword in critical_keywords), (
-                    f"Critical operation {op_name} explanation should mention execution risks: {issue.why}"
-                )
+                critical_keywords = [
+                    "execute",
+                    "code",
+                    "system",
+                    "shell",
+                    "commands",
+                    "arbitrary",
+                ]
+                assert any(
+                    keyword in issue.why.lower() for keyword in critical_keywords
+                ), f"Critical operation {op_name} explanation should mention execution risks: {issue.why}"
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
@@ -339,14 +377,20 @@ def test_tf_scanner_no_explanation_for_safe_ops(tmp_path):
     suspicious_issues = [
         issue
         for issue in result.issues
-        if issue.severity == IssueSeverity.CRITICAL and "suspicious" in issue.message.lower()
+        if issue.severity == IssueSeverity.CRITICAL
+        and "suspicious" in issue.message.lower()
     ]
-    assert len(suspicious_issues) == 0, "Safe operations should not trigger suspicious operation warnings"
+    assert (
+        len(suspicious_issues) == 0
+    ), "Safe operations should not trigger suspicious operation warnings"
 
     # Should not have explanations about TF operations (only other potential issues)
     tf_op_issues_with_explanations = [
         issue
         for issue in result.issues
-        if issue.why and any(op in issue.why for op in ["TensorFlow", "operation", "graph"])
+        if issue.why
+        and any(op in issue.why for op in ["TensorFlow", "operation", "graph"])
     ]
-    assert len(tf_op_issues_with_explanations) == 0, "Safe operations should not have TF operation explanations"
+    assert (
+        len(tf_op_issues_with_explanations) == 0
+    ), "Safe operations should not have TF operation explanations"

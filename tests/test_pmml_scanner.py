@@ -58,7 +58,9 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     assert result.success
 
     # Should detect suspicious patterns
-    suspicious_issues = [i for i in result.issues if "suspicious content" in i.message.lower()]
+    suspicious_issues = [
+        i for i in result.issues if "suspicious content" in i.message.lower()
+    ]
     assert len(suspicious_issues) >= 1
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
 
@@ -83,7 +85,9 @@ def test_pmml_scanner_external_references(tmp_path: Path) -> None:
     assert result.success
 
     # Should detect external references
-    external_issues = [i for i in result.issues if "external resource" in i.message.lower()]
+    external_issues = [
+        i for i in result.issues if "external resource" in i.message.lower()
+    ]
     assert len(external_issues) >= 2  # Should find both http and https references
     assert all(i.severity == IssueSeverity.WARNING for i in external_issues)
 
@@ -209,8 +213,14 @@ def test_pmml_scanner_comprehensive_dangerous_entities(tmp_path: Path) -> None:
     result = PmmlScanner().scan(str(path))
 
     # Should detect multiple dangerous constructs
-    dangerous_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-    construct_types = {i.details.get("construct") for i in dangerous_issues if i.details.get("construct")}
+    dangerous_issues = [
+        i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+    ]
+    construct_types = {
+        i.details.get("construct")
+        for i in dangerous_issues
+        if i.details.get("construct")
+    }
 
     # Should detect DOCTYPE, ENTITY, ELEMENT, and ATTLIST
     expected_constructs = {"<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"}

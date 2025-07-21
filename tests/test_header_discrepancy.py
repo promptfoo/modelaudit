@@ -18,5 +18,6 @@ def test_header_extension_mismatch_warning(tmp_path):
     # Should NOT have header mismatch warnings for .bin files with pickle data
     # This is expected behavior for PyTorch and HuggingFace models
     assert not any(
-        issue.severity == IssueSeverity.DEBUG and "header" in issue.message.lower() for issue in result.issues
+        issue.severity == IssueSeverity.DEBUG and "header" in issue.message.lower()
+        for issue in result.issues
     )

@@ -2,7 +2,10 @@ import os
 import re
 from typing import ClassVar
 
-from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    SUSPICIOUS_STRING_PATTERNS,
+)
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -77,7 +80,9 @@ class PaddleScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
-    def _check_chunk(self, chunk: bytes, result: ScanResult, offset: int, path: str) -> None:
+    def _check_chunk(
+        self, chunk: bytes, result: ScanResult, offset: int, path: str
+    ) -> None:
         for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 pos = chunk.find(pattern)
@@ -85,7 +90,10 @@ class PaddleScanner(BaseScanner):
                     f"Suspicious binary pattern found: {pattern.decode('ascii', 'ignore')}",
                     severity=IssueSeverity.INFO,
                     location=f"{path} (offset: {offset + pos})",
-                    details={"pattern": pattern.decode("ascii", "ignore"), "offset": offset + pos},
+                    details={
+                        "pattern": pattern.decode("ascii", "ignore"),
+                        "offset": offset + pos,
+                    },
                 )
 
         try:

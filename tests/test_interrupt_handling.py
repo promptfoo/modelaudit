@@ -66,12 +66,18 @@ def test_interrupt_during_scan():
             file_path = Path(temp_dir) / f"model_{i}.pkl"
             with open(file_path, "wb") as f:
                 # Larger data to make scanning take longer
-                data = {"model_id": i, "weights": [0.1, 0.2, 0.3] * 10000, "large_data": list(range(10000))}
+                data = {
+                    "model_id": i,
+                    "weights": [0.1, 0.2, 0.3] * 10000,
+                    "large_data": list(range(10000)),
+                }
                 pickle.dump(data, f)
 
         # Start scan in subprocess
         cmd = [sys.executable, "-m", "modelaudit", "scan", temp_dir]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
 
         # Give it time to start scanning
         time.sleep(2.0)  # Increased delay to ensure scanning has started
@@ -83,9 +89,9 @@ def test_interrupt_during_scan():
         stdout, stderr = process.communicate(timeout=10)
 
         # Check for graceful shutdown
-        assert "Scan interrupted by user" in stdout or "Scan interrupted by user" in stderr, (
-            f"Interrupt message not found. stdout: {stdout}, stderr: {stderr}"
-        )
+        assert (
+            "Scan interrupted by user" in stdout or "Scan interrupted by user" in stderr
+        ), f"Interrupt message not found. stdout: {stdout}, stderr: {stderr}"
 
         # Exit code should be 2 (errors) or 1 (issues found)
         assert process.returncode in [1, 2]

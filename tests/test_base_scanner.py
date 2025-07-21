@@ -237,7 +237,9 @@ def test_base_scanner_file_type_validation(tmp_path):
 
     # Check that we have a file type validation warning in the scan result
     validation_issues = [
-        issue for issue in scan_result.issues if "file type validation failed" in issue.message.lower()
+        issue
+        for issue in scan_result.issues
+        if "file type validation failed" in issue.message.lower()
     ]
     assert len(validation_issues) > 0
 

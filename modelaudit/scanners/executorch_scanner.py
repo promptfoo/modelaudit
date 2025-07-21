@@ -84,7 +84,9 @@ class ExecuTorchScanner(BaseScanner):
                     data = z.read(name)
                     bytes_scanned += len(data)
                     with io.BytesIO(data) as file_like:
-                        sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
+                        sub_result = self.pickle_scanner._scan_pickle_bytes(
+                            file_like, len(data)
+                        )
                     for issue in sub_result.issues:
                         if issue.details:
                             issue.details["pickle_filename"] = name

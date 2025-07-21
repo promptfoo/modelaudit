@@ -125,7 +125,9 @@ class SafeTensorsScanner(BaseScanner):
                 result.metadata["tensors"] = tensor_names
 
                 # Validate tensor offsets and sizes
-                tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
+                tensor_entries: list[tuple[str, Any]] = [
+                    (k, v) for k, v in header.items() if k != "__metadata__"
+                ]
 
                 data_size = file_size - (8 + header_len)
                 offsets = []

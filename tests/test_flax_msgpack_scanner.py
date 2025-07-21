@@ -45,7 +45,11 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
     assert "params" in result.metadata.get("top_level_keys", [])
     assert (
         len(
-            [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL],
+            [
+                issue
+                for issue in result.issues
+                if issue.severity == IssueSeverity.CRITICAL
+            ],
         )
         == 0
     )
@@ -60,7 +64,9 @@ def test_flax_msgpack_suspicious_content(tmp_path):
     result = scanner.scan(str(path))
 
     # Should detect multiple security issues
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+    ]
     assert len(critical_issues) > 0
 
     # Check for specific threats
@@ -91,7 +97,9 @@ def test_flax_msgpack_large_containers(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
+    ]
     assert len(info_issues) >= 2  # Should report both large containers at INFO level
 
     issue_messages = [issue.message for issue in info_issues]
@@ -114,7 +122,9 @@ def test_flax_msgpack_deep_nesting(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+    ]
     assert any("recursion depth exceeded" in issue.message for issue in critical_issues)
 
 
@@ -134,7 +144,9 @@ def test_flax_msgpack_non_standard_structure(tmp_path):
 
     # With our new structural analysis, this should be flagged as suspicious
     # because it has no numerical data that looks like ML weights
-    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    warning_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
+    ]
     assert any("Suspicious data structure" in issue.message for issue in warning_issues)
 
 
@@ -152,9 +164,12 @@ def test_flax_msgpack_corrupted(tmp_path):
     result = scanner.scan(str(path))
 
     assert result.has_errors
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+    ]
     assert any(
-        "Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message
+        "Invalid msgpack format" in issue.message
+        or "Unexpected error processing" in issue.message
         for issue in critical_issues
     )
 
@@ -209,8 +224,12 @@ def test_flax_msgpack_orbax_format_detection(tmp_path):
     assert jax_metadata.get("orbax_format") is True
 
     # Should have INFO issue about Orbax detection
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert any("Orbax checkpoint format detected" in issue.message for issue in info_issues)
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
+    ]
+    assert any(
+        "Orbax checkpoint format detected" in issue.message for issue in info_issues
+    )
 
 
 def test_flax_msgpack_jax_specific_threats(tmp_path):
@@ -229,8 +248,12 @@ def test_flax_msgpack_jax_specific_threats(tmp_path):
     result = scanner.scan(str(path))
 
     # Should detect multiple threats
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
-    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    critical_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+    ]
+    warning_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
+    ]
 
     # Check for JAX-specific threats
     issues_messages = [issue.message for issue in critical_issues + warning_issues]
@@ -245,11 +268,15 @@ def test_flax_msgpack_large_model_support(tmp_path):
 
     # Create scanner with lower blob limit for testing
     is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-    blob_limit = 5 * 1024 * 1024 if is_ci else 10 * 1024 * 1024  # 5MB in CI, 10MB locally
+    blob_limit = (
+        5 * 1024 * 1024 if is_ci else 10 * 1024 * 1024
+    )  # 5MB in CI, 10MB locally
     scanner = FlaxMsgpackScanner(config={"max_blob_bytes": blob_limit})
 
     # Simulate large model embedding
-    embedding_size = 10 * 1024 * 1024 if is_ci else 20 * 1024 * 1024  # 10MB in CI, 20MB locally
+    embedding_size = (
+        10 * 1024 * 1024 if is_ci else 20 * 1024 * 1024
+    )  # 10MB in CI, 20MB locally
     large_embedding = b"\x00" * embedding_size
 
     data = {
@@ -265,9 +292,13 @@ def test_flax_msgpack_large_model_support(tmp_path):
     assert result.success
 
     # Should handle large blobs without flagging as suspicious for legitimate models
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
+    ]
     # The large blob should be detected but at INFO level, not CRITICAL
-    large_blob_issues = [issue for issue in info_issues if "large binary blob" in issue.message.lower()]
+    large_blob_issues = [
+        issue for issue in info_issues if "large binary blob" in issue.message.lower()
+    ]
     assert len(large_blob_issues) >= 1
 
 
@@ -291,9 +322,13 @@ def test_flax_msgpack_ml_context_confidence(tmp_path):
         "params": {
             "transformer": {
                 "attention": {"query": b"\x00" * (768 * 768 * 4)},  # 768x768 matrix
-                "feed_forward": {"dense": b"\x00" * (768 * 3072 * 4)},  # 768x3072 matrix
+                "feed_forward": {
+                    "dense": b"\x00" * (768 * 3072 * 4)
+                },  # 768x3072 matrix
             },
-            "embedding": {"token_embedding": b"\x00" * (50257 * 768 * 4)},  # GPT-2 vocab size
+            "embedding": {
+                "token_embedding": b"\x00" * (50257 * 768 * 4)
+            },  # GPT-2 vocab size
         }
     }
     create_msgpack_file(path, data)
@@ -325,7 +360,9 @@ def test_flax_msgpack_trailing_data(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    warning_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.WARNING
+    ]
     assert any("trailing" in issue.message for issue in warning_issues)
 
 
@@ -358,8 +395,12 @@ def test_flax_msgpack_large_binary_blob(tmp_path):
     scanner = FlaxMsgpackScanner(config=config)
     result = scanner.scan(str(path))
 
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert any("Suspiciously large binary blob" in issue.message for issue in info_issues)
+    info_issues = [
+        issue for issue in result.issues if issue.severity == IssueSeverity.INFO
+    ]
+    assert any(
+        "Suspiciously large binary blob" in issue.message for issue in info_issues
+    )
 
 
 def test_flax_msgpack_custom_config(tmp_path):

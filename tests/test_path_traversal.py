@@ -14,6 +14,8 @@ def test_symlink_outside_directory(tmp_path):
 
     results = scan_model_directory_or_file(str(base_dir))
 
-    traversal_issues = [i for i in results["issues"] if "path traversal" in i["message"].lower()]
+    traversal_issues = [
+        i for i in results["issues"] if "path traversal" in i["message"].lower()
+    ]
     assert len(traversal_issues) == 1
     assert traversal_issues[0]["severity"] == IssueSeverity.CRITICAL.value

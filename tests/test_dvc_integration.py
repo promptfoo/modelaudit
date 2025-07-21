@@ -93,11 +93,13 @@ class TestDvcIntegration:
             pickle.dump({"exists": True}, f)
 
         dvc_file = tmp_path / "partial.dvc"
-        dvc_file.write_text("""outs:
+        dvc_file.write_text(
+            """outs:
 - path: existing.pkl
 - path: missing.pkl
 - path: also_missing.txt
-""")
+"""
+        )
 
         resolved = resolve_dvc_file(str(dvc_file))
         assert resolved == [str(existing)]

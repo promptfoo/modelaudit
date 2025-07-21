@@ -119,7 +119,11 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
 
     fs_protocol = get_fs_protocol(url)
     # Use anonymous access for public buckets
-    fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+    fs = (
+        fsspec.filesystem(fs_protocol, token="anon")
+        if fs_protocol == "gcs"
+        else fsspec.filesystem(fs_protocol)
+    )
 
     try:
         # Get info about the target with retry
@@ -130,7 +134,9 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         info = get_info()
 
         # Check if it's a file or directory
-        if info.get("type") == "file" or (info.get("type") != "directory" and "size" in info):
+        if info.get("type") == "file" or (
+            info.get("type") != "directory" and "size" in info
+        ):
             return {
                 "type": "file",
                 "size": info.get("size", 0),
@@ -152,7 +158,12 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                     if item_info.get("type") == "file" or "size" in item_info:
                         size = item_info.get("size", 0)
                         files.append(
-                            {"path": item, "name": Path(item).name, "size": size, "human_size": format_size(size)}
+                            {
+                                "path": item,
+                                "name": Path(item).name,
+                                "size": size,
+                                "human_size": format_size(size),
+                            }
                         )
                         total_size += size
                 except Exception:
@@ -393,7 +404,9 @@ def download_from_cloud(
         # Try to get a preview first
         preview = get_streaming_preview(url)
         if preview and show_progress:
-            click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
+            click.echo(
+                f"📄 File preview: {preview.get('detected_format', 'unknown')} format"
+            )
 
         # For streaming analysis, we don't need to download
         # Return a special marker path
@@ -402,11 +415,15 @@ def download_from_cloud(
     # Check size limits
     size = metadata.get("total_size", metadata.get("size", 0))
     if max_size and size > max_size:
-        raise ValueError(f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
+        raise ValueError(
+            f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})"
+        )
 
     # Show warning for large files
     if size > 100_000_000 and show_progress:  # 100MB
-        click.echo(f"⚠️  Downloading {metadata['human_size']} (estimated time: {metadata['estimated_time']})")
+        click.echo(
+            f"⚠️  Downloading {metadata['human_size']} (estimated time: {metadata['estimated_time']})"
+        )
 
     # Create download directory
     if cache:
@@ -424,7 +441,11 @@ def download_from_cloud(
     # Get filesystem
     fs_protocol = get_fs_protocol(url)
     # Use anonymous access for public buckets
-    fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+    fs = (
+        fsspec.filesystem(fs_protocol, token="anon")
+        if fs_protocol == "gcs"
+        else fsspec.filesystem(fs_protocol)
+    )
 
     # Check available disk space before downloading
     object_size = get_cloud_object_size(fs, url)
@@ -445,7 +466,9 @@ def download_from_cloud(
             # Filter to only scannable files
             files = filter_scannable_files(files)
             if show_progress:
-                click.echo(f"Found {len(files)} scannable files out of {metadata['file_count']} total files")
+                click.echo(
+                    f"Found {len(files)} scannable files out of {metadata['file_count']} total files"
+                )
 
         if not files:
             raise ValueError("No scannable model files found in directory")
@@ -468,7 +491,9 @@ def download_from_cloud(
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:
-                click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
+                click.echo(
+                    f"Downloading {file_info['name']} ({file_info['human_size']})"
+                )
 
             @retry_with_backoff(max_retries=3, verbose=show_progress)
             def download_file(url=file_url, path=local_path):
@@ -493,7 +518,9 @@ def download_from_cloud(
 
         # Cache the download
         if cache:
-            cache.cache_file(url, local_file)  # Cache the actual file, not the directory
+            cache.cache_file(
+                url, local_file
+            )  # Cache the actual file, not the directory
 
         return local_file  # Return the actual file path for single files
 

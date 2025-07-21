@@ -144,11 +144,15 @@ class ParallelScanner:
         else:
             # Ensure max_workers is within reasonable bounds
             if max_workers < 1:
-                logger.warning(f"max_workers ({max_workers}) is less than 1, setting to 1")
+                logger.warning(
+                    f"max_workers ({max_workers}) is less than 1, setting to 1"
+                )
                 self.max_workers = 1
             elif max_workers > cpu_count * 4:
                 # Allow oversubscription but warn if excessive
-                logger.warning(f"max_workers ({max_workers}) is more than 4x CPU count ({cpu_count})")
+                logger.warning(
+                    f"max_workers ({max_workers}) is more than 4x CPU count ({cpu_count})"
+                )
                 self.max_workers = max_workers
             else:
                 self.max_workers = max_workers
@@ -184,7 +188,9 @@ class ParallelScanner:
             logger.debug(f"Using sequential scanning for {len(file_paths)} files")
             return self._scan_sequential(file_paths, config)
 
-        logger.info(f"Starting parallel scan of {len(file_paths)} files with {self.max_workers} workers")
+        logger.info(
+            f"Starting parallel scan of {len(file_paths)} files with {self.max_workers} workers"
+        )
 
         # Create work items
         work_items = [WorkItem(file_path, config) for file_path in file_paths]
@@ -196,7 +202,9 @@ class ParallelScanner:
         # Process files in parallel
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all work
-            future_to_work = {executor.submit(_scan_file_worker, item): item for item in work_items}
+            future_to_work = {
+                executor.submit(_scan_file_worker, item): item for item in work_items
+            }
 
             # Process results as they complete
             # Calculate a reasonable overall timeout based on number of files and workers
@@ -265,7 +273,10 @@ class ParallelScanner:
                         "message": f"Scan timeout reached after {overall_timeout}s",
                         "severity": IssueSeverity.WARNING.value,
                         "location": "",
-                        "details": {"timeout": overall_timeout, "completed": results.get("files_scanned", 0)},
+                        "details": {
+                            "timeout": overall_timeout,
+                            "completed": results.get("files_scanned", 0),
+                        },
                     }
                 )
 
@@ -367,11 +378,15 @@ class ParallelScanner:
             results["assets"].append(asset_entry)
 
             # Store metadata (already includes license information from worker)
-            results["file_metadata"][work_result.file_path] = result_data.get("metadata", {})
+            results["file_metadata"][work_result.file_path] = result_data.get(
+                "metadata", {}
+            )
 
         else:
             # Handle scan failure
-            self._add_scan_error(results, work_result.file_path, work_result.error or "Unknown error")
+            self._add_scan_error(
+                results, work_result.file_path, work_result.error or "Unknown error"
+            )
 
     def _add_scan_error(
         self,

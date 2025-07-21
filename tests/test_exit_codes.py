@@ -135,7 +135,9 @@ def test_exit_code_info_level_issues():
 def test_exit_code_empty_results():
     """Test exit code with minimal results structure."""
     results = {}
-    assert determine_exit_code(results) == 2  # Changed: no files scanned means exit code 2
+    assert (
+        determine_exit_code(results) == 2
+    )  # Changed: no files scanned means exit code 2
 
 
 def test_exit_code_no_files_scanned():

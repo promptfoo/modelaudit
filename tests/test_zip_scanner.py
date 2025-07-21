@@ -42,7 +42,9 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+            symlink_issues = [
+                i for i in result.issues if "symlink" in i.message.lower()
+            ]
             assert any("outside" in i.message.lower() for i in symlink_issues)
         finally:
             os.unlink(tmp_path)
@@ -61,7 +63,9 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+            symlink_issues = [
+                i for i in result.issues if "symlink" in i.message.lower()
+            ]
             assert any("critical system" in i.message.lower() for i in symlink_issues)
         finally:
             os.unlink(tmp_path)
@@ -99,7 +103,9 @@ class TestZipScanner:
             assert result.success is True
             assert result.bytes_scanned > 0
             # May have some debug/info issues about unknown formats
-            error_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            error_issues = [
+                i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+            ]
             assert len(error_issues) == 0
         finally:
             os.unlink(tmp_path)
@@ -144,7 +150,11 @@ class TestZipScanner:
             assert result.success is True
             # Should have scanned the nested content
             assert (
-                any("nested.zip" in str(issue.location) for issue in result.issues if hasattr(issue, "location"))
+                any(
+                    "nested.zip" in str(issue.location)
+                    for issue in result.issues
+                    if hasattr(issue, "location")
+                )
                 or result.bytes_scanned > 0
             )
         finally:
@@ -169,7 +179,8 @@ class TestZipScanner:
             traversal_issues = [
                 i
                 for i in result.issues
-                if "path traversal" in i.message.lower() or "directory traversal" in i.message.lower()
+                if "path traversal" in i.message.lower()
+                or "directory traversal" in i.message.lower()
             ]
             assert len(traversal_issues) >= 2
 
@@ -189,7 +200,9 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
+            traversal_issues = [
+                i for i in result.issues if "path traversal" in i.message.lower()
+            ]
             assert len(traversal_issues) >= 1
             for issue in traversal_issues:
                 assert issue.severity == IssueSeverity.CRITICAL
@@ -210,7 +223,9 @@ class TestZipScanner:
             assert result.success is True
 
             # Should detect high compression ratio
-            compression_issues = [i for i in result.issues if "compression ratio" in i.message.lower()]
+            compression_issues = [
+                i for i in result.issues if "compression ratio" in i.message.lower()
+            ]
             assert len(compression_issues) >= 1
         finally:
             os.unlink(tmp_path)
@@ -262,7 +277,9 @@ class TestZipScanner:
 
             assert result.success is True
             # Should have a warning about too many entries
-            entries_issues = [i for i in result.issues if "too many entries" in i.message.lower()]
+            entries_issues = [
+                i for i in result.issues if "too many entries" in i.message.lower()
+            ]
             assert len(entries_issues) >= 1
         finally:
             os.unlink(tmp_path)
@@ -315,6 +332,8 @@ class TestZipScanner:
             result = self.scanner.scan(tmp_path)
             assert result.success is False
             assert len(result.issues) > 0
-            assert any("not a valid zip" in issue.message.lower() for issue in result.issues)
+            assert any(
+                "not a valid zip" in issue.message.lower() for issue in result.issues
+            )
         finally:
             os.unlink(tmp_path)

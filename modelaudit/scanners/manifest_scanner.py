@@ -128,7 +128,8 @@ class ManifestScanner(BaseScanner):
             # (has model-related terms in path or specific extensions)
             path_lower = path.lower()
             if any(
-                ml_term in path_lower for ml_term in ["model", "checkpoint", "huggingface", "transformers"]
+                ml_term in path_lower
+                for ml_term in ["model", "checkpoint", "huggingface", "transformers"]
             ) or os.path.splitext(path)[1].lower() in [".json"]:
                 return True
 
@@ -201,7 +202,9 @@ class ManifestScanner(BaseScanner):
 
         try:
             with open(path, encoding="utf-8") as f:
-                content = f.read().lower()  # Convert to lowercase for case-insensitive matching
+                content = (
+                    f.read().lower()
+                )  # Convert to lowercase for case-insensitive matching
 
                 for pattern in self.blacklist_patterns:
                     pattern_lower = pattern.lower()
@@ -246,7 +249,9 @@ class ManifestScanner(BaseScanner):
                     return json.loads(content)
 
                 # Try YAML format if available
-                if HAS_YAML and (ext in [".yaml", ".yml"] or content.strip().startswith("---")):
+                if HAS_YAML and (
+                    ext in [".yaml", ".yml"] or content.strip().startswith("---")
+                ):
                     return yaml.safe_load(content)
 
                 # For other formats, try JSON and then YAML if available
@@ -489,7 +494,9 @@ class ManifestScanner(BaseScanner):
 
                 # Check framework patterns
                 for framework, patterns in framework_patterns.items():
-                    if any(pattern in key_str or pattern in val_str for pattern in patterns):
+                    if any(
+                        pattern in key_str or pattern in val_str for pattern in patterns
+                    ):
                         indicators["framework"] = framework
                         indicators["confidence"] += 1
 
@@ -575,7 +582,8 @@ class ManifestScanner(BaseScanner):
 
             # Credentials in ML context
             if "credentials" in matches and any(
-                pattern in key_lower for pattern in ["_token_id", "token_id_", "_token", "token_type"]
+                pattern in key_lower
+                for pattern in ["_token_id", "token_id_", "_token", "token_type"]
             ):
                 return True
 
@@ -635,7 +643,9 @@ class ManifestScanner(BaseScanner):
         # Special case for GLM (General Language Model) architecture patterns
         # GLM models use specific layer naming conventions that trigger false positives
         # GLM models can be detected as "huggingface", "pytorch", or have null framework (SafeTensors)
-        if (ml_context.get("framework") in ["huggingface", "pytorch", None]) and "execution" in matches:
+        if (
+            ml_context.get("framework") in ["huggingface", "pytorch", None]
+        ) and "execution" in matches:
             # GLM architecture patterns from models like ChatGLM, GLM-4, etc.
             # These are legitimate transformer components with GLM-specific naming
             # Note: keys include "weight_map." prefix from model index files
@@ -721,7 +731,10 @@ class ManifestScanner(BaseScanner):
         # Common path indicators
         lower_value = value.lower()
         indicators = ["/tmp", "/var", "/data", "/home", "/etc"]
-        return bool(any(indicator in lower_value for indicator in indicators) or re.search(r"[a-z]:\\", lower_value))
+        return bool(
+            any(indicator in lower_value for indicator in indicators)
+            or re.search(r"[a-z]:\\", lower_value)
+        )
 
     def _get_context_aware_severity(
         self,

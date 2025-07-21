@@ -130,7 +130,9 @@ UNLICENSED_INDICATORS = [
 
 # SPDX license metadata
 SPDX_LICENSE_PATH = Path(__file__).with_name("spdx_licenses.json")
-SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
+SPDX_LICENSE_URL = (
+    "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
+)
 _SPDX_LICENSES: Optional[dict[str, Any]] = None
 
 
@@ -240,7 +242,9 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
             license_info = LicenseInfo(
                 spdx_id=str(info["spdx_id"]) if info["spdx_id"] else None,
                 name=str(info["name"]) if info["name"] else None,
-                commercial_allowed=info["commercial_allowed"] if isinstance(info["commercial_allowed"], bool) else None,
+                commercial_allowed=info["commercial_allowed"]
+                if isinstance(info["commercial_allowed"], bool)
+                else None,
                 source="file_header",
                 confidence=0.8,  # High confidence for explicit patterns
             )
@@ -350,7 +354,9 @@ def detect_unlicensed_datasets(file_paths: list[str]) -> list[str]:
             # Check if there's a nearby license file
             dir_path = Path(file_path).parent
             try:
-                existing_files = {f.name.lower() for f in dir_path.iterdir() if f.is_file()}
+                existing_files = {
+                    f.name.lower() for f in dir_path.iterdir() if f.is_file()
+                }
                 has_license = bool(LICENSE_FILES & existing_files)
             except OSError:
                 has_license = False
@@ -426,12 +432,15 @@ def _is_ml_model_directory(file_paths: list[str]) -> bool:
 
     # Check for model weight files with typical patterns
     has_weight_files = any(
-        "model" in filename and any(ext in filename for ext in [".bin", ".h5", ".safetensors"])
+        "model" in filename
+        and any(ext in filename for ext in [".bin", ".h5", ".safetensors"])
         for filename in filenames
     )
 
     # Check for config files
-    has_config_files = any("config" in filename and filename.endswith(".json") for filename in filenames)
+    has_config_files = any(
+        "config" in filename and filename.endswith(".json") for filename in filenames
+    )
 
     return has_ml_files or (has_weight_files and has_config_files)
 
@@ -469,7 +478,9 @@ def _get_spdx_info(spdx_id: str) -> Optional[dict[str, Any]]:
     return licenses.get(spdx_id)
 
 
-def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False) -> list[dict[str, Any]]:
+def check_spdx_license_issues(
+    scan_results: dict[str, Any], strict: bool = False
+) -> list[dict[str, Any]]:
     """Check for deprecated or incompatible licenses using SPDX data."""
     warnings: list[dict[str, Any]] = []
     file_metadata = scan_results.get("file_metadata", {})
@@ -502,7 +513,9 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
             {
                 "type": "license_warning",
                 "severity": "error" if strict else "warning",
-                "message": (f"Deprecated licenses detected ({len(deprecated_files)} files)."),
+                "message": (
+                    f"Deprecated licenses detected ({len(deprecated_files)} files)."
+                ),
                 "details": {
                     "files": deprecated_files[:5],
                     "total_count": len(deprecated_files),
@@ -515,7 +528,9 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
             {
                 "type": "license_warning",
                 "severity": "error" if strict else "warning",
-                "message": (f"Incompatible licenses detected ({len(incompatible_files)} files)."),
+                "message": (
+                    f"Incompatible licenses detected ({len(incompatible_files)} files)."
+                ),
                 "details": {
                     "files": incompatible_files[:5],
                     "total_count": len(incompatible_files),
@@ -526,7 +541,9 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
     return warnings
 
 
-def check_commercial_use_warnings(scan_results: dict[str, Any], *, strict: bool = False) -> list[dict[str, Any]]:
+def check_commercial_use_warnings(
+    scan_results: dict[str, Any], *, strict: bool = False
+) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 

@@ -25,7 +25,10 @@ class TensorRTScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        return (
+            os.path.isfile(path)
+            and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        )
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)

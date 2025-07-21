@@ -24,7 +24,9 @@ class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
     name = "openvino"
-    description = "Scans OpenVINO IR models for suspicious layers and external references"
+    description = (
+        "Scans OpenVINO IR models for suspicious layers and external references"
+    )
     supported_extensions: ClassVar[list[str]] = [".xml"]
 
     @classmethod
@@ -75,7 +77,9 @@ class OpenVinoScanner(BaseScanner):
         if version:
             result.metadata["ir_version"] = version
 
-        suspicious_pattern = re.compile("|".join(SUSPICIOUS_STRING_PATTERNS), re.IGNORECASE)
+        suspicious_pattern = re.compile(
+            "|".join(SUSPICIOUS_STRING_PATTERNS), re.IGNORECASE
+        )
 
         for layer in root.findall(".//layer"):
             layer_type = layer.attrib.get("type", "").lower()

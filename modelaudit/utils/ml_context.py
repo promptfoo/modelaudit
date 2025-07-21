@@ -38,8 +38,12 @@ def analyze_binary_for_ml_context(data: bytes, file_size: int = 0) -> dict[str, 
 
     # Calculate statistical expectation for random patterns
     if file_size > 0:
-        context["statistical_expectation"] = _calculate_pattern_expectation(len(data), file_size)
-        context["file_size_factor"] = min(file_size / (100 * 1024 * 1024), 1.0)  # Cap at 100MB
+        context["statistical_expectation"] = _calculate_pattern_expectation(
+            len(data), file_size
+        )
+        context["file_size_factor"] = min(
+            file_size / (100 * 1024 * 1024), 1.0
+        )  # Cap at 100MB
 
     # Detect weight-like characteristics
     weight_indicators = _detect_weight_characteristics(data)
@@ -92,7 +96,9 @@ def should_ignore_executable_signature(
 
     # Shell script shebangs are the most common false positive in weight data
     if signature == b"#!/":
-        return _should_ignore_shebang_pattern(ml_context, pattern_density, total_patterns)
+        return _should_ignore_shebang_pattern(
+            ml_context, pattern_density, total_patterns
+        )
 
     # Always flag actual executables at file start (for other signatures)
     if offset < 1024:  # First 1KB should not contain weight data
@@ -129,9 +135,13 @@ def _should_ignore_shebang_pattern(
         # Adjust multiplier based on file size and confidence
         # Large ML models (>100MB) can have more coincidental patterns
         if file_size_factor > 0.5:  # File > 50MB
-            multiplier = 10 + (weight_confidence - 0.6) * 25  # 10x to 20x for very confident
+            multiplier = (
+                10 + (weight_confidence - 0.6) * 25
+            )  # 10x to 20x for very confident
         else:
-            multiplier = 5 + (weight_confidence - 0.6) * 12.5  # 5x to 10x for smaller files
+            multiplier = (
+                5 + (weight_confidence - 0.6) * 12.5
+            )  # 5x to 10x for smaller files
 
         if total_patterns <= expected_patterns * multiplier:
             return True
@@ -176,7 +186,9 @@ def _analyze_float_patterns(data: bytes) -> dict[str, float]:
             if (
                 value == value  # Not NaN
                 and abs(value) < 1e10  # Not extremely large
-                and (value == 0.0 or abs(value) > 1e-10)  # Not extremely small (unless zero)
+                and (
+                    value == 0.0 or abs(value) > 1e-10
+                )  # Not extremely small (unless zero)
             ):
                 valid_floats += 1
 
@@ -194,7 +206,9 @@ def _detect_weight_characteristics(data: bytes) -> dict[str, float]:
 
     # Sample some float values for statistical analysis
     values = []
-    for i in range(0, min(len(data) - 4, 1000), 8):  # Sample every 8 bytes, max 125 samples
+    for i in range(
+        0, min(len(data) - 4, 1000), 8
+    ):  # Sample every 8 bytes, max 125 samples
         try:
             value = struct.unpack("f", data[i : i + 4])[0]
             if value == value and abs(value) < 1e6:  # Filter out NaN and extreme values
@@ -216,7 +230,9 @@ def _detect_weight_characteristics(data: bytes) -> dict[str, float]:
 
     # 2. Distribution is often roughly normal-ish (not too skewed)
     # Simple check: most values within 3 standard deviations
-    within_3_sigma = sum(1 for v in values if abs(v - mean_val) <= 3 * std_dev) / len(values)
+    within_3_sigma = sum(1 for v in values if abs(v - mean_val) <= 3 * std_dev) / len(
+        values
+    )
     distribution_score = min(within_3_sigma, 1.0)
 
     return {
@@ -239,7 +255,9 @@ def _calculate_pattern_expectation(chunk_size: int, file_size: int) -> float:
         return 0.0
 
     possible_positions = max(chunk_size - 2, 1)  # Number of 3-byte positions in chunk
-    probability_per_position = 1.0 / (256.0**3)  # Probability of specific 3-byte pattern
+    probability_per_position = 1.0 / (
+        256.0**3
+    )  # Probability of specific 3-byte pattern
 
     return possible_positions * probability_per_position
 
@@ -252,13 +270,23 @@ def get_ml_context_explanation(ml_context: dict[str, Any], pattern_count: int) -
     explanations = []
 
     if ml_context.get("weight_confidence", 0) > 0.7:
-        explanations.append(f"High confidence ML weights (score: {ml_context['weight_confidence']:.2f})")
+        explanations.append(
+            f"High confidence ML weights (score: {ml_context['weight_confidence']:.2f})"
+        )
 
     if ml_context.get("float_ratio", 0) > 0.6:
-        explanations.append(f"High floating-point data ratio ({ml_context['float_ratio']:.1%})")
+        explanations.append(
+            f"High floating-point data ratio ({ml_context['float_ratio']:.1%})"
+        )
 
     expected = ml_context.get("statistical_expectation", 0)
     if expected > 0 and pattern_count > 2 and pattern_count <= expected * 3:
-        explanations.append(f"Pattern count ({pattern_count}) within statistical expectation ({expected:.1f})")
+        explanations.append(
+            f"Pattern count ({pattern_count}) within statistical expectation ({expected:.1f})"
+        )
 
-    return "; ".join(explanations) if explanations else "Appears to be legitimate ML weight data"
+    return (
+        "; ".join(explanations)
+        if explanations
+        else "Appears to be legitimate ML weight data"
+    )

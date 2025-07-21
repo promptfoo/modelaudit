@@ -52,9 +52,12 @@ class TestCLILicenseIntegration:
         critical_issues = [
             issue
             for issue in output_data.get("issues", [])
-            if issue.get("severity") == "critical" and issue.get("type") == "license_warning"
+            if issue.get("severity") == "critical"
+            and issue.get("type") == "license_warning"
         ]
-        assert len(critical_issues) == 0, "MIT model should not have critical license issues"
+        assert (
+            len(critical_issues) == 0
+        ), "MIT model should not have critical license issues"
 
     def test_cli_agpl_component_warnings(self, test_data_dir, cli_command):
         """Test CLI scanning of AGPL component triggers warnings."""
@@ -62,23 +65,38 @@ class TestCLILicenseIntegration:
 
         # Run CLI scan with --no-skip-files to scan the .py file containing AGPL license
         result = subprocess.run(
-            [*cli_command, "scan", str(agpl_dir), "--format", "json", "--no-skip-files"],
+            [
+                *cli_command,
+                "scan",
+                str(agpl_dir),
+                "--format",
+                "json",
+                "--no-skip-files",
+            ],
             capture_output=True,
             text=True,
         )
 
         # Should succeed with warnings (exit code 1 = issues found)
-        assert result.returncode == 1, f"AGPL scan should trigger warnings. Exit code: {result.returncode}"
+        assert (
+            result.returncode == 1
+        ), f"AGPL scan should trigger warnings. Exit code: {result.returncode}"
 
         # Parse JSON output
         output_data = json.loads(result.stdout)
 
         # Should have license warning issues
-        license_issues = [issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning"]
+        license_issues = [
+            issue
+            for issue in output_data.get("issues", [])
+            if issue.get("type") == "license_warning"
+        ]
         assert len(license_issues) > 0, "Should have license warning issues"
 
         # Should have AGPL warning
-        agpl_issues = [issue for issue in license_issues if "AGPL" in issue.get("message", "")]
+        agpl_issues = [
+            issue for issue in license_issues if "AGPL" in issue.get("message", "")
+        ]
 
         assert len(agpl_issues) > 0, "Should have AGPL-specific warnings"
 
@@ -108,7 +126,8 @@ class TestCLILicenseIntegration:
         dataset_issues = [
             issue
             for issue in output_data.get("issues", [])
-            if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
+            if issue.get("type") == "license_warning"
+            and "unspecified licenses" in issue.get("message", "")
         ]
         assert len(dataset_issues) > 0, "Should warn about unlicensed datasets"
 
@@ -145,7 +164,8 @@ class TestCLILicenseIntegration:
 
             # Components should have properties
             has_properties = any(
-                "properties" in component and len(component["properties"]) > 0 for component in components
+                "properties" in component and len(component["properties"]) > 0
+                for component in components
             )
             assert has_properties, "Components should have license-related properties"
 
@@ -170,9 +190,9 @@ class TestCLILicenseIntegration:
 
         # Check for license-related content in output
         output_text = result.stdout + result.stderr
-        assert "license" in output_text.lower() or "agpl" in output_text.lower(), (
-            "Verbose output should mention license-related information"
-        )
+        assert (
+            "license" in output_text.lower() or "agpl" in output_text.lower()
+        ), "Verbose output should mention license-related information"
 
     def test_cli_mixed_licenses_comprehensive(self, test_data_dir, cli_command):
         """Test CLI scanning of mixed license directory."""
@@ -189,10 +209,16 @@ class TestCLILicenseIntegration:
         output_data = json.loads(result.stdout)
 
         # Should have scanned multiple files
-        assert output_data["files_scanned"] > 1, "Should scan multiple files in mixed directory"
+        assert (
+            output_data["files_scanned"] > 1
+        ), "Should scan multiple files in mixed directory"
 
         # Should detect multiple license types or have warnings
-        license_issues = [issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning"]
+        license_issues = [
+            issue
+            for issue in output_data.get("issues", [])
+            if issue.get("type") == "license_warning"
+        ]
 
         # Print for debugging
         print("Mixed licenses scan results:")
@@ -214,7 +240,9 @@ class TestCLILicenseIntegration:
         assert result.returncode == 2, "Should return error code 2 for missing files"
 
         # Should have error message
-        assert len(result.stderr) > 0 or "Error" in result.stdout, "Should show error message"
+        assert (
+            len(result.stderr) > 0 or "Error" in result.stdout
+        ), "Should show error message"
 
     def test_cli_help_includes_license_features(self, cli_command):
         """Test that CLI help mentions license-related features."""
@@ -277,23 +305,39 @@ class TestCLILicenseIntegration:
 
             # Run comprehensive scan
             result = subprocess.run(
-                [*cli_command, "scan", str(temp_path), "--format", "json", "--sbom", str(sbom_path), "--verbose"],
+                [
+                    *cli_command,
+                    "scan",
+                    str(temp_path),
+                    "--format",
+                    "json",
+                    "--sbom",
+                    str(sbom_path),
+                    "--verbose",
+                ],
                 capture_output=True,
                 text=True,
             )
 
             # Should complete (may have warnings)
-            assert result.returncode in [0, 1], f"Scan should complete. Exit code: {result.returncode}"
+            assert result.returncode in [
+                0,
+                1,
+            ], f"Scan should complete. Exit code: {result.returncode}"
 
             # Parse results
             output_data = json.loads(result.stdout)
 
             # Should scan multiple files
-            assert output_data["files_scanned"] > 5, "Should scan many files in comprehensive test"
+            assert (
+                output_data["files_scanned"] > 5
+            ), "Should scan many files in comprehensive test"
 
             # Should have various license warnings
             license_issues = [
-                issue for issue in output_data.get("issues", []) if issue.get("type") == "license_warning"
+                issue
+                for issue in output_data.get("issues", [])
+                if issue.get("type") == "license_warning"
             ]
 
             # Should detect different types of license issues

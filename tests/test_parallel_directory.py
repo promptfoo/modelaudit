@@ -178,7 +178,9 @@ class TestScanDirectoryParallel:
             def progress_callback(message, percentage):
                 progress_calls.append((message, percentage))
 
-            results = scan_directory_parallel(tmpdir, {}, progress_callback=progress_callback)
+            results = scan_directory_parallel(
+                tmpdir, {}, progress_callback=progress_callback
+            )
 
             assert results["files_scanned"] == 5
             assert len(progress_calls) > 0

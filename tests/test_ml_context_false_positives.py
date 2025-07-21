@@ -73,7 +73,9 @@ class TestMLContextDetection(unittest.TestCase):
         }
 
         # Should never ignore patterns at file start
-        should_ignore = should_ignore_executable_signature(b"#!/", 0, ml_context, pattern_density=100, total_patterns=1)
+        should_ignore = should_ignore_executable_signature(
+            b"#!/", 0, ml_context, pattern_density=100, total_patterns=1
+        )
         self.assertFalse(should_ignore)
 
     def test_should_not_ignore_elf_without_strong_evidence(self):
@@ -131,7 +133,11 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
                 # Strategically inject shebang patterns at regular intervals
                 # to simulate the statistical occurrence in real weight data
                 shebang_pattern = b"#!/"
-                interval = len(weight_data) // num_shebangs if num_shebangs > 0 else len(weight_data)
+                interval = (
+                    len(weight_data) // num_shebangs
+                    if num_shebangs > 0
+                    else len(weight_data)
+                )
 
                 for i in range(num_shebangs):
                     pos = (i + 1) * interval
@@ -146,7 +152,9 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
                 os.unlink(f.name)
                 raise
 
-    @unittest.skip("Skipping due to test environment differences - core functionality verified with real models")
+    @unittest.skip(
+        "Skipping due to test environment differences - core functionality verified with real models"
+    )
     def test_pickle_scanner_reduces_shebang_false_positives(self):
         """Test that pickle scanner reduces false positives in weight data."""
         scanner = PickleScanner()
@@ -164,19 +172,25 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
             critical_shebang_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity == IssueSeverity.CRITICAL and "Shell script shebang" in issue.message
+                if issue.severity == IssueSeverity.CRITICAL
+                and "Shell script shebang" in issue.message
             ]
 
             info_ignored_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity == IssueSeverity.INFO and "false positive" in issue.message.lower()
+                if issue.severity == IssueSeverity.INFO
+                and "false positive" in issue.message.lower()
             ]
 
             # The ML context should either reduce critical issues or provide info about ignored patterns
             if len(info_ignored_issues) > 0:
                 # If we have info messages, that's good - means filtering worked
-                self.assertGreater(len(info_ignored_issues), 0, "Should have info about ignored false positives")
+                self.assertGreater(
+                    len(info_ignored_issues),
+                    0,
+                    "Should have info about ignored false positives",
+                )
             else:
                 # Otherwise, should have significantly fewer critical issues than total patterns injected
                 self.assertLess(
@@ -188,15 +202,27 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
             # Check that ML context was detected
             ml_context_confidence = 0
             for issue in result.issues:
-                if hasattr(issue, "details") and issue.details and "ml_context_confidence" in issue.details:
-                    ml_context_confidence = max(ml_context_confidence, issue.details["ml_context_confidence"])
+                if (
+                    hasattr(issue, "details")
+                    and issue.details
+                    and "ml_context_confidence" in issue.details
+                ):
+                    ml_context_confidence = max(
+                        ml_context_confidence, issue.details["ml_context_confidence"]
+                    )
 
-            self.assertGreater(ml_context_confidence, 0.5, "Should have detected ML context in weight data")
+            self.assertGreater(
+                ml_context_confidence,
+                0.5,
+                "Should have detected ML context in weight data",
+            )
 
         finally:
             os.unlink(test_file)
 
-    @unittest.skip("Skipping due to test environment differences - core functionality verified with real models")
+    @unittest.skip(
+        "Skipping due to test environment differences - core functionality verified with real models"
+    )
     def test_pickle_scanner_still_detects_real_threats(self):
         """Test that scanner still detects actual executable threats."""
         scanner = PickleScanner()
@@ -211,7 +237,9 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
 
                 # Add malicious executable content after the pickle (not at the beginning)
                 # This simulates a file with embedded executable at the start of binary section
-                malicious_content = b"#!/bin/bash\necho 'I am malicious code'\n" + b"A" * 1000
+                malicious_content = (
+                    b"#!/bin/bash\necho 'I am malicious code'\n" + b"A" * 1000
+                )
                 f.write(malicious_content)
                 f.flush()
 
@@ -221,10 +249,15 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
                 critical_issues = [
                     issue
                     for issue in result.issues
-                    if issue.severity == IssueSeverity.CRITICAL and "Shell script shebang" in issue.message
+                    if issue.severity == IssueSeverity.CRITICAL
+                    and "Shell script shebang" in issue.message
                 ]
 
-                self.assertGreater(len(critical_issues), 0, "Should detect shebang in binary content as critical")
+                self.assertGreater(
+                    len(critical_issues),
+                    0,
+                    "Should detect shebang in binary content as critical",
+                )
 
             finally:
                 os.unlink(f.name)
@@ -249,11 +282,17 @@ class TestPyTorchBinaryScannerFalsePositiveReduction(unittest.TestCase):
 
                 # Inject shebang patterns to simulate coincidental occurrence
                 shebang_pattern = b"#!/"
-                interval = len(tensor_data) // num_shebangs if num_shebangs > 0 else len(tensor_data)
+                interval = (
+                    len(tensor_data) // num_shebangs
+                    if num_shebangs > 0
+                    else len(tensor_data)
+                )
 
                 for i in range(num_shebangs):
                     pos = (i + 1) * interval
-                    if pos + 3 < len(tensor_data) and pos % 4 == 0:  # Align to 4-byte boundaries for floats
+                    if (
+                        pos + 3 < len(tensor_data) and pos % 4 == 0
+                    ):  # Align to 4-byte boundaries for floats
                         tensor_data[pos : pos + 3] = shebang_pattern
 
                 f.write(tensor_data)
@@ -282,19 +321,25 @@ class TestPyTorchBinaryScannerFalsePositiveReduction(unittest.TestCase):
             critical_shebang_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity == IssueSeverity.CRITICAL and "Shell script shebang" in issue.message
+                if issue.severity == IssueSeverity.CRITICAL
+                and "Shell script shebang" in issue.message
             ]
 
             info_ignored_issues = [
                 issue
                 for issue in result.issues
-                if issue.severity == IssueSeverity.INFO and "false positive" in issue.message.lower()
+                if issue.severity == IssueSeverity.INFO
+                and "false positive" in issue.message.lower()
             ]
 
             # The key test: should have either reduced critical issues OR info messages about ignored patterns
             if len(info_ignored_issues) > 0:
                 # If we have info messages, that means the filtering worked
-                self.assertGreater(len(info_ignored_issues), 0, "Should have info about ignored patterns")
+                self.assertGreater(
+                    len(info_ignored_issues),
+                    0,
+                    "Should have info about ignored patterns",
+                )
             else:
                 # Otherwise, should have fewer critical issues than we injected
                 self.assertLess(

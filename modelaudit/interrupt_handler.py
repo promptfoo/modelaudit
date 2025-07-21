@@ -103,8 +103,12 @@ class InterruptHandler:
 
             try:
                 # Store original handlers
-                self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
-                self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
+                self._original_sigint_handler = signal.signal(
+                    signal.SIGINT, self._signal_handler
+                )
+                self._original_sigterm_handler = signal.signal(
+                    signal.SIGTERM, self._signal_handler
+                )
                 self._active = True
                 logger.debug("Interrupt handlers installed")
                 yield

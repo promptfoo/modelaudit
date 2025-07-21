@@ -58,7 +58,9 @@ class GgufScanner(BaseScanner):
     """Scanner for GGUF/GGML model files with comprehensive parsing and security checks."""
 
     name = "gguf"
-    description = "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
+    description = (
+        "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
+    )
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -131,7 +133,9 @@ class GgufScanner(BaseScanner):
             return result
 
         result.finish(
-            success=not any(i.severity == IssueSeverity.CRITICAL for i in result.issues),
+            success=not any(
+                i.severity == IssueSeverity.CRITICAL for i in result.issues
+            ),
         )
         return result
 
@@ -201,7 +205,9 @@ class GgufScanner(BaseScanner):
                 metadata[key] = value
 
                 # Security check for suspicious values
-                if isinstance(value, str) and any(p in value for p in ("/", "\\", ";", "&&", "|", "`")):
+                if isinstance(value, str) and any(
+                    p in value for p in ("/", "\\", ";", "&&", "|", "`")
+                ):
                     result.add_issue(
                         f"Suspicious metadata value for key '{key}': {value}",
                         severity=IssueSeverity.INFO,
@@ -265,7 +271,10 @@ class GgufScanner(BaseScanner):
                     },
                 )
 
-            result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
+            result.metadata["tensors"] = [
+                {"name": t["name"], "type": t["type"], "dims": t["dims"]}
+                for t in tensors
+            ]
         except Exception as e:
             result.add_issue(
                 f"GGUF tensor parse error: {e}",
@@ -320,7 +329,11 @@ class GgufScanner(BaseScanner):
                         )
 
                     expected = ((nelements + blck - 1) // blck) * ts
-                    next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
+                    next_offset = (
+                        tensors[idx + 1]["offset"]
+                        if idx + 1 < len(tensors)
+                        else file_size
+                    )
                     actual = next_offset - tensor["offset"]
 
                     if expected != actual:

@@ -31,7 +31,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     name = "tf_savedmodel"
     description = "Scans TensorFlow SavedModel for suspicious operations"
-    supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
+    supported_extensions: ClassVar[list[str]] = [
+        ".pb",
+        "",
+    ]  # Empty string for directories
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -156,7 +159,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
 
                 # Check for blacklist patterns in text files
-                if hasattr(self, "config") and self.config and "blacklist_patterns" in self.config:
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                ):
                     blacklist_patterns = self.config["blacklist_patterns"]
                     try:
                         # Only check text files
@@ -227,7 +234,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             "op_type": node.op,
                             "node_name": node.name,
                             "meta_graph": (
-                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                meta_graph.meta_info_def.tags[0]
+                                if meta_graph.meta_info_def.tags
+                                else "unknown"
                             ),
                         },
                         why=get_tf_op_explanation(node.op),

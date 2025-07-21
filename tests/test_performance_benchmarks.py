@@ -65,11 +65,17 @@ class TestPerformanceBenchmarks:
             "duration_avg": statistics.mean(durations),
             "duration_min": min(durations),
             "duration_max": max(durations),
-            "duration_stdev": statistics.stdev(durations) if len(durations) > 1 else 0.0,
+            "duration_stdev": statistics.stdev(durations)
+            if len(durations) > 1
+            else 0.0,
             "files_scanned": files_scanned,
             "bytes_scanned": bytes_scanned,
-            "files_per_second": files_scanned / statistics.mean(durations) if statistics.mean(durations) > 0 else 0,
-            "bytes_per_second": bytes_scanned / statistics.mean(durations) if statistics.mean(durations) > 0 else 0,
+            "files_per_second": files_scanned / statistics.mean(durations)
+            if statistics.mean(durations) > 0
+            else 0,
+            "bytes_per_second": bytes_scanned / statistics.mean(durations)
+            if statistics.mean(durations) > 0
+            else 0,
             "all_successful": all(r["success"] for r in results),
         }
 
@@ -77,7 +83,9 @@ class TestPerformanceBenchmarks:
         """Benchmark single file scanning performance."""
         test_files = [
             "safe_pickle.pkl",
-            "malicious_pickle.pkl" if (assets_dir / "malicious_pickle.pkl").exists() else "evil_pickle.pkl",
+            "malicious_pickle.pkl"
+            if (assets_dir / "malicious_pickle.pkl").exists()
+            else "evil_pickle.pkl",
             "safe_keras.h5",
             "malicious_keras.h5",
         ]
@@ -91,22 +99,28 @@ class TestPerformanceBenchmarks:
 
             # Performance assertions
             assert metrics["all_successful"], f"Not all scans successful for {filename}"
-            assert metrics["duration_avg"] < performance_thresholds["single_file_scan_max_time"], (
-                f"Average scan time {metrics['duration_avg']:.2f}s too slow for {filename}"
-            )
-            assert metrics["files_per_second"] >= performance_thresholds["files_per_second_min"], (
-                f"Files per second {metrics['files_per_second']:.2f} too low for {filename}"
-            )
+            assert (
+                metrics["duration_avg"]
+                < performance_thresholds["single_file_scan_max_time"]
+            ), f"Average scan time {metrics['duration_avg']:.2f}s too slow for {filename}"
+            assert (
+                metrics["files_per_second"]
+                >= performance_thresholds["files_per_second_min"]
+            ), f"Files per second {metrics['files_per_second']:.2f} too low for {filename}"
 
             # Consistency check - standard deviation should be reasonable
             if metrics["duration_stdev"] > 0:
-                cv = metrics["duration_stdev"] / metrics["duration_avg"]  # Coefficient of variation
+                cv = (
+                    metrics["duration_stdev"] / metrics["duration_avg"]
+                )  # Coefficient of variation
                 # More lenient CV threshold for CI environments
                 import os
 
                 is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
                 cv_threshold = 2.0 if is_ci else 0.5
-                assert cv < cv_threshold, f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
+                assert (
+                    cv < cv_threshold
+                ), f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
 
     def test_directory_scanning_performance(self, assets_dir, performance_thresholds):
         """Benchmark directory scanning performance."""
@@ -117,15 +131,17 @@ class TestPerformanceBenchmarks:
 
         # Performance assertions
         assert metrics["all_successful"], "Not all directory scans successful"
-        assert metrics["duration_avg"] < performance_thresholds["directory_scan_max_time"], (
-            f"Average directory scan time {metrics['duration_avg']:.2f}s too slow"
-        )
-        assert metrics["files_per_second"] >= performance_thresholds["files_per_second_min"], (
-            f"Files per second {metrics['files_per_second']:.2f} too low"
-        )
-        assert metrics["bytes_per_second"] >= performance_thresholds["bytes_per_second_min"], (
-            f"Bytes per second {metrics['bytes_per_second']:.2f} too low"
-        )
+        assert (
+            metrics["duration_avg"] < performance_thresholds["directory_scan_max_time"]
+        ), f"Average directory scan time {metrics['duration_avg']:.2f}s too slow"
+        assert (
+            metrics["files_per_second"]
+            >= performance_thresholds["files_per_second_min"]
+        ), f"Files per second {metrics['files_per_second']:.2f} too low"
+        assert (
+            metrics["bytes_per_second"]
+            >= performance_thresholds["bytes_per_second_min"]
+        ), f"Bytes per second {metrics['bytes_per_second']:.2f} too low"
 
         # Should scan multiple files
         assert metrics["files_scanned"] > 1, "Should scan multiple files in directory"
@@ -141,7 +157,11 @@ class TestPerformanceBenchmarks:
         import tempfile
 
         # Get list of asset files
-        asset_files = [f for f in assets_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+        asset_files = [
+            f
+            for f in assets_dir.iterdir()
+            if f.is_file() and not f.name.startswith(".")
+        ]
         if len(asset_files) < 3:
             pytest.skip("Not enough asset files for scaling test")
 
@@ -173,7 +193,9 @@ class TestPerformanceBenchmarks:
 
             # Allow some degradation but not complete linear scaling
             degradation_ratio = small_fps / large_fps if large_fps > 0 else float("inf")
-            assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
+            assert (
+                degradation_ratio < 5.0
+            ), f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
     def test_memory_usage_stability(self, assets_dir):
@@ -231,7 +253,9 @@ class TestPerformanceBenchmarks:
                 concurrent_results.append(result)
 
         # All scans should succeed
-        assert all(r["success"] for r in concurrent_results), "All concurrent scans should succeed"
+        assert all(
+            r["success"] for r in concurrent_results
+        ), "All concurrent scans should succeed"
 
         # Performance should not degrade too much under concurrency
         avg_duration = statistics.mean(r["duration"] for r in concurrent_results)
@@ -252,7 +276,9 @@ class TestPerformanceBenchmarks:
             )
         # Increased threshold for CI environments
         overhead_threshold = 15.0
-        assert concurrency_overhead < overhead_threshold, f"Concurrency overhead too high: {concurrency_overhead:.2f}x"
+        assert (
+            concurrency_overhead < overhead_threshold
+        ), f"Concurrency overhead too high: {concurrency_overhead:.2f}x"
 
     def test_large_file_handling(self, assets_dir):
         """Test performance with large files (if available)."""
@@ -278,7 +304,9 @@ class TestPerformanceBenchmarks:
 
             # Calculate throughput
             throughput = large_file_size / duration if duration > 0 else 0
-            assert throughput > 100 * 1024, f"Throughput too low: {throughput:.0f} bytes/s"
+            assert (
+                throughput > 100 * 1024
+            ), f"Throughput too low: {throughput:.0f} bytes/s"
 
         finally:
             temp_path.unlink()
@@ -297,14 +325,18 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result["files_scanned"] == first_result["files_scanned"], (
-                f"Inconsistent files_scanned on run {i + 1}"
-            )
-            assert result["bytes_scanned"] == first_result["bytes_scanned"], (
-                f"Inconsistent bytes_scanned on run {i + 1}"
-            )
-            assert len(result["issues"]) == len(first_result["issues"]), f"Inconsistent issue count on run {i + 1}"
-            assert result["success"] == first_result["success"], f"Inconsistent success status on run {i + 1}"
+            assert (
+                result["files_scanned"] == first_result["files_scanned"]
+            ), f"Inconsistent files_scanned on run {i + 1}"
+            assert (
+                result["bytes_scanned"] == first_result["bytes_scanned"]
+            ), f"Inconsistent bytes_scanned on run {i + 1}"
+            assert len(result["issues"]) == len(
+                first_result["issues"]
+            ), f"Inconsistent issue count on run {i + 1}"
+            assert (
+                result["success"] == first_result["success"]
+            ), f"Inconsistent success status on run {i + 1}"
 
     def test_timeout_performance(self, assets_dir):
         """Test that timeout handling doesn't significantly impact performance."""
@@ -339,8 +371,14 @@ class TestPerformanceBenchmarks:
         assert results_short_timeout["success"], "Short timeout scan should succeed"
 
         # Results should be consistent
-        assert results_long_timeout["files_scanned"] == results_short_timeout["files_scanned"]
-        assert results_long_timeout["bytes_scanned"] == results_short_timeout["bytes_scanned"]
+        assert (
+            results_long_timeout["files_scanned"]
+            == results_short_timeout["files_scanned"]
+        )
+        assert (
+            results_long_timeout["bytes_scanned"]
+            == results_short_timeout["bytes_scanned"]
+        )
 
         # Performance should be similar (timeout mechanism shouldn't add overhead)
         timeout_overhead = abs(duration_long - duration_short) / min(
@@ -353,10 +391,12 @@ class TestPerformanceBenchmarks:
 
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
         # Increased thresholds to account for enhanced security scanning
-        overhead_threshold = 25.0 if is_ci else 5.0  # Allow up to 2500% variance in CI, 500% locally
-        assert timeout_overhead < overhead_threshold, (
-            f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
-        )
+        overhead_threshold = (
+            25.0 if is_ci else 5.0
+        )  # Allow up to 2500% variance in CI, 500% locally
+        assert (
+            timeout_overhead < overhead_threshold
+        ), f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
 
     @pytest.mark.slow
     def test_stress_performance(self, assets_dir):
@@ -408,7 +448,9 @@ class TestPerformanceBenchmarks:
             # Skip CV check in local environments due to high variance
             pytest.skip(f"Skipping CV check in local environment (CV={cv:.2f})")
         cv_threshold = 2.5  # Increased threshold for CI environments
-        assert cv < cv_threshold, f"Performance too inconsistent over time (CV={cv:.2f})"
+        assert (
+            cv < cv_threshold
+        ), f"Performance too inconsistent over time (CV={cv:.2f})"
 
     def benchmark_and_save_results(
         self,
@@ -425,7 +467,11 @@ class TestPerformanceBenchmarks:
         }
 
         # Add individual file benchmarks
-        asset_files = [f for f in assets_dir.iterdir() if f.is_file() and f.suffix in {".pkl", ".h5", ".pt"}]
+        asset_files = [
+            f
+            for f in assets_dir.iterdir()
+            if f.is_file() and f.suffix in {".pkl", ".h5", ".pt"}
+        ]
         benchmark_results["individual_files"] = {}
 
         for asset_file in asset_files[:5]:  # Limit to first 5 files

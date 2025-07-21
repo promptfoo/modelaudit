@@ -18,7 +18,9 @@ class FlaxMsgpackScanner(BaseScanner):
     """Scanner for Flax/JAX msgpack checkpoint files with enhanced security threat detection."""
 
     name = "flax_msgpack"
-    description = "Scans Flax/JAX msgpack checkpoints for security threats and integrity issues"
+    description = (
+        "Scans Flax/JAX msgpack checkpoints for security threats and integrity issues"
+    )
     # Enhanced file extension support for JAX/Flax ecosystem
     supported_extensions: ClassVar[list[str]] = [
         ".msgpack",
@@ -34,7 +36,9 @@ class FlaxMsgpackScanner(BaseScanner):
             500 * 1024 * 1024,  # Increased to 500MB for large language models
         )
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
-        self.max_items_per_container = self.config.get("max_items_per_container", 50000)  # Increased for large models
+        self.max_items_per_container = self.config.get(
+            "max_items_per_container", 50000
+        )  # Increased for large models
 
         # Enhanced suspicious patterns for JAX/Flax specific threats
         self.suspicious_patterns = self.config.get(
@@ -173,7 +177,10 @@ class FlaxMsgpackScanner(BaseScanner):
             return True
 
         # For files without clear extensions, check if they might be msgpack
-        if HAS_MSGPACK and ext in [".ckpt", ""]:  # Some JAX checkpoints have no extension
+        if HAS_MSGPACK and ext in [
+            ".ckpt",
+            "",
+        ]:  # Some JAX checkpoints have no extension
             try:
                 with open(path, "rb") as f:
                     # Read first few bytes to check for msgpack format
@@ -237,11 +244,20 @@ class FlaxMsgpackScanner(BaseScanner):
                 metadata["architecture_hints"].extend(found_patterns)
 
         # Determine likely model type based on patterns
-        if any(p in metadata["architecture_hints"] for p in self.jax_patterns["transformer_patterns"]):
+        if any(
+            p in metadata["architecture_hints"]
+            for p in self.jax_patterns["transformer_patterns"]
+        ):
             metadata["model_type"] = "transformer"
-        elif any(p in metadata["architecture_hints"] for p in self.jax_patterns["cnn_patterns"]):
+        elif any(
+            p in metadata["architecture_hints"]
+            for p in self.jax_patterns["cnn_patterns"]
+        ):
             metadata["model_type"] = "cnn"
-        elif any(p in metadata["architecture_hints"] for p in self.jax_patterns["embedding_patterns"]):
+        elif any(
+            p in metadata["architecture_hints"]
+            for p in self.jax_patterns["embedding_patterns"]
+        ):
             metadata["model_type"] = "embedding"
 
         # Check for optimizer state
@@ -255,7 +271,12 @@ class FlaxMsgpackScanner(BaseScanner):
             if isinstance(data, dict):
                 # Count layers
                 layer_keys = [
-                    k for k in data if any(layer_word in str(k).lower() for layer_word in ["layer", "block", "level"])
+                    k
+                    for k in data
+                    if any(
+                        layer_word in str(k).lower()
+                        for layer_word in ["layer", "block", "level"]
+                    )
                 ]
                 if layer_keys:
                     metadata["layer_count"] += len(layer_keys)
@@ -305,7 +326,13 @@ class FlaxMsgpackScanner(BaseScanner):
                     value_str = str(value)
 
                     # Check for suspicious JAX transform patterns
-                    dangerous_transforms = ["jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval"]
+                    dangerous_transforms = [
+                        "jit_compile",
+                        "eval_jit",
+                        "exec_transform",
+                        "dynamic_eval",
+                        "runtime_eval",
+                    ]
 
                     for transform in dangerous_transforms:
                         if transform in key_str or transform in value_str.lower():
@@ -315,7 +342,9 @@ class FlaxMsgpackScanner(BaseScanner):
                                 location=f"{path}/{key}",
                                 details={
                                     "transform": transform,
-                                    "context": value_str[:200] if len(value_str) > 200 else value_str,
+                                    "context": value_str[:200]
+                                    if len(value_str) > 200
+                                    else value_str,
                                 },
                             )
 
@@ -519,12 +548,16 @@ class FlaxMsgpackScanner(BaseScanner):
             tensors: list[dict[str, Any]] = []
             if isinstance(data, dict):
                 for key, value in data.items():
-                    tensors.extend(collect_tensors(value, f"{path}/{key}" if path else key))
+                    tensors.extend(
+                        collect_tensors(value, f"{path}/{key}" if path else key)
+                    )
             elif isinstance(data, (list, tuple)):
                 for i, value in enumerate(data):
                     tensors.extend(collect_tensors(value, f"{path}[{i}]"))
             elif (
-                isinstance(data, (bytes, bytearray)) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0)
+                isinstance(data, (bytes, bytearray))
+                and len(data) >= 16
+                and (len(data) % 4 == 0 or len(data) % 8 == 0)
             ):
                 # Check if binary data could be a serialized tensor
                 tensors.append(
@@ -541,13 +574,17 @@ class FlaxMsgpackScanner(BaseScanner):
         analysis["tensor_count"] = len(tensors)
 
         if len(tensors) == 0:
-            analysis["suspicious_patterns"].append("No numerical data found - not a typical ML model")
+            analysis["suspicious_patterns"].append(
+                "No numerical data found - not a typical ML model"
+            )
             return analysis
 
         # Analyze tensor size patterns
         large_tensors = [t for t in tensors if t["size"] > 1024]  # > 1KB
         if not large_tensors:
-            analysis["suspicious_patterns"].append("No substantial weight matrices found")
+            analysis["suspicious_patterns"].append(
+                "No substantial weight matrices found"
+            )
             return analysis
 
         # Check for common ML model patterns in tensor sizes
@@ -574,7 +611,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
 
         if common_ml_sizes:
-            analysis["evidence"].append(f"Found {len(common_ml_sizes)} tensors with ML-compatible dimensions")
+            analysis["evidence"].append(
+                f"Found {len(common_ml_sizes)} tensors with ML-compatible dimensions"
+            )
             analysis["weight_matrices"] = common_ml_sizes
             analysis["confidence"] += 0.4
 
@@ -587,7 +626,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 layer_evidence += 1
 
         if layer_evidence >= 2:
-            analysis["evidence"].append(f"Found hierarchical layer structure ({layer_evidence} layer indicators)")
+            analysis["evidence"].append(
+                f"Found hierarchical layer structure ({layer_evidence} layer indicators)"
+            )
             analysis["confidence"] += 0.3
 
         # Check for embedding-like structures (large matrices typical of word embeddings)
@@ -603,9 +644,13 @@ class FlaxMsgpackScanner(BaseScanner):
 
             for vocab_size in common_vocab_sizes:
                 for embed_dim in common_embed_dims:
-                    if abs(elements - (vocab_size * embed_dim)) < (vocab_size * embed_dim * 0.1):  # 10% tolerance
+                    if abs(elements - (vocab_size * embed_dim)) < (
+                        vocab_size * embed_dim * 0.1
+                    ):  # 10% tolerance
                         embedding_evidence += 1
-                        analysis["evidence"].append(f"Found embedding-like matrix: ~{vocab_size}x{embed_dim}")
+                        analysis["evidence"].append(
+                            f"Found embedding-like matrix: ~{vocab_size}x{embed_dim}"
+                        )
                         break
 
         if embedding_evidence > 0:
@@ -615,9 +660,13 @@ class FlaxMsgpackScanner(BaseScanner):
         suspicious_data = 0
         for tensor in tensors:
             # Check for non-ML-like data patterns
-            if tensor["size"] < 100:  # Very small tensors are suspicious for model weights
+            if (
+                tensor["size"] < 100
+            ):  # Very small tensors are suspicious for model weights
                 suspicious_data += 1
-            elif tensor["size"] > 500 * 1024 * 1024:  # Extremely large (>500MB) single tensors
+            elif (
+                tensor["size"] > 500 * 1024 * 1024
+            ):  # Extremely large (>500MB) single tensors
                 analysis["suspicious_patterns"].append(
                     f"Extremely large single tensor: {tensor['size'] // 1024 // 1024}MB"
                 )
@@ -629,11 +678,15 @@ class FlaxMsgpackScanner(BaseScanner):
         # Final confidence calculation
         if analysis["confidence"] >= 0.7:
             analysis["is_ml_model"] = True
-            analysis["evidence"].append("High confidence this is a legitimate ML model based on structural analysis")
+            analysis["evidence"].append(
+                "High confidence this is a legitimate ML model based on structural analysis"
+            )
         elif analysis["confidence"] > 0.4:
             analysis["evidence"].append("Moderate confidence this could be an ML model")
         else:
-            analysis["suspicious_patterns"].append("Low confidence in ML model structure - may be malicious data")
+            analysis["suspicious_patterns"].append(
+                "Low confidence in ML model structure - may be malicious data"
+            )
 
         return analysis
 
@@ -653,7 +706,15 @@ class FlaxMsgpackScanner(BaseScanner):
         found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
 
         # Also check for common transformer model patterns (BERT, GPT, T5, etc.)
-        transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
+        transformer_keys = {
+            "embeddings",
+            "encoder",
+            "decoder",
+            "pooler",
+            "lm_head",
+            "transformer",
+            "model",
+        }
         has_transformer_keys = any(key in found_keys for key in transformer_keys)
 
         has_standard_flax_keys = any(key in found_keys for key in expected_keys)
@@ -665,7 +726,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.DEBUG,
                 location="root",
                 details={
-                    "found_standard_keys": [k for k in expected_keys if k in found_keys],
+                    "found_standard_keys": [
+                        k for k in expected_keys if k in found_keys
+                    ],
                     "model_type": "standard_flax",
                 },
             )
@@ -679,7 +742,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.DEBUG,
                 location="root",
                 details={
-                    "found_transformer_keys": [k for k in transformer_keys if k in found_keys],
+                    "found_transformer_keys": [
+                        k for k in transformer_keys if k in found_keys
+                    ],
                     "model_type": "transformer_model",
                     "all_keys": list(found_keys)[:20],  # Show first 20 keys
                 },
@@ -813,7 +878,9 @@ class FlaxMsgpackScanner(BaseScanner):
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__
             if isinstance(obj, dict):
-                result.metadata["top_level_keys"] = list(obj.keys())[:50]  # Limit for large dicts
+                result.metadata["top_level_keys"] = list(obj.keys())[
+                    :50
+                ]  # Limit for large dicts
                 result.metadata["key_count"] = len(obj.keys())
 
             # Extract JAX/Flax specific metadata and architecture information

@@ -73,6 +73,8 @@ def download_pytorch_hub_model(url: str, cache_dir: Optional[Path] = None) -> Pa
         except Exception as e:
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+            raise Exception(
+                f"Failed to download weights from {weight_url}: {e!s}"
+            ) from e
 
     return dest_dir

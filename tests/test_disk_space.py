@@ -76,7 +76,9 @@ class TestDiskSpaceUtils:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
             # Request 1 GB with 1.5x safety margin = 1.5 GB needed
-            has_space, message = check_disk_space(path, 1024 * 1024 * 1024, safety_margin=1.5)
+            has_space, message = check_disk_space(
+                path, 1024 * 1024 * 1024, safety_margin=1.5
+            )
 
             assert has_space is True  # More than enough space
             assert "Sufficient disk space available" in message

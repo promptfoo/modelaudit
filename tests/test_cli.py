@@ -100,7 +100,9 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    assert str(file1) in result.output or str(file2) in result.output  # Should mention at least one file path
+    assert (
+        str(file1) in result.output or str(file2) in result.output
+    )  # Should mention at least one file path
 
 
 def test_scan_with_blacklist(tmp_path):
@@ -323,7 +325,9 @@ def test_format_text_output_only_info_issues():
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
     assert "1 Info" in clean_output
-    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert (
+        "INFORMATIONAL FINDINGS" in clean_output
+    )  # Info issues show INFORMATIONAL FINDINGS
     assert "WARNINGS DETECTED" not in clean_output
 
 
@@ -344,7 +348,9 @@ def test_format_text_output_debug_and_info_issues():
     clean_output = strip_ansi(output)
     assert "1 Info" in clean_output
     assert "1 Debug" in clean_output
-    assert "INFORMATIONAL FINDINGS" in clean_output  # Info issues show INFORMATIONAL FINDINGS
+    assert (
+        "INFORMATIONAL FINDINGS" in clean_output
+    )  # Info issues show INFORMATIONAL FINDINGS
     assert "WARNINGS DETECTED" not in clean_output
 
 
@@ -401,7 +407,9 @@ def test_scan_mlflow_url_help():
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_url_success(
+    mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path
+):
     """Test successful scanning of a HuggingFace URL."""
     # Setup mocks
     mock_is_hf_url.return_value = True
@@ -422,7 +430,9 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--no-cache", "https://huggingface.co/test/model"])
+    result = runner.invoke(
+        cli, ["scan", "--no-cache", "https://huggingface.co/test/model"]
+    )
 
     # Should succeed
     assert result.exit_code == 0
@@ -466,7 +476,9 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_url_with_issues(
+    mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path
+):
     """Test scanning a HuggingFace URL that has security issues."""
     # Setup mocks
     mock_is_hf_url.return_value = True
@@ -512,12 +524,16 @@ def test_scan_mixed_paths_and_urls():
     """Test scanning both local paths and HuggingFace URLs in one command."""
     runner = CliRunner()
 
-    with patch("modelaudit.cli.is_huggingface_url") as mock_is_hf, patch("os.path.exists") as mock_exists:
+    with patch("modelaudit.cli.is_huggingface_url") as mock_is_hf, patch(
+        "os.path.exists"
+    ) as mock_exists:
         # Setup mocks - first arg is local path, second is URL
         mock_is_hf.side_effect = [False, True]
         mock_exists.return_value = False  # Local path doesn't exist
 
-        result = runner.invoke(cli, ["scan", "/local/path/model.pkl", "https://huggingface.co/test/model"])
+        result = runner.invoke(
+            cli, ["scan", "/local/path/model.pkl", "https://huggingface.co/test/model"]
+        )
 
         # Should report error for missing local file
         assert (
@@ -530,7 +546,9 @@ def test_scan_mixed_paths_and_urls():
 @patch("modelaudit.cli.download_pytorch_hub_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock_is_ph_url, tmp_path):
+def test_scan_pytorchhub_url_success(
+    mock_rmtree, mock_scan, mock_download, mock_is_ph_url, tmp_path
+):
     """Test scanning a PyTorch Hub URL successfully."""
     mock_is_ph_url.return_value = True
     test_dir = tmp_path / "hub"
@@ -547,7 +565,9 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+    result = runner.invoke(
+        cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"]
+    )
 
     assert result.exit_code == 0
     mock_download.assert_called_once()
@@ -562,7 +582,9 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
     mock_is_ph_url.return_value = True
     mock_download.side_effect = Exception("boom")
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+    result = runner.invoke(
+        cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"]
+    )
 
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
@@ -572,7 +594,9 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_success(
+    mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path
+):
     """Test scanning a cloud storage URL successfully."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -613,7 +637,9 @@ def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_with_issues(
+    mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path
+):
     """Test scanning a cloud storage URL that has issues."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -640,7 +666,9 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 @patch("modelaudit.cli.download_artifact")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_jfrog, tmp_path):
+def test_scan_jfrog_url_success(
+    mock_rmtree, mock_scan, mock_download, mock_is_jfrog, tmp_path
+):
     """Test scanning a JFrog URL."""
     mock_is_jfrog.return_value = True
     test_file = tmp_path / "model.bin"
@@ -656,7 +684,9 @@ def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_j
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
+    result = runner.invoke(
+        cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"]
+    )
 
     assert result.exit_code == 0
     mock_download.assert_called_once()
@@ -672,7 +702,9 @@ def test_scan_jfrog_url_download_failure(mock_download, mock_is_jfrog):
     mock_download.side_effect = Exception("fail")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
+    result = runner.invoke(
+        cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"]
+    )
 
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
@@ -692,7 +724,9 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "models:/TestModel/1", "--registry-uri", "http://localhost:5000"])
+    result = runner.invoke(
+        cli, ["scan", "models:/TestModel/1", "--registry-uri", "http://localhost:5000"]
+    )
 
     # Should succeed
     assert result.exit_code == 0
@@ -905,10 +939,14 @@ def test_exit_code_clean_scan(tmp_path):
     result = runner.invoke(cli, ["scan", str(test_file)])
 
     # Should exit with code 0 for clean scan
-    assert result.exit_code == 0, f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
+    assert (
+        result.exit_code == 0
+    ), f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
     # The output might not say "No issues found" if there are debug messages,
     # so let's be less strict
-    assert "clean" in result.output.lower() or "total issues: 0" in result.output.lower()
+    assert (
+        "clean" in result.output.lower() or "total issues: 0" in result.output.lower()
+    )
 
 
 def test_exit_code_security_issues(tmp_path):
@@ -929,7 +967,9 @@ def test_exit_code_security_issues(tmp_path):
     result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
-    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert (
+        result.exit_code == 1
+    ), f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert "error" in result.output.lower() or "warning" in result.output.lower()
 
 
@@ -970,7 +1010,9 @@ def test_doctor_command_with_show_failed():
 
     # Should show failed scanners if any exist
     if "Failed: 0" not in result.output:
-        assert "Failed Scanners:" in result.output or "Recommendations:" in result.output
+        assert (
+            "Failed Scanners:" in result.output or "Recommendations:" in result.output
+        )
 
 
 def test_doctor_command_numpy_status():

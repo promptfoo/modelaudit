@@ -104,7 +104,11 @@ class ScanResult:
         self.bytes_scanned += other.bytes_scanned
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
-            if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
+            if (
+                key in self.metadata
+                and isinstance(self.metadata[key], dict)
+                and isinstance(value, dict)
+            ):
                 self.metadata[key].update(value)
             else:
                 self.metadata[key] = value
@@ -150,9 +154,15 @@ class ScanResult:
 
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
-        error_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
-        warning_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
-        info_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.INFO)
+        error_count = sum(
+            1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL
+        )
+        warning_count = sum(
+            1 for issue in self.issues if issue.severity == IssueSeverity.WARNING
+        )
+        info_count = sum(
+            1 for issue in self.issues if issue.severity == IssueSeverity.INFO
+        )
 
         result = []
         result.append(f"Scan completed in {self.duration:.2f}s")
@@ -290,7 +300,9 @@ class BaseScanner(ABC):
         self._path_validation_result = result if result.issues else None
 
         # Only return result for CRITICAL issues that should stop the scan
-        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+        critical_issues = [
+            issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
         if critical_issues:
             return result
 
@@ -311,7 +323,11 @@ class BaseScanner(ABC):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
             result.add_issue(
                 f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.WARNING,
@@ -333,7 +349,11 @@ class BaseScanner(ABC):
         data = bytearray()
         file_size = self.get_file_size(path)
 
-        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
+        if (
+            self.max_file_read_size
+            and self.max_file_read_size > 0
+            and file_size > self.max_file_read_size
+        ):
             raise ValueError(
                 f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
             )
@@ -347,7 +367,11 @@ class BaseScanner(ABC):
                 if not chunk:
                     break
                 data.extend(chunk)
-                if self.max_file_read_size and self.max_file_read_size > 0 and len(data) > self.max_file_read_size:
+                if (
+                    self.max_file_read_size
+                    and self.max_file_read_size > 0
+                    and len(data) > self.max_file_read_size
+                ):
                     raise ValueError(
                         f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})",
                     )

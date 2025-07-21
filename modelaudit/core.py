@@ -76,7 +76,9 @@ def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None
     assets_list.append({"path": file_path, "type": "error"})
 
 
-def _finalize_scan_results(results: dict[str, Any], config: Optional[dict[str, Any]] = None) -> None:
+def _finalize_scan_results(
+    results: dict[str, Any], config: Optional[dict[str, Any]] = None
+) -> None:
     """
     Finalize scan results by adding license warnings and determining has_errors flag.
 
@@ -92,7 +94,9 @@ def _finalize_scan_results(results: dict[str, Any], config: Optional[dict[str, A
     try:
         if config is None:
             config = {}
-        license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
+        license_warnings = check_commercial_use_warnings(
+            results, strict=config.get("strict_license", False)
+        )
         issues_list = cast(list[dict[str, Any]], results["issues"])
         for warning in license_warnings:
             # Convert license warnings to issues
@@ -110,9 +114,13 @@ def _finalize_scan_results(results: dict[str, Any], config: Optional[dict[str, A
     # Determine has_errors flag
     issues_list = cast(list[dict[str, Any]], results["issues"])
     results["has_errors"] = any(
-        any(indicator in issue.get("message", "") for indicator in OPERATIONAL_ERROR_INDICATORS)
+        any(
+            indicator in issue.get("message", "")
+            for indicator in OPERATIONAL_ERROR_INDICATORS
+        )
         for issue in issues_list
-        if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+        if isinstance(issue, dict)
+        and issue.get("severity") == IssueSeverity.CRITICAL.value
     ) or not results.get("success", True)
 
 
@@ -123,11 +131,15 @@ def validate_scan_config(config: dict[str, Any]) -> None:
         raise ValueError("timeout must be a positive integer")
 
     max_file_size = config.get("max_file_size")
-    if max_file_size is not None and (not isinstance(max_file_size, int) or max_file_size < 0):
+    if max_file_size is not None and (
+        not isinstance(max_file_size, int) or max_file_size < 0
+    ):
         raise ValueError("max_file_size must be a non-negative integer")
 
     max_total_size = config.get("max_total_size")
-    if max_total_size is not None and (not isinstance(max_total_size, int) or max_total_size < 0):
+    if max_total_size is not None and (
+        not isinstance(max_total_size, int) or max_total_size < 0
+    ):
         raise ValueError("max_total_size must be a non-negative integer")
 
     chunk_size = config.get("chunk_size")
@@ -217,7 +229,10 @@ def scan_model_directory_or_file(
 
                     # Add scanner info
                     scanners_list = cast(list[str], results["scanners"])
-                    if scan_result.scanner_name and scan_result.scanner_name not in scanners_list:
+                    if (
+                        scan_result.scanner_name
+                        and scan_result.scanner_name not in scanners_list
+                    ):
                         scanners_list.append(scan_result.scanner_name)
 
                     # Add issues
@@ -262,10 +277,14 @@ def scan_model_directory_or_file(
         # Check if path is a directory
         if os.path.isdir(path):
             # Use parallel scanning if enabled and we have the parallel_directory module
-            logger.debug(f"Directory scan: parallel={parallel}, config keys={list(config.keys())}")
+            logger.debug(
+                f"Directory scan: parallel={parallel}, config keys={list(config.keys())}"
+            )
             # Disable parallel scanning if max_total_size is set (not supported in parallel mode)
             if max_total_size > 0:
-                logger.debug("Disabling parallel scanning due to max_total_size constraint")
+                logger.debug(
+                    "Disabling parallel scanning due to max_total_size constraint"
+                )
                 parallel = False
             if parallel:
                 try:
@@ -293,7 +312,9 @@ def scan_model_directory_or_file(
                     # Recalculate duration based on original start time to maintain consistency
                     # This ensures duration = finish_time - start_time
                     if "finish_time" in parallel_results:
-                        results["duration"] = parallel_results["finish_time"] - original_start_time
+                        results["duration"] = (
+                            parallel_results["finish_time"] - original_start_time
+                        )
 
                     logger.debug(
                         f"Parallel scan completed. parallel_scan={parallel_results.get('parallel_scan')}, "
@@ -307,7 +328,9 @@ def scan_model_directory_or_file(
 
                 except ImportError:
                     # Fall back to sequential scanning
-                    logger.debug("Parallel scanning not available, using sequential scanning")
+                    logger.debug(
+                        "Parallel scanning not available, using sequential scanning"
+                    )
 
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
@@ -323,7 +346,9 @@ def scan_model_directory_or_file(
             try:
                 # Do a quick count of immediate children first
                 immediate_children = len(list(Path(path).iterdir()))
-                if immediate_children < 1000:  # Only count if not too many immediate children
+                if (
+                    immediate_children < 1000
+                ):  # Only count if not too many immediate children
                     total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
             except (OSError, PermissionError):
                 # If we can't count, just proceed without progress percentage
@@ -358,7 +383,9 @@ def scan_model_directory_or_file(
                             continue
 
                         # Resolve the relative link target
-                        resolved_target = (Path(file_path).parent / link_target).resolve()
+                        resolved_target = (
+                            Path(file_path).parent / link_target
+                        ).resolve()
                         # Check if target is in the blobs directory of the same model cache
                         if "/blobs/" in str(resolved_target):
                             # Extract the model cache root (e.g., models--distilbert-base-uncased)
@@ -373,7 +400,9 @@ def scan_model_directory_or_file(
                                         resolved_file = resolved_target
                                     break
 
-                    if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
+                    if not is_hf_cache_symlink and not is_within_directory(
+                        str(base_dir), str(resolved_file)
+                    ):
                         issues_list = cast(list[dict[str, Any]], results["issues"])
                         issues_list.append(
                             {
@@ -404,7 +433,9 @@ def scan_model_directory_or_file(
                             continue
                         scanned_paths.add(target_str)
 
-                        if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
+                        if not is_hf_cache_symlink and not is_within_directory(
+                            str(base_dir), str(target_path)
+                        ):
                             issues_list.append(
                                 {
                                     "message": "Path traversal outside scanned directory",
@@ -440,8 +471,13 @@ def scan_model_directory_or_file(
                             check_interrupted()
 
                             file_result = scan_file(str(target_path), config)
-                            results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-                            results["files_scanned"] = cast(int, results["files_scanned"]) + 1
+                            results["bytes_scanned"] = (
+                                cast(int, results["bytes_scanned"])
+                                + file_result.bytes_scanned
+                            )
+                            results["files_scanned"] = (
+                                cast(int, results["files_scanned"]) + 1
+                            )
                             processed_files += 1
 
                             scanner_name = file_result.scanner_name
@@ -453,14 +489,24 @@ def scan_model_directory_or_file(
                             for issue in file_result.issues:
                                 issues_list.append(issue.to_dict())
 
-                            _add_asset_to_results(results, str(target_path), file_result)
+                            _add_asset_to_results(
+                                results, str(target_path), file_result
+                            )
 
                             file_meta = cast(dict[str, Any], results["file_metadata"])
-                            license_metadata = collect_license_metadata(str(target_path))
-                            combined_metadata = {**file_result.metadata, **license_metadata}
+                            license_metadata = collect_license_metadata(
+                                str(target_path)
+                            )
+                            combined_metadata = {
+                                **file_result.metadata,
+                                **license_metadata,
+                            }
                             file_meta[str(target_path)] = combined_metadata
 
-                            if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
+                            if (
+                                max_total_size > 0
+                                and cast(int, results["bytes_scanned"]) > max_total_size
+                            ):
                                 issues_list.append(
                                     {
                                         "message": (
@@ -494,7 +540,12 @@ def scan_model_directory_or_file(
                     break
 
             # Final progress update for directory scan
-            if progress_callback and not limit_reached and total_files is not None and total_files > 0:
+            if (
+                progress_callback
+                and not limit_reached
+                and total_files is not None
+                and total_files > 0
+            ):
                 progress_callback(
                     f"Completed scanning {processed_files} files",
                     100.0,
@@ -527,18 +578,26 @@ def scan_model_directory_or_file(
                     progress_callback(f"Scanning file: {target}", 0.0)
 
                 file_size = os.path.getsize(target)
-                results["files_scanned"] = cast(int, results.get("files_scanned", 0)) + 1
+                results["files_scanned"] = (
+                    cast(int, results.get("files_scanned", 0)) + 1
+                )
 
                 if progress_callback is not None and file_size > 0:
 
-                    def create_progress_open(callback: Callable[[str, float], None], current_file_size: int):
+                    def create_progress_open(
+                        callback: Callable[[str, float], None], current_file_size: int
+                    ):
                         """Create a progress-aware file opener with properly bound variables."""
 
-                        def progress_open(file_path: str, mode: str = "r", *args: Any, **kwargs: Any) -> IO[Any]:
+                        def progress_open(
+                            file_path: str, mode: str = "r", *args: Any, **kwargs: Any
+                        ) -> IO[Any]:
                             # Note: We intentionally don't use a context manager here because we need to
                             # return the file object for further processing. The SIM115 warning is
                             # suppressed because this is a legitimate use case.
-                            file = builtins.open(file_path, mode, *args, **kwargs)  # noqa: SIM115
+                            file = builtins.open(
+                                file_path, mode, *args, **kwargs
+                            )  # noqa: SIM115
                             file_pos = 0
 
                             original_read = file.read
@@ -565,7 +624,9 @@ def scan_model_directory_or_file(
                 else:
                     file_result = scan_file(target, config)
 
-                results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                results["bytes_scanned"] = (
+                    cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                )
 
                 scanner_name = file_result.scanner_name
                 scanners_list = cast(list[str], results["scanners"])
@@ -583,7 +644,10 @@ def scan_model_directory_or_file(
                 combined_metadata = {**file_result.metadata, **license_metadata}
                 file_meta[target] = combined_metadata
 
-                if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
+                if (
+                    max_total_size > 0
+                    and cast(int, results["bytes_scanned"]) > max_total_size
+                ):
                     issues_list.append(
                         {
                             "message": (
@@ -662,7 +726,11 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     issues = results.get("issues", [])
     if issues:
         # Filter out DEBUG level issues for exit code determination
-        non_debug_issues = [issue for issue in issues if isinstance(issue, dict) and issue.get("severity") != "debug"]
+        non_debug_issues = [
+            issue
+            for issue in issues
+            if isinstance(issue, dict) and issue.get("severity") != "debug"
+        ]
         if non_debug_issues:
             return 1
 
@@ -780,12 +848,24 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             f"indicate {magic_format}. This could indicate file spoofing or corruption."
         )
         logger.warning(discrepancy_msg)
-    elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
+    elif (
+        header_format != ext_format
+        and header_format != "unknown"
+        and ext_format != "unknown"
+    ):
         # Don't warn about common PyTorch .bin files that are ZIP or pickle format internally
         # This is expected behavior for torch.save() and HuggingFace models
         if not (
-            (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
-            or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
+            (
+                ext_format == "pytorch_binary"
+                and header_format in ["zip", "pickle"]
+                and ext == ".bin"
+            )
+            or (
+                ext_format == "pytorch_binary"
+                and header_format == "pickle"
+                and ext in [".pt", ".pth"]
+            )
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.warning(discrepancy_msg)
@@ -876,7 +956,9 @@ def merge_scan_result(
         The updated results dictionary
     """
     # Convert scan_result to dict if it's a ScanResult object
-    scan_dict = scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
+    scan_dict = (
+        scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
+    )
 
     # Merge issues
     issues_list = cast(list[dict[str, Any]], results["issues"])

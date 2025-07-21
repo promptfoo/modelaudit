@@ -36,7 +36,11 @@ class TestNestedPickleIntegration:
         malicious_files: list[Path] = []
 
         # Look for our generated malicious nested pickle files
-        malicious_patterns = ["nested_pickle_*.pkl", "malicious_model_*.pkl", "decode_exec_*.pkl"]
+        malicious_patterns = [
+            "nested_pickle_*.pkl",
+            "malicious_model_*.pkl",
+            "decode_exec_*.pkl",
+        ]
 
         for pattern in malicious_patterns:
             malicious_files.extend(pickles_dir.glob(pattern))
@@ -60,7 +64,9 @@ class TestNestedPickleIntegration:
         malicious_files = self.get_malicious_nested_pickles(pickles_dir)
 
         if not malicious_files:
-            pytest.skip("No malicious nested pickle files found. Run the generators first.")
+            pytest.skip(
+                "No malicious nested pickle files found. Run the generators first."
+            )
 
         for malicious_file in malicious_files:
             print(f"\nTesting malicious file: {malicious_file.name}")
@@ -76,7 +82,8 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in result.issues
-                if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
+                if "nested" in issue.message.lower()
+                or "encoded" in issue.message.lower()
             ]
 
             assert len(nested_issues) > 0, (
@@ -85,7 +92,11 @@ class TestNestedPickleIntegration:
             )
 
             # Should have CRITICAL severity for nested pickle threats
-            critical_nested = [issue for issue in nested_issues if issue.severity == IssueSeverity.CRITICAL]
+            critical_nested = [
+                issue
+                for issue in nested_issues
+                if issue.severity == IssueSeverity.CRITICAL
+            ]
 
             assert len(critical_nested) > 0, (
                 f"No CRITICAL nested pickle issues found in {malicious_file.name}. "
@@ -101,7 +112,9 @@ class TestNestedPickleIntegration:
         safe_files = self.get_safe_nested_pickles(pickles_dir)
 
         if not safe_files:
-            pytest.skip("No safe nested-like pickle files found. Run the generators first.")
+            pytest.skip(
+                "No safe nested-like pickle files found. Run the generators first."
+            )
 
         for safe_file in safe_files:
             print(f"\nTesting safe file: {safe_file.name}")
@@ -117,12 +130,13 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in result.issues
-                if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
+                if "nested" in issue.message.lower()
+                or "encoded" in issue.message.lower()
             ]
 
-            assert len(nested_issues) == 0, (
-                f"False positive nested pickle detection in {safe_file.name}: {[i.message for i in nested_issues]}"
-            )
+            assert (
+                len(nested_issues) == 0
+            ), f"False positive nested pickle detection in {safe_file.name}: {[i.message for i in nested_issues]}"
 
             print("  ✅ No false positives - clean scan")
 
@@ -150,18 +164,21 @@ class TestNestedPickleIntegration:
             exit_code = determine_exit_code(results)
 
             # Should detect as malicious (exit code 1)
-            assert exit_code == 1, (
-                f"Failed to detect {description} as malicious. Exit code: {exit_code}, Issues: {len(results['issues'])}"
-            )
+            assert (
+                exit_code == 1
+            ), f"Failed to detect {description} as malicious. Exit code: {exit_code}, Issues: {len(results['issues'])}"
 
             # Should have nested pickle issues
             nested_issues = [
                 issue
                 for issue in results["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                if "nested" in issue.get("message", "").lower()
+                or "encoded" in issue.get("message", "").lower()
             ]
 
-            assert len(nested_issues) > 0, f"No nested pickle issues found for {description}"
+            assert (
+                len(nested_issues) > 0
+            ), f"No nested pickle issues found for {description}"
 
             print(f"  ✅ Detected {len(nested_issues)} nested threats")
 
@@ -176,14 +193,19 @@ class TestNestedPickleIntegration:
         runner = CliRunner()
 
         # Test JSON output (primary test - this format is most reliable)
-        json_result = runner.invoke(cli, ["scan", str(malicious_file), "--format", "json"])
-        assert json_result.exit_code == 1, f"JSON format should detect malicious file. Output: {json_result.output}"
+        json_result = runner.invoke(
+            cli, ["scan", str(malicious_file), "--format", "json"]
+        )
+        assert (
+            json_result.exit_code == 1
+        ), f"JSON format should detect malicious file. Output: {json_result.output}"
 
         output_data = json.loads(json_result.output)
         nested_issues = [
             issue
             for issue in output_data["issues"]
-            if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+            if "nested" in issue.get("message", "").lower()
+            or "encoded" in issue.get("message", "").lower()
         ]
 
         assert len(nested_issues) > 0, "JSON output should contain nested pickle issues"
@@ -201,11 +223,17 @@ class TestNestedPickleIntegration:
                 or "encoded" in text_result.output.lower()
                 or "danger" in text_result.output.lower()
             )
-            assert threat_mentioned, f"Text output should mention threat detection: {text_result.output[:200]}..."
+            assert (
+                threat_mentioned
+            ), f"Text output should mention threat detection: {text_result.output[:200]}..."
         else:
-            print("⚠️ Text format had environment-specific detection issues, but JSON format works correctly")
+            print(
+                "⚠️ Text format had environment-specific detection issues, but JSON format works correctly"
+            )
             # Ensure JSON format is definitely working as fallback
-            assert json_result.exit_code == 1, "At least JSON format must reliably detect the malicious file"
+            assert (
+                json_result.exit_code == 1
+            ), "At least JSON format must reliably detect the malicious file"
 
     def test_mixed_directory_nested_pickle_scan(self, pickles_dir):
         """Test scanning directory with mix of safe and malicious nested pickle files."""
@@ -244,11 +272,14 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in results["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                if "nested" in issue.get("message", "").lower()
+                or "encoded" in issue.get("message", "").lower()
             ]
 
             # Should detect the malicious files
-            assert len(nested_issues) > 0, "Should detect nested pickle threats in mixed directory"
+            assert (
+                len(nested_issues) > 0
+            ), "Should detect nested pickle threats in mixed directory"
 
             print(f"✅ Mixed directory scan: {len(nested_issues)} threats detected")
 
@@ -275,14 +306,17 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in result["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                if "nested" in issue.get("message", "").lower()
+                or "encoded" in issue.get("message", "").lower()
             ]
             total_nested_issues += len(nested_issues)
 
         duration = time.time() - start_time
 
         # Performance assertions
-        assert duration < 10, f"Scanning {len(all_files)} files took too long: {duration:.2f}s"
+        assert (
+            duration < 10
+        ), f"Scanning {len(all_files)} files took too long: {duration:.2f}s"
         assert total_issues >= 0, "Should have processed files"
 
         print(f"✅ Performance test: {len(all_files)} files in {duration:.2f}s")
@@ -341,20 +375,27 @@ class TestNestedPickleIntegration:
                 nested_issues = [
                     issue
                     for issue in result.issues
-                    if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
+                    if "nested" in issue.message.lower()
+                    or "encoded" in issue.message.lower()
                 ]
 
                 if should_detect:
                     assert len(nested_issues) > 0, f"Should detect {description}"
                     print("  ✅ Correctly detected nested pickle")
                 else:
-                    assert len(nested_issues) == 0, f"Should not detect {description} as nested pickle"
+                    assert (
+                        len(nested_issues) == 0
+                    ), f"Should not detect {description} as nested pickle"
                     print("  ✅ Correctly ignored non-threat")
 
     def test_regression_existing_functionality(self, pickles_dir):
         """Test that nested pickle detection doesn't break existing functionality."""
         # Test existing malicious files still work
-        existing_malicious = ["evil.pickle", "malicious_system_call.pkl", "dill_func.pkl"]
+        existing_malicious = [
+            "evil.pickle",
+            "malicious_system_call.pkl",
+            "dill_func.pkl",
+        ]
 
         for filename in existing_malicious:
             test_file = pickles_dir / filename
@@ -372,10 +413,14 @@ class TestNestedPickleIntegration:
 
             # Should have some security issues (might not be nested pickle specific)
             security_issues = [
-                issue for issue in result.issues if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
+                issue
+                for issue in result.issues
+                if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             ]
 
-            assert len(security_issues) > 0, f"Should detect security issues in {filename}"
+            assert (
+                len(security_issues) > 0
+            ), f"Should detect security issues in {filename}"
 
             print(f"  ✅ Still detects {len(security_issues)} security issues")
 
@@ -390,7 +435,9 @@ class TestNestedPickleIntegration:
         result = scanner.scan(str(malicious_file))
 
         nested_issues = [
-            issue for issue in result.issues if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
+            issue
+            for issue in result.issues
+            if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
         ]
 
         assert len(nested_issues) > 0, "Should find nested pickle issues"

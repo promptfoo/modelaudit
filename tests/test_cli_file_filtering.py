@@ -40,7 +40,9 @@ def test_cli_no_skip_files():
         (Path(tmp_dir) / "script.py").write_text("print('hello')")
 
         # Run scan with --no-skip-files
-        result = runner.invoke(cli, ["scan", "--format", "json", "--no-skip-files", tmp_dir])
+        result = runner.invoke(
+            cli, ["scan", "--format", "json", "--no-skip-files", tmp_dir]
+        )
 
         assert result.exit_code in [0, 1]
         output = json.loads(result.output)
@@ -59,7 +61,9 @@ def test_cli_explicit_skip_files():
         (Path(tmp_dir) / "model.h5").write_bytes(b"model data")
 
         # Run scan with explicit --skip-files
-        result = runner.invoke(cli, ["scan", "--format", "json", "--skip-files", tmp_dir])
+        result = runner.invoke(
+            cli, ["scan", "--format", "json", "--skip-files", tmp_dir]
+        )
 
         assert result.exit_code in [0, 1]
         output = json.loads(result.output)

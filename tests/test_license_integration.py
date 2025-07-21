@@ -48,10 +48,14 @@ class TestLicenseIntegration:
 
         # MIT is permissive, should not trigger warnings
         agpl_warnings = [w for w in license_warnings if "AGPL" in w.get("message", "")]
-        nc_warnings = [w for w in license_warnings if "NonCommercial" in w.get("message", "")]
+        nc_warnings = [
+            w for w in license_warnings if "NonCommercial" in w.get("message", "")
+        ]
 
         assert len(agpl_warnings) == 0, "MIT model should not trigger AGPL warnings"
-        assert len(nc_warnings) == 0, "MIT model should not trigger non-commercial warnings"
+        assert (
+            len(nc_warnings) == 0
+        ), "MIT model should not trigger non-commercial warnings"
 
         # Check that MIT license is detected in metadata
         file_metadata = results.get("file_metadata", {})
@@ -91,7 +95,9 @@ class TestLicenseIntegration:
         assert "source code disclosure" in agpl_warning["details"]["impact"]
 
         # Check for copyleft warning
-        copyleft_warnings = [w for w in license_warnings if "copyleft" in w.get("message", "")]
+        copyleft_warnings = [
+            w for w in license_warnings if "copyleft" in w.get("message", "")
+        ]
         assert len(copyleft_warnings) >= 1, "AGPL should trigger copyleft warnings"
 
     def test_unlicensed_dataset_detection(self, test_data_dir):
@@ -99,12 +105,18 @@ class TestLicenseIntegration:
         unlicensed_dir = test_data_dir / "unlicensed_dataset"
 
         # Scan the unlicensed dataset directory
-        results = scan_model_directory_or_file(str(unlicensed_dir), skip_file_types=False)
+        results = scan_model_directory_or_file(
+            str(unlicensed_dir), skip_file_types=False
+        )
 
         # Should trigger unlicensed dataset warnings
         license_warnings = check_commercial_use_warnings(results)
 
-        dataset_warnings = [w for w in license_warnings if "unspecified licenses" in w.get("message", "")]
+        dataset_warnings = [
+            w
+            for w in license_warnings
+            if "unspecified licenses" in w.get("message", "")
+        ]
         assert len(dataset_warnings) >= 1, "Unlicensed datasets should trigger warnings"
 
         dataset_warning = dataset_warnings[0]
@@ -122,11 +134,15 @@ class TestLicenseIntegration:
         license_warnings = check_commercial_use_warnings(results)
 
         # Should detect non-commercial license in the CC-NC dataset
-        nc_warnings = [w for w in license_warnings if "Non-commercial" in w.get("message", "")]
+        nc_warnings = [
+            w for w in license_warnings if "Non-commercial" in w.get("message", "")
+        ]
         # Note: This might not trigger if the CC-NC pattern isn't detected in the JSON content
 
         # Should detect GPL copyleft
-        copyleft_warnings = [w for w in license_warnings if "copyleft" in w.get("message", "")]
+        copyleft_warnings = [
+            w for w in license_warnings if "copyleft" in w.get("message", "")
+        ]
 
         print(
             f"Mixed licenses warnings: {json.dumps(license_warnings, indent=2, default=str)}",
@@ -184,7 +200,9 @@ class TestLicenseIntegration:
 
         # Should detect as model file
         assert metadata.get("is_model") is True, "Should detect .pkl as model file"
-        assert metadata.get("is_dataset") is True, "Should also detect .pkl as potential dataset"
+        assert (
+            metadata.get("is_dataset") is True
+        ), "Should also detect .pkl as potential dataset"
 
     def test_agpl_component_detection_function(self, test_data_dir):
         """Test the specific AGPL detection function."""
@@ -218,8 +236,12 @@ class TestLicenseIntegration:
 
         # Should include our test files
         unlicensed_names = [Path(f).name for f in unlicensed]
-        assert any(name.endswith(".json") for name in unlicensed_names), "Should detect JSON dataset"
-        assert any(name.endswith(".csv") for name in unlicensed_names), "Should detect CSV dataset"
+        assert any(
+            name.endswith(".json") for name in unlicensed_names
+        ), "Should detect JSON dataset"
+        assert any(
+            name.endswith(".csv") for name in unlicensed_names
+        ), "Should detect CSV dataset"
 
         print(f"Unlicensed datasets: {unlicensed}")
 
@@ -243,7 +265,9 @@ class TestLicenseIntegration:
         assert len(agpl_licenses) > 0, "Should detect AGPL license in header"
         agpl_license = agpl_licenses[0]
         assert "AGPL" in agpl_license.spdx_id
-        assert agpl_license.commercial_allowed is True  # AGPL allows commercial use but with obligations
+        assert (
+            agpl_license.commercial_allowed is True
+        )  # AGPL allows commercial use but with obligations
 
     def test_end_to_end_cli_integration(self, test_data_dir):
         """Test the full CLI integration with license warnings."""
@@ -261,11 +285,15 @@ class TestLicenseIntegration:
 
         # Issues should include license warnings
         all_issues = results.get("issues", [])
-        license_issues = [issue for issue in all_issues if issue.get("type") == "license_warning"]
+        license_issues = [
+            issue for issue in all_issues if issue.get("type") == "license_warning"
+        ]
         assert len(license_issues) > 0, "Should have license warning issues"
 
         # Should have AGPL warning
-        agpl_issues = [issue for issue in license_issues if "AGPL" in issue.get("message", "")]
+        agpl_issues = [
+            issue for issue in license_issues if "AGPL" in issue.get("message", "")
+        ]
         assert len(agpl_issues) > 0, "Should have AGPL warning issues"
 
     def test_copyright_detection(self, test_data_dir):
@@ -295,7 +323,9 @@ class TestLicenseIntegration:
             # Should be detected as unlicensed dataset if large enough
             unlicensed = detect_unlicensed_datasets([str(embeddings_file)])
             if file_size > 100 * 1024:  # > 100KB
-                assert str(embeddings_file) in unlicensed, "Large files should be flagged as unlicensed datasets"
+                assert (
+                    str(embeddings_file) in unlicensed
+                ), "Large files should be flagged as unlicensed datasets"
 
 
 class TestLicenseScenarios:
@@ -334,13 +364,17 @@ class TestLicenseScenarios:
         permissive_patterns = ["MIT", "Apache-2.0", "BSD-3-Clause"]
         for _pattern_key, info in LICENSE_PATTERNS.items():
             if info["spdx_id"] in permissive_patterns:
-                assert info["commercial_allowed"] is True, f"{info['spdx_id']} should allow commercial use"
+                assert (
+                    info["commercial_allowed"] is True
+                ), f"{info['spdx_id']} should allow commercial use"
 
         # Non-commercial licenses should not allow commercial use
         nc_patterns = ["CC-BY-NC"]
         for _pattern_key, info in LICENSE_PATTERNS.items():
             if any(nc in info["spdx_id"] for nc in nc_patterns):
-                assert info["commercial_allowed"] is False, f"{info['spdx_id']} should not allow commercial use"
+                assert (
+                    info["commercial_allowed"] is False
+                ), f"{info['spdx_id']} should not allow commercial use"
 
     def test_ml_model_directory_detection(self):
         """Test ML model directory detection logic."""

@@ -36,7 +36,9 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
 
     # Should have found some issues overall (but not necessarily for each file)
     # Clean models might not have any issues, which is correct behavior
-    scanned_files = [issue.get("location") for issue in results["issues"] if issue.get("location")]
+    scanned_files = [
+        issue.get("location") for issue in results["issues"] if issue.get("location")
+    ]
     print(f"Debug: Found {len(results['issues'])} total issues")
     print(f"Debug: Issues locations: {scanned_files}")
 
@@ -47,11 +49,20 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     # Validate exit code behavior
     expected_exit_code = determine_exit_code(results)
     if results.get("has_errors", False):
-        assert expected_exit_code == 2, f"Should return exit code 2 for operational errors, got {expected_exit_code}"
-    elif any(isinstance(issue, dict) and issue.get("severity") != "debug" for issue in results.get("issues", [])):
-        assert expected_exit_code == 1, f"Should return exit code 1 for security issues, got {expected_exit_code}"
+        assert (
+            expected_exit_code == 2
+        ), f"Should return exit code 2 for operational errors, got {expected_exit_code}"
+    elif any(
+        isinstance(issue, dict) and issue.get("severity") != "debug"
+        for issue in results.get("issues", [])
+    ):
+        assert (
+            expected_exit_code == 1
+        ), f"Should return exit code 1 for security issues, got {expected_exit_code}"
     else:
-        assert expected_exit_code == 0, f"Should return exit code 0 for clean scan, got {expected_exit_code}"
+        assert (
+            expected_exit_code == 0
+        ), f"Should return exit code 0 for clean scan, got {expected_exit_code}"
 
 
 def test_cli_scan_directory(temp_model_dir):
@@ -70,7 +81,9 @@ def test_cli_scan_directory(temp_model_dir):
 
     # Should mention the number of files scanned
     # Check for the new format - should contain "Files scanned:" in the scan summary
-    assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
+    assert (
+        "Files scanned:" in result.output or "files scanned:" in result.output.lower()
+    )
 
 
 def test_cli_json_output_parsing(temp_model_dir):
@@ -174,8 +187,14 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     combined_results = json.loads(result.output)
 
     # Combined results should have at least the sum of individual scans
-    assert combined_results["files_scanned"] >= results1["files_scanned"] + results2["files_scanned"]
-    assert combined_results["bytes_scanned"] >= results1["bytes_scanned"] + results2["bytes_scanned"]
+    assert (
+        combined_results["files_scanned"]
+        >= results1["files_scanned"] + results2["files_scanned"]
+    )
+    assert (
+        combined_results["bytes_scanned"]
+        >= results1["bytes_scanned"] + results2["bytes_scanned"]
+    )
     assert len(combined_results["issues"]) >= len(results1["issues"]) + len(
         results2["issues"],
     )
@@ -193,7 +212,11 @@ def test_file_type_validation_integration(tmp_path):
     result = scan_file(str(fake_h5))
 
     # Should detect file type validation failure
-    validation_issues = [issue for issue in result.issues if "file type validation" in issue.message.lower()]
+    validation_issues = [
+        issue
+        for issue in result.issues
+        if "file type validation" in issue.message.lower()
+    ]
 
     # Should have at least one validation issue
     assert len(validation_issues) > 0
@@ -201,7 +224,9 @@ def test_file_type_validation_integration(tmp_path):
     # Check that the issue has proper details
     validation_issue = validation_issues[0]
     assert validation_issue.severity in [IssueSeverity.WARNING, IssueSeverity.CRITICAL]
-    assert "spoofing" in validation_issue.message or "security" in validation_issue.message
+    assert (
+        "spoofing" in validation_issue.message or "security" in validation_issue.message
+    )
 
 
 def test_valid_file_type_no_warnings(tmp_path):
@@ -218,7 +243,11 @@ def test_valid_file_type_no_warnings(tmp_path):
     result = scan_file(str(zip_file))
 
     # Should not have file type validation warnings
-    validation_issues = [issue for issue in result.issues if "file type validation" in issue.message.lower()]
+    validation_issues = [
+        issue
+        for issue in result.issues
+        if "file type validation" in issue.message.lower()
+    ]
 
     assert len(validation_issues) == 0
 
@@ -237,7 +266,11 @@ def test_pytorch_zip_file_valid(tmp_path):
     result = scan_file(str(pt_file))
 
     # Should not have file type validation warnings (this is a valid case)
-    validation_issues = [issue for issue in result.issues if "file type validation failed" in issue.message.lower()]
+    validation_issues = [
+        issue
+        for issue in result.issues
+        if "file type validation failed" in issue.message.lower()
+    ]
 
     assert len(validation_issues) == 0
 
@@ -253,7 +286,11 @@ def test_small_file_no_false_positives(tmp_path):
     result = scan_file(str(small_file))
 
     # Should not have file type validation warnings for small files
-    validation_issues = [issue for issue in result.issues if "file type validation failed" in issue.message.lower()]
+    validation_issues = [
+        issue
+        for issue in result.issues
+        if "file type validation failed" in issue.message.lower()
+    ]
 
     assert len(validation_issues) == 0
 
@@ -293,7 +330,9 @@ def test_tensorflow_savedmodel_integration(tmp_path):
 
     # Basic assertions
     assert results["success"] is True
-    assert results["files_scanned"] >= 1  # Should scan at least the savedmodel directory
+    assert (
+        results["files_scanned"] >= 1
+    )  # Should scan at least the savedmodel directory
     assert results["bytes_scanned"] > 0  # Should have scanned some content
 
     # Test using CLI
@@ -316,7 +355,9 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     assert "duration" in output_json
 
     # Verify the path appears in the output (the scanner handled the directory)
-    assert str(savedmodel_path) in str(output_json) or str(savedmodel_path.name) in str(output_json)
+    assert str(savedmodel_path) in str(output_json) or str(savedmodel_path.name) in str(
+        output_json
+    )
 
     # Test that weight distribution scanner was used
     # Look for evidence that weight analysis was performed
@@ -366,7 +407,9 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
     weights = model.get_layer("anomalous_layer").get_weights()
     if len(weights) >= 1:
         # Make some weights larger than typical
-        weights[0][:, 0] = np.random.randn(5) * 2.0  # Larger than normal but not extreme
+        weights[0][:, 0] = (
+            np.random.randn(5) * 2.0
+        )  # Larger than normal but not extreme
         model.get_layer("anomalous_layer").set_weights(weights)
 
     # Save the model

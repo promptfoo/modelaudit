@@ -117,11 +117,15 @@ def download_artifact(
                 f"Authentication failed for JFrog URL {url}. Please provide a valid API token or access token."
             ) from e
         if e.response.status_code == 403:
-            raise Exception(f"Access denied for JFrog URL {url}. Please check your permissions.") from e
+            raise Exception(
+                f"Access denied for JFrog URL {url}. Please check your permissions."
+            ) from e
         if e.response.status_code == 404:
             raise Exception(f"Artifact not found at {url}") from e
 
-        raise Exception(f"HTTP error {e.response.status_code} downloading from {url}: {e}") from e
+        raise Exception(
+            f"HTTP error {e.response.status_code} downloading from {url}: {e}"
+        ) from e
     except requests.exceptions.RequestException as e:
         if cache_dir is None and temp_dir.exists():
             shutil.rmtree(temp_dir)

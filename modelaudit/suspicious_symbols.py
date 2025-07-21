@@ -392,7 +392,9 @@ def validate_patterns() -> list[str]:
     # Validate dangerous builtins
     for builtin in DANGEROUS_BUILTINS:
         if not isinstance(builtin, str):
-            warnings.append(f"Builtin name must be string: {builtin}")  # pragma: no cover
+            warnings.append(
+                f"Builtin name must be string: {builtin}"
+            )  # pragma: no cover
 
     # Validate dangerous opcodes
     for opcode in DANGEROUS_OPCODES:
@@ -402,14 +404,20 @@ def validate_patterns() -> list[str]:
     # Validate binary code patterns
     for binary_pattern in BINARY_CODE_PATTERNS:
         if not isinstance(binary_pattern, bytes):
-            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")  # pragma: no cover
+            warnings.append(
+                f"Binary code pattern must be bytes: {binary_pattern!r}"
+            )  # pragma: no cover
 
     # Validate executable signatures
     for signature, description in EXECUTABLE_SIGNATURES.items():
         if not isinstance(signature, bytes):
-            warnings.append(f"Signature must be bytes: {signature!r}")  # pragma: no cover
+            warnings.append(
+                f"Signature must be bytes: {signature!r}"
+            )  # pragma: no cover
         if not isinstance(description, str):
-            warnings.append(f"Description must be string for signature {signature!r}")  # pragma: no cover
+            warnings.append(
+                f"Description must be string for signature {signature!r}"
+            )  # pragma: no cover
         if not description:
             warnings.append(
                 f"Description must be non-empty for signature {signature!r}",

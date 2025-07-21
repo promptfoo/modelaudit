@@ -233,7 +233,11 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertTrue(result.success)
 
             # Any remaining issues should be INFO or WARNING level, not ERROR
-            error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+            error_issues = [
+                issue
+                for issue in result.issues
+                if issue.severity == IssueSeverity.CRITICAL
+            ]
             self.assertEqual(
                 len(error_issues),
                 0,
@@ -279,7 +283,9 @@ class TestPickleSmartDetection(unittest.TestCase):
             self.assertTrue(result.success)
 
             # Should not flag the __version__ string as suspicious in ML context
-            version_issues = [issue for issue in result.issues if "__version__" in issue.message]
+            version_issues = [
+                issue for issue in result.issues if "__version__" in issue.message
+            ]
             self.assertEqual(
                 len(version_issues),
                 0,
@@ -312,7 +318,9 @@ class TestPickleSmartDetection(unittest.TestCase):
 
             # Should have at least one ERROR or WARNING
             high_severity_issues = [
-                issue for issue in result.issues if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
+                issue
+                for issue in result.issues
+                if issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             ]
             self.assertTrue(
                 len(high_severity_issues) > 0,

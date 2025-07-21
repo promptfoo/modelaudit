@@ -127,8 +127,13 @@ def test_scan_mlflow_model_no_registry_uri():
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
-        patch("modelaudit.mlflow_integration.tempfile.mkdtemp", return_value="/tmp/test"),
-        patch("modelaudit.mlflow_integration.scan_model_directory_or_file", return_value={}),
+        patch(
+            "modelaudit.mlflow_integration.tempfile.mkdtemp", return_value="/tmp/test"
+        ),
+        patch(
+            "modelaudit.mlflow_integration.scan_model_directory_or_file",
+            return_value={},
+        ),
         patch("modelaudit.mlflow_integration.shutil.rmtree"),
     ):
         scan_mlflow_model("models:/TestModel/1")

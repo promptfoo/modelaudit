@@ -19,7 +19,9 @@ def get_free_space_bytes(path: Path) -> int:
     return stat.free
 
 
-def check_disk_space(path: Path, required_bytes: int, safety_margin: float = 1.2) -> tuple[bool, str]:
+def check_disk_space(
+    path: Path, required_bytes: int, safety_margin: float = 1.2
+) -> tuple[bool, str]:
     """Check if there's enough disk space for a download.
 
     Args:

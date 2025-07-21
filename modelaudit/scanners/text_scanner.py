@@ -41,7 +41,9 @@ class TextScanner(BaseScanner):
             "requirements.txt",
         }
 
-        return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
+        return filename in ml_text_files or any(
+            filename.startswith(prefix) for prefix in ["vocab", "token", "label"]
+        )
 
     def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
         """Scan a text file for security issues."""
@@ -64,14 +66,24 @@ class TextScanner(BaseScanner):
             filename = os.path.basename(path).lower()
 
             # Identify file type
-            if filename in ["readme.md", "readme.txt", "readme.markdown", "model_card.md"]:
+            if filename in [
+                "readme.md",
+                "readme.txt",
+                "readme.markdown",
+                "model_card.md",
+            ]:
                 result.add_issue(
                     "Model documentation file",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"file_type": "documentation"},
                 )
-            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
+            elif filename in [
+                "vocab.txt",
+                "vocabulary.txt",
+                "tokens.txt",
+                "tokenizer.txt",
+            ]:
                 result.add_issue(
                     "Tokenizer vocabulary file",
                     severity=IssueSeverity.DEBUG,
@@ -87,7 +99,10 @@ class TextScanner(BaseScanner):
                 )
             elif filename in ["license.txt", "license.md"]:
                 result.add_issue(
-                    "License file", severity=IssueSeverity.DEBUG, location=path, details={"file_type": "license"}
+                    "License file",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"file_type": "license"},
                 )
             elif filename == "requirements.txt":
                 # Could scan for suspicious dependencies in the future
@@ -99,7 +114,10 @@ class TextScanner(BaseScanner):
                 )
             else:
                 result.add_issue(
-                    "ML-related text file", severity=IssueSeverity.DEBUG, location=path, details={"file_type": "text"}
+                    "ML-related text file",
+                    severity=IssueSeverity.DEBUG,
+                    location=path,
+                    details={"file_type": "text"},
                 )
 
             result.bytes_scanned = file_size

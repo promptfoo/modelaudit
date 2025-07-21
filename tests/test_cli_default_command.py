@@ -68,7 +68,9 @@ class TestDefaultCommandGroup:
 
             # Should not fail due to unknown command
             assert "No such command" not in result.output
-            assert result.exit_code != 2  # Exit code 2 typically indicates command not found
+            assert (
+                result.exit_code != 2
+            )  # Exit code 2 typically indicates command not found
 
         finally:
             tmp_path1.unlink(missing_ok=True)

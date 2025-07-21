@@ -159,7 +159,9 @@ def test_gguf_scanner_truncated_file(tmp_path):
         f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
 
     result = GgufScanner().scan(str(path))
-    assert not result.success or any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert not result.success or any(
+        i.severity == IssueSeverity.CRITICAL for i in result.issues
+    )
 
 
 def test_gguf_scanner_suspicious_key_paths(tmp_path):
@@ -288,7 +290,10 @@ def test_gguf_scanner_tensor_dimension_limits(tmp_path):
         # Don't write the rest as it would be too long
 
     result = GgufScanner().scan(str(path))
-    assert any("suspicious" in i.message.lower() and "dimensions" in i.message.lower() for i in result.issues)
+    assert any(
+        "suspicious" in i.message.lower() and "dimensions" in i.message.lower()
+        for i in result.issues
+    )
 
 
 def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
@@ -328,7 +333,9 @@ def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
 
     # Should detect the DoS attempt
     assert any(
-        "excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues
+        "excessive dimensions" in i.message.lower()
+        and i.severity == IssueSeverity.CRITICAL
+        for i in result.issues
     )
 
     # Should mention skipping for security
@@ -462,10 +469,16 @@ def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
     warning_messages = [issue.message for issue in result.issues]
 
     # Check for zero dimension warning
-    assert any("tensor_with_zero" in msg and "invalid dimension: 0" in msg for msg in warning_messages)
+    assert any(
+        "tensor_with_zero" in msg and "invalid dimension: 0" in msg
+        for msg in warning_messages
+    )
 
     # Check for negative dimension warning (the exact value depends on how it's interpreted)
-    assert any("tensor_with_negative" in msg and "invalid dimension" in msg for msg in warning_messages)
+    assert any(
+        "tensor_with_negative" in msg and "invalid dimension" in msg
+        for msg in warning_messages
+    )
 
     # Should have exactly 2 warnings (one for each invalid dimension)
     dimension_warnings = [msg for msg in warning_messages if "invalid dimension" in msg]

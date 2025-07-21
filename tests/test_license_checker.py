@@ -75,7 +75,9 @@ def network_service():
         assert len(licenses) >= 1
         agpl_licenses = [lic for lic in licenses if lic.spdx_id == "AGPL-3.0"]
         assert len(agpl_licenses) == 1
-        assert agpl_licenses[0].commercial_allowed is True  # But with strong obligations
+        assert (
+            agpl_licenses[0].commercial_allowed is True
+        )  # But with strong obligations
 
     def test_cc_by_nc_license_detection(self, tmp_path):
         """Test detection of Creative Commons NonCommercial license."""
@@ -178,7 +180,9 @@ def example():
         assert "Another Corp" in holders
 
         # Check years are extracted correctly
-        example_corp_copyrights = [cr for cr in copyrights if cr.holder == "Example Corporation"]
+        example_corp_copyrights = [
+            cr for cr in copyrights if cr.holder == "Example Corporation"
+        ]
         assert len(example_corp_copyrights) >= 1
         assert example_corp_copyrights[0].year == "2024"
 
@@ -279,7 +283,9 @@ class TestUnlicensedDatasetDetection:
         # Note: Small JSON files may still be flagged if they don't have license info
         # This test verifies the behavior - small files in multi-file contexts are skipped
         # but single small files may still be checked
-        assert len(unlicensed) <= 1  # May or may not be flagged depending on size threshold
+        assert (
+            len(unlicensed) <= 1
+        )  # May or may not be flagged depending on size threshold
 
     def test_dataset_with_nearby_license(self, tmp_path):
         """Test dataset with license file in same directory."""
@@ -441,19 +447,31 @@ class TestSpdxLicenseChecks:
     """Test deprecated and incompatible license detection."""
 
     def test_deprecated_license_warning(self):
-        scan_results = {"file_metadata": {"/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}}}
+        scan_results = {
+            "file_metadata": {
+                "/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}
+            }
+        }
 
         warnings = check_commercial_use_warnings(scan_results)
         assert any("deprecated" in w["message"].lower() for w in warnings)
 
     def test_incompatible_license_warning(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+        scan_results = {
+            "file_metadata": {
+                "/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}
+            }
+        }
 
         warnings = check_commercial_use_warnings(scan_results)
         assert any("incompatible" in w["message"].lower() for w in warnings)
 
     def test_strict_license_errors(self):
-        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+        scan_results = {
+            "file_metadata": {
+                "/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}
+            }
+        }
 
         warnings = check_commercial_use_warnings(scan_results, strict=True)
         assert any(w["severity"] == "error" for w in warnings)
@@ -504,7 +522,9 @@ Bob,30
 
         metadata = collect_license_metadata(str(test_file))
 
-        assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
+        assert (
+            metadata["is_dataset"] is True
+        )  # .pkl is both dataset and model extension
         assert metadata["is_model"] is True
 
 
@@ -529,10 +549,16 @@ test,data
         results = scan_model_directory_or_file(str(test_file))
 
         # Should have license warning
-        license_issues = [issue for issue in results.get("issues", []) if issue.get("type") == "license_warning"]
+        license_issues = [
+            issue
+            for issue in results.get("issues", [])
+            if issue.get("type") == "license_warning"
+        ]
 
         assert len(license_issues) > 0
-        assert any("Non-commercial" in issue.get("message", "") for issue in license_issues)
+        assert any(
+            "Non-commercial" in issue.get("message", "") for issue in license_issues
+        )
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):
         """Test that ML model directories don't generate false positive license warnings."""
@@ -555,7 +581,8 @@ test,data
         license_issues = [
             issue
             for issue in results.get("issues", [])
-            if issue.get("type") == "license_warning" and "unspecified licenses" in issue.get("message", "")
+            if issue.get("type") == "license_warning"
+            and "unspecified licenses" in issue.get("message", "")
         ]
 
         assert len(license_issues) == 0

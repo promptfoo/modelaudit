@@ -169,7 +169,10 @@ class TestErrorHandling:
 
             # Check detailed metadata
             assert result.metadata.get("truncated") is True
-            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
+            assert (
+                result.metadata.get("truncation_reason")
+                == "post_stop_data_or_format_issue"
+            )
             assert result.metadata.get("exception_type") == "ValueError"
             assert result.metadata.get("validated_format") is True
             assert "exception_message" in result.metadata
@@ -192,7 +195,9 @@ class TestErrorHandling:
             result = scanner.scan(str(suspicious_file))
 
             # Should be treated as warning (not benign, but not necessarily critical)
-            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
+            warning_issues = [
+                i for i in result.issues if i.severity == IssueSeverity.WARNING
+            ]
             assert len(warning_issues) > 0
             assert not result.metadata.get("truncated", False)
 
@@ -234,9 +239,9 @@ class TestErrorHandling:
             has_logged_messages = len(caplog.records) > 0
 
             # Should have at least one form of error handling
-            assert has_issues or has_truncation_metadata or has_logged_messages, (
-                "Should have some form of error handling (issues, truncation, or logging)"
-            )
+            assert (
+                has_issues or has_truncation_metadata or has_logged_messages
+            ), "Should have some form of error handling (issues, truncation, or logging)"
 
 
 class TestPerformanceAndEdgeCases:
@@ -338,11 +343,16 @@ class TestIntegration:
 
             # Should contain truncation message for legitimate files
             error_messages = [str(issue.message) for issue in info_issues]
-            assert any("truncated due to format complexity" in msg for msg in error_messages)
+            assert any(
+                "truncated due to format complexity" in msg for msg in error_messages
+            )
 
             # Should have proper metadata
             assert result.metadata.get("truncated") is True
-            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
+            assert (
+                result.metadata.get("truncation_reason")
+                == "post_stop_data_or_format_issue"
+            )
 
     def test_backward_compatibility(self, tmp_path):
         """Test that regular pickle scanning still works unchanged."""
@@ -356,7 +366,9 @@ class TestIntegration:
 
         # Should work normally
         assert result.success is True
-        assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
+        assert (
+            len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
+        )
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""
@@ -397,7 +409,9 @@ class TestIntegration:
             # Non-benign errors should definitely create issues
             assert len(result.issues) > 0
             # Should be warning error since KeyError is not in benign list but also not necessarily critical
-            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
+            warning_issues = [
+                i for i in result.issues if i.severity == IssueSeverity.WARNING
+            ]
             assert len(warning_issues) > 0
 
 

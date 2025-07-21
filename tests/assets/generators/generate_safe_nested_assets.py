@@ -36,7 +36,8 @@ def generate_safe_nested_assets():
         ),
         "metadata": {
             "training_time": "2024-01-15T10:30:00Z",
-            "dataset_checksum": "1234567890abcdef" * 8,  # Hex string but not nested pickle
+            "dataset_checksum": "1234567890abcdef"
+            * 8,  # Hex string but not nested pickle
             "description": (
                 "This is a legitimate model with some base64-like strings that should not trigger false positives"
             ),
@@ -58,7 +59,11 @@ def generate_safe_nested_assets():
         "layers": ["conv1", "pool1", "conv2", "pool2", "fc1", "fc2"],
         "weights_binary": fake_tensor_data,  # Binary but not pickle
         "compressed_config": compressed_data,  # Binary but not pickle
-        "tensor_metadata": {"shape": [224, 224, 3], "dtype": "float32", "serialization_format": "custom_binary_v2"},
+        "tensor_metadata": {
+            "shape": [224, 224, 3],
+            "dtype": "float32",
+            "serialization_format": "custom_binary_v2",
+        },
     }
 
     with open(output_dir / "safe_model_with_binary.pkl", "wb") as f:
@@ -78,7 +83,10 @@ def generate_safe_nested_assets():
         "license_text": base64.b64encode(b"MIT License\nCopyright (c) 2024").decode(),
         # Hex-encoded but legitimate data
         "model_signature": "deadbeef" * 32,  # Hex but not nested pickle
-        "weights": {"embedding": "placeholder_tensor_data", "attention": "placeholder_tensor_data"},
+        "weights": {
+            "embedding": "placeholder_tensor_data",
+            "attention": "placeholder_tensor_data",
+        },
     }
 
     with open(output_dir / "safe_model_with_encoding.pkl", "wb") as f:
@@ -98,7 +106,9 @@ def generate_safe_nested_assets():
             "padding_config": large_config,
             "layer_configs": ["layer_" + str(i) for i in range(1000)],  # Large list
         },
-        "weights": {f"layer_{i}": [0.1] * 1000 for i in range(50)},  # Large nested structure
+        "weights": {
+            f"layer_{i}": [0.1] * 1000 for i in range(50)
+        },  # Large nested structure
         "optimizer_state": {
             "momentum": [0.9] * 10000,
             "learning_rate_schedule": [0.001 * (0.95**i) for i in range(1000)],
@@ -113,7 +123,13 @@ def generate_safe_nested_assets():
 
     # Legitimate nested data structures that aren't nested pickles
     nested_config = {
-        "level1": {"level2": {"level3": {"model_params": {"hidden_size": 768, "intermediate_size": 3072}}}}
+        "level1": {
+            "level2": {
+                "level3": {
+                    "model_params": {"hidden_size": 768, "intermediate_size": 3072}
+                }
+            }
+        }
     }
 
     safe_nested_structure = {
@@ -122,7 +138,12 @@ def generate_safe_nested_assets():
         "serialized_metadata": str(nested_config),  # String representation
         "binary_placeholder": b"not a pickle just binary data" * 10,
         "weights": {
-            "encoder": {"layers": {f"layer_{i}": {"weight": [0.1] * 100, "bias": [0.0] * 100} for i in range(12)}}
+            "encoder": {
+                "layers": {
+                    f"layer_{i}": {"weight": [0.1] * 100, "bias": [0.0] * 100}
+                    for i in range(12)
+                }
+            }
         },
     }
 

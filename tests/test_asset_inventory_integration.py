@@ -103,7 +103,9 @@ class TestAssetInventoryIntegration:
         assert len(assets) >= 4
 
         # Check for SafeTensors file with tensor metadata
-        safetensors_assets = [a for a in assets if a["path"].endswith("model.safetensors")]
+        safetensors_assets = [
+            a for a in assets if a["path"].endswith("model.safetensors")
+        ]
         assert len(safetensors_assets) == 1
         st_asset = safetensors_assets[0]
         assert st_asset["type"] == "safetensors"
@@ -142,7 +144,11 @@ class TestAssetInventoryIntegration:
 
         # Check nested SafeTensors asset has tensor metadata
         nested_st = next(
-            (c for c in zip_asset["contents"] if c["path"].endswith("optimizer.safetensors")),
+            (
+                c
+                for c in zip_asset["contents"]
+                if c["path"].endswith("optimizer.safetensors")
+            ),
             None,
         )
         assert nested_st is not None
@@ -183,8 +189,13 @@ class TestAssetInventoryIntegration:
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # The asset inventory is still available in JSON format
         # Just verify that the scan completed successfully and mentioned the files
-        assert "Scan Summary" in result.output or "scan summary" in result.output.lower()
-        assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
+        assert (
+            "Scan Summary" in result.output or "scan summary" in result.output.lower()
+        )
+        assert (
+            "Files scanned:" in result.output
+            or "files scanned:" in result.output.lower()
+        )
 
         # Should still show file paths in issues if any are found
         # The files are still being scanned and processed, just not listed separately
@@ -373,21 +384,21 @@ class TestAssetInventoryIntegration:
         # Simulate a transformer model structure
         tensors = {}
         for layer in range(12):  # 12 transformer layers
-            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(
-                np.float32
-            )
+            tensors[
+                f"transformer.layer.{layer}.attention.self.query.weight"
+            ] = np.random.randn(768, 768).astype(np.float32)
+            tensors[
+                f"transformer.layer.{layer}.attention.self.key.weight"
+            ] = np.random.randn(768, 768).astype(np.float32)
+            tensors[
+                f"transformer.layer.{layer}.attention.self.value.weight"
+            ] = np.random.randn(768, 768).astype(np.float32)
+            tensors[
+                f"transformer.layer.{layer}.attention.output.dense.weight"
+            ] = np.random.randn(768, 768).astype(np.float32)
+            tensors[
+                f"transformer.layer.{layer}.intermediate.dense.weight"
+            ] = np.random.randn(3072, 768).astype(np.float32)
             tensors[f"transformer.layer.{layer}.output.dense.weight"] = np.random.randn(
                 768,
                 3072,
@@ -437,9 +448,18 @@ class TestAssetInventoryIntegration:
 
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # Verify that the overall output structure is still well-formatted
-        assert "Scan Summary" in result.output or "scan summary" in result.output.lower()
-        assert "Files scanned:" in result.output or "files scanned:" in result.output.lower()
-        assert "Issues Found" in result.output or "issues found" in result.output.lower() or "Clean" in result.output
+        assert (
+            "Scan Summary" in result.output or "scan summary" in result.output.lower()
+        )
+        assert (
+            "Files scanned:" in result.output
+            or "files scanned:" in result.output.lower()
+        )
+        assert (
+            "Issues Found" in result.output
+            or "issues found" in result.output.lower()
+            or "Clean" in result.output
+        )
 
         # The asset inventory is still captured but not displayed in text format
         # Users can use --format json to see detailed asset information

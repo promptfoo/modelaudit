@@ -95,7 +95,9 @@ class TestParallelScanner:
             def progress_callback(message, percentage):
                 progress_calls.append((message, percentage))
 
-            scanner = ParallelScanner(max_workers=1, progress_callback=progress_callback)
+            scanner = ParallelScanner(
+                max_workers=1, progress_callback=progress_callback
+            )
             results = scanner.scan_files(files, {})
 
             # Progress callback is called during parallel scanning
@@ -223,7 +225,9 @@ class TestParallelScannerIntegration:
 
             assert results["files_scanned"] == 2
             # Assets should have scanner-specific types
-            assert all(asset["type"] in ["pickle", "numpy"] for asset in results["assets"])
+            assert all(
+                asset["type"] in ["pickle", "numpy"] for asset in results["assets"]
+            )
 
     def test_performance_comparison(self):
         """Compare performance of parallel vs sequential scanning."""

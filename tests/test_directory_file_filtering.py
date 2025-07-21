@@ -91,7 +91,9 @@ class TestDirectoryFileFiltering:
 
             # Test with different parameter values matching CLI behavior
             # CLI --no-skip-files means skip_file_types=False
-            results_no_skip = scan_model_directory_or_file(tmp_dir, skip_file_types=False)
+            results_no_skip = scan_model_directory_or_file(
+                tmp_dir, skip_file_types=False
+            )
             assert results_no_skip["files_scanned"] == 2
 
             # CLI default (--skip-files) means skip_file_types=True

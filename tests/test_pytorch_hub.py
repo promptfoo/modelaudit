@@ -32,7 +32,9 @@ class TestPytorchHubURLDetection:
 @patch("modelaudit.utils.pytorch_hub.requests.get")
 def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp_path):
     html_resp = MagicMock()
-    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.text = (
+        '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    )
     html_resp.raise_for_status = lambda: None
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp

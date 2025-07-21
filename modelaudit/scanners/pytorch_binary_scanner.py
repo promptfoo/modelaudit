@@ -186,7 +186,9 @@ class PyTorchBinaryScanner(BaseScanner):
         )
 
         # Analyze ML context for this chunk
-        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+        ml_context = analyze_binary_for_ml_context(
+            chunk, self.get_file_size(self.current_file_path)
+        )
 
         # Count patterns for density analysis
         pattern_counts = {}
@@ -220,7 +222,9 @@ class PyTorchBinaryScanner(BaseScanner):
             ignored_count = 0
 
             for pos in positions:
-                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                if should_ignore_executable_signature(
+                    sig, pos, ml_context, int(pattern_density), len(positions)
+                ):
                     ignored_count += 1
                 else:
                     filtered_positions.append(pos)

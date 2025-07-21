@@ -465,7 +465,10 @@ class ScannerRegistry:
     def _is_aiml_manifest_file(self, filename: str) -> bool:
         """Check if filename matches AI/ML manifest patterns."""
         # Use exact filename matching to avoid false positives like "config.json.backup"
-        return any(filename == pattern or filename.endswith(f"/{pattern}") for pattern in self._AIML_MANIFEST_PATTERNS)
+        return any(
+            filename == pattern or filename.endswith(f"/{pattern}")
+            for pattern in self._AIML_MANIFEST_PATTERNS
+        )
 
 
 # Global registry instance
@@ -552,7 +555,9 @@ def __getattr__(name: str) -> Any:
 
 
 # Helper function for getting scanner for a file
-def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+def get_scanner_for_file(
+    path: str, config: Optional[dict[str, Any]] = None
+) -> Optional[BaseScanner]:
     """Get an instantiated scanner for a given file path"""
     scanner_class = _registry.get_scanner_for_path(path)
     if scanner_class:

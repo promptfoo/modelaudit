@@ -50,7 +50,10 @@ def generate_nested_pickle_assets():
     b64_attack_data = {
         "model_config": "ResNet50",
         "encoded_weights": b64_encoded,  # This will be stored as a STRING opcode
-        "metadata": {"version": "1.0", "description": "A model with base64-encoded malicious payload"},
+        "metadata": {
+            "version": "1.0",
+            "description": "A model with base64-encoded malicious payload",
+        },
     }
 
     with open(output_dir / "nested_pickle_base64.pkl", "wb") as f:
@@ -80,7 +83,9 @@ def generate_nested_pickle_assets():
     multi_attack_data = {
         "model_metadata": {"version": "1.0"},
         "stage1_payload": stage1_bytes,  # Raw nested
-        "stage1_encoded": base64.b64encode(stage1_bytes).decode("ascii"),  # Encoded nested
+        "stage1_encoded": base64.b64encode(stage1_bytes).decode(
+            "ascii"
+        ),  # Encoded nested
     }
 
     with open(output_dir / "nested_pickle_multistage.pkl", "wb") as f:
@@ -96,7 +101,12 @@ def generate_nested_pickle_assets():
     realistic_model = {
         "model_name": "bert-base-uncased",
         "model_type": "transformer",
-        "config": {"hidden_size": 768, "num_attention_heads": 12, "num_hidden_layers": 12, "vocab_size": 30522},
+        "config": {
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "vocab_size": 30522,
+        },
         "state_dict": {
             "embeddings.weight": "placeholder_tensor_data",
             "encoder.layer.0.attention.self.query.weight": "placeholder_tensor_data",
@@ -105,7 +115,9 @@ def generate_nested_pickle_assets():
         "optimizer_state": "placeholder_optimizer_data",
         # Hidden malicious payload disguised as model metadata
         "training_metadata": inner_bytes,  # Raw nested pickle
-        "tokenizer_config": base64.b64encode(inner_bytes).decode("ascii"),  # Base64 nested
+        "tokenizer_config": base64.b64encode(inner_bytes).decode(
+            "ascii"
+        ),  # Base64 nested
     }
 
     with open(output_dir / "malicious_model_realistic.pkl", "wb") as f:

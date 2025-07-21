@@ -101,7 +101,9 @@ def scan_directory_parallel(
                             break
 
             # Check file is within base directory
-            if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
+            if not is_hf_cache_symlink and not is_within_directory(
+                str(base_dir), str(resolved_file)
+            ):
                 path_traversal_issues.append(
                     {
                         "message": "Path traversal outside scanned directory",
@@ -155,7 +157,11 @@ def scan_directory_parallel(
         for issue in path_traversal_issues:
             # Map string severity to IssueSeverity enum
             severity_str = issue.get("severity", "critical")
-            severity_value = IssueSeverity.WARNING.value if severity_str == "warning" else IssueSeverity.CRITICAL.value
+            severity_value = (
+                IssueSeverity.WARNING.value
+                if severity_str == "warning"
+                else IssueSeverity.CRITICAL.value
+            )
 
             issue_dict = {
                 "message": issue["message"],
@@ -170,6 +176,8 @@ def scan_directory_parallel(
     results["worker_count"] = scanner.max_workers if files_to_scan else 0
 
     logger.debug(f"Parallel scan returning results with keys: {list(results.keys())}")
-    logger.debug(f"parallel_scan={results.get('parallel_scan')}, worker_count={results.get('worker_count')}")
+    logger.debug(
+        f"parallel_scan={results.get('parallel_scan')}, worker_count={results.get('worker_count')}"
+    )
 
     return results

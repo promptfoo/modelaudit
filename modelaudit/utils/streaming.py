@@ -39,7 +39,11 @@ def stream_analyze_file(
 
     fs_protocol = get_fs_protocol(url)
     # Use anonymous access for public buckets
-    fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+    fs = (
+        fsspec.filesystem(fs_protocol, token="anon")
+        if fs_protocol == "gcs"
+        else fsspec.filesystem(fs_protocol)
+    )
 
     try:
         # Get file info first
@@ -174,7 +178,11 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> Optional[dict[str,
 
     try:
         fs_protocol = get_fs_protocol(url)
-        fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+        fs = (
+            fsspec.filesystem(fs_protocol, token="anon")
+            if fs_protocol == "gcs"
+            else fsspec.filesystem(fs_protocol)
+        )
 
         # Read first few bytes
         with fs.open(url, "rb") as f:

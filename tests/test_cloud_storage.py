@@ -107,7 +107,9 @@ class TestDiskSpaceCheckingForCloud:
     @patch("modelaudit.utils.cloud_storage.get_cloud_object_size")
     @patch("modelaudit.utils.cloud_storage.check_disk_space")
     @patch("fsspec.filesystem")
-    def test_download_insufficient_disk_space(self, mock_fs_class, mock_check_disk_space, mock_get_size):
+    def test_download_insufficient_disk_space(
+        self, mock_fs_class, mock_check_disk_space, mock_get_size
+    ):
         """Test download fails when disk space is insufficient."""
         fs = MagicMock()
         mock_fs_class.return_value = fs
@@ -116,10 +118,15 @@ class TestDiskSpaceCheckingForCloud:
         mock_get_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
 
         # Mock disk space check to fail
-        mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
+        mock_check_disk_space.return_value = (
+            False,
+            "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB",
+        )
 
         # Test download failure
-        with pytest.raises(Exception, match="Cannot download from.*Insufficient disk space"):
+        with pytest.raises(
+            Exception, match="Cannot download from.*Insufficient disk space"
+        ):
             download_from_cloud("s3://bucket/large-model.bin")
 
         # Verify download was not attempted
@@ -128,7 +135,9 @@ class TestDiskSpaceCheckingForCloud:
     @patch("modelaudit.utils.cloud_storage.get_cloud_object_size")
     @patch("modelaudit.utils.cloud_storage.check_disk_space")
     @patch("fsspec.filesystem")
-    def test_download_with_disk_space_check(self, mock_fs_class, mock_check_disk_space, mock_get_size, tmp_path):
+    def test_download_with_disk_space_check(
+        self, mock_fs_class, mock_check_disk_space, mock_get_size, tmp_path
+    ):
         """Test successful download with disk space check."""
         fs = MagicMock()
         mock_fs_class.return_value = fs
@@ -140,7 +149,10 @@ class TestDiskSpaceCheckingForCloud:
         mock_get_size.return_value = 1024 * 1024 * 1024  # 1 GB
 
         # Mock disk space check to pass
-        mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
+        mock_check_disk_space.return_value = (
+            True,
+            "Sufficient disk space available (10.0 GB)",
+        )
 
         # Test download
         result = download_from_cloud("s3://bucket/model.bin", cache_dir=tmp_path)

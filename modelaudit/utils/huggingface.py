@@ -129,7 +129,9 @@ def get_model_size(repo_id: str) -> Optional[int]:
         return None
 
 
-def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
+def download_model(
+    url: str, cache_dir: Optional[Path] = None, show_progress: bool = True
+) -> Path:
     """Download a model from HuggingFace.
 
     Args:

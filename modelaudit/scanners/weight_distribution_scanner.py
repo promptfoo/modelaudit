@@ -34,7 +34,9 @@ class WeightDistributionScanner(BaseScanner):
     """Scanner that detects anomalous weight distributions potentially indicating trojaned models"""
 
     name = "weight_distribution"
-    description = "Analyzes weight distributions to detect potential backdoors or trojans"
+    description = (
+        "Analyzes weight distributions to detect potential backdoors or trojans"
+    )
     supported_extensions: ClassVar[list[str]] = [
         ".pt",
         ".pth",
@@ -67,7 +69,9 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
-            return HAS_TENSORFLOW and os.path.exists(os.path.join(path, "saved_model.pb"))
+            return HAS_TENSORFLOW and os.path.exists(
+                os.path.join(path, "saved_model.pb")
+            )
 
         if not os.path.isfile(path):
             return False
@@ -235,7 +239,9 @@ class WeightDistributionScanner(BaseScanner):
             with h5py.File(path, "r") as f:
                 # Navigate through the HDF5 structure to find weights
                 def extract_weights(name, obj):
-                    if isinstance(obj, h5py.Dataset) and ("kernel" in name or "weight" in name):
+                    if isinstance(obj, h5py.Dataset) and (
+                        "kernel" in name or "weight" in name
+                    ):
                         weights_info[name] = np.array(obj)
 
                 f.visititems(extract_weights)
@@ -257,11 +263,18 @@ class WeightDistributionScanner(BaseScanner):
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
-                        if "weight" not in name.lower() and "kernel" not in name.lower():
+                        if (
+                            "weight" not in name.lower()
+                            and "kernel" not in name.lower()
+                        ):
                             continue
                         tensor = tf.train.load_variable(ckpt_prefix, name)
                         array = np.array(tensor)
-                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                        if (
+                            self.max_array_size
+                            and self.max_array_size > 0
+                            and array.nbytes > self.max_array_size
+                        ):
                             continue
                         # Only include 2D+ tensors for consistency with .pb file handling
                         if len(array.shape) >= 2:
@@ -290,9 +303,16 @@ class WeightDistributionScanner(BaseScanner):
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
                         array = tf.make_ndarray(tensor_proto)
-                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                        if (
+                            self.max_array_size
+                            and self.max_array_size > 0
+                            and array.nbytes > self.max_array_size
+                        ):
                             continue
-                        if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
+                        if (
+                            "weight" in node.name.lower()
+                            or "kernel" in node.name.lower()
+                        ) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
@@ -380,23 +400,31 @@ class WeightDistributionScanner(BaseScanner):
                     ]
                 )
                 and "weight" in name.lower()
-            ) and len(weights.shape) == 2:  # Ensure it's a 2D weight matrix
+            ) and len(
+                weights.shape
+            ) == 2:  # Ensure it's a 2D weight matrix
                 final_layer_candidates[name] = weights
 
         # If no clear final layer found, analyze all 2D weight matrices
         if not final_layer_candidates:
             final_layer_candidates = {
-                name: weights for name, weights in weights_info.items() if len(weights.shape) == 2
+                name: weights
+                for name, weights in weights_info.items()
+                if len(weights.shape) == 2
             }
 
         # Analyze each candidate layer with complete architectural context
         for layer_name, weights in final_layer_candidates.items():
-            layer_anomalies = self._analyze_layer_weights(layer_name, weights, architecture_analysis)
+            layer_anomalies = self._analyze_layer_weights(
+                layer_name, weights, architecture_analysis
+            )
             anomalies.extend(layer_anomalies)
 
         return anomalies
 
-    def _analyze_architecture_properties(self, weights_info: dict[str, np.ndarray]) -> dict[str, Any]:
+    def _analyze_architecture_properties(
+        self, weights_info: dict[str, np.ndarray]
+    ) -> dict[str, Any]:
         """
         Analyze the mathematical and architectural properties to determine model characteristics.
         Uses structural analysis rather than name-based detection to avoid security bypasses.
@@ -443,35 +471,68 @@ class WeightDistributionScanner(BaseScanner):
         output_dims = [w["output_dim"] for w in weight_matrices]
 
         # Check for common transformer dimensions (powers of 2, multiples of 64)
-        transformer_dims = [64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192]
+        transformer_dims = [
+            64,
+            128,
+            256,
+            384,
+            512,
+            768,
+            1024,
+            1536,
+            2048,
+            3072,
+            4096,
+            8192,
+        ]
         matching_dims = 0
 
         for dim in input_dims + output_dims:
-            if dim in transformer_dims or any(dim % td == 0 and dim // td <= 16 for td in transformer_dims):
+            if dim in transformer_dims or any(
+                dim % td == 0 and dim // td <= 16 for td in transformer_dims
+            ):
                 matching_dims += 1
 
-        if matching_dims > len(weight_matrices) * 0.6:  # 60% of dimensions match transformer patterns
+        if (
+            matching_dims > len(weight_matrices) * 0.6
+        ):  # 60% of dimensions match transformer patterns
             analysis["confidence"] += 0.3
-            analysis["evidence"].append(f"Found {matching_dims} dimensions matching transformer patterns")
+            analysis["evidence"].append(
+                f"Found {matching_dims} dimensions matching transformer patterns"
+            )
             analysis["is_likely_transformer"] = True
 
         # Check for large vocabulary/embedding patterns (characteristic of LLMs)
         large_vocab_evidence = 0
-        common_vocab_sizes = [30522, 50257, 32000, 28996, 51200, 65536, 100000]  # Known vocab sizes
+        common_vocab_sizes = [
+            30522,
+            50257,
+            32000,
+            28996,
+            51200,
+            65536,
+            100000,
+        ]  # Known vocab sizes
 
         for matrix in weight_matrices:
             # Check if either dimension could be a vocabulary size
             for vocab_size in common_vocab_sizes:
-                if abs(matrix["output_dim"] - vocab_size) < vocab_size * 0.05:  # 5% tolerance
+                if (
+                    abs(matrix["output_dim"] - vocab_size) < vocab_size * 0.05
+                ):  # 5% tolerance
                     large_vocab_evidence += 1
-                    analysis["evidence"].append(f"Found vocabulary-sized layer: {matrix['output_dim']} ≈ {vocab_size}")
+                    analysis["evidence"].append(
+                        f"Found vocabulary-sized layer: {matrix['output_dim']} ≈ {vocab_size}"
+                    )
                     break
 
         # Check for very large hidden dimensions typical of modern LLMs
         large_hidden_dims = [dim for dim in input_dims + output_dims if dim >= 768]
         if large_hidden_dims:
             analysis["confidence"] += 0.2
-            analysis["evidence"].append(f"Found large hidden dimensions: {set(large_hidden_dims)}")
+            analysis["evidence"].append(
+                f"Found large hidden dimensions: {set(large_hidden_dims)}"
+            )
 
         # Check for architectural consistency (repeated dimension patterns)
         dim_frequency: dict[int, int] = {}
@@ -482,21 +543,31 @@ class WeightDistributionScanner(BaseScanner):
         repeated_dims = [dim for dim, freq in dim_frequency.items() if freq >= 3]
         if repeated_dims:
             analysis["confidence"] += 0.2
-            analysis["evidence"].append(f"Found repeated architectural dimensions: {repeated_dims}")
+            analysis["evidence"].append(
+                f"Found repeated architectural dimensions: {repeated_dims}"
+            )
 
         # Check total parameter count (modern LLMs have millions/billions of parameters)
         if total_params > 100_000_000:  # > 100M parameters
             analysis["confidence"] += 0.3
-            analysis["evidence"].append(f"Large parameter count: {total_params:,} parameters")
+            analysis["evidence"].append(
+                f"Large parameter count: {total_params:,} parameters"
+            )
             analysis["is_likely_llm"] = True
         elif total_params > 10_000_000:  # > 10M parameters
             analysis["confidence"] += 0.2
-            analysis["evidence"].append(f"Medium parameter count: {total_params:,} parameters")
+            analysis["evidence"].append(
+                f"Medium parameter count: {total_params:,} parameters"
+            )
 
         # Final classification based on structural evidence
-        if analysis["confidence"] > 0.7 and (large_vocab_evidence > 0 or total_params > 50_000_000):
+        if analysis["confidence"] > 0.7 and (
+            large_vocab_evidence > 0 or total_params > 50_000_000
+        ):
             analysis["is_likely_llm"] = True
-            analysis["evidence"].append("High confidence: Large Language Model based on structural analysis")
+            analysis["evidence"].append(
+                "High confidence: Large Language Model based on structural analysis"
+            )
         elif analysis["confidence"] > 0.5:
             analysis["is_likely_transformer"] = True
             analysis["evidence"].append("Moderate confidence: Transformer-based model")
@@ -505,7 +576,9 @@ class WeightDistributionScanner(BaseScanner):
             "vocab_evidence": large_vocab_evidence,
             "transformer_dims": matching_dims,
             "repeated_dims": len(repeated_dims),
-            "max_dimension": max(input_dims + output_dims) if input_dims + output_dims else 0,
+            "max_dimension": max(input_dims + output_dims)
+            if input_dims + output_dims
+            else 0,
             "dimension_diversity": len(set(input_dims + output_dims)),
         }
 
@@ -562,7 +635,10 @@ class WeightDistributionScanner(BaseScanner):
 
             # Only flag if the number of outliers is reasonable
             outlier_percentage = len(outlier_indices) / n_outputs
-            if len(outlier_indices) > 0 and outlier_percentage < outlier_percentage_threshold:
+            if (
+                len(outlier_indices) > 0
+                and outlier_percentage < outlier_percentage_threshold
+            ):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with "
@@ -570,7 +646,9 @@ class WeightDistributionScanner(BaseScanner):
                         "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
-                            "outlier_neurons": outlier_indices.tolist()[:10],  # Limit to first 10
+                            "outlier_neurons": outlier_indices.tolist()[
+                                :10
+                            ],  # Limit to first 10
                             "total_outliers": len(outlier_indices),
                             "outlier_percentage": float(outlier_percentage * 100),
                             "z_scores": z_scores[outlier_indices].tolist()[:10],
@@ -578,7 +656,9 @@ class WeightDistributionScanner(BaseScanner):
                             "mean_norm": float(np.mean(output_norms)),
                             "std_norm": float(np.std(output_norms)),
                             "analysis_method": "structural_analysis",
-                            "architecture_confidence": architecture_analysis["confidence"],
+                            "architecture_confidence": architecture_analysis[
+                                "confidence"
+                            ],
                         },
                         "why": (
                             "Neurons with weight magnitudes significantly different from others in the same layer may "
@@ -591,7 +671,9 @@ class WeightDistributionScanner(BaseScanner):
 
         # 2. Check for dissimilar weight vectors using cosine similarity
         # Only perform this check for smaller output layers to avoid false positives in large vocab models
-        if 2 < n_outputs <= 1000:  # Skip for large vocabulary models based on size, not name
+        if (
+            2 < n_outputs <= 1000
+        ):  # Skip for large vocabulary models based on size, not name
             # Compute pairwise cosine similarities
             normalized_weights = weights / (np.linalg.norm(weights, axis=0) + 1e-8)
             similarities = np.dot(normalized_weights.T, normalized_weights)
@@ -603,7 +685,11 @@ class WeightDistributionScanner(BaseScanner):
                 other_similarities = np.concatenate(
                     [similarities[i, :i], similarities[i, i + 1 :]],
                 )
-                max_similarity = np.max(np.abs(other_similarities)) if len(other_similarities) > 0 else 0
+                max_similarity = (
+                    np.max(np.abs(other_similarities))
+                    if len(other_similarities) > 0
+                    else 0
+                )
 
                 if max_similarity < self.cosine_similarity_threshold:
                     dissimilar_neurons.append((i, max_similarity))
@@ -650,7 +736,9 @@ class WeightDistributionScanner(BaseScanner):
                         "severity": IssueSeverity.INFO,
                         "details": {
                             "layer": layer_name,
-                            "affected_neurons": neurons_with_extreme_weights.tolist()[:10],  # Limit list
+                            "affected_neurons": neurons_with_extreme_weights.tolist()[
+                                :10
+                            ],  # Limit list
                             "total_affected": len(neurons_with_extreme_weights),
                             "num_extreme_weights": len(extreme_weights[0]),
                             "threshold": float(threshold),

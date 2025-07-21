@@ -40,7 +40,9 @@ class TestHuggingFaceURLDetection:
             "huggingface.co/model",  # Missing protocol
         ]
         for url in invalid_urls:
-            assert not is_huggingface_url(url), f"Incorrectly detected invalid URL: {url}"
+            assert not is_huggingface_url(
+                url
+            ), f"Incorrectly detected invalid URL: {url}"
 
 
 class TestHuggingFaceURLParsing:
@@ -122,12 +124,18 @@ class TestModelDownload:
 
         # Verify cache directory was used
         call_args = mock_snapshot_download.call_args
-        assert call_args[1]["cache_dir"] == str(cache_dir / "huggingface" / "test" / "model")
-        assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
+        assert call_args[1]["cache_dir"] == str(
+            cache_dir / "huggingface" / "test" / "model"
+        )
+        assert call_args[1]["local_dir"] == str(
+            cache_dir / "huggingface" / "test" / "model"
+        )
 
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
-    def test_download_model_cleanup_on_failure(self, mock_rmtree, mock_snapshot_download):
+    def test_download_model_cleanup_on_failure(
+        self, mock_rmtree, mock_snapshot_download
+    ):
         """Test that temporary directory is cleaned up on download failure."""
         # Make snapshot_download raise an exception
         mock_snapshot_download.side_effect = Exception("Download failed")
@@ -230,10 +238,15 @@ class TestModelSizeAndDiskSpace:
         mock_get_model_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
 
         # Mock disk space check to fail
-        mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
+        mock_check_disk_space.return_value = (
+            False,
+            "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB",
+        )
 
         # Test download failure
-        with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
+        with pytest.raises(
+            Exception, match="Cannot download model.*Insufficient disk space"
+        ):
             download_model("https://huggingface.co/test/model")
 
         # Verify snapshot_download was not called
@@ -250,7 +263,10 @@ class TestModelSizeAndDiskSpace:
         mock_get_model_size.return_value = 1024 * 1024 * 1024  # 1 GB
 
         # Mock disk space check to pass
-        mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
+        mock_check_disk_space.return_value = (
+            True,
+            "Sufficient disk space available (10.0 GB)",
+        )
 
         # Mock snapshot download
         mock_path = "/tmp/test_model"

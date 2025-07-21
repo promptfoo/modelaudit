@@ -22,7 +22,10 @@ class CoreMLScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not HAS_COREML:
             return False
-        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        return (
+            os.path.isfile(path)
+            and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        )
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -70,7 +73,11 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
             )
-        if model_type in {"neuralNetwork", "neuralNetworkClassifier", "neuralNetworkRegressor"}:
+        if model_type in {
+            "neuralNetwork",
+            "neuralNetworkClassifier",
+            "neuralNetworkRegressor",
+        }:
             nn = getattr(spec, model_type)
             for layer in nn.layers:
                 if layer.WhichOneof("layer") == "custom":

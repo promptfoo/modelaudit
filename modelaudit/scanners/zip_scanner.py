@@ -168,7 +168,9 @@ class ZipScanner(BaseScanner):
                             location=f"{path}:{name}",
                             details={"target": target},
                         )
-                    if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                    if os.path.isabs(target) and any(
+                        target.startswith(p) for p in CRITICAL_SYSTEM_PATHS
+                    ):
                         result.add_issue(
                             f"Symlink {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
@@ -215,7 +217,9 @@ class ZipScanner(BaseScanner):
                         )
                         suffix = f"_{safe_name}"
 
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=suffix, delete=False
+                    ) as tmp:
                         tmp_path = tmp.name
                         total_size = 0
                         with z.open(name) as entry:
@@ -277,7 +281,9 @@ class ZipScanner(BaseScanner):
                                             1,
                                         )
                                     else:
-                                        issue.location = f"{path}:{name} {issue.location}"
+                                        issue.location = (
+                                            f"{path}:{name} {issue.location}"
+                                        )
                                 else:
                                     issue.location = f"{path}:{name}"
 

@@ -30,7 +30,9 @@ def test_issue_with_why_field():
     # Test serialization includes why field
     issue_dict = issue.to_dict()
     assert "why" in issue_dict
-    assert issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
+    assert (
+        issue_dict["why"] == "This is dangerous because it can execute arbitrary code."
+    )
 
 
 def test_issue_without_why_field():
@@ -101,7 +103,8 @@ def test_pickle_scanner_includes_why():
         system_issues = [
             issue
             for issue in result.issues
-            if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None
+            if ("os" in issue.message.lower() or "posix" in issue.message.lower())
+            and issue.why is not None
         ]
         assert len(system_issues) > 0
 
@@ -181,20 +184,28 @@ def test_all_tf_operations_have_explanations():
     # Verify all SUSPICIOUS_OPS have explanations
     for op in SUSPICIOUS_OPS:
         explanation = get_tf_op_explanation(op)
-        assert explanation is not None, f"Missing explanation for TensorFlow operation: {op}"
+        assert (
+            explanation is not None
+        ), f"Missing explanation for TensorFlow operation: {op}"
         assert isinstance(explanation, str), f"Explanation for {op} must be a string"
-        assert len(explanation) > 10, f"Explanation for {op} is too short: {explanation}"
+        assert (
+            len(explanation) > 10
+        ), f"Explanation for {op} is too short: {explanation}"
 
     # Verify all explanations are for operations in SUSPICIOUS_OPS
     for op in TF_OP_EXPLANATIONS:
-        assert op in SUSPICIOUS_OPS, f"TF_OP_EXPLANATIONS contains {op} which is not in SUSPICIOUS_OPS"
+        assert (
+            op in SUSPICIOUS_OPS
+        ), f"TF_OP_EXPLANATIONS contains {op} which is not in SUSPICIOUS_OPS"
 
 
 def test_tf_explanation_quality():
     """Test that TensorFlow explanations meet quality standards."""
     for op_name, explanation in TF_OP_EXPLANATIONS.items():
         # Should be non-empty string
-        assert isinstance(explanation, str), f"Explanation for {op_name} must be a string"
+        assert isinstance(
+            explanation, str
+        ), f"Explanation for {op_name} must be a string"
         assert len(explanation) > 20, f"Explanation for {op_name} is too short"
 
         # Should mention security risk or attack vector
@@ -211,12 +222,14 @@ def test_tf_explanation_quality():
             "arbitrary",
             "vulnerabilities",
         ]
-        assert any(keyword in explanation.lower() for keyword in security_keywords), (
-            f"Explanation for {op_name} should mention security risks: {explanation}"
-        )
+        assert any(
+            keyword in explanation.lower() for keyword in security_keywords
+        ), f"Explanation for {op_name} should mention security risks: {explanation}"
 
         # Should be properly formatted (no trailing/leading whitespace)
-        assert explanation == explanation.strip(), f"Explanation for {op_name} has improper whitespace"
+        assert (
+            explanation == explanation.strip()
+        ), f"Explanation for {op_name} has improper whitespace"
 
 
 def test_tf_explanation_categories():
@@ -228,9 +241,9 @@ def test_tf_explanation_categories():
         assert explanation is not None
         # Should mention code execution or system compromise
         critical_keywords = ["execute", "code", "system", "shell", "commands"]
-        assert any(keyword in explanation.lower() for keyword in critical_keywords), (
-            f"Critical operation {op} should mention code execution risks"
-        )
+        assert any(
+            keyword in explanation.lower() for keyword in critical_keywords
+        ), f"Critical operation {op} should mention code execution risks"
 
     # File system operations
     file_ops = ["ReadFile", "WriteFile", "Save", "SaveV2", "MergeV2Checkpoints"]
@@ -239,9 +252,9 @@ def test_tf_explanation_categories():
         assert explanation is not None
         # Should mention file operations
         file_keywords = ["file", "write", "read", "save", "overwrite"]
-        assert any(keyword in explanation.lower() for keyword in file_keywords), (
-            f"File operation {op} should mention file system risks"
-        )
+        assert any(
+            keyword in explanation.lower() for keyword in file_keywords
+        ), f"File operation {op} should mention file system risks"
 
     # Data processing operations
     data_ops = ["DecodeRaw", "DecodeJpeg", "DecodePng"]
@@ -250,9 +263,9 @@ def test_tf_explanation_categories():
         assert explanation is not None
         # Should mention data processing risks
         data_keywords = ["decode", "data", "malicious", "exploit", "vulnerabilities"]
-        assert any(keyword in explanation.lower() for keyword in data_keywords), (
-            f"Data operation {op} should mention data processing risks"
-        )
+        assert any(
+            keyword in explanation.lower() for keyword in data_keywords
+        ), f"Data operation {op} should mention data processing risks"
 
 
 def test_tf_explanation_unified_architecture():
@@ -264,25 +277,33 @@ def test_tf_explanation_unified_architecture():
     direct_explanation = get_tf_op_explanation(op_name)
     unified_explanation = get_explanation("tf_op", op_name)
 
-    assert direct_explanation == unified_explanation, "get_tf_op_explanation should use get_explanation internally"
+    assert (
+        direct_explanation == unified_explanation
+    ), "get_tf_op_explanation should use get_explanation internally"
 
     # Test all TF operations through unified interface
     for op_name in TF_OP_EXPLANATIONS:
         explanation = get_explanation("tf_op", op_name)
-        assert explanation is not None, f"get_explanation should work for tf_op category with {op_name}"
-        assert explanation == TF_OP_EXPLANATIONS[op_name], (
-            f"Unified explanation should match direct lookup for {op_name}"
-        )
+        assert (
+            explanation is not None
+        ), f"get_explanation should work for tf_op category with {op_name}"
+        assert (
+            explanation == TF_OP_EXPLANATIONS[op_name]
+        ), f"Unified explanation should match direct lookup for {op_name}"
 
 
 def test_common_message_explanations_coverage():
     """Test that all COMMON_MESSAGE_EXPLANATIONS patterns work correctly."""
     # Test that all defined patterns have explanations
-    assert len(COMMON_MESSAGE_EXPLANATIONS) > 0, "Should have common message explanations defined"
+    assert (
+        len(COMMON_MESSAGE_EXPLANATIONS) > 0
+    ), "Should have common message explanations defined"
 
     for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
         assert explanation, f"Explanation for '{prefix}' should not be empty"
-        assert len(explanation) > 20, f"Explanation for '{prefix}' should be substantial"
+        assert (
+            len(explanation) > 20
+        ), f"Explanation for '{prefix}' should be substantial"
 
 
 def test_get_message_explanation_exact_matches():
@@ -312,9 +333,9 @@ def test_get_message_explanation_exact_matches():
     for prefix, expected_keyword in test_cases:
         explanation = get_message_explanation(prefix)
         assert explanation is not None, f"Should have explanation for '{prefix}'"
-        assert expected_keyword.lower() in explanation.lower(), (
-            f"Explanation for '{prefix}' should contain '{expected_keyword}'"
-        )
+        assert (
+            expected_keyword.lower() in explanation.lower()
+        ), f"Explanation for '{prefix}' should contain '{expected_keyword}'"
 
 
 def test_get_message_explanation_prefix_matching():
@@ -337,9 +358,13 @@ def test_get_message_explanation_prefix_matching():
     for message, should_have_explanation in test_cases:
         explanation = get_message_explanation(message)
         if should_have_explanation:
-            assert explanation is not None, f"Should have explanation for message: '{message}'"
+            assert (
+                explanation is not None
+            ), f"Should have explanation for message: '{message}'"
         else:
-            assert explanation is None, f"Should not have explanation for message: '{message}'"
+            assert (
+                explanation is None
+            ), f"Should not have explanation for message: '{message}'"
 
 
 def test_scan_result_auto_explanation_integration():
@@ -358,7 +383,9 @@ def test_scan_result_auto_explanation_integration():
         result.add_issue(message, severity=IssueSeverity.WARNING)
 
     # Check that the right issues got explanations
-    issues_with_explanation = [issue for issue in result.issues if issue.why is not None]
+    issues_with_explanation = [
+        issue for issue in result.issues if issue.why is not None
+    ]
     issues_without_explanation = [issue for issue in result.issues if issue.why is None]
 
     # Should have 3 with explanations, 1 without
@@ -423,8 +450,12 @@ def test_common_message_explanations_security_focus():
     for prefix, explanation in COMMON_MESSAGE_EXPLANATIONS.items():
         # Each explanation should contain at least one security-focused keyword
         explanation_lower = explanation.lower()
-        has_security_keyword = any(keyword in explanation_lower for keyword in security_keywords)
-        assert has_security_keyword, f"Explanation for '{prefix}' should focus on security implications: {explanation}"
+        has_security_keyword = any(
+            keyword in explanation_lower for keyword in security_keywords
+        )
+        assert (
+            has_security_keyword
+        ), f"Explanation for '{prefix}' should focus on security implications: {explanation}"
 
 
 def test_message_explanation_serialization():
@@ -451,7 +482,9 @@ def test_context_aware_explanations():
 
     # Test ML model context enhancement
     basic_explanation = get_message_explanation("Custom objects found")
-    ml_context_explanation = get_message_explanation("Custom objects found", context="pickle_scanner")
+    ml_context_explanation = get_message_explanation(
+        "Custom objects found", context="pickle_scanner"
+    )
 
     assert basic_explanation is not None
     assert ml_context_explanation is not None
@@ -460,8 +493,12 @@ def test_context_aware_explanations():
     assert "pickle-based formats" in ml_context_explanation.lower()
 
     # Test archive context enhancement
-    basic_archive_explanation = get_message_explanation("Archive entry would extract outside")
-    archive_context_explanation = get_message_explanation("Archive entry would extract outside", context="zip_scanner")
+    basic_archive_explanation = get_message_explanation(
+        "Archive entry would extract outside"
+    )
+    archive_context_explanation = get_message_explanation(
+        "Archive entry would extract outside", context="zip_scanner"
+    )
 
     assert basic_archive_explanation is not None
     assert archive_context_explanation is not None
@@ -497,7 +534,9 @@ def test_ml_specific_message_patterns():
 
     for message in ml_messages:
         explanation = get_message_explanation(message)
-        assert explanation is not None, f"Should have explanation for ML message: '{message}'"
+        assert (
+            explanation is not None
+        ), f"Should have explanation for ML message: '{message}'"
         # All ML explanations should mention security implications
         assert any(
             keyword in explanation.lower()
