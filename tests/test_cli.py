@@ -635,16 +635,11 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 
 
 @patch("modelaudit.cli.is_jfrog_url")
-@patch("modelaudit.cli.download_artifact")
-@patch("modelaudit.cli.scan_model_directory_or_file")
-@patch("shutil.rmtree")
-def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_jfrog, tmp_path):
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL."""
     mock_is_jfrog.return_value = True
-    test_file = tmp_path / "model.bin"
-    test_file.write_text("dummy")
-    mock_download.return_value = test_file
-    mock_scan.return_value = {
+    mock_scan_jfrog.return_value = {
         "bytes_scanned": 512,
         "issues": [],
         "files_scanned": 1,
@@ -657,23 +652,72 @@ def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_j
     result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
 
     assert result.exit_code == 0
-    mock_download.assert_called_once()
-    mock_scan.assert_called_once()
-    mock_rmtree.assert_called()
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token=None,
+        access_token=None,
+        timeout=300,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+    )
 
 
 @patch("modelaudit.cli.is_jfrog_url")
-@patch("modelaudit.cli.download_artifact")
-def test_scan_jfrog_url_download_failure(mock_download, mock_is_jfrog):
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
     """Test handling of JFrog download failures."""
     mock_is_jfrog.return_value = True
-    mock_download.side_effect = Exception("fail")
+    mock_scan_jfrog.side_effect = Exception("fail")
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
 
     assert result.exit_code == 2
-    assert "Error downloading model" in result.output
+    assert "Error downloading/scanning model" in result.output
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
+    """Test scanning a JFrog URL with authentication."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = {
+        "bytes_scanned": 512,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            "--jfrog-api-token",
+            "test-token",
+            "--timeout",
+            "600",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token="test-token",
+        access_token=None,
+        timeout=600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+    )
 
 
 @patch("modelaudit.mlflow_integration.scan_mlflow_model")
