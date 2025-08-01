@@ -167,7 +167,9 @@ class AnomalyDetector:
         # Entropy (discretized)
         hist, _ = np.histogram(flat_data, bins=50)
         hist = hist / hist.sum()  # Normalize
-        entropy = -np.sum(hist * np.log2(hist + 1e-10))
+        # Filter out zero values to avoid log of zero
+        nonzero_hist = hist[hist > 0]
+        entropy = -float(np.sum(nonzero_hist * np.log2(nonzero_hist))) if len(nonzero_hist) > 0 else 0.0
 
         # Sparsity measures
         zero_ratio = np.sum(np.abs(flat_data) < 1e-8) / flat_data.size
@@ -364,7 +366,7 @@ class AnomalyDetector:
                 digit_freq = digit_counts / digit_counts.sum()
 
                 # Chi-square test
-                chi2 = np.sum((digit_freq - benford_expected) ** 2 / benford_expected)
+                chi2: float = float(np.sum((digit_freq - benford_expected) ** 2 / benford_expected))
 
                 # Significant deviation from Benford's Law
                 if chi2 > 20:  # Very high chi-square value

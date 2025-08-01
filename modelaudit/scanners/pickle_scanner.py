@@ -1212,7 +1212,10 @@ class PickleScanner(BaseScanner):
                 ):
                     # Use entropy analysis to check if this is ML data
                     # Look at surrounding data to determine if it's weights
-                    surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    if pos is not None:
+                        surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    else:
+                        surrounding_data = file_data[:1024]  # Use first 1024 bytes if pos is None
                     data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
 
                     # Skip if it looks like ML weights with high confidence
@@ -1247,7 +1250,10 @@ class PickleScanner(BaseScanner):
                     False,
                 ):
                     # Use entropy analysis to check if this is ML data
-                    surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    if pos is not None:
+                        surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    else:
+                        surrounding_data = file_data[:1024]  # Use first 1024 bytes if pos is None
                     data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
 
                     # Skip if it looks like ML weights with high confidence
