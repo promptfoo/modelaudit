@@ -293,7 +293,7 @@ class FrameworkKnowledgeBase:
         ]
 
     def is_pattern_safe_in_framework(
-        self, pattern: str, framework: FrameworkType, context: dict[str, any]
+        self, pattern: str, framework: FrameworkType, context: dict[str, Any]
     ) -> tuple[bool, str]:
         """Check if a pattern is safe within a specific framework context."""
         if framework not in self.patterns:
@@ -321,7 +321,7 @@ class FrameworkKnowledgeBase:
 
         return False, "Pattern not recognized as safe"
 
-    def _validate_context(self, pattern: FrameworkPattern, context: dict[str, any]) -> bool:
+    def _validate_context(self, pattern: FrameworkPattern, context: dict[str, Any]) -> bool:
         """Validate pattern safety based on context."""
         # Check if we're in the right context
         if pattern.context not in str(context):
@@ -413,7 +413,7 @@ class FrameworkKnowledgeBase:
         return ["Consider using framework-specific serialization methods"]
 
     def should_skip_pattern_for_framework(
-        self, pattern: str, framework: FrameworkType, file_context: dict[str, any]
+        self, pattern: str, framework: FrameworkType, file_context: dict[str, Any]
     ) -> bool:
         """Determine if a pattern check should be skipped for a framework."""
         # Framework-specific skips

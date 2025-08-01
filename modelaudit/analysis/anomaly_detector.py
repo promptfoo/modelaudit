@@ -185,7 +185,7 @@ class AnomalyDetector:
             sparsity=sparsity,
         )
 
-    def detect_weight_anomalies(self, weights: dict[str, np.ndarray]) -> dict[str, dict[str, any]]:
+    def detect_weight_anomalies(self, weights: dict[str, np.ndarray]) -> dict[str, dict[str, Any]]:
         """Detect anomalies in model weights."""
         anomalies = {}
 
@@ -244,7 +244,7 @@ class AnomalyDetector:
 
         return "dense_weights"  # Default
 
-    def _check_suspicious_patterns(self, data: np.ndarray) -> list[dict[str, any]]:
+    def _check_suspicious_patterns(self, data: np.ndarray) -> list[dict[str, Any]]:
         """Check for specific suspicious patterns in data."""
         suspicious = []
         flat_data = data.flatten()

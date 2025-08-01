@@ -83,7 +83,7 @@ class UnifiedMLContext:
     float_pattern_ratio: float = 0.0
 
     # Code analysis results
-    validated_code_blocks: list[dict[str, any]] = field(default_factory=list)
+    validated_code_blocks: list[dict[str, Any]] = field(default_factory=list)
 
     def get_adjusted_severity(self, base_severity: float, pattern: str) -> float:
         """Get severity adjusted for ML context."""
