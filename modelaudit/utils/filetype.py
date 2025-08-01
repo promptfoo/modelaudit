@@ -48,14 +48,6 @@ def detect_file_format_from_magic(path: str) -> str:
     magic8 = read_magic_bytes(path, 8)
     magic16 = read_magic_bytes(path, 16)
 
-    try:
-        import tarfile
-
-        if tarfile.is_tarfile(path):
-            return "tar"
-    except Exception:
-        pass
-
     # Check for TAR format
     try:
         import tarfile

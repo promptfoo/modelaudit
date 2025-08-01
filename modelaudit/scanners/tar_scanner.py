@@ -6,7 +6,9 @@ import tarfile
 import tempfile
 from typing import Any, ClassVar
 
+from .. import core
 from ..utils import sanitize_archive_path
+from ..utils.assets import asset_from_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -49,8 +51,9 @@ class TarScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
+        # Check for compound extensions like .tar.gz
+        path_lower = path.lower()
+        if not any(path_lower.endswith(ext) for ext in cls.supported_extensions):
             return False
 
         try:
@@ -170,9 +173,18 @@ class TarScanner(BaseScanner):
                     if len(data) > max_entry_size:
                         raise ValueError(f"TAR entry {name} exceeds maximum size of {max_entry_size} bytes")
 
-                entry_ext = os.path.splitext(name)[1].lower()
-                if entry_ext in self.supported_extensions:
-                    with tempfile.NamedTemporaryFile(suffix=entry_ext, delete=False) as tmp:
+                # Check for compound extensions like .tar.gz
+                name_lower = name.lower()
+                is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
+                if is_tar_extension:
+                    # Extract the full extension for the temp file
+                    for ext in self.supported_extensions:
+                        if name_lower.endswith(ext):
+                            suffix = ext
+                            break
+                    else:
+                        suffix = ".tar"  # fallback
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                         tmp.write(data)
                         tmp_path = tmp.name
                     try:
@@ -182,14 +194,10 @@ class TarScanner(BaseScanner):
                                 if issue.location and issue.location.startswith(tmp_path):
                                     issue.location = issue.location.replace(tmp_path, f"{path}:{name}", 1)
                             result.merge(nested_result)
-                            from ..utils.assets import asset_from_scan_result
-
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
                             asset_entry.setdefault("size", member.size)
                             contents.append(asset_entry)
                         else:
-                            from .. import core
-
                             file_result = core.scan_file(tmp_path, self.config)
                             for issue in file_result.issues:
                                 if issue.location:
@@ -207,8 +215,6 @@ class TarScanner(BaseScanner):
 
                             result.merge(file_result)
 
-                            from ..utils.assets import asset_from_scan_result
-
                             asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
                             asset_entry.setdefault("size", member.size)
                             contents.append(asset_entry)
@@ -224,8 +230,6 @@ class TarScanner(BaseScanner):
                         tmp.write(data)
                         tmp_path = tmp.name
                     try:
-                        from .. import core
-
                         file_result = core.scan_file(tmp_path, self.config)
                         for issue in file_result.issues:
                             if issue.location:
@@ -242,8 +246,6 @@ class TarScanner(BaseScanner):
                                 issue.details = {"tar_entry": name}
 
                         result.merge(file_result)
-
-                        from ..utils.assets import asset_from_scan_result
 
                         asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
                         asset_entry.setdefault("size", member.size)
