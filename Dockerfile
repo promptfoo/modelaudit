@@ -2,12 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy source code first
-COPY . .
+# Copy only necessary files for installation
+COPY pyproject.toml README.md ./
+COPY modelaudit ./modelaudit
 
-# Install dependencies and the application
-# The lock file includes the current project as editable, so we install everything together
-RUN pip install --no-cache-dir -r requirements.lock
+# Install only the base package without heavy ML dependencies
+# This keeps the lightweight image small and fast to build
+RUN pip install --no-cache-dir .
 
 # Create a non-root user
 ARG UID=10001
