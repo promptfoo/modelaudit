@@ -41,8 +41,8 @@ def test_directory_scan(tmp_path):
     test_dir = tmp_path / "test_dir"
     test_dir.mkdir()
 
-    # Create a few test files
-    (test_dir / "file1.txt").write_bytes(b"test content 1")
+    # Create a few test files with model-like extensions
+    (test_dir / "file1.pkl").write_bytes(b"test content 1")
     (test_dir / "file2.dat").write_bytes(b"test content 2")
 
     # Create a subdirectory with a file
@@ -58,9 +58,12 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results["bytes_scanned"] > 0
 
-    # Check for unknown format issues (only .txt and .dat should be unknown)
+    # Check for unknown format issues (only .dat should be unknown)
     unknown_format_issues = [issue for issue in results["issues"] if "Unknown or unhandled format" in issue["message"]]
-    assert len(unknown_format_issues) == 2  # .txt and .dat files
+    assert len(unknown_format_issues) == 1  # .dat file
+
+    # The .pkl file should be handled by PickleScanner
+    assert any("pickle" in scanner for scanner in results.get("scanners", []))
 
     # The .bin file should be handled by PyTorchBinaryScanner
     assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))

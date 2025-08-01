@@ -341,7 +341,7 @@ class BaseScanner(ABC):
 
     def _read_file_safely(self, path: str) -> bytes:
         """Read a file with size validation and chunking."""
-        data = b""
+        data = bytearray()
         file_size = self.get_file_size(path)
 
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
@@ -357,12 +357,12 @@ class BaseScanner(ABC):
                 chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
-                data += chunk
+                data.extend(chunk)
                 if self.max_file_read_size and self.max_file_read_size > 0 and len(data) > self.max_file_read_size:
                     raise ValueError(
                         f"File read exceeds limit: {len(data)} bytes (max: {self.max_file_read_size})",
                     )
-        return data
+        return bytes(data)
 
     def check_interrupted(self) -> None:
         """Check if the scan has been interrupted.
