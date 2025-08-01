@@ -86,8 +86,9 @@ jobs:
 
       - name: Test lightweight container with actual scan
         run: |
-          # Create a test model file and scan it
-          echo "import pickle; pickle.dump({'test': 'data'}, open('test.pkl', 'wb'))" | python3
+          # Create a test model file using Docker to ensure Python is available
+          docker run --rm -v $(pwd):/data python:3.11-slim sh -c "python -c \"import pickle; pickle.dump({'test': 'data'}, open('/data/test.pkl', 'wb'))\""
+          # Now scan the created file
           docker run --rm -v $(pwd):/data modelaudit:lightweight /data/test.pkl
 
   build-test-full:
