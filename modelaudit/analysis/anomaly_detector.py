@@ -53,7 +53,7 @@ class StatisticalProfile:
         # Calculate composite anomaly score
         anomaly_score = np.mean(z_scores) if z_scores else 0.0
 
-        return anomaly_score > threshold, anomaly_score
+        return bool(anomaly_score > threshold), float(anomaly_score)
 
 
 class AnomalyDetector:
@@ -154,8 +154,8 @@ class AnomalyDetector:
         # Basic statistics
         mean = np.mean(flat_data)
         std = np.std(flat_data)
-        min_val = np.min(flat_data)
-        max_val = np.max(flat_data)
+        min_val = float(np.min(flat_data))
+        max_val = float(np.max(flat_data))
 
         # Percentiles
         percentiles = {p: np.percentile(flat_data, p) for p in [1, 5, 25, 50, 75, 95, 99]}
@@ -174,16 +174,16 @@ class AnomalyDetector:
         sparsity = 1.0 - np.count_nonzero(flat_data) / flat_data.size
 
         return StatisticalProfile(
-            mean=mean,
-            std=std,
-            min_val=min_val,
-            max_val=max_val,
-            percentiles=percentiles,
-            skewness=skewness,
-            kurtosis=kurtosis,
-            entropy=entropy,
-            zero_ratio=zero_ratio,
-            sparsity=sparsity,
+            mean=float(mean),
+            std=float(std),
+            min_val=float(min_val),
+            max_val=float(max_val),
+            percentiles={k: float(v) for k, v in percentiles.items()},
+            skewness=float(skewness),
+            kurtosis=float(kurtosis),
+            entropy=float(entropy),
+            zero_ratio=float(zero_ratio),
+            sparsity=float(sparsity),
         )
 
     def detect_weight_anomalies(self, weights: dict[str, np.ndarray]) -> dict[str, dict[str, Any]]:

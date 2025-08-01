@@ -361,7 +361,7 @@ class FrameworkKnowledgeBase:
                 scores[framework] = score
 
         if scores:
-            return max(scores, key=scores.get)
+            return max(scores, key=lambda k: scores[k])
 
         return None
 

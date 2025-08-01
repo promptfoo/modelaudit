@@ -66,7 +66,7 @@ class UnifiedMLContext:
     # Tensor/Weight analysis
     tensors: list[TensorInfo] = field(default_factory=list)
     total_parameters: int = 0
-    weight_statistics: dict[str, float] = field(default_factory=dict)
+    weight_statistics: dict[str, list[float]] = field(default_factory=dict)
 
     # Pattern analysis
     suspicious_patterns_found: set[str] = field(default_factory=set)
