@@ -1,7 +1,6 @@
 """Basic tests for analysis modules."""
 
 
-
 class TestAnalysisModules:
     """Test that analysis modules can be imported and instantiated."""
 
