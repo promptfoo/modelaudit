@@ -220,7 +220,7 @@ def detect_file_format(path: str) -> str:
         # Check magic bytes first for accuracy
         if magic4 == b"GGUF":
             return "gguf"
-        elif magic4 in GGML_MAGIC_VARIANTS:
+        if magic4 in GGML_MAGIC_VARIANTS:
             return "ggml"
         # Fall back to extension-based detection
         return "gguf" if ext == ".gguf" else "ggml"

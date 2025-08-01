@@ -28,7 +28,7 @@ jobs:
       full-image: ${{ steps.filter.outputs.full-image }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v2
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -55,7 +55,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build lightweight image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
@@ -113,7 +113,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build full image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.full

@@ -45,8 +45,8 @@ class TestCoreIntegration:
             json_file = Path(temp_dir) / "config.json"
             json_file.write_text('{"test": "value"}')
 
-            txt_file = Path(temp_dir) / "readme.txt"
-            txt_file.write_text("This is a readme file")
+            pkl_file = Path(temp_dir) / "model.pkl"
+            pkl_file.write_bytes(b"fake pickle data")
 
             # Scan the directory
             results = core.scan_model_directory_or_file(temp_dir)

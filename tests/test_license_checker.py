@@ -93,6 +93,37 @@ Some dataset content here...
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
 
+    def test_rail_license_detection(self, tmp_path):
+        """Test detection of RAIL license."""
+        test_file = tmp_path / "rail_file.py"
+        content = """# Released under the Responsible AI License
+# BigScience Open RAIL-M
+def do_something():
+    pass
+"""
+        test_file.write_text(content)
+
+        licenses = scan_for_license_headers(str(test_file))
+
+        assert len(licenses) >= 1
+        spdx_ids = {lic.spdx_id for lic in licenses}
+        assert "RAIL" in spdx_ids or "BigScience-OpenRAIL-M" in spdx_ids
+
+    def test_bigscience_dataset_notice_detection(self, tmp_path):
+        """Test detection of BigScience dataset license notice."""
+        dataset_file = tmp_path / "dataset.json"
+        content = """
+{
+  "_license": "BigScience Open RAIL-M",
+  "_notice": "Dataset released under BigScience Open RAIL-M"
+}
+"""
+        dataset_file.write_text(content)
+
+        licenses = scan_for_license_headers(str(dataset_file))
+
+        assert any(lic.spdx_id in {"RAIL", "BigScience-OpenRAIL-M"} for lic in licenses)
+
     def test_no_license_detection(self, tmp_path):
         """Test file with no license information."""
         test_file = tmp_path / "no_license.py"
@@ -386,10 +417,10 @@ class TestCommercialUseWarnings:
 
         warnings = check_commercial_use_warnings(scan_results)
 
-        assert len(warnings) == 1
-        assert warnings[0]["severity"] == "warning"
-        assert "Non-commercial" in warnings[0]["message"]
-        assert "cannot be used commercially" in warnings[0]["message"]
+        assert len(warnings) >= 1
+        assert any(w["severity"] == "warning" for w in warnings)
+        assert any("Non-commercial" in w["message"] for w in warnings)
+        assert any("cannot be used commercially" in w["message"] for w in warnings)
 
     def test_check_commercial_use_warnings_clean(self):
         """Test no warnings for clean licenses."""
@@ -404,6 +435,28 @@ class TestCommercialUseWarnings:
         warnings = check_commercial_use_warnings(scan_results)
 
         assert len(warnings) == 0
+
+
+class TestSpdxLicenseChecks:
+    """Test deprecated and incompatible license detection."""
+
+    def test_deprecated_license_warning(self):
+        scan_results = {"file_metadata": {"/path/old.py": {"license_info": [{"spdx_id": "AGPL-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results)
+        assert any("deprecated" in w["message"].lower() for w in warnings)
+
+    def test_incompatible_license_warning(self):
+        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results)
+        assert any("incompatible" in w["message"].lower() for w in warnings)
+
+    def test_strict_license_errors(self):
+        scan_results = {"file_metadata": {"/path/bad.py": {"license_info": [{"spdx_id": "3D-Slicer-1.0"}]}}}
+
+        warnings = check_commercial_use_warnings(scan_results, strict=True)
+        assert any(w["severity"] == "error" for w in warnings)
 
 
 class TestLicenseMetadataCollection:

@@ -94,15 +94,32 @@ modelaudit production_model.safetensors --format json --output security_report.j
 
 ### **CI/CD Pipeline Integration**
 
+ModelAudit automatically detects CI environments and adjusts output accordingly:
+
 ```bash
-modelaudit models/ --exit-code-on-issues --timeout 300
+# Recommended: Use JSON format for machine-readable output
+modelaudit models/ --format json --output results.json
+
+# Text output automatically adapts to CI (no spinners, plain text)
+modelaudit models/ --timeout 300
+
+# Disable colors explicitly with NO_COLOR environment variable
+NO_COLOR=1 modelaudit models/
 ```
+
+**CI-Friendly Features:**
+
+- 🚫 Spinners automatically disabled when output is piped or in CI
+- 🎨 Colors disabled when `NO_COLOR` environment variable is set
+- 📊 JSON output recommended for parsing in CI pipelines
+- 🔍 Exit codes: 0 (clean), 1 (issues found), 2 (errors)
 
 ### **Third-Party Model Validation**
 
 ```bash
-# Scan models from HuggingFace or cloud storage
+# Scan models from HuggingFace, PyTorch Hub, or cloud storage
 modelaudit https://huggingface.co/gpt2
+modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
 modelaudit s3://my-bucket/downloaded-model.pt
 ```
 
@@ -113,6 +130,14 @@ modelaudit model_package.zip --sbom compliance_report.json --verbose
 ```
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+### Static Scanning vs. Promptfoo Redteaming
+
+ModelAudit performs **static** analysis only. It examines model files for risky patterns
+without ever loading or executing them. Promptfoo's redteaming module is
+**dynamic**—it loads the model (locally or via API) and sends crafted prompts to
+probe runtime behavior. Use ModelAudit first to verify the model file itself,
+then run redteaming if you need to test how the model responds when invoked.
 
 ## ⚙️ Installation Options
 

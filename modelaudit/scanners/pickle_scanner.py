@@ -33,6 +33,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
             "torch.optim",
             "torch.utils",
             "_pickle",
+            "collections",
         ],
         "classes": [
             "OrderedDict",
@@ -46,9 +47,10 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
             "AdaptiveAvgPool2d",
             "Sequential",
             "ModuleList",
+            "Tensor",
         ],
         "patterns": [r"torch\..*", r"_pickle\..*", r"collections\.OrderedDict"],
-        "confidence_boost": 0.8,
+        "confidence_boost": 0.9,
     },
     "yolo": {
         "modules": ["ultralytics", "yolo", "models"],
@@ -69,10 +71,23 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib"],
-        "classes": ["Pipeline", "StandardScaler", "PCA"],
-        "patterns": [r"sklearn\..*", r"joblib\..*"],
-        "confidence_boost": 0.7,
+        "modules": ["sklearn", "joblib", "numpy"],
+        "classes": [
+            "Pipeline",
+            "StandardScaler",
+            "PCA",
+            "LogisticRegression",
+            "DecisionTreeClassifier",
+            "SVC",
+            "RandomForestClassifier",
+            "GradientBoostingClassifier",
+            "KMeans",
+            "AgglomerativeClustering",
+            "Ridge",
+            "Lasso",
+        ],
+        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*"],
+        "confidence_boost": 0.9,
     },
     "huggingface": {
         "modules": ["transformers", "tokenizers"],
@@ -411,9 +426,9 @@ def _get_context_aware_severity(
     if confidence > 0.8:
         if base_severity == IssueSeverity.CRITICAL:
             return IssueSeverity.WARNING
-        elif base_severity == IssueSeverity.WARNING:
+        if base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
-    elif confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
+    if confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
         return IssueSeverity.WARNING
 
     return base_severity
@@ -467,7 +482,7 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 return any(marker in sample for marker in joblib_indicators)
 
             # For dill files, they're usually just enhanced pickle
-            elif path.lower().endswith(".dill"):
+            if path.lower().endswith(".dill"):
                 # Dill files should contain standard pickle format
                 # Additional validation could check for dill-specific patterns
                 return True
@@ -901,7 +916,7 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)
                 return result
-            elif is_recursion_on_legitimate_model:
+            if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
                 logger.info(
                     f"Recursion limit reached scanning legitimate ML model {path}. "
@@ -934,7 +949,7 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
-            elif is_recursion_error:
+            if is_recursion_error:
                 # Only flag files as suspicious if they're extremely small AND have obvious malicious patterns
                 # This is very conservative since JSON format handles detailed detection
                 filename = os.path.basename(path).lower()
@@ -995,16 +1010,16 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
-            else:
-                # Handle as critical error for unknown/suspicious cases
-                result.add_issue(
-                    f"Error opening pickle file: {e!s}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"exception": str(e), "exception_type": type(e).__name__},
-                )
-                result.finish(success=False)
-                return result
+
+            # Handle as critical error for unknown/suspicious cases
+            result.add_issue(
+                f"Error opening pickle file: {e!s}",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            result.finish(success=False)
+            return result
 
         result.finish(success=True)
         return result
@@ -1525,16 +1540,63 @@ class PickleScanner(BaseScanner):
                     ),
                 )
             else:
-                # Treat as critical error for unknown/suspicious cases
+                # Improve error messages for common cases
+                error_str = str(e).lower()
+
+                # Determine user-friendly error message and severity
+                if "pickle exhausted before seeing stop" in error_str:
+                    # Empty or incomplete pickle file
+                    if file_size == 0:
+                        message = "Empty file - not a valid pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = "The file is empty and contains no pickle data."
+                    else:
+                        message = "Incomplete or corrupted pickle file - missing STOP opcode"
+                        severity = IssueSeverity.WARNING
+                        why = (
+                            "The file appears to be truncated or corrupted. Valid pickle files must end with a "
+                            "STOP opcode."
+                        )
+                elif "expected" in error_str and "bytes" in error_str and "but only" in error_str:
+                    # File is truncated or not a pickle file
+                    if file_size < 10:
+                        message = "File too small to be a valid pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = "The file is too small to contain valid pickle data."
+                    else:
+                        message = "Invalid pickle format - file appears to be truncated or is not a pickle file"
+                        severity = IssueSeverity.WARNING
+                        why = (
+                            "The file structure doesn't match the pickle format. It may be corrupted, truncated, "
+                            "or not a pickle file at all."
+                        )
+                elif "opcode" in error_str and "unknown" in error_str:
+                    # Unknown opcode - likely not a pickle file
+                    message = "Invalid pickle format - unrecognized opcode"
+                    severity = IssueSeverity.WARNING
+                    why = "The file contains invalid opcodes. This usually means the file is not a valid pickle file."
+                elif "no newline found" in error_str:
+                    # Text file misidentified as pickle
+                    message = "Not a valid pickle file - appears to be a text file"
+                    severity = IssueSeverity.WARNING
+                    why = "The file structure suggests this is a text file, not a pickle file."
+                else:
+                    # Generic error - still make it more user-friendly
+                    message = f"Unable to parse pickle file: {type(e).__name__}"
+                    severity = IssueSeverity.WARNING
+                    why = f"The file could not be parsed as a valid pickle file. Error: {str(e)[:100]}"
+
                 result.add_issue(
-                    f"Error analyzing pickle ops: {e}",
-                    severity=IssueSeverity.CRITICAL,
+                    message,
+                    severity=severity,
                     details={
                         "exception": str(e),
                         "exception_type": type(e).__name__,
                         "file_extension": file_ext,
                         "opcodes_analyzed": opcode_count,
+                        "file_size": file_size,
                     },
+                    why=why,
                 )
 
         finally:

@@ -144,3 +144,6 @@ test_*.pkl
 .venv/
 .rye/
 
+# Internal planning files
+TODO.md
+
