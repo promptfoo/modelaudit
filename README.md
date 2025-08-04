@@ -156,7 +156,7 @@ pip install modelaudit[all]
 **💡 Know what formats you need?**
 
 ```bash
-# Basic installation (pickle, joblib, numpy, zip files)
+# Basic installation (pickle, joblib, numpy, zip/tar archives)
 pip install modelaudit
 
 # Add only what you need
