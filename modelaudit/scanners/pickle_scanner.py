@@ -4,11 +4,18 @@ import struct
 import time
 from typing import Any, BinaryIO, ClassVar, Optional, Union
 
+from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
+from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
+)
+from modelaudit.utils.code_validation import (
+    is_code_potentially_dangerous,
+    validate_python_syntax,
 )
 
 from ..explanations import (
@@ -71,7 +78,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib", "numpy"],
+        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy.dtype"],
         "classes": [
             "Pipeline",
             "StandardScaler",
@@ -80,13 +87,14 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
             "DecisionTreeClassifier",
             "SVC",
             "RandomForestClassifier",
+            "RandomForestRegressor",
             "GradientBoostingClassifier",
             "KMeans",
             "AgglomerativeClustering",
             "Ridge",
             "Lasso",
         ],
-        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*"],
+        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*", r"numpy\.core\..*"],
         "confidence_boost": 0.9,
     },
     "huggingface": {
@@ -247,13 +255,36 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
+    Now includes py_compile validation to reduce false positives.
     """
     import re
 
     # Check for ACTUAL dangerous patterns (not just ML magic methods)
     for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
-        if re.search(pattern, s, re.IGNORECASE):
-            return pattern
+        match = re.search(pattern, s, re.IGNORECASE)
+        if match:
+            # If we found a dangerous pattern, check if it's actually valid Python code
+            # This helps reduce false positives from data that just happens to contain these strings
+
+            # Try to extract a reasonable code snippet around the match
+            start = max(0, match.start() - 50)
+            end = min(len(s), match.end() + 50)
+            code_snippet = s[start:end].strip()
+
+            # Check if this looks like actual Python code
+            is_valid, _ = validate_python_syntax(code_snippet)
+            if is_valid:
+                # It's valid Python! Check if it's actually dangerous
+                is_dangerous, risk_desc = is_code_potentially_dangerous(code_snippet, "low")
+                if is_dangerous:
+                    return f"{pattern} (validated as executable code: {risk_desc})"
+            else:
+                # Not valid Python syntax, might be a false positive
+                # Still flag it if it's a very clear pattern
+                if pattern in [r"eval\s*\(", r"exec\s*\(", r"__import__\s*\("]:
+                    return f"{pattern} (suspicious pattern, not valid Python)"
+                # Otherwise, likely a false positive
+                continue
 
     # If we have strong ML context, ignore common ML patterns
     if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.6:
@@ -696,6 +727,10 @@ class PickleScanner(BaseScanner):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
+        # Initialize analyzers
+        self.entropy_analyzer = EntropyAnalyzer()
+        self.semantic_analyzer = SemanticAnalyzer()
+        self.framework_kb = FrameworkKnowledgeBase()
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -733,8 +768,17 @@ class PickleScanner(BaseScanner):
 
         return False
 
+    def _get_surrounding_data(self, data: bytes, position: int, window_size: int = 1024) -> bytes:
+        """Get data surrounding a specific position for analysis."""
+        start = max(0, position - window_size // 2)
+        end = min(len(data), position + window_size // 2)
+        return data[start:end]
+
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
+        # Initialize context for this file
+        self._initialize_context(path)
+
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -788,16 +832,32 @@ class PickleScanner(BaseScanner):
 
                     # Use find() instead of 'in' operator to be more explicit
                     if raw_content.find(pattern) != -1:
+                        # Extract context around the pattern for semantic analysis
+                        pattern_str = pattern.decode("utf-8", errors="ignore")
+                        pattern_pos = raw_content.find(pattern)
+                        context_start = max(0, pattern_pos - 100)
+                        context_end = min(len(raw_content), pattern_pos + len(pattern) + 100)
+                        context = raw_content[context_start:context_end].decode("utf-8", errors="ignore")
+
+                        # Use semantic analysis to check if this is actually dangerous
+                        # For now, just check if it's in documentation or comments
+                        is_safe = "documentation" in context.lower() or "#" in context
+
+                        # Skip if semantic analysis says it's safe (e.g., in documentation)
+                        if is_safe:
+                            continue
+
                         result.add_issue(
-                            f"Dangerous pattern '{pattern.decode('utf-8', errors='ignore')}' found in raw file content",
+                            f"Dangerous pattern '{pattern_str}' found in raw file content",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={
-                                "pattern": pattern.decode("utf-8", errors="ignore"),
+                                "pattern": pattern_str,
                                 "detection_method": "raw_content_scan",
+                                "semantic_safe": is_safe,
                             },
                             why=(
-                                f"The file contains the dangerous pattern '{pattern.decode('utf-8', errors='ignore')}' "
+                                f"The file contains the dangerous pattern '{pattern_str}' "
                                 f"which could indicate malicious code execution during unpickling."
                             ),
                         )
@@ -1030,6 +1090,11 @@ class PickleScanner(BaseScanner):
         opcode_count = 0
         suspicious_count = 0
 
+        # Read the file data for entropy analysis
+        current_pos = file_obj.tell()
+        file_data = file_obj.read()
+        file_obj.seek(current_pos)  # Reset position
+
         try:
             # Set a reasonable recursion limit to handle complex ML models
             import sys
@@ -1145,6 +1210,18 @@ class PickleScanner(BaseScanner):
                     "is_ml_content",
                     False,
                 ):
+                    # Use entropy analysis to check if this is ML data
+                    # Look at surrounding data to determine if it's weights
+                    if pos is not None:
+                        surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    else:
+                        surrounding_data = file_data[:1024]  # Use first 1024 bytes if pos is None
+                    data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
+
+                    # Skip if it looks like ML weights with high confidence
+                    if data_type == "ml_weights" and confidence > 0.7:
+                        continue
+
                     severity = _get_context_aware_severity(
                         IssueSeverity.WARNING,
                         ml_context,
@@ -1160,6 +1237,8 @@ class PickleScanner(BaseScanner):
                                 "overall_confidence",
                                 0,
                             ),
+                            "entropy_classification": data_type,
+                            "entropy_confidence": confidence,
                         },
                         why=get_opcode_explanation("REDUCE"),
                     )
@@ -1170,6 +1249,24 @@ class PickleScanner(BaseScanner):
                     "is_ml_content",
                     False,
                 ):
+                    # Use entropy analysis to check if this is ML data
+                    if pos is not None:
+                        surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
+                    else:
+                        surrounding_data = file_data[:1024]  # Use first 1024 bytes if pos is None
+                    data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
+
+                    # Skip if it looks like ML weights with high confidence
+                    if data_type == "ml_weights" and confidence > 0.7:
+                        continue
+
+                    # For sklearn models, NEWOBJ is expected for constructing objects
+                    if (
+                        opcode.name == "NEWOBJ"
+                        and ml_context.get("frameworks", {}).get("sklearn", {}).get("confidence", 0) > 0.3
+                    ):
+                        continue
+
                     severity = _get_context_aware_severity(
                         IssueSeverity.WARNING,
                         ml_context,
@@ -1186,6 +1283,8 @@ class PickleScanner(BaseScanner):
                                 "overall_confidence",
                                 0,
                             ),
+                            "entropy_classification": data_type,
+                            "entropy_confidence": confidence,
                         },
                         why=get_opcode_explanation(opcode.name),
                     )
@@ -1266,6 +1365,40 @@ class PickleScanner(BaseScanner):
                                 },
                                 why=get_pattern_explanation("nested_pickle"),
                             )
+                        else:
+                            # Check if decoded content might be Python code
+                            try:
+                                decoded_str = decoded.decode("utf-8", errors="ignore")
+                                if len(decoded_str) > 10 and any(
+                                    pattern in decoded_str
+                                    for pattern in ["import ", "def ", "class ", "eval(", "exec(", "__import__"]
+                                ):
+                                    is_valid, _ = validate_python_syntax(decoded_str)
+                                    if is_valid:
+                                        is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
+                                        if is_dangerous:
+                                            severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+                                            result.add_issue(
+                                                f"Encoded Python code detected ({enc})",
+                                                severity=severity,
+                                                location=f"{self.current_file_path} (pos {pos})",
+                                                details={
+                                                    "position": pos,
+                                                    "opcode": opcode.name,
+                                                    "encoding": enc,
+                                                    "risk_analysis": risk_desc,
+                                                    "code_preview": decoded_str[:100] + "..."
+                                                    if len(decoded_str) > 100
+                                                    else decoded_str,
+                                                },
+                                                why=(
+                                                    "Encoded Python code was found that could be "
+                                                    "executed during unpickling."
+                                                ),
+                                            )
+                            except Exception:
+                                # Not valid UTF-8, skip Python code check
+                                pass
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
