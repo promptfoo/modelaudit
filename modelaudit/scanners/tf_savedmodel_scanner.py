@@ -4,6 +4,10 @@ from typing import Any, ClassVar, Optional
 
 from modelaudit.explanations import get_tf_op_explanation
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+from modelaudit.utils.code_validation import (
+    is_code_potentially_dangerous,
+    validate_python_syntax,
+)
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -219,20 +223,138 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 # Check if the operation is suspicious
                 if node.op in self.suspicious_ops:
                     suspicious_op_found = True
-                    result.add_issue(
-                        f"Suspicious TensorFlow operation: {node.op}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (node: {node.name})",
-                        details={
-                            "op_type": node.op,
-                            "node_name": node.name,
-                            "meta_graph": (
-                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                            ),
-                        },
-                        why=get_tf_op_explanation(node.op),
-                    )
+
+                    # Special handling for PyFunc/PyCall - try to extract and validate Python code
+                    if node.op in ["PyFunc", "PyCall"]:
+                        self._check_python_op(node, result, meta_graph)
+                    else:
+                        result.add_issue(
+                            f"Suspicious TensorFlow operation: {node.op}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "op_type": node.op,
+                                "node_name": node.name,
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            },
+                            why=get_tf_op_explanation(node.op),
+                        )
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
         result.metadata["suspicious_op_found"] = suspicious_op_found
+
+    def _check_python_op(self, node: Any, result: ScanResult, meta_graph: Any) -> None:
+        """Check PyFunc/PyCall operations for embedded Python code"""
+        # PyFunc and PyCall can embed Python code in various ways:
+        # 1. As a string attribute containing Python code
+        # 2. As a reference to a Python function
+        # 3. As serialized bytecode
+
+        code_found = False
+        python_code = None
+
+        # Try to extract Python code from node attributes
+        if hasattr(node, "attr"):
+            # Check for 'func' attribute which might contain Python code
+            if "func" in node.attr:
+                func_attr = node.attr["func"]
+                # The function might be stored as a string
+                if hasattr(func_attr, "s") and func_attr.s:
+                    python_code = func_attr.s.decode("utf-8", errors="ignore")
+                    code_found = True
+
+            # Check for 'body' attribute (some ops store code here)
+            if not code_found and "body" in node.attr:
+                body_attr = node.attr["body"]
+                if hasattr(body_attr, "s") and body_attr.s:
+                    python_code = body_attr.s.decode("utf-8", errors="ignore")
+                    code_found = True
+
+            # Check for function name references
+            if not code_found:
+                for attr_name in ["function_name", "f", "fn"]:
+                    if attr_name in node.attr:
+                        attr = node.attr[attr_name]
+                        if hasattr(attr, "s") and attr.s:
+                            func_name = attr.s.decode("utf-8", errors="ignore")
+                            # Check if it references dangerous modules
+                            dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
+                            if any(dangerous in func_name for dangerous in dangerous_modules):
+                                result.add_issue(
+                                    f"{node.op} operation references potentially dangerous function: {func_name}",
+                                    severity=IssueSeverity.CRITICAL,
+                                    location=f"{self.current_file_path} (node: {node.name})",
+                                    details={
+                                        "op_type": node.op,
+                                        "node_name": node.name,
+                                        "function_reference": func_name,
+                                        "meta_graph": (
+                                            meta_graph.meta_info_def.tags[0]
+                                            if meta_graph.meta_info_def.tags
+                                            else "unknown"
+                                        ),
+                                    },
+                                    why=get_tf_op_explanation(node.op),
+                                )
+                                return
+
+        if code_found and python_code:
+            # Validate the Python code
+            is_valid, error = validate_python_syntax(python_code)
+
+            if is_valid:
+                # Check if the code is dangerous
+                is_dangerous, risk_desc = is_code_potentially_dangerous(python_code, "low")
+
+                severity = IssueSeverity.CRITICAL
+                issue_msg = f"{node.op} operation contains {'dangerous' if is_dangerous else 'executable'} Python code"
+
+                result.add_issue(
+                    issue_msg,
+                    severity=severity,
+                    location=f"{self.current_file_path} (node: {node.name})",
+                    details={
+                        "op_type": node.op,
+                        "node_name": node.name,
+                        "code_analysis": risk_desc if is_dangerous else "Contains executable code",
+                        "code_preview": python_code[:200] + "..." if len(python_code) > 200 else python_code,
+                        "validation_status": "valid_python",
+                        "meta_graph": (
+                            meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                        ),
+                    },
+                    why=get_tf_op_explanation(node.op),
+                )
+            else:
+                # Code found but not valid Python
+                result.add_issue(
+                    f"{node.op} operation contains suspicious data (possibly obfuscated code)",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (node: {node.name})",
+                    details={
+                        "op_type": node.op,
+                        "node_name": node.name,
+                        "validation_error": error,
+                        "data_preview": python_code[:100] + "..." if len(python_code) > 100 else python_code,
+                        "meta_graph": (
+                            meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                        ),
+                    },
+                    why=get_tf_op_explanation(node.op),
+                )
+        else:
+            # PyFunc/PyCall without analyzable code - still dangerous
+            result.add_issue(
+                f"{node.op} operation detected (unable to extract Python code)",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (node: {node.name})",
+                details={
+                    "op_type": node.op,
+                    "node_name": node.name,
+                    "meta_graph": (meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"),
+                },
+                why=get_tf_op_explanation(node.op),
+            )
