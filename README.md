@@ -121,6 +121,8 @@ NO_COLOR=1 modelaudit models/
 modelaudit https://huggingface.co/gpt2
 modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
 modelaudit s3://my-bucket/downloaded-model.pt
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
+    --jfrog-api-token YOUR_TOKEN
 ```
 
 ### **Compliance & Audit Reporting**
