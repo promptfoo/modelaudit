@@ -317,6 +317,23 @@ class ScannerRegistry:
                 "dependencies": ["paddlepaddle"],
                 "numpy_sensitive": True,
             },
+            "tar": {
+                "module": "modelaudit.scanners.tar_scanner",
+                "class": "TarScanner",
+                "description": "Scans TAR archive files",
+                "extensions": [
+                    ".tar",
+                    ".tar.gz",
+                    ".tgz",
+                    ".tar.bz2",
+                    ".tbz2",
+                    ".tar.xz",
+                    ".txz",
+                ],
+                "priority": 98,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -536,6 +553,7 @@ def __getattr__(name: str) -> Any:
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
+        "TarScanner": "tar",
         "ZipScanner": "zip",
     }
 

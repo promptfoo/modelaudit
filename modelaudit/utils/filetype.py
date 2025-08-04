@@ -48,6 +48,15 @@ def detect_file_format_from_magic(path: str) -> str:
     magic8 = read_magic_bytes(path, 8)
     magic16 = read_magic_bytes(path, 16)
 
+    # Check for TAR format
+    try:
+        import tarfile
+
+        if tarfile.is_tarfile(path):
+            return "tar"
+    except Exception:
+        pass
+
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
     if magic8 == hdf5_magic:
         return "hdf5"
@@ -217,6 +226,16 @@ def detect_file_format(path: str) -> str:
         return "pickle"
     if ext == ".mlmodel":
         return "coreml"
+    if ext in (
+        ".tar",
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz2",
+        ".tbz2",
+        ".tar.xz",
+        ".txz",
+    ):
+        return "tar"
 
     return "unknown"
 
@@ -259,6 +278,13 @@ EXTENSION_FORMAT_MAP = {
     ".ggsa": "ggml",
     ".ptl": "executorch",
     ".pte": "executorch",
+    ".tar": "tar",
+    ".tar.gz": "tar",
+    ".tgz": "tar",
+    ".tar.bz2": "tar",
+    ".tbz2": "tar",
+    ".tar.xz": "tar",
+    ".txz": "tar",
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
@@ -317,6 +343,10 @@ def validate_file_type(path: str) -> bool:
 
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
         if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
+            return True
+
+        # TAR files must match
+        if ext_format == "tar" and header_format == "tar":
             return True
 
         # ExecuTorch files should be zip archives
