@@ -439,3 +439,21 @@ def test_non_ml_context_still_flags_suspicious_patterns():
         test_file_path = Path(test_file)
         if test_file_path.exists():
             test_file_path.unlink()
+
+
+def test_imagenet_labels_not_flagged(tmp_path):
+    """ImageNet label strings should not trigger critical issues."""
+    test_file = tmp_path / "vision_config.json"
+    manifest_content = {
+        "model_type": "vision",
+        "labels": {"shell": 0, "cat": 1, "dog": 2},
+    }
+
+    with test_file.open("w") as f:
+        json.dump(manifest_content, f)
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert not critical_issues, "Classification labels should not be critical"
