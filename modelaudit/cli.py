@@ -14,10 +14,11 @@ from yaspin.spinners import Spinners
 from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
+from .jfrog_integration import scan_jfrog_artifact
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
-from .utils.jfrog import download_artifact, is_jfrog_url
+from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 # Configure logging
@@ -633,34 +634,50 @@ def scan_command(
                 elif is_jfrog_url(path):
                     download_spinner = None
                     if format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading and scanning from {style_text(path, fg='cyan')}"
+                        )
                         download_spinner.start()
                     elif format == "text" and not output:
-                        click.echo(f"Downloading from {path}...")
+                        click.echo(f"Downloading and scanning from {path}...")
 
                     try:
-                        download_path = download_artifact(
+                        # Use the integrated JFrog scanning function
+                        results = scan_jfrog_artifact(
                             path,
-                            cache_dir=Path(cache_dir) if cache_dir else None,
                             api_token=jfrog_api_token,
                             access_token=jfrog_access_token,
+                            timeout=timeout,
+                            blacklist_patterns=list(blacklist) if blacklist else None,
+                            max_file_size=max_file_size,
+                            max_total_size=max_total_size,
+                            strict_license=strict_license,
+                            skip_file_types=not no_skip_files,
                         )
-                        actual_path = str(download_path)
-                        temp_dir = str(download_path.parent if download_path.is_file() else download_path)
 
                         if download_spinner:
-                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                            download_spinner.ok(style_text("✅ Downloaded and scanned", fg="green", bold=True))
                         elif format == "text" and not output:
-                            click.echo("Downloaded successfully")
+                            click.echo("Downloaded and scanned successfully")
+
+                        # Aggregate results
+                        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
+                        aggregated_results["issues"].extend(results.get("issues", []))
+                        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
+                        aggregated_results["assets"].extend(results.get("assets", []))
+                        if results.get("has_errors", False):
+                            aggregated_results["has_errors"] = True
+
+                        continue  # Skip the regular scanning flow
 
                     except Exception as e:
                         if download_spinner:
-                            download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                            download_spinner.fail(style_text("❌ Download/scan failed", fg="red", bold=True))
                         elif format == "text" and not output:
-                            click.echo("Download failed")
+                            click.echo("Download/scan failed")
 
-                        logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
-                        click.echo(f"Error downloading model from {path}: {e!s}", err=True)
+                        logger.error(f"Failed to download/scan model from {path}: {e!s}", exc_info=verbose)
+                        click.echo(f"Error downloading/scanning model from {path}: {e!s}", err=True)
                         aggregated_results["has_errors"] = True
                         continue
 
