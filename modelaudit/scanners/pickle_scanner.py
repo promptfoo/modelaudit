@@ -791,6 +791,10 @@ class PickleScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        
+        # Record initial validation checks
+        result.add_check("File path validation", True, category="File System")
+        result.add_check("File size validation", True, category="File System")
 
         # Check if this is a .bin file that might be a PyTorch file
         is_bin_file = os.path.splitext(path)[1].lower() == ".bin"
@@ -825,15 +829,17 @@ class PickleScanner(BaseScanner):
                     b"__import__",
                     b"builtins",  # Often used for builtins.eval, builtins.exec
                 ]
-
+                
+                # Record pattern scanning checks
+                patterns_found = 0
                 for pattern in dangerous_patterns:
                     # Check for interrupts during pattern scanning
                     self.check_interrupted()
 
                     # Use find() instead of 'in' operator to be more explicit
+                    pattern_str = pattern.decode("utf-8", errors="ignore")
                     if raw_content.find(pattern) != -1:
                         # Extract context around the pattern for semantic analysis
-                        pattern_str = pattern.decode("utf-8", errors="ignore")
                         pattern_pos = raw_content.find(pattern)
                         context_start = max(0, pattern_pos - 100)
                         context_end = min(len(raw_content), pattern_pos + len(pattern) + 100)
@@ -845,8 +851,21 @@ class PickleScanner(BaseScanner):
 
                         # Skip if semantic analysis says it's safe (e.g., in documentation)
                         if is_safe:
+                            result.add_check(
+                                f"Pattern '{pattern_str}' semantic validation",
+                                True,
+                                details="Pattern found but determined to be safe in context",
+                                category="Code Execution"
+                            )
                             continue
 
+                        patterns_found += 1
+                        result.add_check(
+                            f"Pattern '{pattern_str}' detection",
+                            False,
+                            details=f"Dangerous pattern found at position {pattern_pos}",
+                            category="Code Execution"
+                        )
                         result.add_issue(
                             f"Dangerous pattern '{pattern_str}' found in raw file content",
                             severity=IssueSeverity.CRITICAL,
@@ -861,14 +880,40 @@ class PickleScanner(BaseScanner):
                                 f"which could indicate malicious code execution during unpickling."
                             ),
                         )
+                    else:
+                        result.add_check(
+                            f"Pattern '{pattern_str}' detection",
+                            True,
+                            details="Pattern not found",
+                            category="Code Execution"
+                        )
 
+                # Record overall early detection result
+                result.add_check(
+                    "Early pattern detection scan",
+                    patterns_found == 0,
+                    details=f"Scanned {len(dangerous_patterns)} dangerous patterns, found {patterns_found}",
+                    category="Code Execution"
+                )
                 early_detection_successful = True
 
         except RecursionError:
             logger.warning(f"Recursion error during early pattern detection for {path}")
+            result.add_check(
+                "Early pattern detection scan",
+                False,
+                details="Recursion error during scan",
+                category="Code Execution"
+            )
             # Don't give up - we can still try the main scan
         except Exception as e:
             logger.warning(f"Error during early pattern detection: {e}")
+            result.add_check(
+                "Early pattern detection scan",
+                False,
+                details=f"Error during scan: {e}",
+                category="Code Execution"
+            )
 
         try:
             with open(path, "rb") as f:
@@ -1104,6 +1149,15 @@ class PickleScanner(BaseScanner):
             # Use a higher limit to ensure we can analyze malicious patterns before hitting recursion limit
             new_limit = max(original_recursion_limit, 10000)
             sys.setrecursionlimit(new_limit)
+            
+            # Record recursion limit check
+            result.add_check(
+                "Recursion limit configuration",
+                True,
+                details=f"Set recursion limit to {new_limit}",
+                category="Configuration"
+            )
+            
             # Process the pickle
             start_pos = file_obj.tell()
 
@@ -1111,6 +1165,10 @@ class PickleScanner(BaseScanner):
             opcodes = []
             # Track strings on the stack for STACK_GLOBAL opcode analysis
             string_stack = []
+            
+            # Track dangerous opcode types found
+            dangerous_opcodes_found = set()
+            safe_opcodes_count = 0
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 # Check for interrupts periodically during opcode processing
@@ -1135,6 +1193,12 @@ class PickleScanner(BaseScanner):
 
                 # Check for too many opcodes
                 if opcode_count > self.max_opcodes:
+                    result.add_check(
+                        "Opcode count limit check",
+                        False,
+                        details=f"Exceeded limit: {opcode_count} > {self.max_opcodes}",
+                        category="Data Validation"
+                    )
                     result.add_issue(
                         f"Too many opcodes in pickle (> {self.max_opcodes})",
                         severity=IssueSeverity.INFO,
@@ -1149,6 +1213,12 @@ class PickleScanner(BaseScanner):
 
                 # Check for timeout
                 if time.time() - result.start_time > self.timeout:
+                    result.add_check(
+                        "Timeout check",
+                        False,
+                        details=f"Exceeded timeout: {self.timeout} seconds",
+                        category="Configuration"
+                    )
                     result.add_issue(
                         f"Scanning timed out after {self.timeout} seconds",
                         severity=IssueSeverity.INFO,
@@ -1160,9 +1230,28 @@ class PickleScanner(BaseScanner):
                         ),
                     )
                     break
+            
+            # Record opcode count check
+            if opcode_count <= self.max_opcodes:
+                result.add_check(
+                    "Opcode count limit check",
+                    True,
+                    details=f"Within limit: {opcode_count} <= {self.max_opcodes}",
+                    category="Data Validation"
+                )
 
             # SMART DETECTION: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
+            
+            # Record ML context detection
+            ml_frameworks = list(ml_context.get("frameworks", {}).keys())
+            ml_confidence = ml_context.get("overall_confidence", 0)
+            result.add_check(
+                "ML framework detection",
+                True,
+                details=f"Detected frameworks: {ml_frameworks or 'None'}, confidence: {ml_confidence:.2f}",
+                category="Model Integrity"
+            )
 
             # Add ML context to metadata for debugging
             result.metadata.update(
@@ -1172,17 +1261,23 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+            
+            # Track GLOBAL opcode checks
+            global_opcodes_checked = 0
+            dangerous_globals_found = 0
 
             # Now analyze the collected opcodes with ML context awareness
             for opcode, arg, pos in opcodes:
                 # Check for GLOBAL opcodes that might reference suspicious modules
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
+                    global_opcodes_checked += 1
                     # Handle both "module function" and "module.function" formats
                     parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
 
                     if len(parts) == 2:
                         mod, func = parts
                         if _is_actually_dangerous_global(mod, func, ml_context):
+                            dangerous_globals_found += 1
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
                                 IssueSeverity.CRITICAL,

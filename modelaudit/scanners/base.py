@@ -68,11 +68,32 @@ class ScanResult:
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
         self.issues: list[Issue] = []
+        self.checks_performed: list[dict[str, Any]] = []  # Track all checks, not just issues
         self.start_time = time.time()
         self.end_time: Optional[float] = None
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
+
+    def add_check(
+        self,
+        check_name: str,
+        passed: bool = True,
+        details: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> None:
+        """Record a security check that was performed"""
+        check_record = {
+            "scanner": self.scanner_name,
+            "check_name": check_name,
+            "passed": passed,
+            "timestamp": time.time(),
+        }
+        if details:
+            check_record["details"] = details
+        if category:
+            check_record["category"] = category
+        self.checks_performed.append(check_record)
 
     def add_issue(
         self,
@@ -88,6 +109,14 @@ class ScanResult:
             why = get_message_explanation(message, context=self.scanner_name)
         issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
+        
+        # Also record this as a failed check
+        self.add_check(
+            check_name=message.split(':')[0] if ':' in message else message[:50],
+            passed=False,
+            category=self._categorize_issue(message),
+        )
+        
         log_level = (
             logging.CRITICAL
             if severity == IssueSeverity.CRITICAL
@@ -98,10 +127,35 @@ class ScanResult:
             )
         )
         logger.log(log_level, str(issue))
+    
+    def _categorize_issue(self, message: str) -> str:
+        """Categorize an issue based on its message"""
+        msg_lower = message.lower()
+        if any(word in msg_lower for word in ['eval', 'exec', 'import', 'subprocess', 'system', 'pyfunc', 'lambda', 'reduce']):
+            return "Code Execution"
+        elif any(word in msg_lower for word in ['file', 'path', 'traversal', 'directory', 'shutil']):
+            return "File System"
+        elif any(word in msg_lower for word in ['socket', 'network', 'http', 'url']):
+            return "Network Operations"
+        elif any(word in msg_lower for word in ['pickle', 'joblib', 'serial', 'deserial', 'opcode']):
+            return "Serialization"
+        elif any(word in msg_lower for word in ['tensor', 'weight', 'model', 'layer', 'shape']):
+            return "Model Integrity"
+        elif any(word in msg_lower for word in ['license', 'copyright', 'gpl']):
+            return "License Compliance"
+        elif any(word in msg_lower for word in ['blacklist', 'policy', 'forbidden']):
+            return "Security Policy"
+        elif any(word in msg_lower for word in ['config', 'setting', 'parameter']):
+            return "Configuration"
+        elif any(word in msg_lower for word in ['size', 'length', 'overflow', 'validation']):
+            return "Data Validation"
+        else:
+            return "General"
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
         self.issues.extend(other.issues)
+        self.checks_performed.extend(other.checks_performed)
         self.bytes_scanned += other.bytes_scanned
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
@@ -140,6 +194,7 @@ class ScanResult:
             "duration": self.duration,
             "bytes_scanned": self.bytes_scanned,
             "issues": [issue.to_dict() for issue in self.issues],
+            "checks_performed": self.checks_performed,
             "metadata": self.metadata,
             "has_errors": self.has_errors,
             "has_warnings": self.has_warnings,

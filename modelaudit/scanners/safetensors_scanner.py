@@ -69,7 +69,9 @@ class SafeTensorsScanner(BaseScanner):
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
+                # Check: File size validation
                 header_len_bytes = f.read(8)
+                result.add_check("File size validation", len(header_len_bytes) == 8, category="Model Integrity")
                 if len(header_len_bytes) != 8:
                     result.add_issue(
                         "File too small to contain SafeTensors header length",
@@ -79,8 +81,11 @@ class SafeTensorsScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
+                # Check: Header length validation
                 header_len = struct.unpack("<Q", header_len_bytes)[0]
-                if header_len <= 0 or header_len > file_size - 8:
+                header_valid = header_len > 0 and header_len <= file_size - 8
+                result.add_check("Header length validation", header_valid, category="Model Integrity")
+                if not header_valid:
                     result.add_issue(
                         "Invalid SafeTensors header length",
                         severity=IssueSeverity.CRITICAL,
@@ -100,7 +105,10 @@ class SafeTensorsScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-                if not header_bytes.strip().startswith(b"{"):
+                # Check: Header format validation
+                header_starts_correctly = header_bytes.strip().startswith(b"{")
+                result.add_check("Header format validation", header_starts_correctly, category="Model Integrity")
+                if not header_starts_correctly:
                     result.add_issue(
                         "SafeTensors header does not start with '{'",
                         severity=IssueSeverity.CRITICAL,
@@ -109,9 +117,12 @@ class SafeTensorsScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
+                # Check: JSON parsing validation
                 try:
                     header = json.loads(header_bytes.decode("utf-8"))
+                    result.add_check("JSON header parsing", True, category="Model Integrity")
                 except json.JSONDecodeError as e:
+                    result.add_check("JSON header parsing", False, category="Model Integrity")
                     result.add_issue(
                         f"Invalid JSON header: {e!s}",
                         severity=IssueSeverity.CRITICAL,

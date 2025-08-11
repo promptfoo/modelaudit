@@ -103,6 +103,7 @@ def scan_model_directory_or_file(
         "path": path,
         "bytes_scanned": 0,
         "issues": [],
+        "checks_performed": [],  # Track all security checks performed
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
@@ -330,6 +331,13 @@ def scan_model_directory_or_file(
                             issues_list = cast(list[dict[str, Any]], results["issues"])
                             for issue in file_result.issues:
                                 issues_list.append(issue.to_dict())
+                            
+                            # Aggregate checks performed
+                            if hasattr(file_result, 'checks_performed'):
+                                if "checks_performed" not in results:
+                                    results["checks_performed"] = []
+                                checks_list = cast(list[dict[str, Any]], results["checks_performed"])
+                                checks_list.extend(file_result.checks_performed)
 
                             _add_asset_to_results(results, str(target_path), file_result)
 
@@ -453,6 +461,13 @@ def scan_model_directory_or_file(
                 issues_list = cast(list[dict[str, Any]], results["issues"])
                 for issue in file_result.issues:
                     issues_list.append(issue.to_dict())
+                
+                # Aggregate checks performed
+                if hasattr(file_result, 'checks_performed'):
+                    if "checks_performed" not in results:
+                        results["checks_performed"] = []
+                    checks_list = cast(list[dict[str, Any]], results["checks_performed"])
+                    checks_list.extend(file_result.checks_performed)
 
                 _add_asset_to_results(results, target, file_result)
 
