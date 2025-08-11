@@ -272,10 +272,11 @@ class SecretsDetector:
         example_secrets = [
             "AKIAIOSFODNN7EXAMPLE",  # AWS example access key
             "bPxRfiCYEXAMPLEKEY",  # AWS example secret key
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",  # JWT.io example token (without signature)
+            # JWT.io example token (without signature part)
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",
             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
         ]
-        
         if any(example in text for example in example_secrets):
             # These are well-known example secrets - still report but lower severity
             # Set confidence to exactly 0.6 so it passes threshold but gets WARNING severity
