@@ -73,13 +73,18 @@ class TarScanner(BaseScanner):
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+
         try:
             self.current_file_path = path
             scan_result = self._scan_tar_file(path, depth=0)
             result.merge(scan_result)
         except tarfile.TarError:
-            result.add_issue(
-                f"Not a valid tar file: {path}",
+            result.add_check(
+                name="TAR File Format Validation",
+                passed=False,
+                message=f"Not a valid tar file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -87,8 +92,10 @@ class TarScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
-            result.add_issue(
-                f"Error scanning tar file: {e!s}",
+            result.add_check(
+                name="TAR File Scan",
+                passed=False,
+                message=f"Error scanning tar file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -105,32 +112,54 @@ class TarScanner(BaseScanner):
         contents: list[dict[str, Any]] = []
 
         if depth >= self.max_depth:
-            result.add_issue(
-                f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
+            result.add_check(
+                name="TAR Depth Bomb Protection",
+                passed=False,
+                message=f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
             return result
+        else:
+            result.add_check(
+                name="TAR Depth Bomb Protection",
+                passed=True,
+                message="TAR nesting depth is within safe limits",
+                location=path,
+                details={"depth": depth, "max_depth": self.max_depth},
+            )
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
             if len(members) > self.max_entries:
-                result.add_issue(
-                    f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=False,
+                    message=f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"entries": len(members), "max_entries": self.max_entries},
                 )
                 return result
+            else:
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=True,
+                    message=f"Entry count ({len(members)}) is within limits",
+                    location=path,
+                    details={"entries": len(members), "max_entries": self.max_entries},
+                )
 
             for member in members:
                 name = member.name
                 temp_base = os.path.join(tempfile.gettempdir(), "extract_tar")
                 resolved_name, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
-                    result.add_issue(
-                        f"Archive entry {name} attempted path traversal outside the archive",
+                    result.add_check(
+                        name="Path Traversal Protection",
+                        passed=False,
+                        message=f"Archive entry {name} attempted path traversal outside the archive",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path}:{name}",
                         details={"entry": name},
@@ -142,18 +171,35 @@ class TarScanner(BaseScanner):
                     target_base = os.path.dirname(resolved_name)
                     target_resolved, target_safe = sanitize_archive_path(target, target_base)
                     if not target_safe:
-                        result.add_issue(
-                            f"Symlink {name} resolves outside extraction directory",
+                        # Check if it's specifically a critical system path
+                        if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                            message = f"Symlink {name} points to critical system path: {target}"
+                        else:
+                            message = f"Symlink {name} resolves outside extraction directory"
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=message,
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"target": target},
                         )
-                    if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
-                        result.add_issue(
-                            f"Symlink {name} points to critical system path: {target}",
+                    elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Symlink {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"target": target},
+                        )
+                    else:
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=True,
+                            message=f"Symlink {name} is safe",
+                            location=f"{path}:{name}",
+                            details={"target": target, "entry": name},
                         )
                     continue
 

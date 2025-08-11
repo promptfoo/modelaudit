@@ -54,60 +54,84 @@ class TextScanner(BaseScanner):
 
             # Check if file is too large (text files shouldn't be huge)
             if file_size > 100 * 1024 * 1024:  # 100MB
-                result.add_issue(
-                    f"Unusually large text file: {file_size / (1024 * 1024):.1f}MB",
+                result.add_check(
+                    name="File Size Check",
+                    passed=False,
+                    message=f"Unusually large text file: {file_size / (1024 * 1024):.1f}MB",
                     severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"file_size": file_size},
+                )
+            else:
+                result.add_check(
+                    name="File Size Check",
+                    passed=True,
+                    message="Text file size is reasonable",
                     location=path,
                     details={"file_size": file_size},
                 )
 
             filename = os.path.basename(path).lower()
 
-            # Identify file type
+            # Identify file type - these are informational checks, not security issues
             if filename in ["readme.md", "readme.txt", "readme.markdown", "model_card.md"]:
-                result.add_issue(
-                    "Model documentation file",
-                    severity=IssueSeverity.DEBUG,
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="Model documentation file",
                     location=path,
                     details={"file_type": "documentation"},
                 )
             elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
-                result.add_issue(
-                    "Tokenizer vocabulary file",
-                    severity=IssueSeverity.DEBUG,
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="Tokenizer vocabulary file",
                     location=path,
                     details={"file_type": "vocabulary"},
                 )
             elif filename in ["labels.txt", "classes.txt"]:
-                result.add_issue(
-                    "Classification labels file",
-                    severity=IssueSeverity.DEBUG,
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="Classification labels file",
                     location=path,
                     details={"file_type": "labels"},
                 )
             elif filename in ["license.txt", "license.md"]:
-                result.add_issue(
-                    "License file", severity=IssueSeverity.DEBUG, location=path, details={"file_type": "license"}
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="License file",
+                    location=path,
+                    details={"file_type": "license"},
                 )
             elif filename == "requirements.txt":
                 # Could scan for suspicious dependencies in the future
-                result.add_issue(
-                    "Python requirements file",
-                    severity=IssueSeverity.DEBUG,
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="Python requirements file",
                     location=path,
                     details={"file_type": "requirements"},
                 )
             else:
-                result.add_issue(
-                    "ML-related text file", severity=IssueSeverity.DEBUG, location=path, details={"file_type": "text"}
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="ML-related text file",
+                    location=path,
+                    details={"file_type": "text"},
                 )
 
             result.bytes_scanned = file_size
             result.finish(success=True)
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning text file: {e!s}",
+            result.add_check(
+                name="Text File Scan",
+                passed=False,
+                message=f"Error scanning text file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"error": str(e)},

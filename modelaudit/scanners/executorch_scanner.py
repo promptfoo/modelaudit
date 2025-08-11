@@ -50,8 +50,10 @@ class ExecuTorchScanner(BaseScanner):
 
         header = self._read_header(path)
         if not header.startswith(b"PK"):
-            result.add_issue(
-                f"Not a valid ExecuTorch archive: {path}",
+            result.add_check(
+                name="ExecuTorch Archive Format Validation",
+                passed=False,
+                message=f"Not a valid ExecuTorch archive: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -67,8 +69,10 @@ class ExecuTorchScanner(BaseScanner):
                     temp_base = os.path.join(tempfile.gettempdir(), "extract")
                     _, is_safe = sanitize_archive_path(name, temp_base)
                     if not is_safe:
-                        result.add_issue(
-                            f"Archive entry {name} attempted path traversal outside the archive",
+                        result.add_check(
+                            name="Path Traversal Protection",
+                            passed=False,
+                            message=f"Archive entry {name} attempted path traversal outside the archive",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"entry": name},
@@ -98,15 +102,19 @@ class ExecuTorchScanner(BaseScanner):
 
                 for name in safe_entries:
                     if name.endswith(".py"):
-                        result.add_issue(
-                            f"Python code file found in ExecuTorch model: {name}",
+                        result.add_check(
+                            name="Python File Detection",
+                            passed=False,
+                            message=f"Python code file found in ExecuTorch model: {name}",
                             severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
                             details={"file": name},
                         )
                     elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
-                        result.add_issue(
-                            f"Executable file found in ExecuTorch model: {name}",
+                        result.add_check(
+                            name="Executable File Detection",
+                            passed=False,
+                            message=f"Executable file found in ExecuTorch model: {name}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
@@ -114,8 +122,10 @@ class ExecuTorchScanner(BaseScanner):
 
                 result.bytes_scanned = bytes_scanned
         except zipfile.BadZipFile:
-            result.add_issue(
-                f"Not a valid zip file: {path}",
+            result.add_check(
+                name="ZIP File Format Validation",
+                passed=False,
+                message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -123,8 +133,10 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:  # pragma: no cover - unexpected errors
-            result.add_issue(
-                f"Error scanning ExecuTorch file: {e!s}",
+            result.add_check(
+                name="ExecuTorch File Scan",
+                passed=False,
+                message=f"Error scanning ExecuTorch file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},

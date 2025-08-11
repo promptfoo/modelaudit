@@ -169,6 +169,32 @@ class ManifestScanner(BaseScanner):
                 if isinstance(content, dict):
                     result.metadata["keys"] = list(content.keys())
 
+                    # Extract model metadata for HuggingFace config files
+                    if os.path.basename(path) == "config.json":
+                        model_info = {}
+                        # Extract key model configuration
+                        if "model_type" in content:
+                            model_info["model_type"] = content["model_type"]
+                        if "architectures" in content:
+                            model_info["architectures"] = content["architectures"]
+                        if "num_parameters" in content:
+                            model_info["num_parameters"] = content["num_parameters"]
+                        if "hidden_size" in content:
+                            model_info["hidden_size"] = content["hidden_size"]
+                        if "num_hidden_layers" in content:
+                            model_info["num_layers"] = content["num_hidden_layers"]
+                        if "num_attention_heads" in content:
+                            model_info["num_heads"] = content["num_attention_heads"]
+                        if "vocab_size" in content:
+                            model_info["vocab_size"] = content["vocab_size"]
+                        if "task" in content:
+                            model_info["task"] = content["task"]
+                        if "transformers_version" in content:
+                            model_info["framework_version"] = content["transformers_version"]
+
+                        if model_info:
+                            result.metadata["model_info"] = model_info
+
                 # Extract license information if present
                 if isinstance(content, dict):
                     license_info = self._extract_license_info(content)
@@ -179,15 +205,19 @@ class ManifestScanner(BaseScanner):
                 self._check_suspicious_patterns(content, result)
 
             else:
-                result.add_issue(
-                    f"Unable to parse file as a manifest or configuration: {path}",
+                result.add_check(
+                    name="Manifest Parse Attempt",
+                    passed=False,
+                    message=f"Unable to parse file as a manifest or configuration: {path}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                 )
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning manifest file: {e!s}",
+            result.add_check(
+                name="Manifest File Scan",
+                passed=False,
+                message=f"Error scanning manifest file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -207,11 +237,14 @@ class ManifestScanner(BaseScanner):
             with open(path, encoding="utf-8") as f:
                 content = f.read().lower()  # Convert to lowercase for case-insensitive matching
 
+                found_blacklisted = False
                 for pattern in self.blacklist_patterns:
                     pattern_lower = pattern.lower()
                     if pattern_lower in content:
-                        result.add_issue(
-                            f"Blacklisted term '{pattern}' found in file",
+                        result.add_check(
+                            name="Blacklist Pattern Check",
+                            passed=False,
+                            message=f"Blacklisted term '{pattern}' found in file",
                             severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"blacklisted_term": pattern, "file_path": path},
@@ -221,9 +254,21 @@ class ManifestScanner(BaseScanner):
                                 "malicious indicators."
                             ),
                         )
+                        found_blacklisted = True
+
+                if not found_blacklisted:
+                    result.add_check(
+                        name="Blacklist Pattern Check",
+                        passed=True,
+                        message="No blacklisted patterns found in file",
+                        location=self.current_file_path,
+                        details={"patterns_checked": len(self.blacklist_patterns)},
+                    )
         except Exception as e:
-            result.add_issue(
-                f"Error checking file for blacklist: {e!s}",
+            result.add_check(
+                name="Blacklist Pattern Check",
+                passed=False,
+                message=f"Error checking file for blacklist: {e!s}",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -267,8 +312,10 @@ class ManifestScanner(BaseScanner):
             # Log the error but don't raise, as we want to continue scanning
             logger.warning(f"Error parsing file {path}: {e!s}")
             if result is not None:
-                result.add_issue(
-                    f"Error parsing file: {path}",
+                result.add_check(
+                    name="File Parse Error",
+                    passed=False,
+                    message=f"Error parsing file: {path}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
@@ -319,8 +366,10 @@ class ManifestScanner(BaseScanner):
                         self.blacklist_patterns,
                     )
                     if blocked:
-                        result.add_issue(
-                            f"Model name blocked by policy: {value}",
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=False,
+                            message=f"Model name blocked by policy: {value}",
                             severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={
@@ -329,11 +378,24 @@ class ManifestScanner(BaseScanner):
                                 "key": full_key,
                             },
                         )
+                    else:
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=True,
+                            message=f"Model name '{value}' passed policy check",
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "key": full_key,
+                            },
+                        )
 
                 # STEP 2: Value-based analysis - check for actually dangerous content
                 if self._is_actually_dangerous_value(key, value):
-                    result.add_issue(
-                        f"Dangerous configuration content: {full_key}",
+                    result.add_check(
+                        name="Dangerous Content Detection",
+                        passed=False,
+                        message=f"Dangerous configuration content: {full_key}",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={
@@ -375,8 +437,10 @@ class ManifestScanner(BaseScanner):
                                 "repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
                             )
 
-                    result.add_issue(
-                        f"Suspicious configuration pattern: {full_key} (category: {', '.join(matches)})",
+                    result.add_check(
+                        name="Suspicious Configuration Pattern Detection",
+                        passed=False,
+                        message=f"Suspicious configuration pattern: {full_key} (category: {', '.join(matches)})",
                         severity=severity,
                         location=self.current_file_path,
                         details={

@@ -66,14 +66,27 @@ class PyTorchBinaryScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+
         try:
             self.current_file_path = path
 
             # Check for suspiciously small files
             if file_size < 100:
-                result.add_issue(
-                    f"Suspiciously small binary file: {file_size} bytes",
+                result.add_check(
+                    name="File Size Validation",
+                    passed=False,
+                    message=f"Suspiciously small binary file: {file_size} bytes",
                     severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"file_size": file_size},
+                )
+            else:
+                result.add_check(
+                    name="File Size Validation",
+                    passed=True,
+                    message="File size is reasonable",
                     location=path,
                     details={"file_size": file_size},
                 )
@@ -118,8 +131,10 @@ class PyTorchBinaryScanner(BaseScanner):
             self._validate_tensor_structure(path, result)
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning binary file: {e!s}",
+            result.add_check(
+                name="Binary File Scan",
+                passed=False,
+                message=f"Error scanning binary file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -138,12 +153,15 @@ class PyTorchBinaryScanner(BaseScanner):
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
+        found_suspicious = False
         for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 # Find the position within the chunk
                 pos = chunk.find(pattern)
-                result.add_issue(
-                    f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
+                result.add_check(
+                    name="Embedded Code Pattern Detection",
+                    passed=False,
+                    message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
                     severity=IssueSeverity.INFO,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
@@ -151,6 +169,15 @@ class PyTorchBinaryScanner(BaseScanner):
                         "offset": offset + pos,
                     },
                 )
+                found_suspicious = True
+
+        if not found_suspicious and offset == 0:  # Only record success on first chunk
+            result.add_check(
+                name="Embedded Code Pattern Detection",
+                passed=True,
+                message="No suspicious code patterns detected",
+                location=self.current_file_path,
+            )
 
     def _check_for_blacklist_patterns(
         self,
@@ -159,12 +186,15 @@ class PyTorchBinaryScanner(BaseScanner):
         offset: int,
     ) -> None:
         """Check for blacklisted patterns in the binary data"""
+        found_blacklisted = False
         for pattern in self.blacklist_patterns:
             pattern_bytes = pattern.encode("utf-8")
             if pattern_bytes in chunk:
                 pos = chunk.find(pattern_bytes)
-                result.add_issue(
-                    f"Blacklisted pattern found: {pattern}",
+                result.add_check(
+                    name="Blacklist Pattern Check",
+                    passed=False,
+                    message=f"Blacklisted pattern found: {pattern}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
@@ -172,6 +202,15 @@ class PyTorchBinaryScanner(BaseScanner):
                         "offset": offset + pos,
                     },
                 )
+                found_blacklisted = True
+
+        if not found_blacklisted and offset == 0:  # Only record success on first chunk
+            result.add_check(
+                name="Blacklist Pattern Check",
+                passed=True,
+                message="No blacklisted patterns found",
+                location=self.current_file_path,
+            )
 
     def _check_for_executable_signatures(
         self,
@@ -227,8 +266,10 @@ class PyTorchBinaryScanner(BaseScanner):
 
             # Report significant patterns that weren't filtered out
             for pos in filtered_positions[:10]:  # Limit to first 10
-                result.add_issue(
-                    f"Executable signature found: {description}",
+                result.add_check(
+                    name="Executable Signature Detection",
+                    passed=False,
+                    message=f"Executable signature found: {description}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {pos})",
                     details={
@@ -246,8 +287,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 from modelaudit.utils.ml_context import get_ml_context_explanation
 
                 explanation = get_ml_context_explanation(ml_context, len(positions))
-                result.add_issue(
-                    f"Ignored {ignored_count} likely false positive {description} patterns",
+                result.add_check(
+                    name="False Positive Filter",
+                    passed=True,
+                    message=f"Ignored {ignored_count} likely false positive {description} patterns",
                     severity=IssueSeverity.DEBUG,
                     location=f"{self.current_file_path}",
                     details={
@@ -270,8 +313,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 # PyTorch tensors often start with specific patterns
                 # This is a basic check - real validation would require parsing the format
                 if len(header) < 8:
-                    result.add_issue(
-                        "File too small to be a valid tensor file",
+                    result.add_check(
+                        name="Tensor File Size Validation",
+                        passed=False,
+                        message="File too small to be a valid tensor file",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"header_size": len(header)},
@@ -289,8 +334,10 @@ class PyTorchBinaryScanner(BaseScanner):
                     if not (-1e100 < value < 1e100) or value != value:  # NaN check
                         result.metadata["tensor_validation"] = "unusual_float_values"
                 except struct.error as e:
-                    result.add_issue(
-                        "Error interpreting tensor header",
+                    result.add_check(
+                        name="Tensor Header Interpretation",
+                        passed=False,
+                        message="Error interpreting tensor header",
                         severity=IssueSeverity.DEBUG,
                         location=self.current_file_path,
                         details={
@@ -300,8 +347,10 @@ class PyTorchBinaryScanner(BaseScanner):
                     )
 
         except Exception as e:
-            result.add_issue(
-                f"Error validating tensor structure: {e!s}",
+            result.add_check(
+                name="Tensor Structure Validation",
+                passed=False,
+                message=f"Error validating tensor structure: {e!s}",
                 severity=IssueSeverity.DEBUG,
                 location=self.current_file_path,
                 details={"exception": str(e)},

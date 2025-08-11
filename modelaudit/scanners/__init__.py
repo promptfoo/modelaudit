@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Iterator
 from typing import Any, Optional
 
-from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -584,6 +584,8 @@ __all__ = [
     "SCANNER_REGISTRY",
     # Base classes (already imported)
     "BaseScanner",
+    "Check",
+    "CheckStatus",
     "Issue",
     "IssueSeverity",
     "ScanResult",

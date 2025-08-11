@@ -42,11 +42,18 @@ class OnnxScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+        self.current_file_path = path
+
         if not HAS_ONNX:
-            result.add_issue(
-                "onnx package not installed, cannot scan ONNX files.",
+            result.add_check(
+                name="ONNX Library Check",
+                passed=False,
+                message="onnx package not installed, cannot scan ONNX files.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                details={"required_package": "onnx"},
             )
             result.finish(success=False)
             return result
@@ -55,8 +62,10 @@ class OnnxScanner(BaseScanner):
             model = onnx.load(path, load_external_data=False)
             result.bytes_scanned = file_size
         except Exception as e:  # pragma: no cover - unexpected parse errors
-            result.add_issue(
-                f"Error parsing ONNX model: {e}",
+            result.add_check(
+                name="ONNX Model Parsing",
+                passed=False,
+                message=f"Error parsing ONNX model: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -81,22 +90,52 @@ class OnnxScanner(BaseScanner):
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
+        python_ops_found = False
+        safe_nodes = 0
+
         for node in model.graph.node:
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
-                result.add_issue(
-                    f"Model uses custom operator domain '{node.domain}'",
+                result.add_check(
+                    name="Custom Operator Domain Check",
+                    passed=False,
+                    message=f"Model uses custom operator domain '{node.domain}'",
                     severity=IssueSeverity.WARNING,
                     location=f"{path} (node: {node.name})",
                     details={"op_type": node.op_type, "domain": node.domain},
                 )
-            if "python" in node.op_type.lower():
-                result.add_issue(
-                    f"Model uses Python operator '{node.op_type}'",
+            elif "python" in node.op_type.lower():
+                python_ops_found = True
+                result.add_check(
+                    name="Python Operator Detection",
+                    passed=False,
+                    message=f"Model uses Python operator '{node.op_type}'",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path} (node: {node.name})",
                     details={"op_type": node.op_type, "domain": node.domain},
                 )
+            else:
+                safe_nodes += 1
+
+        # Record successful checks for safe operators
+        if safe_nodes > 0 and not custom_domains:
+            result.add_check(
+                name="Custom Operator Domain Check",
+                passed=True,
+                message="All operators use standard ONNX domains",
+                location=path,
+                details={"safe_nodes": safe_nodes},
+            )
+
+        if not python_ops_found:
+            result.add_check(
+                name="Python Operator Detection",
+                passed=True,
+                message="No Python operators detected",
+                location=path,
+                details={"nodes_checked": len(model.graph.node)},
+            )
+
         if custom_domains:
             result.metadata["custom_domains"] = sorted(custom_domains)
 
@@ -107,8 +146,10 @@ class OnnxScanner(BaseScanner):
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if location is None:
-                    result.add_issue(
-                        f"Tensor '{tensor.name}' uses external data without location",
+                    result.add_check(
+                        name="External Data Location Check",
+                        passed=False,
+                        message=f"Tensor '{tensor.name}' uses external data without location",
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"tensor": tensor.name},
@@ -116,20 +157,31 @@ class OnnxScanner(BaseScanner):
                     continue
                 external_path = (model_dir / location).resolve()
                 if not external_path.exists():
-                    result.add_issue(
-                        f"External data file not found for tensor '{tensor.name}'",
+                    result.add_check(
+                        name="External Data File Existence",
+                        passed=False,
+                        message=f"External data file not found for tensor '{tensor.name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
                     )
                 elif not str(external_path).startswith(str(model_dir)):
-                    result.add_issue(
-                        f"External data file outside model directory for tensor '{tensor.name}'",
+                    result.add_check(
+                        name="External Data Path Traversal Check",
+                        passed=False,
+                        message=f"External data file outside model directory for tensor '{tensor.name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
                     )
                 else:
+                    result.add_check(
+                        name="External Data Path Traversal Check",
+                        passed=True,
+                        message=f"External data file path is safe for tensor '{tensor.name}'",
+                        location=str(external_path),
+                        details={"tensor": tensor.name, "file": location},
+                    )
                     self._validate_external_size(tensor, external_path, result)
 
     def _validate_external_size(
@@ -146,8 +198,10 @@ class OnnxScanner(BaseScanner):
             expected_size = int(num_elem) * int(dtype.itemsize)
             actual_size = external_path.stat().st_size
             if actual_size < expected_size:
-                result.add_issue(
-                    "External data file size mismatch",
+                result.add_check(
+                    name="External Data Size Validation",
+                    passed=False,
+                    message="External data file size mismatch",
                     severity=IssueSeverity.CRITICAL,
                     location=str(external_path),
                     details={
@@ -156,9 +210,22 @@ class OnnxScanner(BaseScanner):
                         "actual_size": actual_size,
                     },
                 )
+            else:
+                result.add_check(
+                    name="External Data Size Validation",
+                    passed=True,
+                    message="External data file size matches expected",
+                    location=str(external_path),
+                    details={
+                        "tensor": tensor.name,
+                        "size": actual_size,
+                    },
+                )
         except Exception as e:
-            result.add_issue(
-                f"Could not validate external data size: {e}",
+            result.add_check(
+                name="External Data Size Validation",
+                passed=False,
+                message=f"Could not validate external data size: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=str(external_path),
             )
@@ -176,8 +243,10 @@ class OnnxScanner(BaseScanner):
                     expected_size = int(num_elem) * int(dtype.itemsize)
                     actual_size = len(tensor.raw_data)
                     if actual_size < expected_size:
-                        result.add_issue(
-                            f"Tensor '{tensor.name}' data appears truncated",
+                        result.add_check(
+                            name="Tensor Size Validation",
+                            passed=False,
+                            message=f"Tensor '{tensor.name}' data appears truncated",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path} (tensor: {tensor.name})",
                             details={
@@ -185,9 +254,21 @@ class OnnxScanner(BaseScanner):
                                 "actual_size": actual_size,
                             },
                         )
+                    else:
+                        result.add_check(
+                            name="Tensor Size Validation",
+                            passed=True,
+                            message=f"Tensor '{tensor.name}' size is valid",
+                            location=f"{path} (tensor: {tensor.name})",
+                            details={
+                                "size": actual_size,
+                            },
+                        )
                 except Exception as e:
-                    result.add_issue(
-                        f"Could not validate tensor '{tensor.name}': {e}",
+                    result.add_check(
+                        name="Tensor Validation",
+                        passed=False,
+                        message=f"Could not validate tensor '{tensor.name}': {e}",
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )

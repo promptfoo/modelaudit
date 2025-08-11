@@ -44,8 +44,10 @@ class TensorRTScanner(BaseScanner):
             data = self._read_file_safely(path)
             result.bytes_scanned = len(data)
         except Exception as e:  # pragma: no cover - unexpected read errors
-            result.add_issue(
-                f"Error reading TensorRT engine: {e}",
+            result.add_check(
+                name="TensorRT Engine Read",
+                passed=False,
+                message=f"Error reading TensorRT engine: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -55,10 +57,13 @@ class TensorRTScanner(BaseScanner):
 
         for pattern in SUSPICIOUS_PATTERNS:
             if pattern in data:
-                result.add_issue(
-                    f"Suspicious pattern '{pattern.decode('utf-8', 'ignore')}' found",
+                result.add_check(
+                    name="Suspicious Pattern Detection",
+                    passed=False,
+                    message=f"Suspicious pattern '{pattern.decode('utf-8', 'ignore')}' found",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
+                    details={"pattern": pattern.decode("utf-8", "ignore")},
                 )
 
         result.finish(success=not result.has_errors)

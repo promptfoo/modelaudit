@@ -208,9 +208,11 @@ def test_flax_msgpack_orbax_format_detection(tmp_path):
     jax_metadata = result.metadata.get("jax_metadata", {})
     assert jax_metadata.get("orbax_format") is True
 
-    # Should have INFO issue about Orbax detection
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert any("Orbax checkpoint format detected" in issue.message for issue in info_issues)
+    # Should have check about Orbax detection
+    # Now using checks instead of issues - look for passed check with Orbax message
+    orbax_checks = [check for check in result.checks if "Orbax checkpoint format detected" in check.message]
+    assert len(orbax_checks) > 0, "No Orbax detection check found"
+    assert orbax_checks[0].status.value == "passed"
 
 
 def test_flax_msgpack_jax_specific_threats(tmp_path):

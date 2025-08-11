@@ -115,17 +115,22 @@ class WeightDistributionScanner(BaseScanner):
                 elif ext == ".safetensors":
                     weights_info = self._extract_safetensors_weights(path)
                 else:
-                    result.add_issue(
-                        f"Unsupported model format for weight distribution scanner: {ext}",
+                    result.add_check(
+                        name="Model Format Support Check",
+                        passed=False,
+                        message=f"Unsupported model format for weight distribution scanner: {ext}",
                         severity=IssueSeverity.DEBUG,
                         location=path,
+                        details={"extension": ext},
                     )
                     result.finish(success=False)
                     return result
 
             if not weights_info:
-                result.add_issue(
-                    "Could not extract weights from model",
+                result.add_check(
+                    name="Weight Extraction",
+                    passed=False,
+                    message="Could not extract weights from model",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                 )
@@ -137,8 +142,10 @@ class WeightDistributionScanner(BaseScanner):
 
             # Add issues for any anomalies found
             for anomaly in anomalies:
-                result.add_issue(
-                    anomaly["description"],
+                result.add_check(
+                    name="Weight Distribution Anomaly Detection",
+                    passed=False,
+                    message=anomaly["description"],
                     severity=anomaly["severity"],
                     location=path,
                     details=anomaly["details"],
@@ -152,8 +159,10 @@ class WeightDistributionScanner(BaseScanner):
             result.bytes_scanned = file_size
 
         except Exception as e:
-            result.add_issue(
-                f"Error analyzing weight distributions: {e!s}",
+            result.add_check(
+                name="Weight Distribution Analysis",
+                passed=False,
+                message=f"Error analyzing weight distributions: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
