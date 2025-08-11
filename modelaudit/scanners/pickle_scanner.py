@@ -847,14 +847,16 @@ class PickleScanner(BaseScanner):
 
                         # Use semantic analysis to check if this is actually dangerous
                         # For now, just check if it's in documentation or comments
-                        is_safe = "documentation" in context.lower() or "#" in context
+                        is_safe = ("documentation" in context.lower() or 
+                                  "#" in context)
 
                         # Skip if semantic analysis says it's safe (e.g., in documentation)
                         if is_safe:
                             result.add_check(
                                 f"Pattern '{pattern_str}' semantic validation",
                                 True,
-                                details="Pattern found but determined to be safe in context",
+                                details=("Pattern found but determined to be "
+                                        "safe in context"),
                                 category="Code Execution"
                             )
                             continue
@@ -863,7 +865,8 @@ class PickleScanner(BaseScanner):
                         result.add_check(
                             f"Pattern '{pattern_str}' detection",
                             False,
-                            details=f"Dangerous pattern found at position {pattern_pos}",
+                            details=(f"Dangerous pattern found at position "
+                                    f"{pattern_pos}"),
                             category="Code Execution"
                         )
                         result.add_issue(
@@ -892,7 +895,8 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     "Early pattern detection scan",
                     patterns_found == 0,
-                    details=f"Scanned {len(dangerous_patterns)} dangerous patterns, found {patterns_found}",
+                    details=(f"Scanned {len(dangerous_patterns)} dangerous "
+                            f"patterns, found {patterns_found}"),
                     category="Code Execution"
                 )
                 early_detection_successful = True
@@ -1196,7 +1200,8 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         "Opcode count limit check",
                         False,
-                        details=f"Exceeded limit: {opcode_count} > {self.max_opcodes}",
+                        details=(f"Exceeded limit: {opcode_count} > "
+                                f"{self.max_opcodes}"),
                         category="Data Validation"
                     )
                     result.add_issue(
@@ -1236,7 +1241,8 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     "Opcode count limit check",
                     True,
-                    details=f"Within limit: {opcode_count} <= {self.max_opcodes}",
+                    details=(f"Within limit: {opcode_count} <= "
+                            f"{self.max_opcodes}"),
                     category="Data Validation"
                 )
 
@@ -1249,7 +1255,8 @@ class PickleScanner(BaseScanner):
             result.add_check(
                 "ML framework detection",
                 True,
-                details=f"Detected frameworks: {ml_frameworks or 'None'}, confidence: {ml_confidence:.2f}",
+                details=(f"Detected frameworks: {ml_frameworks or 'None'}, "
+                        f"confidence: {ml_confidence:.2f}"),
                 category="Model Integrity"
             )
 
@@ -1272,7 +1279,9 @@ class PickleScanner(BaseScanner):
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
                     global_opcodes_checked += 1
                     # Handle both "module function" and "module.function" formats
-                    parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                    parts = (arg.split(" ", 1) if " " in arg 
+                            else arg.rsplit(".", 1) if "." in arg 
+                            else [arg, ""])
 
                     if len(parts) == 2:
                         mod, func = parts

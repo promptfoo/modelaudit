@@ -68,12 +68,14 @@ class ScanResult:
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
         self.issues: list[Issue] = []
-        self.checks_performed: list[dict[str, Any]] = []  # Track all checks, not just issues
+        self.bytes_scanned: int = 0
+        self.metadata: dict[str, Any] = {}
+        self.checksPerformed: list[dict[str, Any]] = []  # Old naming for compatibility
+        self.checks_performed: list[dict[str, Any]] = []  # Track all security checks performed
+        self.model_structure = None
         self.start_time = time.time()
         self.end_time: Optional[float] = None
-        self.bytes_scanned: int = 0
         self.success: bool = True
-        self.metadata: dict[str, Any] = {}
 
     def add_check(
         self,
@@ -112,7 +114,8 @@ class ScanResult:
         
         # Also record this as a failed check
         self.add_check(
-            check_name=message.split(':')[0] if ':' in message else message[:50],
+            check_name=(message.split(':')[0] if ':' in message 
+                       else message[:50]),
             passed=False,
             category=self._categorize_issue(message),
         )
@@ -130,39 +133,42 @@ class ScanResult:
     
     def _categorize_issue(self, message: str) -> str:
         """Categorize an issue based on its message"""
-        msg_lower = message.lower()
-        if any(word in msg_lower for word in ['eval', 'exec', 'import', 'subprocess', 'system', 'pyfunc', 'lambda', 'reduce']):
+        message_lower = message.lower()
+        
+        if any(keyword in message_lower for keyword in 
+               ['eval', 'exec', 'compile', '__import__', 'lambda', 
+                'reduce', 'opcode', 'builtins']):
             return "Code Execution"
-        elif any(word in msg_lower for word in ['file', 'path', 'traversal', 'directory', 'shutil']):
+        elif any(keyword in message_lower for keyword in 
+                 ['file', 'path', 'shutil', 'tempfile', 'directory']):
             return "File System"
-        elif any(word in msg_lower for word in ['socket', 'network', 'http', 'url']):
+        elif any(keyword in message_lower for keyword in 
+                 ['socket', 'http', 'request', 'urllib', 'network']):
             return "Network Operations"
-        elif any(word in msg_lower for word in ['pickle', 'joblib', 'serial', 'deserial', 'opcode']):
+        elif any(keyword in message_lower for keyword in 
+                 ['pickle', 'serial', 'deserial']):
             return "Serialization"
-        elif any(word in msg_lower for word in ['tensor', 'weight', 'model', 'layer', 'shape']):
+        elif any(keyword in message_lower for keyword in 
+                 ['model', 'weight', 'tensor', 'layer', 'header']):
             return "Model Integrity"
-        elif any(word in msg_lower for word in ['license', 'copyright', 'gpl']):
-            return "License Compliance"
-        elif any(word in msg_lower for word in ['blacklist', 'policy', 'forbidden']):
-            return "Security Policy"
-        elif any(word in msg_lower for word in ['config', 'setting', 'parameter']):
-            return "Configuration"
-        elif any(word in msg_lower for word in ['size', 'length', 'overflow', 'validation']):
+        elif any(keyword in message_lower for keyword in 
+                 ['string', 'integer', 'base64', 'hex', 'overflow']):
             return "Data Validation"
+        elif any(keyword in message_lower for keyword in 
+                 ['license', 'copyright', 'gpl']):
+            return "License Compliance"
+        elif any(keyword in message_lower for keyword in 
+                 ['blacklist', 'policy']):
+            return "Security Policy"
         else:
             return "General"
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
         self.issues.extend(other.issues)
-        self.checks_performed.extend(other.checks_performed)
         self.bytes_scanned += other.bytes_scanned
-        # Merge metadata dictionaries
-        for key, value in other.metadata.items():
-            if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
-                self.metadata[key].update(value)
-            else:
-                self.metadata[key] = value
+        self.metadata.update(other.metadata)
+        self.checks_performed.extend(other.checks_performed)
 
     def finish(self, success: bool = True) -> None:
         """Mark the scan as finished"""
@@ -193,11 +199,11 @@ class ScanResult:
             "success": self.success,
             "duration": self.duration,
             "bytes_scanned": self.bytes_scanned,
-            "issues": [issue.to_dict() for issue in self.issues],
-            "checks_performed": self.checks_performed,
             "metadata": self.metadata,
-            "has_errors": self.has_errors,
-            "has_warnings": self.has_warnings,
+            "scanner_name": self.scanner_name,
+            "model_structure": (self.model_structure.to_dict() 
+                               if self.model_structure else None),
+            "checks_performed": self.checks_performed,
         }
 
     def to_json(self, indent: int = 2) -> str:

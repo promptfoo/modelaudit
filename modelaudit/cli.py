@@ -607,7 +607,9 @@ def scan_command(
                         # Aggregate results directly from MLflow scan
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                         aggregated_results["issues"].extend(results.get("issues", []))
-                        aggregated_results["checks_performed"].extend(results.get("checks_performed", []))
+                        aggregated_results["checks_performed"].extend(
+                            results.get("checks_performed", [])
+                        )
                         aggregated_results["files_scanned"] += results.get("files_scanned", 1)
                         aggregated_results["assets"].extend(results.get("assets", []))
                         if results.get("has_errors", False):
@@ -665,7 +667,9 @@ def scan_command(
                         # Aggregate results
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                         aggregated_results["issues"].extend(results.get("issues", []))
-                        aggregated_results["checks_performed"].extend(results.get("checks_performed", []))
+                        aggregated_results["checks_performed"].extend(
+                            results.get("checks_performed", [])
+                        )
                         aggregated_results["files_scanned"] += results.get("files_scanned", 1)
                         aggregated_results["assets"].extend(results.get("assets", []))
                         if results.get("has_errors", False):
@@ -744,7 +748,9 @@ def scan_command(
                     # Aggregate results
                     aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                     aggregated_results["issues"].extend(results.get("issues", []))
-                    aggregated_results["checks_performed"].extend(results.get("checks_performed", []))
+                    aggregated_results["checks_performed"].extend(
+                        results.get("checks_performed", [])
+                    )
                     aggregated_results["files_scanned"] += results.get(
                         "files_scanned",
                         1,

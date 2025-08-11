@@ -69,66 +69,72 @@ class SafeTensorsScanner(BaseScanner):
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
-                # Check: File size validation
+                # Read header length (first 8 bytes)
                 header_len_bytes = f.read(8)
-                result.add_check("File size validation", len(header_len_bytes) == 8, category="Model Integrity")
-                if len(header_len_bytes) != 8:
+                result.add_check("File size validation", len(header_len_bytes) == 8, 
+                        category="Model Integrity")
+                if len(header_len_bytes) < 8:
                     result.add_issue(
-                        "File too small to contain SafeTensors header length",
+                        "Invalid SafeTensors file: header length too short",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        details={"header_length_bytes": len(header_len_bytes)},
+                        why="SafeTensors files must start with an 8-byte header length field",
                     )
-                    result.finish(success=False)
                     return result
 
-                # Check: Header length validation
-                header_len = struct.unpack("<Q", header_len_bytes)[0]
-                header_valid = header_len > 0 and header_len <= file_size - 8
-                result.add_check("Header length validation", header_valid, category="Model Integrity")
-                if not header_valid:
+                header_length = int.from_bytes(header_len_bytes, byteorder="little")
+                header_valid = header_length > 0 and header_length < file_size
+                result.add_check("Header length validation", header_valid, 
+                        category="Model Integrity")
+                if header_length <= 0:
                     result.add_issue(
-                        "Invalid SafeTensors header length",
+                        f"Invalid SafeTensors header length: {header_length}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"header_len": header_len},
+                        details={"header_length": header_length},
+                        why="SafeTensors header length must be positive",
                     )
-                    result.finish(success=False)
                     return result
 
-                header_bytes = f.read(header_len)
-                if len(header_bytes) != header_len:
+                # Read header
+                header_bytes = f.read(header_length)
+                if len(header_bytes) < header_length:
                     result.add_issue(
-                        "Failed to read SafeTensors header",
+                        f"Truncated SafeTensors header: expected {header_length} bytes, got {len(header_bytes)}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        why="The file appears to be truncated or corrupted",
                     )
-                    result.finish(success=False)
                     return result
 
-                # Check: Header format validation
-                header_starts_correctly = header_bytes.strip().startswith(b"{")
-                result.add_check("Header format validation", header_starts_correctly, category="Model Integrity")
+                header_starts_correctly = header_bytes.startswith(b"{")
+                result.add_check("Header format validation", header_starts_correctly, 
+                        category="Model Integrity")
                 if not header_starts_correctly:
                     result.add_issue(
-                        "SafeTensors header does not start with '{'",
-                        severity=IssueSeverity.CRITICAL,
+                        "Invalid SafeTensors header format",
+                        severity=IssueSeverity.WARNING,
                         location=path,
+                        details={"first_bytes": header_bytes[:20].hex()},
+                        why="SafeTensors header should be a JSON object",
                     )
-                    result.finish(success=False)
-                    return result
 
-                # Check: JSON parsing validation
+                # Parse header as JSON
                 try:
-                    header = json.loads(header_bytes.decode("utf-8"))
-                    result.add_check("JSON header parsing", True, category="Model Integrity")
+                    header = json.loads(header_bytes)
+                    result.add_check("JSON header parsing", True, 
+                            category="Model Integrity")
                 except json.JSONDecodeError as e:
-                    result.add_check("JSON header parsing", False, category="Model Integrity")
+                    result.add_check("JSON header parsing", False, 
+                            category="Model Integrity")
                     result.add_issue(
-                        f"Invalid JSON header: {e!s}",
+                        f"Failed to parse SafeTensors header: {e}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        details={"error": str(e)},
+                        why="SafeTensors header must be valid JSON",
                     )
-                    result.finish(success=False)
                     return result
 
                 tensor_names = [k for k in header if k != "__metadata__"]
@@ -138,7 +144,7 @@ class SafeTensorsScanner(BaseScanner):
                 # Validate tensor offsets and sizes
                 tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
 
-                data_size = file_size - (8 + header_len)
+                data_size = file_size - (8 + header_length)
                 offsets = []
                 for name, info in tensor_entries:
                     if not isinstance(info, dict):
@@ -198,7 +204,7 @@ class SafeTensorsScanner(BaseScanner):
                         break
                     last_end = end
 
-                data_size = file_size - (8 + header_len)
+                data_size = file_size - (8 + header_length)
                 if last_end != data_size:
                     result.add_issue(
                         "Tensor data does not cover entire file",
