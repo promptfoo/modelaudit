@@ -766,16 +766,9 @@ class PickleScanner(BaseScanner):
                 if file_format == "pickle":
                     return True
                 elif file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
-                    # Check if it's a PyTorch zip file (contains archive/data.pkl or pytorch_model/data.pkl)
-                    try:
-                        import zipfile
-
-                        with zipfile.ZipFile(path, "r") as z:
-                            # PyTorch zip files contain 'archive/data.pkl' or 'pytorch_model/data.pkl'
-                            namelist = z.namelist()
-                            return "archive/data.pkl" in namelist or "pytorch_model/data.pkl" in namelist
-                    except Exception:
-                        return False
+                    # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
+                    # The pickle scanner shouldn't try to parse them as regular pickle files
+                    return False
 
                 return False
             except Exception:

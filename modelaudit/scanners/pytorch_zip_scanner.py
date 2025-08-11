@@ -14,7 +14,7 @@ class PyTorchZipScanner(BaseScanner):
 
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
-    supported_extensions: ClassVar[list[str]] = [".pt", ".pth"]
+    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".bin"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -38,7 +38,19 @@ class PyTorchZipScanner(BaseScanner):
 
         # Check file extension
         ext = os.path.splitext(path)[1].lower()
-        return ext in cls.supported_extensions
+        if ext not in cls.supported_extensions:
+            return False
+
+        # For .bin files, only handle if they're ZIP format (torch.save() output)
+        if ext == ".bin":
+            try:
+                from modelaudit.utils.filetype import detect_file_format
+                return detect_file_format(path) == "zip"
+            except Exception:
+                return False
+
+        # For .pt and .pth, always try to handle
+        return True
 
     def scan(self, path: str) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
