@@ -211,7 +211,7 @@ def test_flax_msgpack_orbax_format_detection(tmp_path):
     # Should have check about Orbax detection
     # Now using checks instead of issues - look for passed check with Orbax message
     orbax_checks = [check for check in result.checks if "Orbax checkpoint format detected" in check.message]
-    assert len(orbax_checks) > 0, f"No Orbax detection check found. Available checks: {[c.message for c in result.checks]}"
+    assert len(orbax_checks) > 0, "No Orbax detection check found"
     assert orbax_checks[0].status.value == "passed"
 
 
