@@ -45,6 +45,7 @@ class PyTorchZipScanner(BaseScanner):
         if ext == ".bin":
             try:
                 from modelaudit.utils.filetype import detect_file_format
+
                 return detect_file_format(path) == "zip"
             except Exception:
                 return False
