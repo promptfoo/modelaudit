@@ -52,18 +52,23 @@ class OpenVinoScanner(BaseScanner):
         if os.path.isfile(bin_path):
             result.metadata["bin_size"] = self.get_file_size(bin_path)
         else:
-            result.add_issue(
-                "Associated .bin weights file not found",
+            result.add_check(
+                name="OpenVINO Weights File Check",
+                passed=False,
+                message="Associated .bin weights file not found",
                 severity=IssueSeverity.WARNING,
                 location=bin_path,
+                details={"expected_file": bin_path},
             )
 
         try:
             tree = DefusedET.parse(path)
             root = tree.getroot()
         except Exception as e:  # pragma: no cover - parse errors
-            result.add_issue(
-                f"Invalid OpenVINO XML: {e}",
+            result.add_check(
+                name="OpenVINO XML Parse",
+                passed=False,
+                message=f"Invalid OpenVINO XML: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -81,24 +86,30 @@ class OpenVinoScanner(BaseScanner):
             layer_type = layer.attrib.get("type", "").lower()
             layer_name = layer.attrib.get("name", "")
             if layer_type in {"python", "custom"}:
-                result.add_issue(
-                    f"OpenVINO model uses {layer_type} layer '{layer_name}'",
+                result.add_check(
+                    name="Suspicious Layer Type Detection",
+                    passed=False,
+                    message=f"OpenVINO model uses {layer_type} layer '{layer_name}'",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"layer": layer_name, "type": layer_type},
+                    details={"layer_type": layer_type, "layer_name": layer_name},
                 )
             library = layer.attrib.get("library")
             if library:
-                result.add_issue(
-                    f"Layer '{layer_name}' references external library '{library}'",
+                result.add_check(
+                    name="External Library Reference Check",
+                    passed=False,
+                    message=f"Layer '{layer_name}' references external library '{library}'",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"library": library},
+                    details={"layer_name": layer_name, "library": library},
                 )
             for attr_val in layer.attrib.values():
                 if suspicious_pattern.search(str(attr_val)):
-                    result.add_issue(
-                        "Suspicious content in layer attributes",
+                    result.add_check(
+                        name="Layer Attribute Security Check",
+                        passed=False,
+                        message="Suspicious content in layer attributes",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"attribute": attr_val},

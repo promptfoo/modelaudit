@@ -74,11 +74,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check if TensorFlow is installed
         if not HAS_TENSORFLOW:
             result = self._create_result()
-            result.add_issue(
-                "TensorFlow not installed, cannot scan SavedModel. Install with 'pip install modelaudit[tensorflow]'.",
+            result.add_check(
+                name="TensorFlow Library Check",
+                passed=False,
+                message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path},
+                details={"path": path, "required_package": "tensorflow"},
             )
             result.finish(success=False)
             return result
@@ -89,8 +91,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if os.path.isdir(path):
             return self._scan_saved_model_directory(path)
         result = self._create_result()
-        result.add_issue(
-            f"Path is neither a file nor a directory: {path}",
+        result.add_check(
+            name="Path Type Validation",
+            passed=False,
+            message=f"Path is neither a file nor a directory: {path}",
             severity=IssueSeverity.CRITICAL,
             location=path,
             details={"path": path},
@@ -104,6 +108,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+        self.current_file_path = path
+
         try:
             with open(path, "rb") as f:
                 content = f.read()
@@ -115,8 +123,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 self._analyze_saved_model(saved_model, result)
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning TF SavedModel file: {e!s}",
+            result.add_check(
+                name="SavedModel Parsing",
+                passed=False,
+                message=f"Error scanning TF SavedModel file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -134,8 +144,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Look for saved_model.pb in the directory
         saved_model_path = Path(dir_path) / "saved_model.pb"
         if not saved_model_path.exists():
-            result.add_issue(
-                "No saved_model.pb found in directory.",
+            result.add_check(
+                name="SavedModel Structure Check",
+                passed=False,
+                message="No saved_model.pb found in directory.",
                 severity=IssueSeverity.CRITICAL,
                 location=dir_path,
             )
@@ -152,8 +164,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 file_path = Path(root) / file
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):
-                    result.add_issue(
-                        f"Python file found in SavedModel: {file}",
+                    result.add_check(
+                        name="Python File Detection",
+                        passed=False,
+                        message=f"Python file found in SavedModel: {file}",
                         severity=IssueSeverity.INFO,
                         location=str(file_path),
                         details={"file": file, "directory": root},
@@ -183,15 +197,19 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 content = f.read()
                                 for pattern in blacklist_patterns:
                                     if pattern in content:
-                                        result.add_issue(
-                                            f"Blacklisted pattern '{pattern}' found in file {file}",
+                                        result.add_check(
+                                            name="Blacklist Pattern Check",
+                                            passed=False,
+                                            message=f"Blacklisted pattern '{pattern}' found in file {file}",
                                             severity=IssueSeverity.CRITICAL,
                                             location=str(file_path),
                                             details={"pattern": pattern, "file": file},
                                         )
                     except Exception as e:
-                        result.add_issue(
-                            f"Error reading file {file}: {e!s}",
+                        result.add_check(
+                            name="File Read Check",
+                            passed=False,
+                            message=f"Error reading file {file}: {e!s}",
                             severity=IssueSeverity.DEBUG,
                             location=str(file_path),
                             details={
@@ -228,8 +246,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     if node.op in ["PyFunc", "PyCall"]:
                         self._check_python_op(node, result, meta_graph)
                     else:
-                        result.add_issue(
-                            f"Suspicious TensorFlow operation: {node.op}",
+                        result.add_check(
+                            name="TensorFlow Operation Security Check",
+                            passed=False,
+                            message=f"Suspicious TensorFlow operation: {node.op}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (node: {node.name})",
                             details={
@@ -283,8 +303,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             # Check if it references dangerous modules
                             dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
                             if any(dangerous in func_name for dangerous in dangerous_modules):
-                                result.add_issue(
-                                    f"{node.op} operation references potentially dangerous function: {func_name}",
+                                result.add_check(
+                                    name="PyFunc Function Reference Check",
+                                    passed=False,
+                                    message=f"{node.op} operation references dangerous function: {func_name}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=f"{self.current_file_path} (node: {node.name})",
                                     details={
@@ -312,8 +334,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 severity = IssueSeverity.CRITICAL
                 issue_msg = f"{node.op} operation contains {'dangerous' if is_dangerous else 'executable'} Python code"
 
-                result.add_issue(
-                    issue_msg,
+                result.add_check(
+                    name="PyFunc Python Code Analysis",
+                    passed=False,
+                    message=issue_msg,
                     severity=severity,
                     location=f"{self.current_file_path} (node: {node.name})",
                     details={
@@ -330,8 +354,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
             else:
                 # Code found but not valid Python
-                result.add_issue(
-                    f"{node.op} operation contains suspicious data (possibly obfuscated code)",
+                result.add_check(
+                    name="PyFunc Code Validation",
+                    passed=False,
+                    message=f"{node.op} operation contains suspicious data (possibly obfuscated code)",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (node: {node.name})",
                     details={
@@ -347,8 +373,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
         else:
             # PyFunc/PyCall without analyzable code - still dangerous
-            result.add_issue(
-                f"{node.op} operation detected (unable to extract Python code)",
+            result.add_check(
+                name="PyFunc Code Extraction Check",
+                passed=False,
+                message=f"{node.op} operation detected (unable to extract Python code)",
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path} (node: {node.name})",
                 details={

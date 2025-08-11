@@ -103,6 +103,7 @@ def scan_model_directory_or_file(
         "path": path,
         "bytes_scanned": 0,
         "issues": [],
+        "checks": [],  # Track all security checks performed
         "success": True,
         "files_scanned": 0,
         "scanners": [],  # Track the scanners used
@@ -150,6 +151,12 @@ def scan_model_directory_or_file(
                     issues_list = cast(list[dict[str, Any]], results["issues"])
                     for issue in scan_result.issues:
                         issues_list.append(issue.to_dict())
+
+                    # Add checks if available
+                    if hasattr(scan_result, "checks"):
+                        checks_list = cast(list[dict[str, Any]], results["checks"])
+                        for check in scan_result.checks:
+                            checks_list.append(check.to_dict())
 
                     # Add asset
                     _add_asset_to_results(results, stream_url, scan_result)
@@ -331,6 +338,12 @@ def scan_model_directory_or_file(
                             for issue in file_result.issues:
                                 issues_list.append(issue.to_dict())
 
+                            # Add checks if available
+                            if hasattr(file_result, "checks"):
+                                checks_list = cast(list[dict[str, Any]], results["checks"])
+                                for check in file_result.checks:
+                                    checks_list.append(check.to_dict())
+
                             _add_asset_to_results(results, str(target_path), file_result)
 
                             file_meta = cast(dict[str, Any], results["file_metadata"])
@@ -453,6 +466,12 @@ def scan_model_directory_or_file(
                 issues_list = cast(list[dict[str, Any]], results["issues"])
                 for issue in file_result.issues:
                     issues_list.append(issue.to_dict())
+
+                # Add checks if available
+                if hasattr(file_result, "checks"):
+                    checks_list = cast(list[dict[str, Any]], results["checks"])
+                    for check in file_result.checks:
+                        checks_list.append(check.to_dict())
 
                 _add_asset_to_results(results, target, file_result)
 

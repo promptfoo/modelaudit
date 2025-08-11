@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,61 @@ class IssueSeverity(Enum):
     INFO = "info"  # Informational, not a security concern
     WARNING = "warning"  # Potential issue, needs review
     CRITICAL = "critical"  # Definite security concern
+
+
+class CheckStatus(Enum):
+    """Enum for check status"""
+
+    PASSED = "passed"  # Check passed successfully
+    FAILED = "failed"  # Check failed (issue found)
+    SKIPPED = "skipped"  # Check was skipped
+
+
+class Check:
+    """Represents a single security check performed during scanning"""
+
+    def __init__(
+        self,
+        name: str,
+        status: CheckStatus,
+        message: str,
+        severity: Optional[IssueSeverity] = None,
+        location: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
+    ):
+        self.name = name  # Name of the check performed
+        self.status = status  # Whether the check passed or failed
+        self.message = message  # Description of what was checked
+        self.severity = severity  # Severity (only for failed checks)
+        self.location = location  # File position, line number, etc.
+        self.details = details or {}
+        self.why = why  # Explanation (mainly for failed checks)
+        self.timestamp = time.time()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the check to a dictionary for serialization"""
+        result = {
+            "name": self.name,
+            "status": self.status.value,
+            "message": self.message,
+            "location": self.location,
+            "details": self.details,
+            "timestamp": self.timestamp,
+        }
+        if self.severity:
+            result["severity"] = self.severity.value
+        if self.why:
+            result["why"] = self.why
+        return result
+
+    def __str__(self) -> str:
+        """String representation of the check"""
+        status_symbol = "✓" if self.status == CheckStatus.PASSED else "✗"
+        prefix = f"[{status_symbol}] {self.name}"
+        if self.location:
+            prefix += f" ({self.location})"
+        return f"{prefix}: {self.message}"
 
 
 class Issue:
@@ -68,11 +124,55 @@ class ScanResult:
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
         self.issues: list[Issue] = []
+        self.checks: list[Check] = []  # All checks performed (passed and failed)
         self.start_time = time.time()
         self.end_time: Optional[float] = None
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
+
+    def add_check(
+        self,
+        name: str,
+        passed: bool,
+        message: str,
+        severity: Optional[IssueSeverity] = None,
+        location: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
+    ) -> None:
+        """Add a check result (passed or failed)"""
+        status = CheckStatus.PASSED if passed else CheckStatus.FAILED
+
+        # For failed checks, ensure we have a severity
+        if not passed and severity is None:
+            severity = IssueSeverity.WARNING
+
+        check = Check(name, status, message, severity, location, details, why)
+        self.checks.append(check)
+
+        # If the check failed, also add it as an issue for backward compatibility
+        if not passed:
+            if why is None:
+                why = get_message_explanation(message, context=self.scanner_name)
+            # Severity should never be None here due to check above, but add assertion for type checker
+            assert severity is not None
+            issue = Issue(message, severity, location, details, why)
+            self.issues.append(issue)
+
+            log_level = (
+                logging.CRITICAL
+                if severity == IssueSeverity.CRITICAL
+                else (
+                    logging.WARNING
+                    if severity == IssueSeverity.WARNING
+                    else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
+                )
+            )
+            logger.log(log_level, str(issue))
+        else:
+            # Log successful checks at DEBUG level
+            logger.debug(f"Check passed: {name} - {message}")
 
     def add_issue(
         self,
@@ -82,12 +182,18 @@ class ScanResult:
         details: Optional[dict[str, Any]] = None,
         why: Optional[str] = None,
     ) -> None:
-        """Add an issue to the result"""
+        """Add an issue to the result (for backward compatibility)"""
         if why is None:
             # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
         issue = Issue(message, severity, location, details, why)
         self.issues.append(issue)
+
+        # Also add as a failed check for consistency
+        check_name = details.get("check_name", "Security Check") if details else "Security Check"
+        check = Check(check_name, CheckStatus.FAILED, message, severity, location, details, why)
+        self.checks.append(check)
+
         log_level = (
             logging.CRITICAL
             if severity == IssueSeverity.CRITICAL
@@ -102,6 +208,7 @@ class ScanResult:
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
         self.issues.extend(other.issues)
+        self.checks.extend(other.checks)  # Merge checks as well
         self.bytes_scanned += other.bytes_scanned
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
@@ -140,9 +247,13 @@ class ScanResult:
             "duration": self.duration,
             "bytes_scanned": self.bytes_scanned,
             "issues": [issue.to_dict() for issue in self.issues],
+            "checks": [check.to_dict() for check in self.checks],  # Include all checks
             "metadata": self.metadata,
             "has_errors": self.has_errors,
             "has_warnings": self.has_warnings,
+            "total_checks": len(self.checks),
+            "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
+            "failed_checks": sum(1 for c in self.checks if c.status == CheckStatus.FAILED),
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -234,6 +345,32 @@ class BaseScanner(ABC):
 
         return result
 
+    def add_file_integrity_check(self, path: str, result: ScanResult) -> None:
+        """Add file integrity check with hashes to the scan result.
+
+        This should be called by scanners to record file hashes for compliance.
+        """
+        hashes = self.calculate_file_hashes(path)
+        file_size = self.get_file_size(path)
+
+        # Add the check
+        result.add_check(
+            name="File Integrity Hash",
+            passed=True,  # Hash calculation itself is neutral
+            message="File integrity hashes calculated",
+            location=path,
+            details={
+                "md5": hashes["md5"],
+                "sha256": hashes["sha256"],
+                "sha512": hashes["sha512"],
+                "file_size": file_size,
+            },
+        )
+
+        # Also add to metadata for easy access
+        result.metadata["file_hashes"] = hashes
+        result.metadata["file_size"] = file_size
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 
@@ -315,6 +452,39 @@ class BaseScanner(ABC):
             # If the file becomes inaccessible during scanning, treat the size
             # as zero rather than raising an exception.
             return 0
+
+    def calculate_file_hashes(self, path: str) -> dict[str, str]:
+        """Calculate MD5, SHA256, and SHA512 hashes of a file.
+
+        Returns a dictionary with hash values or error messages.
+        """
+        hashes = {"md5": "", "sha256": "", "sha512": ""}
+
+        if not os.path.isfile(path):
+            return hashes
+
+        try:
+            # Calculate all hashes in a single pass for efficiency
+            md5_hash = hashlib.md5()
+            sha256_hash = hashlib.sha256()
+            sha512_hash = hashlib.sha512()
+
+            with open(path, "rb") as f:
+                # Read file in chunks to handle large files
+                for chunk in iter(lambda: f.read(8192), b""):
+                    md5_hash.update(chunk)
+                    sha256_hash.update(chunk)
+                    sha512_hash.update(chunk)
+
+            hashes["md5"] = md5_hash.hexdigest()
+            hashes["sha256"] = sha256_hash.hexdigest()
+            hashes["sha512"] = sha512_hash.hexdigest()
+
+        except Exception as e:
+            logger.warning(f"Failed to calculate hashes for {path}: {e}")
+            # Return empty hashes on error rather than failing
+
+        return hashes
 
     def _check_size_limit(self, path: str) -> Optional[ScanResult]:
         """Check if the file exceeds the configured size limit."""
