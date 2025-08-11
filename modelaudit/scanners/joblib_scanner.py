@@ -114,9 +114,28 @@ class JoblibScanner(BaseScanner):
                 # Try safe decompression
                 try:
                     decompressed = self._safe_decompress(data)
+                    # Record successful decompression check
+                    compressed_size = len(data)
+                    decompressed_size = len(decompressed)
+                    if compressed_size > 0:
+                        ratio = decompressed_size / compressed_size
+                        result.add_check(
+                            name="Compression Bomb Detection",
+                            passed=True,
+                            message=f"Compression ratio ({ratio:.1f}x) is within safe limits",
+                            location=path,
+                            details={
+                                "compressed_size": compressed_size,
+                                "decompressed_size": decompressed_size,
+                                "ratio": ratio,
+                                "max_ratio": self.max_decompression_ratio,
+                            },
+                        )
                 except ValueError as e:
-                    result.add_issue(
-                        str(e),
+                    result.add_check(
+                        name="Compression Bomb Detection",
+                        passed=False,
+                        message=str(e),
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"security_check": "compression_bomb_detection"},
@@ -124,10 +143,13 @@ class JoblibScanner(BaseScanner):
                     result.finish(success=False)
                     return result
                 except Exception as e:
-                    result.add_issue(
-                        f"Error decompressing joblib file: {e}",
+                    result.add_check(
+                        name="Joblib Decompression",
+                        passed=False,
+                        message=f"Error decompressing joblib file: {e}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        details={"exception": str(e), "exception_type": type(e).__name__},
                     )
                     result.finish(success=False)
                     return result
@@ -139,8 +161,10 @@ class JoblibScanner(BaseScanner):
                 result.merge(sub_result)
                 result.bytes_scanned = len(decompressed)
         except Exception as e:  # pragma: no cover
-            result.add_issue(
-                f"Error scanning joblib file: {e}",
+            result.add_check(
+                name="Joblib File Scan",
+                passed=False,
+                message=f"Error scanning joblib file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},

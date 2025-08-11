@@ -315,15 +315,21 @@ def scan_command(
     # Set logging level based on verbosity
     if verbose:
         logger.setLevel(logging.DEBUG)
+        logging.getLogger("modelaudit.core").setLevel(logging.DEBUG)
+    else:
+        # Suppress INFO logs from core module in normal mode
+        logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
         "bytes_scanned": 0,
         "issues": [],
+        "checks": [],  # Track all security checks performed
         "files_scanned": 0,
         "assets": [],
         "has_errors": False,
         "scanner_names": [],
+        "file_metadata": {},  # Track metadata from each file
         "start_time": time.time(),
     }
 
@@ -606,10 +612,14 @@ def scan_command(
                         # Aggregate results directly from MLflow scan
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                         aggregated_results["issues"].extend(results.get("issues", []))
+                        aggregated_results["checks"].extend(results.get("checks", []))
                         aggregated_results["files_scanned"] += results.get("files_scanned", 1)
                         aggregated_results["assets"].extend(results.get("assets", []))
                         if results.get("has_errors", False):
                             aggregated_results["has_errors"] = True
+                        # Aggregate file metadata
+                        if "file_metadata" in results:
+                            aggregated_results["file_metadata"].update(results["file_metadata"])
 
                         # Track scanner names
                         for scanner in results.get("scanners", []):
@@ -663,10 +673,14 @@ def scan_command(
                         # Aggregate results
                         aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                         aggregated_results["issues"].extend(results.get("issues", []))
+                        aggregated_results["checks"].extend(results.get("checks", []))
                         aggregated_results["files_scanned"] += results.get("files_scanned", 1)
                         aggregated_results["assets"].extend(results.get("assets", []))
                         if results.get("has_errors", False):
                             aggregated_results["has_errors"] = True
+                        # Aggregate file metadata
+                        if "file_metadata" in results:
+                            aggregated_results["file_metadata"].update(results["file_metadata"])
 
                         continue  # Skip the regular scanning flow
 
@@ -741,6 +755,7 @@ def scan_command(
                     # Aggregate results
                     aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
                     aggregated_results["issues"].extend(results.get("issues", []))
+                    aggregated_results["checks"].extend(results.get("checks", []))
                     aggregated_results["files_scanned"] += results.get(
                         "files_scanned",
                         1,
@@ -748,6 +763,10 @@ def scan_command(
                     aggregated_results["assets"].extend(results.get("assets", []))
                     if results.get("has_errors", False):
                         aggregated_results["has_errors"] = True
+
+                    # Aggregate file metadata
+                    if "file_metadata" in results:
+                        aggregated_results["file_metadata"].update(results["file_metadata"])
 
                     # Track scanner names
                     for scanner in results.get("scanners", []):
@@ -861,6 +880,14 @@ def scan_command(
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
 
+    # Calculate check statistics
+    total_checks = len(aggregated_results.get("checks", []))
+    passed_checks = sum(1 for c in aggregated_results.get("checks", []) if c.get("status") == "passed")
+    failed_checks = sum(1 for c in aggregated_results.get("checks", []) if c.get("status") == "failed")
+    aggregated_results["total_checks"] = total_checks
+    aggregated_results["passed_checks"] = passed_checks
+    aggregated_results["failed_checks"] = failed_checks
+
     # Deduplicate issues based on message, severity, and location
     seen_issues = set()
     deduplicated_issues = []
@@ -891,7 +918,21 @@ def scan_command(
 
     # Format the output
     if format == "json":
-        output_data = aggregated_results
+        output_data = aggregated_results.copy()
+        # Filter out DEBUG issues unless verbose mode is enabled
+        if not verbose and "issues" in output_data:
+            output_data["issues"] = [
+                issue
+                for issue in output_data["issues"]
+                if not isinstance(issue, dict) or issue.get("severity") != "debug"
+            ]
+        # Also filter DEBUG checks unless verbose
+        if not verbose and "checks" in output_data:
+            output_data["checks"] = [
+                check
+                for check in output_data["checks"]
+                if not isinstance(check, dict) or check.get("severity") != "debug"
+            ]
         output_text = json.dumps(output_data, indent=2)
     else:
         # Text format
@@ -960,6 +1001,67 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         label_str = style_text(f"  {label}:", fg="bright_black")
         value_str = style_text(value, fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
+
+    # Add model information if available
+    if "file_metadata" in results:
+        for _file_path, metadata in results["file_metadata"].items():
+            if metadata.get("model_info"):
+                model_info = metadata["model_info"]
+                output_lines.append("")
+                output_lines.append(style_text("  Model Information:", fg="bright_black"))
+
+                if "model_type" in model_info:
+                    output_lines.append(f"  • Type: {style_text(model_info['model_type'], fg='cyan')}")
+                if "architectures" in model_info:
+                    arch_str = (
+                        ", ".join(model_info["architectures"])
+                        if isinstance(model_info["architectures"], list)
+                        else model_info["architectures"]
+                    )
+                    output_lines.append(f"  • Architecture: {style_text(arch_str, fg='cyan')}")
+                if "num_layers" in model_info:
+                    output_lines.append(f"  • Layers: {style_text(str(model_info['num_layers']), fg='cyan')}")
+                if "hidden_size" in model_info:
+                    output_lines.append(f"  • Hidden Size: {style_text(str(model_info['hidden_size']), fg='cyan')}")
+                if "vocab_size" in model_info:
+                    vocab_str = f"{model_info['vocab_size']:,}"
+                    output_lines.append(f"  • Vocab Size: {style_text(vocab_str, fg='cyan')}")
+                if "framework_version" in model_info:
+                    output_lines.append(f"  • Framework: {style_text(model_info['framework_version'], fg='cyan')}")
+                break  # Only show the first model info found
+
+    # Add security check statistics
+    if "total_checks" in results and results["total_checks"] > 0:
+        total = results["total_checks"]
+        passed = results.get("passed_checks", 0)
+        failed = results.get("failed_checks", 0)
+        success_rate = (passed / total * 100) if total > 0 else 0
+
+        output_lines.append("")
+        output_lines.append(style_text("  Security Checks:", fg="bright_black"))
+
+        # Show check counts with visual indicator
+        check_str = f"  ✅ {passed} passed / "
+        if failed > 0:
+            check_str += style_text(f"❌ {failed} failed", fg="red")
+        else:
+            check_str += style_text(f"✅ {failed} failed", fg="green")
+        check_str += f" (Total: {total})"
+        output_lines.append(check_str)
+
+        # Show success rate with color coding
+        if success_rate >= 95:
+            rate_color = "green"
+            rate_icon = "✅"
+        elif success_rate >= 80:
+            rate_color = "yellow"
+            rate_icon = "⚠️"
+        else:
+            rate_color = "red"
+            rate_icon = "🚨"
+
+        rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
+        output_lines.append(rate_str)
 
     # Add issue summary
     issues = results.get("issues", [])

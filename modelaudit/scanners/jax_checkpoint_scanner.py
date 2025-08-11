@@ -139,14 +139,19 @@ class JaxCheckpointScanner(BaseScanner):
                     self._analyze_orbax_metadata(metadata, str(metadata_path), result)
 
                 except json.JSONDecodeError as e:
-                    result.add_issue(
-                        f"Invalid JSON in Orbax metadata: {e}",
+                    result.add_check(
+                        name="Orbax Metadata JSON Validation",
+                        passed=False,
+                        message=f"Invalid JSON in Orbax metadata: {e}",
                         severity=IssueSeverity.WARNING,
                         location=str(metadata_path),
+                        details={"error": str(e), "file": metadata_file},
                     )
                 except Exception as e:
-                    result.add_issue(
-                        f"Error reading Orbax metadata: {e}",
+                    result.add_check(
+                        name="Orbax Metadata Read Check",
+                        passed=False,
+                        message=f"Error reading Orbax metadata: {e}",
                         severity=IssueSeverity.WARNING,
                         location=str(metadata_path),
                     )
@@ -162,8 +167,10 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Check for suspicious restore functions
         if "restore_fn" in metadata:
-            result.add_issue(
-                "Custom restore function detected in Orbax metadata",
+            result.add_check(
+                name="Orbax Restore Function Check",
+                passed=False,
+                message="Custom restore function detected in Orbax metadata",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"restore_fn": str(metadata["restore_fn"])[:200]},
@@ -173,8 +180,10 @@ class JaxCheckpointScanner(BaseScanner):
         metadata_str = str(metadata).lower()
         for pattern in self.jax_suspicious_patterns:
             if pattern in metadata_str:
-                result.add_issue(
-                    f"Suspicious pattern in Orbax metadata: {pattern}",
+                result.add_check(
+                    name="Orbax Pattern Security Check",
+                    passed=False,
+                    message=f"Suspicious pattern in Orbax metadata: {pattern}",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"pattern": pattern},
@@ -196,8 +205,10 @@ class JaxCheckpointScanner(BaseScanner):
             file_size = os.path.getsize(path)
 
             if file_size > self.max_file_size:
-                result.add_issue(
-                    f"Checkpoint file too large: {file_size:,} bytes",
+                result.add_check(
+                    name="Checkpoint File Size Check",
+                    passed=False,
+                    message=f"Checkpoint file too large: {file_size:,} bytes",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"file_size": file_size, "max_size": self.max_file_size},
@@ -215,17 +226,22 @@ class JaxCheckpointScanner(BaseScanner):
             elif header.startswith(b"{"):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
-                result.add_issue(
-                    f"Unknown checkpoint file format: {path}",
-                    severity=IssueSeverity.INFO,
+                result.add_check(
+                    name="Checkpoint Format Detection",
+                    passed=True,
+                    message=f"Unknown checkpoint file format: {path}",
                     location=path,
+                    details={"format": "unknown"},
                 )
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning checkpoint file: {e}",
+            result.add_check(
+                name="Checkpoint File Scan",
+                passed=False,
+                message=f"Error scanning checkpoint file: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                details={"error": str(e), "error_type": type(e).__name__},
             )
 
     def _scan_pickle_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -248,8 +264,10 @@ class JaxCheckpointScanner(BaseScanner):
 
             for opcode in dangerous_opcodes:
                 if opcode in data:
-                    result.add_issue(
-                        f"Dangerous pickle opcode detected: {opcode.decode('ascii', errors='ignore')}",
+                    result.add_check(
+                        name="Pickle Opcode Security Check",
+                        passed=False,
+                        message=f"Dangerous pickle opcode detected: {opcode.decode('ascii', errors='ignore')}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"opcode": opcode.hex()},
@@ -260,28 +278,37 @@ class JaxCheckpointScanner(BaseScanner):
                 data_str = data.decode("utf-8", errors="ignore")
                 for pattern in self.jax_suspicious_patterns:
                     if pattern in data_str:
-                        result.add_issue(
-                            f"Suspicious JAX pattern in pickle: {pattern}",
+                        result.add_check(
+                            name="JAX Pattern Security Check",
+                            passed=False,
+                            message=f"Suspicious JAX pattern in pickle: {pattern}",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
+                            details={"pattern": pattern},
                         )
             except Exception:
                 pass
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning pickle checkpoint: {e}",
+            result.add_check(
+                name="Pickle Checkpoint Scan",
+                passed=False,
+                message=f"Error scanning pickle checkpoint: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                details={"error": str(e), "error_type": type(e).__name__},
             )
 
     def _scan_numpy_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan NumPy-based JAX checkpoint."""
         if not HAS_NUMPY:
-            result.add_issue(
-                "NumPy not available for checkpoint analysis",
+            result.add_check(
+                name="NumPy Library Check",
+                passed=False,
+                message="NumPy not available for checkpoint analysis",
                 severity=IssueSeverity.INFO,
                 location=path,
+                details={"required_library": "numpy"},
             )
             return
 
@@ -291,27 +318,34 @@ class JaxCheckpointScanner(BaseScanner):
 
             # Check array properties
             if array.size > 100_000_000:  # 100M elements
-                result.add_issue(
-                    f"Extremely large NumPy array: {array.size:,} elements",
+                result.add_check(
+                    name="NumPy Array Size Check",
+                    passed=False,
+                    message=f"Extremely large NumPy array: {array.size:,} elements",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    details={"size": array.size, "shape": array.shape},
+                    details={"size": array.size, "shape": array.shape, "threshold": 100_000_000},
                 )
 
             # Validate array shape
             if any(dim <= 0 for dim in array.shape):
-                result.add_issue(
-                    "Invalid array shape with non-positive dimensions",
+                result.add_check(
+                    name="NumPy Array Shape Validation",
+                    passed=False,
+                    message="Invalid array shape with non-positive dimensions",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"shape": array.shape},
                 )
 
         except Exception as e:
-            result.add_issue(
-                f"Error loading NumPy checkpoint: {e}",
+            result.add_check(
+                name="NumPy Checkpoint Load",
+                passed=False,
+                message=f"Error loading NumPy checkpoint: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                details={"error": str(e), "error_type": type(e).__name__},
             )
 
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -324,23 +358,32 @@ class JaxCheckpointScanner(BaseScanner):
             data_str = json.dumps(data).lower()
             for pattern in self.jax_suspicious_patterns:
                 if pattern in data_str:
-                    result.add_issue(
-                        f"Suspicious pattern in JSON checkpoint: {pattern}",
+                    result.add_check(
+                        name="JSON Pattern Security Check",
+                        passed=False,
+                        message=f"Suspicious pattern in JSON checkpoint: {pattern}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        details={"pattern": pattern},
                     )
 
         except json.JSONDecodeError as e:
-            result.add_issue(
-                f"Invalid JSON in checkpoint: {e}",
+            result.add_check(
+                name="JSON Checkpoint Validation",
+                passed=False,
+                message=f"Invalid JSON in checkpoint: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                details={"error": str(e)},
             )
         except Exception as e:
-            result.add_issue(
-                f"Error scanning JSON checkpoint: {e}",
+            result.add_check(
+                name="JSON Checkpoint Scan",
+                passed=False,
+                message=f"Error scanning JSON checkpoint: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                details={"error": str(e), "error_type": type(e).__name__},
             )
 
     def scan(self, path: str) -> ScanResult:
@@ -350,6 +393,9 @@ class JaxCheckpointScanner(BaseScanner):
             return path_check_result
 
         result = self._create_result()
+
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
 
         try:
             self.current_file_path = path
@@ -378,11 +424,13 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_checkpoint_file(path, result)
 
         except Exception as e:
-            result.add_issue(
-                f"Unexpected error scanning JAX checkpoint: {e}",
+            result.add_check(
+                name="JAX Checkpoint Scan",
+                passed=False,
+                message=f"Unexpected error scanning JAX checkpoint: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"error_type": type(e).__name__},
+                details={"error": str(e), "error_type": type(e).__name__},
             )
             result.finish(success=False)
             return result

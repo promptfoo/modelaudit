@@ -73,13 +73,18 @@ class PmmlScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         result.metadata["has_defusedxml"] = HAS_DEFUSEDXML
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+
         try:
             with open(path, "rb") as f:
                 data = f.read()
             result.bytes_scanned = len(data)
         except Exception as e:  # pragma: no cover - unexpected read errors
-            result.add_issue(
-                f"Error reading file: {e}",
+            result.add_check(
+                name="PMML File Read",
+                passed=False,
+                message=f"Error reading file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -92,16 +97,20 @@ class PmmlScanner(BaseScanner):
         except UnicodeDecodeError:
             try:
                 text = data.decode("utf-8", errors="replace")
-                result.add_issue(
-                    "Non UTF-8 characters in PMML file",
+                result.add_check(
+                    name="PMML UTF-8 Encoding Check",
+                    passed=False,
+                    message="Non UTF-8 characters in PMML file",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate "
                     "corruption or malicious content.",
                 )
             except Exception as e:
-                result.add_issue(
-                    f"Failed to decode file as text: {e}",
+                result.add_check(
+                    name="PMML Text Decoding",
+                    passed=False,
+                    message=f"Failed to decode file as text: {e}",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
@@ -118,8 +127,10 @@ class PmmlScanner(BaseScanner):
                 root = DefusedET.fromstring(text)
             else:
                 # Warn about using unsafe parser
-                result.add_issue(
-                    "Using unsafe XML parser - defusedxml not available",
+                result.add_check(
+                    name="XML Parser Security Check",
+                    passed=False,
+                    message="Using unsafe XML parser - defusedxml not available",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. "
@@ -127,8 +138,10 @@ class PmmlScanner(BaseScanner):
                 )
                 root = UnsafeET.fromstring(text)
         except Exception as e:
-            result.add_issue(
-                f"Malformed XML: {e}",
+            result.add_check(
+                name="XML Parse Validation",
+                passed=False,
+                message=f"Malformed XML: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -160,8 +173,10 @@ class PmmlScanner(BaseScanner):
 
         for construct in DANGEROUS_ENTITIES:
             if construct in text_upper:
-                result.add_issue(
-                    f"PMML file contains {construct} declaration",
+                result.add_check(
+                    name="XXE Attack Vector Check",
+                    passed=False,
+                    message=f"PMML file contains {construct} declaration",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"construct": construct},
@@ -172,8 +187,10 @@ class PmmlScanner(BaseScanner):
     def _validate_pmml_structure(self, root, result: ScanResult, path: str) -> None:
         """Validate basic PMML structure and extract metadata."""
         if root.tag.lower() != "pmml":
-            result.add_issue(
-                "Root element is not <PMML>",
+            result.add_check(
+                name="PMML Root Element Validation",
+                passed=False,
+                message="Root element is not <PMML>",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 why="Valid PMML files should have <PMML> as the root element.",
@@ -182,8 +199,10 @@ class PmmlScanner(BaseScanner):
             version = root.attrib.get("version", "")
             result.metadata["pmml_version"] = version
             if not version:
-                result.add_issue(
-                    "PMML missing version attribute",
+                result.add_check(
+                    name="PMML Version Check",
+                    passed=False,
+                    message="PMML missing version attribute",
                     severity=IssueSeverity.INFO,
                     location=path,
                     why="PMML files should specify a version for compatibility.",
@@ -207,8 +226,10 @@ class PmmlScanner(BaseScanner):
             # Check for external resource references
             for url_pattern in URL_PATTERNS:
                 if url_pattern in combined:
-                    result.add_issue(
-                        f"PMML references external resource: {url_pattern}",
+                    result.add_check(
+                        name="External Resource Reference Check",
+                        passed=False,
+                        message=f"PMML references external resource: {url_pattern}",
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"tag": elem.tag, "url_pattern": url_pattern},
@@ -221,8 +242,10 @@ class PmmlScanner(BaseScanner):
 
             # Check for suspicious element names (like <script>)
             if elem.tag.lower() in ["script", "javascript", "python", "exec", "eval"]:
-                result.add_issue(
-                    f"Suspicious XML element found: <{elem.tag}>",
+                result.add_check(
+                    name="Suspicious XML Element Check",
+                    passed=False,
+                    message=f"Suspicious XML element found: <{elem.tag}>",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"tag": elem.tag},
@@ -233,8 +256,10 @@ class PmmlScanner(BaseScanner):
             if elem.tag.lower() == "extension":
                 for pattern in SUSPICIOUS_PATTERNS:
                     if re.search(pattern, combined, re.IGNORECASE):
-                        result.add_issue(
-                            "Suspicious content in <Extension> element",
+                        result.add_check(
+                            name="Extension Element Security Check",
+                            passed=False,
+                            message="Suspicious content in <Extension> element",
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={"tag": elem.tag, "pattern": pattern},
