@@ -145,7 +145,7 @@ class SecretsDetector:
             return 0.0
 
         # Count byte frequencies
-        freq = {}
+        freq: dict[int, int] = {}
         for byte in data[:window_size]:
             freq[byte] = freq.get(byte, 0) + 1
 
@@ -234,7 +234,8 @@ class SecretsDetector:
         # This is a UUID - only flag if it's not in a secret-like context
         uuid_pattern = r"^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}$"
         secret_contexts = ["key", "token", "secret", "password", "auth"]
-        return re.match(uuid_pattern, text.lower()) and not any(word in context_lower for word in secret_contexts)
+        match = re.match(uuid_pattern, text.lower())
+        return bool(match and not any(word in context_lower for word in secret_contexts))
 
     def _calculate_confidence(self, text: str, pattern_desc: str, context: str = "") -> float:
         """Calculate confidence score for a detected secret (0.0 to 1.0).
@@ -340,20 +341,20 @@ class SecretsDetector:
                                 or re.match(r"^[0-9a-fA-F]+$", decoded_text)
                             )
                         ):
-                                findings.append(
-                                    {
-                                        "type": "high_entropy_region",
-                                        "severity": "INFO",  # Lower severity as it's just suspicious
-                                        "position": i,
-                                        "entropy": round(entropy, 2),
-                                        "confidence": 0.4,  # Low confidence for entropy-only detection
-                                        "message": f"High entropy region detected (entropy: {entropy:.2f}) - "
+                            findings.append(
+                                {
+                                    "type": "high_entropy_region",
+                                    "severity": "INFO",  # Lower severity as it's just suspicious
+                                    "position": i,
+                                    "entropy": round(entropy, 2),
+                                    "confidence": 0.4,  # Low confidence for entropy-only detection
+                                    "message": f"High entropy region detected (entropy: {entropy:.2f}) - "
                                     "possible encoded secret",
-                                        "context": f"{context} offset:{i}" if context else f"offset:{i}",
-                                        "recommendation": "Review this region for base64/hex encoded secrets",
-                                    }
-                                )
-                                break  # Only report first high-entropy region to avoid spam
+                                    "context": f"{context} offset:{i}" if context else f"offset:{i}",
+                                    "recommendation": "Review this region for base64/hex encoded secrets",
+                                }
+                            )
+                            break  # Only report first high-entropy region to avoid spam
                     except Exception:
                         pass
                 elif entropy > self.min_entropy:
