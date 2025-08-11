@@ -63,10 +63,10 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     (r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}", "Slack Webhook URL"),
     (r"[0-9]{17,19}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27}", "Discord Bot Token"),
     (r"[0-9]{9,10}:[a-zA-Z0-9_-]{35}", "Telegram Bot Token"),
-    # Cryptocurrency
-    (r"[13][a-km-zA-HJ-NP-Z1-9]{25,34}", "Bitcoin Address"),
-    (r"0x[a-fA-F0-9]{40}", "Ethereum Address"),
-    (r"[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}", "Litecoin Address"),
+    # Cryptocurrency - with word boundaries to avoid false matches
+    (r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", "Bitcoin Address"),
+    (r"\b0x[a-fA-F0-9]{40}\b", "Ethereum Address"),
+    (r"\b[LM][a-km-zA-HJ-NP-Z1-9]{26,33}\b", "Litecoin Address"),
     (r"seed\s+phrase[:=]\s*['\"]([a-z\s]{20,})['\"]", "Crypto Seed Phrase"),
     # Other Services
     (r"twilio_[a-zA-Z_]+\s*=\s*['\"]?([a-zA-Z0-9]{32})['\"]?", "Twilio Key"),

@@ -1138,7 +1138,7 @@ class PickleScanner(BaseScanner):
         current_pos = file_obj.tell()
         file_data = file_obj.read()
         file_obj.seek(current_pos)  # Reset position
-        
+
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
 
