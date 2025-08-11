@@ -267,10 +267,19 @@ class SecretsDetector:
         test_indicators = ["test", "example", "sample", "demo", "fake", "dummy", "placeholder"]
         text_lower = text.lower()
 
-        # Special case: AWS example keys (well-known AWS examples)
-        if "AKIAIOSFODNN7EXAMPLE" in text or "bPxRfiCYEXAMPLEKEY" in text:
-            # These are official AWS example keys - still flag them but with lower confidence
-            confidence = 0.6  # Set to exactly threshold
+        # Special case: Well-known example/test secrets
+        # These are commonly used in documentation and testing
+        example_secrets = [
+            "AKIAIOSFODNN7EXAMPLE",  # AWS example access key
+            "bPxRfiCYEXAMPLEKEY",  # AWS example secret key
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",  # JWT.io example token (without signature)
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
+        ]
+        
+        if any(example in text for example in example_secrets):
+            # These are well-known example secrets - still report but lower severity
+            # Set confidence to exactly 0.6 so it passes threshold but gets WARNING severity
+            confidence = 0.6  # Exactly at threshold - will be WARNING level, not CRITICAL
         elif any(indicator in text_lower for indicator in test_indicators):
             # Check if it's JUST a test indicator or part of real data
             # If the entire string is "test" or "example", it's definitely fake
