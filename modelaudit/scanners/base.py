@@ -371,6 +371,70 @@ class BaseScanner(ABC):
         result.metadata["file_hashes"] = hashes
         result.metadata["file_size"] = file_size
 
+    def check_for_embedded_secrets(
+        self,
+        data: Any,
+        result: ScanResult,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for embedded secrets, API keys, and credentials in data.
+
+        Args:
+            data: Data to check (bytes, str, dict, etc.)
+            result: ScanResult to add findings to
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            Number of secrets detected
+        """
+        if not enable_check or not self.config.get("check_secrets", True):
+            return 0
+
+        try:
+            from modelaudit.secrets_detector import SecretsDetector
+
+            detector = SecretsDetector(self.config.get("secrets_config"))
+            findings = detector.scan_model_weights(data, context)
+
+            for finding in findings:
+                severity_map = {
+                    "CRITICAL": IssueSeverity.CRITICAL,
+                    "WARNING": IssueSeverity.WARNING,
+                    "INFO": IssueSeverity.INFO,
+                }
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+
+                result.add_check(
+                    name="Embedded Secrets Detection",
+                    passed=False,
+                    message=finding.get("message", "Secret detected"),
+                    severity=severity,
+                    location=finding.get("context", context),
+                    details=finding,
+                    why=finding.get("recommendation", "Remove sensitive data from model"),
+                )
+
+            # Add a passing check if no secrets were found
+            if not findings and context:
+                result.add_check(
+                    name="Embedded Secrets Detection",
+                    passed=True,
+                    message="No embedded secrets detected",
+                    location=context,
+                )
+
+            return len(findings)
+
+        except ImportError:
+            # SecretsDetector not available, log as debug
+            logger.debug("SecretsDetector not available, skipping secrets check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for embedded secrets: {e}")
+            return 0
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 

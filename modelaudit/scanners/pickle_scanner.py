@@ -1139,6 +1139,9 @@ class PickleScanner(BaseScanner):
         file_data = file_obj.read()
         file_obj.seek(current_pos)  # Reset position
 
+        # Check for embedded secrets in the pickle data
+        self.check_for_embedded_secrets(file_data, result, self.current_file_path)
+
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+
