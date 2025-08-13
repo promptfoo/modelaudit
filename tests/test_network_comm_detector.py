@@ -186,9 +186,7 @@ class TestNetworkCommDetector:
     def test_blacklist_detection(self):
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
-        config = {
-            "custom_blacklist": [b"malicious-site.com", b"known-c2.net", b"phishing-domain.org"]
-        }
+        config = {"custom_blacklist": [b"malicious-site.com", b"known-c2.net", b"phishing-domain.org"]}
         detector = NetworkCommDetector(config)
 
         data = b"""
