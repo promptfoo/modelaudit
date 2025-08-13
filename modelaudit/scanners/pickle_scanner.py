@@ -1151,6 +1151,14 @@ class PickleScanner(BaseScanner):
             context=self.current_file_path,
         )
 
+        # Check for network communication patterns
+        # Models should not contain network capabilities
+        self.check_for_network_communication(
+            file_data,
+            result,
+            context=self.current_file_path,
+        )
+
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+

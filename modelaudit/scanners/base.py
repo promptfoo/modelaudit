@@ -501,6 +501,71 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
 
+    def check_for_network_communication(
+        self,
+        data: bytes,
+        result: ScanResult,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for network communication patterns in model data.
+
+        Args:
+            data: Binary model data to check
+            result: ScanResult to add findings to
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            Number of network communication patterns detected
+        """
+        if not enable_check or not self.config.get("check_network_comm", True):
+            return 0
+
+        try:
+            from modelaudit.network_comm_detector import NetworkCommDetector
+
+            detector = NetworkCommDetector(self.config.get("network_comm_config"))
+            findings = detector.scan(data, context)
+
+            for finding in findings:
+                severity_map = {
+                    "CRITICAL": IssueSeverity.CRITICAL,
+                    "HIGH": IssueSeverity.CRITICAL,
+                    "MEDIUM": IssueSeverity.WARNING,
+                    "LOW": IssueSeverity.INFO,
+                }
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+
+                result.add_check(
+                    name="Network Communication Detection",
+                    passed=False,
+                    message=finding.get("message", "Network communication pattern detected"),
+                    severity=severity,
+                    location=finding.get("context", context),
+                    details=finding,
+                    why="Models should not contain network communication capabilities",
+                )
+
+            # Add a passing check if no patterns were found
+            if not findings and context:
+                result.add_check(
+                    name="Network Communication Detection",
+                    passed=True,
+                    message="No network communication patterns detected",
+                    location=context,
+                )
+
+            return len(findings)
+
+        except ImportError:
+            # NetworkCommDetector not available, log as debug
+            logger.debug("NetworkCommDetector not available, skipping network comm check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for network communication: {e}")
+            return 0
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 

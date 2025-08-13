@@ -92,6 +92,13 @@ class OnnxScanner(BaseScanner):
                 model_type="onnx",
                 context=path,
             )
+
+            # Check for network communication patterns
+            self.check_for_network_communication(
+                model_data,
+                result,
+                context=path,
+            )
         except Exception as e:
             # Log but don't fail the scan
             result.add_check(
