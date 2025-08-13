@@ -178,6 +178,13 @@ class PyTorchZipScanner(BaseScanner):
                         context=path,
                     )
 
+                    # Check for network communication patterns
+                    self.check_for_network_communication(
+                        bytes(all_data),
+                        result,
+                        context=path,
+                    )
+
                 # Check for other suspicious files
                 python_files_found = False
                 executable_files_found = False
