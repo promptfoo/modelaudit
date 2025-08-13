@@ -501,6 +501,71 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
 
+    def check_for_data_leakage(
+        self,
+        data: bytes,
+        result: ScanResult,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for training data leakage in model data.
+
+        Args:
+            data: Binary model data to check
+            result: ScanResult to add findings to
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            Number of data leakage issues detected
+        """
+        if not enable_check or not self.config.get("check_data_leakage", True):
+            return 0
+
+        try:
+            from modelaudit.data_leakage_detector import DataLeakageDetector
+
+            detector = DataLeakageDetector(self.config.get("data_leakage_config"))
+            findings = detector.scan(data, context)
+
+            for finding in findings:
+                severity_map = {
+                    "CRITICAL": IssueSeverity.CRITICAL,
+                    "HIGH": IssueSeverity.CRITICAL,
+                    "MEDIUM": IssueSeverity.WARNING,
+                    "LOW": IssueSeverity.INFO,
+                }
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+
+                result.add_check(
+                    name="Training Data Leakage Detection",
+                    passed=False,
+                    message=finding.get("message", "Data leakage detected"),
+                    severity=severity,
+                    location=finding.get("context", context),
+                    details=finding,
+                    why=finding.get("recommendation", "Review training data for sensitive information"),
+                )
+
+            # Add a passing check if no leakage was found
+            if not findings and context:
+                result.add_check(
+                    name="Training Data Leakage Detection",
+                    passed=True,
+                    message="No training data leakage detected",
+                    location=context,
+                )
+
+            return len(findings)
+
+        except ImportError:
+            # DataLeakageDetector not available, log as debug
+            logger.debug("DataLeakageDetector not available, skipping data leakage check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for data leakage: {e}")
+            return 0
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 

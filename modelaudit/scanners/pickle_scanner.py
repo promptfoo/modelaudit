@@ -1151,6 +1151,13 @@ class PickleScanner(BaseScanner):
             context=self.current_file_path,
         )
 
+        # Check for training data leakage (PII, high entropy regions)
+        self.check_for_data_leakage(
+            file_data,
+            result,
+            context=self.current_file_path,
+        )
+
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+
