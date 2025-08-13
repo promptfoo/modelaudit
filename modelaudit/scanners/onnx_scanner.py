@@ -81,6 +81,28 @@ class OnnxScanner(BaseScanner):
             },
         )
 
+        # Check for JIT/Script code execution risks in the ONNX model
+        # Read the file as binary to scan for patterns
+        try:
+            with open(path, "rb") as f:
+                model_data = f.read()
+            self.check_for_jit_script_code(
+                model_data,
+                result,
+                model_type="onnx",
+                context=path,
+            )
+        except Exception as e:
+            # Log but don't fail the scan
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=False,
+                message=f"Could not check for JIT/Script code: {e}",
+                severity=IssueSeverity.DEBUG,
+                location=path,
+                details={"exception": str(e)},
+            )
+
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
