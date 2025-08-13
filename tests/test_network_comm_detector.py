@@ -184,13 +184,17 @@ class TestNetworkCommDetector:
         assert 6379 in ports  # Redis
 
     def test_blacklist_detection(self):
-        """Test detection of blacklisted domains."""
-        detector = NetworkCommDetector()
+        """Test detection of blacklisted domains when configured."""
+        # Configure with specific blacklisted domains
+        config = {
+            "custom_blacklist": [b"malicious-site.com", b"known-c2.net", b"phishing-domain.org"]
+        }
+        detector = NetworkCommDetector(config)
 
         data = b"""
-        http://evil.com/payload
-        connect to malware.net
-        upload to backdoor.io
+        http://malicious-site.com/payload
+        connect to known-c2.net
+        upload to phishing-domain.org
         """
 
         findings = detector.scan(data)

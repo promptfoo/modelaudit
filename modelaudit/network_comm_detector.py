@@ -128,16 +128,9 @@ class NetworkCommDetector:
         31337,  # Back Orifice
     ]
 
-    # Known malicious domains/IPs (examples - would be loaded from threat intel)
-    BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = [
-        b"evil.com",
-        b"malware.net",
-        b"c2server.org",
-        b"badactor.io",
-        b"command-control.net",
-        b"exfiltrate.org",
-        b"backdoor.io",
-    ]
+    # Blacklisted domains - empty by default, should be configured by user
+    # via config parameter if they have specific domains to block
+    BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = []
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the detector with optional configuration."""
