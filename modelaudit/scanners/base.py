@@ -435,6 +435,72 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for embedded secrets: {e}")
             return 0
 
+    def check_for_jit_script_code(
+        self,
+        data: bytes,
+        result: ScanResult,
+        model_type: str = "unknown",
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for JIT/Script code execution risks in model data.
+
+        Args:
+            data: Binary model data to check
+            result: ScanResult to add findings to
+            model_type: Type of model (pytorch, tensorflow, onnx, etc.)
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            Number of JIT/Script risks detected
+        """
+        if not enable_check or not self.config.get("check_jit_script", True):
+            return 0
+
+        try:
+            from modelaudit.jit_script_detector import JITScriptDetector
+
+            detector = JITScriptDetector(self.config.get("jit_script_config"))
+            findings = detector.scan_model(data, model_type, context)
+
+            for finding in findings:
+                severity_map = {
+                    "CRITICAL": IssueSeverity.CRITICAL,
+                    "WARNING": IssueSeverity.WARNING,
+                    "INFO": IssueSeverity.INFO,
+                }
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+
+                result.add_check(
+                    name="JIT/Script Code Execution Detection",
+                    passed=False,
+                    message=finding.get("message", "JIT/Script code risk detected"),
+                    severity=severity,
+                    location=finding.get("context", context),
+                    details=finding,
+                    why=finding.get("recommendation", "Review JIT/Script code for security"),
+                )
+
+            # Add a passing check if no risks were found
+            if not findings and context:
+                result.add_check(
+                    name="JIT/Script Code Execution Detection",
+                    passed=True,
+                    message="No JIT/Script code execution risks detected",
+                    location=context,
+                )
+
+            return len(findings)
+
+        except ImportError:
+            # JITScriptDetector not available, log as debug
+            logger.debug("JITScriptDetector not available, skipping JIT/Script check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for JIT/Script code: {e}")
+            return 0
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 

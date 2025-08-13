@@ -157,6 +157,27 @@ class PyTorchZipScanner(BaseScanner):
                     # Merge results
                     result.merge(sub_result)
 
+                # Check for JIT/Script code execution risks
+                # Read all the data from the ZIP to check for TorchScript patterns
+                all_data = bytearray()
+                for name in safe_entries:
+                    try:
+                        entry_data = z.read(name)
+                        all_data.extend(entry_data)
+                        bytes_scanned += len(entry_data)
+                    except Exception:
+                        # Skip files that can't be read
+                        pass
+
+                # Check for JIT/Script patterns in the combined data
+                if all_data:
+                    self.check_for_jit_script_code(
+                        bytes(all_data),
+                        result,
+                        model_type="pytorch",
+                        context=path,
+                    )
+
                 # Check for other suspicious files
                 python_files_found = False
                 executable_files_found = False

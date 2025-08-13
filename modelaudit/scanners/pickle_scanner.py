@@ -1142,6 +1142,15 @@ class PickleScanner(BaseScanner):
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
 
+        # Check for JIT/Script code execution risks in the pickle data
+        # Pickle files can contain TorchScript or other JIT code
+        self.check_for_jit_script_code(
+            file_data,
+            result,
+            model_type="pytorch",  # Most pickle files in ML are PyTorch
+            context=self.current_file_path,
+        )
+
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+
