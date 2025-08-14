@@ -858,54 +858,8 @@ class PickleScanner(BaseScanner):
                     raw_content += chunk
                     bytes_read += len(chunk)
 
-                # Look for dangerous patterns in raw bytes using simple operations
-                dangerous_patterns = [
-                    b"posix",  # Common in malicious pickles (posix.system)
-                    b"subprocess",
-                    b"eval",
-                    b"exec",
-                    b"__import__",
-                    b"builtins",  # Often used for builtins.eval, builtins.exec
-                ]
-
-                for pattern in dangerous_patterns:
-                    # Check for interrupts during pattern scanning
-                    self.check_interrupted()
-
-                    # Use find() instead of 'in' operator to be more explicit
-                    if raw_content.find(pattern) != -1:
-                        # Extract context around the pattern for semantic analysis
-                        pattern_str = pattern.decode("utf-8", errors="ignore")
-                        pattern_pos = raw_content.find(pattern)
-                        context_start = max(0, pattern_pos - 100)
-                        context_end = min(len(raw_content), pattern_pos + len(pattern) + 100)
-                        context = raw_content[context_start:context_end].decode("utf-8", errors="ignore")
-
-                        # Use semantic analysis to check if this is actually dangerous
-                        # For now, just check if it's in documentation or comments
-                        is_safe = "documentation" in context.lower() or "#" in context
-
-                        # Skip if semantic analysis says it's safe (e.g., in documentation)
-                        if is_safe:
-                            continue
-
-                        result.add_check(
-                            name="Dangerous Pattern Detection",
-                            passed=False,
-                            message=f"Dangerous pattern '{pattern_str}' found in raw file content",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={
-                                "pattern": pattern_str,
-                                "detection_method": "raw_content_scan",
-                                "semantic_safe": is_safe,
-                                "check_name": "Dangerous Pattern Detection",
-                            },
-                            why=(
-                                f"The file contains the dangerous pattern '{pattern_str}' "
-                                f"which could indicate malicious code execution during unpickling."
-                            ),
-                        )
+                # Use the refactored method to scan for dangerous patterns
+                self._scan_for_dangerous_patterns(raw_content, result, path)
 
                 # If we scanned for dangerous patterns but found none, record a successful check
                 dangerous_found = any(
@@ -1158,6 +1112,59 @@ class PickleScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
+        """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
+        # Early detection of dangerous patterns
+        dangerous_patterns = [
+            b"posix",  # Common in malicious pickles (posix.system)
+            b"subprocess",
+            b"eval",
+            b"exec",
+            b"__import__",
+            b"builtins",  # Often used for builtins.eval, builtins.exec
+        ]
+
+        # Limit how much we scan for performance
+        max_scan_size = min(8192, len(data))
+        scan_data = data[:max_scan_size]
+
+        for pattern in dangerous_patterns:
+            # Check for interrupts during pattern scanning
+            self.check_interrupted()
+            # Use find() instead of 'in' operator to be more explicit
+            if scan_data.find(pattern) != -1:
+                # Extract context around the pattern for semantic analysis
+                pattern_str = pattern.decode("utf-8", errors="ignore")
+                pattern_pos = scan_data.find(pattern)
+                context_start = max(0, pattern_pos - 100)
+                context_end = min(len(scan_data), pattern_pos + len(pattern) + 100)
+                context = scan_data[context_start:context_end].decode("utf-8", errors="ignore")
+
+                # Use semantic analysis to check if this is actually dangerous
+                # For now, just check if it's in documentation or comments
+                is_safe = "documentation" in context.lower() or "#" in context
+
+                # Skip if semantic analysis says it's safe (e.g., in documentation)
+                if is_safe:
+                    continue
+
+                result.add_check(
+                    name="Dangerous Pattern Detection",
+                    passed=False,
+                    message=f"Dangerous pattern '{pattern_str}' found in raw file content",
+                    severity=IssueSeverity.CRITICAL,
+                    location=context_path,
+                    details={
+                        "pattern": pattern_str,
+                        "detection_method": "raw_content_scan",
+                        "semantic_safe": is_safe,
+                    },
+                    why=(
+                        f"The file contains the dangerous pattern '{pattern_str}' "
+                        f"which could indicate malicious code execution during unpickling."
+                    ),
+                )
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
@@ -1168,6 +1175,10 @@ class PickleScanner(BaseScanner):
         current_pos = file_obj.tell()
         file_data = file_obj.read()
         file_obj.seek(current_pos)  # Reset position
+
+        # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
+        # This was missing and allowed malicious PyTorch models to pass undetected
+        self._scan_for_dangerous_patterns(file_data, result, self.current_file_path)
 
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
