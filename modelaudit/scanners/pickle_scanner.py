@@ -561,10 +561,9 @@ def is_suspicious_global(mod: str, func: str) -> bool:
 
     # Check for obfuscated references
     # Some exploits use getattr or other indirection
-    if normalized_mod in ["__builtin", "builtin", "__builtins", "builtins"]:
-        if func in dangerous_funcs:
-            logger.debug(f"Detected obfuscated builtin reference: {mod}.{func}")
-            return True
+    if normalized_mod in ["__builtin", "builtin", "__builtins", "builtins"] and func in dangerous_funcs:
+        logger.debug(f"Detected obfuscated builtin reference: {mod}.{func}")
+        return True
 
     return False
 

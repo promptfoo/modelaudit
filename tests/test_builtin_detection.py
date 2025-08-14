@@ -67,10 +67,13 @@ class TestBuiltinDetection:
             # Check that it specifically detected __builtin__.eval
             found_builtin_eval = False
             for issue in critical_issues:
-                if "module" in issue.details:
-                    if issue.details["module"] == "__builtin__" and issue.details.get("function") == "eval":
-                        found_builtin_eval = True
-                        break
+                if (
+                    "module" in issue.details
+                    and issue.details["module"] == "__builtin__"
+                    and issue.details.get("function") == "eval"
+                ):
+                    found_builtin_eval = True
+                    break
 
             assert found_builtin_eval, "Should specifically detect __builtin__.eval"
 
