@@ -528,13 +528,44 @@ def _is_legitimate_serialization_file(path: str) -> bool:
 
 
 def is_suspicious_global(mod: str, func: str) -> bool:
-    """Check if a module.function reference is suspicious"""
+    """
+    Check if a module.function reference is suspicious.
+
+    Enhanced to detect various forms of builtin eval/exec that other tools
+    might miss, including __builtin__ (Python 2 style) and __builtins__.
+    """
+    # Normalize module name for consistent checking
+    # Some exploits use alternative spellings or references
+    normalized_mod = mod.strip().lower() if mod else ""
+
+    # Check for direct matches first
     if mod in SUSPICIOUS_GLOBALS:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
             return True
         if isinstance(val, list) and func in val:
             return True
+
+    # Enhanced detection for builtin eval/exec patterns
+    # These are CRITICAL as they allow arbitrary code execution
+    builtin_variants = ["__builtin__", "__builtins__", "builtins"]
+    dangerous_funcs = ["eval", "exec", "execfile", "compile", "__import__"]
+
+    if mod in builtin_variants and func in dangerous_funcs:
+        # Log for comparative analysis
+        logger.debug(
+            f"Detected dangerous builtin: {mod}.{func} - "
+            f"This is a CRITICAL security risk that some tools might underreport"
+        )
+        return True
+
+    # Check for obfuscated references
+    # Some exploits use getattr or other indirection
+    if normalized_mod in ["__builtin", "builtin", "__builtins", "builtins"]:
+        if func in dangerous_funcs:
+            logger.debug(f"Detected obfuscated builtin reference: {mod}.{func}")
+            return True
+
     return False
 
 
