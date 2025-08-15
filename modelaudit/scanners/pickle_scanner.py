@@ -1122,6 +1122,7 @@ class PickleScanner(BaseScanner):
             b"exec",
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"runpy",  # Can execute arbitrary modules via run_module, run_path
             # Enhanced os/subprocess detection
             b"os.system",  # Direct system command execution
             b"os.popen",  # Process spawning with pipe
