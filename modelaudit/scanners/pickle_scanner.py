@@ -1197,9 +1197,15 @@ class PickleScanner(BaseScanner):
         opcode_count = 0
         suspicious_count = 0
 
-        # Read the file data for entropy analysis
+        # For large files, use chunked reading to avoid memory issues
+        MAX_MEMORY_READ = 50 * 1024 * 1024  # 50MB max in memory at once
+
         current_pos = file_obj.tell()
-        file_data = file_obj.read()
+
+        # Read file data - either all at once for small files or first chunk for large files
+        # For large files, read first 50MB for pattern analysis (critical malicious code is usually at the beginning)
+        file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
+
         file_obj.seek(current_pos)  # Reset position
 
         # CRITICAL FIX: Scan for dangerous patterns in embedded pickles

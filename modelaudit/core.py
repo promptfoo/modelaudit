@@ -16,6 +16,10 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.assets import asset_from_scan_result
+from modelaudit.utils.extreme_large_file_handler import (
+    scan_extreme_large_file,
+    should_use_extreme_handler,
+)
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_file_format_from_magic,
@@ -697,28 +701,35 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         sr.finish(success=True)
         return sr
 
-    # Check file size first
-    max_file_size = config.get("max_file_size", 0)  # Default unlimited
+    # Get file size for later checks
     try:
         file_size = os.path.getsize(path)
-        if max_file_size > 0 and file_size > max_file_size:
-            sr = ScanResult(scanner_name="size_check")
-            sr.add_issue(
-                f"File too large to scan: {file_size} bytes (max: {max_file_size})",
-                severity=IssueSeverity.WARNING,
-                details={
-                    "file_size": file_size,
-                    "max_file_size": max_file_size,
-                    "path": path,
-                },
-            )
-            return sr
     except OSError as e:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
             f"Error checking file size: {e}",
             severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
+        )
+        return sr
+
+    # Check if we should use extreme handler BEFORE applying size limits
+    # Extreme handler bypasses size limits for huge models
+    use_extreme_handler = should_use_extreme_handler(path)
+
+    # Check file size limit only if NOT using extreme handler
+    max_file_size = config.get("max_file_size", 0)  # Default unlimited
+    if not use_extreme_handler and max_file_size > 0 and file_size > max_file_size:
+        sr = ScanResult(scanner_name="size_check")
+        sr.add_issue(
+            f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+            severity=IssueSeverity.WARNING,
+            details={
+                "file_size": file_size,
+                "max_file_size": max_file_size,
+                "path": path,
+                "hint": "Consider using extreme large model support for files over 50GB",
+            },
         )
         return sr
 
@@ -782,8 +793,9 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
     result: Optional[ScanResult]
 
-    # Check if we should use large file handler
-    use_large_handler = should_use_large_file_handler(path)
+    # We already checked use_extreme_handler above for size limit bypass
+    # Now check if we should use regular large handler
+    use_large_handler = should_use_large_file_handler(path) and not use_extreme_handler
     progress_callback = config.get("progress_callback")
     timeout = config.get("timeout", 1800)
 
@@ -794,7 +806,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         scanner = preferred_scanner(config=config)
 
         try:
-            if use_large_handler:
+            if use_extreme_handler:
+                logger.info(f"Using extreme large file handler for {path}")
+                result = scan_extreme_large_file(
+                    path, scanner, progress_callback, timeout * 2
+                )  # Double timeout for extreme files
+            elif use_large_handler:
                 logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
@@ -817,7 +834,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             scanner = scanner_class(config=config)
 
             try:
-                if use_large_handler:
+                if use_extreme_handler:
+                    logger.info(f"Using extreme large file handler for {path}")
+                    result = scan_extreme_large_file(
+                        path, scanner, progress_callback, timeout * 2
+                    )  # Double timeout for extreme files
+                elif use_large_handler:
                     logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
