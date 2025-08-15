@@ -1122,6 +1122,7 @@ class PickleScanner(BaseScanner):
             b"exec",
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"webbrowser",  # Can open malicious URLs (webbrowser.open)
             b"importlib",  # Dynamic module loading (import_module, reload, etc.)
             b"runpy",  # Can execute arbitrary modules via run_module, run_path
             # Enhanced os/subprocess detection
