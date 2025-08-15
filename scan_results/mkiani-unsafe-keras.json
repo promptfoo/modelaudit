@@ -1,0 +1,80 @@
+{
+  "bytes_scanned": 0,
+  "issues": [
+    {
+      "message": "File type validation failed: extension indicates hdf5 but magic bytes indicate zip. This could indicate file spoofing or corruption. Using header-based detection.",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/unsafe_model.keras",
+      "details": {
+        "extension_format": "hdf5",
+        "header_format": "zip",
+        "file_type_validation_failed": true
+      },
+      "timestamp": 1755214182.988844,
+      "why": "Mismatched file headers and extensions may indicate file spoofing attacks where malicious content is disguised as a legitimate model format."
+    }
+  ],
+  "checks": [
+    {
+      "name": "Security Check",
+      "status": "failed",
+      "message": "File type validation failed: extension indicates hdf5 but magic bytes indicate zip. This could indicate file spoofing or corruption. Using header-based detection.",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/unsafe_model.keras",
+      "details": {
+        "extension_format": "hdf5",
+        "header_format": "zip",
+        "file_type_validation_failed": true
+      },
+      "timestamp": 1755214182.988845,
+      "severity": "warning",
+      "why": "Mismatched file headers and extensions may indicate file spoofing attacks where malicious content is disguised as a legitimate model format."
+    }
+  ],
+  "files_scanned": 3,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/unsafe_model.keras",
+      "type": "weight_distribution",
+      "size": 425774
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/models--mkiani--unsafe-keras/refs/main",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/.cache/huggingface/download/unsafe_model.keras.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": ["weight_distribution", "skipped"],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/unsafe_model.keras": {
+      "file_size": 425774,
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": true
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/models--mkiani--unsafe-keras/refs/main": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-keras/.cache/huggingface/download/unsafe_model.keras.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    }
+  },
+  "start_time": 1755214174.7233338,
+  "duration": 8.275651216506958,
+  "total_checks": 4,
+  "passed_checks": 0,
+  "failed_checks": 4
+}
