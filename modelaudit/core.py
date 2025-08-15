@@ -621,7 +621,7 @@ def determine_exit_code(results: dict[str, Any]) -> int:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING and CRITICAL issues should trigger exit code 1
         security_issues = [
-            issue for issue in issues 
+            issue for issue in issues
             if isinstance(issue, dict) and issue.get("severity") in ["warning", "critical"]
         ]
         if security_issues:
