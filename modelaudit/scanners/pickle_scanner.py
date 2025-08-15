@@ -681,14 +681,15 @@ def check_opcode_sequence(
         # SMART DETECTION: Much higher threshold for ML content
         ml_confidence = ml_context.get("overall_confidence", 0)
         if ml_confidence > 0.7:
-            threshold = 100  # Very high threshold for high-confidence ML
+            threshold = 200  # Even higher threshold for high-confidence ML (was 100)
         elif ml_confidence > 0.4:
-            threshold = 50  # Higher threshold for medium-confidence ML
+            threshold = 100  # Higher threshold for medium-confidence ML (was 50)
         else:
-            threshold = 20  # Still higher than original 5 for unknown content
+            threshold = 50  # Higher than original for unknown content (was 20)
 
-        # If we see too many dangerous opcodes AND it's not clearly ML content
-        if dangerous_opcode_count > threshold:
+        # Also require higher ML confidence to trigger warnings
+        # If ML confidence is below 0.6, don't warn about opcode counts
+        if ml_confidence >= 0.6 and dangerous_opcode_count > threshold:
             suspicious_patterns.append(
                 {
                     "pattern": "MANY_DANGEROUS_OPCODES",
@@ -1132,9 +1133,10 @@ class PickleScanner(BaseScanner):
             b"__builtins__",  # Alternative reference to builtins
             b"globals",  # Access to global namespace for code injection
             b"locals",  # Access to local namespace for code injection
+            b"runpy",  # Can run modules and scripts (runpy.run_module, runpy.run_path)
             b"webbrowser",  # Can open malicious URLs (webbrowser.open)
-            b"importlib",  # Dynamic module loading (import_module, reload, etc.)
-            b"runpy",  # Can execute arbitrary modules via run_module, run_path
+            b"importlib",  # Dynamic imports (importlib.import_module)
+            b"execfile",  # Execute Python files (Python 2 legacy but still dangerous)
             # Enhanced os/subprocess detection
             b"os.system",  # Direct system command execution
             b"os.popen",  # Process spawning with pipe

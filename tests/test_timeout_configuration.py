@@ -79,7 +79,7 @@ class TestTimeoutConfiguration:
     def test_default_timeout(self):
         """Test default timeout value"""
         scanner = SlowTestScanner()
-        assert scanner.timeout == 300  # Default 5 minutes
+        assert scanner.timeout == 1800  # Default 30 minutes for large models
 
     def test_timeout_error_handling(self):
         """Test that TimeoutError is caught and handled gracefully"""
