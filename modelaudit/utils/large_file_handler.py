@@ -102,7 +102,7 @@ class LargeFileHandler:
         self._report_progress(f"Scanning {self.file_name}", 0)
 
         # Use the scanner's normal scan method
-        result = self.scanner.scan(self.file_path)
+        result: ScanResult = self.scanner.scan(self.file_path)
 
         self._report_progress(f"Completed {self.file_name}", 100)
         return result
@@ -118,7 +118,10 @@ class LargeFileHandler:
         try:
             # For pickle files, we need special handling
             if hasattr(self.scanner, "_scan_pickle_chunks"):
-                return self.scanner._scan_pickle_chunks(self.file_path, chunk_size, self.progress_callback)
+                chunk_result: ScanResult = self.scanner._scan_pickle_chunks(
+                    self.file_path, chunk_size, self.progress_callback
+                )
+                return chunk_result
 
             # For other scanners, fall back to normal scanning
             # but with progress updates
