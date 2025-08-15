@@ -372,6 +372,8 @@ class BaseScanner(ABC):
                 return True
             raise TimeoutError(f"Scan exceeded timeout of {self.timeout} seconds (elapsed: {elapsed:.1f}s)")
 
+        return False
+
     def _get_remaining_time(self) -> float:
         """Get the remaining time before timeout.
 
