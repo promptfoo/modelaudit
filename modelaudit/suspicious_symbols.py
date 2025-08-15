@@ -124,6 +124,8 @@ SUSPICIOUS_GLOBALS = {
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
     "socket": ["*"],  # Network communication
+    # Web/Network interaction - CRITICAL RISK
+    "webbrowser": ["open", "open_new", "open_new_tab"],  # Can open malicious URLs
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
@@ -144,6 +146,13 @@ DANGEROUS_BUILTINS = [
     "open",
     "input",
     "__import__",
+    "globals",  # Access to global namespace
+    "locals",  # Access to local namespace
+    "setattr",  # Can set arbitrary attributes
+    "getattr",  # Can access arbitrary attributes
+    "delattr",  # Can delete attributes
+    "vars",  # Access to object's namespace
+    "dir",  # Can enumerate available attributes
 ]
 
 # Suspicious string patterns used by PickleScanner

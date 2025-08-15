@@ -1120,8 +1120,13 @@ class PickleScanner(BaseScanner):
             b"subprocess",
             b"eval",
             b"exec",
+            b"compile",  # Can compile and execute arbitrary code
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"__builtins__",  # Alternative reference to builtins
+            b"globals",  # Access to global namespace for code injection
+            b"locals",  # Access to local namespace for code injection
+            b"webbrowser",  # Can open malicious URLs (webbrowser.open)
             b"importlib",  # Dynamic module loading (import_module, reload, etc.)
             b"runpy",  # Can execute arbitrary modules via run_module, run_path
             # Enhanced os/subprocess detection

@@ -576,23 +576,45 @@ class BaseScanner(ABC):
 
         # Check if path exists
         if not os.path.exists(path):
-            result.add_issue(
-                f"Path does not exist: {path}",
+            result.add_check(
+                name="Path Exists",
+                passed=False,
+                message=f"Path does not exist: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Exists",
+                passed=True,
+                message="Path exists",
+                location=path,
+                details={"path": path},
+            )
 
         # Check if path is readable
         if not os.access(path, os.R_OK):
-            result.add_issue(
-                f"Path is not readable: {path}",
+            result.add_check(
+                name="Path Readable",
+                passed=False,
+                message=f"Path is not readable: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Readable",
+                passed=True,
+                message="Path is readable",
+                location=path,
+                details={"path": path},
+            )
 
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
@@ -606,8 +628,10 @@ class BaseScanner(ABC):
                 if not validate_file_type(path):
                     header_format = detect_file_format_from_magic(path)
                     ext_format = detect_format_from_extension(path)
-                    result.add_issue(
-                        (
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=False,
+                        message=(
                             f"File type validation failed: extension indicates {ext_format} but magic bytes "
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
@@ -620,17 +644,26 @@ class BaseScanner(ABC):
                             "security_check": "file_type_validation",
                         },
                     )
+                else:
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=True,
+                        message="File type validation passed",
+                        location=path,
+                    )
             except Exception as e:
                 # Don't fail the scan if file type validation has an error
-                result.add_issue(
-                    f"File type validation error: {e!s}",
+                result.add_check(
+                    name="File Type Validation",
+                    passed=False,
+                    message=f"File type validation error: {e!s}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
 
-        # Store validation warnings for the scanner to merge later
-        self._path_validation_result = result if result.issues else None
+        # Store validation checks or warnings for the scanner to merge later
+        self._path_validation_result = result if (result.issues or result.checks) else None
 
         # Only return result for CRITICAL issues that should stop the scan
         critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
@@ -683,24 +716,47 @@ class BaseScanner(ABC):
 
     def _check_size_limit(self, path: str) -> Optional[ScanResult]:
         """Check if the file exceeds the configured size limit."""
-        result = self._create_result()
         file_size = self.get_file_size(path)
-        result.metadata["file_size"] = file_size
 
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
-            result.add_issue(
-                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+            result = self._create_result()
+            result.metadata["file_size"] = file_size
+            result.add_check(
+                name="File Size Limit",
+                passed=False,
+                message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
-                why="Large files may consume excessive memory or processing time. Consider whether this file "
-                "size is expected for your use case.",
+                why=(
+                    "Large files may consume excessive memory or processing time. "
+                    "Consider whether this file size is expected for your use case."
+                ),
             )
             result.finish(success=False)
             return result
+
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
+            self._path_validation_result.add_check(
+                name="File Size Limit",
+                passed=True,
+                message="File size within limit",
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+        else:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
 
         return None
 
