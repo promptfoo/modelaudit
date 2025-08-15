@@ -104,7 +104,7 @@ class OnnxScanner(BaseScanner):
             result.add_check(
                 name="JIT/Script Code Execution Detection",
                 passed=False,
-                message=f"Could not check for JIT/Script code: {e}",
+                message=f"Failed to check for JIT/Script code: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=path,
                 details={"exception": str(e)},
@@ -254,7 +254,7 @@ class OnnxScanner(BaseScanner):
             result.add_check(
                 name="External Data Size Validation",
                 passed=False,
-                message=f"Could not validate external data size: {e}",
+                message=f"Failed to validate external data size: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=str(external_path),
             )
@@ -297,7 +297,7 @@ class OnnxScanner(BaseScanner):
                     result.add_check(
                         name="Tensor Validation",
                         passed=False,
-                        message=f"Could not validate tensor '{tensor.name}': {e}",
+                        message=f"Failed to validate tensor '{tensor.name}': {e}",
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )

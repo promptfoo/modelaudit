@@ -130,7 +130,7 @@ class WeightDistributionScanner(BaseScanner):
                 result.add_check(
                     name="Weight Extraction",
                     passed=False,
-                    message="Could not extract weights from model",
+                    message="Failed to extract weights from model",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                 )
@@ -225,8 +225,7 @@ class WeightDistributionScanner(BaseScanner):
                 with zipfile.ZipFile(path, "r") as z:
                     # Look for data.pkl which contains the weights
                     if "data.pkl" in z.namelist():
-                        # We can't easily extract weights from pickle without executing it
-                        # This is a limitation we should document
+                        # Cannot extract weights from pickle without execution
                         pass
             except Exception as e:
                 logger.debug(f"Failed to extract weights from {path}: {e}")
@@ -476,7 +475,7 @@ class WeightDistributionScanner(BaseScanner):
                     analysis["evidence"].append(f"Found vocabulary-sized layer: {matrix['output_dim']} ≈ {vocab_size}")
                     break
 
-        # Check for very large hidden dimensions typical of modern LLMs
+        # Check for large hidden dimensions typical of modern LLMs
         large_hidden_dims = [dim for dim in input_dims + output_dims if dim >= 768]
         if large_hidden_dims:
             analysis["confidence"] += 0.2
@@ -549,7 +548,7 @@ class WeightDistributionScanner(BaseScanner):
             n_outputs > self.llm_vocab_threshold
             # Large input dimensions (hidden layers in large models)
             or n_inputs > 2048
-            # Very large weight matrices (characteristic of large models)
+            # Large weight matrices (characteristic of large models)
             or weights.size > 10_000_000
         ):
             # Moderate relaxation for large models based on size analysis

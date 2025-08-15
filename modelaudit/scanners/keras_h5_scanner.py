@@ -118,7 +118,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_check(
                             name="Keras Model Format Check",
                             passed=True,
-                            message="File appears to be a TensorFlow H5 model, not Keras format",
+                            message="File is a TensorFlow H5 model, not Keras format",
                             location=self.current_file_path,
                             details={"format": "tensorflow_h5"},
                         )
@@ -312,7 +312,6 @@ class KerasH5Scanner(BaseScanner):
             is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
 
             if is_safe_pattern:
-                # This is a safe normalization lambda - record as passed check
                 result.add_check(
                     name="Lambda Layer Code Analysis",
                     passed=True,

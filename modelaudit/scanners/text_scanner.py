@@ -52,7 +52,7 @@ class TextScanner(BaseScanner):
             file_size = os.path.getsize(path)
             result.metadata["file_size"] = file_size
 
-            # Check if file is too large (text files shouldn't be huge)
+            # Check if file exceeds expected size for text files
             if file_size > 100 * 1024 * 1024:  # 100MB
                 result.add_check(
                     name="File Size Check",

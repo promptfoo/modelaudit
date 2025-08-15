@@ -15,11 +15,11 @@ from modelaudit.license_checker import (
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
-from modelaudit.utils.assets import asset_from_scan_result
-from modelaudit.utils.extreme_large_file_handler import (
-    scan_extreme_large_file,
-    should_use_extreme_handler,
+from modelaudit.utils.advanced_file_handler import (
+    scan_advanced_large_file,
+    should_use_advanced_handler,
 )
+from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_file_format_from_magic,
@@ -212,7 +212,7 @@ def scan_model_directory_or_file(
             limit_reached = False
 
             # Quick check: count files only if directory seems reasonable in size
-            # This avoids the expensive rglob() on very large directories
+            # This avoids the expensive rglob() on large directories
             try:
                 # Do a quick count of immediate children first
                 immediate_children = len(list(Path(path).iterdir()))
@@ -714,8 +714,8 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         return sr
 
     # Check if we should use extreme handler BEFORE applying size limits
-    # Extreme handler bypasses size limits for huge models
-    use_extreme_handler = should_use_extreme_handler(path)
+    # Extreme handler bypasses size limits for large models
+    use_extreme_handler = should_use_advanced_handler(path)
 
     # Check file size limit only if NOT using extreme handler
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
@@ -808,7 +808,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         try:
             if use_extreme_handler:
                 logger.info(f"Using extreme large file handler for {path}")
-                result = scan_extreme_large_file(
+                result = scan_advanced_large_file(
                     path, scanner, progress_callback, timeout * 2
                 )  # Double timeout for extreme files
             elif use_large_handler:
@@ -836,7 +836,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             try:
                 if use_extreme_handler:
                     logger.info(f"Using extreme large file handler for {path}")
-                    result = scan_extreme_large_file(
+                    result = scan_advanced_large_file(
                         path, scanner, progress_callback, timeout * 2
                     )  # Double timeout for extreme files
                 elif use_large_handler:
