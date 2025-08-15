@@ -22,6 +22,10 @@ from modelaudit.utils.filetype import (
     detect_format_from_extension,
     validate_file_type,
 )
+from modelaudit.utils.large_file_handler import (
+    scan_large_file,
+    should_use_large_file_handler,
+)
 from modelaudit.utils.streaming import stream_analyze_file
 
 logger = logging.getLogger("modelaudit.core")
@@ -68,9 +72,9 @@ def validate_scan_config(config: dict[str, Any]) -> None:
 def scan_model_directory_or_file(
     path: str,
     blacklist_patterns: Optional[list[str]] = None,
-    timeout: int = 300,
-    max_file_size: int = 0,
-    max_total_size: int = 0,
+    timeout: int = 1800,  # Increased to 30 minutes for large models (up to 8GB+)
+    max_file_size: int = 0,  # 0 means unlimited - support any size
+    max_total_size: int = 0,  # 0 means unlimited
     strict_license: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     skip_file_types: bool = True,
@@ -611,12 +615,16 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     if files_scanned == 0:
         return 2
 
-    # Check for any security findings (warnings, errors, or info issues)
+    # Check for any security findings (warnings or critical issues only)
     issues = results.get("issues", [])
     if issues:
-        # Filter out DEBUG level issues for exit code determination
-        non_debug_issues = [issue for issue in issues if isinstance(issue, dict) and issue.get("severity") != "debug"]
-        if non_debug_issues:
+        # Filter out DEBUG and INFO level issues for exit code determination
+        # Only WARNING and CRITICAL issues should trigger exit code 1
+        security_issues = [
+            issue for issue in issues 
+            if isinstance(issue, dict) and issue.get("severity") in ["warning", "critical"]
+        ]
+        if security_issues:
             return 1
 
     # No issues found
@@ -772,19 +780,35 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
     result: Optional[ScanResult]
+
+    # Check if we should use large file handler
+    use_large_handler = should_use_large_file_handler(path)
+    progress_callback = config.get("progress_callback")
+    timeout = config.get("timeout", 1800)
+
     if preferred_scanner and preferred_scanner.can_handle(path):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
         scanner = preferred_scanner(config=config)
-        result = scanner.scan(path)
+
+        if use_large_handler:
+            logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+            result = scan_large_file(path, scanner, progress_callback, timeout)
+        else:
+            result = scanner.scan(path)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
         scanner_class = _registry.get_scanner_for_path(path)
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
-            result = scanner.scan(path)
+
+            if use_large_handler:
+                logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                result = scan_large_file(path, scanner, progress_callback, timeout)
+            else:
+                result = scanner.scan(path)
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
