@@ -116,6 +116,16 @@ def cli() -> None:
 @cli.command("scan")
 @click.argument("paths", nargs=-1, type=str, required=True)
 @click.option(
+    "--suppress",
+    multiple=True,
+    help="Suppress specific rule codes (e.g., --suppress S101 --suppress S710)",
+)
+@click.option(
+    "--severity",
+    multiple=True,
+    help="Override rule severity (e.g., --severity S301=HIGH --severity S701=CRITICAL)",
+)
+@click.option(
     "--blacklist",
     "-b",
     multiple=True,
@@ -216,6 +226,8 @@ def cli() -> None:
 )
 def scan_command(
     paths: tuple[str, ...],
+    suppress: tuple[str, ...],
+    severity: tuple[str, ...],
     blacklist: tuple[str, ...],
     format: str,
     output: Optional[str],
@@ -280,6 +292,23 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
+    # Configure rule suppression and severity overrides
+    from .config import ModelAuditConfig, set_config
+    
+    # Parse CLI severity overrides
+    severity_overrides = {}
+    for sev in severity:
+        if "=" in sev:
+            rule_code, sev_level = sev.split("=", 1)
+            severity_overrides[rule_code] = sev_level
+    
+    # Create config from CLI args
+    cli_config = ModelAuditConfig.from_cli_args(
+        suppress=list(suppress) if suppress else None,
+        severity=severity_overrides if severity_overrides else None
+    )
+    set_config(cli_config)
+    
     # Expand DVC pointer files before scanning
     expanded_paths = []
     for p in paths:
@@ -1237,6 +1266,7 @@ def _format_issue(
     """Format a single issue with proper indentation and styling"""
     message = issue.get("message", "Unknown issue")
     location = issue.get("location", "")
+    rule_code = issue.get("rule_code", "")
 
     # Icon based on severity
     icons = {
@@ -1248,6 +1278,11 @@ def _format_issue(
 
     # Build the issue line
     icon = icons.get(severity, "    └─ ")
+    
+    # Add rule code if available
+    if rule_code:
+        rule_str = style_text(f"[{rule_code}]", fg="yellow", bold=True)
+        message = f"{rule_str} {message}"
 
     if location:
         location_str = style_text(f"[{location}]", fg="cyan", bold=True)
@@ -1281,7 +1316,140 @@ def _format_issue(
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
-@cli.command()
+@cli.command("rules")
+@click.argument("rule_code", required=False)
+@click.option(
+    "--list", "list_rules", is_flag=True, help="List all rules"
+)
+@click.option(
+    "--category", help="Show rules in a category range (e.g., 100-199)"
+)
+@click.option(
+    "--format", type=click.Choice(["table", "json"]), default="table", help="Output format"
+)
+def rules_command(rule_code: Optional[str], list_rules: bool, category: Optional[str], format: str) -> None:
+    """View and explain security rules."""
+    from .rules import RuleRegistry
+    
+    # Initialize rules
+    RuleRegistry.initialize()
+    
+    if rule_code:
+        # Show specific rule
+        rule = RuleRegistry.get_rule(rule_code.upper())
+        if not rule:
+            click.echo(f"Rule {rule_code} not found", err=True)
+            sys.exit(1)
+        
+        if format == "json":
+            click.echo(json.dumps({
+                "code": rule.code,
+                "name": rule.name,
+                "severity": rule.default_severity.value,
+                "description": rule.description,
+            }, indent=2))
+        else:
+            click.echo(f"Code: {style_text(rule.code, bold=True)}")
+            click.echo(f"Name: {rule.name}")
+            click.echo(f"Default Severity: {style_text(rule.default_severity.value, fg=get_severity_color(rule.default_severity.value))}")
+            click.echo(f"Description: {rule.description}")
+    
+    elif category:
+        # Show category range
+        try:
+            if "-" in category:
+                start, end = category.split("-")
+                start = int(start)
+                end = int(end)
+            else:
+                # Single category like "100" means 100-199
+                start = int(category)
+                end = start + 99
+            
+            rules = RuleRegistry.get_rules_by_range(start, end)
+            if not rules:
+                click.echo(f"No rules found in range S{start}-S{end}", err=True)
+                sys.exit(1)
+            
+            display_rules(rules, format)
+        except ValueError:
+            click.echo(f"Invalid category format: {category}", err=True)
+            sys.exit(1)
+    
+    else:
+        # List all rules
+        rules = RuleRegistry.get_all_rules()
+        display_rules(rules, format)
+
+
+def get_severity_color(severity: str) -> str:
+    """Get color for severity level."""
+    colors = {
+        "CRITICAL": "red",
+        "HIGH": "red",
+        "MEDIUM": "yellow",
+        "LOW": "cyan",
+        "INFO": "blue",
+    }
+    return colors.get(severity.upper(), "white")
+
+
+def display_rules(rules: dict, format: str) -> None:
+    """Display rules in requested format."""
+    if format == "json":
+        rules_list = [
+            {
+                "code": rule.code,
+                "name": rule.name,
+                "severity": rule.default_severity.value,
+                "description": rule.description,
+            }
+            for rule in rules.values()
+        ]
+        click.echo(json.dumps(rules_list, indent=2))
+    else:
+        # Group by category
+        categories = {}
+        for code, rule in sorted(rules.items()):
+            if code.startswith("S"):
+                try:
+                    num = int(code[1:])
+                    cat = (num // 100) * 100
+                    if cat not in categories:
+                        categories[cat] = []
+                    categories[cat].append(rule)
+                except ValueError:
+                    continue
+        
+        # Display by category
+        category_names = {
+            100: "Code Execution",
+            200: "Pickle & Deserialization",
+            300: "Network & Communication",
+            400: "File System",
+            500: "Embedded Binaries",
+            600: "Encoding & Obfuscation",
+            700: "Secrets & Credentials",
+            800: "Model Weights",
+            900: "File Format",
+            1000: "Supply Chain",
+            1100: "Framework-Specific",
+        }
+        
+        for cat in sorted(categories.keys()):
+            cat_name = category_names.get(cat, f"S{cat}-S{cat+99}")
+            click.echo(f"\n{style_text(f'=== {cat_name} (S{cat}-S{cat+99}) ===', bold=True)}")
+            
+            for rule in categories[cat]:
+                severity_color = get_severity_color(rule.default_severity.value)
+                click.echo(
+                    f"{style_text(rule.code, bold=True):6} "
+                    f"{style_text(rule.default_severity.value, fg=severity_color):8} "
+                    f"{rule.name}"
+                )
+
+
+@cli.command("doctor")
 @click.option(
     "--show-failed",
     is_flag=True,

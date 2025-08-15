@@ -43,8 +43,7 @@ class TFLiteScanner(BaseScanner):
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"required_package": "tflite"},
-            )
+                details={"required_package": "tflite"}, rule_code="S902",)
             result.finish(success=False)
             return result
 
@@ -74,8 +73,7 @@ class TFLiteScanner(BaseScanner):
                 message=f"Model declares {subgraph_count} subgraphs which exceeds the safe limit",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT},
-            )
+                details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT}, rule_code="S902",)
 
         for sg_index in range(subgraph_count):
             subgraph = model.Subgraphs(sg_index)
@@ -91,8 +89,7 @@ class TFLiteScanner(BaseScanner):
                     message="TFLite model has extremely large tensor or operator count",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"tensors": tensors_len, "operators": operators_len, "max_allowed": _MAX_COUNT},
-                )
+                    details={"tensors": tensors_len, "operators": operators_len, "max_allowed": _MAX_COUNT}, rule_code="S902",)
                 continue
 
             for t_index in range(tensors_len):
@@ -102,7 +99,7 @@ class TFLiteScanner(BaseScanner):
                     result.add_check(
                         name="Tensor Dimension Validation",
                         passed=False,
-                        message="Tensor dimension extremely large (possible overflow)",
+                        message="Tensor dimension extremely large (possible overflow", rule_code="S703")",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path} (tensor {t_index})",
                         details={"tensor_index": t_index, "shape": shape, "max_allowed_dim": _MAX_DIM},
@@ -121,6 +118,7 @@ class TFLiteScanner(BaseScanner):
                         message=f"Model uses custom operator '{name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path} (operator {o_index})",
+                rule_code="S302"",
                         details={"operator_name": name, "operator_index": o_index},
                     )
 

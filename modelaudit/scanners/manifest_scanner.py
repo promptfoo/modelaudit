@@ -211,7 +211,8 @@ class ManifestScanner(BaseScanner):
                     message=f"Unable to parse file as a manifest or configuration: {path}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
-                )
+                rule_code="S902"
+            )
 
         except Exception as e:
             result.add_check(
@@ -251,9 +252,10 @@ class ManifestScanner(BaseScanner):
                             why=(
                                 "This term matches a user-defined blacklist pattern. Organizations use blacklists to "
                                 "identify models or configurations that violate security policies or contain known "
-                                "malicious indicators."
-                            ),
-                        )
+                                "malicious indicators."),
+                rule_code="S1001",
+                            rule_code="S902"
+            )
                         found_blacklisted = True
 
                 if not found_blacklisted:
@@ -262,7 +264,9 @@ class ManifestScanner(BaseScanner):
                         passed=True,
                         message="No blacklisted patterns found in file",
                         location=self.current_file_path,
-                        details={"patterns_checked": len(self.blacklist_patterns)},
+                        details={"patterns_checked": len(self.blacklist_patterns,
+                rule_code=None,  # Passing check
+            )},
                     )
         except Exception as e:
             result.add_check(
@@ -272,6 +276,7 @@ class ManifestScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S1001",
             )
 
     def _parse_file(
@@ -319,6 +324,7 @@ class ManifestScanner(BaseScanner):
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S902",
                 )
 
         return None
@@ -402,7 +408,9 @@ class ManifestScanner(BaseScanner):
                             "key": full_key,
                             "analysis": "value_based",
                             "danger": "executable_content",
-                            "value": self._format_value(value),
+                            "value": self._format_value(value,
+                rule_code="S902",
+            ),
                         },
                     )
                     # Don't continue here - still check for patterns and recurse
@@ -441,6 +449,7 @@ class ManifestScanner(BaseScanner):
                         name="Suspicious Configuration Pattern Detection",
                         passed=False,
                         message=f"Suspicious configuration pattern: {full_key} (category: {', '.join(matches)})",
+                        rule_code="S905",
                         severity=severity,
                         location=self.current_file_path,
                         details={

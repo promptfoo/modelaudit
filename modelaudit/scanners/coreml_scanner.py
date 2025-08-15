@@ -44,6 +44,7 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"required_package": "coremltools"},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -61,7 +62,9 @@ class CoreMLScanner(BaseScanner):
                 message=f"Invalid Core ML file or parse error: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={"exception": str(e,
+                rule_code="S902",
+            ), "exception_type": type(e).__name__},
             )
             result.finish(success=False)
             return result
@@ -76,6 +79,7 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model uses customModel which may execute arbitrary code",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                rule_code="S104",
             )
         else:
             result.add_check(
@@ -84,6 +88,7 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model does not use customModel",
                 location=path,
                 details={"model_type": model_type},
+                rule_code=None,  # Passing check
             )
         if model_type in {"neuralNetwork", "neuralNetworkClassifier", "neuralNetworkRegressor"}:
             nn = getattr(spec, model_type)
@@ -98,7 +103,8 @@ class CoreMLScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"layer": layer.name, "class_name": class_name},
-                    )
+                rule_code="S902",
+            )
                     custom_layers_found = True
 
             if not custom_layers_found and nn.layers:
@@ -107,7 +113,9 @@ class CoreMLScanner(BaseScanner):
                     passed=True,
                     message="No custom layers detected in Core ML model",
                     location=path,
-                    details={"layer_count": len(nn.layers)},
+                    details={"layer_count": len(nn.layers,
+                rule_code=None,  # Passing check
+            )},
                 )
 
         if spec.HasField("linkedModel"):
@@ -117,13 +125,15 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model links to external model",
                 severity=IssueSeverity.WARNING,
                 location=path,
-            )
+            rule_code="S610"
+                )
         else:
             result.add_check(
                 name="External Model Link Check",
                 passed=True,
                 message="Core ML model does not link to external models",
                 location=path,
+                rule_code=None,  # Passing check
             )
 
         if spec.HasField("serializedModel"):
@@ -133,13 +143,15 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model contains serialized sub-model",
                 severity=IssueSeverity.WARNING,
                 location=path,
-            )
+            rule_code="S902"
+                )
         else:
             result.add_check(
                 name="Serialized Sub-Model Check",
                 passed=True,
                 message="Core ML model does not contain serialized sub-models",
                 location=path,
+                rule_code=None,  # Passing check
             )
 
         result.finish(success=not result.has_errors)

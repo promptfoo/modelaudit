@@ -1,0 +1,22 @@
+# Example pyproject.toml configuration for ModelAudit
+# Add this [tool.modelaudit] section to your existing pyproject.toml
+
+[tool.modelaudit]
+# Suppress noisy rules
+suppress = [
+    "S710",   # High entropy strings
+    "S801",   # Weight distribution
+    "S802",   # Outlier neurons
+    "S803",   # Dissimilar vectors
+]
+
+# Adjust severity levels
+[tool.modelaudit.severity]
+S101 = "HIGH"      # Downgrade os module (we need it)
+S301 = "LOW"       # Socket usage is expected
+S701 = "CRITICAL"  # API keys are critical
+
+# Per-file ignores
+[tool.modelaudit.ignore]
+"tests/**" = ["S101", "S102", "S103"]  # Allow dangerous imports in tests
+"scripts/**" = ["S401", "S402", "S403"] # Allow file operations in scripts

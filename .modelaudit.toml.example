@@ -1,0 +1,33 @@
+# ModelAudit Configuration Example
+# Copy this file to .modelaudit.toml to use
+
+# Suppress specific rules (they won't be reported)
+suppress = [
+    "S710",  # High entropy strings (too many false positives)
+    "S801",  # Suspicious weight distribution (noisy)
+    "S802",  # Outlier neurons (noisy)
+    "S803",  # Dissimilar weight vectors (noisy)
+    "S904",  # Excessive file size warnings
+]
+
+# Override severity levels for specific rules
+[severity]
+S301 = "HIGH"      # Upgrade socket usage to HIGH
+S701 = "CRITICAL"  # API keys are critical for our use case
+S702 = "CRITICAL"  # Passwords are critical
+S1008 = "HIGH"     # License issues are important
+
+# File-specific suppressions (gitignore-style patterns)
+[ignore]
+"tests/**" = ["S200-S299"]           # Ignore all pickle issues in tests
+"vendor/**" = ["S1000-S1099"]        # Ignore supply chain in vendored files
+"*.onnx" = ["S107"]                  # ONNX models often have importlib
+"fixtures/**" = ["S700-S799"]        # Test data may have fake credentials
+"legacy/**" = ["S201", "S202"]       # Old models we can't change
+
+# Scanner-specific options
+[options]
+secrets_min_entropy = 4.5
+pickle_scan_depth = 1000
+max_file_size = "5GB"
+timeout = 600

@@ -25,6 +25,13 @@ from ..explanations import (
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .rule_mapper import (
+    get_embedded_code_rule_code,
+    get_encoding_rule_code,
+    get_generic_rule_code,
+    get_import_rule_code,
+    get_pickle_opcode_rule_code,
+)
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
@@ -877,7 +884,8 @@ class PickleScanner(BaseScanner):
                             "detection_method": "raw_content_scan",
                             "patterns_checked": ["posix", "subprocess", "eval", "exec", "__import__", "builtins"],
                         },
-                    )
+                rule_code=None,  # Passing check
+            )
 
                 early_detection_successful = True
 
@@ -932,7 +940,8 @@ class PickleScanner(BaseScanner):
                                     location=issue.location,
                                     details=issue.details,
                                     why=issue.why,
-                                )
+                                rule_code="S902"
+            )
 
                             # Update total bytes scanned
                             result.bytes_scanned = file_size
@@ -988,7 +997,8 @@ class PickleScanner(BaseScanner):
                         "reason": "recursion_with_security_findings",
                         "file_size": file_size,
                         "exception_type": "RecursionError",
-                        "security_issues_count": len([i for i in result.issues if i.severity != IssueSeverity.INFO]),
+                        "security_issues_count": len([i for i in result.issues if i.severity != IssueSeverity.INFO],
+                    rule_code="S902"),
                     },
                     why=(
                         "The scan encountered recursion limits but already detected security issues in the file. "
@@ -1028,6 +1038,7 @@ class PickleScanner(BaseScanner):
                         "exceed Python's recursion limits during analysis. The file appears legitimate based "
                         "on format validation."
                     ),
+                    rule_code=None  # Passing check
                 )
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
@@ -1059,8 +1070,8 @@ class PickleScanner(BaseScanner):
                         },
                         why=(
                             "This very small file has an obviously suspicious filename and caused recursion errors "
-                            "during pattern detection, which strongly suggests it's a maliciously crafted pickle."
-                        ),
+                            "during pattern detection, which strongly suggests it's a maliciously crafted pickle."),
+                rule_code="S902",
                     )
                 else:
                     # Handle recursion errors conservatively - treat as scanner limitation
@@ -1083,8 +1094,8 @@ class PickleScanner(BaseScanner):
                         why=(
                             "The pickle file structure is too complex for the scanner to fully analyze due to "
                             "Python's recursion limits. This often occurs with legitimate but complex data structures. "
-                            "Consider manually inspecting the file if security is a concern."
-                        ),
+                            "Consider manually inspecting the file if security is a concern."),
+                rule_code="S201",
                     )
 
                 result.metadata.update(
@@ -1162,6 +1173,23 @@ class PickleScanner(BaseScanner):
                 if is_safe:
                     continue
 
+                # Determine rule code based on the dangerous pattern
+                pattern_rule_code = None
+                if pattern_str == "posix":
+                    pattern_rule_code = "S101"  # os/posix module
+                elif pattern_str == "system":
+                    pattern_rule_code = "S101"  # os.system
+                elif pattern_str == "subprocess":
+                    pattern_rule_code = "S103"
+                elif pattern_str == "eval" or pattern_str == "exec":
+                    pattern_rule_code = "S104"
+                elif pattern_str == "__import__":
+                    pattern_rule_code = "S106"
+                elif pattern_str == "compile":
+                    pattern_rule_code = "S105"
+                elif pattern_str in ["__builtin__", "__builtins__", "builtins"]:
+                    pattern_rule_code = "S115"
+
                 result.add_check(
                     name="Dangerous Pattern Detection",
                     passed=False,
@@ -1175,8 +1203,9 @@ class PickleScanner(BaseScanner):
                     },
                     why=(
                         f"The file contains the dangerous pattern '{pattern_str}' "
-                        f"which could indicate malicious code execution during unpickling."
-                    ),
+                        f"which could indicate malicious code execution during unpickling."),
+                rule_code="S902",
+                    rule_code=pattern_rule_code
                 )
 
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
@@ -1222,7 +1251,8 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Pickle Protocol Version Check",
                         passed=False,
-                        message=f"Unsupported pickle protocol version {protocol_version} (max supported: 5)",
+                        message=f"Unsupported pickle protocol version {protocol_version} (max supported: 5")",
+                rule_code="S902"",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"protocol_version": protocol_version, "max_supported": 5},
@@ -1234,7 +1264,8 @@ class PickleScanner(BaseScanner):
                         message=f"Valid pickle protocol version {protocol_version}",
                         location=self.current_file_path,
                         details={"protocol_version": protocol_version},
-                    )
+                rule_code=None,  # Passing check
+            )
             else:
                 # Protocol 0 or 1
                 result.add_check(
@@ -1243,7 +1274,8 @@ class PickleScanner(BaseScanner):
                     message="Pickle protocol version 0 or 1 detected",
                     location=self.current_file_path,
                     details={"protocol_version": "0 or 1"},
-                )
+                rule_code=None,  # Passing check
+            )
 
         try:
             # Set a reasonable recursion limit to handle complex ML models
@@ -1292,7 +1324,8 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Stack Depth Safety Check",
                         passed=False,
-                        message=f"Stack depth ({current_stack_depth}) exceeds safety limit",
+                        message=f"Stack depth ({current_stack_depth}")",
+                rule_code="S902" exceeds safety limit",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (pos {pos})",
                         details={
@@ -1326,7 +1359,8 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Opcode Count Check",
                         passed=False,
-                        message=f"Too many opcodes in pickle (> {self.max_opcodes})",
+                        message=f"Too many opcodes in pickle (> {self.max_opcodes}")",
+                rule_code="S902"",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
@@ -1348,8 +1382,8 @@ class PickleScanner(BaseScanner):
                         details={"opcode_count": opcode_count, "timeout": self.timeout},
                         why=(
                             "The scan exceeded the configured time limit. Large or complex pickle files may take "
-                            "longer to analyze due to the number of opcodes that need to be processed."
-                        ),
+                            "longer to analyze due to the number of opcodes that need to be processed."),
+                rule_code="S902",
                     )
                     break
 
@@ -1360,6 +1394,7 @@ class PickleScanner(BaseScanner):
                     passed=True,
                     message=f"Opcode count ({opcode_count}) is within limits",
                     location=self.current_file_path,
+                    rule_code=None,  # Passing check
                     details={
                         "opcode_count": opcode_count,
                         "max_opcodes": self.max_opcodes,
@@ -1372,6 +1407,7 @@ class PickleScanner(BaseScanner):
                     name="Stack Depth Validation",
                     passed=True,
                     message=f"Maximum stack depth ({max_stack_depth}) is within safe limits",
+                    rule_code=None,  # Passing check
                     location=self.current_file_path,
                     details={
                         "max_depth_reached": max_stack_depth,
@@ -1402,7 +1438,9 @@ class PickleScanner(BaseScanner):
                     message="Recognized as legitimate ML model content",
                     location=self.current_file_path,
                     details={
-                        "frameworks": list(ml_context.get("frameworks", {}).keys()),
+                        "frameworks": list(ml_context.get("frameworks", {},
+                rule_code=None,  # Passing check
+            ).keys()),
                         "confidence": ml_context.get("overall_confidence", 0),
                         "opcode_count": opcode_count,
                     },
@@ -1423,12 +1461,15 @@ class PickleScanner(BaseScanner):
                                 IssueSeverity.CRITICAL,
                                 ml_context,
                             )
+                            # Get rule code for this import/module
+                            rule_code = get_import_rule_code(mod, func)
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=False,
                                 message=f"Suspicious reference {mod}.{func}",
                                 severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
+                                location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
+                                rule_code=rule_code,
                                 details={
                                     "module": mod,
                                     "function": func,
@@ -1458,6 +1499,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
+                                rule_code=None  # Passing check
                             )
 
                 # SMART DETECTION: Only flag REDUCE opcodes if not clearly ML content
@@ -1486,7 +1528,8 @@ class PickleScanner(BaseScanner):
                         passed=False,
                         message="Found REDUCE opcode - potential __reduce__ method execution",
                         severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
+                        location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
+                        rule_code="S201",
                         details={
                             "position": pos,
                             "opcode": opcode.name,
@@ -1528,12 +1571,15 @@ class PickleScanner(BaseScanner):
                         IssueSeverity.WARNING,
                         ml_context,
                     )
+                    # Get rule code for this pickle opcode
+                    opcode_rule = get_pickle_opcode_rule_code(opcode.name)
                     result.add_check(
                         name="INST/OBJ Opcode Safety Check",
                         passed=False,
                         message=f"Found {opcode.name} opcode - potential code execution",
                         severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
+                        location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
+                        rule_code=opcode_rule,
                         details={
                             "position": pos,
                             "opcode": opcode.name,
@@ -1562,12 +1608,28 @@ class PickleScanner(BaseScanner):
                             IssueSeverity.WARNING,
                             ml_context,
                         )
+                        # Determine rule code based on pattern
+                        rule_code = None
+                        if "eval" in suspicious_pattern or "exec" in suspicious_pattern:
+                            rule_code = "S104"
+                        elif "os.system" in suspicious_pattern:
+                            rule_code = "S101"
+                        elif "subprocess" in suspicious_pattern:
+                            rule_code = "S103"
+                        elif "__import__" in suspicious_pattern:
+                            rule_code = "S106"
+                        elif "compile" in suspicious_pattern:
+                            rule_code = "S105"
+                        else:
+                            rule_code = get_generic_rule_code(suspicious_pattern)
+
                         result.add_check(
                             name="String Pattern Security Check",
                             passed=False,
                             message=f"Suspicious string pattern: {suspicious_pattern}",
                             severity=severity,
-                            location=f"{self.current_file_path} (pos {pos})",
+                            location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
+                            rule_code=rule_code,
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
@@ -1596,7 +1658,8 @@ class PickleScanner(BaseScanner):
                             passed=False,
                             message="Nested pickle payload detected",
                             severity=severity,
-                            location=f"{self.current_file_path} (pos {pos})",
+                            location=f"{self.current_file_path} (pos {pos})", rule_code="S201"",
+                            rule_code="S213",
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
@@ -1616,12 +1679,15 @@ class PickleScanner(BaseScanner):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                            # Get rule code for encoding type
+                            enc_rule = get_encoding_rule_code("base64")
                             result.add_check(
                                 name="Encoded Pickle Detection",
                                 passed=False,
                                 message="Encoded pickle payload detected",
                                 severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
+                                location=f"{self.current_file_path} (pos {pos})", rule_code="S201"",
+                                rule_code=enc_rule,
                                 details={
                                     "position": pos,
                                     "opcode": opcode.name,
@@ -1643,12 +1709,18 @@ class PickleScanner(BaseScanner):
                                         is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
                                         if is_dangerous:
                                             severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+                                            # Get rule code for encoding type
+                                            enc_rule = get_encoding_rule_code(enc)
+                                            if not enc_rule:
+                                                enc_rule = "S507"  # Python embedded code
                                             result.add_check(
                                                 name="Encoded Python Code Detection",
                                                 passed=False,
-                                                message=f"Encoded Python code detected ({enc})",
+                                                message=f"Encoded Python code detected ({enc}")",
+                rule_code="S902"",
                                                 severity=severity,
                                                 location=f"{self.current_file_path} (pos {pos})",
+                                                rule_code=enc_rule,
                                                 details={
                                                     "position": pos,
                                                     "opcode": opcode.name,
@@ -1705,12 +1777,17 @@ class PickleScanner(BaseScanner):
                                 IssueSeverity.CRITICAL,
                                 ml_context,
                             )
+                            # Get rule code for this import/module
+                            rule_code = get_import_rule_code(mod, func)
+                            if not rule_code:
+                                rule_code = "S205"  # STACK_GLOBAL
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
                                 passed=False,
                                 message=f"Suspicious module reference found: {mod}.{func}",
                                 severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
+                                location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
+                                rule_code=rule_code,
                                 details={
                                     "module": mod,
                                     "function": func,
@@ -1740,6 +1817,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
+                                rule_code=None  # Passing check
                             )
                     else:
                         # Only warn about insufficient context if not ML content
@@ -1749,7 +1827,7 @@ class PickleScanner(BaseScanner):
                                 passed=False,
                                 message="STACK_GLOBAL opcode found without sufficient string context",
                                 severity=IssueSeverity.INFO,
-                                location=f"{self.current_file_path} (pos {pos})",
+                                location=f"{self.current_file_path} (pos {pos})", rule_code="S902"",
                                 details={
                                     "position": pos,
                                     "opcode": opcode.name,
@@ -1775,12 +1853,19 @@ class PickleScanner(BaseScanner):
                     ml_context,
                 )
                 module_name = dangerous_pattern.get("module", "")
+                # Get rule code for the dangerous module
+                module_name = dangerous_pattern.get("module", "")
+                func_name = dangerous_pattern.get("function", "")
+                rule_code = get_import_rule_code(module_name, func_name)
+                if not rule_code:
+                    rule_code = "S201"  # REDUCE opcode
                 result.add_check(
                     name="Reduce Pattern Analysis",
                     passed=False,
                     message=f"Detected dangerous __reduce__ pattern with "
-                    f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
+                    f"{dangerous_pattern.get('module', ''), rule_code="S902"}.{dangerous_pattern.get('function', '')}",
                     severity=severity,
+                    rule_code=rule_code,
                     location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
                     details={
                         **dangerous_pattern,
@@ -1802,7 +1887,9 @@ class PickleScanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "opcode_count": opcode_count,
-                        "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                        "ml_context_confidence": ml_context.get("overall_confidence", 0,
+                rule_code=None,  # Passing check
+            ),
                     },
                 )
 
@@ -1818,7 +1905,7 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Opcode Sequence Analysis",
                         passed=False,
-                        message=f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown')}",
+                        message=f"Suspicious opcode sequence: {sequence.get('pattern', 'unknown'"), rule_code="S902"}",
                         severity=severity,
                         location=f"{self.current_file_path} (pos {sequence.get('position', 0)})",
                         details={
@@ -1842,7 +1929,9 @@ class PickleScanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "opcode_count": opcode_count,
-                        "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                        "ml_context_confidence": ml_context.get("overall_confidence", 0,
+                rule_code=None,  # Passing check
+            ),
                     },
                 )
 
@@ -1929,8 +2018,8 @@ class PickleScanner(BaseScanner):
                         "This appears to be a large, legitimate ML model file that exceeds the scanner's "
                         "complexity limits. Complex model architectures with deeply nested structures can "
                         "exceed Python's recursion limits during analysis. The file appears legitimate based "
-                        "on format validation."
-                    ),
+                        "on format validation."),
+                rule_code="S902",
                 )
             elif is_recursion_error:
                 # Handle recursion errors more gracefully - this is a scanner limitation, not security issue
@@ -1963,8 +2052,8 @@ class PickleScanner(BaseScanner):
                     why=(
                         "The pickle file structure is too complex for the scanner to fully analyze due to "
                         "Python's recursion limits. This often occurs with legitimate but complex data structures. "
-                        "Consider manually inspecting the file if security is a concern."
-                    ),
+                        "Consider manually inspecting the file if security is a concern."),
+                rule_code="S902",
                 )
             elif is_benign_error:
                 # Log for security auditing but treat as non-fatal
@@ -1985,7 +2074,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="Pickle Stream Integrity Check",
                     passed=False,
-                    message=f"Scan truncated due to format complexity: {type(e).__name__}",
+                    message=f"Scan truncated due to format complexity: {type(e"), rule_code="S902".__name__}",
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={
@@ -2054,7 +2143,7 @@ class PickleScanner(BaseScanner):
                     severity=severity,
                     location=self.current_file_path,
                     details={
-                        "exception": str(e),
+                        "exception": str(e)}, rule_code="S902",
                         "exception_type": type(e).__name__,
                         "file_extension": file_ext,
                         "opcodes_analyzed": opcode_count,
@@ -2159,12 +2248,27 @@ class PickleScanner(BaseScanner):
                 for pattern in code_patterns:
                     if pattern in chunk:
                         pos = chunk.find(pattern)
+                        # Determine rule code based on pattern
+                        pattern_str = pattern.decode("ascii", errors="ignore")
+                        rule_code = None
+                        if "eval" in pattern_str or "exec" in pattern_str:
+                            rule_code = "S104"
+                        elif "os.system" in pattern_str or "os.popen" in pattern_str:
+                            rule_code = "S101"
+                        elif "subprocess" in pattern_str:
+                            rule_code = "S103"
+                        else:
+                            rule_code = get_generic_rule_code(pattern_str)
+
                         result.add_check(
                             name="Binary Data Safety Check",
                             passed=False,
                             message=(
-                                f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore')}"
+                                f"Suspicious code pattern in binary data: {pattern.decode('ascii', errors='ignore'})",
+                rule_code="S902"}"
+            )
                             ),
+                            rule_code=rule_code,
                             severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} (offset: {current_offset + pos})",
                             details={
@@ -2211,8 +2315,8 @@ class PickleScanner(BaseScanner):
                         },
                         why=(
                             "The binary content scan exceeded the configured time limit. Large model files may "
-                            "require more time to fully analyze."
-                        ),
+                            "require more time to fully analyze."),
+                rule_code="S902",
                     )
                     break
 
@@ -2239,12 +2343,16 @@ class PickleScanner(BaseScanner):
 
                 # Report significant patterns that weren't filtered out
                 for offset in filtered_positions[:10]:  # Limit to first 10 to avoid spam
+                    # Get rule code for executable type
+                    exec_rule = get_embedded_code_rule_code(description)
                     result.add_check(
                         name="Executable Signature Detection",
                         passed=False,
                         message=f"Executable signature found in binary data: {description}",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{self.current_file_path} (offset: {offset})",
+                rule_code="S902"",
+                        rule_code=exec_rule,
                         details={
                             "signature": sig.hex(),
                             "description": description,
@@ -2278,6 +2386,7 @@ class PickleScanner(BaseScanner):
                             "ml_context_explanation": explanation,
                             "ml_context_confidence": first_chunk_ml_context.get("weight_confidence", 0),
                         },
+                        rule_code=None  # Passing check
                     )
 
             # Special check for Windows PE files with more validation
@@ -2329,9 +2438,10 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="PE Executable Detection",
                         passed=False,
-                        message="Executable signature found in binary data: Windows executable (PE)",
+                        message="Executable signature found in binary data: Windows executable (PE", rule_code="S902")",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{self.current_file_path} (offset: {offset})",
+                        rule_code="S501",
                         details={
                             "signature": pe_sig.hex(),
                             "description": "Windows executable (PE) with valid DOS stub",
@@ -2362,6 +2472,7 @@ class PickleScanner(BaseScanner):
                             "total_found": len(pe_positions),
                             "ml_context_explanation": explanation,
                         },
+                        rule_code=None  # Passing check
                     )
 
             result.bytes_scanned = bytes_scanned
