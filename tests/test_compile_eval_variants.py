@@ -113,7 +113,6 @@ class TestCompileEvalVariants:
         finally:
             os.unlink(temp_path)
 
-
     def test_builtins_access_detection(self):
         """Test detection of __builtins__ access."""
         scanner = PickleScanner()
@@ -238,7 +237,7 @@ class TestCompileEvalVariants:
             b"\x80\x02"  # Protocol 2
             b"cbuiltins\neval\n"  # Import eval
             b"q\x00"  # BINPUT 0
-            b"(S'__import__(\"os\").system(\"echo pwned\")'\n"  # Malicious code
+            b'(S\'__import__("os").system("echo pwned")\'\n'  # Malicious code
             b"tq\x01"  # TUPLE, BINPUT 1
             b"Rq\x02"  # REDUCE - execute eval
             b"."  # STOP
