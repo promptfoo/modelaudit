@@ -1,340 +1,352 @@
-# ModelAudit False Positive Reduction - TODO
+# ModelAudit Security Improvements TODO
 
-## Completed Work (2024-01-19)
+Based on scanning known malicious models, here are critical security gaps that need to be addressed.
 
-### 1. Basic py_compile Validation ✅
+## 1. Add webbrowser.open Detection as CRITICAL
 
-- Created `modelaudit/utils/code_validation.py` with syntax validation and risk analysis
-- Enhanced pickle scanner to validate suspicious strings before flagging
-- Improved Keras Lambda layer detection with code validation
-- Added PyFunc/PyCall validation for TensorFlow SavedModel scanner
-- **Result**: 100% false positive reduction in test suite (5 → 0 false positives)
+### Problem
+Models containing `webbrowser.open` (like drhyrum/bert-tiny-torch-picklebomb) are only flagged as WARNING despite being able to open malicious URLs on model load.
 
-### 2. Advanced False Positive Reduction Modules (In Progress)
+### Implementation
+- Add `b"webbrowser"` to the dangerous_patterns list in `_scan_for_dangerous_patterns()`
+- Ensure it triggers CRITICAL severity
+- Check for variations: `webbrowser.open`, `webbrowser.open_new`, `webbrowser.open_new_tab`
 
-Created comprehensive modules for advanced analysis:
+### Validation
+```bash
+# Should detect as CRITICAL
+rye run modelaudit hf://drhyrum/bert-tiny-torch-picklebomb
+rye run modelaudit hf://Frase/tiny-bert-model-unsafe
 
-#### a. Unified ML Context System (`modelaudit/context/unified_context.py`)
+# Expected: CRITICAL issue for "webbrowser" pattern
+```
 
-- Cross-scanner intelligence sharing
-- Architecture detection (Transformer, CNN, RNN, etc.)
-- Framework-specific severity adjustments
-- Tensor/weight profiling
+## 2. Add runpy Module Detection
 
-#### b. Entropy-Based Analysis (`modelaudit/analysis/entropy_analyzer.py`)
+### Problem
+Models using `runpy.run_module` or `runpy.run_path` (like mkiani/gpt2-runpy) show 0 issues.
 
-- Shannon entropy calculation for data classification
-- Float pattern analysis for weight detection
-- Code vs data discrimination
-- Adaptive pattern search skipping
-
-#### c. Semantic Code Analysis (`modelaudit/analysis/semantic_analyzer.py`)
-
-- AST-based code flow analysis
-- Safe usage pattern detection
-- Import usage tracking
-- Obfuscation detection
+### Implementation
+- Add `b"runpy"` to dangerous_patterns
+- Detect specific methods: `run_module`, `run_path`, `_run_module_as_main`
+- Flag as CRITICAL (arbitrary code execution)
 
-#### d. Statistical Anomaly Detection (`modelaudit/analysis/anomaly_detector.py`)
-
-- Weight distribution profiling
-- Benford's Law validation
-- Outlier detection using statistical methods
-
-#### e. Framework Knowledge Base (`modelaudit/knowledge/framework_patterns.py`)
-
-- Framework-specific safe operations
-- Common false positive patterns
-- Architecture-specific patterns
-
-#### f. Integrated Analyzer (`modelaudit/analysis/integrated_analyzer.py`)
-
-- Multi-signal fusion with weighted confidence
-- Combined analysis from all modules
-- Risk level calculation
-
-## Testing Plan
-
-### Models to Test
-
-1. **Small Models** (for quick iteration)
-   - DistilBERT (HuggingFace)
-   - MobileNet (TensorFlow/Keras)
-   - Small GPT-2 (124M)
-   - ResNet-18 (PyTorch)
-   - XGBoost iris classifier
-
-2. **Recent/Popular Models**
-   - Phi-3-mini (Microsoft)
-   - Llama 3.2 1B (Meta)
-   - Stable Diffusion v1.5 (smaller variant)
-   - Whisper tiny (OpenAI)
-   - CLIP ViT-B/32
-
-### Test Methodology
-
-1. Download each model
-2. Run current scanner (baseline)
-3. Record false positives and true positives
-4. Apply new analysis modules
-5. Compare results
-6. Document issues and improvements
-
-### Success Criteria
-
-- Reduce false positive rate by >80%
-- Maintain 100% true positive rate
-- Processing time increase <2x
-- Clear explanations for all decisions
-
-## Test Results
-
-### Model 1: DistilBERT Base
-
-- **Source**: hf://distilbert-base-uncased
-- **Size**: 256MB
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 1
-  - True Positives: 0
-  - Total Issues: 1
-  - Scan Time: 4.52s
-  - Example FPs:
-    - File extension indicates pytorch_binary but header indicates...
-- **Notes**: Model downloaded successfully
-
-### Model 2: TinyBERT
-
-- **Source**: hf://huawei-noah/TinyBERT_General_4L_312D
-- **Size**: 56MB
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 1
-  - True Positives: 0
-  - Total Issues: 1
-  - Scan Time: 0.91s
-  - Example FPs:
-    - File extension indicates pytorch_binary but header indicates...
-- **Notes**: Model downloaded successfully
-
-### Model 3: MobileNet V2
-
-- **Source**: hf://timm/mobilenetv2_100.ra_in1k
-- **Size**: 14MB
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 1
-  - True Positives: 0
-  - Total Issues: 1
-  - Scan Time: 0.00s
-  - Example FPs:
-    - Unknown or unhandled format: zip...
-- **Notes**: Model downloaded successfully
-
-### Model 4: Phi-3 Mini 4K
-
-- **Source**: hf://microsoft/Phi-3-mini-4k-instruct
-- **Size**: 3.8B params
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 0
-  - True Positives: 0
-  - Total Issues: 0
-  - Scan Time: 0.00s
-- **Notes**: Model downloaded successfully
-
-### Model 5: Llama 3.2 1B
-
-- **Source**: hf://meta-llama/Llama-3.2-1B
-- **Size**: 1B params
-- **Framework**: pytorch
-- **Error**: Unknown error
-- **Notes**: Model downloaded successfully
-
-### Model 6: all-MiniLM-L6-v2
-
-- **Source**: hf://sentence-transformers/all-MiniLM-L6-v2
-- **Size**: 23MB
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 1
-  - True Positives: 0
-  - Total Issues: 1
-  - Scan Time: 0.00s
-  - Example FPs:
-    - Unknown or unhandled format: zip...
-- **Notes**: Model downloaded successfully
-
-### Model 7: GPT2 Small
-
-- **Source**: hf://gpt2
-- **Size**: 124M
-- **Framework**: pytorch
-- **Baseline Results**:
-  - False Positives: 1
-  - True Positives: 0
-  - Total Issues: 1
-  - Scan Time: 8.12s
-  - Example FPs:
-    - File extension indicates pytorch_binary but header indicates...
-- **Notes**: Model downloaded successfully
-
-## Issues Found During Testing
-
-### Issue 1: Keras Lambda Layer False Positives
-
-- **Model Affected**: Keras models with Lambda layers
-- **Root Cause**: Lambda layer detection not distinguishing between safe normalization functions and potentially dangerous code
-- **Proposed Fix**: Already implemented in code_validation.py - needs integration into keras_h5_scanner.py
-- **Priority**: High
-
-### Issue 2: Sklearn Pickle Opcode Over-reporting
-
-- **Model Affected**: All sklearn models using pickle
-- **Root Cause**: REDUCE and NEWOBJ opcodes are standard for sklearn model serialization
-- **Proposed Fix**: Use entropy analysis to distinguish ML weights from actual code
-- **Priority**: High
-
-### Issue 3: String Pattern Detection Too Aggressive
-
-- **Model Affected**: Models with documentation containing 'eval' or 'exec' in strings
-- **Root Cause**: Pattern matching on raw content without context
-- **Proposed Fix**: Apply semantic analysis to understand context
-- **Priority**: Medium
-
-## Next Steps
-
-1. Complete testing with 10 models
-2. Fix identified issues
-3. Integrate modules into scanners
-4. Update tests with real-world examples
-5. Performance optimization
-6. Documentation updates
-
-## Integration Plan
-
-### Phase 1: Low-Risk Integration
-
-- Add unified context to scanner base class
-- Use entropy analysis for binary scanning only
-- Test with subset of users
-
-### Phase 2: Full Integration
-
-- Enable semantic analysis for all code patterns
-- Activate framework knowledge base
-- Deploy anomaly detection
-
-### Phase 3: Optimization
-
-- Cache analysis results
-- Parallel processing for large models
-- Configurable sensitivity levels
-
-## Risks and Mitigations
-
-1. **Performance Impact**
-   - Risk: Analysis takes too long
-   - Mitigation: Lazy evaluation, caching, parallel processing
-
-2. **Over-Fitting**
-   - Risk: Too specific to test models
-   - Mitigation: Diverse model testing, continuous monitoring
-
-3. **Maintenance Burden**
-   - Risk: Complex system hard to maintain
-   - Mitigation: Good documentation, modular design, comprehensive tests
-
-## Summary of Work Completed
-
-### 1. Initial py_compile Implementation ✅
-
-- Created `modelaudit/utils/code_validation.py` with three main functions:
-  - `validate_python_syntax()`: Uses py_compile for syntax validation
-  - `extract_dangerous_constructs()`: AST-based analysis
-  - `is_code_potentially_dangerous()`: Risk assessment
-- Enhanced pickle scanner to validate suspicious strings
-- Modified Keras H5 scanner for Lambda layer validation
-- Enhanced TensorFlow SavedModel scanner for PyFunc/PyCall validation
-- **Result**: 100% false positive reduction in unit tests (5 → 0)
-
-### 2. Real Model Testing ✅
-
-Tested 7 real models from HuggingFace:
-
-- Most models show only debug-level issues (not false positives)
-- Current scanner already quite good at avoiding false positives
-- Main issues are informational messages about file format detection
-
-### 3. Synthetic False Positive Testing ✅
-
-Created comprehensive synthetic tests revealing areas for improvement:
-
-- PyTorch models with 'eval' patterns: ✓ No false positives
-- Keras Lambda layers: ✗ 3 false positives (needs fix)
-- Sklearn pickle models: ✗ 90 false positives (standard opcodes)
-- Models with exec/eval in strings: ✗ 6 false positives
-- Models with import in metadata: ✓ No false positives
-
-### 4. Advanced Analysis Modules Created ✅
-
-Built comprehensive framework for advanced false positive reduction:
-
-- **Unified ML Context**: Cross-scanner intelligence sharing
-- **Entropy Analyzer**: Distinguish code from ML weights
-- **Semantic Analyzer**: Context-aware code analysis
-- **Anomaly Detector**: Statistical weight validation
-- **Framework Knowledge Base**: ML framework patterns
-- **Integrated Analyzer**: Multi-signal fusion
-
-### 5. PR #206 Created ✅
-
-- Title: "feat: add py_compile validation to reduce false positives"
-- Includes comprehensive test suite
-- Shows 100% false positive reduction in unit tests
-- Maintains 100% true positive detection
-
-### Key Metrics
-
-- **Unit Test False Positives**: 5 → 0 (100% reduction)
-- **Real Model Performance**: Most models scan clean (debug messages only)
-- **Synthetic Test Results**: 99 false positives identified for fixing
-- **Test Coverage**: 7 real models + 5 synthetic test scenarios
-
-### Recommendations
-
-1. Integrate advanced modules gradually, starting with entropy analysis
-2. Focus on pickle scanner improvements (highest false positive count)
-3. Add ML-specific context to all scanners
-4. Create framework-specific allowlists for safe operations
-
-## Final Results Summary
-
-### Improvements Integrated:
-
-1. **Unified ML Context**: Added to base scanner for cross-scanner intelligence
-2. **Entropy Analysis**: Integrated into pickle scanner to distinguish ML weights from code
-3. **Semantic Analysis**: Partially integrated for dangerous pattern detection
-4. **Keras Lambda Validation**: Improved to only flag actually dangerous Lambda layers
-5. **Sklearn Support**: Better detection of sklearn models to reduce NEWOBJ/REDUCE false positives
-
-### Test Results:
-
-- **Unit Tests**: All 8 py_compile improvement tests passing ✅
-- **Pickle Scanner Tests**: All 12 tests passing ✅
-- **Keras Scanner Tests**: All 11 tests passing ✅
-- **Real Model Tests**: 7 models tested, only debug-level issues (file format warnings)
-- **Synthetic False Positive Tests**: Some improvements but more work needed on sklearn models
-
-### Remaining Issues:
-
-1. **Sklearn Pickle Models**: Still showing high false positive count (90) - needs better ML context detection
-2. **Keras Lambda Error**: NoneType error needs investigation
-3. **Entropy Analysis**: Could be more effective at distinguishing ML weights
-
-### Next Steps:
-
-1. Further improve sklearn model detection in ML context
-2. Add caching for entropy analysis to improve performance
-3. Complete semantic analyzer integration
-4. Add more ML framework patterns to knowledge base
+### Validation
+```bash
+# Should detect as CRITICAL
+rye run modelaudit hf://mkiani/gpt2-runpy
+
+# Expected: CRITICAL issue for "runpy" pattern
+```
+
+## 3. Add importlib Detection
+
+### Problem
+Dynamic imports via `importlib` can be used to load malicious modules.
+
+### Implementation
+- Add `b"importlib"` to dangerous_patterns
+- Detect: `import_module`, `__import__`, `reload`
+- Consider context to reduce false positives
+
+### Validation
+```bash
+# Test with models that use importlib for attacks
+# Create test pickle with importlib.import_module('os').system('echo pwned')
+```
+
+## 4. Improve os/subprocess Detection
+
+### Problem
+mkiani/gpt2-system shows 0 issues despite using system calls.
+
+### Implementation
+- Enhance detection for:
+  - `os.system`, `os.popen`, `os.spawn*`
+  - `subprocess.call`, `subprocess.run`, `subprocess.Popen`
+  - `commands.getoutput` (Python 2 legacy)
+- Check for obfuscated variants
+
+### Validation
+```bash
+# Should detect as CRITICAL
+rye run modelaudit hf://mkiani/gpt2-system
+
+# Expected: CRITICAL issue for "system" or "subprocess" patterns
+```
+
+## 5. Fix PyTorch ZIP Scanner File Detection
+
+### Problem
+When scanning pytorch_model.bin files directly, they show as "Clean" with 0 bytes scanned.
+
+### Implementation
+- Fix the PyTorchZipScanner's can_handle() method for .bin files
+- Ensure ZIP detection works for PyTorch archives
+- Properly extract and scan embedded pickles
+
+### Validation
+```bash
+# Should properly scan the file
+rye run modelaudit /path/to/pytorch_model.bin
+
+# Expected: Should scan >0 bytes and detect issues in embedded pickles
+```
+
+## 6. Add compile() and eval() Variants Detection
+
+### Problem
+Not detecting all code execution patterns comprehensively.
+
+### Implementation
+- Detect `compile()` with `exec` mode
+- Detect `eval()` with `__builtins__` access
+- Detect `type()` usage for class creation with malicious methods
+- Detect `globals()` and `locals()` manipulation
+
+### Validation
+```bash
+# Test with models using eval/exec variants
+rye run modelaudit hf://mkiani/gpt2-exec
+
+# Expected: CRITICAL issues for code execution patterns
+```
+
+## 7. Enhance TensorFlow SavedModel Scanner
+
+### Problem
+mkiani/unsafe-saved-model shows 0 issues despite being documented as unsafe.
+
+### Implementation
+- Create or enhance SavedModel scanner
+- Detect custom ops with execution capabilities
+- Check for unsafe function definitions
+- Scan for Lambda layers with arbitrary code
+
+### Validation
+```bash
+# Should detect issues
+rye run modelaudit hf://mkiani/unsafe-saved-model
+
+# Expected: Issues detected in SavedModel format
+```
+
+## 8. Improve Keras Scanner for .keras Files
+
+### Problem
+mkiani/unsafe-keras only shows file type mismatch warning, not security issues.
+
+### Implementation
+- Handle both HDF5 and ZIP-based .keras formats
+- Detect unsafe Lambda layers
+- Detect custom objects with __call__ methods
+- Check for arbitrary code in layer configs
+
+### Validation
+```bash
+# Should detect unsafe patterns
+rye run modelaudit hf://mkiani/unsafe-keras
+
+# Expected: CRITICAL issues for unsafe Lambda layers or custom objects
+```
+
+## 9. Add Timeout Configuration
+
+### Problem
+Large models (like mkiani/gpt2-exec) timeout during scanning.
+
+### Implementation
+- Add --timeout flag to CLI
+- Implement progressive scanning for large files
+- Add ability to skip large files with warning
+- Implement chunked scanning for huge models
+
+### Validation
+```bash
+# Should complete within timeout
+rye run modelaudit hf://mkiani/gpt2-exec --timeout 60
+
+# Expected: Either completes or provides partial results with timeout warning
+```
+
+## 10. Add Comprehensive GLOBAL Opcode Analysis
+
+### Problem
+Not catching all dangerous GLOBAL opcodes that reference malicious modules.
+
+### Implementation
+- Expand SUSPICIOUS_GLOBALS dictionary
+- Add pattern matching for GLOBAL opcodes:
+  - `nt.system`, `posix.system`, `posix.popen`
+  - `urllib.request.urlopen`, `requests.get`
+  - `socket.socket`, `ssl.wrap_socket`
+- Check GLOBAL + REDUCE combinations
+
+### Validation
+```bash
+# Test with known pickle bombs
+rye run modelaudit hf://drhyrum/bert-tiny-torch-picklebomb
+
+# Expected: CRITICAL issues for dangerous GLOBAL opcodes
+```
+
+## 11. Add Base64/Hex Encoded Payload Detection
+
+### Problem
+Malicious payloads can be hidden in base64/hex encoded strings.
+
+### Implementation
+- Detect large base64/hex strings in pickles
+- Attempt to decode and scan decoded content
+- Flag suspicious encoded content patterns
+- Check for `base64.b64decode`, `binascii.unhexlify`
+
+### Validation
+```bash
+# Test with models containing encoded payloads
+# Create test case with base64.b64decode(malicious_payload)
+
+# Expected: WARNING or CRITICAL for encoded suspicious content
+```
+
+## 12. Create Blacklist for Known Malicious Models
+
+### Problem
+Known malicious models should be immediately flagged.
+
+### Implementation
+- Maintain a list of known malicious model hashes
+- Check SHA256 of scanned files against blacklist
+- Add option to update blacklist from threat intelligence
+- Flag blacklisted models as CRITICAL immediately
+
+### Validation
+```bash
+# Test with known malicious models
+rye run modelaudit hf://drhyrum/bert-tiny-torch-picklebomb
+
+# Expected: CRITICAL issue "Known malicious model (blacklisted)"
+```
+
+## 13. Add URL/Domain Severity Escalation
+
+### Problem
+URLs are only flagged as WARNING, but malicious URLs should be CRITICAL.
+
+### Implementation
+- Check URLs against threat intelligence feeds
+- Escalate to CRITICAL for:
+  - Known malicious domains
+  - Suspicious URL patterns (/hack, /exploit, /shell)
+  - URLs with IP addresses instead of domains
+  - URLs with suspicious ports
+
+### Validation
+```bash
+# Test with model containing suspicious URL
+rye run modelaudit hf://drhyrum/bert-tiny-torch-picklebomb
+# Contains: https://pramuwaskito.org/hacker/q
+
+# Expected: CRITICAL issue for suspicious URL pattern (/hacker/)
+```
+
+## 14. Add exec/eval String Detection
+
+### Problem
+Our fix added pattern detection, but models might use string-based execution.
+
+### Implementation
+- Detect string literals containing code patterns
+- Look for: `"exec("`, `"eval("`, `"compile("`, `"__import__("` 
+- Check for obfuscated strings that decode to these patterns
+- Scan for chr() sequences building malicious strings
+
+### Validation
+```bash
+# Test with models using string-based execution
+rye run modelaudit hf://mkiani/gpt2-exec
+
+# Expected: CRITICAL issues for code execution strings
+```
+
+## 15. Improve Smart Detection Override
+
+### Problem
+ML context confidence is allowing some malicious patterns to be downgraded.
+
+### Implementation
+- Add explicit bypass list for patterns that should ALWAYS be CRITICAL
+- Never downgrade: `eval`, `exec`, `system`, `subprocess`, `webbrowser`
+- Add --strict flag to disable smart detection
+- Log when smart detection downgrades a finding
+
+### Validation
+```bash
+# Test with --strict flag
+rye run modelaudit hf://ykilcher/totally-harmless-model --strict
+
+# Expected: All dangerous patterns flagged as CRITICAL without downgrading
+```
+
+## Testing Strategy
+
+### Create Test Suite
+1. Create a comprehensive test suite with minimal malicious pickles for each attack vector
+2. Each test should be <1KB to avoid timeouts
+3. Test both direct patterns and obfuscated variants
+
+### Validation Script
+```python
+# test_malicious_detection.py
+test_cases = [
+    ("webbrowser_test.pkl", "CRITICAL", "webbrowser"),
+    ("runpy_test.pkl", "CRITICAL", "runpy"),
+    ("eval_exec_test.pkl", "CRITICAL", "eval"),
+    ("subprocess_test.pkl", "CRITICAL", "subprocess"),
+    ("importlib_test.pkl", "CRITICAL", "importlib"),
+]
+
+for filename, expected_severity, expected_pattern in test_cases:
+    result = scan_file(filename)
+    assert any(i.severity == expected_severity and expected_pattern in i.message 
+              for i in result.issues)
+```
+
+### Performance Requirements
+- Scanning should complete within 30 seconds for models <1GB
+- Memory usage should stay under 2GB for typical models
+- Should handle malformed files gracefully without crashing
+
+## Priority Order
+
+### High Priority (Security Critical)
+1. Add webbrowser.open detection ⚨
+2. Add runpy module detection ⚨
+3. Improve os/subprocess detection ⚨
+4. Fix PyTorch ZIP scanner ⚨
+
+### Medium Priority (Coverage)
+5. Add importlib detection
+6. Enhance TensorFlow SavedModel scanner
+7. Improve Keras scanner
+8. Add comprehensive GLOBAL opcode analysis
+
+### Low Priority (Enhancements)
+9. Add timeout configuration
+10. Add base64/hex payload detection
+11. Create model blacklist
+12. Add URL severity escalation
+
+## Success Metrics
+
+- **Detection Rate**: Should detect 100% of known malicious models from models.md
+- **False Positive Rate**: Should remain <5% on legitimate models
+- **Performance**: Should scan 95% of models within 30 seconds
+- **Coverage**: Should support all major ML formats (pickle, PyTorch, Keras, SavedModel, ONNX)
+
+## Notes
+
+- Each feature should include unit tests
+- Document new detection patterns in the README
+- Consider adding a --explain flag to show why something was flagged
+- Maintain backwards compatibility with existing scans
