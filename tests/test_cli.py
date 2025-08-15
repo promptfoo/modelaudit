@@ -75,8 +75,8 @@ def test_scan_directory(tmp_path):
     # Create a test directory with files
     test_dir = tmp_path / "test_dir"
     test_dir.mkdir()
-    (test_dir / "file1.txt").write_bytes(b"test content 1")
-    (test_dir / "file2.dat").write_bytes(b"test content 2")
+    (test_dir / "file1.pkl").write_bytes(b"test content 1")
+    (test_dir / "file2.bin").write_bytes(b"test content 2")
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_dir)], catch_exceptions=True)
@@ -171,6 +171,44 @@ def test_scan_sbom_output(tmp_path):
         json.loads(sbom_file.read_text())
     except json.JSONDecodeError:
         pytest.fail("SBOM output is not valid JSON")
+
+
+def test_scan_output_utf8_locale(tmp_path):
+    """Ensure output file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    output_file = tmp_path / "output.txt"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)], env=env)
+
+    assert output_file.exists()
+    try:
+        output_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("Output file is not valid UTF-8")
+
+
+def test_scan_sbom_utf8_locale(tmp_path):
+    """Ensure SBOM file is valid UTF-8 even with ASCII locale."""
+    test_file = tmp_path / "utf8_test.dat"
+    test_file.write_bytes(b"test content")
+
+    sbom_file = tmp_path / "sbom.json"
+
+    runner = CliRunner()
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)], env=env)
+
+    assert sbom_file.exists()
+    try:
+        sbom_file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        pytest.fail("SBOM file is not valid UTF-8")
 
 
 def test_scan_verbose_mode(tmp_path):
@@ -336,6 +374,7 @@ def test_scan_huggingface_url_help():
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
     assert "https://huggingface.co/user/model" in result.output
+    assert "https://pytorch.org/hub/pytorch_vision_resnet/" in result.output
     assert "hf://user/model" in result.output
     assert "s3://my-bucket/models/" in result.output
     assert "models:/MyModel/1" in result.output
@@ -383,11 +422,16 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "https://huggingface.co/test/model"])
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded" in result.output or "Clean" in result.output
+    assert (
+        "Downloaded" in result.output
+        or "Clean" in result.output
+        or "Downloaded successfully" in result.output
+        or "Downloading from" in result.output
+    )
 
     # Verify download was called
     mock_download.assert_called_once()
@@ -397,7 +441,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     call_args = mock_scan.call_args
     assert call_args[0][0] == str(test_model_dir)
 
-    # Verify cleanup was attempted
+    # Verify cleanup was attempted (only when not using cache)
     mock_rmtree.assert_called()
 
 
@@ -449,11 +493,16 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "hf://test/malicious-model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/malicious-model"])
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
-    assert "Downloaded" in result.output or "issue" in result.output.lower()
+    assert (
+        "Downloaded" in result.output
+        or "issue" in result.output.lower()
+        or "Downloaded successfully" in result.output
+        or "Downloading from" in result.output
+    )
 
     # Verify cleanup was still attempted
     mock_rmtree.assert_called()
@@ -473,6 +522,48 @@ def test_scan_mixed_paths_and_urls(mock_scan):
 
         # Should report error for missing local file
         assert "Path does not exist: /local/path/model.pkl" in result.output
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock_is_ph_url, tmp_path):
+    """Test scanning a PyTorch Hub URL successfully."""
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    (test_dir / "model.pt").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = {
+        "bytes_scanned": 1,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
+    """Test download failure for PyTorch Hub URL."""
+    mock_is_ph_url.return_value = True
+    mock_download.side_effect = Exception("boom")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
+
+    assert result.exit_code == 2
+    assert "Error downloading model" in result.output
 
 
 @patch("modelaudit.cli.is_cloud_url")
@@ -496,7 +587,7 @@ def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_c
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "s3://bucket/model.bin"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "s3://bucket/model.bin"])
 
     assert result.exit_code == 0
     mock_download.assert_called_once()
@@ -537,23 +628,18 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
     }
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "gs://bucket/model.pkl"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "gs://bucket/model.pkl"])
 
     assert result.exit_code == 1
     mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.is_jfrog_url")
-@patch("modelaudit.cli.download_artifact")
-@patch("modelaudit.cli.scan_model_directory_or_file")
-@patch("shutil.rmtree")
-def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_jfrog, tmp_path):
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL."""
     mock_is_jfrog.return_value = True
-    test_file = tmp_path / "model.bin"
-    test_file.write_text("dummy")
-    mock_download.return_value = test_file
-    mock_scan.return_value = {
+    mock_scan_jfrog.return_value = {
         "bytes_scanned": 512,
         "issues": [],
         "files_scanned": 1,
@@ -566,23 +652,72 @@ def test_scan_jfrog_url_success(mock_rmtree, mock_scan, mock_download, mock_is_j
     result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
 
     assert result.exit_code == 0
-    mock_download.assert_called_once()
-    mock_scan.assert_called_once()
-    mock_rmtree.assert_called()
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token=None,
+        access_token=None,
+        timeout=300,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+    )
 
 
 @patch("modelaudit.cli.is_jfrog_url")
-@patch("modelaudit.cli.download_artifact")
-def test_scan_jfrog_url_download_failure(mock_download, mock_is_jfrog):
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
     """Test handling of JFrog download failures."""
     mock_is_jfrog.return_value = True
-    mock_download.side_effect = Exception("fail")
+    mock_scan_jfrog.side_effect = Exception("fail")
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
 
     assert result.exit_code == 2
-    assert "Error downloading model" in result.output
+    assert "Error downloading/scanning model" in result.output
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
+    """Test scanning a JFrog URL with authentication."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = {
+        "bytes_scanned": 512,
+        "issues": [],
+        "files_scanned": 1,
+        "assets": [],
+        "has_errors": False,
+        "scanners": ["test_scanner"],
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            "--jfrog-api-token",
+            "test-token",
+            "--timeout",
+            "600",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token="test-token",
+        access_token=None,
+        timeout=600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+    )
 
 
 @patch("modelaudit.mlflow_integration.scan_mlflow_model")
@@ -603,7 +738,11 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 
     # Should succeed
     assert result.exit_code == 0
-    assert "Downloaded & Scanned" in result.output or "Clean" in result.output
+    assert (
+        "Downloaded & Scanned" in result.output
+        or "Clean" in result.output
+        or "Downloaded and scanned successfully" in result.output
+    )
 
     # Verify MLflow scan was called with correct parameters
     mock_scan_mlflow.assert_called_once_with(

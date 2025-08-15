@@ -61,8 +61,10 @@ class OciLayerScanner(BaseScanner):
                 else:
                     raise
         except Exception as e:
-            result.add_issue(
-                f"Error parsing manifest: {e}",
+            result.add_check(
+                name="OCI Manifest Parse",
+                passed=False,
+                message=f"Error parsing manifest: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception_type": type(e).__name__},
@@ -95,8 +97,10 @@ class OciLayerScanner(BaseScanner):
                 layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
 
             if not is_safe:
-                result.add_issue(
-                    f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
+                result.add_check(
+                    name="Layer Path Traversal Protection",
+                    passed=False,
+                    message=f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path}:{layer_ref}",
                     details={"layer": layer_ref},
@@ -104,8 +108,10 @@ class OciLayerScanner(BaseScanner):
                 continue
 
             if not os.path.exists(layer_path):
-                result.add_issue(
-                    f"Layer not found: {layer_ref}",
+                result.add_check(
+                    name="Layer File Existence Check",
+                    passed=False,
+                    message=f"Layer not found: {layer_ref}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
                 )
@@ -147,8 +153,10 @@ class OciLayerScanner(BaseScanner):
                         finally:
                             os.unlink(tmp_path)
             except Exception as e:
-                result.add_issue(
-                    f"Error processing layer {layer_ref}: {e}",
+                result.add_check(
+                    name="Layer Processing",
+                    passed=False,
+                    message=f"Error processing layer {layer_ref}: {e}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
                     details={"exception_type": type(e).__name__},

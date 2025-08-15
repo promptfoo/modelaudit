@@ -250,11 +250,11 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
     """
     if category == "import" and specific_item in DANGEROUS_IMPORTS:
         return DANGEROUS_IMPORTS[specific_item]
-    elif category == "opcode" and specific_item in DANGEROUS_OPCODES:
+    if category == "opcode" and specific_item in DANGEROUS_OPCODES:
         return DANGEROUS_OPCODES[specific_item]
-    elif category == "pattern" and specific_item in PATTERN_EXPLANATIONS:
+    if category == "pattern" and specific_item in PATTERN_EXPLANATIONS:
         return PATTERN_EXPLANATIONS[specific_item]
-    elif category == "tf_op" and specific_item in TF_OP_EXPLANATIONS:
+    if category == "tf_op" and specific_item in TF_OP_EXPLANATIONS:
         return TF_OP_EXPLANATIONS[specific_item]
 
     return None
@@ -433,7 +433,7 @@ def _enhance_explanation_with_context(message: str, base_explanation: str, conte
                 "This is particularly dangerous in pickle-based formats where object deserialization "
                 "can trigger immediate code execution without user consent."
             )
-        elif message.startswith("File too large"):
+        if message.startswith("File too large"):
             return (
                 "Extremely large model files may indicate embedded malicious data or denial-of-service "
                 "attacks. ML models with unexpectedly large sizes should be verified for legitimate "

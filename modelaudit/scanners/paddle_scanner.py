@@ -40,10 +40,13 @@ class PaddleScanner(BaseScanner):
         result.metadata["file_size"] = self.get_file_size(path)
 
         if not HAS_PADDLE:
-            result.add_issue(
-                "paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
+            result.add_check(
+                name="PaddlePaddle Library Check",
+                passed=False,
+                message="paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                details={"required_package": "paddlepaddle"},
             )
             result.finish(success=False)
             return result
@@ -65,8 +68,10 @@ class PaddleScanner(BaseScanner):
                     self._check_chunk(chunk, result, bytes_scanned - len(chunk), path)
             result.bytes_scanned = bytes_scanned
         except Exception as e:  # pragma: no cover - unexpected I/O errors
-            result.add_issue(
-                f"Error reading file: {e}",
+            result.add_check(
+                name="Paddle File Read",
+                passed=False,
+                message=f"Error reading file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -81,8 +86,10 @@ class PaddleScanner(BaseScanner):
         for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 pos = chunk.find(pattern)
-                result.add_issue(
-                    f"Suspicious binary pattern found: {pattern.decode('ascii', 'ignore')}",
+                result.add_check(
+                    name="Binary Pattern Detection",
+                    passed=False,
+                    message=f"Suspicious binary pattern found: {pattern.decode('ascii', 'ignore')}",
                     severity=IssueSeverity.INFO,
                     location=f"{path} (offset: {offset + pos})",
                     details={"pattern": pattern.decode("ascii", "ignore"), "offset": offset + pos},
@@ -94,8 +101,10 @@ class PaddleScanner(BaseScanner):
             text = chunk.decode("utf-8", "ignore")
         for regex in SUSPICIOUS_STRING_PATTERNS:
             if re.search(regex, text):
-                result.add_issue(
-                    f"Suspicious string pattern found: {regex}",
+                result.add_check(
+                    name="String Pattern Detection",
+                    passed=False,
+                    message=f"Suspicious string pattern found: {regex}",
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"pattern": regex},

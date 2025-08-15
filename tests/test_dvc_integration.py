@@ -32,6 +32,20 @@ class TestDvcIntegration:
         assert results["files_scanned"] == 1
         assert any(target.name in asset["path"] for asset in results["assets"])
 
+    def test_directory_scan_expands_dvc(self, tmp_path):
+        """Test that directory scans expand DVC files to their targets."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"c": 3}, f)
+
+        dvc_file = tmp_path / "model.pkl.dvc"
+        dvc_file.write_text("outs:\n- path: model.pkl\n")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert any(target.name in asset["path"] for asset in results["assets"])
+
     def test_resolve_multiple_outputs(self, tmp_path):
         """Test DVC file with multiple outputs."""
         # Create multiple targets

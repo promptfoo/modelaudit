@@ -1,7 +1,7 @@
 import os
 from typing import ClassVar
 
-from modelaudit.scanners.base import BaseScanner, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
 
 class MockScanner(BaseScanner):
@@ -80,6 +80,10 @@ def test_base_scanner_check_path_nonexistent():
     assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not exist" in result.issues[0].message.lower()
 
+    check_names = {check.name: check for check in result.checks}
+    assert "Path Exists" in check_names
+    assert check_names["Path Exists"].status == CheckStatus.FAILED
+
 
 def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     """Test _check_path with unreadable file."""
@@ -102,6 +106,10 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     assert len(result.issues) == 1
     assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not readable" in result.issues[0].message.lower()
+
+    check_map = {check.name: check for check in result.checks}
+    assert check_map["Path Exists"].status == CheckStatus.PASSED
+    assert check_map["Path Readable"].status == CheckStatus.FAILED
 
 
 def test_base_scanner_check_path_directory(tmp_path):
@@ -137,6 +145,10 @@ def test_base_scanner_check_path_valid(tmp_path):
 
     # Should return None for valid files
     assert result is None
+
+    merged = scanner._create_result()
+    check_names = {check.name for check in merged.checks}
+    assert {"Path Exists", "Path Readable", "File Type Validation"}.issubset(check_names)
 
 
 def test_base_scanner_get_file_size(tmp_path):
@@ -282,3 +294,46 @@ def test_base_scanner_small_file_handling(tmp_path):
 
     # Should return None (path is valid) - small files can't be validated
     assert result is None
+
+
+def test_base_scanner_read_file_safely(tmp_path):
+    """_read_file_safely should return bytes with chunking."""
+    scanner = MockScanner(config={"chunk_size": 4})
+
+    file_path = tmp_path / "data.test"
+    content = b"0123456789"
+    file_path.write_bytes(content)
+
+    data = scanner._read_file_safely(str(file_path))
+
+    assert isinstance(data, bytes)
+    assert data == content
+
+
+def test_base_scanner_size_limit_pass(tmp_path):
+    """_check_size_limit should record a passing check when within limits."""
+    scanner = MockScanner(config={"max_file_read_size": 100})
+    file_path = tmp_path / "small.test"
+    content = b"small"
+    file_path.write_bytes(content)
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert result is None
+    merged = scanner._create_result()
+    checks = {check.name: check for check in merged.checks}
+    assert checks["File Size Limit"].status == CheckStatus.PASSED
+
+
+def test_base_scanner_size_limit_fail(tmp_path):
+    """_check_size_limit should return a result when file is too large."""
+    scanner = MockScanner(config={"max_file_read_size": 5})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.success is False

@@ -28,7 +28,7 @@ jobs:
       full-image: ${{ steps.filter.outputs.full-image }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v2
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -55,7 +55,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build lightweight image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
@@ -86,8 +86,9 @@ jobs:
 
       - name: Test lightweight container with actual scan
         run: |
-          # Create a test model file and scan it
-          echo "import pickle; pickle.dump({'test': 'data'}, open('test.pkl', 'wb'))" | python3
+          # Create a test model file using Docker to ensure Python is available
+          docker run --rm -v $(pwd):/data python:3.11-slim sh -c "python -c \"import pickle; pickle.dump({'test': 'data'}, open('/data/test.pkl', 'wb'))\""
+          # Now scan the created file
           docker run --rm -v $(pwd):/data modelaudit:lightweight /data/test.pkl
 
   build-test-full:
@@ -113,7 +114,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build full image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.full

@@ -74,6 +74,9 @@ class ZipScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
+
         try:
             # Store the file path for use in issue locations
             self.current_file_path = path
@@ -83,8 +86,10 @@ class ZipScanner(BaseScanner):
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
-            result.add_issue(
-                f"Not a valid zip file: {path}",
+            result.add_check(
+                name="ZIP File Format Validation",
+                passed=False,
+                message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
@@ -92,8 +97,10 @@ class ZipScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
-            result.add_issue(
-                f"Error scanning zip file: {e!s}",
+            result.add_check(
+                name="ZIP File Scan",
+                passed=False,
+                message=f"Error scanning zip file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -113,27 +120,51 @@ class ZipScanner(BaseScanner):
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
-            result.add_issue(
-                f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
+            result.add_check(
+                name="ZIP Depth Bomb Protection",
+                passed=False,
+                message=f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
             return result
+        else:
+            result.add_check(
+                name="ZIP Depth Bomb Protection",
+                passed=True,
+                message="ZIP nesting depth is within safe limits",
+                location=path,
+                details={"depth": depth, "max_depth": self.max_depth},
+            )
 
         with zipfile.ZipFile(path, "r") as z:
             # Check number of entries
-            if len(z.namelist()) > self.max_entries:
-                result.add_issue(
-                    f"ZIP file contains too many entries ({len(z.namelist())} > {self.max_entries})",
+            entry_count = len(z.namelist())
+            if entry_count > self.max_entries:
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=False,
+                    message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={
-                        "entries": len(z.namelist()),
+                        "entries": entry_count,
                         "max_entries": self.max_entries,
                     },
                 )
                 return result
+            else:
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=True,
+                    message=f"Entry count ({entry_count}) is within limits",
+                    location=path,
+                    details={
+                        "entries": entry_count,
+                        "max_entries": self.max_entries,
+                    },
+                )
 
             # Scan each file in the archive
             for name in z.namelist():
@@ -142,8 +173,10 @@ class ZipScanner(BaseScanner):
                 temp_base = os.path.join(tempfile.gettempdir(), "extract")
                 resolved_name, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
-                    result.add_issue(
-                        f"Archive entry {name} attempted path traversal outside the archive",
+                    result.add_check(
+                        name="Path Traversal Protection",
+                        passed=False,
+                        message=f"Archive entry {name} attempted path traversal outside the archive",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path}:{name}",
                         details={"entry": name},
@@ -162,18 +195,35 @@ class ZipScanner(BaseScanner):
                         target_base,
                     )
                     if not target_safe:
-                        result.add_issue(
-                            f"Symlink {name} resolves outside extraction directory",
+                        # Check if it's specifically a critical system path
+                        if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                            message = f"Symlink {name} points to critical system path: {target}"
+                        else:
+                            message = f"Symlink {name} resolves outside extraction directory"
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=message,
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target},
+                            details={"target": target, "entry": name},
                         )
-                    if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
-                        result.add_issue(
-                            f"Symlink {name} points to critical system path: {target}",
+                    elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Symlink {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target},
+                            details={"target": target, "entry": name},
+                        )
+                    else:
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=True,
+                            message=f"Symlink {name} is safe",
+                            location=f"{path}:{name}",
+                            details={"target": target, "entry": name},
                         )
                     # Do not scan symlink contents
                     continue
@@ -186,8 +236,10 @@ class ZipScanner(BaseScanner):
                 if info.compress_size > 0:
                     compression_ratio = info.file_size / info.compress_size
                     if compression_ratio > 100:
-                        result.add_issue(
-                            f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
+                        result.add_check(
+                            name="Compression Ratio Check",
+                            passed=False,
+                            message=f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
                             severity=IssueSeverity.WARNING,
                             location=f"{path}:{name}",
                             details={
@@ -195,6 +247,22 @@ class ZipScanner(BaseScanner):
                                 "compressed_size": info.compress_size,
                                 "uncompressed_size": info.file_size,
                                 "ratio": compression_ratio,
+                                "threshold": 100,
+                            },
+                        )
+                    else:
+                        # Record safe compression ratio
+                        result.add_check(
+                            name="Compression Ratio Check",
+                            passed=True,
+                            message=f"Compression ratio ({compression_ratio:.1f}x) is within safe limits: {name}",
+                            location=f"{path}:{name}",
+                            details={
+                                "entry": name,
+                                "compressed_size": info.compress_size,
+                                "uncompressed_size": info.file_size,
+                                "ratio": compression_ratio,
+                                "threshold": 100,
                             },
                         )
 
@@ -204,29 +272,34 @@ class ZipScanner(BaseScanner):
                         "max_entry_size",
                         10485760,
                     )  # 10 MB default
-                    data = b""
-                    with z.open(name) as entry:
-                        while True:
-                            chunk = entry.read(4096)  # Read in 4 KB chunks
-                            if not chunk:
-                                break
-                            data += chunk
-                            if len(data) > max_entry_size:
-                                raise ValueError(
-                                    f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                )
+
+                    if name.lower().endswith(".zip"):
+                        suffix = ".zip"
+                    else:
+                        safe_name = re.sub(
+                            r"[^a-zA-Z0-9_.-]",
+                            "_",
+                            os.path.basename(name),
+                        )
+                        suffix = f"_{safe_name}"
+
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp_path = tmp.name
+                        total_size = 0
+                        with z.open(name) as entry:
+                            while True:
+                                chunk = entry.read(4096)
+                                if not chunk:
+                                    break
+                                total_size += len(chunk)
+                                if total_size > max_entry_size:
+                                    raise ValueError(
+                                        f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
+                                    )
+                                tmp.write(chunk)
 
                     # Check if it's another zip file
                     if name.lower().endswith(".zip"):
-                        # Write to temporary file and scan recursively
-
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".zip",
-                            delete=False,
-                        ) as tmp:
-                            tmp.write(data)
-                            tmp_path = tmp.name
-
                         try:
                             nested_result = self._scan_zip_file(tmp_path, depth + 1)
                             # Update locations in nested results
@@ -254,22 +327,6 @@ class ZipScanner(BaseScanner):
                         # Try to scan the file with appropriate scanner
                         # Write to temporary file with proper extension and original filename
                         # This preserves the original filename for scanners that need it (like ManifestScanner)
-
-                        _, ext = os.path.splitext(name)
-                        # Create a more meaningful temporary filename that includes the original name
-                        # This helps scanners like ManifestScanner that depend on filename patterns
-                        # Use robust sanitization to handle special characters safely
-                        safe_name = re.sub(
-                            r"[^a-zA-Z0-9_.-]",
-                            "_",
-                            os.path.basename(name),
-                        )
-                        with tempfile.NamedTemporaryFile(
-                            suffix=f"_{safe_name}",
-                            delete=False,
-                        ) as tmp:
-                            tmp.write(data)
-                            tmp_path = tmp.name
 
                         try:
                             # Import core here to avoid circular import
@@ -311,16 +368,18 @@ class ZipScanner(BaseScanner):
 
                             # If no scanner handled the file, count the bytes ourselves
                             if file_result.scanner_name == "unknown":
-                                result.bytes_scanned += len(data)
+                                result.bytes_scanned += total_size
                         finally:
                             os.unlink(tmp_path)
 
                 except Exception as e:
-                    result.add_issue(
-                        f"Error scanning ZIP entry {name}: {e!s}",
+                    result.add_check(
+                        name="ZIP Entry Scan",
+                        passed=False,
+                        message=f"Error scanning ZIP entry {name}: {e!s}",
                         severity=IssueSeverity.WARNING,
                         location=f"{path}:{name}",
-                        details={"entry": name, "exception": str(e)},
+                        details={"entry": name, "exception": str(e), "exception_type": type(e).__name__},
                     )
 
         result.metadata["contents"] = contents

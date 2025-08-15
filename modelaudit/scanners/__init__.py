@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Iterator
 from typing import Any, Optional
 
-from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +23,8 @@ def _check_numpy_compatibility() -> tuple[bool, str]:
                 False,
                 f"NumPy {numpy_version} detected. Some ML frameworks may require NumPy < 2.0 for compatibility.",
             )
-        else:
-            return True, f"NumPy {numpy_version} detected (compatible)."
+
+        return True, f"NumPy {numpy_version} detected (compatible)."
     except ImportError:
         return False, "NumPy not available."
 
@@ -97,7 +97,7 @@ class ScannerRegistry:
                 "class": "PyTorchBinaryScanner",
                 "description": "Scans PyTorch binary files",
                 "extensions": [".bin"],
-                "priority": 2,  # Must come before generic scanners for .bin files
+                "priority": 3,  # After pytorch_zip to allow ZIP detection first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
@@ -106,7 +106,7 @@ class ScannerRegistry:
                 "class": "TensorFlowSavedModelScanner",
                 "description": "Scans TensorFlow SavedModel files",
                 "extensions": [".pb", ""],  # Empty string for directories
-                "priority": 3,
+                "priority": 4,
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
             },
@@ -115,7 +115,7 @@ class ScannerRegistry:
                 "class": "KerasH5Scanner",
                 "description": "Scans Keras H5 model files",
                 "extensions": [".h5", ".hdf5", ".keras"],
-                "priority": 4,
+                "priority": 5,
                 "dependencies": ["h5py"],  # Heavy dependency
                 "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
             },
@@ -124,7 +124,7 @@ class ScannerRegistry:
                 "class": "OnnxScanner",
                 "description": "Scans ONNX model files",
                 "extensions": [".onnx"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
@@ -133,7 +133,7 @@ class ScannerRegistry:
                 "class": "CoreMLScanner",
                 "description": "Scans Apple Core ML model files",
                 "extensions": [".mlmodel"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["coreml"],  # Heavy dependency
                 "numpy_sensitive": True,
             },
@@ -142,7 +142,7 @@ class ScannerRegistry:
                 "class": "OpenVinoScanner",
                 "description": "Scans OpenVINO IR model files",
                 "extensions": [".xml"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
@@ -150,8 +150,8 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
                 "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [".pt", ".pth"],
-                "priority": 6,  # Must come before ZipScanner since .pt/.pth files are zip files
+                "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
+                "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
@@ -200,6 +200,15 @@ class ScannerRegistry:
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
+            "text": {
+                "module": "modelaudit.scanners.text_scanner",
+                "class": "TextScanner",
+                "description": "Scans ML-related text files",
+                "extensions": [".txt", ".md", ".markdown", ".rst"],
+                "priority": 11,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "manifest": {
                 "module": "modelaudit.scanners.manifest_scanner",
                 "class": "ManifestScanner",
@@ -217,7 +226,7 @@ class ScannerRegistry:
                     ".model",
                     ".metadata",
                 ],
-                "priority": 11,
+                "priority": 12,
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
@@ -307,6 +316,23 @@ class ScannerRegistry:
                 "priority": 18,
                 "dependencies": ["paddlepaddle"],
                 "numpy_sensitive": True,
+            },
+            "tar": {
+                "module": "modelaudit.scanners.tar_scanner",
+                "class": "TarScanner",
+                "description": "Scans TAR archive files",
+                "extensions": [
+                    ".tar",
+                    ".tar.gz",
+                    ".tgz",
+                    ".tar.bz2",
+                    ".tbz2",
+                    ".tar.xz",
+                    ".txz",
+                ],
+                "priority": 98,
+                "dependencies": [],
+                "numpy_sensitive": False,
             },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
@@ -527,6 +553,7 @@ def __getattr__(name: str) -> Any:
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
+        "TarScanner": "tar",
         "ZipScanner": "zip",
     }
 
@@ -535,12 +562,20 @@ def __getattr__(name: str) -> Any:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
             return scanner_class
-        else:
-            raise ImportError(
-                f"Failed to load scanner '{name}' - dependencies may not be installed",
-            )
+        raise ImportError(
+            f"Failed to load scanner '{name}' - dependencies may not be installed",
+        )
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+# Helper function for getting scanner for a file
+def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+    """Get an instantiated scanner for a given file path"""
+    scanner_class = _registry.get_scanner_for_path(path)
+    if scanner_class:
+        return scanner_class(config=config)
+    return None
 
 
 # Export the registry for direct use
@@ -549,9 +584,12 @@ __all__ = [
     "SCANNER_REGISTRY",
     # Base classes (already imported)
     "BaseScanner",
+    "Check",
+    "CheckStatus",
     "Issue",
     "IssueSeverity",
     "ScanResult",
     "_registry",
+    "get_scanner_for_file",
     # Scanner classes will be lazy loaded via __getattr__
 ]

@@ -65,11 +65,12 @@ from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 # when encountered in pickle files during deserialization
 SUSPICIOUS_GLOBALS = {
     # System interaction modules - HIGH RISK
-    "os": "*",  # File system operations, command execution
+    "os": "*",  # File system operations, command execution (system, popen, spawn*)
     "posix": "*",  # Unix system calls (os.system equivalent)
     "sys": "*",  # Python runtime manipulation
-    "subprocess": "*",  # Process spawning and control
+    "subprocess": "*",  # Process spawning and control (call, run, Popen, check_output)
     "runpy": "*",  # Dynamic module execution
+    "commands": "*",  # Python 2 legacy command execution (getoutput, getstatusoutput)
     # Code execution functions - CRITICAL RISK
     "builtins": [
         "eval",
@@ -79,8 +80,37 @@ SUSPICIOUS_GLOBALS = {
         "input",
         "__import__",
     ],  # Dynamic code evaluation and file access
+    # Python 2 style builtins - CRITICAL RISK
+    "__builtin__": [
+        "eval",
+        "exec",
+        "execfile",
+        "compile",
+        "open",
+        "input",
+        "raw_input",
+        "__import__",
+        "reload",
+    ],  # Python 2 style builtin functions (still exploitable in many contexts)
+    # Alternative builtin references - CRITICAL RISK
+    "__builtins__": [
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "__import__",
+    ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
-    "importlib": ["import_module"],  # Dynamic module loading
+    "importlib": [
+        "import_module",  # Dynamic module loading
+        "__import__",  # Direct import function
+        "reload",  # Module reloading
+        "find_loader",  # Module loader access
+        "load_module",  # Direct module loading
+    ],  # CRITICAL RISK - Dynamic module imports can load malicious code
+    "importlib.machinery": "*",  # Module machinery manipulation
+    "importlib.util": "*",  # Module utilities for dynamic imports
     # Serialization/deserialization - MEDIUM RISK
     "pickle": ["loads", "load"],  # Recursive pickle loading
     "base64": ["b64decode", "b64encode", "decode"],  # Encoding/obfuscation
@@ -94,6 +124,8 @@ SUSPICIOUS_GLOBALS = {
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
     "socket": ["*"],  # Network communication
+    # Web/Network interaction - CRITICAL RISK
+    "webbrowser": ["open", "open_new", "open_new_tab"],  # Can open malicious URLs
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
@@ -114,6 +146,13 @@ DANGEROUS_BUILTINS = [
     "open",
     "input",
     "__import__",
+    "globals",  # Access to global namespace
+    "locals",  # Access to local namespace
+    "setattr",  # Can set arbitrary attributes
+    "getattr",  # Can access arbitrary attributes
+    "delattr",  # Can delete attributes
+    "vars",  # Access to object's namespace
+    "dir",  # Can enumerate available attributes
 ]
 
 # Suspicious string patterns used by PickleScanner
@@ -128,7 +167,10 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"exec\(",  # Dynamic code execution
     # System command execution - CRITICAL
     r"os\.system",  # Direct system command execution
-    r"subprocess\.(?:Popen|call|check_output)",  # Process spawning
+    r"os\.popen",  # Process spawning with pipe
+    r"os\.spawn[a-z]*",  # os.spawn* variants (spawnv, spawnve, spawnl, etc.)
+    r"subprocess\.(?:Popen|call|check_output|run|check_call)",  # Process spawning
+    r"commands\.(?:getoutput|getstatusoutput)",  # Python 2 legacy command execution
     # Dynamic imports - HIGH RISK
     # Match explicit module imports to reduce noise from unrelated "import" substrings
     r"\bimport\s+[\w\.]+",  # Import statements referencing modules
