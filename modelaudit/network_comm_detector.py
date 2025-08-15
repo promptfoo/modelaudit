@@ -289,26 +289,28 @@ class NetworkCommDetector:
     def _scan_domains(self, data: bytes, context: str) -> None:
         """Scan for domain name patterns."""
         seen_domains = set()
-        
+
         # Skip domain detection in binary ML model files to avoid false positives
         # Binary weights can randomly match domain patterns
-        if context and any(ext in context.lower() for ext in ['.bin', '.pt', '.pth', '.ckpt', '.h5', '.pb', '.onnx']):
+        if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
             # For ML model files, only look for very explicit domain references
             # that are unlikely to occur randomly
             explicit_domain_patterns = [
-                rb'https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}',  # Full URLs only
-                rb'["\'](?:api|webhook|callback|endpoint)["\']:\s*["\'][a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}',  # Config-like patterns
+                rb"https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}",  # Full URLs only
+                # Config-like patterns
+                rb'["\'](?:api|webhook|callback|endpoint)["\']:\s*["\'][a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}',
             ]
-            
+
             for pattern in explicit_domain_patterns:
                 for match in re.finditer(pattern, data, re.IGNORECASE):
                     domain_match = match.group()
-                    if b'://' in domain_match:
+                    if b"://" in domain_match:
                         # Extract domain from URL
-                        domain = domain_match.split(b'://', 1)[1].split(b'/')[0].decode('utf-8', errors='ignore').lower()
+                        parts = domain_match.split(b"://", 1)[1].split(b"/")[0]
+                        domain = parts.decode("utf-8", errors="ignore").lower()
                     else:
-                        domain = match.group().decode('utf-8', errors='ignore').lower()
-                    
+                        domain = match.group().decode("utf-8", errors="ignore").lower()
+
                     if domain not in seen_domains:
                         seen_domains.add(domain)
                         self.findings.append(
@@ -338,13 +340,13 @@ class NetworkCommDetector:
             # Skip ML model layer names (e.g., layer1.weight, conv2d.bias)
             if any(pattern in domain for pattern in ["layer", "weight", "bias", "conv", "bn", "norm", "fc", "dense"]):
                 continue
-                
+
             # Skip very short domain names in binary files (likely false positives)
             # e.g., "8.to", "9.cc" are probably random bytes, not real domains
             parts = domain.split(".")
             if len(parts) < 2:
                 continue
-            
+
             # Skip single character subdomains with short TLDs (common false positive in binary data)
             if len(parts) == 2 and len(parts[0]) <= 2 and len(parts[1]) <= 2:
                 continue  # Skip patterns like "8.to", "h8.cc", etc.
@@ -508,7 +510,7 @@ class NetworkCommDetector:
         """Scan for references to suspicious ports."""
         # Skip port detection in binary ML model files to avoid false positives
         # Binary weights can randomly contain patterns like ":22" or ":23"
-        if context and any(ext in context.lower() for ext in ['.bin', '.pt', '.pth', '.ckpt', '.h5', '.pb', '.onnx']):
+        if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
             # For ML model files, only check for very specific network patterns
             # that are unlikely to occur randomly
             for port in self.SUSPICIOUS_PORTS:
@@ -521,9 +523,10 @@ class NetworkCommDetector:
                     f"ssh.*:{port}".encode(),
                     f"telnet.*:{port}".encode(),
                 ]
-                
+
                 for pattern_bytes in explicit_patterns:
                     import re
+
                     pattern = re.compile(pattern_bytes, re.IGNORECASE | re.DOTALL)
                     if pattern.search(data):
                         port_name = self._get_port_name(port)
