@@ -1092,6 +1092,7 @@ class PickleScanner(BaseScanner):
             b"exec",
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"webbrowser",  # Can open malicious URLs (webbrowser.open)
         ]
 
         # Limit how much we scan for performance
