@@ -75,14 +75,14 @@ def test_bad_offsets(tmp_path: Path) -> None:
 
 def test_deeply_nested_header(tmp_path: Path) -> None:
     """Ensure deeply nested headers are handled gracefully."""
+    # Create a deeply nested structure manually as a string to avoid json.dumps recursion
+    # We'll create a JSON string with deep nesting that will trigger RecursionError on parse
     depth = 1500
-    nested: dict[str, dict] = {}
-    current = nested
-    for _ in range(depth):
-        current["a"] = {}
-        current = current["a"]
-
-    header_bytes = json.dumps(nested).encode("utf-8")
+    
+    # Build the deeply nested JSON string manually
+    header_str = '{"a":' * depth + '{}' + '}' * depth
+    header_bytes = header_str.encode("utf-8")
+    
     file_path = tmp_path / "deep.safetensors"
     with open(file_path, "wb") as f:
         f.write(struct.pack("<Q", len(header_bytes)))
