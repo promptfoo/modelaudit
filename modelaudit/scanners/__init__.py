@@ -110,6 +110,15 @@ class ScannerRegistry:
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
             },
+            "keras_zip": {
+                "module": "modelaudit.scanners.keras_zip_scanner",
+                "class": "KerasZipScanner",
+                "description": "Scans ZIP-based Keras model files",
+                "extensions": [".keras"],
+                "priority": 4,  # Higher priority than keras_h5 to check ZIP format first
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
             "keras_h5": {
                 "module": "modelaudit.scanners.keras_h5_scanner",
                 "class": "KerasH5Scanner",
