@@ -1122,6 +1122,8 @@ class PickleScanner(BaseScanner):
             b"exec",
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"importlib",  # Dynamic module loading (import_module, reload, etc.)
+            b"runpy",  # Running modules as scripts (run_module, run_path)
         ]
 
         # Limit how much we scan for performance
