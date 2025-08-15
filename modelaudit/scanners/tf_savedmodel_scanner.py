@@ -112,6 +112,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
+        # Check if this is a keras_metadata.pb file
+        if path.endswith("keras_metadata.pb"):
+            # Scan it for Lambda layers
+            self._scan_keras_metadata(path, result)
+            result.finish(success=True)
+            return result
+
         try:
             with open(path, "rb") as f:
                 content = f.read()
@@ -157,6 +164,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Scan the saved_model.pb file
         file_scan_result = self._scan_saved_model_file(str(saved_model_path))
         result.merge(file_scan_result)
+
+        # Check for keras_metadata.pb which contains Lambda layer definitions
+        keras_metadata_path = Path(dir_path) / "keras_metadata.pb"
+        if keras_metadata_path.exists():
+            self._scan_keras_metadata(str(keras_metadata_path), result)
 
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
@@ -261,6 +273,49 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                             why=get_tf_op_explanation(node.op),
                         )
+
+                # Check for StatefulPartitionedCall which can contain custom functions
+                if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
+                    # These operations can contain arbitrary functions
+                    # Check the function name for suspicious patterns
+                    func_attr = node.attr["f"]
+                    if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
+                        func_name = func_attr.func.name
+
+                        # Check for suspicious function names
+                        suspicious_func_patterns = [
+                            "lambda",
+                            "eval",
+                            "exec",
+                            "compile",
+                            "__import__",
+                            "system",
+                            "popen",
+                            "subprocess",
+                            "pickle",
+                            "marshal",
+                        ]
+
+                        for pattern in suspicious_func_patterns:
+                            if pattern in func_name.lower():
+                                result.add_check(
+                                    name="StatefulPartitionedCall Security Check",
+                                    passed=False,
+                                    message=f"StatefulPartitionedCall with suspicious function: {func_name}",
+                                    severity=IssueSeverity.WARNING,
+                                    location=f"{self.current_file_path} (node: {node.name})",
+                                    details={
+                                        "op_type": node.op,
+                                        "node_name": node.name,
+                                        "function_name": func_name,
+                                        "suspicious_pattern": pattern,
+                                    },
+                                    why=(
+                                        "StatefulPartitionedCall can execute custom functions "
+                                        "that may contain arbitrary code."
+                                    ),
+                                )
+                                break
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
@@ -385,4 +440,171 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "meta_graph": (meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"),
                 },
                 why=get_tf_op_explanation(node.op),
+            )
+
+    def _scan_keras_metadata(self, path: str, result: ScanResult) -> None:
+        """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
+        import base64
+        import re
+
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+                result.bytes_scanned += len(content)
+
+                # Convert to string for pattern matching
+                content_str = content.decode("utf-8", errors="ignore")
+
+                # Look for Lambda layers in the metadata
+                lambda_pattern = re.compile(r'"class_name":\s*"Lambda"', re.IGNORECASE)
+                lambda_matches = lambda_pattern.findall(content_str)
+
+                if lambda_matches:
+                    # Found Lambda layers, now look for the function definition
+                    # Lambda functions are often base64 encoded in the metadata
+
+                    # Pattern to find base64 encoded functions in Lambda configs
+                    # Look for the function field with base64 data
+                    # The pattern needs to handle newlines in the base64 string
+                    func_pattern = re.compile(
+                        r'"function":\s*\{[^}]*"items":\s*\[\s*"([A-Za-z0-9+/=\s\\n]+)"', re.DOTALL
+                    )
+
+                    for match in func_pattern.finditer(content_str):
+                        base64_code = match.group(1)
+
+                        try:
+                            # Clean the base64 string (remove newlines and spaces)
+                            base64_code = base64_code.replace("\\n", "").replace(" ", "").strip()
+
+                            # Try to decode the base64
+                            decoded = base64.b64decode(base64_code)
+                            decoded_str = decoded.decode("utf-8", errors="ignore")
+
+                            # Check for dangerous patterns in the decoded content
+                            dangerous_patterns = [
+                                "exec",
+                                "eval",
+                                "__import__",
+                                "compile",
+                                "open",
+                                "subprocess",
+                                "os.system",
+                                "os.popen",
+                                "pickle",
+                                "marshal",
+                                "importlib",
+                                "runpy",
+                                "webbrowser",
+                            ]
+
+                            found_patterns = []
+                            for pattern in dangerous_patterns:
+                                if pattern in decoded_str.lower():
+                                    found_patterns.append(pattern)
+
+                            if found_patterns:
+                                result.add_issue(
+                                    message=f"Lambda layer contains dangerous code: {', '.join(found_patterns)}",
+                                    severity=IssueSeverity.CRITICAL,
+                                    location=path,
+                                    details={
+                                        "layer_type": "Lambda",
+                                        "dangerous_patterns": found_patterns,
+                                        "code_preview": decoded_str[:200] + "..."
+                                        if len(decoded_str) > 200
+                                        else decoded_str,
+                                        "encoding": "base64",
+                                    },
+                                    why=(
+                                        "Lambda layers can execute arbitrary Python code during model inference, "
+                                        "which poses a severe security risk."
+                                    ),
+                                )
+                            else:
+                                # Lambda layer found but no obvious dangerous patterns
+                                result.add_check(
+                                    name="Lambda Layer Detection",
+                                    passed=False,
+                                    message="Lambda layer detected with custom code",
+                                    severity=IssueSeverity.WARNING,
+                                    location=path,
+                                    details={
+                                        "layer_type": "Lambda",
+                                        "code_preview": decoded_str[:100] + "..."
+                                        if len(decoded_str) > 100
+                                        else decoded_str,
+                                    },
+                                    why=(
+                                        "Lambda layers can execute arbitrary Python code. "
+                                        "Review the code to ensure it's safe."
+                                    ),
+                                )
+
+                        except Exception as decode_error:
+                            # Couldn't decode the function, but Lambda layer is still present
+                            result.add_check(
+                                name="Lambda Layer Detection",
+                                passed=False,
+                                message="Lambda layer detected (unable to decode function)",
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "layer_type": "Lambda",
+                                    "decode_error": str(decode_error),
+                                },
+                                why=(
+                                    "Lambda layers can execute arbitrary code. "
+                                    "Unable to inspect the code for security analysis."
+                                ),
+                            )
+
+                    # If we found Lambda layers but no function definitions
+                    if not func_pattern.search(content_str):
+                        result.add_check(
+                            name="Lambda Layer Detection",
+                            passed=False,
+                            message=f"Found {len(lambda_matches)} Lambda layer(s) in model",
+                            severity=IssueSeverity.WARNING,
+                            location=path,
+                            details={
+                                "layer_count": len(lambda_matches),
+                            },
+                            why="Lambda layers can execute arbitrary Python code during model inference.",
+                        )
+
+                # Also check for other suspicious patterns directly in the metadata
+                suspicious_patterns = {
+                    "eval": "Code evaluation",
+                    "exec": "Code execution",
+                    "__import__": "Dynamic imports",
+                    "os.system": "System command execution",
+                    "subprocess": "Process spawning",
+                    "pickle": "Unsafe deserialization",
+                    "marshal": "Unsafe deserialization",
+                }
+
+                for pattern, description in suspicious_patterns.items():
+                    if pattern in content_str.lower():
+                        result.add_check(
+                            name="Keras Metadata Pattern Check",
+                            passed=False,
+                            message=f"Suspicious pattern '{pattern}' found in keras metadata",
+                            severity=IssueSeverity.WARNING,
+                            location=path,
+                            details={
+                                "pattern": pattern,
+                                "description": description,
+                            },
+                            why=f"The pattern '{pattern}' suggests {description} capability in the model.",
+                        )
+
+        except Exception as e:
+            result.add_check(
+                name="Keras Metadata Scan",
+                passed=False,
+                message=f"Error scanning keras_metadata.pb: {e!s}",
+                severity=IssueSeverity.DEBUG,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
