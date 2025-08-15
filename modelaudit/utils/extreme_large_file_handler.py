@@ -5,7 +5,6 @@ This module provides advanced utilities for scanning extremely large model files
 with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
 """
 
-import hashlib
 import logging
 import mmap
 import os
@@ -22,7 +21,8 @@ logger = logging.getLogger(__name__)
 # Size thresholds for extreme models
 EXTREME_MODEL_THRESHOLD = 50 * 1024 * 1024 * 1024  # 50GB - use memory mapping
 MASSIVE_MODEL_THRESHOLD = 200 * 1024 * 1024 * 1024  # 200GB - distributed scanning
-COLOSSAL_MODEL_THRESHOLD = 1000 * 1024 * 1024 * 1024  # 1TB - special handling
+COLOSSAL_MODEL_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - special handling
+# Note: No upper limit - we can handle files of ANY size through sampling
 
 # Memory mapping parameters
 MMAP_CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks for memory mapping
@@ -154,9 +154,7 @@ class MemoryMappedScanner:
                     # Progress reporting
                     if progress_callback:
                         percentage = (bytes_scanned / self.file_size) * 100
-                        progress_callback(
-                            f"Memory-mapped scan: {bytes_scanned:,}/{self.file_size:,} bytes", percentage
-                        )
+                        progress_callback(f"Memory-mapped scan: {bytes_scanned:,}/{self.file_size:,} bytes", percentage)
 
                     # Move to next window with small overlap
                     if end_pos >= self.file_size:
@@ -178,28 +176,51 @@ class MemoryMappedScanner:
         return result
 
     def _analyze_window(self, data: bytes, offset: int) -> ScanResult:
-        """Analyze a window of data for suspicious patterns."""
+        """Analyze a window of data using the actual scanner's checks."""
         result = ScanResult(scanner_name=self.scanner.name)
 
-        # Quick pattern matching for known malicious signatures
-        suspicious_patterns = [
-            (b"exec", "exec() call detected"),
-            (b"eval", "eval() call detected"),
-            (b"__import__", "Dynamic import detected"),
-            (b"os.system", "System command execution detected"),
-            (b"subprocess", "Subprocess execution detected"),
-            (b"pickle.loads", "Pickle deserialization detected"),
-            (b"marshal.loads", "Marshal deserialization detected"),
-        ]
+        # First, run scanner-specific analysis if available
+        if hasattr(self.scanner, "_analyze_chunk"):
+            # Scanner has chunk analysis capability
+            chunk_result = self.scanner._analyze_chunk(data, offset)
+            result.merge(chunk_result)
+        elif hasattr(self.scanner, "_analyze_bytes"):
+            # Scanner can analyze raw bytes
+            bytes_result = self.scanner._analyze_bytes(data, offset)
+            result.merge(bytes_result)
+        else:
+            # Fall back to pattern matching for all scanners
+            # This ensures we still catch obvious malicious patterns
+            suspicious_patterns = [
+                (b"exec", "exec() call detected"),
+                (b"eval", "eval() call detected"),
+                (b"__import__", "Dynamic import detected"),
+                (b"os.system", "System command execution detected"),
+                (b"subprocess", "Subprocess execution detected"),
+                (b"pickle.loads", "Pickle deserialization detected"),
+                (b"marshal.loads", "Marshal deserialization detected"),
+                (b"compile(", "compile() call detected"),
+                (b"__builtins__", "Builtins access detected"),
+                (b"getattr", "Dynamic attribute access detected"),
+            ]
 
-        for pattern, message in suspicious_patterns:
-            if pattern in data:
-                result.add_issue(
-                    message,
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"offset {offset:,}",
-                    details={"pattern": pattern.decode("utf-8", errors="ignore"), "offset": offset},
-                )
+            for pattern, message in suspicious_patterns:
+                if pattern in data:
+                    result.add_issue(
+                        message,
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"offset {offset:,}",
+                        details={"pattern": pattern.decode("utf-8", errors="ignore"), "offset": offset},
+                    )
+
+        # Run any additional scanner-specific checks
+        if hasattr(self.scanner, "check_for_embedded_secrets"):
+            # Check for embedded secrets in this window
+            self.scanner.check_for_embedded_secrets(data, result, f"offset {offset:,}")
+
+        if hasattr(self.scanner, "check_for_dangerous_imports"):
+            # Check for dangerous imports
+            self.scanner.check_for_dangerous_imports(data, result, f"offset {offset:,}")
 
         return result
 
@@ -374,49 +395,73 @@ class ExtremeLargeFileHandler:
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
     def _scan_massive_file(self) -> ScanResult:
-        """Scan massive files with distributed approach."""
-        result = ScanResult(scanner_name=self.scanner.name)
+        """Scan massive files using memory-mapped approach with FULL security checks."""
+        logger.info(f"Scanning massive file ({self.total_size:,} bytes) with full security checks")
 
-        # For massive files, we only do signature-based scanning
+        # Add informational note about file size
+        result = ScanResult(scanner_name=self.scanner.name)
         result.add_issue(
-            f"File too large for complete scanning ({self.total_size:,} bytes)",
-            severity=IssueSeverity.WARNING,
+            f"Scanning massive file ({self.total_size:,} bytes) - this may take some time",
+            severity=IssueSeverity.INFO,
             details={
                 "file_size": self.total_size,
-                "recommendation": "Consider using SafeTensors format or splitting the model",
+                "strategy": "memory-mapped with full checks",
+                "note": "All security checks will be performed",
             },
         )
 
-        # Quick signature check
-        try:
-            with open(self.file_path, "rb") as f:
-                # Read first 1MB for format detection
-                header = f.read(1024 * 1024)
+        # Use memory-mapped scanner to run ALL checks
+        # This ensures we don't skip any security validations
+        mmap_scanner = MemoryMappedScanner(self.file_path, self.scanner)
 
-                # Calculate file hash (first 10MB only for speed)
-                f.seek(0)
-                hasher = hashlib.sha256()
-                hasher.update(f.read(10 * 1024 * 1024))
-                partial_hash = hasher.hexdigest()
+        # If the scanner has its own scanning method, try to use it with memory mapping
+        if hasattr(self.scanner, "_scan_with_mmap"):
+            # Scanner supports memory-mapped scanning directly
+            scan_result = self.scanner._scan_with_mmap(self.file_path, self.progress_callback)
+        else:
+            # Use our generic memory-mapped approach but with the scanner's checks
+            scan_result = mmap_scanner.scan_with_mmap(self.progress_callback)
 
-                result.add_issue(
-                    "Partial file signature calculated",
-                    severity=IssueSeverity.INFO,
-                    details={"partial_sha256": partial_hash, "hash_bytes": "first 10MB"},
-                )
+            # Also run the scanner's normal checks on sampled sections
+            # to ensure we don't miss scanner-specific validations
+            try:
+                # Let the scanner analyze the header (first 10MB)
+                with open(self.file_path, "rb") as f:
+                    header_data = f.read(min(10 * 1024 * 1024, self.total_size))
 
-                # Basic format detection
-                if header.startswith(b"PK"):
-                    result.add_issue("ZIP-based format detected", severity=IssueSeverity.INFO)
-                elif header.startswith(b"\x80"):
-                    result.add_issue("Pickle-based format detected", severity=IssueSeverity.WARNING)
+                    # If scanner has special header analysis, use it
+                    if hasattr(self.scanner, "_analyze_header"):
+                        header_result = self.scanner._analyze_header(header_data)
+                        scan_result.merge(header_result)
+                    elif hasattr(self.scanner, "_analyze_chunk"):
+                        header_result = self.scanner._analyze_chunk(header_data, 0)
+                        scan_result.merge(header_result)
 
-                result.bytes_scanned = len(header)
+                    # For scanners that need the full scan method, create a temp file with sample
+                    # This ensures pickle scanners, etc. can run their full validation
+                    if hasattr(self.scanner, "scan") and not hasattr(self.scanner, "_analyze_chunk"):
+                        import tempfile
 
-        except Exception as e:
-            logger.error(f"Error scanning massive file: {e}")
-            result.add_issue(f"Scan error: {e!s}", severity=IssueSeverity.WARNING)
+                        with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
+                            tmp.write(header_data)
+                            tmp_path = tmp.name
 
+                        try:
+                            # Run scanner's full validation on the sample
+                            sample_result = self.scanner.scan(tmp_path)
+                            # Merge findings but note they're from a sample
+                            for issue in sample_result.issues:
+                                issue.message = f"[Sample] {issue.message}"
+                            scan_result.merge(sample_result)
+                        finally:
+                            import os as os_module
+
+                            os_module.unlink(tmp_path)
+
+            except Exception as e:
+                logger.warning(f"Error running additional scanner checks: {e}")
+
+        result.merge(scan_result)
         return result
 
 

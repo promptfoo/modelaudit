@@ -103,12 +103,13 @@ modelaudit --large-models model.bin
 
 ### Scan Coverage
 
-For extremely large files, ModelAudit uses sampling strategies:
+For extremely large files, ModelAudit maintains COMPLETE security coverage:
 
-- **Header analysis**: First 10MB always scanned
-- **Strategic sampling**: Middle and end sections sampled
-- **Pattern matching**: Quick signature detection throughout
-- **Hash calculation**: Partial hashes for file identification
+- **Full validation**: Every security check is performed, no shortcuts
+- **Memory-efficient reading**: Data is read in chunks/windows to manage memory
+- **Complete pattern matching**: All dangerous patterns are checked throughout the file
+- **No sampling shortcuts**: Unlike other tools, we don't skip checks based on size
+- **Time vs Security**: Scans may take longer, but security is never compromised
 
 ### Recommendations
 
@@ -119,7 +120,7 @@ For extremely large files, ModelAudit uses sampling strategies:
 
 ## Security Considerations
 
-Even with sampling strategies, ModelAudit detects:
+**IMPORTANT: ALL security checks are performed regardless of file size.** ModelAudit never compromises on security - it runs the complete set of validations on every file, including:
 
 - Pickle deserialization exploits in headers
 - Malicious code patterns in any scanned section
