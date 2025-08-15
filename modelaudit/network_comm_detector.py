@@ -343,14 +343,14 @@ class NetworkCommDetector:
 
             # Skip very short domain names in binary files (likely false positives)
             # e.g., "8.to", "9.cc" are probably random bytes, not real domains
-            parts = domain.split(".")
-            if len(parts) < 2:
+            domain_parts = domain.split(".")
+            if len(domain_parts) < 2:
                 continue
 
             # Skip single character subdomains with short TLDs (common false positive in binary data)
-            if len(parts) == 2 and len(parts[0]) <= 2 and len(parts[1]) <= 2:
+            if len(domain_parts) == 2 and len(domain_parts[0]) <= 2 and len(domain_parts[1]) <= 2:
                 continue  # Skip patterns like "8.to", "h8.cc", etc.
-            tld = parts[-1]
+            tld = domain_parts[-1]
             # Common TLDs (not exhaustive, but covers most)
             valid_tlds = [
                 "com",
@@ -394,8 +394,7 @@ class NetworkCommDetector:
 
             seen_domains.add(domain)
 
-            # Check TLD
-            tld = domain.split(".")[-1]
+            # Check TLD for suspicious domains
             suspicious_tlds = ["tk", "ml", "ga", "cf", "cc", "to", "pw"]
 
             confidence = 0.3
@@ -552,8 +551,8 @@ class NetworkCommDetector:
                     f"PORT={port}".encode(),
                 ]
 
-                for pattern in patterns:
-                    if pattern in data:
+                for pattern_bytes in patterns:
+                    if pattern_bytes in data:
                         port_name = self._get_port_name(port)
 
                         self.findings.append(
