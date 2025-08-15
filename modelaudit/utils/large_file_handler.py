@@ -223,9 +223,7 @@ class LargeFileHandler:
 
         except Exception as e:
             logger.error(f"Error during streaming scan: {e}")
-            result.add_issue(
-                f"Streaming scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)}
-            )
+            result.add_issue(f"Streaming scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
 
         result.bytes_scanned = bytes_processed
         self._report_progress(f"Completed streaming analysis of {self.file_name}", 100)
@@ -284,9 +282,7 @@ class LargeFileHandler:
 
         except Exception as e:
             logger.error(f"Error during optimized scan: {e}")
-            result.add_issue(
-                f"Optimized scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)}
-            )
+            result.add_issue(f"Optimized scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
 
         self._report_progress(f"Completed optimized scan of {self.file_name}", 100)
         return result
