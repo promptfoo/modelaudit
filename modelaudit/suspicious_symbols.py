@@ -102,7 +102,15 @@ SUSPICIOUS_GLOBALS = {
         "__import__",
     ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
-    "importlib": ["import_module"],  # Dynamic module loading
+    "importlib": [
+        "import_module",  # Dynamic module loading
+        "__import__",  # Direct import function
+        "reload",  # Module reloading
+        "find_loader",  # Module loader access
+        "load_module",  # Direct module loading
+    ],  # CRITICAL RISK - Dynamic module imports can load malicious code
+    "importlib.machinery": "*",  # Module machinery manipulation
+    "importlib.util": "*",  # Module utilities for dynamic imports
     # Serialization/deserialization - MEDIUM RISK
     "pickle": ["loads", "load"],  # Recursive pickle loading
     "base64": ["b64decode", "b64encode", "decode"],  # Encoding/obfuscation
