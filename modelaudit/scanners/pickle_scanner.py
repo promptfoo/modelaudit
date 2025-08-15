@@ -816,6 +816,9 @@ class PickleScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
+        # Start scan timer for timeout tracking
+        self._start_scan_timer()
+
         # Initialize context for this file
         self._initialize_context(path)
 
@@ -852,6 +855,9 @@ class PickleScanner(BaseScanner):
                 while bytes_read < max_bytes:
                     # Check for interrupts during file reading
                     self.check_interrupted()
+
+                    # Check for timeout
+                    self._check_timeout()
 
                     chunk = f.read(min(chunk_size, max_bytes - bytes_read))
                     if not chunk:

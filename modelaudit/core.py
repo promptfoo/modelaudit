@@ -793,11 +793,22 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         )
         scanner = preferred_scanner(config=config)
 
-        if use_large_handler:
-            logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
-            result = scan_large_file(path, scanner, progress_callback, timeout)
-        else:
-            result = scanner.scan(path)
+        try:
+            if use_large_handler:
+                logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                result = scan_large_file(path, scanner, progress_callback, timeout)
+            else:
+                result = scanner.scan(path)
+        except TimeoutError as e:
+            # Handle timeout gracefully
+            result = ScanResult(scanner_name=preferred_scanner.name)
+            result.add_issue(
+                f"Scan timeout: {e}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout": config.get("timeout", 300), "error": str(e)},
+            )
+            result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
         scanner_class = _registry.get_scanner_for_path(path)
@@ -805,11 +816,22 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
 
-            if use_large_handler:
-                logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
-                result = scan_large_file(path, scanner, progress_callback, timeout)
-            else:
-                result = scanner.scan(path)
+            try:
+                if use_large_handler:
+                    logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                    result = scan_large_file(path, scanner, progress_callback, timeout)
+                else:
+                    result = scanner.scan(path)
+            except TimeoutError as e:
+                # Handle timeout gracefully
+                result = ScanResult(scanner_name=scanner_class.name)
+                result.add_issue(
+                    f"Scan timeout: {e}",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"timeout": config.get("timeout", 300), "error": str(e)},
+                )
+                result.finish(success=False)
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
