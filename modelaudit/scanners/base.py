@@ -387,7 +387,7 @@ class BaseScanner(ABC):
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
-        self.timeout = self.config.get("timeout", 300)  # Default 5 minutes
+        self.timeout = self.config.get("timeout", 1800)  # Default 30 minutes for large models
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
@@ -399,6 +399,7 @@ class BaseScanner(ABC):
         )  # Default unlimited
         self._path_validation_result: Optional[ScanResult] = None
         self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
+        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -433,6 +434,68 @@ class BaseScanner(ABC):
             self._path_validation_result = None
 
         return result
+
+    def _start_scan_timer(self) -> None:
+        """Start the scan timer for timeout tracking"""
+        self.scan_start_time = time.time()
+
+    def _check_timeout(self, allow_partial: bool = False) -> bool:
+        """Check if the scan has exceeded the timeout.
+
+        Args:
+            allow_partial: If True, return True on timeout instead of raising exception
+
+        Returns:
+            True if timeout exceeded and allow_partial is True, False otherwise
+
+        Raises:
+            TimeoutError: If the scan has exceeded the configured timeout and allow_partial is False
+        """
+        if self.scan_start_time is None:
+            self.scan_start_time = time.time()
+            return False
+
+        elapsed = time.time() - self.scan_start_time
+        if elapsed > self.timeout:
+            if allow_partial:
+                return True
+            raise TimeoutError(f"Scan exceeded timeout of {self.timeout} seconds (elapsed: {elapsed:.1f}s)")
+
+        return False
+
+    def _get_remaining_time(self) -> float:
+        """Get the remaining time before timeout.
+
+        Returns:
+            Remaining time in seconds, or timeout value if timer not started
+        """
+        if self.scan_start_time is None:
+            return self.timeout
+
+        elapsed = time.time() - self.scan_start_time
+        remaining = self.timeout - elapsed
+        return max(0, remaining)
+
+    def _add_timeout_warning(self, result: ScanResult, bytes_scanned: int, total_bytes: int) -> None:
+        """Add a warning to the result indicating the scan was incomplete due to timeout.
+
+        Args:
+            result: The scan result to add the warning to
+            bytes_scanned: Number of bytes scanned before timeout
+            total_bytes: Total bytes in the file
+        """
+        percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
+        result.add_issue(
+            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+            severity=IssueSeverity.WARNING,
+            location=self.current_file_path,
+            details={
+                "bytes_scanned": bytes_scanned,
+                "total_bytes": total_bytes,
+                "percentage_complete": percentage,
+                "timeout_seconds": self.timeout,
+            },
+        )
 
     def add_file_integrity_check(self, path: str, result: ScanResult) -> None:
         """Add file integrity check with hashes to the scan result.
@@ -668,23 +731,45 @@ class BaseScanner(ABC):
 
         # Check if path exists
         if not os.path.exists(path):
-            result.add_issue(
-                f"Path does not exist: {path}",
+            result.add_check(
+                name="Path Exists",
+                passed=False,
+                message=f"Path does not exist: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Exists",
+                passed=True,
+                message="Path exists",
+                location=path,
+                details={"path": path},
+            )
 
         # Check if path is readable
         if not os.access(path, os.R_OK):
-            result.add_issue(
-                f"Path is not readable: {path}",
+            result.add_check(
+                name="Path Readable",
+                passed=False,
+                message=f"Path is not readable: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Readable",
+                passed=True,
+                message="Path is readable",
+                location=path,
+                details={"path": path},
+            )
 
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
@@ -698,8 +783,10 @@ class BaseScanner(ABC):
                 if not validate_file_type(path):
                     header_format = detect_file_format_from_magic(path)
                     ext_format = detect_format_from_extension(path)
-                    result.add_issue(
-                        (
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=False,
+                        message=(
                             f"File type validation failed: extension indicates {ext_format} but magic bytes "
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
@@ -712,17 +799,26 @@ class BaseScanner(ABC):
                             "security_check": "file_type_validation",
                         },
                     )
+                else:
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=True,
+                        message="File type validation passed",
+                        location=path,
+                    )
             except Exception as e:
                 # Don't fail the scan if file type validation has an error
-                result.add_issue(
-                    f"File type validation error: {e!s}",
+                result.add_check(
+                    name="File Type Validation",
+                    passed=False,
+                    message=f"File type validation error: {e!s}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
 
-        # Store validation warnings for the scanner to merge later
-        self._path_validation_result = result if result.issues else None
+        # Store validation checks or warnings for the scanner to merge later
+        self._path_validation_result = result if (result.issues or result.checks) else None
 
         # Only return result for CRITICAL issues that should stop the scan
         critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
@@ -775,24 +871,47 @@ class BaseScanner(ABC):
 
     def _check_size_limit(self, path: str) -> Optional[ScanResult]:
         """Check if the file exceeds the configured size limit."""
-        result = self._create_result()
         file_size = self.get_file_size(path)
-        result.metadata["file_size"] = file_size
 
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
-            result.add_issue(
-                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+            result = self._create_result()
+            result.metadata["file_size"] = file_size
+            result.add_check(
+                name="File Size Limit",
+                passed=False,
+                message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
-                why="Large files may consume excessive memory or processing time. Consider whether this file "
-                "size is expected for your use case.",
+                why=(
+                    "Large files may consume excessive memory or processing time. "
+                    "Consider whether this file size is expected for your use case."
+                ),
             )
             result.finish(success=False)
             return result
+
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
+            self._path_validation_result.add_check(
+                name="File Size Limit",
+                passed=True,
+                message="File size within limit",
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+        else:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
 
         return None
 

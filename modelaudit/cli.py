@@ -224,6 +224,11 @@ def cli() -> None:
     is_flag=True,
     help="Use streaming analysis for large cloud files (experimental)",
 )
+@click.option(
+    "--large-model-support/--no-large-model-support",
+    default=True,
+    help="Enable optimized scanning for large models (>10MB) [default: enabled]",
+)
 def scan_command(
     paths: tuple[str, ...],
     suppress: tuple[str, ...],
@@ -247,6 +252,7 @@ def scan_command(
     preview: bool,
     selective: bool,
     stream: bool,
+    large_model_support: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
