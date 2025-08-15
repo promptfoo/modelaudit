@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, cast
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -169,8 +169,9 @@ class PyTorchZipScanner(BaseScanner):
                         with z.open(name, "r") as zf:
                             # Scan the pickle file in a memory-efficient way
                             # The pickle scanner will handle the streaming internally
+                            # Type cast to satisfy mypy - z.open returns IO[bytes] which is compatible with BinaryIO
                             sub_result = self.pickle_scanner._scan_pickle_bytes(
-                                zf,
+                                cast(io.BufferedIOBase, zf),  # type: ignore[arg-type]
                                 file_size,
                             )
                         bytes_scanned += file_size
