@@ -615,13 +615,15 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     if files_scanned == 0:
         return 2
 
-    # Check for any security findings (warnings or critical issues only)
+    # Check for any security findings (warnings, errors, or critical issues)
     issues = results.get("issues", [])
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
-        # Only WARNING and CRITICAL issues should trigger exit code 1
+        # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
         security_issues = [
-            issue for issue in issues if isinstance(issue, dict) and issue.get("severity") in ["warning", "critical"]
+            issue
+            for issue in issues
+            if isinstance(issue, dict) and issue.get("severity") in ["warning", "error", "critical"]
         ]
         if security_issues:
             return 1
