@@ -1,0 +1,124 @@
+{
+  "bytes_scanned": 70883,
+  "issues": [],
+  "checks": [
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/keras_metadata.pb",
+      "details": {
+        "md5": "d3752de5385c0caeb8bcc49c1e05ca70",
+        "sha256": "f3702890fe7aaadb9d6ecbb9fed7cffea031f39b1bd7b6ea00b50cd3305b9fd4",
+        "sha512": "2d01eaa0dd4d9031a9ea622f86d34f6d13138781f31066daedd7f3aca61d1aa9b4d2de903f5517b273117ec37b7f9f303a38832a33b9bd6f2a0a14f11cb6e234",
+        "file_size": 11216
+      },
+      "timestamp": 1755214195.790435
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/saved_model.pb",
+      "details": {
+        "md5": "b092521489e383e8eaeff725452fdaf3",
+        "sha256": "bfb03d4554a7712fec2e767fdaf93cb3d80c8d572d8bfd7e3ed86cf81ba47cb1",
+        "sha512": "ddb8543b44522206e56d7d33c25cc130a579211b963a48a94dbc4cf0698a047a3f89ceecdced09ab17a9331d2d37e2813e304d91f6b6cf9a52ab72bda33a4968",
+        "file_size": 59667
+      },
+      "timestamp": 1755214195.7959418
+    }
+  ],
+  "files_scanned": 5,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/keras_metadata.pb",
+      "type": "tf_savedmodel",
+      "size": 11216
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/saved_model.pb",
+      "type": "tf_savedmodel",
+      "size": 59667
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/models--mkiani--unsafe-saved-model/refs/main",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/.cache/huggingface/download/saved_model.pb.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/.cache/huggingface/download/keras_metadata.pb.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": ["tf_savedmodel", "skipped"],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/keras_metadata.pb": {
+      "file_size": 11216,
+      "file_hashes": {
+        "md5": "d3752de5385c0caeb8bcc49c1e05ca70",
+        "sha256": "f3702890fe7aaadb9d6ecbb9fed7cffea031f39b1bd7b6ea00b50cd3305b9fd4",
+        "sha512": "2d01eaa0dd4d9031a9ea622f86d34f6d13138781f31066daedd7f3aca61d1aa9b4d2de903f5517b273117ec37b7f9f303a38832a33b9bd6f2a0a14f11cb6e234"
+      },
+      "op_counts": {},
+      "suspicious_op_found": false,
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": true
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/saved_model.pb": {
+      "file_size": 59667,
+      "file_hashes": {
+        "md5": "b092521489e383e8eaeff725452fdaf3",
+        "sha256": "bfb03d4554a7712fec2e767fdaf93cb3d80c8d572d8bfd7e3ed86cf81ba47cb1",
+        "sha512": "ddb8543b44522206e56d7d33c25cc130a579211b963a48a94dbc4cf0698a047a3f89ceecdced09ab17a9331d2d37e2813e304d91f6b6cf9a52ab72bda33a4968"
+      },
+      "op_counts": {
+        "VarHandleOp": 4,
+        "ReadVariableOp": 4,
+        "Placeholder": 2,
+        "StatefulPartitionedCall": 3,
+        "NoOp": 1,
+        "Const": 1
+      },
+      "suspicious_op_found": false,
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": true
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/models--mkiani--unsafe-saved-model/refs/main": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/.cache/huggingface/download/saved_model.pb.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/unsafe-saved-model/.cache/huggingface/download/keras_metadata.pb.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    }
+  },
+  "start_time": 1755214189.1406121,
+  "duration": 6.658552885055542,
+  "total_checks": 5,
+  "passed_checks": 2,
+  "failed_checks": 3
+}

@@ -165,6 +165,9 @@ def detect_file_format(path: str) -> str:
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
+        # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
+        if magic4.startswith(b"PK"):
+            return "zip"
         # Check if it's a pickle file
         if any(magic4.startswith(m) for m in pickle_magics):
             return "pickle"

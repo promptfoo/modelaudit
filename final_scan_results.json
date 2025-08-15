@@ -1,0 +1,73 @@
+{
+  "scan_date": "2025-08-15 09:02:40",
+  "models": [
+    {
+      "model": "MustEr/malicious_bert_base",
+      "type": "pickle",
+      "status": "NOT_FOUND",
+      "time": 0.3753678798675537,
+      "description": "Malicious BERT variant"
+    },
+    {
+      "model": "arunwrc/malicious-xception-model",
+      "type": "keras",
+      "status": "NOT_FOUND",
+      "time": 0.36429738998413086,
+      "description": "Keras Xception malicious"
+    },
+    {
+      "model": "baller423/goose-ai-safetensors",
+      "type": "safetensors",
+      "status": "NOT_FOUND",
+      "time": 0.3725571632385254,
+      "description": "SafeTensors test"
+    },
+    {
+      "model": "Kijai/LivePortrait_safetensors",
+      "type": "safetensors",
+      "status": "CLEAN",
+      "critical": 0,
+      "warning": 0,
+      "info": 5,
+      "time": 1.3240251541137695,
+      "files_scanned": 25,
+      "bytes_scanned": 109210840,
+      "description": "LivePortrait model"
+    },
+    {
+      "model": "Codeium/triton",
+      "type": "misc",
+      "status": "NOT_FOUND",
+      "time": 0.3682858943939209,
+      "description": "Triton test model"
+    },
+    {
+      "model": "ppradyoth/pickle_test_0.0.19",
+      "type": "pickle",
+      "status": "NOT_FOUND",
+      "time": 0.3630359172821045,
+      "description": "PAIT-PKL-099"
+    },
+    {
+      "model": "hf-internal-testing/unsafe-model",
+      "type": "pickle",
+      "status": "MALICIOUS",
+      "critical": 2,
+      "warning": 1,
+      "info": 0,
+      "time": 1.099364995956421,
+      "files_scanned": 3,
+      "bytes_scanned": 706,
+      "description": "HF internal test"
+    }
+  ],
+  "summary": {
+    "total": 7,
+    "malicious": 1,
+    "suspicious": 0,
+    "clean": 1,
+    "not_found": 5,
+    "errors": 0,
+    "detection_rate": 50.0
+  }
+}

@@ -97,7 +97,7 @@ class ScannerRegistry:
                 "class": "PyTorchBinaryScanner",
                 "description": "Scans PyTorch binary files",
                 "extensions": [".bin"],
-                "priority": 2,  # Must come before generic scanners for .bin files
+                "priority": 3,  # After pytorch_zip to allow ZIP detection first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
@@ -106,16 +106,25 @@ class ScannerRegistry:
                 "class": "TensorFlowSavedModelScanner",
                 "description": "Scans TensorFlow SavedModel files",
                 "extensions": [".pb", ""],  # Empty string for directories
-                "priority": 3,
+                "priority": 4,
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
+            },
+            "keras_zip": {
+                "module": "modelaudit.scanners.keras_zip_scanner",
+                "class": "KerasZipScanner",
+                "description": "Scans ZIP-based Keras model files",
+                "extensions": [".keras"],
+                "priority": 4,  # Higher priority than keras_h5 to check ZIP format first
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "keras_h5": {
                 "module": "modelaudit.scanners.keras_h5_scanner",
                 "class": "KerasH5Scanner",
                 "description": "Scans Keras H5 model files",
                 "extensions": [".h5", ".hdf5", ".keras"],
-                "priority": 4,
+                "priority": 5,
                 "dependencies": ["h5py"],  # Heavy dependency
                 "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
             },
@@ -124,7 +133,7 @@ class ScannerRegistry:
                 "class": "OnnxScanner",
                 "description": "Scans ONNX model files",
                 "extensions": [".onnx"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
@@ -133,7 +142,7 @@ class ScannerRegistry:
                 "class": "CoreMLScanner",
                 "description": "Scans Apple Core ML model files",
                 "extensions": [".mlmodel"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["coreml"],  # Heavy dependency
                 "numpy_sensitive": True,
             },
@@ -142,7 +151,7 @@ class ScannerRegistry:
                 "class": "OpenVinoScanner",
                 "description": "Scans OpenVINO IR model files",
                 "extensions": [".xml"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
@@ -150,8 +159,8 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
                 "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [".pt", ".pth"],
-                "priority": 6,  # Must come before ZipScanner since .pt/.pth files are zip files
+                "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
+                "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },

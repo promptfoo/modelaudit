@@ -122,7 +122,26 @@ class PyTorchZipScanner(BaseScanner):
                         details={"entries_checked": len(z.namelist())},
                         rule_code=None  # Passing check
                     )
-                pickle_files = [n for n in safe_entries if n.endswith(".pkl")]
+                # Find pickle files - PyTorch models often use various names
+                # Common patterns: data.pkl, archive/data.pkl, *.pkl, or any file with pickle magic bytes
+                pickle_files = []
+                for name in safe_entries:
+                    # Check common pickle file patterns
+                    if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
+                        pickle_files.append(name)
+
+                # If no obvious pickle files found, check all files for pickle magic bytes
+                if not pickle_files:
+                    for name in safe_entries:
+                        try:
+                            # Read first few bytes to check for pickle magic
+                            data_start = z.read(name)[:4]
+                            pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+                            if any(data_start.startswith(m) for m in pickle_magics):
+                                pickle_files.append(name)
+                        except Exception:
+                            pass
+
                 result.metadata["pickle_files"] = pickle_files
 
                 # Track number of bytes scanned

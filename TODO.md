@@ -350,3 +350,361 @@ for filename, expected_severity, expected_pattern in test_cases:
 - Document new detection patterns in the README
 - Consider adding a --explain flag to show why something was flagged
 - Maintain backwards compatibility with existing scans
+
+---
+
+# False Positive & False Negative Fixes
+
+## Critical False Positive Fixes
+
+### FP-1: Hardcoded Password False Positive in Binary Data
+**Issue**: Safe BERT models trigger "Hardcoded Password" detection on random binary data
+- **Root Cause**: Pattern `pwd\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?` matches random bytes in model weights
+- **Affected Files**: google/bert_uncased_L-2_H-128_A-2 (and other legitimate models)
+- **Location**: `modelaudit/secrets_detector.py:54`
+
+**Fix Implementation**:
+```python
+# In secrets_detector.py, add context validation
+def is_likely_text_context(data: bytes, position: int, window: int = 50) -> bool:
+    """Check if surrounding context looks like text, not binary weights"""
+    start = max(0, position - window)
+    end = min(len(data), position + window)
+    context = data[start:end]
+    
+    # Count printable ASCII characters
+    ascii_count = sum(1 for b in context if 32 <= b < 127)
+    text_ratio = ascii_count / len(context) if context else 0
+    
+    # Also check for null bytes (common in binary but not text)
+    null_count = context.count(b'\x00')
+    
+    return text_ratio > 0.7 and null_count < 2
+
+def validate_password_detection(match, data, position):
+    """Additional validation for password patterns"""
+    # Skip if in binary context
+    if not is_likely_text_context(data, position):
+        return False
+    
+    # Check entropy (real passwords have moderate entropy)
+    value = match.group(1) if hasattr(match, 'group') else match
+    entropy = calculate_shannon_entropy(value)
+    
+    # Binary data has very high or very low entropy
+    # Passwords typically have entropy between 2.5 and 4.0
+    if entropy < 2.0 or entropy > 4.5:
+        return False
+    
+    return True
+```
+
+**Validation**:
+```bash
+# Should NOT trigger false positives
+rye run modelaudit hf://google/bert_uncased_L-2_H-128_A-2
+# Expected: No "Hardcoded Password" issues
+
+# Should still detect real passwords
+echo 'password="mysecretpass123"' > test_password.txt
+rye run modelaudit test_password.txt
+# Expected: CRITICAL issue for hardcoded password
+```
+
+### FP-2: Excessive MANY_DANGEROUS_OPCODES Warnings
+**Issue**: Safe models trigger warnings for having >20 dangerous opcodes
+- **Root Cause**: Threshold of 20 is too low for legitimate models
+- **Affected**: hf-internal-testing/tiny-random-bert (10 warnings), prajjwal1/bert-tiny (5 warnings)
+- **Location**: `modelaudit/scanners/pickle_scanner.py:692-696`
+
+**Fix Implementation**:
+```python
+# In pickle_scanner.py
+# Current code around line 692:
+# if dangerous_opcode_count > 20:  # CHANGE THIS
+
+# New implementation:
+DANGEROUS_OPCODE_WARNING_THRESHOLD = 100  # Increase from 20
+DANGEROUS_OPCODE_RATIO_THRESHOLD = 0.15   # Add ratio check
+
+def should_warn_dangerous_opcodes(opcodes_data):
+    """Smarter detection of suspicious opcode patterns"""
+    dangerous_count = opcodes_data.get('dangerous_opcode_count', 0)
+    total_count = opcodes_data.get('total_opcodes', 0)
+    ml_confidence = opcodes_data.get('ml_confidence', 0)
+    
+    # Don't warn if ML confidence is low
+    if ml_confidence < 0.6:  # Increase from 0.3
+        return False
+    
+    # Check absolute count
+    if dangerous_count < DANGEROUS_OPCODE_WARNING_THRESHOLD:
+        return False
+    
+    # Check ratio (dangerous should be significant portion)
+    if total_count > 0:
+        ratio = dangerous_count / total_count
+        if ratio < DANGEROUS_OPCODE_RATIO_THRESHOLD:
+            return False
+    
+    # Check for specific malicious patterns
+    if has_malicious_opcode_sequence(opcodes_data):
+        return True
+    
+    return dangerous_count > DANGEROUS_OPCODE_WARNING_THRESHOLD
+
+def has_malicious_opcode_sequence(opcodes_data):
+    """Check for known malicious sequences"""
+    sequences = opcodes_data.get('sequences', [])
+    
+    MALICIOUS_SEQUENCES = [
+        ['GLOBAL', 'exec'],
+        ['GLOBAL', 'eval'],
+        ['GLOBAL', 'system'],
+        ['GLOBAL', 'subprocess'],
+        ['GLOBAL', 'webbrowser'],
+    ]
+    
+    for mal_seq in MALICIOUS_SEQUENCES:
+        if any(all(op in seq for op in mal_seq) for seq in sequences):
+            return True
+    
+    return False
+```
+
+**Validation**:
+```bash
+# Should NOT trigger warnings for safe models
+rye run modelaudit hf://hf-internal-testing/tiny-random-bert
+# Expected: No MANY_DANGEROUS_OPCODES warnings
+
+# Should still detect real threats
+rye run modelaudit hf://drhyrum/bert-tiny-torch-picklebomb
+# Expected: CRITICAL issues for actual malicious patterns
+```
+
+## Critical False Negative Fixes
+
+### FN-1: HuggingFace Adapter Not Downloading Model Files
+**Issue**: mkiani/gpt2-exec shows 0 issues because only config.json is downloaded
+- **Root Cause**: HF adapter doesn't explicitly request weight files
+- **Location**: `modelaudit/utils/huggingface.py:132`
+
+**Fix Implementation**:
+```python
+# In huggingface.py, modify download_model function
+from huggingface_hub import list_repo_files
+
+def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
+    """Download model ensuring we get actual model files"""
+    
+    # Parse URL to get repo_id
+    repo_id, revision = parse_huggingface_url(url)
+    
+    # List all files in repo
+    try:
+        repo_files = list_repo_files(repo_id)
+    except Exception:
+        repo_files = []
+    
+    # Identify model weight files
+    MODEL_EXTENSIONS = {'.bin', '.pt', '.pth', '.pkl', '.safetensors', 
+                       '.onnx', '.pb', '.h5', '.keras', '.tflite', '.ckpt'}
+    
+    model_files = [f for f in repo_files 
+                   if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
+    
+    # Download with explicit file patterns
+    if model_files:
+        # Download specific model files
+        local_path = snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            allow_patterns=model_files,  # Explicitly request model files
+            tqdm_class=tqdm if show_progress else None,
+        )
+    else:
+        # Fallback: download everything if no model files identified
+        logger.warning(f"No model files found in {repo_id}, downloading all files")
+        local_path = snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            tqdm_class=tqdm if show_progress else None,
+        )
+    
+    # Validate we got model files
+    downloaded_path = Path(local_path)
+    found_models = False
+    for ext in MODEL_EXTENSIONS:
+        if list(downloaded_path.glob(f"*{ext}")):
+            found_models = True
+            break
+    
+    if not found_models:
+        logger.warning(f"No model files found after download for {repo_id}")
+    
+    return downloaded_path
+```
+
+**Validation**:
+```bash
+# Should now detect issues in exec variant models
+rye run modelaudit hf://mkiani/gpt2-exec
+# Expected: CRITICAL issues detected
+
+rye run modelaudit hf://mkiani/gpt2-runpy
+# Expected: CRITICAL issues detected
+
+rye run modelaudit hf://mkiani/gpt2-system
+# Expected: CRITICAL issues detected
+```
+
+### FN-2: Missing exec/eval Detection Patterns
+**Issue**: Some exec variants not detected even when files are scanned
+- **Root Cause**: Patterns might be obfuscated or use alternative methods
+- **Location**: `modelaudit/scanners/pickle_scanner.py`
+
+**Fix Implementation**:
+```python
+# Add to dangerous_patterns in pickle_scanner.py
+ENHANCED_DANGEROUS_PATTERNS = [
+    # Direct patterns
+    b"exec",
+    b"eval",
+    b"compile",
+    b"__import__",
+    
+    # Alternative execution methods
+    b"runpy",
+    b"importlib",
+    b"execfile",
+    
+    # Obfuscated patterns (hex for 'exec')
+    b"\x65\x78\x65\x63",
+    
+    # Common obfuscation techniques
+    b"chr(101)",  # Building 'e' in exec
+    b"chr(120)",  # Building 'x' in exec
+    
+    # Base64 variants of 'exec' and 'eval'
+    b"ZXhlYw",  # base64('exec')
+    b"ZXZhbA",  # base64('eval')
+]
+
+def detect_obfuscated_execution(data: bytes) -> List[Issue]:
+    """Detect obfuscated code execution attempts"""
+    issues = []
+    
+    # Check for string concatenation building dangerous commands
+    concat_patterns = [
+        rb"['\"]e['\"].*?['\"]x['\"].*?['\"]e['\"].*?['\"]c['\"]",  # "e"+"x"+"e"+"c"
+        rb"['\"]e['\"].*?['\"]v['\"].*?['\"]a['\"].*?['\"]l['\"]",  # "e"+"v"+"a"+"l"
+    ]
+    
+    for pattern in concat_patterns:
+        if re.search(pattern, data):
+            issues.append(create_critical_issue(
+                "Obfuscated code execution pattern detected",
+                pattern=pattern.decode('utf-8', errors='ignore')
+            ))
+    
+    # Check for chr() building
+    if b"chr(101)" in data and b"chr(120)" in data:
+        issues.append(create_critical_issue(
+            "Character code obfuscation detected (likely building 'exec')"
+        ))
+    
+    return issues
+```
+
+**Validation**:
+```bash
+# Test all exec variants
+for model in mkiani/gpt2-exec mkiani/gpt2-runpy mkiani/gpt2-system; do
+    echo "Testing $model..."
+    rye run modelaudit hf://$model
+done
+
+# Expected: All three should show CRITICAL issues
+```
+
+## Testing Strategy for Fixes
+
+### Create Test Suite
+```python
+# tests/test_false_positives.py
+import pytest
+from modelaudit.core import scan_file
+
+class TestFalsePositives:
+    """Test that legitimate models don't trigger false positives"""
+    
+    SAFE_MODELS = [
+        "google/bert_uncased_L-2_H-128_A-2",
+        "hf-internal-testing/tiny-random-bert",
+        "prajjwal1/bert-tiny",
+        "distilbert/distilbert-base-uncased",
+        "google/flan-t5-small",
+    ]
+    
+    @pytest.mark.parametrize("model", SAFE_MODELS)
+    def test_no_false_positives(self, model):
+        """Safe models should not trigger critical issues"""
+        result = scan_file(f"hf://{model}")
+        
+        # No critical issues
+        critical_issues = [i for i in result.issues if i.severity == "critical"]
+        assert len(critical_issues) == 0, f"False positive in {model}: {critical_issues}"
+        
+        # Limited warnings acceptable
+        warnings = [i for i in result.issues if i.severity == "warning"]
+        assert len(warnings) < 5, f"Too many warnings in {model}: {len(warnings)}"
+
+# tests/test_false_negatives.py  
+class TestFalseNegatives:
+    """Test that malicious models are detected"""
+    
+    MALICIOUS_MODELS = [
+        ("mkiani/gpt2-exec", "exec"),
+        ("mkiani/gpt2-runpy", "runpy"),
+        ("mkiani/gpt2-system", "system"),
+        ("drhyrum/bert-tiny-torch-picklebomb", "webbrowser"),
+    ]
+    
+    @pytest.mark.parametrize("model,expected_pattern", MALICIOUS_MODELS)
+    def test_detects_malicious(self, model, expected_pattern):
+        """Malicious models should be detected"""
+        result = scan_file(f"hf://{model}")
+        
+        # Should have critical issues
+        critical_issues = [i for i in result.issues if i.severity == "critical"]
+        assert len(critical_issues) > 0, f"Failed to detect {model}"
+        
+        # Should detect expected pattern
+        patterns_found = [i.message for i in critical_issues]
+        assert any(expected_pattern in msg for msg in patterns_found)
+```
+
+## Implementation Priority
+
+1. **Immediate (This Week)**:
+   - Fix FN-1: HuggingFace download issue (blocks testing)
+   - Fix FP-1: Hardcoded password false positive (most disruptive)
+
+2. **Next Sprint**:
+   - Fix FP-2: Opcode threshold tuning
+   - Fix FN-2: Enhanced exec/eval detection
+
+3. **Following Sprint**:
+   - Add comprehensive test suite
+   - Performance optimizations
+   - Documentation updates
+
+## Success Metrics
+
+- **False Positive Rate**: < 5% on safe models (currently 100%)
+- **Detection Rate**: > 95% on malicious models (currently ~89%)
+- **Performance**: < 5 seconds average scan time
+- **No Regressions**: All currently detected threats still detected

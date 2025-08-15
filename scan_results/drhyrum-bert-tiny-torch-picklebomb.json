@@ -1,0 +1,1633 @@
+{
+  "bytes_scanned": 9214,
+  "issues": [
+    {
+      "message": "URL detected in model: https://pramuwaskito.org/hacker/q",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "type": "url_detected",
+        "severity": "MEDIUM",
+        "confidence": 0.5,
+        "message": "URL detected in model: https://pramuwaskito.org/hacker/q",
+        "url": "https://pramuwaskito.org/hacker/q",
+        "position": 26,
+        "context": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl"
+      },
+      "timestamp": 1755213965.686003,
+      "why": "Models should not contain network communication capabilities"
+    },
+    {
+      "message": "Domain name detected: pramuwaskito.org",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "type": "domain_name",
+        "severity": "MEDIUM",
+        "confidence": 0.3,
+        "message": "Domain name detected: pramuwaskito.org",
+        "domain": "pramuwaskito.org",
+        "tld": "org",
+        "position": 34,
+        "context": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl"
+      },
+      "timestamp": 1755213965.686083,
+      "why": "Models should not contain network communication capabilities"
+    },
+    {
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 931)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 931,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.688571,
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 2179)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 2179,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.688597,
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 3290)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 3290,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.6886148,
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 4679)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 4679,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.688631,
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 5900)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 5900,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.6886468,
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    }
+  ],
+  "checks": [
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "md5": "9c84854f2565361ba11f34f7761c5cd2",
+        "sha256": "c8354611d7d2f2437aa2ce1af05760ae2a4acbfc21e2b3a4cbe77024130bf8df",
+        "sha512": "e63616cb23c88bfa00f3eb0b66fccdac9baa89cfce896d08a48d8600df8ff552c827da60aa74710dfdd14665bd1c2a6c79fe96cdafd3b20772dda026503decb2",
+        "file_size": 8906
+      },
+      "timestamp": 1755213965.671187
+    },
+    {
+      "name": "Dangerous Pattern Detection",
+      "status": "passed",
+      "message": "No dangerous patterns found in raw file content",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "detection_method": "raw_content_scan",
+        "patterns_checked": [
+          "posix",
+          "subprocess",
+          "eval",
+          "exec",
+          "__import__",
+          "builtins"
+        ]
+      },
+      "timestamp": 1755213965.6712608
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {},
+      "timestamp": 1755213965.68259
+    },
+    {
+      "name": "JIT/Script Code Execution Detection",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {},
+      "timestamp": 1755213965.68336
+    },
+    {
+      "name": "Network Communication Detection",
+      "status": "failed",
+      "message": "URL detected in model: https://pramuwaskito.org/hacker/q",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "type": "url_detected",
+        "severity": "MEDIUM",
+        "confidence": 0.5,
+        "message": "URL detected in model: https://pramuwaskito.org/hacker/q",
+        "url": "https://pramuwaskito.org/hacker/q",
+        "position": 26,
+        "context": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl"
+      },
+      "timestamp": 1755213965.686002,
+      "severity": "warning",
+      "why": "Models should not contain network communication capabilities"
+    },
+    {
+      "name": "Network Communication Detection",
+      "status": "failed",
+      "message": "Domain name detected: pramuwaskito.org",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "type": "domain_name",
+        "severity": "MEDIUM",
+        "confidence": 0.3,
+        "message": "Domain name detected: pramuwaskito.org",
+        "domain": "pramuwaskito.org",
+        "tld": "org",
+        "position": 34,
+        "context": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl"
+      },
+      "timestamp": 1755213965.6860821,
+      "severity": "warning",
+      "why": "Models should not contain network communication capabilities"
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 2",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "protocol_version": 2
+      },
+      "timestamp": 1755213965.686104
+    },
+    {
+      "name": "Opcode Count Check",
+      "status": "passed",
+      "message": "Opcode count (1925) is within limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "opcode_count": 1925,
+        "max_opcodes": 1000000
+      },
+      "timestamp": 1755213965.687857
+    },
+    {
+      "name": "Stack Depth Validation",
+      "status": "passed",
+      "message": "Maximum stack depth (197) is within safe limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "max_depth_reached": 197,
+        "safe_threshold": 1000
+      },
+      "timestamp": 1755213965.687859
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Safe global reference validated: webbrowser.open",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 2)",
+      "details": {
+        "module": "webbrowser",
+        "function": "open",
+        "position": 2,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.687917
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Safe global reference validated: collections.OrderedDict",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 69)",
+      "details": {
+        "module": "collections",
+        "function": "OrderedDict",
+        "position": 69,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.6879208
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Safe global reference validated: torch._utils._rebuild_tensor_v2",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 136)",
+      "details": {
+        "module": "torch._utils",
+        "function": "_rebuild_tensor_v2",
+        "position": 136,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.687924
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Safe global reference validated: torch.LongStorage",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 187)",
+      "details": {
+        "module": "torch",
+        "function": "LongStorage",
+        "position": 187,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.687926
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Safe global reference validated: torch.FloatStorage",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 323)",
+      "details": {
+        "module": "torch",
+        "function": "FloatStorage",
+        "position": 323,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.687932
+    },
+    {
+      "name": "Reduce Pattern Analysis",
+      "status": "passed",
+      "message": "No dangerous __reduce__ patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "details": {
+        "opcode_count": 1925,
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.688396
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "failed",
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 931)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 931,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.68857,
+      "severity": "warning",
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "failed",
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 2179)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 2179,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.688597,
+      "severity": "warning",
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "failed",
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 3290)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 3290,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.6886148,
+      "severity": "warning",
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "failed",
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 4679)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 4679,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.68863,
+      "severity": "warning",
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "failed",
+      "message": "Suspicious opcode sequence: MANY_DANGEROUS_OPCODES",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 5900)",
+      "details": {
+        "pattern": "MANY_DANGEROUS_OPCODES",
+        "count": 21,
+        "max_consecutive": 1,
+        "ml_confidence": 0.315,
+        "position": 5900,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1755213965.6886458,
+      "severity": "warning",
+      "why": "This pickle contains an unusually high concentration of opcodes that can execute code (REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+    }
+  ],
+  "files_scanned": 105,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/config.json",
+      "type": "manifest",
+      "size": 308,
+      "keys": [
+        "hidden_size",
+        "hidden_act",
+        "initializer_range",
+        "vocab_size",
+        "hidden_dropout_prob",
+        "num_attention_heads",
+        "type_vocab_size",
+        "max_position_embeddings",
+        "num_hidden_layers",
+        "intermediate_size",
+        "attention_probs_dropout_prob",
+        "model_type"
+      ]
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/pytorch_model.bin",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/version",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl",
+      "type": "pickle",
+      "size": 8906
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104248528",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107288432",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107126640",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107966592",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107465600",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102687856",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102798288",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/106870768",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104786464",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107403104",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100258528",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102474416",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105677744",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107788272",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102769552",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104350992",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/110540912",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107717904",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107638608",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101378128",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108048272",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108043856",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108101904",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/95918736",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101028384",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107361280",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104477200",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101378224",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/97389408",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107541520",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102768528",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104127520",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102646816",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100878480",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104864128",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107700576",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102886912",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107109936",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108105680",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105517808",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107610896",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101028288",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107958624",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105642560",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100878576",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104929328",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/106182800",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/models--drhyrum--bert-tiny-torch-picklebomb/refs/main",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/vocab.txt.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/config.json.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/README.md.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/pytorch_model.bin.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/version.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data.pkl.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102474416.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105677744.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102798288.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102886912.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/106870768.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101028288.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102687856.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100878480.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102769552.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107288432.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107700576.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107403104.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107610896.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108043856.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104127520.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107361280.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104350992.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108101904.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107966592.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100878576.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/95918736.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/110540912.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107541520.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102646816.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104929328.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101378128.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107126640.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102768528.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104864128.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105517808.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107638608.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107465600.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/97389408.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104786464.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107109936.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108048272.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104248528.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108105680.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104477200.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107958624.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107788272.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100258528.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101378224.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101028384.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/106182800.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107717904.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105642560.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": ["manifest", "pickle", "skipped"],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/config.json": {
+      "file_size": 308,
+      "keys": [
+        "hidden_size",
+        "hidden_act",
+        "initializer_range",
+        "vocab_size",
+        "hidden_dropout_prob",
+        "num_attention_heads",
+        "type_vocab_size",
+        "max_position_embeddings",
+        "num_hidden_layers",
+        "intermediate_size",
+        "attention_probs_dropout_prob",
+        "model_type"
+      ],
+      "model_info": {
+        "model_type": "bert",
+        "hidden_size": 128,
+        "num_layers": 2,
+        "num_heads": 2,
+        "vocab_size": 30522
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/pytorch_model.bin": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/version": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl": {
+      "file_size": 8906,
+      "file_hashes": {
+        "md5": "9c84854f2565361ba11f34f7761c5cd2",
+        "sha256": "c8354611d7d2f2437aa2ce1af05760ae2a4acbfc21e2b3a4cbe77024130bf8df",
+        "sha512": "e63616cb23c88bfa00f3eb0b66fccdac9baa89cfce896d08a48d8600df8ff552c827da60aa74710dfdd14665bd1c2a6c79fe96cdafd3b20772dda026503decb2"
+      },
+      "max_stack_depth": 197,
+      "ml_context": {
+        "frameworks": {
+          "pytorch": {
+            "confidence": 0.315,
+            "matches": ["module:torch(3)", "module:collections(1)"],
+            "raw_score": 35.0
+          }
+        },
+        "overall_confidence": 0.315,
+        "is_ml_content": true,
+        "detected_patterns": ["module:torch(3)", "module:collections(1)"]
+      },
+      "opcode_count": 1925,
+      "suspicious_count": 5,
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": true
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104248528": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107288432": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107126640": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107966592": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107465600": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102687856": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102798288": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/106870768": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104786464": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107403104": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100258528": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102474416": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105677744": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107788272": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102769552": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104350992": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/110540912": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107717904": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107638608": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101378128": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108048272": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108043856": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108101904": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/95918736": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101028384": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107361280": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104477200": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101378224": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/97389408": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107541520": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102768528": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104127520": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102646816": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100878480": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104864128": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107700576": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/102886912": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107109936": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/108105680": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105517808": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107610896": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/101028288": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/107958624": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/105642560": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/100878576": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/104929328": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data/106182800": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/models--drhyrum--bert-tiny-torch-picklebomb/refs/main": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/vocab.txt.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/config.json.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/README.md.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/pytorch_model.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/version.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data.pkl.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102474416.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105677744.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102798288.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102886912.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/106870768.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101028288.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102687856.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100878480.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102769552.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107288432.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107700576.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107403104.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107610896.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108043856.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104127520.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107361280.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104350992.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108101904.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107966592.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100878576.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/95918736.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/110540912.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107541520.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102646816.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104929328.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101378128.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107126640.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/102768528.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104864128.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105517808.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107638608.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107465600.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/97389408.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104786464.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107109936.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108048272.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104248528.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/108105680.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/104477200.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107958624.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107788272.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/100258528.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101378224.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/101028384.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/106182800.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/107717904.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/.cache/huggingface/download/archive/data/105642560.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    }
+  },
+  "start_time": 1755213943.6544042,
+  "duration": 22.124202966690063,
+  "total_checks": 123,
+  "passed_checks": 13,
+  "failed_checks": 110
+}
