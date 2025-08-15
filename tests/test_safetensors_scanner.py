@@ -73,6 +73,29 @@ def test_bad_offsets(tmp_path: Path) -> None:
     assert any("offset" in issue.message.lower() for issue in result.issues)
 
 
+def test_deeply_nested_header(tmp_path: Path) -> None:
+    """Ensure deeply nested headers are handled gracefully."""
+    depth = 1500
+    nested: dict[str, dict] = {}
+    current = nested
+    for _ in range(depth):
+        current["a"] = {}
+        current = current["a"]
+
+    header_bytes = json.dumps(nested).encode("utf-8")
+    file_path = tmp_path / "deep.safetensors"
+    with open(file_path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b"\x00")
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    assert result.has_errors
+    assert any(check.details.get("exception_type") == "RecursionError" for check in result.checks)
+
+
 def test_suspicious_metadata(tmp_path: Path) -> None:
     file_path = tmp_path / "model.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
