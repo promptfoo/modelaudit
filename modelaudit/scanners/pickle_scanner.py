@@ -1123,7 +1123,18 @@ class PickleScanner(BaseScanner):
             b"__import__",
             b"builtins",  # Often used for builtins.eval, builtins.exec
             b"importlib",  # Dynamic module loading (import_module, reload, etc.)
-            b"runpy",  # Running modules as scripts (run_module, run_path)
+            b"runpy",  # Can execute arbitrary modules via run_module, run_path
+            # Enhanced os/subprocess detection
+            b"os.system",  # Direct system command execution
+            b"os.popen",  # Process spawning with pipe
+            b"os.spawn",  # Process spawning variants (spawnv, spawnve, etc.)
+            b"subprocess.call",  # Subprocess call
+            b"subprocess.run",  # Subprocess run (Python 3.5+)
+            b"subprocess.Popen",  # Process creation
+            b"commands",  # Python 2 legacy commands module
+            b"getoutput",  # commands.getoutput
+            b"getstatusoutput",  # commands.getstatusoutput
+            b"system",  # Catches both os.system and from os import system
         ]
 
         # Limit how much we scan for performance

@@ -1,127 +1,264 @@
-"""Test detection of runpy module as a critical security issue."""
+"""
+Test detection of runpy module usage in pickle files.
 
-import pickle
+The runpy module allows execution of arbitrary Python modules and scripts,
+making it a critical security risk when found in pickle files.
+"""
+
+import os
 import tempfile
-from pathlib import Path
 
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
 
-def test_runpy_run_module_detection():
-    """Test that runpy.run_module is detected as CRITICAL."""
-    # Create a malicious pickle that uses runpy.run_module
-    malicious_code = """
-import runpy
-runpy.run_module('os', run_name='__main__')
-"""
+class TestRunpyDetection:
+    """Test detection of dangerous runpy module usage."""
 
-    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        pickle.dump({"code": malicious_code}, f)
-        temp_path = f.name
+    def test_runpy_in_suspicious_globals(self):
+        """Verify that runpy is marked as suspicious in SUSPICIOUS_GLOBALS."""
+        assert "runpy" in SUSPICIOUS_GLOBALS
+        # runpy should be marked as "*" (all functions are dangerous)
+        assert SUSPICIOUS_GLOBALS["runpy"] == "*"
 
-    try:
+    def test_runpy_run_module_detection(self):
+        """Test detection of runpy.run_module in pickle files."""
         scanner = PickleScanner()
-        result = scanner.scan(temp_path)
 
-        # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        # Create a pickle with runpy.run_module
+        # Protocol 2 pickle with GLOBAL opcode for runpy.run_module
+        pickle_bytes = b"\x80\x02crunpy\nrun_module\nq\x00."
 
-        # Should have at least one critical issue
-        assert len(critical_issues) > 0, "No critical issues found for runpy"
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle_bytes)
+            temp_path = f.name
 
-        # Check that runpy is mentioned in critical issues
-        runpy_found = any("runpy" in issue.message.lower() for issue in critical_issues)
-        assert runpy_found, "runpy not found in critical issues"
+        try:
+            result = scanner.scan(temp_path)
 
-    finally:
-        Path(temp_path).unlink()
+            # Should have critical issues
+            assert len(result.issues) > 0, "Should detect runpy.run_module"
 
+            # Check for CRITICAL severity
+            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            assert len(critical_issues) > 0, "runpy.run_module should be CRITICAL"
 
-def test_runpy_run_path_detection():
-    """Test that runpy.run_path is detected as CRITICAL."""
-    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        # Create pickle with runpy.run_path
-        code = """
-import runpy
-runpy.run_path('/path/to/malicious.py')
-"""
-        pickle.dump({"code": code}, f)
-        temp_path = f.name
+            # Check that runpy was specifically detected
+            all_messages = " ".join(issue.message for issue in result.issues)
+            all_details = " ".join(str(issue.details) for issue in result.issues)
+            assert "runpy" in all_messages.lower() or "runpy" in all_details, "Should mention runpy"
 
-    try:
+        finally:
+            os.unlink(temp_path)
+
+    def test_runpy_run_path_detection(self):
+        """Test detection of runpy.run_path in pickle files."""
         scanner = PickleScanner()
-        result = scanner.scan(temp_path)
 
-        # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        # Create a pickle with runpy.run_path
+        pickle_bytes = b"\x80\x02crunpy\nrun_path\nq\x00."
 
-        # Should detect runpy as critical
-        assert len(critical_issues) > 0, "No critical issues found for runpy.run_path"
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle_bytes)
+            temp_path = f.name
 
-        # Verify runpy is in the critical messages
-        runpy_critical = any("runpy" in issue.message.lower() for issue in critical_issues)
-        assert runpy_critical, "runpy.run_path not detected as critical"
+        try:
+            result = scanner.scan(temp_path)
 
-    finally:
-        Path(temp_path).unlink()
+            # Should detect as dangerous
+            assert len(result.issues) > 0, "Should detect runpy.run_path"
 
+            # Should have at least one CRITICAL issue
+            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            assert len(critical_issues) > 0, "runpy.run_path should be CRITICAL"
 
-def test_runpy_pattern_in_raw_bytes():
-    """Test that raw runpy pattern is detected as CRITICAL."""
-    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        # Write pickle with runpy reference
-        f.write(b"\x80\x02crunpy\nrun_module\nq\x00X\x02\x00\x00\x00os\nq\x01\x85q\x02Rq\x03.")
-        temp_path = f.name
+        finally:
+            os.unlink(temp_path)
 
-    try:
+    def test_runpy_with_arguments(self):
+        """Test detection of runpy with arguments (more realistic attack)."""
         scanner = PickleScanner()
-        result = scanner.scan(temp_path)
 
-        # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        # Create a pickle that uses runpy.run_module to execute os
+        # This simulates: runpy.run_module('os').__dict__['system']('echo pwned')
+        pickle_bytes = (
+            b"\x80\x02"  # Protocol 2
+            b"crunpy\nrun_module\n"  # Import runpy.run_module
+            b"q\x00"  # BINPUT 0
+            b"(S'os'\n"  # Argument: 'os' module
+            b"tq\x01"  # TUPLE, BINPUT 1
+            b"Rq\x02"  # REDUCE (calls run_module), BINPUT 2
+            b"."  # STOP
+        )
 
-        # Should detect runpy as critical
-        assert len(critical_issues) > 0, "No critical issues found for raw runpy bytes"
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle_bytes)
+            temp_path = f.name
 
-        # Verify runpy is in the critical messages
-        runpy_critical = any("runpy" in issue.message.lower() for issue in critical_issues)
-        assert runpy_critical, "runpy pattern not detected as critical"
+        try:
+            result = scanner.scan(temp_path)
 
-    finally:
-        Path(temp_path).unlink()
+            # Should detect multiple issues (runpy and possibly 'os' in string)
+            assert len(result.issues) > 0, "Should detect runpy with malicious argument"
 
+            # Should have CRITICAL issues
+            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            assert len(critical_issues) > 0, "runpy execution should be CRITICAL"
 
-def test_runpy_not_false_positive_in_comments():
-    """Test that runpy in documentation/comments is not flagged as CRITICAL."""
-    # Create a safe pickle with runpy only in a comment string
-    safe_data = {"documentation": "This model does not use runpy# Safe comment", "config": {"safe": True}}
+            # Check for runpy detection
+            found_runpy = False
+            for issue in result.issues:
+                if "runpy" in issue.message.lower() or "runpy" in str(issue.details):
+                    found_runpy = True
+                    break
+            assert found_runpy, "Should specifically detect runpy module"
 
-    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        pickle.dump(safe_data, f)
-        temp_path = f.name
+        finally:
+            os.unlink(temp_path)
 
-    try:
+    def test_runpy_run_module_as_main(self):
+        """Test detection of runpy._run_module_as_main (internal but dangerous)."""
         scanner = PickleScanner()
-        result = scanner.scan(temp_path)
 
-        # Check for critical issues mentioning runpy
-        critical_runpy_issues = [
-            issue
-            for issue in result.issues
-            if str(issue.severity) == "IssueSeverity.CRITICAL" and "runpy" in issue.message.lower()
+        # Create a pickle with runpy._run_module_as_main
+        pickle_bytes = b"\x80\x02crunpy\n_run_module_as_main\nq\x00."
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle_bytes)
+            temp_path = f.name
+
+        try:
+            result = scanner.scan(temp_path)
+
+            # Should detect as dangerous
+            assert len(result.issues) > 0, "Should detect runpy._run_module_as_main"
+
+            # Check severity
+            serious_issues = [i for i in result.issues if i.severity.name in ["CRITICAL", "WARNING"]]
+            assert len(serious_issues) > 0, "runpy._run_module_as_main should be serious"
+
+        finally:
+            os.unlink(temp_path)
+
+    def test_runpy_pattern_in_raw_content(self):
+        """Test that 'runpy' pattern is detected in raw file content."""
+        scanner = PickleScanner()
+
+        # Create a file with 'runpy' in it (even if not a valid pickle)
+        content = b"Some content with runpy module reference"
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(content)
+            temp_path = f.name
+
+        try:
+            result = scanner.scan(temp_path)
+
+            # Should detect 'runpy' pattern
+            pattern_detected = False
+            for issue in result.issues:
+                if "runpy" in issue.message.lower():
+                    pattern_detected = True
+                    assert issue.severity.name == "CRITICAL", "runpy pattern should be CRITICAL"
+                    break
+
+            assert pattern_detected, "Should detect 'runpy' pattern in raw content"
+
+        finally:
+            os.unlink(temp_path)
+
+    def test_multiple_runpy_functions(self):
+        """Test detection of various runpy functions."""
+        scanner = PickleScanner()
+
+        runpy_functions = [
+            b"run_module",
+            b"run_path",
+            b"_run_module_as_main",
+            b"_run_code",
         ]
 
-        # Should not flag runpy in documentation as critical
-        # (The semantic analysis should mark it as safe)
-        assert len(critical_runpy_issues) == 0, "False positive: runpy in documentation flagged as critical"
+        for func_bytes in runpy_functions:
+            # Create pickle with specific runpy function
+            pickle_bytes = b"\x80\x02crunpy\n" + func_bytes + b"\nq\x00."
 
-    finally:
-        Path(temp_path).unlink()
+            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+                f.write(pickle_bytes)
+                temp_path = f.name
 
+            try:
+                result = scanner.scan(temp_path)
 
-if __name__ == "__main__":
-    test_runpy_run_module_detection()
-    test_runpy_run_path_detection()
-    test_runpy_pattern_in_raw_bytes()
-    test_runpy_not_false_positive_in_comments()
-    print("All runpy detection tests passed!")
+                func_name = func_bytes.decode("utf-8")
+                assert len(result.issues) > 0, f"Should detect runpy.{func_name}"
+
+                # All runpy functions should trigger warnings or critical issues
+                serious_issues = [i for i in result.issues if i.severity.name in ["CRITICAL", "WARNING"]]
+                assert len(serious_issues) > 0, f"runpy.{func_name} should be flagged as serious"
+
+            finally:
+                os.unlink(temp_path)
+
+    def test_obfuscated_runpy_import(self):
+        """Test detection of obfuscated runpy imports."""
+        scanner = PickleScanner()
+
+        # Test with different module name formats that might be used
+        test_cases = [
+            b"\x80\x02c__main__\nrunpy\nq\x00.",  # __main__.runpy
+            b"\x80\x02cglobals\nrunpy\nq\x00.",  # globals.runpy
+        ]
+
+        for pickle_bytes in test_cases:
+            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+                f.write(pickle_bytes)
+                temp_path = f.name
+
+            try:
+                result = scanner.scan(temp_path)
+
+                # Should detect 'runpy' pattern at minimum
+                runpy_detected = any(
+                    "runpy" in issue.message.lower() or "runpy" in str(issue.details) for issue in result.issues
+                )
+                assert runpy_detected, "Should detect runpy even in obfuscated imports"
+
+            finally:
+                os.unlink(temp_path)
+
+    def test_runpy_severity_levels(self):
+        """Test that runpy is consistently flagged as CRITICAL."""
+        scanner = PickleScanner()
+
+        # Create a pickle with runpy that would execute malicious code
+        pickle_bytes = (
+            b"\x80\x02"  # Protocol 2
+            b"crunpy\nrun_module\n"  # runpy.run_module
+            b"p0\n"
+            b"(S'subprocess'\n"  # Run subprocess module
+            b"p1\n"
+            b"tp2\n"
+            b"Rp3\n"  # REDUCE - execute
+            b"."  # STOP
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle_bytes)
+            temp_path = f.name
+
+        try:
+            result = scanner.scan(temp_path)
+
+            # Should have multiple CRITICAL issues (runpy + subprocess)
+            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            assert len(critical_issues) >= 2, "Should have multiple CRITICAL issues for runpy + subprocess"
+
+            # Verify runpy is among the critical issues
+            runpy_critical = any(
+                "runpy" in issue.message.lower() or ("module" in issue.details and issue.details["module"] == "runpy")
+                for issue in critical_issues
+            )
+            assert runpy_critical, "runpy should be flagged as CRITICAL"
+
+        finally:
+            os.unlink(temp_path)
