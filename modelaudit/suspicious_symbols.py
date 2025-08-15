@@ -124,6 +124,8 @@ SUSPICIOUS_GLOBALS = {
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
     "socket": ["*"],  # Network communication
+    # Web/Network interaction - CRITICAL RISK
+    "webbrowser": ["open", "open_new", "open_new_tab"],  # Can open malicious URLs
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
