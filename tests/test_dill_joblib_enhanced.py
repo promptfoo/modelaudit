@@ -196,9 +196,12 @@ class TestErrorHandling:
             assert len(warning_issues) > 0
             assert not result.metadata.get("truncated", False)
 
-            # Check the issue details
-            issue = warning_issues[0]
-            assert "RuntimeError" in issue.details.get("exception_type", "")
+            # Find the issue related to the runtime error
+            runtime_issue = next(
+                (i for i in warning_issues if "RuntimeError" in i.details.get("exception_type", "")),
+                None,
+            )
+            assert runtime_issue is not None
 
     def test_logging_for_truncated_scans(self, tmp_path, caplog):
         """Test that error scans are properly handled and logged."""
