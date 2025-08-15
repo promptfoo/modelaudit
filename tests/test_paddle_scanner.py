@@ -36,4 +36,7 @@ def test_paddle_scanner_missing_dependency(tmp_path):
         result = scanner.scan(str(path))
         assert not result.success
         assert any("paddlepaddle" in i.message for i in result.issues)
-        assert result.issues[0].severity == IssueSeverity.CRITICAL
+        # Find the paddlepaddle-related issue specifically
+        paddle_issues = [i for i in result.issues if "paddlepaddle" in i.message]
+        assert len(paddle_issues) > 0
+        assert paddle_issues[0].severity == IssueSeverity.CRITICAL
