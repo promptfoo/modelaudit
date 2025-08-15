@@ -146,6 +146,14 @@ DANGEROUS_BUILTINS = [
     "open",
     "input",
     "__import__",
+    "globals",  # Access to global namespace
+    "locals",  # Access to local namespace
+    "type",  # Can create classes with custom methods
+    "setattr",  # Can set arbitrary attributes
+    "getattr",  # Can access arbitrary attributes
+    "delattr",  # Can delete attributes
+    "vars",  # Access to object's namespace
+    "dir",  # Can enumerate available attributes
 ]
 
 # Suspicious string patterns used by PickleScanner
