@@ -154,6 +154,9 @@ class PyTorchZipScanner(BaseScanner):
                     info = z.getinfo(name)
                     file_size = info.file_size
 
+                    # Set the current file path on the pickle scanner for proper error reporting
+                    self.pickle_scanner.current_file_path = f"{path}:{name}"
+
                     # For small pickle files (< 10MB), read normally
                     if file_size < 10 * 1024 * 1024:
                         data = z.read(name)
