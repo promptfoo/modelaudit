@@ -84,8 +84,7 @@ class KerasH5Scanner(BaseScanner):
                 message="h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path, "required_package": "h5py"},
-            )
+                details={"path": path, "required_package": "h5py"}, rule_code="S902",)
             result.finish(success=False)
             return result
 
@@ -121,7 +120,8 @@ class KerasH5Scanner(BaseScanner):
                             message="File appears to be a TensorFlow H5 model, not Keras format",
                             location=self.current_file_path,
                             details={"format": "tensorflow_h5"},
-                        )
+                rule_code=None,  # Passing check
+            )
                     else:
                         result.add_check(
                             name="Keras Model Format Check",
@@ -129,6 +129,7 @@ class KerasH5Scanner(BaseScanner):
                             message="File does not appear to be a Keras model (no model_config attribute)",
                             location=self.current_file_path,
                             details={"format": "generic_h5"},
+                            rule_code=None  # Passing check
                         )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
@@ -144,7 +145,8 @@ class KerasH5Scanner(BaseScanner):
                     result.add_check(
                         name="Model Config Type Validation",
                         passed=False,
-                        message=f"Invalid model config type: expected dict, got {type(model_config).__name__}",
+                        message=f"Invalid model config type: expected dict, got {type(model_config})",
+                rule_code="S902".__name__}",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
@@ -157,7 +159,7 @@ class KerasH5Scanner(BaseScanner):
                         passed=False,
                         message="Model contains custom objects which could contain arbitrary code",
                         severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (model_config)",
+                        location=f"{self.current_file_path} (model_config)", rule_code="S302"",
                         details={"custom_objects": list(f.attrs["custom_objects"])},
                     )
 
@@ -176,7 +178,7 @@ class KerasH5Scanner(BaseScanner):
                                 result.add_check(
                                     name="Custom Metric Detection",
                                     passed=False,
-                                    message=f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
+                                    message=f"Model contains custom metric: {metric.get('class_name', 'unknown'"), rule_code="S305"}",
                                     severity=IssueSeverity.WARNING,
                                     location=f"{self.current_file_path} (metrics)",
                                     details={"metric": metric},
@@ -218,7 +220,8 @@ class KerasH5Scanner(BaseScanner):
                 result.add_check(
                     name="Layers Type Validation",
                     passed=False,
-                    message=f"Invalid layers type: expected list, got {type(layers_value).__name__}",
+                    message=f"Invalid layers type: expected list, got {type(layers_value})",
+                rule_code="S902".__name__}",
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
@@ -233,7 +236,8 @@ class KerasH5Scanner(BaseScanner):
                 result.add_check(
                     name="Layer Type Validation",
                     passed=False,
-                    message=f"Invalid layer type: expected dict, got {type(layer).__name__}",
+                    message=f"Invalid layer type: expected dict, got {type(layer})",
+                rule_code="S902".__name__}",
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={"actual_type": type(layer).__name__, "expected_type": "dict"},
@@ -266,7 +270,9 @@ class KerasH5Scanner(BaseScanner):
                             "description": self.suspicious_layer_types[layer_class],
                             "layer_config": layer_config,
                         },
-                        why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
+                        why=get_pattern_explanation("lambda_layer",
+                rule_code="S902",
+            ) if layer_class == "Lambda" else None,
                     )
 
             # Check layer configuration for suspicious strings
@@ -322,7 +328,8 @@ class KerasH5Scanner(BaseScanner):
                         "layer_class": "Lambda",
                         "pattern_type": "safe_normalization",
                     },
-                )
+                rule_code=None,  # Passing check
+            )
                 return
 
             # This might be serialized Python code
@@ -344,10 +351,7 @@ class KerasH5Scanner(BaseScanner):
                             "layer_class": "Lambda",
                             "code_analysis": risk_desc,
                             "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
-                            "validation_status": "valid_python",
-                        },
-                        why=get_pattern_explanation("lambda_layer"),
-                    )
+                        }, rule_code="S507"  # Python embedded code)
                 else:
                     # Valid Python but not dangerous - record as passed
                     result.add_check(
@@ -359,7 +363,8 @@ class KerasH5Scanner(BaseScanner):
                             "layer_class": "Lambda",
                             "validation_status": "valid_python",
                         },
-                    )
+                rule_code=None,  # Passing check
+            )
             else:
                 # Not valid Python syntax - might be a configuration issue
                 # Only flag if it looks like attempted code execution
@@ -376,7 +381,9 @@ class KerasH5Scanner(BaseScanner):
                             "layer_config": layer_config,
                             "validation_error": error,
                         },
-                        why=get_pattern_explanation("lambda_layer"),
+                        why=get_pattern_explanation("lambda_layer",
+                rule_code="S1103",
+            ),
                     )
         elif module_name or function_name:
             # Module/function reference - check for dangerous imports
@@ -393,7 +400,9 @@ class KerasH5Scanner(BaseScanner):
                         "module": module_name,
                         "function": function_name,
                     },
-                    why=get_pattern_explanation("lambda_layer"),
+                    why=get_pattern_explanation("lambda_layer",
+                rule_code="S1103",
+            ),
                 )
             else:
                 # Safe module reference - record as passed
@@ -407,7 +416,8 @@ class KerasH5Scanner(BaseScanner):
                         "module": module_name,
                         "function": function_name,
                     },
-                )
+                rule_code=None,  # Passing check
+            )
         # Don't flag Lambda layers without code - they might just be placeholders
 
     def _check_config_for_suspicious_strings(
@@ -433,7 +443,7 @@ class KerasH5Scanner(BaseScanner):
                             passed=False,
                             message=f"Suspicious configuration string found in {context}: '{suspicious_term}'",
                             severity=IssueSeverity.INFO,
-                            location=f"{self.current_file_path} ({context})",
+                            location=f"{self.current_file_path} ({context})", rule_code="S902"",
                             details={
                                 "suspicious_term": suspicious_term,
                                 "context": context,

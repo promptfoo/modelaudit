@@ -228,6 +228,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 message="Orbax checkpoint format detected",
                 location="root",
                 details={"checkpoint_format": "orbax"},
+                rule_code=None,  # Passing check
             )
 
         # Analyze architecture patterns
@@ -320,6 +321,7 @@ class FlaxMsgpackScanner(BaseScanner):
                                     "transform": transform,
                                     "context": value_str[:200] if len(value_str) > 200 else value_str,
                                 },
+                                rule_code="S902",
                             )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
@@ -342,6 +344,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"suspicious_key": "__jax_array__"},
+                        rule_code="S905"
                     )
 
                 # Check for unusual shape specifications that might indicate attacks
@@ -355,6 +358,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={"shape": shape},
+                            rule_code="S902"
                         )
                     elif any(dim > 10**9 for dim in shape if isinstance(dim, int)):
                         result.add_check(
@@ -364,6 +368,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={"shape": shape, "max_safe_dimension": 10**9},
+                            rule_code="S703"
                         )
 
                 for key, value in data.items():
@@ -391,6 +396,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         "sample": value[:200] + "..." if len(value) > 200 else value,
                         "full_length": len(value),
                     },
+                    rule_code="S902"
                 )
 
     def _check_suspicious_keys(
@@ -408,6 +414,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=location,
                 details={"suspicious_key": key},
+                rule_code="S902"
             )
 
     def _analyze_content(
@@ -426,6 +433,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=location,
                 details={"depth": depth, "max_allowed": self.max_recursion_depth},
+                rule_code="S902"
             )
             return
 
@@ -439,11 +447,11 @@ class FlaxMsgpackScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=location,
                     details={"size": size, "max_allowed": self.max_blob_bytes},
+                    rule_code="S902"
                 )
-
-            # Check for embedded executable content in binary data
+            
+            # Try to decode as text to check for embedded code
             try:
-                # Try to decode as UTF-8 to check for hidden text
                 decoded = value.decode("utf-8", errors="ignore")
                 if len(decoded) > 50:  # Only check substantial text
                     self._check_suspicious_strings(
@@ -464,6 +472,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     name="String Length Check",
                     passed=False,
                     message=f"Extremely long string found: {len(value):,} characters",
+                    rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=location,
                     details={"length": len(value), "threshold": 100000},
@@ -475,6 +484,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     name="Dictionary Size Check",
                     passed=False,
                     message=f"Dictionary with excessive items: {len(value):,}",
+                    rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=location,
                     details={
@@ -499,6 +509,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     name="Array Size Check",
                     passed=False,
                     message=f"Array with excessive items: {len(value):,}",
+                    rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=location,
                     details={
@@ -520,6 +531,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=location,
                     details={"value": value},
+                    rule_code="S902"
                 )
 
     def _analyze_ml_structure(self, obj: Any, result: ScanResult) -> dict[str, Any]:
@@ -669,6 +681,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="Flax Structure Validation",
                 passed=False,
                 message=f"Unexpected top-level type: {type(obj).__name__} (expected dict)",
+                rule_code="S903",
                 severity=IssueSeverity.WARNING,
                 location="root",
                 details={"actual_type": type(obj).__name__, "expected_type": "dict"},
@@ -696,6 +709,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     "found_standard_keys": [k for k in expected_keys if k in found_keys],
                     "model_type": "standard_flax",
                 },
+                rule_code=None,  # Passing check
             )
             return
 
@@ -712,6 +726,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     "model_type": "transformer_model",
                     "all_keys": list(found_keys)[:20],  # Show first 20 keys
                 },
+                rule_code=None  # Passing check
             )
             return
 
@@ -730,6 +745,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     "model_type": "converted_ml_model",
                     "structural_evidence": ml_analysis["evidence"],
                 },
+                rule_code=None  # Passing check
             )
         elif ml_analysis["confidence"] > 0.4:
             # Moderate confidence - flag for review but don't alarm
@@ -743,6 +759,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     "model_type": "possible_ml_model",
                     "recommendation": "Manual review recommended",
                 },
+                rule_code=None  # Passing check
             )
         else:
             # Low confidence - this is suspicious
@@ -759,6 +776,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     "model_type": "suspicious",
                     "suspicious_patterns": ml_analysis["suspicious_patterns"],
                 },
+                rule_code="S903"
             )
 
         # Always check for truly suspicious top-level keys regardless of ML confidence
@@ -789,6 +807,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location="root",
                 details={"dangerous_keys": list(suspicious_top_level)},
+                rule_code="S902"
             )
 
     def scan(self, path: str) -> ScanResult:
@@ -813,6 +832,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"required_package": "msgpack"},
+                rule_code="S902"
             )
             result.finish(success=False)
             return result
@@ -837,6 +857,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"has_trailing_data": True},
+                    rule_code="S902"
                 )
                 # Unpack just the first object
                 unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
@@ -853,6 +874,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"msgpack_error": str(e)},
+                    rule_code="S902"
                 )
                 result.finish(success=False)
                 return result
@@ -883,6 +905,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 message="File too large to process safely - potential memory exhaustion attack",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -894,6 +917,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"error_type": type(e).__name__, "error_message": str(e)},
+                rule_code="S902"
             )
             result.finish(success=False)
             return result

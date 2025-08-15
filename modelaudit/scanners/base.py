@@ -44,6 +44,7 @@ class Check:
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
         why: Optional[str] = None,
+        rule_code: Optional[str] = None,
     ):
         self.name = name  # Name of the check performed
         self.status = status  # Whether the check passed or failed
@@ -52,6 +53,7 @@ class Check:
         self.location = location  # File position, line number, etc.
         self.details = details or {}
         self.why = why  # Explanation (mainly for failed checks)
+        self.rule_code = rule_code  # Rule code for this check (e.g., S101)
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,12 +91,14 @@ class Issue:
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
         why: Optional[str] = None,
+        rule_code: Optional[str] = None,
     ):
         self.message = message
         self.severity = severity
         self.location = location  # File position, line number, etc.
         self.details = details or {}
         self.why = why  # Explanation of why this is a security concern
+        self.rule_code = rule_code  # Rule code (e.g., "S101")
         self.timestamp = time.time()
 
     def to_dict(self) -> dict[str, Any]:
@@ -108,11 +112,15 @@ class Issue:
         }
         if self.why:
             result["why"] = self.why
+        if self.rule_code:
+            result["rule_code"] = self.rule_code
         return result
 
     def __str__(self) -> str:
         """String representation of the issue"""
         prefix = f"[{self.severity.value.upper()}]"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -140,15 +148,55 @@ class ScanResult:
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
         why: Optional[str] = None,
+        rule_code: Optional[str] = None,
     ) -> None:
-        """Add a check result (passed or failed)"""
+        """Add a check result (passed or failed) with rule support"""
+        from ..config import get_config
+        from ..rules import RuleRegistry, Severity
+
+        # Auto-detect rule code if not provided
+        if not rule_code and not passed:
+            match = RuleRegistry.find_matching_rule(message)
+            if match:
+                rule_code, rule = match
+                # Use rule's default severity if not specified
+                if severity is None:
+                    severity_map = {
+                        Severity.CRITICAL: IssueSeverity.CRITICAL,
+                        Severity.HIGH: IssueSeverity.CRITICAL,
+                        Severity.MEDIUM: IssueSeverity.WARNING,
+                        Severity.LOW: IssueSeverity.INFO,
+                        Severity.INFO: IssueSeverity.INFO,
+                    }
+                    severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
+
+        # Check if rule is suppressed
+        config = get_config()
+        if rule_code and config.is_suppressed(rule_code, location):
+            logger.debug(f"Suppressed {rule_code}: {message}")
+            return
+
+        # Apply severity override from config
+        if rule_code and severity is not None:
+            rule = RuleRegistry.get_rule(rule_code)
+            if rule:
+                configured_severity = config.get_severity(rule_code, rule.default_severity)
+                severity_map = {
+                    Severity.CRITICAL: IssueSeverity.CRITICAL,
+                    Severity.HIGH: IssueSeverity.CRITICAL,
+                    Severity.MEDIUM: IssueSeverity.WARNING,
+                    Severity.LOW: IssueSeverity.INFO,
+                    Severity.INFO: IssueSeverity.INFO,
+                }
+                severity = severity_map.get(configured_severity, severity)
+
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
 
         # For failed checks, ensure we have a severity
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
-        check = Check(name, status, message, severity, location, details, why)
+        check = Check(name, status, message, severity, location, details, why, rule_code)
         self.checks.append(check)
 
         # If the check failed, also add it as an issue for backward compatibility
@@ -157,7 +205,7 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
-            issue = Issue(message, severity, location, details, why)
+            issue = Issue(message, severity, location, details, why, rule_code)
             self.issues.append(issue)
 
             log_level = (
@@ -181,12 +229,53 @@ class ScanResult:
         location: Optional[str] = None,
         details: Optional[dict[str, Any]] = None,
         why: Optional[str] = None,
+        rule_code: Optional[str] = None,
     ) -> None:
-        """Add an issue to the result (for backward compatibility)"""
+        """Add an issue to the result with rule support"""
+        from ..config import get_config
+        from ..rules import RuleRegistry, Severity
+
+        # Auto-detect rule code if not provided
+        if not rule_code:
+            match = RuleRegistry.find_matching_rule(message)
+            if match:
+                rule_code, rule = match
+                # Use rule's default severity if not specified explicitly
+                severity_map = {
+                    Severity.CRITICAL: IssueSeverity.CRITICAL,
+                    Severity.HIGH: IssueSeverity.CRITICAL,
+                    Severity.MEDIUM: IssueSeverity.WARNING,
+                    Severity.LOW: IssueSeverity.INFO,
+                    Severity.INFO: IssueSeverity.INFO,
+                }
+                # Only override if severity wasn't explicitly set
+                if severity == IssueSeverity.WARNING:  # Default value
+                    severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
+
+        # Check if rule is suppressed
+        config = get_config()
+        if rule_code and config.is_suppressed(rule_code, location):
+            logger.debug(f"Suppressed {rule_code}: {message}")
+            return
+
+        # Apply severity override from config
+        if rule_code:
+            rule = RuleRegistry.get_rule(rule_code)
+            if rule:
+                configured_severity = config.get_severity(rule_code, rule.default_severity)
+                severity_map = {
+                    Severity.CRITICAL: IssueSeverity.CRITICAL,
+                    Severity.HIGH: IssueSeverity.CRITICAL,
+                    Severity.MEDIUM: IssueSeverity.WARNING,
+                    Severity.LOW: IssueSeverity.INFO,
+                    Severity.INFO: IssueSeverity.INFO,
+                }
+                severity = severity_map.get(configured_severity, severity)
+
         if why is None:
             # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
-        issue = Issue(message, severity, location, details, why)
+        issue = Issue(message, severity, location, details, why, rule_code)
         self.issues.append(issue)
 
         # Also add as a failed check for consistency
@@ -410,6 +499,7 @@ class BaseScanner(ABC):
                     name="Embedded Secrets Detection",
                     passed=False,
                     message=finding.get("message", "Secret detected"),
+                    rule_code="S609",
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -476,6 +566,7 @@ class BaseScanner(ABC):
                     name="JIT/Script Code Execution Detection",
                     passed=False,
                     message=finding.get("message", "JIT/Script code risk detected"),
+                    rule_code="S507",
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -541,6 +632,7 @@ class BaseScanner(ABC):
                     name="Network Communication Detection",
                     passed=False,
                     message=finding.get("message", "Network communication pattern detected"),
+                    rule_code="S610",
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,

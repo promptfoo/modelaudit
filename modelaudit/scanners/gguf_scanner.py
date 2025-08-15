@@ -124,6 +124,7 @@ class GgufScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"magic_bytes": magic.hex()},
+                        rule_code="S903"
                     )
                     result.finish(success=False)
                     return result
@@ -201,7 +202,8 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 24},
-            )
+                    rule_code="S902"
+                )
             return
 
         # Parse metadata with security checks
@@ -219,7 +221,7 @@ class GgufScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"suspicious_key": key},
-                    )
+                        rule_code="S405"
 
                 (value_type,) = struct.unpack("<I", f.read(4))
                 value = self._read_value(f, value_type)
@@ -234,6 +236,7 @@ class GgufScanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"key": key, "value": str(value)[:200]},
+                        rule_code="S902"
                     )
 
             result.metadata["metadata"] = metadata
@@ -245,6 +248,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902"
             )
             return
 
@@ -258,7 +262,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=self.current_file_path,
                 details={"alignment": alignment, "valid_range": "8-1024, multiple of 8"},
-            )
+                rule_code="S902"
 
         # Align to tensor data
         current = f.tell()
@@ -279,6 +283,7 @@ class GgufScanner(BaseScanner):
                         name="Tensor Dimension Validation",
                         passed=False,
                         message=f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
+                        rule_code="S703",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
@@ -295,7 +300,7 @@ class GgufScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"tensor_name": t_name, "dimensions": nd, "max_normal": 8},
-                    )
+                        rule_code="S703"
 
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
                 (t_type,) = struct.unpack("<I", f.read(4))
@@ -319,6 +324,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902"
             )
             return
 
@@ -336,7 +342,7 @@ class GgufScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "invalid_dimension": d},
-                        )
+                            rule_code="S902"
                         has_invalid_dimension = True
                         break
                     nelements *= d
@@ -361,6 +367,7 @@ class GgufScanner(BaseScanner):
                         name="Tensor Size Limit Check",
                         passed=False,
                         message=f"Tensor {tensor['name']} estimated size ({estimated_size}) exceeds limit",
+                        rule_code="S902",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={
@@ -382,7 +389,7 @@ class GgufScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
-                        )
+                            rule_code="S703"
 
                     expected = ((nelements + blck - 1) // blck) * ts
                     next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
@@ -396,6 +403,7 @@ class GgufScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "expected": expected, "actual": actual},
+                            rule_code="S902"
                         )
             except (OverflowError, ValueError) as e:
                 result.add_check(
@@ -405,6 +413,7 @@ class GgufScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={"tensor_name": tensor["name"], "error": str(e)},
+                    rule_code="S703"
                 )
 
         result.bytes_scanned = f.tell()
@@ -428,6 +437,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 32},
+                rule_code="S902"
             )
             return
 
@@ -442,6 +452,7 @@ class GgufScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={"header_bytes_read": len(version_bytes), "expected": 4},
+                    rule_code="S902"
                 )
                 return
 
@@ -456,6 +467,7 @@ class GgufScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={"version": version, "max_expected": 10000},
+                    rule_code="S902"
                 )
         except Exception as e:
             result.add_check(
@@ -465,6 +477,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902"
             )
 
         result.bytes_scanned = file_size

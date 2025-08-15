@@ -47,6 +47,7 @@ class PaddleScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"required_package": "paddlepaddle"},
+                rule_code="S902"
             )
             result.finish(success=False)
             return result
@@ -89,7 +90,8 @@ class PaddleScanner(BaseScanner):
                 result.add_check(
                     name="Binary Pattern Detection",
                     passed=False,
-                    message=f"Suspicious binary pattern found: {pattern.decode('ascii', 'ignore')}",
+                    message=f"Suspicious binary pattern found: {pattern.decode('ascii', 'ignore'"})",
+                rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=f"{path} (offset: {offset + pos})",
                     details={"pattern": pattern.decode("ascii", "ignore"), "offset": offset + pos},
@@ -108,4 +110,4 @@ class PaddleScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"pattern": regex},
-                )
+                    rule_code="S902"

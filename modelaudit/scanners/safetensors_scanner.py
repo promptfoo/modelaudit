@@ -11,6 +11,11 @@ from typing import Any, ClassVar
 from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .rule_mapper import (
+    get_file_issue_rule_code,
+    get_model_rule_code,
+    get_generic_rule_code,
+)
 
 # Map SafeTensors dtypes to byte sizes for integrity checking
 _DTYPE_SIZES = {
@@ -80,8 +85,8 @@ class SafeTensorsScanner(BaseScanner):
                         message="File too small to contain SafeTensors header length",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"bytes_read": len(header_len_bytes), "required": 8},
-                    )
+                        details={"bytes_read": len(header_len_bytes,
+                    rule_code="S902")}, rule_code="S902"  # Corrupted structure)
                     result.finish(success=False)
                     return result
 
@@ -93,8 +98,7 @@ class SafeTensorsScanner(BaseScanner):
                         message="Invalid SafeTensors header length",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"header_len": header_len, "max_allowed": file_size - 8},
-                    )
+                        details={"header_len": header_len, "max_allowed": file_size - 8}, rule_code="S902",  # Corrupted structure)
                     result.finish(success=False)
                     return result
                 else:
@@ -104,6 +108,7 @@ class SafeTensorsScanner(BaseScanner):
                         message="SafeTensors header length is valid",
                         location=path,
                         details={"header_len": header_len},
+                        rule_code=None,  # Passing check
                     )
 
                 header_bytes = f.read(header_len)
@@ -114,8 +119,8 @@ class SafeTensorsScanner(BaseScanner):
                         message="Failed to read SafeTensors header",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"bytes_read": len(header_bytes), "expected": header_len},
-                    )
+                        details={"bytes_read": len(header_bytes,
+                    rule_code="S902"), "expected": header_len}, rule_code="S902"  # Corrupted structure)
                     result.finish(success=False)
                     return result
 
@@ -126,6 +131,8 @@ class SafeTensorsScanner(BaseScanner):
                         message="SafeTensors header does not start with '{'",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
+                        rule_code="S902",  # Corrupted structure
+            )
                     )
                     result.finish(success=False)
                     return result
@@ -135,6 +142,7 @@ class SafeTensorsScanner(BaseScanner):
                         passed=True,
                         message="SafeTensors header format is valid JSON",
                         location=path,
+                        rule_code=None,  # Passing check
                     )
 
                 try:
@@ -146,8 +154,7 @@ class SafeTensorsScanner(BaseScanner):
                         message=f"Invalid JSON header: {e!s}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"exception": str(e), "exception_type": type(e).__name__},
-                    )
+                        details={"exception": str(e)}, rule_code="S902"}, rule_code="S902"  # Corrupted structure)
                     result.finish(success=False)
                     return result
 
@@ -168,8 +175,8 @@ class SafeTensorsScanner(BaseScanner):
                             message=f"Invalid tensor entry for {name}",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
-                        )
+                            details={"tensor": name, "actual_type": type(info,
+                    rule_code="S902").__name__, "expected_type": "dict"}, rule_code="S902"  # Corrupted structure)
                         continue
 
                     begin, end = info.get("data_offsets", [0, 0])
@@ -185,10 +192,10 @@ class SafeTensorsScanner(BaseScanner):
                             location=path,
                             details={
                                 "tensor": name,
-                                "begin_type": type(begin).__name__,
+                                "begin_type": type(begin,
+                    rule_code="S902").__name__,
                                 "end_type": type(end).__name__,
-                            },
-                        )
+                            }, rule_code="S902",  # Corrupted structure)
                         continue
 
                     if begin < 0 or end <= begin or end > data_size:
@@ -198,8 +205,7 @@ class SafeTensorsScanner(BaseScanner):
                             message=f"Tensor {name} offsets out of bounds",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"tensor": name, "begin": begin, "end": end, "data_size": data_size},
-                        )
+                            details={"tensor": name, "begin": begin, "end": end, "data_size": data_size}, rule_code="S902",  # Corrupted structure)
                         continue
                     else:
                         result.add_check(
@@ -208,6 +214,7 @@ class SafeTensorsScanner(BaseScanner):
                             message=f"Tensor {name} offsets are valid",
                             location=path,
                             details={"tensor": name, "begin": begin, "end": end},
+                            rule_code=None,  # Passing check
                         )
 
                     offsets.append((begin, end))
@@ -226,8 +233,7 @@ class SafeTensorsScanner(BaseScanner):
                                     "tensor": name,
                                     "expected_size": expected_size,
                                     "actual_size": end - begin,
-                                },
-                            )
+                                }, rule_code="S902",  # Corrupted structure)
                         else:
                             result.add_check(
                                 name="Tensor Size Consistency Check",
@@ -238,6 +244,7 @@ class SafeTensorsScanner(BaseScanner):
                                     "tensor": name,
                                     "size": expected_size,
                                 },
+                                rule_code=None,  # Passing check
                             )
 
                 # Check offset continuity
@@ -253,8 +260,7 @@ class SafeTensorsScanner(BaseScanner):
                             message="Tensor data offsets have gaps or overlap",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"gap_at": begin, "expected": last_end},
-                        )
+                            details={"gap_at": begin, "expected": last_end}, rule_code="S902",  # Corrupted structure)
                         break
                     last_end = end
 
@@ -265,6 +271,7 @@ class SafeTensorsScanner(BaseScanner):
                         message="Tensor offsets are continuous without gaps",
                         location=path,
                         details={"total_offsets": len(offsets)},
+                        rule_code=None  # Passing check
                     )
 
                 data_size = file_size - (8 + header_len)
@@ -275,8 +282,7 @@ class SafeTensorsScanner(BaseScanner):
                         message="Tensor data does not cover entire file",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"last_offset": last_end, "data_size": data_size},
-                    )
+                        details={"last_offset": last_end, "data_size": data_size}, rule_code="S902",  # Corrupted structure)
 
                 # Check metadata
                 metadata = header.get("__metadata__", {})
@@ -289,12 +295,15 @@ class SafeTensorsScanner(BaseScanner):
                                 message=f"Metadata value for {key} is very long",
                                 severity=IssueSeverity.INFO,
                                 location=path,
-                                details={"key": key, "length": len(value), "threshold": 1000},
+                                details={"key": key, "length": len(value,
+                    rule_code="S902"), "threshold": 1000},
                                 why=(
                                     "Metadata fields over 1000 characters are unusual in model files. Long strings "
                                     "in metadata could contain encoded payloads, scripts, or data exfiltration "
                                     "attempts."
                                 ),
+                                rule_code="S905",  # Suspicious metadata
+            )
                             )
 
                         if isinstance(value, str):
@@ -311,9 +320,12 @@ class SafeTensorsScanner(BaseScanner):
                                     details={"key": key, "pattern": "code-like"},
                                     why=(
                                         "Metadata containing code-like patterns (import statements, shebangs, escape "
-                                        "sequences) is atypical for model files and may indicate embedded scripts or "
+                                        "sequences,
+                    rule_code="S902") is atypical for model files and may indicate embedded scripts or "
                                         "injection attempts."
                                     ),
+                                    rule_code="S507",  # Python embedded code
+            )
                                 )
 
                             # Check for regex-based suspicious patterns (independent of above check)
@@ -327,6 +339,8 @@ class SafeTensorsScanner(BaseScanner):
                                         location=path,
                                         details={"key": key, "pattern": pattern},
                                         why="Metadata matched known suspicious pattern",
+                                        rule_code="S905",  # Suspicious metadata
+            )
                                     )
                                     break
 
@@ -340,8 +354,7 @@ class SafeTensorsScanner(BaseScanner):
                 message=f"Error scanning SafeTensors file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+                details={"exception": str(e), rule_code="S703", "exception_type": type(e).__name__}, rule_code="S902"  # Scan error/corruption)
             result.finish(success=False)
             return result
 

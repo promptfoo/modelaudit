@@ -80,8 +80,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path, "required_package": "tensorflow"},
-            )
+                details={"path": path, "required_package": "tensorflow"}, rule_code="S902",)
             result.finish(success=False)
             return result
 
@@ -97,8 +96,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             message=f"Path is neither a file nor a directory: {path}",
             severity=IssueSeverity.CRITICAL,
             location=path,
-            details={"path": path},
-        )
+            details={"path": path}, rule_code="S902",)
         result.finish(success=False)
         return result
 
@@ -150,6 +148,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 message="No saved_model.pb found in directory.",
                 severity=IssueSeverity.CRITICAL,
                 location=dir_path,
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -169,7 +168,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         passed=False,
                         message=f"Python file found in SavedModel: {file}",
                         severity=IssueSeverity.INFO,
-                        location=str(file_path),
+                        location=str(file_path), rule_code="S902",
                         details={"file": file, "directory": root},
                     )
 
@@ -202,7 +201,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                             passed=False,
                                             message=f"Blacklisted pattern '{pattern}' found in file {file}",
                                             severity=IssueSeverity.CRITICAL,
-                                            location=str(file_path),
+                                            location=str(file_path,
+                rule_code="S902",
+            ),
                                             details={"pattern": pattern, "file": file},
                                         )
                     except Exception as e:
@@ -211,7 +212,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             passed=False,
                             message=f"Error reading file {file}: {e!s}",
                             severity=IssueSeverity.DEBUG,
-                            location=str(file_path),
+                            location=str(file_path), rule_code="S902",
                             details={
                                 "file": file,
                                 "exception": str(e),
@@ -252,6 +253,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             message=f"Suspicious TensorFlow operation: {node.op}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (node: {node.name})",
+                rule_code="S703"",
                             details={
                                 "op_type": node.op,
                                 "node_name": node.name,
@@ -309,6 +311,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     message=f"{node.op} operation references dangerous function: {func_name}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=f"{self.current_file_path} (node: {node.name})",
+                rule_code="S902"",
                                     details={
                                         "op_type": node.op,
                                         "node_name": node.name,
@@ -339,7 +342,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     passed=False,
                     message=issue_msg,
                     severity=severity,
-                    location=f"{self.current_file_path} (node: {node.name})",
+                    location=f"{self.current_file_path} (node: {node.name})", rule_code="S902"",
                     details={
                         "op_type": node.op,
                         "node_name": node.name,
@@ -357,7 +360,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 result.add_check(
                     name="PyFunc Code Validation",
                     passed=False,
-                    message=f"{node.op} operation contains suspicious data (possibly obfuscated code)",
+                    message=f"{node.op} operation contains suspicious data (possibly obfuscated code")",
+                rule_code="S902"",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (node: {node.name})",
                     details={
@@ -376,7 +380,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.add_check(
                 name="PyFunc Code Extraction Check",
                 passed=False,
-                message=f"{node.op} operation detected (unable to extract Python code)",
+                message=f"{node.op} operation detected (unable to extract Python code")",
+                rule_code="S902"",
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path} (node: {node.name})",
                 details={

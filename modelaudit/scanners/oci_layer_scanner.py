@@ -67,7 +67,9 @@ class OciLayerScanner(BaseScanner):
                 message=f"Error parsing manifest: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception_type": type(e).__name__},
+                details={"exception_type": type(e,
+                rule_code="S902",
+            ).__name__},
             )
             result.finish(success=False)
             return result
@@ -103,8 +105,7 @@ class OciLayerScanner(BaseScanner):
                     message=f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path}:{layer_ref}",
-                    details={"layer": layer_ref},
-                )
+                    details={"layer": layer_ref}, rule_code="S405",)
                 continue
 
             if not os.path.exists(layer_path):
@@ -114,6 +115,7 @@ class OciLayerScanner(BaseScanner):
                     message=f"Layer not found: {layer_ref}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
+                rule_code="S902"
                 )
                 continue
             try:
@@ -159,7 +161,8 @@ class OciLayerScanner(BaseScanner):
                     message=f"Error processing layer {layer_ref}: {e}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
-                    details={"exception_type": type(e).__name__},
+                    details={"exception_type": type(e,
+                    rule_code="S902").__name__},
                 )
 
         result.finish(success=True)

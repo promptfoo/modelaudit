@@ -7,6 +7,10 @@ from typing import Any, ClassVar, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .rule_mapper import (
+    get_file_issue_rule_code,
+    get_embedded_code_rule_code,
+)
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -91,6 +95,7 @@ class ZipScanner(BaseScanner):
                 passed=False,
                 message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
+                rule_code="S902",  # Corrupted structure
                 location=path,
                 details={"path": path},
             )
@@ -102,6 +107,7 @@ class ZipScanner(BaseScanner):
                 passed=False,
                 message=f"Error scanning zip file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
+                rule_code="S902",  # Scan error
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -125,6 +131,7 @@ class ZipScanner(BaseScanner):
                 passed=False,
                 message=f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
                 severity=IssueSeverity.WARNING,
+                rule_code="S410",  # Archive bomb
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
@@ -135,6 +142,7 @@ class ZipScanner(BaseScanner):
                 passed=True,
                 message="ZIP nesting depth is within safe limits",
                 location=path,
+                rule_code=None,  # Passing check
                 details={"depth": depth, "max_depth": self.max_depth},
             )
 
@@ -147,6 +155,7 @@ class ZipScanner(BaseScanner):
                     passed=False,
                     message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
                     severity=IssueSeverity.WARNING,
+                    rule_code="S410",  # Archive bomb
                     location=path,
                     details={
                         "entries": entry_count,
@@ -164,6 +173,7 @@ class ZipScanner(BaseScanner):
                         "entries": entry_count,
                         "max_entries": self.max_entries,
                     },
+                    rule_code=None  # Passing check
                 )
 
             # Scan each file in the archive
@@ -178,6 +188,7 @@ class ZipScanner(BaseScanner):
                         passed=False,
                         message=f"Archive entry {name} attempted path traversal outside the archive",
                         severity=IssueSeverity.CRITICAL,
+                        rule_code="S405",  # Path traversal
                         location=f"{path}:{name}",
                         details={"entry": name},
                     )
@@ -205,6 +216,7 @@ class ZipScanner(BaseScanner):
                             passed=False,
                             message=message,
                             severity=IssueSeverity.CRITICAL,
+                            rule_code="S406",  # Symlink external
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
                         )
@@ -214,6 +226,7 @@ class ZipScanner(BaseScanner):
                             passed=False,
                             message=f"Symlink {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
+                            rule_code="S408",  # System file access
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
                         )
@@ -223,6 +236,7 @@ class ZipScanner(BaseScanner):
                             passed=True,
                             message=f"Symlink {name} is safe",
                             location=f"{path}:{name}",
+                            rule_code=None,  # Passing check
                             details={"target": target, "entry": name},
                         )
                     # Do not scan symlink contents
@@ -241,6 +255,7 @@ class ZipScanner(BaseScanner):
                             passed=False,
                             message=f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
                             severity=IssueSeverity.WARNING,
+                            rule_code="S410",  # Archive bomb
                             location=f"{path}:{name}",
                             details={
                                 "entry": name,
@@ -264,6 +279,7 @@ class ZipScanner(BaseScanner):
                                 "ratio": compression_ratio,
                                 "threshold": 100,
                             },
+                            rule_code=None  # Passing check
                         )
 
                 # Extract and scan the file
@@ -378,6 +394,7 @@ class ZipScanner(BaseScanner):
                         passed=False,
                         message=f"Error scanning ZIP entry {name}: {e!s}",
                         severity=IssueSeverity.WARNING,
+                        rule_code="S902",  # Scan error
                         location=f"{path}:{name}",
                         details={"entry": name, "exception": str(e), "exception_type": type(e).__name__},
                     )
