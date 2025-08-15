@@ -60,7 +60,7 @@ class PyTorchZipScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
-        # Don't skip large files - we can handle them with streaming
+        # Handle large files with streaming
         # size_check = self._check_size_limit(path)
         # if size_check:
         #     return size_check

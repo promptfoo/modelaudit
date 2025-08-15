@@ -1,26 +1,26 @@
-"""Test that extreme large files bypass size limits."""
+"""Test that advanced file handler bypasses size limits for large files."""
 
 import tempfile
 from unittest.mock import patch
 
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import ScanResult
-from modelaudit.utils.extreme_large_file_handler import (
+from modelaudit.utils.advanced_file_handler import (
     COLOSSAL_MODEL_THRESHOLD,
     EXTREME_MODEL_THRESHOLD,
-    MASSIVE_MODEL_THRESHOLD,
-    should_use_extreme_handler,
+    LARGE_MODEL_THRESHOLD_200GB,
+    should_use_advanced_handler,
 )
 
 
-class TestExtremeSizeLimits:
+class TestAdvancedSizeLimits:
     """Test that size limits don't prevent scanning huge models."""
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     @patch("modelaudit.core.os.path.getsize")
-    @patch("modelaudit.core.should_use_extreme_handler")
-    def test_extreme_files_bypass_size_limit(self, mock_should_use, mock_core_size, mock_extreme_size):
-        """Test that extreme files bypass max_file_size limit."""
+    @patch("modelaudit.core.should_use_advanced_handler")
+    def test_advanced_files_bypass_size_limit(self, mock_should_use, mock_core_size, mock_extreme_size):
+        """Test that advanced handler bypasses max_file_size limit."""
         # Simulate a 100GB file
         huge_size = 100 * 1024 * 1024 * 1024
         mock_core_size.return_value = huge_size
@@ -32,7 +32,7 @@ class TestExtremeSizeLimits:
             config = {"max_file_size": 1024 * 1024 * 1024}  # 1GB limit
 
             # Mock the extreme handler to avoid actual scanning
-            with patch("modelaudit.core.scan_extreme_large_file") as mock_scan:
+            with patch("modelaudit.core.scan_advanced_large_file") as mock_scan:
                 mock_scan.return_value = ScanResult("test")
 
                 # Mock other required functions
@@ -54,7 +54,7 @@ class TestExtremeSizeLimits:
                                 # but using the normal large file handler
                                 assert result is not None
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     def test_normal_files_respect_size_limit(self, mock_size):
         """Test that normal files still respect max_file_size."""
         # Simulate a 5GB file (below extreme threshold)
@@ -75,7 +75,7 @@ class TestExtremeSizeLimits:
                 assert any("too large" in issue.message.lower() for issue in result.issues)
                 assert any("hint" in issue.details for issue in result.issues if issue.details)
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     def test_colossal_files_handled(self, mock_size):
         """Test that even 10TB+ files can be handled."""
         # Simulate a 10TB file
@@ -83,10 +83,10 @@ class TestExtremeSizeLimits:
         mock_size.return_value = colossal_size
 
         # Should be detected as needing extreme handler
-        assert should_use_extreme_handler("massive_model.bin")
+        assert should_use_advanced_handler("massive_model.bin")
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
-    @patch("modelaudit.core.should_use_extreme_handler")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.core.should_use_advanced_handler")
     def test_unlimited_size_default(self, mock_should_use, mock_size):
         """Test that default config has no size limit."""
         # Simulate a 500GB file
@@ -101,7 +101,7 @@ class TestExtremeSizeLimits:
             with patch("modelaudit.core.os.path.getsize") as mock_core_size:
                 mock_core_size.return_value = huge_size
 
-                with patch("modelaudit.core.scan_extreme_large_file") as mock_scan:
+                with patch("modelaudit.core.scan_advanced_large_file") as mock_scan:
                     mock_scan.return_value = ScanResult("test")
 
                     # Mock other required functions
@@ -127,15 +127,15 @@ class TestExtremeSizeLimits:
         assert EXTREME_MODEL_THRESHOLD >= 50 * 1024 * 1024 * 1024
 
         # Massive threshold should be larger
-        assert MASSIVE_MODEL_THRESHOLD > EXTREME_MODEL_THRESHOLD
+        assert LARGE_MODEL_THRESHOLD_200GB > EXTREME_MODEL_THRESHOLD
 
         # Colossal threshold should be even larger
-        assert COLOSSAL_MODEL_THRESHOLD > MASSIVE_MODEL_THRESHOLD
+        assert COLOSSAL_MODEL_THRESHOLD > LARGE_MODEL_THRESHOLD_200GB
 
         # Colossal should handle at least 1TB
         assert COLOSSAL_MODEL_THRESHOLD >= 1024 * 1024 * 1024 * 1024
 
-    @patch("modelaudit.utils.extreme_large_file_handler.ShardedModelDetector.detect_shards")
+    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
     def test_sharded_models_bypass_individual_limits(self, mock_detect):
         """Test that sharded models are detected regardless of individual file sizes."""
         # Simulate detection of sharded model
@@ -145,7 +145,7 @@ class TestExtremeSizeLimits:
         }
 
         # Even a "small" shard should trigger extreme handler if part of large model
-        assert should_use_extreme_handler("shard1.bin")
+        assert should_use_advanced_handler("shard1.bin")
 
     def test_no_hardcoded_upper_limit(self):
         """Ensure there's no hardcoded upper limit that would block any file."""
@@ -153,11 +153,11 @@ class TestExtremeSizeLimits:
         petabyte = 1024 * 1024 * 1024 * 1024 * 1024  # 1PB
         exabyte = petabyte * 1024  # 1EB
 
-        with patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize") as mock_size:
+        with patch("modelaudit.utils.advanced_file_handler.os.path.getsize") as mock_size:
             # Test petabyte file
             mock_size.return_value = petabyte
-            assert should_use_extreme_handler("petabyte_model.bin")
+            assert should_use_advanced_handler("petabyte_model.bin")
 
             # Test exabyte file (theoretical)
             mock_size.return_value = exabyte
-            assert should_use_extreme_handler("exabyte_model.bin")
+            assert should_use_advanced_handler("exabyte_model.bin")

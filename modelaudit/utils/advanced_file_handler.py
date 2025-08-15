@@ -1,7 +1,7 @@
 """
-Extreme large file handling utilities for ModelAudit.
+Advanced file handling utilities for ModelAudit.
 
-This module provides advanced utilities for scanning extremely large model files (400B+ parameters)
+This module provides advanced utilities for scanning large model files (400B+ parameters)
 with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
 """
 
@@ -18,11 +18,10 @@ from ..scanners.base import IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
-# Size thresholds for extreme models
+# Size thresholds for large models
 EXTREME_MODEL_THRESHOLD = 50 * 1024 * 1024 * 1024  # 50GB - use memory mapping
-MASSIVE_MODEL_THRESHOLD = 200 * 1024 * 1024 * 1024  # 200GB - distributed scanning
+LARGE_MODEL_THRESHOLD_200GB = 200 * 1024 * 1024 * 1024  # 200GB - distributed scanning
 COLOSSAL_MODEL_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - special handling
-# Note: No upper limit - we can handle files of ANY size through sampling
 
 # Memory mapping parameters
 MMAP_CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks for memory mapping
@@ -105,7 +104,7 @@ class ShardedModelDetector:
 
 
 class MemoryMappedScanner:
-    """Scanner using memory-mapped I/O for extreme file sizes."""
+    """Scanner using memory-mapped I/O for large file sizes."""
 
     def __init__(self, file_path: str, scanner: Any):
         """
@@ -300,18 +299,18 @@ class ParallelShardScanner:
         return result
 
 
-class ExtremeLargeFileHandler:
-    """Handler for extremely large model files (400B+ parameters)."""
+class AdvancedFileHandler:
+    """Handler for large model files (400B+ parameters)."""
 
     def __init__(
         self,
         file_path: str,
         scanner: Any,
         progress_callback: Optional[Callable[[str, float], None]] = None,
-        timeout: int = 7200,  # 2 hours for extreme models
+        timeout: int = 7200,  # 2 hours for large models
     ):
         """
-        Initialize extreme large file handler.
+        Initialize advanced file handler.
 
         Args:
             file_path: Path to the file
@@ -338,18 +337,18 @@ class ExtremeLargeFileHandler:
 
     def scan(self) -> ScanResult:
         """
-        Scan the extremely large model.
+        Scan the large model file.
 
         Returns:
             ScanResult with findings
         """
-        logger.info(f"Scanning extreme large model: {self.total_size:,} bytes, sharded={self.is_sharded}")
+        logger.info(f"Scanning large model file: {self.total_size:,} bytes, sharded={self.is_sharded}")
 
         # Determine scanning strategy
         if self.is_sharded:
             return self._scan_sharded_model()
-        elif self.total_size > MASSIVE_MODEL_THRESHOLD:
-            return self._scan_massive_file()
+        elif self.total_size > LARGE_MODEL_THRESHOLD_200GB:
+            return self._scan_large_file_distributed()
         elif self.total_size > EXTREME_MODEL_THRESHOLD:
             return self._scan_with_mmap()
         else:
@@ -379,7 +378,7 @@ class ExtremeLargeFileHandler:
                             details={"config_file": config_path},
                         )
             except Exception as e:
-                logger.warning(f"Could not read config file: {e}")
+                logger.warning(f"Failed to read config file: {e}")
 
         # Scan shards in parallel
         if self.shard_info:
@@ -394,14 +393,14 @@ class ExtremeLargeFileHandler:
         mmap_scanner = MemoryMappedScanner(self.file_path, self.scanner)
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
-    def _scan_massive_file(self) -> ScanResult:
-        """Scan massive files using memory-mapped approach with FULL security checks."""
-        logger.info(f"Scanning massive file ({self.total_size:,} bytes) with full security checks")
+    def _scan_large_file_distributed(self) -> ScanResult:
+        """Scan large files using memory-mapped approach with FULL security checks."""
+        logger.info(f"Scanning file ({self.total_size:,} bytes) with full security checks")
 
         # Add informational note about file size
         result = ScanResult(scanner_name=self.scanner.name)
         result.add_issue(
-            f"Scanning massive file ({self.total_size:,} bytes) - this may take some time",
+            f"Scanning file ({self.total_size:,} bytes) - processing may take additional time",
             severity=IssueSeverity.INFO,
             details={
                 "file_size": self.total_size,
@@ -465,15 +464,15 @@ class ExtremeLargeFileHandler:
         return result
 
 
-def should_use_extreme_handler(file_path: str) -> bool:
+def should_use_advanced_handler(file_path: str) -> bool:
     """
-    Check if file should use extreme large file handler.
+    Check if file should use advanced file handler.
 
     Args:
         file_path: Path to check
 
     Returns:
-        True if extreme handler should be used
+        True if advanced handler should be used
     """
     # Check for sharded model
     if ShardedModelDetector.detect_shards(file_path):
@@ -487,14 +486,14 @@ def should_use_extreme_handler(file_path: str) -> bool:
         return False
 
 
-def scan_extreme_large_file(
+def scan_advanced_large_file(
     file_path: str,
     scanner: Any,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     timeout: int = 7200,
 ) -> ScanResult:
     """
-    Scan an extremely large file.
+    Scan a large file with advanced handler.
 
     Args:
         file_path: Path to scan
@@ -505,5 +504,5 @@ def scan_extreme_large_file(
     Returns:
         ScanResult with findings
     """
-    handler = ExtremeLargeFileHandler(file_path, scanner, progress_callback, timeout)
+    handler = AdvancedFileHandler(file_path, scanner, progress_callback, timeout)
     return handler.scan()
