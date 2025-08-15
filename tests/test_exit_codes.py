@@ -116,7 +116,7 @@ def test_exit_code_mixed_severity():
 
 
 def test_exit_code_info_level_issues():
-    """Test exit code 1 for info level issues."""
+    """Test exit code 0 for info level issues (INFO is not a security problem)."""
     results = {
         "success": True,
         "has_errors": False,
@@ -129,7 +129,7 @@ def test_exit_code_info_level_issues():
         ],
         "files_scanned": 1,
     }
-    assert determine_exit_code(results) == 1
+    assert determine_exit_code(results) == 0  # INFO level should not trigger exit code 1
 
 
 def test_exit_code_empty_results():
