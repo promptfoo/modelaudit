@@ -79,6 +79,27 @@ SUSPICIOUS_GLOBALS = {
         "input",
         "__import__",
     ],  # Dynamic code evaluation and file access
+    # Python 2 style builtins - CRITICAL RISK
+    "__builtin__": [
+        "eval",
+        "exec",
+        "execfile",
+        "compile",
+        "open",
+        "input",
+        "raw_input",
+        "__import__",
+        "reload",
+    ],  # Python 2 style builtin functions (still exploitable in many contexts)
+    # Alternative builtin references - CRITICAL RISK
+    "__builtins__": [
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "__import__",
+    ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
     "importlib": ["import_module"],  # Dynamic module loading
     # Serialization/deserialization - MEDIUM RISK
