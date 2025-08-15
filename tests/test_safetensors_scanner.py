@@ -78,11 +78,11 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
     # Create a deeply nested structure manually as a string to avoid json.dumps recursion
     # We'll create a JSON string with deep nesting that will trigger RecursionError on parse
     depth = 1500
-    
+
     # Build the deeply nested JSON string manually
-    header_str = '{"a":' * depth + '{}' + '}' * depth
+    header_str = '{"a":' * depth + "{}" + "}" * depth
     header_bytes = header_str.encode("utf-8")
-    
+
     file_path = tmp_path / "deep.safetensors"
     with open(file_path, "wb") as f:
         f.write(struct.pack("<Q", len(header_bytes)))
