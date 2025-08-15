@@ -278,44 +278,44 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
                     # These operations can contain arbitrary functions
                     # Check the function name for suspicious patterns
-                        func_attr = node.attr["f"]
-                        if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
-                            func_name = func_attr.func.name
+                    func_attr = node.attr["f"]
+                    if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
+                        func_name = func_attr.func.name
 
-                            # Check for suspicious function names
-                            suspicious_func_patterns = [
-                                "lambda",
-                                "eval",
-                                "exec",
-                                "compile",
-                                "__import__",
-                                "system",
-                                "popen",
-                                "subprocess",
-                                "pickle",
-                                "marshal",
-                            ]
+                        # Check for suspicious function names
+                        suspicious_func_patterns = [
+                            "lambda",
+                            "eval",
+                            "exec",
+                            "compile",
+                            "__import__",
+                            "system",
+                            "popen",
+                            "subprocess",
+                            "pickle",
+                            "marshal",
+                        ]
 
-                            for pattern in suspicious_func_patterns:
-                                if pattern in func_name.lower():
-                                    result.add_check(
-                                        name="StatefulPartitionedCall Security Check",
-                                        passed=False,
-                                        message=f"StatefulPartitionedCall with suspicious function: {func_name}",
-                                        severity=IssueSeverity.WARNING,
-                                        location=f"{self.current_file_path} (node: {node.name})",
-                                        details={
-                                            "op_type": node.op,
-                                            "node_name": node.name,
-                                            "function_name": func_name,
-                                            "suspicious_pattern": pattern,
-                                        },
-                                        why=(
-                                            "StatefulPartitionedCall can execute custom functions "
-                                            "that may contain arbitrary code."
-                                        ),
-                                    )
-                                    break
+                        for pattern in suspicious_func_patterns:
+                            if pattern in func_name.lower():
+                                result.add_check(
+                                    name="StatefulPartitionedCall Security Check",
+                                    passed=False,
+                                    message=f"StatefulPartitionedCall with suspicious function: {func_name}",
+                                    severity=IssueSeverity.WARNING,
+                                    location=f"{self.current_file_path} (node: {node.name})",
+                                    details={
+                                        "op_type": node.op,
+                                        "node_name": node.name,
+                                        "function_name": func_name,
+                                        "suspicious_pattern": pattern,
+                                    },
+                                    why=(
+                                        "StatefulPartitionedCall can execute custom functions "
+                                        "that may contain arbitrary code."
+                                    ),
+                                )
+                                break
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
