@@ -21,7 +21,6 @@ class TestCompileEvalVariants:
         assert "compile" in DANGEROUS_BUILTINS
         assert "globals" in DANGEROUS_BUILTINS
         assert "locals" in DANGEROUS_BUILTINS
-        assert "type" in DANGEROUS_BUILTINS
         assert "setattr" in DANGEROUS_BUILTINS
         assert "getattr" in DANGEROUS_BUILTINS
 
@@ -114,36 +113,6 @@ class TestCompileEvalVariants:
         finally:
             os.unlink(temp_path)
 
-    def test_type_detection(self):
-        """Test detection of type() for dynamic class creation."""
-        scanner = PickleScanner()
-
-        # Create a pickle with type() reference
-        # This could be used to create classes with malicious __reduce__ methods
-        pickle_bytes = b"\x80\x02cbuiltins\ntype\nq\x00."
-
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            f.write(pickle_bytes)
-            temp_path = f.name
-
-        try:
-            result = scanner.scan(temp_path)
-
-            # Should detect as dangerous
-            assert len(result.issues) > 0, "Should detect type()"
-
-            # Check that type was detected
-            pattern_detected = False
-            for issue in result.issues:
-                if "type" in issue.message.lower():
-                    pattern_detected = True
-                    assert issue.severity == IssueSeverity.CRITICAL, "type should be CRITICAL"
-                    break
-
-            assert pattern_detected, "Should detect type pattern"
-
-        finally:
-            os.unlink(temp_path)
 
     def test_builtins_access_detection(self):
         """Test detection of __builtins__ access."""
@@ -259,24 +228,19 @@ class TestCompileEvalVariants:
         finally:
             os.unlink(temp_path)
 
-    def test_type_class_creation_attack(self):
-        """Test detection of type() used to create malicious classes."""
+    def test_eval_in_reduce_attack(self):
+        """Test detection of eval used in __reduce__ for malicious unpickling."""
         scanner = PickleScanner()
 
-        # Create a pickle that uses type() to create a class with malicious __reduce__
-        # This simulates creating a class that executes code when unpickled
+        # Create a pickle that contains eval in a __reduce__ context
+        # This simulates creating an object that executes code when unpickled
         pickle_bytes = (
             b"\x80\x02"  # Protocol 2
-            b"cbuiltins\ntype\n"  # Import type
+            b"cbuiltins\neval\n"  # Import eval
             b"q\x00"  # BINPUT 0
-            b"(S'Evil'\n"  # Class name
-            b"(tq\x01"  # Empty bases tuple
-            b"(S'__reduce__'\n"  # Method name
-            b"cbuiltins\neval\n"  # Method implementation
-            b"tq\x02"  # Dict items
-            b"}q\x03"  # EMPTY_DICT, BINPUT 3
-            b"tq\x04"  # Args tuple for type()
-            b"Rq\x05"  # REDUCE - create class
+            b"(S'__import__(\"os\").system(\"echo pwned\")'\n"  # Malicious code
+            b"tq\x01"  # TUPLE, BINPUT 1
+            b"Rq\x02"  # REDUCE - execute eval
             b"."  # STOP
         )
 
@@ -288,18 +252,15 @@ class TestCompileEvalVariants:
             result = scanner.scan(temp_path)
 
             # Should detect dangerous patterns
-            assert len(result.issues) > 0, "Should detect type() class creation attack"
+            assert len(result.issues) > 0, "Should detect eval in __reduce__ attack"
 
-            # Should detect both type and eval
-            found_type = False
+            # Should detect eval
             found_eval = False
             for issue in result.issues:
-                if "type" in issue.message.lower():
-                    found_type = True
                 if "eval" in issue.message.lower():
                     found_eval = True
+                    break
 
-            assert found_type, "Should detect type pattern"
             assert found_eval, "Should detect eval in __reduce__"
 
         finally:
@@ -356,7 +317,6 @@ class TestCompileEvalVariants:
             b"__builtins__",
             b"globals",
             b"locals",
-            b"type",
         ]
 
         for pattern in new_patterns:

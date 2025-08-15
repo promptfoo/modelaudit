@@ -148,7 +148,6 @@ DANGEROUS_BUILTINS = [
     "__import__",
     "globals",  # Access to global namespace
     "locals",  # Access to local namespace
-    "type",  # Can create classes with custom methods
     "setattr",  # Can set arbitrary attributes
     "getattr",  # Can access arbitrary attributes
     "delattr",  # Can delete attributes

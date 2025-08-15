@@ -1126,7 +1126,6 @@ class PickleScanner(BaseScanner):
             b"__builtins__",  # Alternative reference to builtins
             b"globals",  # Access to global namespace for code injection
             b"locals",  # Access to local namespace for code injection
-            b"type",  # Can create classes with malicious __reduce__ methods
             b"webbrowser",  # Can open malicious URLs (webbrowser.open)
             b"importlib",  # Dynamic module loading (import_module, reload, etc.)
             b"runpy",  # Can execute arbitrary modules via run_module, run_path
