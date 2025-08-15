@@ -1,4 +1,4 @@
-"""Tests for extreme large file handler."""
+"""Tests for advanced file handler."""
 
 import os
 import tempfile
@@ -6,12 +6,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from modelaudit.scanners.base import BaseScanner, ScanResult
-from modelaudit.utils.extreme_large_file_handler import (
-    ExtremeLargeFileHandler,
+from modelaudit.utils.advanced_file_handler import (
+    AdvancedFileHandler,
     MemoryMappedScanner,
     ParallelShardScanner,
     ShardedModelDetector,
-    should_use_extreme_handler,
+    should_use_advanced_handler,
 )
 
 
@@ -170,11 +170,11 @@ class TestParallelShardScanner:
             assert len([i for i in result.issues if "Scanning sharded model" in i.message]) == 1
 
 
-class TestExtremeLargeFileHandler:
+class TestAdvancedFileHandler:
     """Test extreme large file handler."""
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
-    @patch("modelaudit.utils.extreme_large_file_handler.ShardedModelDetector.detect_shards")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
     def test_sharded_model_handling(self, mock_detect, mock_getsize):
         """Test handling of sharded models."""
         mock_detect.return_value = {
@@ -187,25 +187,25 @@ class TestExtremeLargeFileHandler:
         mock_scanner.name = "test_scanner"
         mock_scanner.__class__ = BaseScanner
 
-        handler = ExtremeLargeFileHandler("model.bin", mock_scanner)
+        handler = AdvancedFileHandler("model.bin", mock_scanner)
         assert handler.is_sharded
         assert handler.total_size == 100 * 1024 * 1024 * 1024
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     def test_extreme_file_detection(self, mock_getsize):
         """Test detection of extreme large files."""
         # Test file over 50GB threshold
         mock_getsize.return_value = 60 * 1024 * 1024 * 1024  # 60GB
 
-        assert should_use_extreme_handler("large_model.bin")
+        assert should_use_advanced_handler("large_model.bin")
 
         # Test file under threshold
         mock_getsize.return_value = 5 * 1024 * 1024 * 1024  # 5GB
 
-        assert not should_use_extreme_handler("small_model.bin")
+        assert not should_use_advanced_handler("small_model.bin")
 
-    @patch("modelaudit.utils.extreme_large_file_handler.os.path.getsize")
-    @patch("modelaudit.utils.extreme_large_file_handler.ShardedModelDetector.detect_shards")
+    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
     def test_massive_file_handling(self, mock_detect, mock_getsize):
         """Test handling of massive files (>200GB)."""
         mock_detect.return_value = None  # Not sharded
@@ -218,7 +218,7 @@ class TestExtremeLargeFileHandler:
             mock_scanner = MagicMock()
             mock_scanner.name = "test_scanner"
 
-            handler = ExtremeLargeFileHandler(f.name, mock_scanner)
+            handler = AdvancedFileHandler(f.name, mock_scanner)
 
             with patch("builtins.open", create=True) as mock_open:
                 mock_file = MagicMock()

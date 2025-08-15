@@ -282,27 +282,6 @@ class PyTorchBinaryScanner(BaseScanner):
                     },
                 )
 
-            # Add debug note about ignored patterns (only shown in verbose mode)
-            if ignored_count > 0 and len(positions) > 5:
-                from modelaudit.utils.ml_context import get_ml_context_explanation
-
-                explanation = get_ml_context_explanation(ml_context, len(positions))
-                result.add_check(
-                    name="False Positive Filter",
-                    passed=True,
-                    message=f"Ignored {ignored_count} likely false positive {description} patterns",
-                    severity=IssueSeverity.DEBUG,
-                    location=f"{self.current_file_path}",
-                    details={
-                        "signature": sig.hex(),
-                        "ignored_count": ignored_count,
-                        "total_found": len(positions),
-                        "pattern_density_per_mb": round(pattern_density, 1),
-                        "ml_context_explanation": explanation,
-                    },
-                    why=f"These patterns were likely false positives in ML weight data. {explanation}",
-                )
-
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
         """Validate that the file appears to have valid tensor structure"""
         try:
@@ -310,8 +289,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 # Read first few bytes to check for common tensor patterns
                 header = f.read(32)
 
-                # PyTorch tensors often start with specific patterns
-                # This is a basic check - real validation would require parsing the format
+                # Validate tensor file header patterns
                 if len(header) < 8:
                     result.add_check(
                         name="Tensor File Size Validation",
@@ -323,14 +301,12 @@ class PyTorchBinaryScanner(BaseScanner):
                     )
                     return
 
-                # Check if it looks like it might contain float32/float64 data
-                # by looking for patterns of IEEE 754 floats
-                # This is a heuristic - not definitive
+                # Check for IEEE 754 float patterns
 
                 # Try to interpret first 8 bytes as double
                 try:
                     value = struct.unpack("d", header[:8])[0]
-                    # Check if it's a reasonable float value (not NaN, not huge)
+                    # Validate float value is within reasonable bounds
                     if not (-1e100 < value < 1e100) or value != value:  # NaN check
                         result.metadata["tensor_validation"] = "unusual_float_values"
                 except struct.error as e:

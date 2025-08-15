@@ -23,7 +23,7 @@ VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024  # 8GB - special handling
 
 # Default chunk sizes for different file sizes
 DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks
-LARGE_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB chunks for very large files
+LARGE_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB chunks for large files
 STREAM_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for streaming
 
 
@@ -168,17 +168,15 @@ class LargeFileHandler:
 
     def _scan_streaming(self) -> ScanResult:
         """Streaming scan for large files - always scans completely for security."""
-        # IMPORTANT: For security, we must scan the entire file, not just samples
-        # Malicious code can be hidden anywhere in the file
+        # Security requires complete file scanning
         logger.info(f"Using complete scan for {self.file_name} ({self.file_size:,} bytes) for security")
-        return self._scan_normal()  # Always scan completely for security
+        return self._scan_normal()
 
     def _scan_optimized(self) -> ScanResult:
-        """Optimized scanning for very large files (>8GB) - still scans completely."""
-        # IMPORTANT: For security, we must scan the entire file
-        # Even for very large files, complete scanning is essential
-        logger.info(f"Using complete scan for very large file {self.file_name} ({self.file_size:,} bytes) for security")
-        return self._scan_normal()  # Always scan completely for security
+        """Optimized scanning for large files (>8GB) - still scans completely."""
+        # Security requires complete file scanning
+        logger.info(f"Using complete scan for file {self.file_name} ({self.file_size:,} bytes) for security")
+        return self._scan_normal()
 
 
 def should_use_large_file_handler(file_path: str) -> bool:
