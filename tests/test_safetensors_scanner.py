@@ -76,7 +76,7 @@ def test_bad_offsets(tmp_path: Path) -> None:
 def test_deeply_nested_header(tmp_path: Path) -> None:
     """Ensure deeply nested headers are handled gracefully."""
     import sys
-    
+
     # Create a deeply nested structure manually as a string to avoid json.dumps recursion
     # We'll create a JSON string with deep nesting that will trigger RecursionError on parse
     # Use recursion limit + extra to ensure we exceed it
