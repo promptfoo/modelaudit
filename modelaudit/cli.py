@@ -1075,7 +1075,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append("")
         output_lines.append(style_text("  Failed Checks (non-critical):", fg="yellow"))
         # Group failed checks by name to avoid repetition
-        check_groups = {}
+        check_groups: dict[str, list[str]] = {}
         for check in failed_checks_list:
             check_name = check.get("name", "Unknown check")
             if check_name not in check_groups:
