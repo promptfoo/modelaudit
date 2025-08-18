@@ -1,3 +1,5 @@
+import io
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -105,6 +107,17 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile(str(zip_path)) is True
     assert is_zipfile(str(non_zip_path)) is False
     assert is_zipfile("nonexistent_file.zip") is False
+
+
+def test_detect_file_format_tar(tmp_path):
+    """Detect tar archives by signature without extra I/O."""
+    tar_path = tmp_path / "archive.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        info = tarfile.TarInfo(name="test.txt")
+        tar.addfile(info, io.BytesIO(b"content"))
+
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
 
 
 def test_zip_magic_variants(tmp_path):
