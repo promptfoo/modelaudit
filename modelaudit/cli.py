@@ -142,18 +142,15 @@ def login(api_key, host):
             click.echo(click.style("Successfully logged in", fg="green", bold=True))
             click.echo(click.style("Logged in as:", dim=True))
             click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
-            click.echo(
-                f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}"
-            )
-            click.echo(
-                f"Access the app at {click.style(app.get('url', 'Unknown'), fg='cyan')}"
-            )
+            click.echo(f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}")
+            click.echo(f"Access the app at {click.style(app.get('url', 'Unknown'), fg='cyan')}")
         else:
             click.echo(
                 f"Please login or sign up at {click.style('https://promptfoo.app', fg='green')} to get an API key."
             )
             click.echo(
-                f"After logging in, you can get your API token at {click.style('https://promptfoo.app/welcome', fg='green')}"
+                f"After logging in, you can get your API token at "
+                f"{click.style('https://promptfoo.app/welcome', fg='green')}"
             )
     except Exception as e:
         error_message = str(e)
@@ -184,13 +181,10 @@ def logout():
 def whoami():
     """Show current user information"""
     try:
-        email = config.get_user_email()
         api_key = config.get_api_key()
 
-        if not email or not api_key:
-            click.echo(
-                f"Not logged in. Run {click.style('modelaudit auth login', bold=True)} to login."
-            )
+        if not api_key:
+            click.echo(f"Not logged in. Run {click.style('modelaudit auth login', bold=True)} to login.")
             return
 
         # Get current user info from API
@@ -200,9 +194,7 @@ def whoami():
 
         click.echo(click.style("Currently logged in as:", fg="green", bold=True))
         click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
-        click.echo(
-            f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}"
-        )
+        click.echo(f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}")
         click.echo(f"App URL: {click.style(config.get_app_url(), fg='cyan')}")
 
     except Exception as e:
@@ -1106,6 +1098,39 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         value_str = style_text(value, fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
 
+    # Add authentication status (inspired by semgrep's approach)
+    from .scanners import _registry
+
+    available_scanners = _registry.get_available_scanners()
+    total_scanners = len(_registry.get_scanner_classes())  # Total possible scanners
+    authenticated = config.is_authenticated()
+
+    if authenticated:
+        auth_label = style_text("  Authentication:", fg="bright_black")
+        auth_value = style_text("Logged in", fg="green", bold=True)
+        output_lines.append(f"{auth_label} {auth_value}")
+        # Show enhanced scanner count for authenticated users
+        scanner_label = style_text("  Enhanced Scanners:", fg="bright_black")
+        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="green", bold=True)
+        output_lines.append(f"{scanner_label} {scanner_value}")
+    else:
+        auth_label = style_text("  Authentication:", fg="bright_black")
+        auth_value = style_text("Anonymous", fg="yellow", bold=True)
+        output_lines.append(f"{auth_label} {auth_value}")
+        # Show limited scanner info for unauthenticated users
+        scanner_label = style_text("  Basic Scanners:", fg="bright_black")
+        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="yellow", bold=True)
+        output_lines.append(f"{scanner_label} {scanner_value}")
+
+        # Add gentle encouragement to login (only if we have failures or limited functionality)
+        if len(available_scanners) < total_scanners:
+            output_lines.append("")
+            tip_icon = "💡"
+            tip_text = "Login for enhanced scanning with cloud models and fewer false positives"
+            login_cmd = style_text("modelaudit auth login", fg="cyan", bold=True)
+            output_lines.append(f"  {tip_icon} {tip_text}")
+            output_lines.append(f"     Run {login_cmd} to get started")
+
     # Add model information if available
     if "file_metadata" in results:
         for _file_path, metadata in results["file_metadata"].items():
@@ -1352,6 +1377,15 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(f"  {status_line}")
 
     output_lines.append("═" * 80)
+
+    # Add encouragement message for unauthenticated users after successful scans
+    # (similar to promptfoo's approach)
+    if not config.is_authenticated() and not visible_issues:
+        output_lines.append("")
+        encouragement_msg = "» Want enhanced scanning with cloud models and team sharing?"
+        signup_link = style_text("https://promptfoo.app", fg="green", bold=True)
+        encouragement_line = f"  {encouragement_msg} Sign up at {signup_link}"
+        output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
 

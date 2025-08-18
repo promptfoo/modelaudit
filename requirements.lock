@@ -262,6 +262,8 @@ pandas==2.3.0
     # via mlflow
 pillow==11.2.1
     # via matplotlib
+platformdirs==4.3.8
+    # via modelaudit
 propcache==0.3.2
     # via aiohttp
     # via yarl

@@ -26,9 +26,9 @@ class ModelAuditConfig:
             return self._config_data
 
         try:
-            with open(self.config_file, "r") as f:
+            with open(self.config_file) as f:
                 self._config_data = json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             self._config_data = {}
 
         return self._config_data
@@ -39,8 +39,13 @@ class ModelAuditConfig:
             return
 
         os.makedirs(self.config_dir, exist_ok=True)
+
+        # Create file with secure permissions (owner read/write only)
         with open(self.config_file, "w") as f:
             json.dump(self._config_data, f, indent=2)
+
+        # Set secure permissions (0o600 = owner read/write only)
+        os.chmod(self.config_file, 0o600)
 
     def get_api_key(self) -> Optional[str]:
         """Get API key from environment or config."""

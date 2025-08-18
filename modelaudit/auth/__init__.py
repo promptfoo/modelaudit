@@ -3,4 +3,4 @@
 from .client import AuthClient
 from .config import ModelAuditConfig
 
-__all__ = ["ModelAuditConfig", "AuthClient"]
+__all__ = ["AuthClient", "ModelAuditConfig"]

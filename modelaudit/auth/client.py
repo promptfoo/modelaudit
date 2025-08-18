@@ -1,7 +1,7 @@
 """Authentication client for ModelAudit."""
 
 import logging
-from typing import Any, Dict
+from typing import Any, Optional
 
 import requests
 
@@ -19,9 +19,7 @@ class AuthClient:
         # Set a reasonable timeout
         self.session.timeout = 30
 
-    def validate_and_set_api_token(
-        self, token: str, api_host: str = None
-    ) -> Dict[str, Any]:
+    def validate_and_set_api_token(self, token: str, api_host: Optional[str] = None) -> dict[str, Any]:
         """
         Validate API token and set configuration.
 
@@ -74,10 +72,10 @@ class AuthClient:
             return {"user": user, "organization": organization, "app": app}
 
         except requests.RequestException as e:
-            logger.error(f"Failed to validate API token with host {host}: {str(e)}")
+            logger.error(f"Failed to validate API token with host {host}: {e!s}")
             raise
 
-    def get_user_info(self) -> Dict[str, Any]:
+    def get_user_info(self) -> dict[str, Any]:
         """
         Get current user information.
 
@@ -90,9 +88,7 @@ class AuthClient:
         """
         api_key = config.get_api_key()
         if not api_key:
-            raise ValueError(
-                "Not authenticated. Please run 'modelaudit auth login' first."
-            )
+            raise ValueError("Not authenticated. Please run 'modelaudit auth login' first.")
 
         api_host = config.get_api_host()
 
@@ -111,7 +107,7 @@ class AuthClient:
             return response.json()
 
         except requests.RequestException as e:
-            logger.error(f"Failed to get user info: {str(e)}")
+            logger.error(f"Failed to get user info: {e!s}")
             raise
 
 
