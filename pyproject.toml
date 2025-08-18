@@ -139,6 +139,7 @@ dev-dependencies = [
     "pytest-cov>=6.2.1",
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
+    "pytest-asyncio>=1.1.0",
 ]
 
 [tool.ruff]
@@ -195,6 +196,7 @@ markers = [
     "integration: marks tests as integration tests",
     "performance: marks tests as performance benchmarks",
     "unit: marks tests as unit tests (fast)",
+    "asyncio: marks tests as asyncio tests",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
