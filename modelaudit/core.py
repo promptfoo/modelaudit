@@ -711,6 +711,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
+        sr.finish(success=False)
         return sr
 
     # Check if we should use extreme handler BEFORE applying size limits
@@ -731,6 +732,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                 "hint": "Consider using extreme large model support for files over 50GB",
             },
         )
+        sr.finish(success=False)
         return sr
 
     logger.debug(f"Processing: {path}")
