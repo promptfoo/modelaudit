@@ -3,7 +3,7 @@
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional  # noqa: UP035
 
 from .base import ProgressPhase, ProgressStats
 
@@ -225,7 +225,7 @@ class EmailProgressHook(ProgressHook):
         username: str,
         password: str,
         from_email: str,
-        to_emails: list[str],
+        to_emails: List[str],  # noqa: UP006
         use_tls: bool = True,
         send_on_start: bool = True,
         send_on_complete: bool = True,
@@ -667,7 +667,7 @@ class ProgressHookManager:
         """
         return self._hooks.get(name)
 
-    def list_hooks(self) -> list[str]:
+    def list_hooks(self) -> List[str]:  # noqa: UP006
         """List all hook names.
 
         Returns:
