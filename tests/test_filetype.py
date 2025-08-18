@@ -27,6 +27,18 @@ def test_detect_file_format_directory(tmp_path):
     assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
 
 
+def test_detect_file_format_large_directory(tmp_path):
+    """Ensure detection short-circuits in directories with many files."""
+    tf_dir = tmp_path / "tf_large"
+    tf_dir.mkdir()
+    (tf_dir / "saved_model.pb").write_bytes(b"dummy content")
+
+    for i in range(1000):
+        (tf_dir / f"file_{i}.txt").write_text("x")
+
+    assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
+
+
 def test_detect_file_format_zip(tmp_path):
     """Test detecting a ZIP file format."""
     # Create a ZIP file
