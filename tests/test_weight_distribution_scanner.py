@@ -1,9 +1,12 @@
 import os
+import pickle
 import tempfile
+import zipfile
 
 import numpy as np
 import pytest
 
+from modelaudit.scanners import weight_distribution_scanner
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 
 # Skip tests if required libraries are not available
@@ -282,6 +285,41 @@ class TestWeightDistributionScanner:
 
         finally:
             os.unlink(temp_path)
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
+        """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
+        data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
+        data_bytes = pickle.dumps(data, protocol=4)
+        zip_path = tmp_path / "model.pt"
+        with zipfile.ZipFile(zip_path, "w") as z:
+            z.writestr("data.pkl", data_bytes)
+
+        def fail_load(*_args, **_kwargs):
+            raise RuntimeError("fail")
+
+        monkeypatch.setattr(weight_distribution_scanner.torch, "load", fail_load)
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+        assert not scanner.extraction_unsafe
+        assert "layer.weight" in weights
+        assert weights["layer.weight"].shape == (2, 2)
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
+        """Unsafe pickle opcodes should be flagged"""
+        model = torch.nn.Linear(2, 2)
+        zip_path = tmp_path / "model.pt"
+        torch.save(model.state_dict(), zip_path)
+
+        def fail_load(*_args, **_kwargs):
+            raise RuntimeError("fail")
+
+        monkeypatch.setattr(weight_distribution_scanner.torch, "load", fail_load)
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+        assert weights == {}
+        assert scanner.extraction_unsafe
 
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
