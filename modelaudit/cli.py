@@ -15,10 +15,10 @@ from . import __version__
 from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
+from .rules import Rule
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
-from .rules import Rule
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
