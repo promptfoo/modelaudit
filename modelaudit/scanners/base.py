@@ -20,7 +20,7 @@ ProgressPhase = None
 
 # Try to import progress tracking, handle circular import gracefully
 try:
-    from ..progress import ProgressPhase, ProgressTracker  # type: ignore
+    from ..progress import ProgressTracker  # type: ignore
 
     PROGRESS_AVAILABLE = True
 except (ImportError, RecursionError):
@@ -884,9 +884,12 @@ class BaseScanner(ABC):
 
     def _setup_progress_for_file(self, path: str) -> None:
         """Setup progress tracking for a specific file."""
-        if self.progress_tracker and ProgressPhase:
+        if self.progress_tracker and PROGRESS_AVAILABLE:
             file_size = self.get_file_size(path)
             self.progress_tracker.stats.total_bytes = file_size
+            # Import locally to avoid circular import but ensure type safety
+            from ..progress import ProgressPhase
+
             self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
 
     # All progress tracking methods disabled to fix CI circular import issues
@@ -912,7 +915,7 @@ class BaseScanner(ABC):
 
     def _set_progress_phase(self, phase: Any, message: str = "") -> None:
         """Set current progress phase."""
-        if self.progress_tracker and ProgressPhase:
+        if self.progress_tracker and PROGRESS_AVAILABLE:
             self.progress_tracker.set_phase(phase, message)
 
     def _next_progress_phase(self, message: str = "") -> bool:
