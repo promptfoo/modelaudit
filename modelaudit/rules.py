@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from re import Pattern
-from typing import Optional
+from typing import ClassVar, Optional
 
 
 class Severity(str, Enum):
@@ -37,7 +37,7 @@ class Rule:
 class RuleRegistry:
     """Central registry for all security rules."""
 
-    _rules: dict[str, Rule] = {}
+    _rules: ClassVar[dict[str, Rule]] = {}
     _initialized = False
 
     @classmethod

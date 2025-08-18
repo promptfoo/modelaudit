@@ -1373,9 +1373,7 @@ def rules_command(rule_code: Optional[str], list_rules: bool, category: Optional
         else:
             click.echo(f"Code: {style_text(rule.code, bold=True)}")
             click.echo(f"Name: {rule.name}")
-            severity_text = style_text(
-                rule.default_severity.value, fg=get_severity_color(rule.default_severity.value)
-            )
+            severity_text = style_text(rule.default_severity.value, fg=get_severity_color(rule.default_severity.value))
             click.echo(f"Default Severity: {severity_text}")
             click.echo(f"Description: {rule.description}")
 
