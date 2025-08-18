@@ -1285,7 +1285,8 @@ class PickleScanner(BaseScanner):
             max_stack_depth = 0
             # Dynamic stack depth limit - will be adjusted based on ML context
             base_stack_depth_limit = 1000  # Base limit for unknown content
-            stack_depth_warnings: list[dict[str, Union[int, str]]] = []  # Store warnings for ML-context-aware processing
+            # Store warnings for ML-context-aware processing
+            stack_depth_warnings: list[dict[str, Union[int, str]]] = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 # Check for interrupts periodically during opcode processing
@@ -1420,13 +1421,15 @@ class PickleScanner(BaseScanner):
             if stack_depth_warnings:
                 # Filter warnings based on adjusted limit
                 significant_warnings = [
-                    w for w in stack_depth_warnings 
+                    w for w in stack_depth_warnings
                     if isinstance(w["current_depth"], int) and w["current_depth"] > adjusted_stack_depth_limit
                 ]
 
                 if significant_warnings:
                     # Report only the most severe warning to avoid spam
-                    worst_warning = max(significant_warnings, key=lambda x: x["current_depth"] if isinstance(x["current_depth"], int) else 0)
+                    def get_depth(x):
+                        return x["current_depth"] if isinstance(x["current_depth"], int) else 0
+                    worst_warning = max(significant_warnings, key=get_depth)
                     severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
 
                     result.add_check(
@@ -1451,12 +1454,16 @@ class PickleScanner(BaseScanner):
                     )
                 else:
                     # Warnings were filtered out as benign for ML content
+                    max_filtered_depth = max(
+                        w["current_depth"] for w in stack_depth_warnings
+                        if isinstance(w["current_depth"], int)
+                    )
                     result.add_check(
                         name="Stack Depth Safety Check",
                         passed=True,
                         message=(
                             f"Stack depth warnings filtered as benign for ML content "
-                            f"(max: {max(w['current_depth'] for w in stack_depth_warnings if isinstance(w['current_depth'], int))})"
+                            f"(max: {max_filtered_depth})"
                         ),
                         location=self.current_file_path,
                         details={
