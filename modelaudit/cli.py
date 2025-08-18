@@ -349,7 +349,7 @@ def scan_command(
 
     # Setup progress tracking
     progress_tracker = None
-    progress_reporters = []
+    progress_reporters: list[Any] = []
 
     if progress and len(expanded_paths) > 0:
         try:
