@@ -656,7 +656,7 @@ class RuleRegistry:
         cls._add_rule(
             "S901",
             "File type mismatch",
-            Severity.LOW,
+            Severity.MEDIUM,
             "Extension doesn't match content",
             [r"type.*mismatch", r"extension.*mismatch", r"format.*conflict"],
         )

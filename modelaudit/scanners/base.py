@@ -818,6 +818,7 @@ class BaseScanner(ABC):
                             "extension_format": ext_format,
                             "security_check": "file_type_validation",
                         },
+                        rule_code="S901",  # File type mismatch
                     )
                 else:
                     result.add_check(
