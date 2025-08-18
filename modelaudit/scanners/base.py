@@ -7,7 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, List, Optional  # noqa: UP035
 
 from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
@@ -139,8 +139,8 @@ class ScanResult:
 
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
-        self.issues: list[Issue] = []
-        self.checks: list[Check] = []  # All checks performed (passed and failed)
+        self.issues: List[Issue] = []  # noqa: UP006
+        self.checks: List[Check] = []  # All checks performed (passed and failed)  # noqa: UP006
         self.start_time = time.time()
         self.end_time: Optional[float] = None
         self.bytes_scanned: int = 0
@@ -309,7 +309,7 @@ class BaseScanner(ABC):
 
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
-    supported_extensions: ClassVar[list[str]] = []
+    supported_extensions: ClassVar[List[str]] = []  # noqa: UP006
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
