@@ -214,6 +214,28 @@ def cli() -> None:
     default=True,
     help="Enable optimized scanning for large models (>10MB) [default: enabled]",
 )
+@click.option(
+    "--progress/--no-progress",
+    default=True,
+    help="Enable progress reporting for large model scans [default: enabled]",
+)
+@click.option(
+    "--progress-log",
+    type=click.Path(exists=False, file_okay=True, dir_okay=False),
+    help="Write progress information to log file",
+)
+@click.option(
+    "--progress-format",
+    type=click.Choice(["tqdm", "simple", "json"]),
+    default="tqdm",
+    help="Progress display format [default: tqdm]",
+)
+@click.option(
+    "--progress-interval",
+    type=float,
+    default=2.0,
+    help="Progress update interval in seconds [default: 2.0]",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -236,6 +258,10 @@ def scan_command(
     selective: bool,
     stream: bool,
     large_model_support: bool,
+    progress: bool,
+    progress_log: Optional[str],
+    progress_format: str,
+    progress_interval: float,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -320,6 +346,65 @@ def scan_command(
     else:
         # Suppress INFO logs from core module in normal mode
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
+
+    # Setup progress tracking
+    progress_tracker = None
+    progress_reporters: list = []
+
+    if progress and len(expanded_paths) > 0:
+        try:
+            from .progress import (
+                ConsoleProgressReporter,
+                FileProgressReporter,
+                ProgressPhase,
+                ProgressTracker,
+                SimpleConsoleReporter,
+            )
+
+            # Create progress tracker
+            progress_tracker = ProgressTracker(
+                update_interval=progress_interval,
+            )
+
+            # Add console reporter based on format preference
+            if format == "text" and not output:
+                if progress_format == "tqdm":
+                    # Use tqdm progress bars if available and appropriate
+                    console_reporter = ConsoleProgressReporter(
+                        update_interval=progress_interval,
+                        disable_on_non_tty=True,
+                        show_bytes=True,
+                        show_items=True,
+                    )
+                else:
+                    # Use simple console reporter
+                    console_reporter = SimpleConsoleReporter(  # type: ignore[assignment]
+                        update_interval=progress_interval,
+                        show_percentage=True,
+                        show_speed=True,
+                        show_eta=True,
+                    )
+                progress_reporters.append(console_reporter)
+                progress_tracker.add_reporter(console_reporter)
+
+            # Add file logger if specified
+            if progress_log:
+                log_format = "json" if progress_format == "json" else "text"
+                file_reporter = FileProgressReporter(
+                    log_file=progress_log,
+                    update_interval=progress_interval * 2,  # Less frequent for file logging
+                    format_type=log_format,
+                    append_mode=True,
+                )
+                progress_reporters.append(file_reporter)
+                progress_tracker.add_reporter(file_reporter)
+
+                if verbose:
+                    click.echo(f"Progress will be logged to: {progress_log}")
+
+        except ImportError:
+            if verbose:
+                click.echo("Progress tracking not available (missing dependencies)", err=True)
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
@@ -732,16 +817,72 @@ def scan_command(
 
                 # Perform the scan with the specified options
                 try:
-                    # Define progress callback if using spinner
+                    # Define progress callback for legacy spinner support
                     progress_callback = None
-                    if spinner:
+                    if spinner and not progress_tracker:
 
                         def update_progress(message, percentage, spinner=spinner):
                             spinner.text = f"{message} ({percentage:.1f}%)"
 
                         progress_callback = update_progress
 
+                    # Setup progress tracking for this path
+                    if progress_tracker:
+                        from .progress import ProgressPhase
+
+                        # Estimate file/directory size for progress tracking
+                        if os.path.isfile(actual_path):
+                            total_bytes = os.path.getsize(actual_path)
+                            total_items = 1
+                        elif os.path.isdir(actual_path):
+                            try:
+                                # Quick estimate of directory contents
+                                total_bytes = sum(
+                                    os.path.getsize(os.path.join(root, file))
+                                    for root, _, files in os.walk(actual_path)
+                                    for file in files
+                                )
+                                total_items = sum(len(files) for root, _, files in os.walk(actual_path))
+                            except (OSError, PermissionError):
+                                total_bytes = 0
+                                total_items = 0
+                        else:
+                            total_bytes = 0
+                            total_items = 0
+
+                        progress_tracker.set_totals(total_bytes=total_bytes, total_items=total_items)
+                        progress_tracker.set_phase(
+                            ProgressPhase.INITIALIZING, f"Starting scan of {os.path.basename(actual_path)}"
+                        )
+
+                        # Create enhanced progress callback
+                        def enhanced_progress_callback(message, percentage):
+                            if progress_tracker:
+                                # Update progress based on percentage
+                                bytes_processed = int((percentage / 100.0) * total_bytes) if total_bytes > 0 else 0
+                                progress_tracker.update_bytes(bytes_processed, message)
+
+                                # Update phase based on message content
+                                message_lower = message.lower()
+                                if "loading" in message_lower:
+                                    progress_tracker.set_phase(ProgressPhase.LOADING, message)
+                                elif "analyzing" in message_lower or "scanning" in message_lower:
+                                    progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
+                                elif "checking" in message_lower:
+                                    progress_tracker.set_phase(ProgressPhase.CHECKING, message)
+
+                            # Also update spinner if present
+                            if spinner:
+                                spinner.text = f"{message} ({percentage:.1f}%)"
+
+                        progress_callback = enhanced_progress_callback  # type: ignore[assignment]
+
                     # Run the scan with progress reporting
+                    config_overrides = {
+                        "enable_progress": bool(progress_tracker),
+                        "progress_update_interval": progress_interval,
+                    }
+
                     results = scan_model_directory_or_file(
                         actual_path,
                         blacklist_patterns=list(blacklist) if blacklist else None,
@@ -751,6 +892,7 @@ def scan_command(
                         strict_license=strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=not no_skip_files,  # CLI flag is inverted (--no-skip-files)
+                        **config_overrides,
                     )
 
                     # Aggregate results
@@ -842,11 +984,19 @@ def scan_command(
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
 
+                    # Report error to progress tracker
+                    if progress_tracker:
+                        progress_tracker.report_error(e)
+
             except Exception as e:
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
+
+                # Report error to progress tracker
+                if progress_tracker:
+                    progress_tracker.report_error(e)
 
             finally:
                 # Clean up temporary directory if we downloaded a model
@@ -877,6 +1027,26 @@ def scan_command(
             # Break outside of finally block if interrupted
             if should_break:
                 break
+
+    # Complete progress tracking
+    if progress_tracker:
+        try:
+            from .progress import ProgressPhase
+
+            progress_tracker.set_phase(ProgressPhase.FINALIZING, "Completing scan and generating report")
+            progress_tracker.complete()
+        except Exception as e:
+            logger.warning(f"Error completing progress tracking: {e}")
+
+    # Cleanup progress reporters
+    for reporter in progress_reporters:
+        try:
+            if hasattr(reporter, "cleanup"):
+                reporter.cleanup()
+            elif hasattr(reporter, "close"):
+                reporter.close()
+        except Exception as e:
+            logger.warning(f"Error cleaning up progress reporter: {e}")
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]

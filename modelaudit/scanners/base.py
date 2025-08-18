@@ -11,6 +11,16 @@ from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
 
+# Progress tracking imports (lazy loaded to avoid circular dependencies)
+try:
+    from ..progress import ProgressPhase, ProgressTracker
+
+    PROGRESS_AVAILABLE = True
+except ImportError:
+    PROGRESS_AVAILABLE = False
+    ProgressTracker = None  # type: ignore
+    ProgressPhase = None  # type: ignore
+
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -311,6 +321,12 @@ class BaseScanner(ABC):
         self._path_validation_result: Optional[ScanResult] = None
         self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
         self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
+
+        # Progress tracking
+        self.progress_tracker: Optional[ProgressTracker] = None
+        self._enable_progress = self.config.get("enable_progress", True)
+        if PROGRESS_AVAILABLE and self._enable_progress:
+            self._initialize_progress_tracker()
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -855,3 +871,122 @@ class BaseScanner(ABC):
         Raises KeyboardInterrupt if an interrupt has been requested.
         """
         check_interrupted()
+
+    def _initialize_progress_tracker(self) -> None:
+        """Initialize progress tracker for this scanner."""
+        if not PROGRESS_AVAILABLE:
+            return
+
+        # Get file size for progress tracking
+        file_size = self.get_file_size(self.current_file_path) if self.current_file_path else 0
+
+        # Initialize tracker with basic phases
+        phases = [
+            ProgressPhase.INITIALIZING,
+            ProgressPhase.LOADING,
+            ProgressPhase.ANALYZING,
+            ProgressPhase.CHECKING,
+            ProgressPhase.FINALIZING,
+        ]
+
+        from ..progress.multi_phase import MultiPhaseProgressTracker
+
+        self.progress_tracker = MultiPhaseProgressTracker(
+            phases=phases,
+            total_bytes=file_size,
+            update_interval=self.config.get("progress_update_interval", 2.0),
+        )
+
+    def _setup_progress_for_file(self, path: str) -> None:
+        """Setup progress tracking for a specific file."""
+        if not self.progress_tracker:
+            return
+
+        file_size = self.get_file_size(path)
+        self.progress_tracker.set_totals(total_bytes=file_size)
+        self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan of {os.path.basename(path)}")
+
+    def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:
+        """Update progress with bytes processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_bytes(bytes_processed, current_item)
+
+    def _increment_progress_bytes(self, bytes_delta: int, current_item: str = "") -> None:
+        """Increment progress by a number of bytes."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_bytes(bytes_delta, current_item)
+
+    def _update_progress_items(self, items_processed: int, current_item: str = "") -> None:
+        """Update progress with items processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_items(items_processed, current_item)
+
+    def _increment_progress_items(self, items_delta: int = 1, current_item: str = "") -> None:
+        """Increment progress by a number of items."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_items(items_delta, current_item)
+
+    def _set_progress_phase(self, phase: ProgressPhase, message: str = "") -> None:
+        """Set current progress phase."""
+        if self.progress_tracker and hasattr(self.progress_tracker, "set_phase"):
+            self.progress_tracker.set_phase(phase, message)
+
+    def _next_progress_phase(self, message: str = "") -> bool:
+        """Move to next progress phase."""
+        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):
+            return self.progress_tracker.next_phase(message)
+        return False
+
+    def _set_progress_status(self, message: str) -> None:
+        """Set progress status message."""
+        if self.progress_tracker:
+            self.progress_tracker.set_status(message)
+
+    def _complete_progress(self) -> None:
+        """Mark progress as complete."""
+        if self.progress_tracker:
+            self.progress_tracker.complete()
+
+    def _report_progress_error(self, error: Exception) -> None:
+        """Report an error to progress tracker."""
+        if self.progress_tracker:
+            self.progress_tracker.report_error(error)
+
+    def scan_with_progress(self, path: str) -> ScanResult:
+        """Scan with progress tracking enabled.
+
+        This is a wrapper around the scan method that provides progress tracking.
+        Subclasses should override scan() but can call this method for progress support.
+        """
+        self.current_file_path = path
+
+        # Initialize progress tracking for this file
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self._setup_progress_for_file(path)
+
+        try:
+            result = self.scan(path)
+            self._complete_progress()
+            return result
+        except Exception as e:
+            self._report_progress_error(e)
+            raise
+
+    def get_progress_stats(self):
+        """Get current progress statistics."""
+        if self.progress_tracker:
+            return self.progress_tracker.get_stats()
+        return None
+
+    def add_progress_reporter(self, reporter) -> None:
+        """Add a progress reporter to this scanner."""
+        if self.progress_tracker:
+            self.progress_tracker.add_reporter(reporter)
+
+    def add_progress_callback(self, callback) -> None:
+        """Add a progress callback to this scanner."""
+        if self.progress_tracker:
+            self.progress_tracker.add_callback(callback)
