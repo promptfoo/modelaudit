@@ -312,7 +312,7 @@ class AnomalyDetector:
         # Look for ASCII-like patterns in float data
         if data.dtype == np.float32:
             # Check if values cluster around ASCII ranges when interpreted as bytes
-            byte_interpretation = (data * 255).astype(np.int32)
+            byte_interpretation: np.ndarray = (data * 255).astype(np.int32)
             ascii_printable = np.logical_and(byte_interpretation >= 32, byte_interpretation <= 126)
             ascii_ratio = np.mean(ascii_printable)
 
