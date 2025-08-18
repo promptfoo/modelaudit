@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
+    LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
 )
@@ -281,7 +282,17 @@ def scan_model_directory_or_file(
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
                     if skip_file_types and should_skip_file(file_path):
-                        logger.debug(f"Skipping non-model file: {file_path}")
+                        filename_lower = Path(file_path).name.lower()
+                        if filename_lower in LICENSE_FILES:
+                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            try:
+                                license_metadata = collect_license_metadata(str(resolved_file))
+                                file_meta[str(resolved_file)] = license_metadata
+                                logger.debug(f"Collected license metadata from skipped file: {file_path}")
+                            except Exception as e:
+                                logger.warning(f"Error collecting license metadata for {file_path}: {e}")
+                        else:
+                            logger.debug(f"Skipping non-model file: {file_path}")
                         continue
 
                     # Handle DVC files and get target paths
