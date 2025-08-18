@@ -4,7 +4,6 @@ import logging
 import os
 
 # Progress tracking imports with circular dependency detection
-import sys
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -14,18 +13,18 @@ from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
 
+# Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
-ProgressTracker = None
-ProgressPhase = None
+ProgressTracker = None  # type: ignore
+ProgressPhase = None  # type: ignore
 
 # Try to import progress tracking, handle circular import gracefully
 try:
-    from ..progress import ProgressPhase, ProgressTracker
+    from ..progress import ProgressPhase, ProgressTracker  # type: ignore
     PROGRESS_AVAILABLE = True
 except (ImportError, RecursionError):
-    PROGRESS_AVAILABLE = False
-    ProgressTracker = None  # type: ignore
-    ProgressPhase = None  # type: ignore
+    # Keep None values to indicate unavailable
+    pass
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -329,7 +328,7 @@ class BaseScanner(ABC):
         self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
 
         # Progress tracking setup
-        self.progress_tracker = None
+        self.progress_tracker: Optional[Any] = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
     @classmethod
@@ -879,12 +878,12 @@ class BaseScanner(ABC):
     def _initialize_progress_tracker(self) -> None:
         """Initialize progress tracker for this scanner."""
         if self._enable_progress and ProgressTracker:
-            self.progress_tracker = ProgressTracker()
+            self.progress_tracker = ProgressTracker()  # type: ignore
             logger.debug(f"Progress tracker initialized for {self.name} scanner")
 
     def _setup_progress_for_file(self, path: str) -> None:
         """Setup progress tracking for a specific file."""
-        if self.progress_tracker and ProgressPhase:
+        if self.progress_tracker and ProgressPhase:  # type: ignore
             file_size = self.get_file_size(path)
             self.progress_tracker.stats.total_bytes = file_size
             self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
@@ -910,14 +909,14 @@ class BaseScanner(ABC):
         if self.progress_tracker:
             self.progress_tracker.increment_items(items_delta, current_item)
 
-    def _set_progress_phase(self, phase, message: str = "") -> None:
+    def _set_progress_phase(self, phase: Any, message: str = "") -> None:
         """Set current progress phase."""
-        if self.progress_tracker and ProgressPhase:
+        if self.progress_tracker and ProgressPhase:  # type: ignore
             self.progress_tracker.set_phase(phase, message)
 
     def _next_progress_phase(self, message: str = "") -> bool:
         """Move to next progress phase."""
-        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):
+        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):  # type: ignore
             return self.progress_tracker.next_phase(message)
         return False
 
@@ -965,7 +964,7 @@ class BaseScanner(ABC):
             return self.progress_tracker.get_stats()
         return None
 
-    def add_progress_reporter(self, reporter) -> None:
+    def add_progress_reporter(self, reporter: Any) -> None:
         """Add a progress reporter to this scanner."""
         # Initialize progress tracker if not already done
         if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
@@ -974,7 +973,7 @@ class BaseScanner(ABC):
         if self.progress_tracker:
             self.progress_tracker.add_reporter(reporter)
 
-    def add_progress_callback(self, callback) -> None:
+    def add_progress_callback(self, callback: Any) -> None:
         """Add a progress callback to this scanner."""
         # Initialize progress tracker if not already done
         if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:

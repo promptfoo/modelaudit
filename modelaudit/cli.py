@@ -887,7 +887,7 @@ def scan_command(
                                     spinner_bound.text = f"{message} ({percentage:.1f}%)"
                             return enhanced_progress_callback
 
-                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[assignment]
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
 
                     # Run the scan with progress reporting
                     config_overrides = {
