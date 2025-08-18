@@ -424,9 +424,9 @@ class AdvancedFileHandler:
             # Also run the scanner's normal checks on sampled sections
             # to ensure we don't miss scanner-specific validations
             try:
-                # Let the scanner analyze the header (first 10MB)
+                # Let the scanner analyze the header (first 10GB)
                 with open(self.file_path, "rb") as f:
-                    header_data = f.read(min(10 * 1024 * 1024, self.total_size))
+                    header_data = f.read(min(10 * 1024 * 1024 * 1024, self.total_size))
 
                     # If scanner has special header analysis, use it
                     if hasattr(self.scanner, "_analyze_header"):
