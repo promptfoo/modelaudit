@@ -1,9 +1,11 @@
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.cloud_storage import (
     download_from_cloud,
+    filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
 )
@@ -54,6 +56,28 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert result.exists() or True  # Mock doesn't create actual files
 
 
+@patch("fsspec.filesystem")
+@pytest.mark.asyncio
+async def test_download_from_cloud_async_context(mock_fs, tmp_path, monkeypatch):
+    fs = MagicMock()
+    mock_fs.return_value = fs
+
+    fs.info.return_value = {"type": "file", "size": 1024}
+
+    url = "s3://bucket/model.pt"
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr("modelaudit.utils.cloud_storage.asyncio.get_running_loop", lambda: loop)
+    rcst_mock = MagicMock(wraps=asyncio.run_coroutine_threadsafe)
+    monkeypatch.setattr("modelaudit.utils.cloud_storage.asyncio.run_coroutine_threadsafe", rcst_mock)
+
+    result = await asyncio.to_thread(download_from_cloud, url, cache_dir=tmp_path)
+
+    rcst_mock.assert_called_once()
+    fs.get.assert_called_once()
+    assert result.name == "model.pt"
+
+
 @patch("builtins.__import__")
 def test_download_missing_dependency(mock_import):
     def side_effect(name, *args, **kwargs):
@@ -66,6 +90,15 @@ def test_download_missing_dependency(mock_import):
 
     with pytest.raises(ImportError):
         download_from_cloud("s3://bucket/model.pt")
+
+
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+def test_download_from_cloud_analysis_failure(mock_analyze, mock_fs):
+    mock_analyze.return_value = {"type": "unknown", "error": "boom"}
+    with pytest.raises(ValueError, match="Failed to analyze cloud target"):
+        download_from_cloud("s3://bucket/model.pt", use_cache=False)
+    mock_fs.assert_not_called()
 
 
 class TestCloudObjectSize:
@@ -153,3 +186,8 @@ class TestDiskSpaceCheckingForCloud:
         # Result should be a path containing the filename
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
+
+
+def test_filter_scannable_files_recognizes_pdiparams():
+    files = [{"path": "model.pdiparams"}]
+    assert filter_scannable_files(files) == files

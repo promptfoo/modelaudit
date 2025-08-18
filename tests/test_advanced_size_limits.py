@@ -74,6 +74,17 @@ class TestAdvancedSizeLimits:
                 # Should have a size warning
                 assert any("too large" in issue.message.lower() for issue in result.issues)
                 assert any("hint" in issue.details for issue in result.issues if issue.details)
+                assert not result.success
+                assert result.end_time is not None
+
+    @patch("modelaudit.core.os.path.getsize", side_effect=OSError("stat failed"))
+    def test_stat_error_sets_failure_and_end_time(self, mock_size):
+        """Ensure stat errors mark result as failed and set end time."""
+        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+            result = scan_file(f.name, {})
+            assert any("Error checking file size" in issue.message for issue in result.issues)
+            assert not result.success
+            assert result.end_time is not None
 
     @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     def test_colossal_files_handled(self, mock_size):

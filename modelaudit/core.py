@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
+    LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
 )
@@ -281,7 +282,17 @@ def scan_model_directory_or_file(
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
                     if skip_file_types and should_skip_file(file_path):
-                        logger.debug(f"Skipping non-model file: {file_path}")
+                        filename_lower = Path(file_path).name.lower()
+                        if filename_lower in LICENSE_FILES:
+                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            try:
+                                license_metadata = collect_license_metadata(str(resolved_file))
+                                file_meta[str(resolved_file)] = license_metadata
+                                logger.debug(f"Collected license metadata from skipped file: {file_path}")
+                            except Exception as e:
+                                logger.warning(f"Error collecting license metadata for {file_path}: {e}")
+                        else:
+                            logger.debug(f"Skipping non-model file: {file_path}")
                         continue
 
                     # Handle DVC files and get target paths
@@ -375,11 +386,12 @@ def scan_model_directory_or_file(
                                 break
                         except Exception as e:
                             logger.warning(f"Error scanning file {target_path}: {e!s}")
+                            results["success"] = False
                             issues_list = cast(list[dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
                                     "message": f"Error scanning file: {e!s}",
-                                    "severity": IssueSeverity.WARNING.value,
+                                    "severity": IssueSeverity.CRITICAL.value,
                                     "location": str(target_path),
                                     "details": {"exception_type": type(e).__name__},
                                 }
@@ -519,7 +531,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {e!s}",
-            "severity": IssueSeverity.WARNING.value,
+            "severity": IssueSeverity.CRITICAL.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -587,7 +599,8 @@ def scan_model_directory_or_file(
         any(
             any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
             for issue in issues_list
-            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+            if isinstance(issue, dict)
+            and issue.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}
         )
         or not results["success"]
     )
@@ -711,6 +724,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
+        sr.finish(success=False)
         return sr
 
     # Check if we should use extreme handler BEFORE applying size limits
@@ -731,9 +745,10 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                 "hint": "Consider using extreme large model support for files over 50GB",
             },
         )
+        sr.finish(success=False)
         return sr
 
-    logger.info(f"Scanning file: {path}")
+    logger.debug(f"Processing: {path}")
 
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
@@ -807,12 +822,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
         try:
             if use_extreme_handler:
-                logger.info(f"Using extreme large file handler for {path}")
+                logger.debug(f"Large file optimization enabled: {path}")
                 result = scan_advanced_large_file(
                     path, scanner, progress_callback, timeout * 2
                 )  # Double timeout for extreme files
             elif use_large_handler:
-                logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
                 result = scanner.scan(path)
@@ -835,12 +850,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
             try:
                 if use_extreme_handler:
-                    logger.info(f"Using extreme large file handler for {path}")
+                    logger.debug(f"Large file optimization enabled: {path}")
                     result = scan_advanced_large_file(
                         path, scanner, progress_callback, timeout * 2
                     )  # Double timeout for extreme files
                 elif use_large_handler:
-                    logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                    logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
                     result = scanner.scan(path)
