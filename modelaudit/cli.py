@@ -855,27 +855,31 @@ def scan_command(
                             ProgressPhase.INITIALIZING, f"Starting scan of {os.path.basename(actual_path)}"
                         )
 
-                        # Create enhanced progress callback
-                        def enhanced_progress_callback(message, percentage):
-                            if progress_tracker:
-                                # Update progress based on percentage
-                                bytes_processed = int((percentage / 100.0) * total_bytes) if total_bytes > 0 else 0
-                                progress_tracker.update_bytes(bytes_processed, message)
+                        # Create enhanced progress callback with proper variable binding
+                        def create_enhanced_progress_callback(total_bytes_bound, spinner_bound):
+                            def enhanced_progress_callback(message, percentage):
+                                if progress_tracker:
+                                    # Update progress based on percentage
+                                    bytes_processed = (
+                                        int((percentage / 100.0) * total_bytes_bound) if total_bytes_bound > 0 else 0
+                                    )
+                                    progress_tracker.update_bytes(bytes_processed, message)
 
-                                # Update phase based on message content
-                                message_lower = message.lower()
-                                if "loading" in message_lower:
-                                    progress_tracker.set_phase(ProgressPhase.LOADING, message)
-                                elif "analyzing" in message_lower or "scanning" in message_lower:
-                                    progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
-                                elif "checking" in message_lower:
-                                    progress_tracker.set_phase(ProgressPhase.CHECKING, message)
+                                    # Update phase based on message content
+                                    message_lower = message.lower()
+                                    if "loading" in message_lower:
+                                        progress_tracker.set_phase(ProgressPhase.LOADING, message)
+                                    elif "analyzing" in message_lower or "scanning" in message_lower:
+                                        progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
+                                    elif "checking" in message_lower:
+                                        progress_tracker.set_phase(ProgressPhase.CHECKING, message)
 
-                            # Also update spinner if present
-                            if spinner:
-                                spinner.text = f"{message} ({percentage:.1f}%)"
+                                # Also update spinner if present
+                                if spinner_bound:
+                                    spinner_bound.text = f"{message} ({percentage:.1f}%)"
+                            return enhanced_progress_callback
 
-                        progress_callback = enhanced_progress_callback  # type: ignore[assignment]
+                        progress_callback = create_enhanced_progress_callback(total_bytes, spinner)
 
                     # Run the scan with progress reporting
                     config_overrides = {
