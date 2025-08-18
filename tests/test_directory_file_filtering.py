@@ -109,10 +109,14 @@ class TestDirectoryFileFiltering:
             results = scan_model_directory_or_file(tmp_dir)
 
             file_meta = results.get("file_metadata", {})
-            assert str(license_plain) in file_meta
-            assert file_meta[str(license_plain)]["license_info"]
-            assert str(license_txt) in file_meta
-            assert file_meta[str(license_txt)]["license_info"]
+            # Resolve paths to handle system-specific path resolution differences
+            license_plain_resolved = str(license_plain.resolve())
+            license_txt_resolved = str(license_txt.resolve())
+
+            assert license_plain_resolved in file_meta
+            assert file_meta[license_plain_resolved]["license_info"]
+            assert license_txt_resolved in file_meta
+            assert file_meta[license_txt_resolved]["license_info"]
 
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""
