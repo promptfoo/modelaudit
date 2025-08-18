@@ -332,7 +332,7 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ".bin",
         ".ckpt",
         ".pdmodel",
-        ".pdparams",
+        ".pdiparams",
         ".pdopt",
         ".ot",
         ".ort",
@@ -363,7 +363,13 @@ def download_from_cloud(
     selective: bool = True,
     stream_analyze: bool = False,
 ) -> Path:
-    """Download a file or directory from cloud storage to a local path."""
+    """Download a file or directory from cloud storage to a local path.
+
+    Raises:
+        ImportError: If the :mod:`fsspec` package is not installed.
+        ValueError: If the cloud target cannot be analyzed or its type is unknown.
+        ValueError: If the object exceeds ``max_size``.
+    """
     try:
         import fsspec
     except ImportError as e:
@@ -383,7 +389,17 @@ def download_from_cloud(
             return cached_path
 
     # Analyze target
-    metadata = asyncio.run(analyze_cloud_target(url))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        metadata = asyncio.run(analyze_cloud_target(url))
+    else:
+        metadata = asyncio.run_coroutine_threadsafe(analyze_cloud_target(url), loop).result()
+
+    # Ensure target was analyzed successfully
+    if "error" in metadata or metadata.get("type") == "unknown":
+        error_msg = metadata.get("error", "Unknown cloud target type")
+        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
@@ -484,7 +500,7 @@ def download_from_cloud(
         def download_single_file():
             fs.get(url, str(local_file))
 
-        if show_progress and size > 10_000_000:  # Show progress for files > 10MB
+        if show_progress and size > 10 * 1024 * 1024 * 1024:  # Show progress for files > 10GB
             with yaspin(text=f"Downloading {file_name}") as spinner:
                 download_single_file()
                 spinner.ok("✓")

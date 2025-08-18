@@ -1,7 +1,9 @@
 import zipfile
+from pathlib import Path
 
 from modelaudit.utils.filetype import (
     detect_file_format,
+    detect_file_format_from_magic,
     detect_format_from_extension,
     find_sharded_files,
     is_zipfile,
@@ -229,3 +231,15 @@ def test_validate_file_type(tmp_path):
     bin_pickle = tmp_path / "weights.bin"
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
+
+
+def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):
+    """Return 'unknown' when reading magic bytes fails."""
+    file_path = tmp_path / "unreadable.bin"
+    file_path.write_bytes(b"\x89HDF")
+
+    def open_raise(self, *args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "open", open_raise)
+    assert detect_file_format_from_magic(str(file_path)) == "unknown"

@@ -58,7 +58,7 @@ class InterruptHandler:
             signum: Signal number (SIGINT=2, SIGTERM=15)
             frame: Current stack frame (unused)
         """
-        logger.info(f"Received signal {signum}, setting interrupt flag")
+        logger.info(f"Signal {signum} received, initiating graceful shutdown")
         self._interrupted.set()
 
     def is_interrupted(self) -> bool:

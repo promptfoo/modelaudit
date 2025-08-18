@@ -1,0 +1,8 @@
+2025-08-14 16:26:05,686 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl): URL detected in model: https://pramuwaskito.org/hacker/q
+2025-08-14 16:26:05,686 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl): Domain name detected: pramuwaskito.org
+2025-08-14 16:26:05,688 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 931)): Suspicious opcode sequence: MANY_DANGEROUS_OPCODES
+2025-08-14 16:26:05,688 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 2179)): Suspicious opcode sequence: MANY_DANGEROUS_OPCODES
+2025-08-14 16:26:05,688 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 3290)): Suspicious opcode sequence: MANY_DANGEROUS_OPCODES
+2025-08-14 16:26:05,688 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 4679)): Suspicious opcode sequence: MANY_DANGEROUS_OPCODES
+2025-08-14 16:26:05,688 - modelaudit.scanners - WARNING - [WARNING] (/Users/mdangelo/.modelaudit/cache/huggingface/drhyrum/bert-tiny-torch-picklebomb/archive/data.pkl (pos 5900)): Suspicious opcode sequence: MANY_DANGEROUS_OPCODES
+Results written to scan_results/drhyrum-bert-tiny-torch-picklebomb.json

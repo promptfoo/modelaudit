@@ -6,7 +6,7 @@ that could be used for data exfiltration or command & control operations.
 
 import ipaddress
 import re
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, Union
 
 
 class NetworkCommDetector:
@@ -128,6 +128,32 @@ class NetworkCommDetector:
         31337,  # Back Orifice
     ]
 
+    # Precompile port patterns to avoid repeated compilation during scanning
+    PORT_PATTERNS: ClassVar[dict[int, list[bytes]]] = {
+        port: [
+            f":{port}".encode(),
+            f"port={port}".encode(),
+            f"port {port}".encode(),
+            f"PORT={port}".encode(),
+        ]
+        for port in SUSPICIOUS_PORTS
+    }
+
+    EXPLICIT_PORT_PATTERNS: ClassVar[dict[int, list[re.Pattern]]] = {
+        port: [
+            re.compile(pattern, re.IGNORECASE | re.DOTALL)
+            for pattern in [
+                f"connect.*:{port}".encode(),
+                f"socket.*port={port}".encode(),
+                f"http://.*:{port}".encode(),
+                f"https://.*:{port}".encode(),
+                f"ssh.*:{port}".encode(),
+                f"telnet.*:{port}".encode(),
+            ]
+        ]
+        for port in SUSPICIOUS_PORTS
+    }
+
     # Blacklisted domains - empty by default, should be configured by user
     # via config parameter if they have specific domains to block
     BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = []
@@ -137,11 +163,18 @@ class NetworkCommDetector:
         self.config = config or {}
         self.findings: list[dict[str, Any]] = []
 
-        # Add custom patterns from config
+        # Clone class-level patterns to avoid cross-instance leakage
+        self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
+        self.blacklisted_domains: list[bytes] = self.BLACKLISTED_DOMAINS.copy()
+
+        def _to_lower_bytes(value: Union[bytes, str]) -> bytes:
+            return value.lower() if isinstance(value, bytes) else value.encode().lower()
+
+        # Add custom patterns from config, normalizing to lowercase bytes
         if "custom_cc_patterns" in self.config:
-            self.CC_PATTERNS.extend(self.config["custom_cc_patterns"])
+            self.cc_patterns.extend(_to_lower_bytes(p) for p in self.config["custom_cc_patterns"])
         if "custom_blacklist" in self.config:
-            self.BLACKLISTED_DOMAINS.extend(self.config["custom_blacklist"])
+            self.blacklisted_domains.extend(_to_lower_bytes(d) for d in self.config["custom_blacklist"])
 
     def scan(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan data for network communication patterns.
@@ -478,7 +511,7 @@ class NetworkCommDetector:
 
     def _scan_cc_patterns(self, data: bytes, context: str) -> None:
         """Scan for command & control patterns."""
-        for pattern in self.CC_PATTERNS:
+        for pattern in self.cc_patterns:
             if pattern in data.lower():
                 # Get context
                 idx = data.lower().find(pattern)
@@ -507,26 +540,13 @@ class NetworkCommDetector:
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
-        # Skip port detection in binary ML model files to avoid false positives
-        # Binary weights can randomly contain patterns like ":22" or ":23"
-        if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
-            # For ML model files, only check for very specific network patterns
-            # that are unlikely to occur randomly
-            for port in self.SUSPICIOUS_PORTS:
-                # Only check for explicit port references with more context
-                explicit_patterns = [
-                    f"connect(.*:{port}".encode(),
-                    f"socket.*port={port}".encode(),
-                    f"http://.*:{port}".encode(),
-                    f"https://.*:{port}".encode(),
-                    f"ssh.*:{port}".encode(),
-                    f"telnet.*:{port}".encode(),
-                ]
+        is_ml_model = context and any(
+            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]
+        )
 
-                for pattern_bytes in explicit_patterns:
-                    import re
-
-                    pattern = re.compile(pattern_bytes, re.IGNORECASE | re.DOTALL)
+        for port in self.SUSPICIOUS_PORTS:
+            if is_ml_model:
+                for pattern in self.EXPLICIT_PORT_PATTERNS[port]:
                     if pattern.search(data):
                         port_name = self._get_port_name(port)
                         self.findings.append(
@@ -541,17 +561,8 @@ class NetworkCommDetector:
                             }
                         )
                         break
-        else:
-            # For non-ML files, use the original detection
-            for port in self.SUSPICIOUS_PORTS:
-                patterns = [
-                    f":{port}".encode(),
-                    f"port={port}".encode(),
-                    f"port {port}".encode(),
-                    f"PORT={port}".encode(),
-                ]
-
-                for pattern_bytes in patterns:
+            else:
+                for pattern_bytes in self.PORT_PATTERNS[port]:
                     if pattern_bytes in data:
                         port_name = self._get_port_name(port)
 
@@ -570,7 +581,7 @@ class NetworkCommDetector:
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""
-        for blacklisted in self.BLACKLISTED_DOMAINS:
+        for blacklisted in self.blacklisted_domains:
             if blacklisted in data.lower():
                 self.findings.append(
                     {

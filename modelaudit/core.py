@@ -9,18 +9,27 @@ from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
+    LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
 )
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
+from modelaudit.utils.advanced_file_handler import (
+    scan_advanced_large_file,
+    should_use_advanced_handler,
+)
 from modelaudit.utils.assets import asset_from_scan_result
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
+)
+from modelaudit.utils.large_file_handler import (
+    scan_large_file,
+    should_use_large_file_handler,
 )
 from modelaudit.utils.streaming import stream_analyze_file
 
@@ -68,9 +77,9 @@ def validate_scan_config(config: dict[str, Any]) -> None:
 def scan_model_directory_or_file(
     path: str,
     blacklist_patterns: Optional[list[str]] = None,
-    timeout: int = 300,
-    max_file_size: int = 0,
-    max_total_size: int = 0,
+    timeout: int = 1800,  # Increased to 30 minutes for large models (up to 8GB+)
+    max_file_size: int = 0,  # 0 means unlimited - support any size
+    max_total_size: int = 0,  # 0 means unlimited
     strict_license: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     skip_file_types: bool = True,
@@ -204,7 +213,7 @@ def scan_model_directory_or_file(
             limit_reached = False
 
             # Quick check: count files only if directory seems reasonable in size
-            # This avoids the expensive rglob() on very large directories
+            # This avoids the expensive rglob() on large directories
             try:
                 # Do a quick count of immediate children first
                 immediate_children = len(list(Path(path).iterdir()))
@@ -273,7 +282,17 @@ def scan_model_directory_or_file(
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
                     if skip_file_types and should_skip_file(file_path):
-                        logger.debug(f"Skipping non-model file: {file_path}")
+                        filename_lower = Path(file_path).name.lower()
+                        if filename_lower in LICENSE_FILES:
+                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            try:
+                                license_metadata = collect_license_metadata(str(resolved_file))
+                                file_meta[str(resolved_file)] = license_metadata
+                                logger.debug(f"Collected license metadata from skipped file: {file_path}")
+                            except Exception as e:
+                                logger.warning(f"Error collecting license metadata for {file_path}: {e}")
+                        else:
+                            logger.debug(f"Skipping non-model file: {file_path}")
                         continue
 
                     # Handle DVC files and get target paths
@@ -367,11 +386,12 @@ def scan_model_directory_or_file(
                                 break
                         except Exception as e:
                             logger.warning(f"Error scanning file {target_path}: {e!s}")
+                            results["success"] = False
                             issues_list = cast(list[dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
                                     "message": f"Error scanning file: {e!s}",
-                                    "severity": IssueSeverity.WARNING.value,
+                                    "severity": IssueSeverity.CRITICAL.value,
                                     "location": str(target_path),
                                     "details": {"exception_type": type(e).__name__},
                                 }
@@ -511,7 +531,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {e!s}",
-            "severity": IssueSeverity.WARNING.value,
+            "severity": IssueSeverity.CRITICAL.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -579,7 +599,8 @@ def scan_model_directory_or_file(
         any(
             any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
             for issue in issues_list
-            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+            if isinstance(issue, dict)
+            and issue.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}
         )
         or not results["success"]
     )
@@ -611,12 +632,17 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     if files_scanned == 0:
         return 2
 
-    # Check for any security findings (warnings, errors, or info issues)
+    # Check for any security findings (warnings, errors, or critical issues)
     issues = results.get("issues", [])
     if issues:
-        # Filter out DEBUG level issues for exit code determination
-        non_debug_issues = [issue for issue in issues if isinstance(issue, dict) and issue.get("severity") != "debug"]
-        if non_debug_issues:
+        # Filter out DEBUG and INFO level issues for exit code determination
+        # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
+        security_issues = [
+            issue
+            for issue in issues
+            if isinstance(issue, dict) and issue.get("severity") in ["warning", "error", "critical"]
+        ]
+        if security_issues:
             return 1
 
     # No issues found
@@ -688,22 +714,9 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         sr.finish(success=True)
         return sr
 
-    # Check file size first
-    max_file_size = config.get("max_file_size", 0)  # Default unlimited
+    # Get file size for later checks
     try:
         file_size = os.path.getsize(path)
-        if max_file_size > 0 and file_size > max_file_size:
-            sr = ScanResult(scanner_name="size_check")
-            sr.add_issue(
-                f"File too large to scan: {file_size} bytes (max: {max_file_size})",
-                severity=IssueSeverity.WARNING,
-                details={
-                    "file_size": file_size,
-                    "max_file_size": max_file_size,
-                    "path": path,
-                },
-            )
-            return sr
     except OSError as e:
         sr = ScanResult(scanner_name="error")
         sr.add_issue(
@@ -711,9 +724,31 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
+        sr.finish(success=False)
         return sr
 
-    logger.info(f"Scanning file: {path}")
+    # Check if we should use extreme handler BEFORE applying size limits
+    # Extreme handler bypasses size limits for large models
+    use_extreme_handler = should_use_advanced_handler(path)
+
+    # Check file size limit only if NOT using extreme handler
+    max_file_size = config.get("max_file_size", 0)  # Default unlimited
+    if not use_extreme_handler and max_file_size > 0 and file_size > max_file_size:
+        sr = ScanResult(scanner_name="size_check")
+        sr.add_issue(
+            f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+            severity=IssueSeverity.WARNING,
+            details={
+                "file_size": file_size,
+                "max_file_size": max_file_size,
+                "path": path,
+                "hint": "Consider using extreme large model support for files over 50GB",
+            },
+        )
+        sr.finish(success=False)
+        return sr
+
+    logger.debug(f"Processing: {path}")
 
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
@@ -772,19 +807,68 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
     result: Optional[ScanResult]
+
+    # We already checked use_extreme_handler above for size limit bypass
+    # Now check if we should use regular large handler
+    use_large_handler = should_use_large_file_handler(path) and not use_extreme_handler
+    progress_callback = config.get("progress_callback")
+    timeout = config.get("timeout", 1800)
+
     if preferred_scanner and preferred_scanner.can_handle(path):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
         scanner = preferred_scanner(config=config)
-        result = scanner.scan(path)
+
+        try:
+            if use_extreme_handler:
+                logger.debug(f"Large file optimization enabled: {path}")
+                result = scan_advanced_large_file(
+                    path, scanner, progress_callback, timeout * 2
+                )  # Double timeout for extreme files
+            elif use_large_handler:
+                logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
+                result = scan_large_file(path, scanner, progress_callback, timeout)
+            else:
+                result = scanner.scan(path)
+        except TimeoutError as e:
+            # Handle timeout gracefully
+            result = ScanResult(scanner_name=preferred_scanner.name)
+            result.add_issue(
+                f"Scan timeout: {e}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout": config.get("timeout", 300), "error": str(e)},
+            )
+            result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
         scanner_class = _registry.get_scanner_for_path(path)
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
-            result = scanner.scan(path)
+
+            try:
+                if use_extreme_handler:
+                    logger.debug(f"Large file optimization enabled: {path}")
+                    result = scan_advanced_large_file(
+                        path, scanner, progress_callback, timeout * 2
+                    )  # Double timeout for extreme files
+                elif use_large_handler:
+                    logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
+                    result = scan_large_file(path, scanner, progress_callback, timeout)
+                else:
+                    result = scanner.scan(path)
+            except TimeoutError as e:
+                # Handle timeout gracefully
+                result = ScanResult(scanner_name=scanner_class.name)
+                result.add_issue(
+                    f"Scan timeout: {e}",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"timeout": config.get("timeout", 300), "error": str(e)},
+                )
+                result.finish(success=False)
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
