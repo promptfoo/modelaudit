@@ -64,6 +64,18 @@ Validates model integrity and prevents tampering in your ML pipeline
 
 Checks for license violations that could expose your company to legal risk
 
+### **Finds Embedded Secrets**
+
+Detects API keys, tokens, and other credentials hidden in model weights or metadata
+
+### **Flags Network Communication**
+
+Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2 channels
+
+### **Detects Hidden JIT/Script Execution**
+
+Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
+
 ## 📊 Supported Model Formats
 
 ModelAudit scans **all major ML model formats** with specialized security analysis for each:
@@ -117,9 +129,11 @@ NO_COLOR=1 modelaudit models/
 ### **Third-Party Model Validation**
 
 ```bash
-# Scan models from HuggingFace, PyTorch Hub, or cloud storage
+# Scan models from HuggingFace, PyTorch Hub, MLflow, JFrog, or cloud storage
 modelaudit https://huggingface.co/gpt2
 modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
+modelaudit models:/MyModel/Production
+modelaudit model.dvc
 modelaudit s3://my-bucket/downloaded-model.pt
 modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
     --jfrog-api-token YOUR_TOKEN
@@ -128,10 +142,23 @@ modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
 ### **Compliance & Audit Reporting**
 
 ```bash
-modelaudit model_package.zip --sbom compliance_report.json --verbose
+modelaudit model_package.zip --sbom compliance_report.json --strict-license --verbose
 ```
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+### ⚙️ Advanced CLI Options
+
+ModelAudit provides additional flags for specialized workflows:
+
+- `--strict-license` – fail when incompatible or deprecated licenses are detected
+- `--max-file-size BYTES` / `--max-total-size BYTES` – limit scanning of very large files
+- `--max-download-size SIZE` – cap remote downloads (e.g., `500MB`, `2GB`)
+- `--preview` – show size and metadata before downloading remote models
+- `--cache/--no-cache` and `--cache-dir PATH` – control caching of cloud downloads
+- `--no-skip-files` and `--selective/--all-files` – control which files are scanned in directories
+- `--registry-uri URI` – scan models in an MLflow registry
+- `--jfrog-api-token` / `--jfrog-access-token` – authenticate with JFrog Artifactory
 
 ### Static Scanning vs. Promptfoo Redteaming
 
@@ -198,18 +225,50 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 <details>
 <summary><b>View all available extras and what they include</b></summary>
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[tensorflow]`  | TensorFlow framework          | Scanning `.pb` SavedModel files         |
-| `[pytorch]`     | PyTorch framework             | Scanning `.pt`, `.pth` files            |
-| `[h5]`          | h5py library                  | Scanning `.h5`, `.keras`, `.hdf5` files |
-| `[onnx]`        | ONNX runtime                  | Scanning `.onnx` model files            |
-| `[safetensors]` | SafeTensors library           | Scanning `.safetensors` files           |
-| `[flax]`        | msgpack for JAX/Flax          | Scanning `.msgpack`, `.flax` files      |
-| `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure            |
-| `[mlflow]`      | MLflow library                | Scanning MLflow model registry          |
-| `[all]`         | All ML frameworks             | Maximum compatibility                   |
-| `[numpy1]`      | All ML frameworks + NumPy<2.0 | When facing NumPy conflicts             |
+**Core ML Frameworks:**
+
+| Extra           | Includes    | Use When                                |
+| --------------- | ----------- | --------------------------------------- |
+| `[h5]`          | h5py        | Scanning `.h5`, `.keras`, `.hdf5` files |
+| `[onnx]`        | onnx        | Scanning `.onnx` model files            |
+| `[pytorch]`     | torch       | Scanning `.pt`, `.pth`, `.ckpt` files   |
+| `[safetensors]` | safetensors | Scanning `.safetensors` files           |
+| `[tensorflow]`  | tensorflow  | Scanning `.pb` SavedModel files         |
+
+**Specialized Tools:**
+
+| Extra        | Includes    | Use When                                 |
+| ------------ | ----------- | ---------------------------------------- |
+| `[coreml]`   | coremltools | Scanning `.mlmodel` Core ML files        |
+| `[flax]`     | msgpack     | Scanning `.msgpack`, `.flax` JAX files   |
+| `[tensorrt]` | tensorrt    | Scanning TensorRT engine files           |
+| `[tflite]`   | tflite      | Scanning `.tflite` TensorFlow Lite files |
+| `[yaml]`     | pyyaml      | Scanning YAML configuration files        |
+
+**Data & Storage:**
+
+| Extra      | Includes             | Use When                               |
+| ---------- | -------------------- | -------------------------------------- |
+| `[cloud]`  | fsspec, s3fs, gcsfs  | Scanning from S3, GCS, Azure storage   |
+| `[dill]`   | dill                 | Scanning `.dill` serialized files      |
+| `[joblib]` | joblib, scikit-learn | Scanning `.joblib` scikit-learn models |
+
+**Integration:**
+
+| Extra           | Includes                   | Use When                              |
+| --------------- | -------------------------- | ------------------------------------- |
+| `[huggingface]` | huggingface-hub (optional) | Explicit HuggingFace model downloads¹ |
+| `[mlflow]`      | mlflow                     | Scanning MLflow model registry        |
+
+**Meta-packages:**
+
+| Extra      | Includes                     | Use When                                |
+| ---------- | ---------------------------- | --------------------------------------- |
+| `[all-ci]` | All frameworks (no platform) | CI/CD environments                      |
+| `[all]`    | All frameworks + tools       | Maximum compatibility                   |
+| `[numpy1]` | All frameworks + NumPy<2.0   | Resolving NumPy compatibility conflicts |
+
+¹ _Note: `huggingface-hub` is included in base installation; this extra is optional for explicit dependency management._
 
 </details>
 
