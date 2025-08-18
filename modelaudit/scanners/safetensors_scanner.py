@@ -139,14 +139,27 @@ class SafeTensorsScanner(BaseScanner):
 
                 try:
                     header = json.loads(header_bytes.decode("utf-8"))
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, RecursionError) as e:
+                    is_recursion = isinstance(e, RecursionError)
+                    message = (
+                        "SafeTensors header too deeply nested or invalid JSON"
+                        if is_recursion
+                        else f"Invalid JSON header: {e!s}"
+                    )
+                    why = (
+                        "SafeTensors header JSON exceeded parser recursion limits, "
+                        "indicating a malformed or malicious file."
+                        if is_recursion
+                        else "SafeTensors header contained invalid JSON."
+                    )
                     result.add_check(
                         name="SafeTensors JSON Parse",
                         passed=False,
-                        message=f"Invalid JSON header: {e!s}",
+                        message=message,
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
+                        why=why,
                     )
                     result.finish(success=False)
                     return result
