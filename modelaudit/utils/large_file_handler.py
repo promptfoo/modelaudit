@@ -86,7 +86,7 @@ class LargeFileHandler:
         Returns:
             ScanResult with findings
         """
-        logger.info(f"Scanning {self.file_name} ({self.file_size:,} bytes) using {self.strategy} strategy")
+        logger.debug(f"File scan strategy: {self.strategy} for {self.file_name} ({self.file_size:,} bytes)")
 
         if self.strategy == "normal":
             return self._scan_normal()
@@ -169,13 +169,11 @@ class LargeFileHandler:
     def _scan_streaming(self) -> ScanResult:
         """Streaming scan for large files - always scans completely for security."""
         # Security requires complete file scanning
-        logger.info(f"Using complete scan for {self.file_name} ({self.file_size:,} bytes) for security")
         return self._scan_normal()
 
     def _scan_optimized(self) -> ScanResult:
         """Optimized scanning for large files (>8GB) - still scans completely."""
         # Security requires complete file scanning
-        logger.info(f"Using complete scan for file {self.file_name} ({self.file_size:,} bytes) for security")
         return self._scan_normal()
 
 

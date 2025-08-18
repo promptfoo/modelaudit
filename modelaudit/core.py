@@ -733,7 +733,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         )
         return sr
 
-    logger.info(f"Scanning file: {path}")
+    logger.debug(f"Processing: {path}")
 
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
@@ -807,12 +807,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
         try:
             if use_extreme_handler:
-                logger.info(f"Using extreme large file handler for {path}")
+                logger.debug(f"Large file optimization enabled: {path}")
                 result = scan_advanced_large_file(
                     path, scanner, progress_callback, timeout * 2
                 )  # Double timeout for extreme files
             elif use_large_handler:
-                logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
                 result = scanner.scan(path)
@@ -835,12 +835,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
             try:
                 if use_extreme_handler:
-                    logger.info(f"Using extreme large file handler for {path}")
+                    logger.debug(f"Large file optimization enabled: {path}")
                     result = scan_advanced_large_file(
                         path, scanner, progress_callback, timeout * 2
                     )  # Double timeout for extreme files
                 elif use_large_handler:
-                    logger.info(f"Using large file handler for {path} ({file_size:,} bytes)")
+                    logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
                     result = scanner.scan(path)
