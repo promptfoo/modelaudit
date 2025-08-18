@@ -64,6 +64,18 @@ Validates model integrity and prevents tampering in your ML pipeline
 
 Checks for license violations that could expose your company to legal risk
 
+### **Finds Embedded Secrets**
+
+Detects API keys, tokens, and other credentials hidden in model weights or metadata
+
+### **Flags Network Communication**
+
+Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2 channels
+
+### **Detects Hidden JIT/Script Execution**
+
+Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
+
 ## 📊 Supported Model Formats
 
 ModelAudit scans **all major ML model formats** with specialized security analysis for each:
@@ -117,9 +129,11 @@ NO_COLOR=1 modelaudit models/
 ### **Third-Party Model Validation**
 
 ```bash
-# Scan models from HuggingFace, PyTorch Hub, or cloud storage
+# Scan models from HuggingFace, PyTorch Hub, MLflow, JFrog, or cloud storage
 modelaudit https://huggingface.co/gpt2
 modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
+modelaudit models:/MyModel/Production
+modelaudit model.dvc
 modelaudit s3://my-bucket/downloaded-model.pt
 modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
     --jfrog-api-token YOUR_TOKEN
@@ -128,10 +142,23 @@ modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
 ### **Compliance & Audit Reporting**
 
 ```bash
-modelaudit model_package.zip --sbom compliance_report.json --verbose
+modelaudit model_package.zip --sbom compliance_report.json --strict-license --verbose
 ```
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+### ⚙️ Advanced CLI Options
+
+ModelAudit provides additional flags for specialized workflows:
+
+- `--strict-license` – fail when incompatible or deprecated licenses are detected
+- `--max-file-size BYTES` / `--max-total-size BYTES` – limit scanning of very large files
+- `--max-download-size SIZE` – cap remote downloads (e.g., `500MB`, `2GB`)
+- `--preview` – show size and metadata before downloading remote models
+- `--cache/--no-cache` and `--cache-dir PATH` – control caching of cloud downloads
+- `--no-skip-files` and `--selective/--all-files` – control which files are scanned in directories
+- `--registry-uri URI` – scan models in an MLflow registry
+- `--jfrog-api-token` / `--jfrog-access-token` – authenticate with JFrog Artifactory
 
 ### Static Scanning vs. Promptfoo Redteaming
 
@@ -208,6 +235,7 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 | `[flax]`        | msgpack for JAX/Flax          | Scanning `.msgpack`, `.flax` files      |
 | `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure            |
 | `[mlflow]`      | MLflow library                | Scanning MLflow model registry          |
+| `[huggingface]` | huggingface-hub library       | Downloading models from HuggingFace     |
 | `[all]`         | All ML frameworks             | Maximum compatibility                   |
 | `[numpy1]`      | All ML frameworks + NumPy<2.0 | When facing NumPy conflicts             |
 
