@@ -21,11 +21,6 @@ from .utils.huggingface import download_model, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("modelaudit")
 
 
@@ -1358,4 +1353,12 @@ def doctor(show_failed: bool):
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     cli()
+
+
+if __name__ == "__main__":
+    main()
