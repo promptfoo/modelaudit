@@ -183,6 +183,22 @@ class TestNetworkCommDetector:
         assert 4444 in ports  # Metasploit
         assert 6379 in ports  # Redis
 
+    def test_suspicious_port_scan_performance(self):
+        """Ensure port scanning remains performant with precompiled patterns."""
+        detector = NetworkCommDetector()
+        data = b"connect to server:1337" * 100
+        context = "model.bin"
+
+        import time
+
+        start = time.perf_counter()
+        for _ in range(50):
+            detector.findings = []
+            detector._scan_suspicious_ports(data, context)
+        duration = time.perf_counter() - start
+
+        assert duration < 1.0
+
     def test_blacklist_detection(self):
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
@@ -232,6 +248,25 @@ class TestNetworkCommDetector:
         domains = [f["domain"] for f in blacklist_findings]
         assert "custom-evil.com" in domains
         assert "my-c2.net" in domains
+
+    def test_custom_patterns_isolated_between_instances(self):
+        """Ensure custom patterns and blacklists do not leak between instances."""
+        config = {
+            "custom_cc_patterns": ["LEAK_PATTERN"],
+            "custom_blacklist": ["LEAK.example"],
+        }
+        detector_with_custom = NetworkCommDetector(config)
+        detector_default = NetworkCommDetector()
+
+        data = b"LEAK_PATTERN http://LEAK.example"
+
+        findings_custom = detector_with_custom.scan(data)
+        assert any(f["type"] == "cc_pattern" and f["pattern"] == "leak_pattern" for f in findings_custom)
+        assert any(f["type"] == "blacklisted_domain" and f["domain"] == "leak.example" for f in findings_custom)
+
+        findings_default = detector_default.scan(data)
+        assert all(f["type"] != "cc_pattern" for f in findings_default)
+        assert all(f["type"] != "blacklisted_domain" for f in findings_default)
 
     def test_confidence_scoring(self):
         """Test confidence scoring for different patterns."""

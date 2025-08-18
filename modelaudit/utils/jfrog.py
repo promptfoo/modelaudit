@@ -1,5 +1,6 @@
 """Utilities for handling JFrog Artifactory downloads."""
 
+import logging
 import os
 import shutil
 import tempfile
@@ -7,8 +8,11 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import click
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -87,7 +91,15 @@ def download_artifact(
 
     # If no authentication is provided, proceed without auth (for public repos)
     if not headers:
-        print("Warning: No JFrog authentication provided. Attempting anonymous access.")
+        message = "No JFrog authentication provided. Attempting anonymous access."
+        try:
+            ctx = click.get_current_context(silent=True)
+            if ctx:
+                click.echo(f"⚠️  {message}")
+            else:
+                logger.warning(message)
+        except Exception:
+            logger.warning(message)
 
     try:
         # Use requests for proper authentication and error handling
