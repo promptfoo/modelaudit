@@ -98,12 +98,9 @@ class ModelAuditConfig:
         # Parse severity overrides
         if "severity" in data and isinstance(data["severity"], dict):
             for rule_code, severity_str in data["severity"].items():
-                try:
+                with contextlib.suppress(ValueError, AttributeError):
                     # Convert string to Severity enum
                     self.severity[rule_code] = Severity(severity_str.upper())
-                except (ValueError, AttributeError):
-                    # Invalid severity, skip
-                    pass
 
         # Parse ignore patterns
         if "ignore" in data and isinstance(data["ignore"], dict):
