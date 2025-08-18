@@ -375,11 +375,12 @@ def scan_model_directory_or_file(
                                 break
                         except Exception as e:
                             logger.warning(f"Error scanning file {target_path}: {e!s}")
+                            results["success"] = False
                             issues_list = cast(list[dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
                                     "message": f"Error scanning file: {e!s}",
-                                    "severity": IssueSeverity.WARNING.value,
+                                    "severity": IssueSeverity.CRITICAL.value,
                                     "location": str(target_path),
                                     "details": {"exception_type": type(e).__name__},
                                 }
@@ -519,7 +520,7 @@ def scan_model_directory_or_file(
         results["success"] = False
         issue_dict = {
             "message": f"Error during scan: {e!s}",
-            "severity": IssueSeverity.WARNING.value,
+            "severity": IssueSeverity.CRITICAL.value,
             "details": {"exception_type": type(e).__name__},
         }
         issues_list = cast(list[dict[str, Any]], results["issues"])
@@ -587,7 +588,8 @@ def scan_model_directory_or_file(
         any(
             any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
             for issue in issues_list
-            if isinstance(issue, dict) and issue.get("severity") == IssueSeverity.CRITICAL.value
+            if isinstance(issue, dict)
+            and issue.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}
         )
         or not results["success"]
     )
