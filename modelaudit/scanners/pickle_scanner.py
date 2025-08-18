@@ -24,7 +24,7 @@ from ..explanations import (
     get_pattern_explanation,
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
@@ -870,9 +870,8 @@ class PickleScanner(BaseScanner):
 
                 # If we scanned for dangerous patterns but found none, record a successful check
                 dangerous_found = any(
-                    issue.severity == IssueSeverity.CRITICAL
-                    for issue in result.issues
-                    if "Dangerous Pattern Detection" in issue.details.get("check_name", "")
+                    check.name == "Dangerous Pattern Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
                 )
                 if not dangerous_found:
                     result.add_check(
@@ -882,7 +881,14 @@ class PickleScanner(BaseScanner):
                         location=path,
                         details={
                             "detection_method": "raw_content_scan",
-                            "patterns_checked": ["posix", "subprocess", "eval", "exec", "__import__", "builtins"],
+                            "patterns_checked": [
+                                "posix",
+                                "subprocess",
+                                "eval",
+                                "exec",
+                                "__import__",
+                                "builtins",
+                            ],
                         },
                     )
 
