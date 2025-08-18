@@ -152,11 +152,11 @@ class TestDiskSpaceCheckingForCloud:
 
         # Mock analyze_cloud_target to return file metadata
         mock_analyze.return_value = {
-            "type": "file", 
+            "type": "file",
             "size": 10 * 1024 * 1024 * 1024,
             "name": "large-model.bin",
             "human_size": "10.0 GB",
-            "estimated_time": "5 minutes"
+            "estimated_time": "5 minutes",
         }
 
         # Mock object size
@@ -172,10 +172,10 @@ class TestDiskSpaceCheckingForCloud:
         # Verify download was not attempted
         fs.get.assert_not_called()
         fs.close.assert_called_once()
-        
+
         # Verify the disk space check was actually called
         mock_check_disk_space.assert_called_once()
-        
+
         # Verify object size check was called
         mock_get_size.assert_called_once()
 
@@ -183,7 +183,9 @@ class TestDiskSpaceCheckingForCloud:
     @patch("modelaudit.utils.cloud_storage.check_disk_space")
     @patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_with_disk_space_check(self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size, tmp_path):
+    def test_download_with_disk_space_check(
+        self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size, tmp_path
+    ):
         """Test successful download with disk space check."""
         fs_meta = make_fs_mock()
         fs_meta.info.return_value = {"type": "file", "size": 1024 * 1024 * 1024}
@@ -195,11 +197,11 @@ class TestDiskSpaceCheckingForCloud:
 
         # Mock analyze_cloud_target to return file metadata
         mock_analyze.return_value = {
-            "type": "file", 
+            "type": "file",
             "size": 1024 * 1024 * 1024,
             "name": "model.bin",
             "human_size": "1.0 GB",
-            "estimated_time": "1 minute"
+            "estimated_time": "1 minute",
         }
 
         # Mock object size
