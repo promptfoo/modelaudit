@@ -2,6 +2,9 @@ import hashlib
 import json
 import logging
 import os
+
+# Progress tracking imports with circular dependency detection
+import sys
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -11,8 +14,18 @@ from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
 
-# Progress tracking disabled to fix circular import issues
 PROGRESS_AVAILABLE = False
+ProgressTracker = None
+ProgressPhase = None
+
+# Try to import progress tracking, handle circular import gracefully
+try:
+    from ..progress import ProgressPhase, ProgressTracker
+    PROGRESS_AVAILABLE = True
+except (ImportError, RecursionError):
+    PROGRESS_AVAILABLE = False
+    ProgressTracker = None  # type: ignore
+    ProgressPhase = None  # type: ignore
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -315,9 +328,9 @@ class BaseScanner(ABC):
         self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
         self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
 
-        # Progress tracking disabled to fix CI circular import issues
+        # Progress tracking setup
         self.progress_tracker = None
-        self._enable_progress = False
+        self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -863,50 +876,65 @@ class BaseScanner(ABC):
         """
         check_interrupted()
 
-    def _initialize_progress_tracker(self) -> None:  # noqa: B027
-        """Initialize progress tracker for this scanner - disabled."""
-        pass  # Disabled to fix CI circular import issues
+    def _initialize_progress_tracker(self) -> None:
+        """Initialize progress tracker for this scanner."""
+        if self._enable_progress and ProgressTracker:
+            self.progress_tracker = ProgressTracker()
+            logger.debug(f"Progress tracker initialized for {self.name} scanner")
 
-    def _setup_progress_for_file(self, path: str) -> None:  # noqa: B027
-        """Setup progress tracking for a specific file - disabled."""
-        pass  # Disabled to fix CI circular import issues
+    def _setup_progress_for_file(self, path: str) -> None:
+        """Setup progress tracking for a specific file."""
+        if self.progress_tracker and ProgressPhase:
+            file_size = self.get_file_size(path)
+            self.progress_tracker.stats.total_bytes = file_size
+            self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
 
     # All progress tracking methods disabled to fix CI circular import issues
-    def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:  # noqa: B027
-        """Update progress with bytes processed - disabled."""
-        pass
+    def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:
+        """Update progress with bytes processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_bytes(bytes_processed, current_item)
 
-    def _increment_progress_bytes(self, bytes_delta: int, current_item: str = "") -> None:  # noqa: B027
-        """Increment progress by a number of bytes - disabled."""
-        pass
+    def _increment_progress_bytes(self, bytes_delta: int, current_item: str = "") -> None:
+        """Increment progress by a number of bytes."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_bytes(bytes_delta, current_item)
 
-    def _update_progress_items(self, items_processed: int, current_item: str = "") -> None:  # noqa: B027
-        """Update progress with items processed - disabled."""
-        pass
+    def _update_progress_items(self, items_processed: int, current_item: str = "") -> None:
+        """Update progress with items processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_items(items_processed, current_item)
 
-    def _increment_progress_items(self, items_delta: int = 1, current_item: str = "") -> None:  # noqa: B027
-        """Increment progress by a number of items - disabled."""
-        pass
+    def _increment_progress_items(self, items_delta: int = 1, current_item: str = "") -> None:
+        """Increment progress by a number of items."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_items(items_delta, current_item)
 
-    def _set_progress_phase(self, phase, message: str = "") -> None:  # noqa: B027
-        """Set current progress phase - disabled."""
-        pass
+    def _set_progress_phase(self, phase, message: str = "") -> None:
+        """Set current progress phase."""
+        if self.progress_tracker and ProgressPhase:
+            self.progress_tracker.set_phase(phase, message)
 
     def _next_progress_phase(self, message: str = "") -> bool:
-        """Move to next progress phase - disabled."""
+        """Move to next progress phase."""
+        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):
+            return self.progress_tracker.next_phase(message)
         return False
 
-    def _set_progress_status(self, message: str) -> None:  # noqa: B027
-        """Set progress status message - disabled."""
-        pass
+    def _set_progress_status(self, message: str) -> None:
+        """Set progress status message."""
+        if self.progress_tracker:
+            self.progress_tracker.set_status(message)
 
-    def _complete_progress(self) -> None:  # noqa: B027
-        """Mark progress as complete - disabled."""
-        pass
+    def _complete_progress(self) -> None:
+        """Mark progress as complete."""
+        if self.progress_tracker:
+            self.progress_tracker.complete()
 
-    def _report_progress_error(self, error: Exception) -> None:  # noqa: B027
-        """Report an error to progress tracker - disabled."""
-        pass
+    def _report_progress_error(self, error: Exception) -> None:
+        """Report an error to progress tracker."""
+        if self.progress_tracker:
+            self.progress_tracker.report_error(error)
 
     def scan_with_progress(self, path: str) -> ScanResult:
         """Scan with progress tracking enabled.
@@ -916,7 +944,9 @@ class BaseScanner(ABC):
         """
         self.current_file_path = path
 
-        # Progress tracking disabled
+        # Initialize progress tracking for this file
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
 
         if self.progress_tracker:
             self._setup_progress_for_file(path)
@@ -937,10 +967,18 @@ class BaseScanner(ABC):
 
     def add_progress_reporter(self, reporter) -> None:
         """Add a progress reporter to this scanner."""
+        # Initialize progress tracker if not already done
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
         if self.progress_tracker:
             self.progress_tracker.add_reporter(reporter)
 
     def add_progress_callback(self, callback) -> None:
         """Add a progress callback to this scanner."""
+        # Initialize progress tracker if not already done
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
         if self.progress_tracker:
             self.progress_tracker.add_callback(callback)
