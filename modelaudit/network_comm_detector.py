@@ -6,7 +6,7 @@ that could be used for data exfiltration or command & control operations.
 
 import ipaddress
 import re
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, Union
 
 
 class NetworkCommDetector:
@@ -137,11 +137,18 @@ class NetworkCommDetector:
         self.config = config or {}
         self.findings: list[dict[str, Any]] = []
 
-        # Add custom patterns from config
+        # Clone class-level patterns to avoid cross-instance leakage
+        self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
+        self.blacklisted_domains: list[bytes] = self.BLACKLISTED_DOMAINS.copy()
+
+        def _to_lower_bytes(value: Union[bytes, str]) -> bytes:
+            return value.lower() if isinstance(value, bytes) else value.encode().lower()
+
+        # Add custom patterns from config, normalizing to lowercase bytes
         if "custom_cc_patterns" in self.config:
-            self.CC_PATTERNS.extend(self.config["custom_cc_patterns"])
+            self.cc_patterns.extend(_to_lower_bytes(p) for p in self.config["custom_cc_patterns"])
         if "custom_blacklist" in self.config:
-            self.BLACKLISTED_DOMAINS.extend(self.config["custom_blacklist"])
+            self.blacklisted_domains.extend(_to_lower_bytes(d) for d in self.config["custom_blacklist"])
 
     def scan(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan data for network communication patterns.
@@ -478,7 +485,7 @@ class NetworkCommDetector:
 
     def _scan_cc_patterns(self, data: bytes, context: str) -> None:
         """Scan for command & control patterns."""
-        for pattern in self.CC_PATTERNS:
+        for pattern in self.cc_patterns:
             if pattern in data.lower():
                 # Get context
                 idx = data.lower().find(pattern)
@@ -524,8 +531,6 @@ class NetworkCommDetector:
                 ]
 
                 for pattern_bytes in explicit_patterns:
-                    import re
-
                     pattern = re.compile(pattern_bytes, re.IGNORECASE | re.DOTALL)
                     if pattern.search(data):
                         port_name = self._get_port_name(port)
@@ -570,7 +575,7 @@ class NetworkCommDetector:
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""
-        for blacklisted in self.BLACKLISTED_DOMAINS:
+        for blacklisted in self.blacklisted_domains:
             if blacklisted in data.lower():
                 self.findings.append(
                     {
