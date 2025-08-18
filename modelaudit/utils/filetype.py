@@ -40,13 +40,19 @@ def detect_file_format_from_magic(path: str) -> str:
     if not file_path.is_file():
         return "unknown"
 
-    size = file_path.stat().st_size
-    if size < 4:
+    try:
+        size = file_path.stat().st_size
+        if size < 4:
+            return "unknown"
+
+        with file_path.open("rb") as f:
+            header = f.read(16)
+    except OSError:
         return "unknown"
 
-    magic4 = read_magic_bytes(path, 4)
-    magic8 = read_magic_bytes(path, 8)
-    magic16 = read_magic_bytes(path, 16)
+    magic4 = header[:4]
+    magic8 = header[:8]
+    magic16 = header[:16]
 
     # Check for TAR format
     try:

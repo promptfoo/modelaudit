@@ -98,6 +98,22 @@ class TestDirectoryFileFiltering:
             results_skip = scan_model_directory_or_file(tmp_dir, skip_file_types=True)
             assert results_skip["files_scanned"] == 1  # only model.bin
 
+    def test_license_files_metadata_collected(self):
+        """Ensure license files are processed for metadata even when skipped."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            license_plain = Path(tmp_dir) / "LICENSE"
+            license_txt = Path(tmp_dir) / "LICENSE.txt"
+            license_plain.write_text("MIT License")
+            license_txt.write_text("MIT License")
+
+            results = scan_model_directory_or_file(tmp_dir)
+
+            file_meta = results.get("file_metadata", {})
+            assert str(license_plain) in file_meta
+            assert file_meta[str(license_plain)]["license_info"]
+            assert str(license_txt) in file_meta
+            assert file_meta[str(license_txt)]["license_info"]
+
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""
         with tempfile.TemporaryDirectory() as tmp_dir:

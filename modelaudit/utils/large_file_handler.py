@@ -86,7 +86,7 @@ class LargeFileHandler:
         Returns:
             ScanResult with findings
         """
-        logger.info(f"Scanning {self.file_name} ({self.file_size:,} bytes) using {self.strategy} strategy")
+        logger.debug(f"File scan strategy: {self.strategy} for {self.file_name} ({self.file_size:,} bytes)")
 
         if self.strategy == "normal":
             return self._scan_normal()
@@ -112,6 +112,7 @@ class LargeFileHandler:
         result = ScanResult(scanner_name=self.scanner.name)
         bytes_processed = 0
         chunk_size = DEFAULT_CHUNK_SIZE
+        success = True
 
         self._report_progress(f"Scanning {self.file_name} in chunks", 0)
 
@@ -121,6 +122,8 @@ class LargeFileHandler:
                 chunk_result: ScanResult = self.scanner._scan_pickle_chunks(
                     self.file_path, chunk_size, self.progress_callback
                 )
+                if chunk_result.end_time is None:
+                    chunk_result.finish(success=not chunk_result.has_errors)
                 return chunk_result
 
             # For other scanners, fall back to normal scanning
@@ -137,6 +140,7 @@ class LargeFileHandler:
                                 "percentage": (bytes_processed / self.file_size) * 100,
                             },
                         )
+                        success = False
                         break
 
                     chunk = f.read(chunk_size)
@@ -156,26 +160,33 @@ class LargeFileHandler:
 
             # If scanner doesn't support chunking, fall back to normal scan
             if bytes_processed == 0:
-                return self._scan_normal()
+                normal_result = self._scan_normal()
+                if normal_result.end_time is None:
+                    normal_result.finish(success=not normal_result.has_errors)
+                return normal_result
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")
-            result.add_issue(f"Scanning error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
+            result.add_issue(
+                f"Scanning error: {e!s}",
+                severity=IssueSeverity.WARNING,
+                details={"error": str(e)},
+            )
+            success = False
 
         result.bytes_scanned = bytes_processed
         self._report_progress(f"Completed {self.file_name}", 100)
+        result.finish(success=success and not result.has_errors)
         return result
 
     def _scan_streaming(self) -> ScanResult:
         """Streaming scan for large files - always scans completely for security."""
         # Security requires complete file scanning
-        logger.info(f"Using complete scan for {self.file_name} ({self.file_size:,} bytes) for security")
         return self._scan_normal()
 
     def _scan_optimized(self) -> ScanResult:
         """Optimized scanning for large files (>8GB) - still scans completely."""
         # Security requires complete file scanning
-        logger.info(f"Using complete scan for file {self.file_name} ({self.file_size:,} bytes) for security")
         return self._scan_normal()
 
 
