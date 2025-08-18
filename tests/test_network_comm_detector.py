@@ -233,6 +233,25 @@ class TestNetworkCommDetector:
         assert "custom-evil.com" in domains
         assert "my-c2.net" in domains
 
+    def test_custom_patterns_isolated_between_instances(self):
+        """Ensure custom patterns and blacklists do not leak between instances."""
+        config = {
+            "custom_cc_patterns": ["LEAK_PATTERN"],
+            "custom_blacklist": ["LEAK.example"],
+        }
+        detector_with_custom = NetworkCommDetector(config)
+        detector_default = NetworkCommDetector()
+
+        data = b"LEAK_PATTERN http://LEAK.example"
+
+        findings_custom = detector_with_custom.scan(data)
+        assert any(f["type"] == "cc_pattern" and f["pattern"] == "leak_pattern" for f in findings_custom)
+        assert any(f["type"] == "blacklisted_domain" and f["domain"] == "leak.example" for f in findings_custom)
+
+        findings_default = detector_default.scan(data)
+        assert all(f["type"] != "cc_pattern" for f in findings_default)
+        assert all(f["type"] != "blacklisted_domain" for f in findings_default)
+
     def test_confidence_scoring(self):
         """Test confidence scoring for different patterns."""
         detector = NetworkCommDetector()
