@@ -1,0 +1,7 @@
+{
+  "name": "safe_model",
+  "version": "1.0.0",
+  "config": {
+    "learning_rate": 0.001
+  }
+}

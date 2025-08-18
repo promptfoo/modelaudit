@@ -1,16 +1,17 @@
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling==1.26.3"]  # Without a version spec, hatchling==1.27.0 is used which fails to publish. Ref: https://github.com/astral-sh/rye/issues/1446#issuecomment-2545154562
+build-backend = "hatchling.build"
 
-[tool.poetry]
+[project]
 name = "modelaudit"
-version = "0.1.1"
+version = "0.2.1"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
-authors = ["Ian Webster <ian@promptfoo.dev>"]
-license = "MIT"
+authors = [
+    { name = "Ian Webster", email = "ian@promptfoo.dev" },
+    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" }
+]
+license = { text = "MIT" }
 readme = "README.md"
-repository = "https://github.com/promptfoo/modelaudit"
-homepage = "https://github.com/promptfoo/modelaudit"
 keywords = ["ai", "ml", "security", "model-scanning", "pickle", "tensorflow", "pytorch"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -23,64 +24,231 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1.7",
+    "yaspin>=2.5.0",
+    "numpy>=1.19.0",
+    "scipy>=1.7.0",
+    "cyclonedx-python-lib>=10.2.0",
+    "defusedxml>=0.7.1",
+    "huggingface-hub>=0.23.0",
+    "requests>=2.28.0",
+    "python-dotenv>=1.0.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.9,<4.0"
-click = "^8.1.3"
-yaspin = "^2.3.0"
-requests = "^2.25.0"
-platformdirs = "^3.0.0"
-numpy = ">=1.19.0"
-scipy = ">=1.5.0"
+[project.optional-dependencies]
+# Note: ML frameworks may require NumPy < 2.0 for compatibility
+# If you encounter NumPy compatibility issues, consider using:
+# pip install "numpy<2.0" tensorflow h5py torch onnx
+tensorflow = ["tensorflow>=2.13.0,<3.0"]
+h5 = ["h5py>=3.1,<4.0"]
+pytorch = ["torch>=2.6.0,<3.0"]
+yaml = ["pyyaml>=6.0,<7.0"]
+safetensors = ["safetensors>=0.4.0"]
+onnx = ["onnx>=1.12.0,<2.0"]
+dill = ["dill>=0.3.0,<1.0"]
+joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
+flax = ["msgpack>=1.0.0,<2.0"]
+tflite = ["tflite>=2.18.0"]
+coreml = ["coremltools>=8.0"]
+tensorrt = ["tensorrt>=8.6.0"]
+mlflow = ["mlflow>=2.12.0"]
+huggingface = ["huggingface-hub>=0.23.0"]
+cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
+# Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
+numpy1 = [
+    "numpy>=1.19.0,<2.0",
+    "tensorflow>=2.13.0,<3.0",
+    "h5py>=3.1,<4.0",
+    "torch>=2.6.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "safetensors>=0.4.0",
+    "onnx>=1.12.0,<2.0",
+    "dill>=0.3.0,<1.0",
+    "joblib>=1.0.0,<2.0",
+    "scikit-learn>=1.0.0,<2.0",
+    "msgpack>=1.0.0,<2.0",
+    "tflite>=2.18.0",
+    "coremltools>=8.0",
+    "tensorrt>=8.6.0",
+    "huggingface-hub>=0.23.0",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
+]
+# All dependencies except platform-specific ones (for CI)
+all-ci = [
+    "tensorflow>=2.13.0,<3.0",
+    "h5py>=3.1,<4.0",
+    "torch>=2.6.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "safetensors>=0.4.0",
+    "onnx>=1.12.0,<2.0",
+    "dill>=0.3.0,<1.0",
+    "joblib>=1.0.0,<2.0",
+    "scikit-learn>=1.0.0,<2.0",
+    "msgpack>=1.0.0,<2.0",
+    "tflite>=2.18.0",
+    "coremltools>=8.0",
+    "mlflow>=2.12.0",
+    "huggingface-hub>=0.23.0",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
+]
+all = [
+    "tensorflow>=2.13.0,<3.0",
+    "h5py>=3.1,<4.0",
+    "torch>=2.6.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "safetensors>=0.4.0",
+    "onnx>=1.12.0,<2.0",
+    "dill>=0.3.0,<1.0",
+    "joblib>=1.0.0,<2.0",
+    "scikit-learn>=1.0.0,<2.0",
+    "msgpack>=1.0.0,<2.0",
+    "tflite>=2.18.0",
+    "coremltools>=8.0",
+    "tensorrt>=8.6.0",
+    "mlflow>=2.12.0",
+    "huggingface-hub>=0.23.0",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
+]
 
-# Optional dependencies for specific scanners
-tensorflow = { version = ">=2.6", optional = true }
-h5py = { version = ">=3.1", optional = true }
-torch = { version = ">=1.6", optional = true }
-pyyaml = { version = "^6.0", optional = true }
-safetensors = { version = ">=0.4.0", optional = true }
-onnx = { version = ">=1.12.0", optional = true }
-
-[tool.poetry.group.dev.dependencies]
-pytest = ">=7.0.0"
-coverage = "^7.2.7"
-mypy = "^1.4.1"
-ruff = ">=0.10.0"
-types-PyYAML = "^6.0.12.20250516"
-types-tensorflow = "^2.18.0.20250516"
-pytest-cov = "^6.2.1"
-
-[tool.poetry.extras]
-tensorflow = ["tensorflow"]
-h5 = ["h5py"]
-pytorch = ["torch"]
-yaml = ["pyyaml"]
-safetensors = ["safetensors"]
-onnx = ["onnx"]
-all = ["tensorflow", "h5py", "torch", "pyyaml", "safetensors", "onnx"]
-
-[tool.poetry.scripts]
+[project.scripts]
 modelaudit = "modelaudit.cli:main"
 
+[project.urls]
+Repository = "https://github.com/promptfoo/modelaudit"
+Homepage = "https://github.com/promptfoo/modelaudit"
+
+[tool.rye]
+managed = true
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "coverage>=7.4.0",
+    "mypy>=1.8.0",
+    "ruff>=0.10.0",
+    "types-PyYAML>=6.0.12.20250516",
+    "types-tensorflow>=2.18.0.20250516",
+    "types-requests>=2.31.0",
+    "types-click>=7.1.8",
+    "pytest-cov>=6.2.1",
+    "dill>=0.4.0",
+    "pytest-xdist>=3.7.0",
+    "pytest-asyncio>=1.1.0",
+]
+
 [tool.ruff]
-line-length = 88
+line-length = 120
 target-version = "py39"
 
 [tool.ruff.lint]
-extend-select = ["I"]
+# Extend the default rule set to be more prescriptive
+extend-select = [
+    "I",    # isort - import sorting
+    "W",    # pycodestyle warnings (includes trailing whitespace)
+    "E",    # pycodestyle errors  
+    "Q",    # flake8-quotes - enforce quote style
+    "COM",  # flake8-commas - trailing commas
+    "UP",   # pyupgrade - modernize Python syntax
+    "B",    # flake8-bugbear - additional bug and design problems
+    "C4",   # flake8-comprehensions - better list/dict comprehensions
+    "SIM",  # flake8-simplify - simplify code
+    "RUF",  # Ruff-specific rules
+]
+
+# Ignore rules that conflict with the formatter
+ignore = [
+    "COM812",  # Trailing comma (conflicts with formatter)
+]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"tests/**/*.py" = ["S101"]
+"tests/**/*.py" = ["S101", "F841"]
+
+[tool.ruff.lint.flake8-quotes]
+# Standardize on double quotes for consistency with docstrings
+inline-quotes = "double"
+multiline-quotes = "double"
+docstring-quotes = "double"
+avoid-escape = true
 
 [tool.ruff.format]
 # Black-compatible formatting
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--disable-warnings",
+    "--tb=short",
+]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "performance: marks tests as performance benchmarks",
+    "unit: marks tests as unit tests (fast)",
+    "asyncio: marks tests as asyncio tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
 
 [tool.mypy]
 python_version = "3.9"
-warn_return_any = false
-warn_unused_configs = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
+
+# Phase 1: Immediate improvements to catch real bugs
+warn_return_any = true         # Warn when returning Any from typed functions
+warn_unused_configs = true     # Warn about unused config options
+warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_redundant_casts = true    # Remove unnecessary casts
+warn_unreachable = true        # Detect unreachable code
+no_implicit_optional = true    # Require Optional[] for None defaults
+strict_equality = true         # Stricter comparison checks
+
+# Better error reporting
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+
+# Phase 2: To enable after fixing current issues
+# check_untyped_defs = true      # Type-check untyped function bodies
+# disallow_incomplete_defs = true # Functions with annotations must be fully annotated
+
+# Phase 3: Long-term strict typing goals
+# disallow_untyped_defs = true   # Require type annotations for all functions
+# disallow_any_generics = true   # Require type parameters for generics
+
+# Continue ignoring missing imports for now
 ignore_missing_imports = true
-no_implicit_optional = false
+
+# Per-module overrides for gradual adoption
+[[tool.mypy.overrides]]
+module = "modelaudit.tests.*"
+# Tests can be less strict
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "modelaudit.scanners.*"
+# Scanners use dynamic patterns that need Any
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = "modelaudit.suspicious_symbols"
+# Runtime validation needs to check types even with annotations
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
+module = "modelaudit.scanners.oci_layer_scanner"
+# Runtime validation needs to check types even with annotations
+warn_unreachable = false

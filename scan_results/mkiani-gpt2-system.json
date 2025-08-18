@@ -1,0 +1,149 @@
+{
+  "bytes_scanned": 665,
+  "issues": [],
+  "checks": [],
+  "files_scanned": 7,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/config.json",
+      "type": "manifest",
+      "size": 665,
+      "keys": [
+        "activation_function",
+        "architectures",
+        "attn_pdrop",
+        "bos_token_id",
+        "embd_pdrop",
+        "eos_token_id",
+        "initializer_range",
+        "layer_norm_epsilon",
+        "model_type",
+        "n_ctx",
+        "n_embd",
+        "n_head",
+        "n_layer",
+        "n_positions",
+        "resid_pdrop",
+        "summary_activation",
+        "summary_first_dropout",
+        "summary_proj_to_labels",
+        "summary_type",
+        "summary_use_proj",
+        "task_specific_params",
+        "vocab_size"
+      ]
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/pytorch_model (1).bin",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/pytorch_model.bin",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/models--mkiani--gpt2-system/refs/main",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/config.json.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/pytorch_model (1).bin.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/pytorch_model.bin.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": ["manifest", "skipped"],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/config.json": {
+      "file_size": 665,
+      "keys": [
+        "activation_function",
+        "architectures",
+        "attn_pdrop",
+        "bos_token_id",
+        "embd_pdrop",
+        "eos_token_id",
+        "initializer_range",
+        "layer_norm_epsilon",
+        "model_type",
+        "n_ctx",
+        "n_embd",
+        "n_head",
+        "n_layer",
+        "n_positions",
+        "resid_pdrop",
+        "summary_activation",
+        "summary_first_dropout",
+        "summary_proj_to_labels",
+        "summary_type",
+        "summary_use_proj",
+        "task_specific_params",
+        "vocab_size"
+      ],
+      "model_info": {
+        "model_type": "gpt2",
+        "architectures": ["GPT2LMHeadModel"],
+        "vocab_size": 50257
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/pytorch_model (1).bin": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/pytorch_model.bin": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/models--mkiani--gpt2-system/refs/main": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/config.json.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/pytorch_model (1).bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-system/.cache/huggingface/download/pytorch_model.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    }
+  },
+  "start_time": 1755214150.8585322,
+  "duration": 10.051492691040039,
+  "total_checks": 6,
+  "passed_checks": 0,
+  "failed_checks": 6
+}

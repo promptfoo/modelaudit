@@ -1,3 +1,9 @@
+import re
+from importlib.metadata import PackageNotFoundError, version
+
+import pytest
+
+import modelaudit
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 
@@ -15,11 +21,7 @@ def test_unknown_file(tmp_path):
     assert results["success"] is True
 
     # Should have an issue about unknown format
-    unknown_format_issues = [
-        issue
-        for issue in results["issues"]
-        if "Unknown or unhandled format" in issue["message"]
-    ]
+    unknown_format_issues = [issue for issue in results["issues"] if "Unknown or unhandled format" in issue["message"]]
     assert len(unknown_format_issues) > 0
 
 
@@ -39,8 +41,8 @@ def test_directory_scan(tmp_path):
     test_dir = tmp_path / "test_dir"
     test_dir.mkdir()
 
-    # Create a few test files
-    (test_dir / "file1.txt").write_bytes(b"test content 1")
+    # Create a few test files with model-like extensions
+    (test_dir / "file1.pkl").write_bytes(b"test content 1")
     (test_dir / "file2.dat").write_bytes(b"test content 2")
 
     # Create a subdirectory with a file
@@ -56,13 +58,12 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results["bytes_scanned"] > 0
 
-    # Check for unknown format issues (only .txt and .dat should be unknown)
-    unknown_format_issues = [
-        issue
-        for issue in results["issues"]
-        if "Unknown or unhandled format" in issue["message"]
-    ]
-    assert len(unknown_format_issues) == 2  # .txt and .dat files
+    # Check for unknown format issues (only .dat should be unknown)
+    unknown_format_issues = [issue for issue in results["issues"] if "Unknown or unhandled format" in issue["message"]]
+    assert len(unknown_format_issues) == 1  # .dat file
+
+    # The .pkl file should be handled by PickleScanner
+    assert any("pickle" in scanner for scanner in results.get("scanners", []))
 
     # The .bin file should be handled by PyTorchBinaryScanner
     assert any("pytorch_binary" in scanner for scanner in results.get("scanners", []))
@@ -81,11 +82,7 @@ def test_max_file_size(tmp_path):
     assert results["files_scanned"] == 1
 
     # Should have an issue about file being too large
-    large_file_issues = [
-        issue
-        for issue in results["issues"]
-        if "File too large to scan" in issue["message"]
-    ]
+    large_file_issues = [issue for issue in results["issues"] if "File too large to scan" in issue["message"]]
     assert len(large_file_issues) == 1
 
     # Scan with max_file_size larger than the file
@@ -97,12 +94,39 @@ def test_max_file_size(tmp_path):
     # assert results["bytes_scanned"] > 0
 
     # Should not have an issue about file being too large
-    large_file_issues = [
-        issue
-        for issue in results["issues"]
-        if "File too large to scan" in issue["message"]
-    ]
+    large_file_issues = [issue for issue in results["issues"] if "File too large to scan" in issue["message"]]
     assert len(large_file_issues) == 0
+
+
+def test_max_total_size(tmp_path):
+    """Test max_total_size parameter."""
+    import pickle
+
+    file1 = tmp_path / "a.pkl"
+    with file1.open("wb") as f:
+        pickle.dump({"data": "x" * 100}, f)
+
+    file2 = tmp_path / "b.pkl"
+    with file2.open("wb") as f:
+        pickle.dump({"data": "y" * 100}, f)
+
+    file3 = tmp_path / "c.pkl"
+    with file3.open("wb") as f:
+        pickle.dump({"data": "z" * 100}, f)
+
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+
+    assert results["success"] is True
+
+    limit_issues = [i for i in results["issues"] if "Total scan size limit exceeded" in i["message"]]
+    assert len(limit_issues) == 1
+
+    assert results["files_scanned"] == 2
+
+    termination_messages = [
+        i for i in results["issues"] if "Scan terminated early due to total size limit" in i["message"]
+    ]
+    assert len(termination_messages) == 1
 
 
 def test_timeout(tmp_path, monkeypatch):
@@ -164,7 +188,7 @@ def test_scan_result_class():
     result.add_issue("Debug message", severity=IssueSeverity.DEBUG)
     result.add_issue("Info message", severity=IssueSeverity.INFO)
     result.add_issue("Warning message", severity=IssueSeverity.WARNING)
-    result.add_issue("Error message", severity=IssueSeverity.ERROR)
+    result.add_issue("Error message", severity=IssueSeverity.CRITICAL)
 
     # Test issue count
     assert len(result.issues) == 4
@@ -191,7 +215,7 @@ def test_scan_result_class():
         assert result.has_errors is True
     else:
         # Manual check for errors
-        assert any(issue.severity == IssueSeverity.ERROR for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_merge_scan_results():
@@ -230,3 +254,74 @@ def test_blacklist_patterns(tmp_path):
 
     # Just verify the scan completes successfully
     assert results["success"] is True
+
+
+def test_invalid_config_values(tmp_path):
+    """Test validation of configuration parameters."""
+    test_file = tmp_path / "test_invalid.dat"
+    test_file.write_bytes(b"data")
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), timeout=0)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_file_size=-1)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), chunk_size=0)
+
+    with pytest.raises(ValueError):
+        scan_model_directory_or_file(str(test_file), max_total_size=-1)
+
+
+def test_version_consistency():
+    """Test that __version__ matches the package metadata version."""
+    # This is a recommended test from the Python Packaging Guide
+    # to ensure version consistency between code and distribution metadata
+    try:
+        package_version = version("modelaudit")
+        assert modelaudit.__version__ == package_version, (
+            f"Version mismatch: __version__ is '{modelaudit.__version__}' but package metadata version is "
+            f"'{package_version}'"
+        )
+    except PackageNotFoundError:
+        # Package is not installed, so we can't compare versions
+        # This is expected in development environments
+        assert modelaudit.__version__ == "unknown", (
+            f"Expected __version__ to be 'unknown' when package is not installed, but got '{modelaudit.__version__}'"
+        )
+
+
+def test_version_is_semver():
+    """Test that __version__ follows semantic versioning format."""
+    # Semantic versioning pattern: MAJOR.MINOR.PATCH with optional pre-release and build metadata
+    # Examples: 1.0.0, 0.1.3, 2.1.0-alpha, 1.0.0-beta.1, 1.0.0+20130313144700
+    semver_pattern = (
+        r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+        r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))"
+        r"?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+    )
+
+    version = modelaudit.__version__
+
+    # Skip validation if version is "unknown" (development scenarios)
+    if version == "unknown":
+        return
+
+    assert re.match(semver_pattern, version), (
+        f"Version '{version}' does not follow semantic versioning format. Expected format: MAJOR.MINOR.PATCH "
+        f"(e.g., 1.0.0, 0.1.3, 2.1.0-alpha)"
+    )
+
+    # Additional basic checks
+    parts = version.split(".")
+    assert len(parts) >= 3, f"Version '{version}' must have at least 3 parts (major.minor.patch)"
+
+    # Ensure major, minor, patch are numeric (before any pre-release suffix)
+    major = parts[0]
+    minor = parts[1]
+    patch_part = parts[2].split("-")[0].split("+")[0]  # Remove pre-release/build metadata
+
+    assert major.isdigit(), f"Major version '{major}' must be numeric"
+    assert minor.isdigit(), f"Minor version '{minor}' must be numeric"
+    assert patch_part.isdigit(), f"Patch version '{patch_part}' must be numeric"

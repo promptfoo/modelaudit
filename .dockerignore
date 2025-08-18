@@ -1,0 +1,43 @@
+# Rye
+.venv/
+.python-version
+.rye/
+
+# Development files
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation  
+docs/
+# Keep README.md as it's referenced in pyproject.toml
+!README.md
+
+# Testing
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+
+# Scratch/development
+scratch/
+llm_context.txt
+
+# CI/CD
+.github/

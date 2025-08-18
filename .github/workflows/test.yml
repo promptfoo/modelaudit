@@ -2,121 +2,334 @@ name: Python CI
 
 on:
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "**.rst"
+      - "LICENSE*"
+      - ".github/workflows/docs-check.yml"
   push:
     branches:
       - main
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # First, determine what changed to optimize subsequent jobs
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - '**.py'
+              - 'pyproject.toml'
+              - 'requirements*.lock'
+            docker:
+              - 'Dockerfile*'
+              - '.dockerignore'
+            workflows:
+              - '.github/workflows/**'
+            dependencies:
+              - 'pyproject.toml'
+              - 'requirements*.lock'
+
   lint:
     name: Lint and Format
+    needs: changes
+    # Always run on main branch, otherwise only if Python files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Lint with Ruff
         run: |
-          poetry run ruff check .
+          rye run ruff check modelaudit/ tests/
+
+      - name: Check import organization with Ruff
+        run: |
+          rye run ruff check --select I modelaudit/ tests/
 
       - name: Check formatting with Ruff
         run: |
-          poetry run ruff format --check .
+          rye run ruff format --check modelaudit/ tests/
 
   type-check:
     name: Type Check
+    needs: [changes, lint]
+    # Only run if Python files changed and linting passed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Type checking
-        run: poetry run mypy modelaudit/
+        run: |
+          rye run mypy modelaudit/ tests/
 
   test:
     name: Test Python ${{ matrix.python-version }}
+    needs: [changes, lint]
+    # Only run if Python files changed and linting passed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # For PRs, only test min and max Python versions to save time
+        # For main branch, test all versions
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+          version: latest
 
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: poetry install --sync --with dev --extras "all" --no-interaction
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
 
-      - name: Run tests with pytest
-        run: poetry run pytest -v --cov=modelaudit
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
+
+      - name: Run fast tests (parallel execution)
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+
+      - name: Run slow/integration tests (if main branch)
+        if: github.ref == 'refs/heads/main'
+        timeout-minutes: 15
+        run: |
+          # Only run tests explicitly marked with @pytest.mark.slow or @pytest.mark.integration
+          rye run pytest -n 1 --tb=short \
+            tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_stress_performance \
+            tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories \
+            tests/test_license_integration.py::TestLicenseIntegration::test_end_to_end_cli_integration
+
+  test-numpy-compatibility:
+    name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    needs: [changes, lint]
+    # Only run on main branch or if dependencies changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        # Reduced matrix for PRs
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.9", "3.11", "3.12"]') }}
+        numpy-mode: ["1.x", "2.x"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
+        with:
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin ${{ matrix.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
+            ${{ runner.os }}-rye-
+
+      - name: Install with NumPy 1.x compatibility mode
+        if: matrix.numpy-mode == '1.x'
+        run: |
+          rye sync --no-dev
+          rye add --optional numpy1 'numpy>=1.19.0,<2.0'
+          rye sync --features numpy1
+
+      - name: Install with NumPy 2.x (default)
+        if: matrix.numpy-mode == '2.x'
+        run: |
+          rye sync --features all-ci
+
+      - name: Check NumPy version
+        run: |
+          rye run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+
+      - name: Test scanner diagnostics
+        run: |
+          rye run modelaudit doctor --show-failed
+
+      - name: Test basic scanning functionality
+        run: |
+          # Create a test file to scan
+          echo "Testing basic scanning with NumPy ${{ matrix.numpy-mode }}"
+          rye run python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+          rye run modelaudit scan test_model.pkl --format json --output test_results.json
+          cat test_results.json
+
+      - name: Run NumPy compatibility tests
+        run: |
+          rye run pytest tests/test_numpy_scanner.py -v
+          rye run pytest tests/test_scanner_registry.py -v -k "numpy"
 
   build:
     name: Build and Package
-    needs: [lint, type-check]
+    needs: [changes, lint, type-check]
+    # Always build on main, otherwise only if Python files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
         with:
-          python-version: "3.11"
-          cache: poetry
-          cache-dependency-path: poetry.lock
+          enable-cache: true
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
 
       - name: Build package
         run: |
-          poetry install --sync --no-interaction
-          poetry build
+          rye build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+
+  # Summary job to ensure all required checks pass
+  ci-success:
+    name: CI Success
+    needs: [lint, type-check, test, test-numpy-compatibility, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if all jobs succeeded
+        run: |
+          # A job is considered successful if it either succeeded or was skipped
+          # (skipped means the job's conditions weren't met, which is fine)
+          LINT_RESULT="${{ needs.lint.result }}"
+          TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
+          TEST_RESULT="${{ needs.test.result }}"
+          NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
+          BUILD_RESULT="${{ needs.build.result }}"
+
+          echo "Job results:"
+          echo "  lint: $LINT_RESULT"
+          echo "  type-check: $TYPE_CHECK_RESULT"
+          echo "  test: $TEST_RESULT"
+          echo "  test-numpy-compatibility: $NUMPY_RESULT"
+          echo "  build: $BUILD_RESULT"
+
+          # Check if any job failed or was cancelled
+          if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
+                "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
+                "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
+                "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||
+                "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]]; then
+            echo "Some CI checks failed!"
+            exit 1
+          else
+            echo "All CI checks passed (or were skipped due to path filters)!"
+            exit 0
+          fi

@@ -7,8 +7,9 @@ This file provides comprehensive guidance for AI agents working with the ModelAu
 ModelAudit is a Python security scanner that detects malicious code, backdoors, and security risks in ML model files. It supports multiple formats (PyTorch, TensorFlow, Keras, SafeTensors, Pickle, ZIP) and provides both CLI and programmatic interfaces.
 
 **Key Security Focus:**
+
 - Dangerous code execution patterns
-- Suspicious opcodes in pickle files  
+- Suspicious opcodes in pickle files
 - Malicious configurations in model files
 - Blacklisted model names and patterns
 - Weight distribution anomalies
@@ -40,7 +41,7 @@ modelaudit/
 │   ├── test_integration.py   # Integration tests
 │   ├── test_cli.py          # CLI tests
 │   └── conftest.py          # pytest configuration
-├── pyproject.toml           # Poetry configuration
+├── pyproject.toml           # Rye configuration
 ├── README.md                # Project documentation
 └── CLAUDE.md               # Claude-specific guidance
 ```
@@ -49,20 +50,32 @@ modelaudit/
 
 ### Code Style & Standards
 
-**Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12)
+**Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12, 3.13)
 
 **Code Quality Tools:**
+
 - **Ruff**: Ultra-fast linter and formatter (replaces Black, isort, flake8)
 - **MyPy**: Static type checking
 - **pytest**: Testing framework with coverage
 
-**Formatting Standards:**
+**Code Quality Standards (matches CI workflow):**
+
 ```bash
-# ALWAYS run these before committing:
-poetry run ruff format .         # Format code
-poetry run ruff check .          # Lint code
-poetry run mypy modelaudit/      # Type check
-poetry run pytest               # Run tests
+# PRE-COMMIT WORKFLOW (development - format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests
+
+# CI VERIFICATION COMMANDS (read-only, matches test.yml):
+rye run ruff check modelaudit/ tests/            # Lint check
+rye run ruff check --select I modelaudit/ tests/ # Import organization check
+rye run ruff format --check modelaudit/ tests/   # Format verification
+rye run mypy modelaudit/ tests/                  # Type checking
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
+rye run pytest -n auto -m "slow or integration" --tb=short  # Slow/integration tests (main branch only in CI)
 ```
 
 ### Naming Conventions
@@ -75,6 +88,7 @@ poetry run pytest               # Run tests
 ### Type Hints
 
 Always use type hints for function parameters and return values:
+
 ```python
 def scan(self, path: str) -> ScanResult:
     """Scan a model file."""
@@ -115,29 +129,40 @@ class MyScanner(BaseScanner):
 
 ### Scanner Registration
 
-Add new scanners to `SCANNER_REGISTRY` in `modelaudit/scanners/__init__.py`:
+Scanners are registered lazily via `ScannerRegistry` in
+`modelaudit/scanners/__init__.py`. `SCANNER_REGISTRY` exposes a lazy list of
+available scanner classes. To register a new scanner, add its metadata to the
+`_scanners` dictionary inside `ScannerRegistry._init_registry`:
+
 ```python
-SCANNER_REGISTRY = [
-    PickleScanner,
-    PyTorchZipScanner,
-    # ... existing scanners
-    MyScanner,  # Add here
-]
+self._scanners["my_scanner"] = {
+    "module": "modelaudit.scanners.my_scanner",
+    "class": "MyScanner",
+    "description": "Scans My format",
+    "extensions": [".my"],
+    "priority": 10,
+    "dependencies": [],
+    "numpy_sensitive": False,
+}
 ```
+
+After adding the entry, the scanner will appear in `SCANNER_REGISTRY` when it is
+first accessed.
 
 ### Issue Reporting
 
 Use the `ScanResult` and `Issue` classes for consistent reporting:
+
 ```python
 # Report security issues
 result.add_issue(
     "Detected malicious code execution",
-    severity=IssueSeverity.ERROR,
+    severity=IssueSeverity.CRITICAL,
     location=path,
     details={"pattern": "os.system", "position": 123}
 )
 
-# Severity levels: ERROR, WARNING, INFO, DEBUG
+# Valid severity levels: DEBUG, INFO, WARNING, CRITICAL
 ```
 
 ## 🧪 Testing Guidelines
@@ -160,11 +185,11 @@ def test_my_scanner_safe_file(tmp_path: Path) -> None:
     # Create test file
     test_file = tmp_path / "safe.myformat"
     test_file.write_bytes(b"safe content")
-    
+
     # Run scanner
     scanner = MyScanner()
     result = scanner.scan(str(test_file))
-    
+
     # Assert results
     assert result.success is True
     assert not result.has_errors
@@ -174,11 +199,11 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
     # Create malicious test file
     malicious_file = tmp_path / "malicious.myformat"
     malicious_file.write_bytes(b"malicious content")
-    
+
     # Run scanner
     scanner = MyScanner()
     result = scanner.scan(str(malicious_file))
-    
+
     # Assert malicious content detected
     assert result.has_errors
     assert any("malicious" in issue.message.lower() for issue in result.issues)
@@ -187,18 +212,25 @@ def test_my_scanner_malicious_file(tmp_path: Path) -> None:
 ### Running Tests
 
 ```bash
-# Run all tests
-poetry run pytest
+# Run fast tests (matches CI workflow - parallel execution, excludes slow/integration/performance tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+
+# Run slow/integration tests (matches CI workflow - usually main branch only)
+rye run pytest -n auto -m "slow or integration" --tb=short
+
+# Run all tests (not recommended for regular development)
+rye run pytest
 
 # Run specific test file
-poetry run pytest tests/test_my_scanner.py -v
+rye run pytest tests/test_my_scanner.py -v
 
-# Run with coverage
-poetry run pytest --cov=modelaudit
+# Run with coverage (already included in fast tests command above)
+rye run pytest --cov=modelaudit
 
-# Run tests for specific Python versions
-poetry install --extras all  # Install all dependencies first
-poetry run pytest
+# Run tests for specific Python versions (matches CI matrix: 3.9, 3.10, 3.11, 3.12)
+rye sync --features all  # Install all dependencies first
+rye pin 3.11             # Pin to specific version (example)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
 ```
 
 ## 📦 Dependencies & Installation
@@ -210,23 +242,40 @@ poetry run pytest
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Poetry (recommended)
-poetry install --extras all  # All optional dependencies
-poetry install --extras "tensorflow pytorch h5"  # Specific extras
+# Install with Rye (recommended) - matches CI workflow
+rye sync --features all  # All optional dependencies for comprehensive testing
+rye sync                 # Basic dependencies only
 
-# Or with pip
-pip install -e .[all]
+# Or with pip (alternative)
+pip install -e .[all]    # Install in development mode with all extras
+pip install -e .         # Basic installation
 ```
 
 ### Optional Dependencies
 
 The project uses optional dependencies for specific scanners:
+
 - `tensorflow`: TensorFlow SavedModel scanning
-- `h5py`: Keras H5 model scanning  
-- `torch`: PyTorch model scanning
-- `pyyaml`: YAML manifest scanning
+- `h5`: Keras H5 model scanning (h5py)
+- `pytorch`: PyTorch model scanning (torch)
+- `yaml`: YAML manifest scanning (pyyaml)
 - `safetensors`: SafeTensors model scanning
 - `onnx`: ONNX model scanning
+- `dill`: Enhanced pickle support with security validation
+- `joblib`: Joblib model scanning with scikit-learn integration
+- `flax`: Flax msgpack scanning
+- `tflite`: TensorFlow Lite model scanning
+- `all`: All of the above dependencies
+
+Install specific extras as needed:
+
+```bash
+# With pip
+pip install modelaudit[tensorflow,pytorch,h5]
+
+# With rye (development)
+rye sync --features="tensorflow pytorch h5"
+```
 
 Always test that scanners gracefully handle missing optional dependencies.
 
@@ -238,7 +287,7 @@ Always test that scanners gracefully handle missing optional dependencies.
 # Dangerous imports to detect
 SUSPICIOUS_GLOBALS = {
     "os": "*",
-    "subprocess": "*", 
+    "subprocess": "*",
     "eval": "*",
     "exec": "*",
     "__import__": "*"
@@ -262,11 +311,12 @@ SUSPICIOUS_PATTERNS = [
 ### ML Context Detection
 
 The codebase includes smart detection to reduce false positives in ML contexts:
+
 ```python
 # ML-safe patterns that shouldn't trigger alerts
 ML_SAFE_GLOBALS = {
     "torch": ["*"],
-    "numpy": ["*"], 
+    "numpy": ["*"],
     "transformers": ["*"],
     "sklearn": ["*"]
 }
@@ -280,7 +330,7 @@ ML_SAFE_GLOBALS = {
 # Scan single file
 modelaudit scan model.pkl
 
-# Scan directory  
+# Scan directory
 modelaudit scan ./models/
 
 # Export to JSON
@@ -330,7 +380,7 @@ modelaudit scan model.pkl --verbose
 When contributing code:
 
 1. **Follow conventional commits**: `feat:`, `fix:`, `docs:`, etc.
-2. **All tests must pass** across Python 3.9-3.12
+2. **All tests must pass** across Python 3.9-3.13
 3. **Code must be formatted** with Ruff
 4. **Type checking must pass** with MyPy
 5. **Keep PRs focused** on single concerns
@@ -340,11 +390,12 @@ When contributing code:
 ### Pre-commit Checklist
 
 ```bash
-# Run before every commit
-poetry run ruff format .
-poetry run ruff check .
-poetry run mypy modelaudit/
-poetry run pytest
+# Run before every commit (matches CI workflow with format equivalents):
+rye run ruff format modelaudit/ tests/           # Format code and tests
+rye run ruff check --fix modelaudit/ tests/      # Lint and fix issues
+rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
+rye run mypy modelaudit/ tests/                  # Type check (both prod and tests)
+rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short  # Fast tests
 ```
 
 ## 🔗 Key Files for AI Agents
@@ -355,4 +406,4 @@ poetry run pytest
 - **`pyproject.toml`**: Dependencies and project configuration
 - **`tests/conftest.py`**: Test configuration and fixtures
 
-Understanding these files is crucial for effective contributions to the ModelAudit codebase. 
+Understanding these files is crucial for effective contributions to the ModelAudit codebase.

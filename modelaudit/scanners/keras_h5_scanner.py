@@ -1,7 +1,17 @@
 import json
 import os
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
+from modelaudit.suspicious_symbols import (
+    SUSPICIOUS_CONFIG_PROPERTIES,
+    SUSPICIOUS_LAYER_TYPES,
+)
+from modelaudit.utils.code_validation import (
+    is_code_potentially_dangerous,
+    validate_python_syntax,
+)
+
+from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
@@ -12,37 +22,13 @@ try:
 except ImportError:
     HAS_H5PY = False
 
-# Suspicious Keras layer types that might contain executable code
-SUSPICIOUS_LAYER_TYPES = {
-    "Lambda": "Can contain arbitrary Python code",
-    "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
-    "PyFunc": "Can execute Python code",
-    "CallbackLambda": "Can execute callbacks at runtime",
-}
-
-# Suspicious config properties that might indicate security issues
-SUSPICIOUS_CONFIG_PROPERTIES = [
-    "function",
-    "module",
-    "code",
-    "eval",
-    "exec",
-    "import",
-    "subprocess",
-    "os.",
-    "system",
-    "popen",
-    "shell",
-]
-
 
 class KerasH5Scanner(BaseScanner):
     """Scanner for Keras H5 model files"""
 
     name = "keras_h5"
     description = "Scans Keras H5 model files for suspicious layer configurations"
-    supported_extensions = [".h5", ".hdf5", ".keras"]
+    supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -77,19 +63,28 @@ class KerasH5Scanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a Keras model file for suspicious configurations"""
+        # Initialize context for this file
+        self._initialize_context(path)
+
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
-            result.add_issue(
-                "h5py not installed, cannot scan Keras H5 files.",
-                severity=IssueSeverity.ERROR,
+            result.add_check(
+                name="H5PY Library Check",
+                passed=False,
+                message="h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path},
+                details={"path": path, "required_package": "h5py"},
             )
             result.finish(success=False)
             return result
@@ -97,6 +92,9 @@ class KerasH5Scanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
 
         try:
             # Store the file path for use in issue locations
@@ -107,12 +105,31 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
-                    result.add_issue(
-                        "File does not appear to be a Keras model "
-                        "(no model_config attribute)",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
+                    # Check if this might be a TensorFlow SavedModel H5 file instead
+                    # Look for common TensorFlow H5 structure patterns
+                    is_tensorflow_h5 = any(
+                        key.startswith(
+                            ("model_weights", "optimizer_weights", "variables"),
+                        )
+                        for key in f
                     )
+
+                    if is_tensorflow_h5:
+                        result.add_check(
+                            name="Keras Model Format Check",
+                            passed=True,
+                            message="File is a TensorFlow H5 model, not Keras format",
+                            location=self.current_file_path,
+                            details={"format": "tensorflow_h5"},
+                        )
+                    else:
+                        result.add_check(
+                            name="Keras Model Format Check",
+                            passed=True,
+                            message="File does not appear to be a Keras model (no model_config attribute)",
+                            location=self.current_file_path,
+                            details={"format": "generic_h5"},
+                        )
                     result.finish(success=True)  # Still success, just not a Keras file
                     return result
 
@@ -121,13 +138,24 @@ class KerasH5Scanner(BaseScanner):
                 model_config = json.loads(model_config_str)
 
                 # Scan model configuration
-                self._scan_model_config(model_config, result)
+                if isinstance(model_config, dict):
+                    self._scan_model_config(model_config, result)
+                else:
+                    result.add_check(
+                        name="Model Config Type Validation",
+                        passed=False,
+                        message=f"Invalid model config type: expected dict, got {type(model_config).__name__}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
+                    )
 
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
-                    result.add_issue(
-                        "Model contains custom objects which could contain "
-                        "arbitrary code",
+                    result.add_check(
+                        name="Custom Objects Security Check",
+                        passed=False,
+                        message="Model contains custom objects which could contain arbitrary code",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (model_config)",
                         details={"custom_objects": list(f.attrs["custom_objects"])},
@@ -145,18 +173,21 @@ class KerasH5Scanner(BaseScanner):
                                 "CategoricalAccuracy",
                                 "BinaryAccuracy",
                             ]:
-                                result.add_issue(
-                                    f"Model contains custom metric: "
-                                    f"{metric.get('class_name', 'unknown')}",
+                                result.add_check(
+                                    name="Custom Metric Detection",
+                                    passed=False,
+                                    message=f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
                                     severity=IssueSeverity.WARNING,
                                     location=f"{self.current_file_path} (metrics)",
                                     details={"metric": metric},
                                 )
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning Keras H5 file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+            result.add_check(
+                name="Keras H5 File Scan",
+                passed=False,
+                message=f"Error scanning Keras H5 file: {e!s}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -172,13 +203,6 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan the model configuration for suspicious elements"""
-        if not isinstance(model_config, dict):
-            result.add_issue(
-                "Invalid model configuration format",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-            )
-            return
 
         # Check model class name
         model_class = model_config.get("class_name", "")
@@ -187,13 +211,34 @@ class KerasH5Scanner(BaseScanner):
         # Collect all layers
         layers = []
         if "config" in model_config and "layers" in model_config["config"]:
-            layers = model_config["config"]["layers"]
+            layers_value = model_config["config"]["layers"]
+            if isinstance(layers_value, list):
+                layers = layers_value
+            else:
+                result.add_check(
+                    name="Layers Type Validation",
+                    passed=False,
+                    message=f"Invalid layers type: expected list, got {type(layers_value).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
+                )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
 
         # Check each layer
         for layer in layers:
+            if not isinstance(layer, dict):
+                result.add_check(
+                    name="Layer Type Validation",
+                    passed=False,
+                    message=f"Invalid layer type: expected dict, got {type(layer).__name__}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={"actual_type": type(layer).__name__, "expected_type": "dict"},
+                )
+                continue
             layer_class = layer.get("class_name", "")
 
             # Update layer count
@@ -204,16 +249,25 @@ class KerasH5Scanner(BaseScanner):
 
             # Check for suspicious layer types
             if layer_class in self.suspicious_layer_types:
-                result.add_issue(
-                    f"Suspicious layer type found: {layer_class}",
-                    severity=IssueSeverity.ERROR,
-                    location=self.current_file_path,
-                    details={
-                        "layer_class": layer_class,
-                        "description": self.suspicious_layer_types[layer_class],
-                        "layer_config": layer.get("config", {}),
-                    },
-                )
+                layer_config = layer.get("config", {})
+
+                # Special handling for Lambda layers - validate Python code
+                if layer_class == "Lambda":
+                    self._check_lambda_layer(layer_config, result)
+                else:
+                    result.add_check(
+                        name="Suspicious Layer Type Detection",
+                        passed=False,
+                        message=f"Suspicious layer type found: {layer_class}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": layer_class,
+                            "description": self.suspicious_layer_types[layer_class],
+                            "layer_config": layer_config,
+                        },
+                        why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
+                    )
 
             # Check layer configuration for suspicious strings
             self._check_config_for_suspicious_strings(
@@ -223,23 +277,147 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # If there are nested models, scan them recursively
-            if (
-                layer_class == "Model"
-                and "config" in layer
-                and "layers" in layer["config"]
-            ):
+            if layer_class == "Model" and "config" in layer and "layers" in layer["config"] and isinstance(layer, dict):
                 self._scan_model_config(layer, result)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
+    def _check_lambda_layer(self, layer_config: dict[str, Any], result: ScanResult) -> None:
+        """Check Lambda layer for executable Python code with validation"""
+        import re
+
+        # Lambda layers can contain Python code in several forms:
+        # 1. As a string in 'function' field (serialized Python code)
+        # 2. As a module + function reference
+        # 3. As inline code
+
+        # Extract potential Python code from Lambda config
+        function_str = layer_config.get("function")
+        module_name = layer_config.get("module")
+        function_name = layer_config.get("function_name")
+
+        # Common safe Lambda patterns for normalization
+        SAFE_LAMBDA_PATTERNS = [
+            r"lambda\s+x\s*:\s*x\s*/\s*\d+",  # lambda x: x / 255
+            r"lambda\s+x\s*:\s*x\s*\*\s*\d+",  # lambda x: x * 2
+            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)",  # lambda x: tf.nn.softmax(x)
+            r"lambda\s+x\s*:\s*K\.\w+\(x",  # lambda x: K.softmax(x)
+            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+",  # lambda x: (x - 128) / 128
+        ]
+
+        # Check if there's actual Python code to validate
+        if function_str and isinstance(function_str, str):
+            # First check if it matches safe patterns
+            is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
+
+            if is_safe_pattern:
+                result.add_check(
+                    name="Lambda Layer Code Analysis",
+                    passed=True,
+                    message="Lambda layer contains safe normalization pattern",
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "pattern_type": "safe_normalization",
+                    },
+                )
+                return
+
+            # This might be serialized Python code
+            is_valid, error = validate_python_syntax(function_str)
+
+            if is_valid:
+                # It's valid Python! Check if it's dangerous
+                is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
+
+                # Check if code is dangerous
+                if is_dangerous:
+                    result.add_check(
+                        name="Lambda Layer Code Analysis",
+                        passed=False,
+                        message="Lambda layer contains dangerous Python code",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "code_analysis": risk_desc,
+                            "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
+                            "validation_status": "valid_python",
+                        },
+                        why=get_pattern_explanation("lambda_layer"),
+                    )
+                else:
+                    # Valid Python but not dangerous - record as passed
+                    result.add_check(
+                        name="Lambda Layer Code Analysis",
+                        passed=True,
+                        message="Lambda layer contains safe Python code",
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "validation_status": "valid_python",
+                        },
+                    )
+            else:
+                # Not valid Python syntax - might be a configuration issue
+                # Only flag if it looks like attempted code execution
+                if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
+                    result.add_check(
+                        name="Lambda Layer Suspicious Keywords Check",
+                        passed=False,
+                        message="Lambda layer contains suspicious configuration",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "description": self.suspicious_layer_types["Lambda"],
+                            "layer_config": layer_config,
+                            "validation_error": error,
+                        },
+                        why=get_pattern_explanation("lambda_layer"),
+                    )
+        elif module_name or function_name:
+            # Module/function reference - check for dangerous imports
+            dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
+            if module_name and any(dangerous in module_name for dangerous in dangerous_modules):
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=False,
+                    message=f"Lambda layer references potentially dangerous module: {module_name}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "module": module_name,
+                        "function": function_name,
+                    },
+                    why=get_pattern_explanation("lambda_layer"),
+                )
+            else:
+                # Safe module reference - record as passed
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=True,
+                    message="Lambda layer module references are safe",
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "module": module_name,
+                        "function": function_name,
+                    },
+                )
+        # Don't flag Lambda layers without code - they might just be placeholders
+
     def _check_config_for_suspicious_strings(
         self,
-        config: dict[str, Any],
+        config: Any,
         result: ScanResult,
         context: str = "",
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
+
+        # Validate config is actually a dict
         if not isinstance(config, dict):
             return
 
@@ -249,10 +427,11 @@ class KerasH5Scanner(BaseScanner):
                 # Check for suspicious strings
                 for suspicious_term in self.suspicious_config_props:
                     if suspicious_term in value.lower():
-                        result.add_issue(
-                            f"Suspicious configuration string found in {context}: "
-                            f"'{suspicious_term}'",
-                            severity=IssueSeverity.WARNING,
+                        result.add_check(
+                            name="Suspicious Configuration String Check",
+                            passed=False,
+                            message=f"Suspicious configuration string found in {context}: '{suspicious_term}'",
+                            severity=IssueSeverity.INFO,
                             location=f"{self.current_file_path} ({context})",
                             details={
                                 "suspicious_term": suspicious_term,

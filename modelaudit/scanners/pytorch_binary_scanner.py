@@ -1,8 +1,13 @@
 import os
 import struct
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.suspicious_symbols import (
+    BINARY_CODE_PATTERNS,
+    EXECUTABLE_SIGNATURES,
+)
+
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
 class PyTorchBinaryScanner(BaseScanner):
@@ -10,7 +15,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
     name = "pytorch_binary"
     description = "Scans PyTorch binary tensor files for suspicious patterns"
-    supported_extensions = [".bin"]
+    supported_extensions: ClassVar[list[str]] = [".bin"]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -30,9 +35,18 @@ class PyTorchBinaryScanner(BaseScanner):
 
         # Check if it's actually a pytorch binary file
         try:
-            from modelaudit.utils.filetype import detect_file_format
+            from modelaudit.utils.filetype import detect_file_format, validate_file_type
 
             file_format = detect_file_format(path)
+
+            # Validate file type for security, but be permissive for .bin files
+            # since they can contain various formats of legitimate binary data
+            if not validate_file_type(path):
+                # File type validation failed - log but don't reject immediately
+                # for .bin files since they can contain arbitrary binary data
+                logger.warning(f"File type validation failed for .bin file: {path}")
+                # Continue to check if it's still a valid pytorch_binary format
+
             return file_format == "pytorch_binary"
         except Exception:
             return False
@@ -44,18 +58,35 @@ class PyTorchBinaryScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
 
         try:
             self.current_file_path = path
 
             # Check for suspiciously small files
             if file_size < 100:
-                result.add_issue(
-                    f"Suspiciously small binary file: {file_size} bytes",
-                    severity=IssueSeverity.WARNING,
+                result.add_check(
+                    name="File Size Validation",
+                    passed=False,
+                    message=f"Suspiciously small binary file: {file_size} bytes",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"file_size": file_size},
+                )
+            else:
+                result.add_check(
+                    name="File Size Validation",
+                    passed=True,
+                    message="File size is reasonable",
                     location=path,
                     details={"file_size": file_size},
                 )
@@ -74,18 +105,24 @@ class PyTorchBinaryScanner(BaseScanner):
 
                     # Check for embedded Python code patterns
                     self._check_for_code_patterns(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
                     # Check for blacklisted patterns
                     if self.blacklist_patterns:
                         self._check_for_blacklist_patterns(
-                            chunk, result, bytes_scanned - len(chunk)
+                            chunk,
+                            result,
+                            bytes_scanned - len(chunk),
                         )
 
                     # Check for executable file signatures
                     self._check_for_executable_signatures(
-                        chunk, result, bytes_scanned - len(chunk)
+                        chunk,
+                        result,
+                        bytes_scanned - len(chunk),
                     )
 
             result.bytes_scanned = bytes_scanned
@@ -94,9 +131,11 @@ class PyTorchBinaryScanner(BaseScanner):
             self._validate_tensor_structure(path, result)
 
         except Exception as e:
-            result.add_issue(
-                f"Error scanning binary file: {str(e)}",
-                severity=IssueSeverity.ERROR,
+            result.add_check(
+                name="Binary File Scan",
+                passed=False,
+                message=f"Error scanning binary file: {e!s}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -107,88 +146,139 @@ class PyTorchBinaryScanner(BaseScanner):
         return result
 
     def _check_for_code_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
-        code_patterns = [
-            b"import os",
-            b"import sys",
-            b"import subprocess",
-            b"eval(",
-            b"exec(",
-            b"__import__",
-            b"compile(",
-            b"globals()",
-            b"locals()",
-            b"open(",
-            b"file(",
-            b"input(",
-            b"raw_input(",
-            b"execfile(",
-            b"os.system",
-            b"subprocess.call",
-            b"subprocess.Popen",
-            b"socket.socket",
-        ]
-
-        for pattern in code_patterns:
+        found_suspicious = False
+        for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 # Find the position within the chunk
                 pos = chunk.find(pattern)
-                result.add_issue(
-                    f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
-                    severity=IssueSeverity.WARNING,
+                result.add_check(
+                    name="Embedded Code Pattern Detection",
+                    passed=False,
+                    message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
+                    severity=IssueSeverity.INFO,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern.decode("ascii", errors="ignore"),
                         "offset": offset + pos,
                     },
                 )
+                found_suspicious = True
+
+        if not found_suspicious and offset == 0:  # Only record success on first chunk
+            result.add_check(
+                name="Embedded Code Pattern Detection",
+                passed=True,
+                message="No suspicious code patterns detected",
+                location=self.current_file_path,
+            )
 
     def _check_for_blacklist_patterns(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
         """Check for blacklisted patterns in the binary data"""
+        found_blacklisted = False
         for pattern in self.blacklist_patterns:
             pattern_bytes = pattern.encode("utf-8")
             if pattern_bytes in chunk:
                 pos = chunk.find(pattern_bytes)
-                result.add_issue(
-                    f"Blacklisted pattern found: {pattern}",
-                    severity=IssueSeverity.ERROR,
+                result.add_check(
+                    name="Blacklist Pattern Check",
+                    passed=False,
+                    message=f"Blacklisted pattern found: {pattern}",
+                    severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern,
                         "offset": offset + pos,
                     },
                 )
+                found_blacklisted = True
+
+        if not found_blacklisted and offset == 0:  # Only record success on first chunk
+            result.add_check(
+                name="Blacklist Pattern Check",
+                passed=True,
+                message="No blacklisted patterns found",
+                location=self.current_file_path,
+            )
 
     def _check_for_executable_signatures(
-        self, chunk: bytes, result: ScanResult, offset: int
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
     ) -> None:
-        """Check for executable file signatures"""
-        # Common executable signatures
-        executable_sigs = {
-            b"MZ": "Windows executable (PE)",
-            b"\x7fELF": "Linux executable (ELF)",
-            b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
-            b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
-            b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
-            b"#!/": "Shell script shebang",
-        }
+        """Check for executable file signatures with ML context awareness"""
+        from modelaudit.utils.ml_context import (
+            analyze_binary_for_ml_context,
+            should_ignore_executable_signature,
+        )
 
-        for sig, description in executable_sigs.items():
+        # Analyze ML context for this chunk
+        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+
+        # Count patterns for density analysis
+        pattern_counts = {}
+
+        # Common executable signatures
+        for sig, description in EXECUTABLE_SIGNATURES.items():
             if sig in chunk:
-                pos = chunk.find(sig)
-                result.add_issue(
-                    f"Executable signature found: {description}",
-                    severity=IssueSeverity.ERROR,
-                    location=f"{self.current_file_path} (offset: {offset + pos})",
+                # Count all occurrences
+                positions = []
+                pos = 0
+                while True:
+                    pos = chunk.find(sig, pos)
+                    if pos == -1:
+                        break
+                    positions.append(offset + pos)
+                    pos += len(sig)
+
+                if positions:
+                    pattern_counts[sig] = (positions, description)
+
+        # Process findings with ML context filtering
+        for sig, (positions, description) in pattern_counts.items():
+            # Calculate pattern density more reasonably for small files
+            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            # Use at least 1MB for density calculation to avoid inflated densities in small files
+            effective_size_mb = max(file_size_mb, 1.0)
+            pattern_density = len(positions) / effective_size_mb
+
+            # Apply ML context filtering
+            filtered_positions = []
+            ignored_count = 0
+
+            for pos in positions:
+                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                    ignored_count += 1
+                else:
+                    filtered_positions.append(pos)
+
+            # Report significant patterns that weren't filtered out
+            for pos in filtered_positions[:10]:  # Limit to first 10
+                result.add_check(
+                    name="Executable Signature Detection",
+                    passed=False,
+                    message=f"Executable signature found: {description}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (offset: {pos})",
                     details={
                         "signature": sig.hex(),
                         "description": description,
-                        "offset": offset + pos,
+                        "offset": pos,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_confidence": ml_context.get("weight_confidence", 0),
                     },
                 )
 
@@ -199,33 +289,44 @@ class PyTorchBinaryScanner(BaseScanner):
                 # Read first few bytes to check for common tensor patterns
                 header = f.read(32)
 
-                # PyTorch tensors often start with specific patterns
-                # This is a basic check - real validation would require parsing the format
+                # Validate tensor file header patterns
                 if len(header) < 8:
-                    result.add_issue(
-                        "File too small to be a valid tensor file",
-                        severity=IssueSeverity.WARNING,
+                    result.add_check(
+                        name="Tensor File Size Validation",
+                        passed=False,
+                        message="File too small to be a valid tensor file",
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"header_size": len(header)},
                     )
                     return
 
-                # Check if it looks like it might contain float32/float64 data
-                # by looking for patterns of IEEE 754 floats
-                # This is a heuristic - not definitive
+                # Check for IEEE 754 float patterns
 
                 # Try to interpret first 8 bytes as double
                 try:
                     value = struct.unpack("d", header[:8])[0]
-                    # Check if it's a reasonable float value (not NaN, not huge)
+                    # Validate float value is within reasonable bounds
                     if not (-1e100 < value < 1e100) or value != value:  # NaN check
                         result.metadata["tensor_validation"] = "unusual_float_values"
-                except struct.error:
-                    pass
+                except struct.error as e:
+                    result.add_check(
+                        name="Tensor Header Interpretation",
+                        passed=False,
+                        message="Error interpreting tensor header",
+                        severity=IssueSeverity.DEBUG,
+                        location=self.current_file_path,
+                        details={
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                        },
+                    )
 
         except Exception as e:
-            result.add_issue(
-                f"Error validating tensor structure: {str(e)}",
+            result.add_check(
+                name="Tensor Structure Validation",
+                passed=False,
+                message=f"Error validating tensor structure: {e!s}",
                 severity=IssueSeverity.DEBUG,
                 location=self.current_file_path,
                 details={"exception": str(e)},

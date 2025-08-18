@@ -1,615 +1,338 @@
 # ModelAudit
 
-A security scanner for AI models. Quickly check your AIML models for potential security risks before deployment.
+**Secure your AI models before deployment.** Detects malicious code, backdoors, and security vulnerabilities in ML model files.
 
-<img width="989" alt="image" src="https://github.com/user-attachments/assets/9de32c99-b1c1-4a04-a913-e6031b30024a" />
+[![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
+[![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
+[![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
+[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
 
-## Table of Contents
+<img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
-- [What It Does](#-what-it-does)
-- [Quick Start](#-quick-start)
-- [Authentication](#-authentication)
-- [Features](#-features)
-- [Security Scanners](#️-security-scanners)
-- [Development](#️-development)
-- [Configuration](#-configuration)
-- [JSON Output Format](#-json-output-format)
-- [Contributing](#-contributing)
-- [License](#-license)
-
-## 🔍 What It Does
-
-ModelAudit scans ML model files for:
-
-- **Malicious code execution** (e.g., `os.system` calls in pickled models)
-- **Suspicious TensorFlow operations** (PyFunc, file I/O operations)
-- **Potentially unsafe Keras Lambda layers** with arbitrary code execution
-- **Dangerous pickle opcodes** (REDUCE, INST, OBJ, STACK_GLOBAL)
-- **Encoded payloads** and suspicious string patterns
-- **Risky configurations** in model architectures
-- **Suspicious patterns** in model manifests and configuration files
-- **Models with blacklisted names** or content patterns
-- **Malicious content in ZIP archives** including nested archives and zip bombs
+📖 **[Full Documentation](https://www.promptfoo.dev/docs/model-audit/)** | 🎯 **[Usage Examples](https://www.promptfoo.dev/docs/model-audit/usage/)** | 🔍 **[Supported Formats](https://www.promptfoo.dev/docs/model-audit/scanners/)**
 
 ## 🚀 Quick Start
 
-### Installation
-
-**Basic installation:**
+**Install and scan in 30 seconds:**
 
 ```bash
-pip install modelaudit
-```
-
-**With optional dependencies for specific model formats:**
-
-```bash
-# For TensorFlow SavedModel scanning
-pip install modelaudit[tensorflow]
-
-# For Keras H5 model scanning
-pip install modelaudit[h5]
-
-# For PyTorch model scanning
-pip install modelaudit[pytorch]
-
-# For YAML manifest scanning
-pip install modelaudit[yaml]
-
-# Install all optional dependencies
+# Install ModelAudit with all ML framework support
 pip install modelaudit[all]
-```
 
-**Development installation:**
-
-```bash
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
-
-# Using Poetry (recommended)
-poetry install --all-extras
-
-# Or using pip
-pip install -e .[all]
-```
-
-### Basic Usage
-
-**Using with Promptfoo (Recommended):**
-
-```bash
-# Scan models through promptfoo (automatic authentication)
-promptfoo scan-model model.pkl
-promptfoo scan-model model1.pkl model2.h5 model3.pt
-promptfoo scan-model ./models/
-```
-
-**Standalone Usage:**
-
-```bash
-# Scan a single model
-modelaudit scan model.pkl
-
-# Scan multiple models
-modelaudit scan model1.pkl model2.h5 model3.pt
+# Scan a model file
+modelaudit model.pkl
 
 # Scan a directory
-modelaudit scan ./models/
-```
+modelaudit ./models/
 
-**Advanced scanning options:**
-
-```bash
-# Export results to JSON
-modelaudit scan model.pkl --format json --output results.json
-
-# Set maximum file size to scan (1GB limit)
-modelaudit scan model.pkl --max-file-size 1073741824
-
-# Add custom blacklist patterns
-modelaudit scan model.pkl --blacklist "unsafe_model" --blacklist "malicious_net"
-
-# Set scan timeout (5 minutes)
-modelaudit scan large_model.pkl --timeout 300
-
-# Verbose output for debugging
-modelaudit scan model.pkl --verbose
+# Export results for CI/CD
+modelaudit model.pkl --format json --output results.json
 ```
 
 **Example output:**
 
 ```bash
-$ modelaudit scan suspicious_model.pkl
-
-────────────────────────────────────────────────────────────────────────────────
-ModelAudit Security Scanner
-Scanning for potential security issues in ML model files
-────────────────────────────────────────────────────────────────────────────────
-Paths to scan: suspicious_model.pkl
-────────────────────────────────────────────────────────────────────────────────
+$ modelaudit suspicious_model.pkl
 
 ✓ Scanning suspicious_model.pkl
+Files scanned: 1 | Issues found: 2 critical, 1 warning
 
-Active Scanner: pickle
-Scan completed in 0.02 seconds
-Files scanned: 1
-Scanned 156 bytes
-Issues found: 2 errors, 1 warnings
+1. suspicious_model.pkl (pos 28): [CRITICAL] Malicious code execution attempt
+   Why: Contains os.system() call that could run arbitrary commands
 
-1. suspicious_model.pkl (pos 28): [CRITICAL] Suspicious module reference found: posix.system
-2. suspicious_model.pkl (pos 52): [WARNING] Found REDUCE opcode - potential __reduce__ method execution
+2. suspicious_model.pkl (pos 52): [WARNING] Dangerous pickle deserialization
+   Why: Could execute code when the model loads
 
-────────────────────────────────────────────────────────────────────────────────
-✗ Scan completed with findings
+✗ Security issues found - DO NOT deploy this model
 ```
 
-### Exit Codes
+## 🛡️ What Problems It Solves
 
-ModelAudit uses different exit codes to indicate scan results:
+### **Prevents Code Execution Attacks**
 
-- **0**: Success - No security issues found
-- **1**: Security issues found (scan completed successfully)
-- **2**: Errors occurred during scanning (e.g., file not found, scan failures)
+Stops malicious models that run arbitrary commands when loaded (common in PyTorch .pt files)
 
-**CI/CD Integration:**
+### **Detects Model Backdoors**
+
+Identifies trojaned models with hidden functionality or suspicious weight patterns
+
+### **Ensures Supply Chain Security**
+
+Validates model integrity and prevents tampering in your ML pipeline
+
+### **Enforces License Compliance**
+
+Checks for license violations that could expose your company to legal risk
+
+### **Finds Embedded Secrets**
+
+Detects API keys, tokens, and other credentials hidden in model weights or metadata
+
+### **Flags Network Communication**
+
+Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2 channels
+
+### **Detects Hidden JIT/Script Execution**
+
+Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
+
+## 📊 Supported Model Formats
+
+ModelAudit scans **all major ML model formats** with specialized security analysis for each:
+
+| Format          | Extensions                            | Risk Level | Notes                                        |
+| --------------- | ------------------------------------- | ---------- | -------------------------------------------- |
+| **PyTorch**     | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Contains pickle serialization - always scan  |
+| **Pickle**      | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
+| **Joblib**      | `.joblib`                             | 🔴 HIGH    | Can contain pickled objects                  |
+| **SafeTensors** | `.safetensors`                        | 🟢 SAFE    | Preferred secure format                      |
+| **GGUF/GGML**   | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard, binary format                  |
+| **ONNX**        | `.onnx`                               | 🟢 SAFE    | Industry standard, good interoperability     |
+| **TensorFlow**  | `.pb`, SavedModel                     | 🟠 MEDIUM  | Scan for dangerous operations                |
+| **Keras**       | `.h5`, `.keras`, `.hdf5`              | 🟠 MEDIUM  | Check for executable layers                  |
+| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟡 LOW     | Validate transforms                          |
+
+Plus 10+ additional formats including ExecuTorch, TensorFlow Lite, Core ML, and more.
+
+[View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
+
+## 🎯 Common Use Cases
+
+### **Pre-Deployment Security Checks**
 
 ```bash
-# Stop deployment if security issues are found
-modelaudit scan model.pkl || exit 1
-
-# In GitHub Actions
-- name: Security scan models
-  run: |
-    poetry run modelaudit scan models/ --format json --output scan-results.json
-    if [ $? -eq 1 ]; then
-      echo "Security issues found in models!"
-      exit 1
-    fi
+modelaudit production_model.safetensors --format json --output security_report.json
 ```
 
-## 🔐 Authentication
+### **CI/CD Pipeline Integration**
 
-ModelAudit supports authentication that seamlessly integrates with promptfoo's authentication system, providing a unified authentication experience across both tools.
-
-### Overview
-
-The authentication system provides:
-- **Seamless Integration**: Automatic credential sharing from promptfoo when using the wrapper
-- **Standalone Use**: Direct authentication when using modelaudit independently
-- **Consistent UX**: Same auth commands and flow as promptfoo
-- **Secure Storage**: Platform-appropriate credential storage
-
-### Seamless Integration with Promptfoo (Recommended)
-
-If you're using modelaudit through promptfoo's `scan-model` command, authentication is automatic:
+ModelAudit automatically detects CI environments and adjusts output accordingly:
 
 ```bash
-# First, authenticate with promptfoo
-promptfoo auth login --api-key YOUR_API_KEY
+# Recommended: Use JSON format for machine-readable output
+modelaudit models/ --format json --output results.json
 
-# Then modelaudit automatically uses your credentials
-promptfoo scan-model /path/to/your/model
+# Text output automatically adapts to CI (no spinners, plain text)
+modelaudit models/ --timeout 300
+
+# Disable colors explicitly with NO_COLOR environment variable
+NO_COLOR=1 modelaudit models/
 ```
 
-When you run `promptfoo scan-model`, promptfoo automatically:
-1. Checks if you're authenticated with promptfoo
-2. Passes your credentials to modelaudit via environment variables
-3. Logs a message: "Using promptfoo authentication for modelaudit"
+**CI-Friendly Features:**
 
-### Standalone Authentication
+- 🚫 Spinners automatically disabled when output is piped or in CI
+- 🎨 Colors disabled when `NO_COLOR` environment variable is set
+- 📊 JSON output recommended for parsing in CI pipelines
+- 🔍 Exit codes: 0 (clean), 1 (issues found), 2 (errors)
 
-You can also authenticate modelaudit directly for standalone use:
+### **Third-Party Model Validation**
 
 ```bash
-# Login with your API key
-modelaudit auth login --api-key YOUR_API_KEY
-
-# Check current authentication status
-modelaudit auth whoami
-
-# Logout when done
-modelaudit auth logout
+# Scan models from HuggingFace, PyTorch Hub, MLflow, JFrog, or cloud storage
+modelaudit https://huggingface.co/gpt2
+modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
+modelaudit models:/MyModel/Production
+modelaudit model.dvc
+modelaudit s3://my-bucket/downloaded-model.pt
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
+    --jfrog-api-token YOUR_TOKEN
 ```
 
-### Getting Your API Key
-
-1. Sign up or log in at [promptfoo.app](https://promptfoo.app)
-2. Get your API key from [promptfoo.app/welcome](https://promptfoo.app/welcome)
-3. Use it with either promptfoo or modelaudit authentication
-
-### Authentication Commands
-
-#### `modelaudit auth login`
-
-Login to promptfoo services.
+### **Compliance & Audit Reporting**
 
 ```bash
-# Login with API key
-modelaudit auth login --api-key YOUR_API_KEY
-
-# Login with custom host
-modelaudit auth login --api-key YOUR_API_KEY --host https://your-api.example.com
-
-# Short form
-modelaudit auth login -k YOUR_API_KEY -h https://your-api.example.com
+modelaudit model_package.zip --sbom compliance_report.json --strict-license --verbose
 ```
 
-**Options:**
-- `--api-key, -k`: Your promptfoo API key
-- `--host, -h`: Custom API host URL (optional)
+[View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
-#### `modelaudit auth logout`
+### ⚙️ Advanced CLI Options
 
-Logout and clear stored credentials.
+ModelAudit provides additional flags for specialized workflows:
+
+- `--strict-license` – fail when incompatible or deprecated licenses are detected
+- `--max-file-size BYTES` / `--max-total-size BYTES` – limit scanning of very large files
+- `--max-download-size SIZE` – cap remote downloads (e.g., `500MB`, `2GB`)
+- `--preview` – show size and metadata before downloading remote models
+- `--cache/--no-cache` and `--cache-dir PATH` – control caching of cloud downloads
+- `--no-skip-files` and `--selective/--all-files` – control which files are scanned in directories
+- `--registry-uri URI` – scan models in an MLflow registry
+- `--jfrog-api-token` / `--jfrog-access-token` – authenticate with JFrog Artifactory
+
+### Static Scanning vs. Promptfoo Redteaming
+
+ModelAudit performs **static** analysis only. It examines model files for risky patterns
+without ever loading or executing them. Promptfoo's redteaming module is
+**dynamic**—it loads the model (locally or via API) and sends crafted prompts to
+probe runtime behavior. Use ModelAudit first to verify the model file itself,
+then run redteaming if you need to test how the model responds when invoked.
+
+## ⚙️ Installation Options
+
+**Basic installation (recommended for most users):**
+
+### Quick Install Decision Guide
+
+**🚀 Just want everything to work?**
 
 ```bash
-modelaudit auth logout
+pip install modelaudit[all]
 ```
 
-#### `modelaudit auth whoami`
-
-Show current user information.
+**💡 Know what formats you need?**
 
 ```bash
-modelaudit auth whoami
-```
-
-Displays:
-- User email
-- Organization name  
-- App URL
-
-### How It Works
-
-#### Configuration Storage
-
-ModelAudit stores configuration in platform-appropriate directories:
-- **Linux/macOS**: `~/.config/modelaudit/config.json`
-- **Windows**: `%APPDATA%/modelaudit/config.json`
-
-#### Credential Priority
-
-ModelAudit checks for credentials in this order:
-
-1. **Environment Variables** (highest priority, used by promptfoo wrapper):
-   - `MODELAUDIT_API_KEY`
-   - `MODELAUDIT_API_HOST`
-   - `MODELAUDIT_USER_EMAIL`
-   - `MODELAUDIT_APP_URL`
-
-2. **Config File** (used for standalone authentication):
-   - Stored in user config directory
-
-#### API Compatibility
-
-ModelAudit uses the same API endpoints as promptfoo:
-- **Default API Host**: `https://api.promptfoo.app`
-- **Endpoint**: `/api/v1/users/me`
-- **Authentication**: Bearer token
-
-### Best Practices
-
-#### For Teams Using Promptfoo
-- Set up authentication once with promptfoo: `promptfoo auth login --api-key <key>`
-- Use `promptfoo scan-model` for seamless integration
-- Team members can share the same authentication workflow
-
-#### For CI/CD Pipelines
-```bash
-# Set environment variables in your CI system
-export MODELAUDIT_API_KEY="${PROMPTFOO_API_KEY}"
-export MODELAUDIT_API_HOST="https://api.promptfoo.app"
-
-# Then run scans without explicit login
-modelaudit scan /path/to/models/
-```
-
-#### For Standalone Development
-```bash
-# Login once per development environment
-modelaudit auth login --api-key YOUR_KEY
-
-# Verify authentication
-modelaudit auth whoami
-
-# Run scans
-modelaudit scan test_model.pkl
-```
-
-### Troubleshooting
-
-#### Common Authentication Errors
-
-**"Not authenticated":**
-```bash
-# Solution: Login first
-modelaudit auth login --api-key YOUR_API_KEY
-```
-
-**"Authentication failed: Unauthorized":**
-```bash
-# Solution: Check your API key is valid
-# Get a new one from https://promptfoo.app/welcome
-```
-
-**"Failed to get user info":**
-```bash
-# Solution: Check network connection and API host
-modelaudit auth login --api-key YOUR_API_KEY --host https://api.promptfoo.app
-```
-
-#### Common Issues
-
-**Authentication commands not showing up in CLI:**
-This may occur due to Python package caching issues. Try:
-```bash
-pip uninstall modelaudit -y
+# Basic installation (pickle, joblib, numpy, zip/tar archives)
 pip install modelaudit
+
+# Add only what you need
+pip install modelaudit[tensorflow]  # TensorFlow SavedModel (.pb)
+pip install modelaudit[pytorch]     # PyTorch models (.pt, .pth)
+pip install modelaudit[h5]          # Keras/H5 models (.h5, .keras)
+pip install modelaudit[onnx]        # ONNX models (.onnx)
+pip install modelaudit[safetensors] # SafeTensors (.safetensors)
+
+# Multiple formats
+pip install modelaudit[tensorflow,pytorch,h5]
 ```
 
-**"Command 'auth' not found":**
-Ensure you have the latest version of modelaudit installed:
-```bash
-pip install --upgrade modelaudit
-```
-
-**Environment variables not being read:**
-Make sure environment variable names are exactly:
-- `MODELAUDIT_API_KEY` (not `MODELAUDIT_API_TOKEN`)
-- `MODELAUDIT_API_HOST`
-- `MODELAUDIT_USER_EMAIL`
-- `MODELAUDIT_APP_URL`
-
-**API validation failures:**
-- Check your API key is valid at [promptfoo.app/welcome](https://promptfoo.app/welcome)
-- Verify network connectivity to `https://api.promptfoo.app`
-- Try with verbose logging for more details
-
-### Security
-
-- API keys are stored locally in user config directories
-- No credentials are transmitted except to the configured API host
-- Environment variables take precedence (for promptfoo integration)
-- Logout completely removes stored credentials
-
-### Migration
-
-If you have existing promptfoo authentication, no migration is needed. ModelAudit will automatically use your promptfoo credentials when called via the wrapper.
-
-For standalone use, simply run:
-```bash
-modelaudit auth login --api-key YOUR_EXISTING_KEY
-```
-
-## ✨ Features
-
-### Core Capabilities
-
-- **Multiple Format Support**: PyTorch (.pt, .pth), TensorFlow (SavedModel), Keras (.h5, .keras), SafeTensors (.safetensors), Pickle (.pkl), ZIP archives (.zip)
-- **Automatic Format Detection**: Identifies model formats automatically
-- **Deep Security Analysis**: Examines model internals, not just metadata
-- **Recursive Archive Scanning**: Scans contents of ZIP files and nested archives
-- **Batch Processing**: Scan multiple files and directories efficiently
-- **Configurable Scanning**: Set timeouts, file size limits, custom blacklists
-
-### Reporting & Integration
-
-- **Detailed Reporting**: Scan duration, files processed, bytes scanned, issue severity
-- **Multiple Output Formats**: Human-readable text and machine-readable JSON
-- **Severity Levels**: ERROR, WARNING, INFO, DEBUG for flexible filtering
-- **CI/CD Ready**: Clear exit codes for automated pipeline integration
-- **Promptfoo Integration**: Seamless authentication and usage through `promptfoo scan-model`
-
-### Security Detection
-
-- **Code Execution**: Detects embedded Python code, eval/exec calls, system commands
-- **Pickle Security**: Analyzes dangerous opcodes, suspicious imports, encoded payloads
-- **Model Integrity**: Checks for unexpected files, suspicious configurations
-- **Archive Security**: Directory traversal attacks, zip bombs, malicious nested files
-- **Pattern Matching**: Custom blacklist patterns for organizational policies
-
-## 🛡️ Security Scanners
-
-### Pickle Scanner
-
-**Detects malicious code in Python pickle files:**
-
-- Dangerous opcodes: `REDUCE`, `INST`, `OBJ`, `STACK_GLOBAL`
-- Suspicious imports: `os`, `subprocess`, `eval`, `exec`
-- Encoded payloads and obfuscated code
-- `__reduce__` method exploits
-
-### TensorFlow Scanner
-
-**Analyzes TensorFlow SavedModel for suspicious operations:**
-
-- File I/O operations: `ReadFile`, `WriteFile`
-- Python execution: `PyFunc`, `PyCall`
-- System operations: `ShellExecute`, `SystemConfig`
-- Checks SavedModel directory structure
-
-### Keras Scanner
-
-**Examines Keras H5 models for security risks:**
-
-- Dangerous layer types: `Lambda`, `TFOpLambda`
-- Suspicious configurations containing code execution
-- Custom objects and metrics with arbitrary code
-- Model architecture analysis
-
-### PyTorch Scanner
-
-**Scans PyTorch models (ZIP-based format):**
-
-- Embedded pickle file analysis
-- Missing standard files (data.pkl warnings)
-- Suspicious additional files (Python scripts, executables)
-- Custom blacklist pattern matching
-
-### SafeTensors Scanner
-
-**Validates SafeTensors model files for integrity:**
-
-- Parses header metadata and verifies tensor offsets
-- Checks dtype and shape sizes against byte ranges
-- Flags suspicious or malformed metadata entries
-
-### Manifest Scanner
-
-**Analyzes configuration and manifest files:**
-
-- Suspicious keys: network access, file paths, execution commands
-- Credential exposure: passwords, API keys, secrets
-- Blacklisted model names and patterns
-- Supports JSON, YAML, XML, TOML formats
-
-### ZIP Scanner
-
-**Scans ZIP archives and their contents:**
-
-- **Recursive scanning**: Analyzes files within ZIP archives using appropriate scanners
-- **Security checks**: Detects directory traversal attempts, zip bombs, suspicious compression ratios
-- **Nested archive support**: Scans ZIP files within ZIP files up to configurable depth
-- **Content analysis**: Each file in the archive is scanned with its appropriate scanner
-- **Resource limits**: Configurable max depth, max entries, and max file size protections
-
-### Weight Distribution Scanner
-
-**Detects anomalous weight patterns that may indicate trojaned models:**
-
-- **Outlier detection**: Uses Z-score analysis to find neurons with abnormal weight magnitudes
-- **Dissimilarity analysis**: Identifies weight vectors that are significantly different from others using cosine similarity
-- **Extreme value detection**: Flags neurons with unusually large weight values
-- **Multi-format support**: Works with PyTorch, Keras/TensorFlow H5, ONNX, and SafeTensors models
-- **Focus on classification models**: Designed for models with <10k output classes
-
-**Note**: This scanner is disabled by default for LLMs (models with >10k vocabulary size) as the detection methods are not effective for large language models. To enable experimental LLM scanning, use `--config '{"enable_llm_checks": true}'`.
-
-## 🛠️ Development
-
-### Setup
+**☁️ Need cloud storage support?**
 
 ```bash
-# Clone repository
-git clone https://github.com/promptfoo/modelaudit.git
-cd modelaudit
-
-# Install with Poetry (recommended)
-poetry install --all-extras
-
-# Or with pip
-pip install -e .[all]
+pip install modelaudit[cloud]  # S3, GCS, and Azure support
 ```
 
-### Testing with Development Version
-
-**Install and test your local development version:**
+**⚠️ Having NumPy compatibility issues?**
 
 ```bash
-# Option 1: Install in development mode with pip
-pip install -e .[all]
+# Some ML frameworks require NumPy < 2.0
+pip install modelaudit[numpy1]
 
-# Then test the CLI directly
-modelaudit scan test_model.pkl
-
-# Option 2: Use Poetry (recommended)
-poetry install --all-extras
-
-# Test with Poetry run (no shell activation needed)
-poetry run modelaudit scan test_model.pkl
-
-# Test with Python import
-poetry run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+# Check what's working
+modelaudit doctor --show-failed
 ```
 
-**Create test models for development:**
+**Docker installation:**
 
 ```bash
-# Create a simple test pickle file
-python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
-
-# Test scanning it
-modelaudit scan test_model.pkl
+docker pull ghcr.io/promptfoo/modelaudit:latest
+docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
-### Running Tests
+### 📦 Dependency Reference
+
+<details>
+<summary><b>View all available extras and what they include</b></summary>
+
+**Core ML Frameworks:**
+
+| Extra           | Includes    | Use When                                |
+| --------------- | ----------- | --------------------------------------- |
+| `[h5]`          | h5py        | Scanning `.h5`, `.keras`, `.hdf5` files |
+| `[onnx]`        | onnx        | Scanning `.onnx` model files            |
+| `[pytorch]`     | torch       | Scanning `.pt`, `.pth`, `.ckpt` files   |
+| `[safetensors]` | safetensors | Scanning `.safetensors` files           |
+| `[tensorflow]`  | tensorflow  | Scanning `.pb` SavedModel files         |
+
+**Specialized Tools:**
+
+| Extra        | Includes    | Use When                                 |
+| ------------ | ----------- | ---------------------------------------- |
+| `[coreml]`   | coremltools | Scanning `.mlmodel` Core ML files        |
+| `[flax]`     | msgpack     | Scanning `.msgpack`, `.flax` JAX files   |
+| `[tensorrt]` | tensorrt    | Scanning TensorRT engine files           |
+| `[tflite]`   | tflite      | Scanning `.tflite` TensorFlow Lite files |
+| `[yaml]`     | pyyaml      | Scanning YAML configuration files        |
+
+**Data & Storage:**
+
+| Extra      | Includes             | Use When                               |
+| ---------- | -------------------- | -------------------------------------- |
+| `[cloud]`  | fsspec, s3fs, gcsfs  | Scanning from S3, GCS, Azure storage   |
+| `[dill]`   | dill                 | Scanning `.dill` serialized files      |
+| `[joblib]` | joblib, scikit-learn | Scanning `.joblib` scikit-learn models |
+
+**Integration:**
+
+| Extra           | Includes                   | Use When                              |
+| --------------- | -------------------------- | ------------------------------------- |
+| `[huggingface]` | huggingface-hub (optional) | Explicit HuggingFace model downloads¹ |
+| `[mlflow]`      | mlflow                     | Scanning MLflow model registry        |
+
+**Meta-packages:**
+
+| Extra      | Includes                     | Use When                                |
+| ---------- | ---------------------------- | --------------------------------------- |
+| `[all-ci]` | All frameworks (no platform) | CI/CD environments                      |
+| `[all]`    | All frameworks + tools       | Maximum compatibility                   |
+| `[numpy1]` | All frameworks + NumPy<2.0   | Resolving NumPy compatibility conflicts |
+
+¹ _Note: `huggingface-hub` is included in base installation; this extra is optional for explicit dependency management._
+
+</details>
+
+## 📋 Output Formats
+
+**Human-readable output (default):**
 
 ```bash
-# Run all tests
-poetry run pytest
+$ modelaudit model.pkl
 
-# Run with coverage
-poetry run pytest --cov=modelaudit
+✓ Scanning model.pkl
+Files scanned: 1 | Issues found: 1 critical
 
-# Run specific test categories
-poetry run pytest tests/test_pickle_scanner.py -v
-poetry run pytest tests/test_integration.py -v
-
-# Run tests with all optional dependencies
-poetry install --all-extras
-poetry run pytest
+1. model.pkl (pos 28): [CRITICAL] Malicious code execution attempt
+   Why: Contains os.system() call that could run arbitrary commands
 ```
 
-### Development Workflow
+**JSON output for automation:**
+
+```json
+{
+  "files_scanned": 1,
+  "issues": [
+    {
+      "message": "Malicious code execution attempt",
+      "severity": "critical",
+      "location": "model.pkl (pos 28)"
+    }
+  ]
+}
+```
+
+## 🔧 Getting Help
+
+- **Documentation**: [promptfoo.dev/docs/model-audit/](https://www.promptfoo.dev/docs/model-audit/)
+- **Troubleshooting**: [promptfoo.dev/docs/model-audit/troubleshooting/](https://www.promptfoo.dev/docs/model-audit/troubleshooting/)
+- **Issues**: [github.com/promptfoo/modelaudit/issues](https://github.com/promptfoo/modelaudit/issues)
+
+### 🔍 Troubleshooting Common Issues
+
+**Scanner not working?**
 
 ```bash
-# Run linting and formatting with Ruff
-poetry run ruff check .          # Check entire codebase (including tests)
-poetry run ruff check --fix .    # Automatically fix lint issues
-poetry run ruff format .         # Format code
-
-# Type checking
-poetry run mypy modelaudit/
-
-# Build package
-poetry build
-
-# Publish (maintainers only)
-poetry publish
+# Check which scanners are available
+modelaudit doctor --show-failed
 ```
 
-**Code Quality Tools:**
-
-This project uses modern Python tooling for maintaining code quality:
-
-- **[Ruff](https://docs.astral.sh/ruff/)**: Ultra-fast Python linter and formatter (replaces Black, isort, flake8)
-- **[MyPy](https://mypy.readthedocs.io/)**: Static type checker
-
-### Contributing
+**NumPy compatibility errors?**
 
 ```bash
-# Create feature branch
-git checkout -b feature/your-feature-name
+# Option 1: Use the numpy1 compatibility mode
+pip install modelaudit[numpy1]
 
-# Make your changes...
-git add .
-git commit -m "feat: description"
-git push origin feature/your-feature-name
+# Option 2: Manually downgrade NumPy
+pip install "numpy<2.0" --force-reinstall
+pip install --force-reinstall tensorflow torch h5py  # Reinstall ML frameworks
 ```
 
-**Pull Request Guidelines:**
+**Missing scanner for your format?**
 
-- Create PR against `main` branch
-- Follow Conventional Commits format (`feat:`, `fix:`, `docs:`, etc.)
-- All PRs are squash-merged with a conventional commit message
-- Keep changes small and focused
-
-### Project Structure
-
-```
-modelaudit/
-├── modelaudit/
-│   ├── scanners/          # Model format scanners
-│   │   ├── pickle_scanner.py      # Pickle/joblib security scanner
-│   │   ├── tf_savedmodel_scanner.py  # TensorFlow SavedModel scanner
-│   │   ├── keras_h5_scanner.py    # Keras H5 model scanner
-│   │   ├── pytorch_zip_scanner.py # PyTorch ZIP format scanner
-│   │   └── manifest_scanner.py    # Config/manifest scanner
-│   ├── utils/             # Utility modules
-│   ├── cli.py            # Command-line interface
-│   └── core.py           # Core scanning logic
-├── tests/                # Test suite
-└── docs/                 # Documentation
+```bash
+# ModelAudit will tell you exactly what to install
+modelaudit your-model.onnx
+# Output: "onnx not installed, cannot scan ONNX files. Install with 'pip install modelaudit[onnx]'"
 ```
 
 ## 📝 License

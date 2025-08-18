@@ -1,6 +1,7 @@
 import os
+from typing import ClassVar
 
-from modelaudit.scanners.base import BaseScanner, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
 
 class MockScanner(BaseScanner):
@@ -8,7 +9,7 @@ class MockScanner(BaseScanner):
 
     name = "test_scanner"
     description = "Test scanner for unit tests"
-    supported_extensions = [".test", ".tst"]
+    supported_extensions: ClassVar[list[str]] = [".test", ".tst"]
 
     def scan(self, path: str) -> ScanResult:
         result = self._create_result()
@@ -76,8 +77,12 @@ def test_base_scanner_check_path_nonexistent():
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not exist" in result.issues[0].message.lower()
+
+    check_names = {check.name: check for check in result.checks}
+    assert "Path Exists" in check_names
+    assert check_names["Path Exists"].status == CheckStatus.FAILED
 
 
 def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
@@ -99,8 +104,12 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     assert isinstance(result, ScanResult)
     assert result.success is False
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.ERROR
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
     assert "not readable" in result.issues[0].message.lower()
+
+    check_map = {check.name: check for check in result.checks}
+    assert check_map["Path Exists"].status == CheckStatus.PASSED
+    assert check_map["Path Readable"].status == CheckStatus.FAILED
 
 
 def test_base_scanner_check_path_directory(tmp_path):
@@ -121,7 +130,7 @@ def test_base_scanner_check_path_directory(tmp_path):
         assert isinstance(result, ScanResult)
         assert result.success is False
         assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.ERROR
+        assert result.issues[0].severity == IssueSeverity.CRITICAL
         assert "directory" in result.issues[0].message.lower()
 
 
@@ -137,6 +146,10 @@ def test_base_scanner_check_path_valid(tmp_path):
     # Should return None for valid files
     assert result is None
 
+    merged = scanner._create_result()
+    check_names = {check.name for check in merged.checks}
+    assert {"Path Exists", "Path Readable", "File Type Validation"}.issubset(check_names)
+
 
 def test_base_scanner_get_file_size(tmp_path):
     """Test the get_file_size method."""
@@ -149,6 +162,23 @@ def test_base_scanner_get_file_size(tmp_path):
     size = scanner.get_file_size(str(test_file))
 
     assert size == len(content)
+
+
+def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
+    """get_file_size should handle OS errors gracefully."""
+
+    test_file = tmp_path / "test.test"
+    test_file.write_bytes(b"data")
+
+    def mock_getsize(_path):  # pragma: no cover - error simulation
+        raise OSError("bad file")
+
+    monkeypatch.setattr(os.path, "getsize", mock_getsize)
+
+    scanner = MockScanner()
+    size = scanner.get_file_size(str(test_file))
+
+    assert size == 0
 
 
 def test_scanner_implementation(tmp_path):
@@ -198,3 +228,112 @@ def test_issue_class():
     assert "[WARNING]" in issue_str
     assert "test.pkl" in issue_str
     assert "Test issue" in issue_str
+
+
+def test_base_scanner_file_type_validation(tmp_path):
+    """Test that BaseScanner performs file type validation in _check_path."""
+    scanner = MockScanner()
+
+    # Create a file with mismatched extension and magic bytes
+    invalid_h5 = tmp_path / "fake.h5"
+    invalid_h5.write_bytes(b"not real hdf5 data")
+
+    result = scanner._check_path(str(invalid_h5))
+
+    # Should return None (warnings don't stop the scan)
+    assert result is None
+
+    # But scan should include the validation warnings
+    scan_result = scanner.scan(str(invalid_h5))
+    assert scan_result is not None
+
+    # Check that we have a file type validation warning in the scan result
+    validation_issues = [
+        issue for issue in scan_result.issues if "file type validation failed" in issue.message.lower()
+    ]
+    assert len(validation_issues) > 0
+
+    # Should be WARNING level (not CRITICAL) to allow scan to continue
+    assert validation_issues[0].severity == IssueSeverity.WARNING
+
+    # Should contain details about the mismatch
+    assert "header_format" in validation_issues[0].details
+    assert "extension_format" in validation_issues[0].details
+
+
+def test_base_scanner_valid_file_type(tmp_path):
+    """Test that BaseScanner doesn't warn for valid file types."""
+    import zipfile
+
+    scanner = MockScanner()
+
+    # Create a valid ZIP file with .zip extension
+    zip_file = tmp_path / "archive.zip"
+    with zipfile.ZipFile(zip_file, "w") as zipf:
+        zipf.writestr("test.txt", "data")
+
+    result = scanner._check_path(str(zip_file))
+
+    # Should return None (path is valid) without validation warnings
+    assert result is None
+
+    # Scan should work without file type validation issues
+    scan_result = scanner.scan(str(zip_file))
+    assert scan_result is not None
+
+
+def test_base_scanner_small_file_handling(tmp_path):
+    """Test that BaseScanner handles small files properly in validation."""
+    scanner = MockScanner()
+
+    # Create a very small file (< 4 bytes)
+    small_file = tmp_path / "tiny.h5"
+    small_file.write_bytes(b"hi")
+
+    result = scanner._check_path(str(small_file))
+
+    # Should return None (path is valid) - small files can't be validated
+    assert result is None
+
+
+def test_base_scanner_read_file_safely(tmp_path):
+    """_read_file_safely should return bytes with chunking."""
+    scanner = MockScanner(config={"chunk_size": 4})
+
+    file_path = tmp_path / "data.test"
+    content = b"0123456789"
+    file_path.write_bytes(content)
+
+    data = scanner._read_file_safely(str(file_path))
+
+    assert isinstance(data, bytes)
+    assert data == content
+
+
+def test_base_scanner_size_limit_pass(tmp_path):
+    """_check_size_limit should record a passing check when within limits."""
+    scanner = MockScanner(config={"max_file_read_size": 100})
+    file_path = tmp_path / "small.test"
+    content = b"small"
+    file_path.write_bytes(content)
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert result is None
+    merged = scanner._create_result()
+    checks = {check.name: check for check in merged.checks}
+    assert checks["File Size Limit"].status == CheckStatus.PASSED
+
+
+def test_base_scanner_size_limit_fail(tmp_path):
+    """_check_size_limit should return a result when file is too large."""
+    scanner = MockScanner(config={"max_file_read_size": 5})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.success is False
