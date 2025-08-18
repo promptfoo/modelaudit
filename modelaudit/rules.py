@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from re import Pattern
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 
 class Severity(str, Enum):
@@ -27,7 +27,7 @@ class Rule:
     name: str
     default_severity: Severity
     description: str
-    message_patterns: List[Pattern[str]]
+    message_patterns: list[Pattern[str]]
 
     def matches_message(self, message: str) -> bool:
         """Check if this rule matches a given message."""
@@ -37,7 +37,7 @@ class Rule:
 class RuleRegistry:
     """Central registry for all security rules."""
 
-    _rules: Dict[str, Rule] = {}
+    _rules: dict[str, Rule] = {}
     _initialized = False
 
     @classmethod
@@ -882,7 +882,7 @@ class RuleRegistry:
         cls._initialized = True
 
     @classmethod
-    def _add_rule(cls, code: str, name: str, severity: Severity, description: str, patterns: List[str]):
+    def _add_rule(cls, code: str, name: str, severity: Severity, description: str, patterns: list[str]):
         """Add a rule to the registry."""
         compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
         cls._rules[code] = Rule(code, name, severity, description, compiled_patterns)
@@ -894,7 +894,7 @@ class RuleRegistry:
         return cls._rules.get(code)
 
     @classmethod
-    def find_matching_rule(cls, message: str) -> Optional[Tuple[str, Rule]]:
+    def find_matching_rule(cls, message: str) -> Optional[tuple[str, Rule]]:
         """Find the first rule that matches a message."""
         cls.initialize()
         for code, rule in cls._rules.items():
@@ -903,13 +903,13 @@ class RuleRegistry:
         return None
 
     @classmethod
-    def get_all_rules(cls) -> Dict[str, Rule]:
+    def get_all_rules(cls) -> dict[str, Rule]:
         """Get all registered rules."""
         cls.initialize()
         return cls._rules.copy()
 
     @classmethod
-    def get_rules_by_range(cls, start: int, end: int) -> Dict[str, Rule]:
+    def get_rules_by_range(cls, start: int, end: int) -> dict[str, Rule]:
         """Get rules in a numeric range (e.g., S100-S199)."""
         cls.initialize()
         result = {}
