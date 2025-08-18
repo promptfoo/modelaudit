@@ -15,8 +15,8 @@ from ..interrupt_handler import check_interrupted
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
-ProgressTracker = None  # type: ignore
-ProgressPhase = None  # type: ignore
+ProgressTracker = None
+ProgressPhase = None
 
 # Try to import progress tracking, handle circular import gracefully
 try:
@@ -883,7 +883,7 @@ class BaseScanner(ABC):
 
     def _setup_progress_for_file(self, path: str) -> None:
         """Setup progress tracking for a specific file."""
-        if self.progress_tracker and ProgressPhase:  # type: ignore
+        if self.progress_tracker and ProgressPhase:
             file_size = self.get_file_size(path)
             self.progress_tracker.stats.total_bytes = file_size
             self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
@@ -911,12 +911,12 @@ class BaseScanner(ABC):
 
     def _set_progress_phase(self, phase: Any, message: str = "") -> None:
         """Set current progress phase."""
-        if self.progress_tracker and ProgressPhase:  # type: ignore
+        if self.progress_tracker and ProgressPhase:
             self.progress_tracker.set_phase(phase, message)
 
     def _next_progress_phase(self, message: str = "") -> bool:
         """Move to next progress phase."""
-        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):  # type: ignore
+        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):
             return self.progress_tracker.next_phase(message)
         return False
 
