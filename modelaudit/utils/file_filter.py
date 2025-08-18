@@ -79,7 +79,6 @@ DEFAULT_SKIP_EXTENSIONS = {
 
 # Default filenames to skip
 DEFAULT_SKIP_FILENAMES = {
-    "LICENSE",
     "README",
     "CHANGELOG",
     "AUTHORS",
