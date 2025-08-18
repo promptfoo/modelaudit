@@ -105,7 +105,7 @@ class CoreMLScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"layer": layer.name, "class_name": class_name},
-                        rule_code="S902",
+                        rule_code="S104",  # Dynamic code execution
                     )
                     custom_layers_found = True
 
