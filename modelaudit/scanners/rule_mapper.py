@@ -149,6 +149,10 @@ def get_encoding_rule_code(encoding_type: str) -> Optional[str]:
         return "S606"
     elif "xor" in enc_lower:
         return "S607"
+    elif "url" in enc_lower or "percent" in enc_lower:
+        return "S609"
+    elif "custom" in enc_lower or "unknown" in enc_lower:
+        return "S610"
 
     return None
 
@@ -189,6 +193,8 @@ def get_file_issue_rule_code(issue_type: str) -> Optional[str]:
         return "S405"
     elif "symlink" in issue_lower:
         return "S406"
+    elif "system" in issue_lower and "file" in issue_lower:
+        return "S408"
     elif "archive" in issue_lower and "bomb" in issue_lower:
         return "S410"
     elif "mismatch" in issue_lower and ("type" in issue_lower or "extension" in issue_lower):
@@ -199,6 +205,8 @@ def get_file_issue_rule_code(issue_type: str) -> Optional[str]:
         return "S903"
     elif "size" in issue_lower and ("large" in issue_lower or "excessive" in issue_lower):
         return "S904"
+    elif "suspicious" in issue_lower and ("pattern" in issue_lower or "config" in issue_lower):
+        return "S905"
     elif "polyglot" in issue_lower:
         return "S908"
 
@@ -262,5 +270,7 @@ def get_generic_rule_code(message: str) -> Optional[str]:
         or ("opcode" in msg_lower and "count" in msg_lower)
     ):
         return None  # Internal check, no rule
+    elif "unknown" in msg_lower and ("opcode" in msg_lower or "operation" in msg_lower):
+        return "S999"  # Unknown opcode/operation
 
     return None
