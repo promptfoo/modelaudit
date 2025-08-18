@@ -3,6 +3,7 @@
 import io
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import click
 
@@ -14,8 +15,10 @@ def can_stream_analyze(url: str, scanner: BaseScanner) -> bool:
     """Check if a file can be analyzed via streaming."""
     # Currently support streaming for pickle files
     # Can be extended to other formats that support partial reads
-    path = Path(url)
-    return path.suffix.lower() in {".pkl", ".pickle", ".joblib"}
+    parsed = urlparse(url)
+    path = Path(parsed.path)
+    suffix = path.suffix.lower()
+    return suffix in {".pkl", ".pickle", ".joblib"}
 
 
 def stream_analyze_file(
