@@ -91,11 +91,7 @@ def stream_analyze_file(
                     method = getattr(scanner, method_name)
                     try:
                         temp_file.seek(0)
-                        scan_result = (
-                            method(temp_file, bytes_to_read)
-                            if needs_size
-                            else method(temp_file)
-                        )
+                        scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
                         break
                     except Exception:
                         scan_result = None
