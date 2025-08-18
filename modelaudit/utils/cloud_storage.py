@@ -332,7 +332,7 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ".bin",
         ".ckpt",
         ".pdmodel",
-        ".pdparams",
+        ".pdiparams",
         ".pdopt",
         ".ot",
         ".ort",
