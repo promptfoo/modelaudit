@@ -4,6 +4,7 @@ import pytest
 
 from modelaudit.utils.cloud_storage import (
     download_from_cloud,
+    filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
 )
@@ -153,3 +154,8 @@ class TestDiskSpaceCheckingForCloud:
         # Result should be a path containing the filename
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
+
+
+def test_filter_scannable_files_recognizes_pdiparams():
+    files = [{"path": "model.pdiparams"}]
+    assert filter_scannable_files(files) == files
