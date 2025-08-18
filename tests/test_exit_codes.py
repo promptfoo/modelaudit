@@ -1,6 +1,8 @@
 """Tests specifically for exit code logic."""
 
-from modelaudit.core import determine_exit_code
+from unittest.mock import patch
+
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
 
 def test_exit_code_clean_scan():
@@ -192,3 +194,17 @@ def test_exit_code_files_scanned_with_issues():
         "files_scanned": 5,
     }
     assert determine_exit_code(results) == 1
+
+
+def test_exit_code_file_scan_failure(tmp_path):
+    """Return exit code 2 when an exception occurs during file scan."""
+    test_file = tmp_path / "bad.pkl"
+    test_file.write_text("data")
+
+    with patch("modelaudit.core.scan_file", side_effect=RuntimeError("boom")):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results["has_errors"] is True
+    assert results["success"] is False
+    assert any(issue.get("severity") == "critical" for issue in results["issues"])
+    assert determine_exit_code(results) == 2
