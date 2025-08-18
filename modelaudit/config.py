@@ -5,12 +5,14 @@ Simple TOML-based configuration for suppressing rules and adjusting severity.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Optional
 
 try:
     import tomllib
 except ImportError:
     import tomli as tomllib  # Python < 3.11
+
+import contextlib
 
 from .rules import Severity
 
@@ -20,16 +22,16 @@ class ModelAuditConfig:
     """Configuration for ModelAudit scanning."""
 
     # Rules to suppress (won't be reported)
-    suppress: Set[str] = field(default_factory=set)
+    suppress: set[str] = field(default_factory=set)
 
     # Severity overrides for specific rules
-    severity: Dict[str, Severity] = field(default_factory=dict)
+    severity: dict[str, Severity] = field(default_factory=dict)
 
     # Per-file ignore patterns (gitignore-style patterns -> rules to ignore)
-    ignore: Dict[str, List[str]] = field(default_factory=dict)
+    ignore: dict[str, list[str]] = field(default_factory=dict)
 
     # Scanner options
-    options: Dict[str, any] = field(default_factory=dict)
+    options: dict[str, any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "ModelAuditConfig":
@@ -129,9 +131,8 @@ class ModelAuditConfig:
         # Check file-specific suppression
         if file_path and self.ignore:
             for pattern, rules in self.ignore.items():
-                if self._matches_pattern(file_path, pattern):
-                    if rule_code in rules or "ALL" in rules:
-                        return True
+                if self._matches_pattern(file_path, pattern) and (rule_code in rules or "ALL" in rules):
+                    return True
 
         return False
 
@@ -162,7 +163,7 @@ class ModelAuditConfig:
 
     @classmethod
     def from_cli_args(
-        cls, suppress: Optional[List[str]] = None, severity: Optional[Dict[str, str]] = None
+        cls, suppress: Optional[list[str]] = None, severity: Optional[dict[str, str]] = None
     ) -> "ModelAuditConfig":
         """
         Create config from CLI arguments.
@@ -182,10 +183,8 @@ class ModelAuditConfig:
 
         if severity:
             for rule_code, severity_str in severity.items():
-                try:
+                with contextlib.suppress(ValueError, AttributeError):
                     config.severity[rule_code] = Severity(severity_str.upper())
-                except (ValueError, AttributeError):
-                    pass
 
         return config
 

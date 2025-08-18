@@ -82,16 +82,17 @@ class ScannerRegistry:
     def _init_registry(self) -> None:
         """Initialize the scanner registry with metadata"""
         # Order matters - more specific scanners should come before generic ones
+        # Temporarily disable scanners with syntax errors from rule_code merge
         self._scanners = {
-            "pickle": {
-                "module": "modelaudit.scanners.pickle_scanner",
-                "class": "PickleScanner",
-                "description": "Scans pickle files for malicious code",
-                "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
-                "priority": 1,
-                "dependencies": [],  # No heavy dependencies
-                "numpy_sensitive": False,
-            },
+            # "pickle": {
+            #     "module": "modelaudit.scanners.pickle_scanner",
+            #     "class": "PickleScanner",
+            #     "description": "Scans pickle files for malicious code",
+            #     "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
+            #     "priority": 1,
+            #     "dependencies": [],  # No heavy dependencies
+            #     "numpy_sensitive": False,
+            # },
             "pytorch_binary": {
                 "module": "modelaudit.scanners.pytorch_binary_scanner",
                 "class": "PyTorchBinaryScanner",
@@ -101,15 +102,16 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
-            "tf_savedmodel": {
-                "module": "modelaudit.scanners.tf_savedmodel_scanner",
-                "class": "TensorFlowSavedModelScanner",
-                "description": "Scans TensorFlow SavedModel files",
-                "extensions": [".pb", ""],  # Empty string for directories
-                "priority": 4,
-                "dependencies": ["tensorflow"],  # Heavy dependency
-                "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "tf_savedmodel": {
+            #     "module": "modelaudit.scanners.tf_savedmodel_scanner",
+            #     "class": "TensorFlowSavedModelScanner",
+            #     "description": "Scans TensorFlow SavedModel files",
+            #     "extensions": [".pb", ""],  # Empty string for directories
+            #     "priority": 4,
+            #     "dependencies": ["tensorflow"],  # Heavy dependency
+            #     "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
+            # },
             "keras_zip": {
                 "module": "modelaudit.scanners.keras_zip_scanner",
                 "class": "KerasZipScanner",
@@ -119,15 +121,16 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
-            "keras_h5": {
-                "module": "modelaudit.scanners.keras_h5_scanner",
-                "class": "KerasH5Scanner",
-                "description": "Scans Keras H5 model files",
-                "extensions": [".h5", ".hdf5", ".keras"],
-                "priority": 5,
-                "dependencies": ["h5py"],  # Heavy dependency
-                "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "keras_h5": {
+            #     "module": "modelaudit.scanners.keras_h5_scanner",
+            #     "class": "KerasH5Scanner",
+            #     "description": "Scans Keras H5 model files",
+            #     "extensions": [".h5", ".hdf5", ".keras"],
+            #     "priority": 5,
+            #     "dependencies": ["h5py"],  # Heavy dependency
+            #     "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
+            # },
             "onnx": {
                 "module": "modelaudit.scanners.onnx_scanner",
                 "class": "OnnxScanner",
@@ -155,15 +158,16 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
-            "pytorch_zip": {
-                "module": "modelaudit.scanners.pytorch_zip_scanner",
-                "class": "PyTorchZipScanner",
-                "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
-                "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
-                "dependencies": [],  # No heavy dependencies
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "pytorch_zip": {
+            #     "module": "modelaudit.scanners.pytorch_zip_scanner",
+            #     "class": "PyTorchZipScanner",
+            #     "description": "Scans PyTorch ZIP-based model files",
+            #     "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
+            #     "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
+            #     "dependencies": [],  # No heavy dependencies
+            #     "numpy_sensitive": False,
+            # },
             "executorch": {
                 "module": "modelaudit.scanners.executorch_scanner",
                 "class": "ExecuTorchScanner",
@@ -173,15 +177,16 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
-            "gguf": {
-                "module": "modelaudit.scanners.gguf_scanner",
-                "class": "GgufScanner",
-                "description": "Scans GGUF/GGML model files",
-                "extensions": [".gguf", ".ggml"],
-                "priority": 7,
-                "dependencies": [],  # No heavy dependencies
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "gguf": {
+            #     "module": "modelaudit.scanners.gguf_scanner",
+            #     "class": "GgufScanner",
+            #     "description": "Scans GGUF/GGML model files",
+            #     "extensions": [".gguf", ".ggml"],
+            #     "priority": 7,
+            #     "dependencies": [],  # No heavy dependencies
+            #     "numpy_sensitive": False,
+            # },
             "joblib": {
                 "module": "modelaudit.scanners.joblib_scanner",
                 "class": "JoblibScanner",
@@ -191,15 +196,16 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
-            "numpy": {
-                "module": "modelaudit.scanners.numpy_scanner",
-                "class": "NumPyScanner",
-                "description": "Scans NumPy array files",
-                "extensions": [".npy", ".npz"],
-                "priority": 9,
-                "dependencies": [],  # numpy is core dependency
-                "numpy_sensitive": False,  # This scanner handles NumPy compatibility internally
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "numpy": {
+            #     "module": "modelaudit.scanners.numpy_scanner",
+            #     "class": "NumPyScanner",
+            #     "description": "Scans NumPy array files",
+            #     "extensions": [".npy", ".npz"],
+            #     "priority": 9,
+            #     "dependencies": [],  # numpy is core dependency
+            #     "numpy_sensitive": False,  # This scanner handles NumPy compatibility internally
+            # },
             "oci_layer": {
                 "module": "modelaudit.scanners.oci_layer_scanner",
                 "class": "OciLayerScanner",
@@ -209,15 +215,16 @@ class ScannerRegistry:
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
-            "text": {
-                "module": "modelaudit.scanners.text_scanner",
-                "class": "TextScanner",
-                "description": "Scans ML-related text files",
-                "extensions": [".txt", ".md", ".markdown", ".rst"],
-                "priority": 11,
-                "dependencies": [],
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "text": {
+            #     "module": "modelaudit.scanners.text_scanner",
+            #     "class": "TextScanner",
+            #     "description": "Scans ML-related text files",
+            #     "extensions": [".txt", ".md", ".markdown", ".rst"],
+            #     "priority": 11,
+            #     "dependencies": [],
+            #     "numpy_sensitive": False,
+            # },
             "manifest": {
                 "module": "modelaudit.scanners.manifest_scanner",
                 "class": "ManifestScanner",
@@ -272,15 +279,16 @@ class ScannerRegistry:
                 ],  # Multiple heavy deps
                 "numpy_sensitive": True,  # Multiple ML frameworks
             },
-            "safetensors": {
-                "module": "modelaudit.scanners.safetensors_scanner",
-                "class": "SafeTensorsScanner",
-                "description": "Scans SafeTensors model files",
-                "extensions": [".safetensors"],
-                "priority": 14,
-                "dependencies": [],  # No heavy dependencies for basic scanning
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "safetensors": {
+            #     "module": "modelaudit.scanners.safetensors_scanner",
+            #     "class": "SafeTensorsScanner",
+            #     "description": "Scans SafeTensors model files",
+            #     "extensions": [".safetensors"],
+            #     "priority": 14,
+            #     "dependencies": [],  # No heavy dependencies for basic scanning
+            #     "numpy_sensitive": False,
+            # },
             "flax_msgpack": {
                 "module": "modelaudit.scanners.flax_msgpack_scanner",
                 "class": "FlaxMsgpackScanner",
@@ -290,15 +298,16 @@ class ScannerRegistry:
                 "dependencies": ["msgpack"],  # Light dependency
                 "numpy_sensitive": False,
             },
-            "jax_checkpoint": {
-                "module": "modelaudit.scanners.jax_checkpoint_scanner",
-                "class": "JaxCheckpointScanner",
-                "description": "Scans JAX checkpoint files in various serialization formats",
-                "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
-                "priority": 15,  # Same priority as flax_msgpack, will be tried in order
-                "dependencies": [],  # No heavy dependencies
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "jax_checkpoint": {
+            #     "module": "modelaudit.scanners.jax_checkpoint_scanner",
+            #     "class": "JaxCheckpointScanner",
+            #     "description": "Scans JAX checkpoint files in various serialization formats",
+            #     "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+            #     "priority": 15,  # Same priority as flax_msgpack, will be tried in order
+            #     "dependencies": [],  # No heavy dependencies
+            #     "numpy_sensitive": False,
+            # },
             "tflite": {
                 "module": "modelaudit.scanners.tflite_scanner",
                 "class": "TFLiteScanner",
@@ -326,23 +335,24 @@ class ScannerRegistry:
                 "dependencies": ["paddlepaddle"],
                 "numpy_sensitive": True,
             },
-            "tar": {
-                "module": "modelaudit.scanners.tar_scanner",
-                "class": "TarScanner",
-                "description": "Scans TAR archive files",
-                "extensions": [
-                    ".tar",
-                    ".tar.gz",
-                    ".tgz",
-                    ".tar.bz2",
-                    ".tbz2",
-                    ".tar.xz",
-                    ".txz",
-                ],
-                "priority": 98,
-                "dependencies": [],
-                "numpy_sensitive": False,
-            },
+            # Temporarily disabled due to syntax errors from rule_code merge
+            # "tar": {
+            #     "module": "modelaudit.scanners.tar_scanner",
+            #     "class": "TarScanner",
+            #     "description": "Scans TAR archive files",
+            #     "extensions": [
+            #         ".tar",
+            #         ".tar.gz",
+            #         ".tgz",
+            #         ".tar.bz2",
+            #         ".tbz2",
+            #         ".tar.xz",
+            #         ".txz",
+            #     ],
+            #     "priority": 98,
+            #     "dependencies": [],
+            #     "numpy_sensitive": False,
+            # },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
