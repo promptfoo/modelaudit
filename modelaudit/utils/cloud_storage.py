@@ -495,7 +495,7 @@ def download_from_cloud(
         def download_single_file():
             fs.get(url, str(local_file))
 
-        if show_progress and size > 10_000_000:  # Show progress for files > 10MB
+        if show_progress and size > 10 * 1024 * 1024 * 1024:  # Show progress for files > 10GB
             with yaspin(text=f"Downloading {file_name}") as spinner:
                 download_single_file()
                 spinner.ok("✓")
