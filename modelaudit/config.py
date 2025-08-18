@@ -5,7 +5,7 @@ Simple TOML-based configuration for suppressing rules and adjusting severity.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import tomllib
@@ -31,7 +31,7 @@ class ModelAuditConfig:
     ignore: dict[str, list[str]] = field(default_factory=dict)
 
     # Scanner options
-    options: dict[str, any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "ModelAuditConfig":

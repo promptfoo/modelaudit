@@ -18,6 +18,7 @@ from .jfrog_integration import scan_jfrog_artifact
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
+from .rules import Rule
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
@@ -1381,9 +1382,9 @@ def rules_command(rule_code: Optional[str], list_rules: bool, category: Optional
         # Show category range
         try:
             if "-" in category:
-                start, end = category.split("-")
-                start = int(start)
-                end = int(end)
+                start_str, end_str = category.split("-")
+                start = int(start_str)
+                end = int(end_str)
             else:
                 # Single category like "100" means 100-199
                 start = int(category)
@@ -1432,7 +1433,7 @@ def display_rules(rules: dict, format: str) -> None:
         click.echo(json.dumps(rules_list, indent=2))
     else:
         # Group by category
-        categories = {}
+        categories: dict[int, list[Rule]] = {}
         for code, rule in sorted(rules.items()):
             if code.startswith("S"):
                 try:
