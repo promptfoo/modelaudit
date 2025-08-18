@@ -318,8 +318,8 @@ class BaseScanner(ABC):
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
-            10 * 1024 * 1024,
-        )  # Default: 10MB chunks
+            10 * 1024 * 1024 * 1024,
+        )  # Default: 10GB chunks
         self.max_file_read_size = self.config.get(
             "max_file_read_size",
             0,

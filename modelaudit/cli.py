@@ -212,7 +212,7 @@ def cli() -> None:
 @click.option(
     "--large-model-support/--no-large-model-support",
     default=True,
-    help="Enable optimized scanning for large models (>10MB) [default: enabled]",
+    help="Enable optimized scanning for large models (≈10GB+) [default: enabled]",
 )
 @click.option(
     "--progress/--no-progress",

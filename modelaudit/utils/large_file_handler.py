@@ -16,14 +16,14 @@ from ..scanners.base import IssueSeverity, ScanResult
 logger = logging.getLogger(__name__)
 
 # Size thresholds for different scanning strategies
-SMALL_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB - scan normally
-MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB - use chunking
-LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024  # 1GB - use streaming
-VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024  # 8GB - special handling
+SMALL_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024  # 10GB - scan normally
+MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024 * 1024  # 100GB - use chunking
+LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use streaming
+VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024 * 1024  # 8TB - special handling
 
 # Default chunk sizes for different file sizes
-DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks
-LARGE_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB chunks for large files
+DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024 * 1024  # 10GB chunks
+LARGE_CHUNK_SIZE = 50 * 1024 * 1024 * 1024  # 50GB chunks for large files
 STREAM_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for streaming
 
 
@@ -198,7 +198,8 @@ def should_use_large_file_handler(file_path: str) -> bool:
         file_path: Path to the file
 
     Returns:
-        True if the file should use large file handler
+        True if the file exceeds approximately 10GB
+        and should use the large file handler
     """
     try:
         file_size = os.path.getsize(file_path)
