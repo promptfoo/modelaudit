@@ -227,48 +227,48 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 
 **Core ML Frameworks:**
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[h5]`          | h5py                          | Scanning `.h5`, `.keras`, `.hdf5` files |
-| `[onnx]`        | onnx                          | Scanning `.onnx` model files            |
-| `[pytorch]`     | torch                         | Scanning `.pt`, `.pth`, `.ckpt` files   |
-| `[safetensors]` | safetensors                   | Scanning `.safetensors` files           |
-| `[tensorflow]`  | tensorflow                    | Scanning `.pb` SavedModel files         |
+| Extra           | Includes    | Use When                                |
+| --------------- | ----------- | --------------------------------------- |
+| `[h5]`          | h5py        | Scanning `.h5`, `.keras`, `.hdf5` files |
+| `[onnx]`        | onnx        | Scanning `.onnx` model files            |
+| `[pytorch]`     | torch       | Scanning `.pt`, `.pth`, `.ckpt` files   |
+| `[safetensors]` | safetensors | Scanning `.safetensors` files           |
+| `[tensorflow]`  | tensorflow  | Scanning `.pb` SavedModel files         |
 
 **Specialized Tools:**
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[coreml]`      | coremltools                   | Scanning `.mlmodel` Core ML files       |
-| `[flax]`        | msgpack                       | Scanning `.msgpack`, `.flax` JAX files  |
-| `[tensorrt]`    | tensorrt                      | Scanning TensorRT engine files          |
-| `[tflite]`      | tflite                        | Scanning `.tflite` TensorFlow Lite files|
-| `[yaml]`        | pyyaml                        | Scanning YAML configuration files       |
+| Extra        | Includes    | Use When                                 |
+| ------------ | ----------- | ---------------------------------------- |
+| `[coreml]`   | coremltools | Scanning `.mlmodel` Core ML files        |
+| `[flax]`     | msgpack     | Scanning `.msgpack`, `.flax` JAX files   |
+| `[tensorrt]` | tensorrt    | Scanning TensorRT engine files           |
+| `[tflite]`   | tflite      | Scanning `.tflite` TensorFlow Lite files |
+| `[yaml]`     | pyyaml      | Scanning YAML configuration files        |
 
 **Data & Storage:**
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure storage    |
-| `[dill]`        | dill                          | Scanning `.dill` serialized files       |
-| `[joblib]`      | joblib, scikit-learn          | Scanning `.joblib` scikit-learn models  |
+| Extra      | Includes             | Use When                               |
+| ---------- | -------------------- | -------------------------------------- |
+| `[cloud]`  | fsspec, s3fs, gcsfs  | Scanning from S3, GCS, Azure storage   |
+| `[dill]`   | dill                 | Scanning `.dill` serialized files      |
+| `[joblib]` | joblib, scikit-learn | Scanning `.joblib` scikit-learn models |
 
 **Integration:**
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[huggingface]` | huggingface-hub (optional)    | Explicit HuggingFace model downloads¹   |
-| `[mlflow]`      | mlflow                        | Scanning MLflow model registry          |
+| Extra           | Includes                   | Use When                              |
+| --------------- | -------------------------- | ------------------------------------- |
+| `[huggingface]` | huggingface-hub (optional) | Explicit HuggingFace model downloads¹ |
+| `[mlflow]`      | mlflow                     | Scanning MLflow model registry        |
 
 **Meta-packages:**
 
-| Extra           | Includes                      | Use When                                |
-| --------------- | ----------------------------- | --------------------------------------- |
-| `[all-ci]`      | All frameworks (no platform)  | CI/CD environments                      |
-| `[all]`         | All frameworks + tools        | Maximum compatibility                   |
-| `[numpy1]`      | All frameworks + NumPy<2.0    | Resolving NumPy compatibility conflicts |
+| Extra      | Includes                     | Use When                                |
+| ---------- | ---------------------------- | --------------------------------------- |
+| `[all-ci]` | All frameworks (no platform) | CI/CD environments                      |
+| `[all]`    | All frameworks + tools       | Maximum compatibility                   |
+| `[numpy1]` | All frameworks + NumPy<2.0   | Resolving NumPy compatibility conflicts |
 
-¹ *Note: `huggingface-hub` is included in base installation; this extra is optional for explicit dependency management.*
+¹ _Note: `huggingface-hub` is included in base installation; this extra is optional for explicit dependency management._
 
 </details>
 
