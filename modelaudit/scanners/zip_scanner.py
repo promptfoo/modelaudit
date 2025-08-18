@@ -7,10 +7,6 @@ from typing import Any, ClassVar, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .rule_mapper import (
-    get_file_issue_rule_code,
-    get_embedded_code_rule_code,
-)
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -173,7 +169,7 @@ class ZipScanner(BaseScanner):
                         "entries": entry_count,
                         "max_entries": self.max_entries,
                     },
-                    rule_code=None  # Passing check
+                    rule_code=None,  # Passing check
                 )
 
             # Scan each file in the archive
@@ -279,7 +275,7 @@ class ZipScanner(BaseScanner):
                                 "ratio": compression_ratio,
                                 "threshold": 100,
                             },
-                            rule_code=None  # Passing check
+                            rule_code=None,  # Passing check
                         )
 
                 # Extract and scan the file

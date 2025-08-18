@@ -243,7 +243,9 @@ class PyTorchZipScanner(BaseScanner):
                             message=f"Python code file found in PyTorch model: {name}",
                             severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
-                            details={"file": name}, rule_code="S507"  # Python embedded code)
+                            details={"file": name},
+                            rule_code="S507",  # Python embedded code
+                        )
                         # Determine rule code based on file type
                         exec_rule = None
                         if name.endswith(".exe"):
@@ -318,12 +320,14 @@ class PyTorchZipScanner(BaseScanner):
                                             passed=False,
                                             message=f"Blacklisted pattern '{pattern}' found in pickled file {name}",
                                             severity=IssueSeverity.CRITICAL,
-                                            location=f"{self.current_file_path} ({name})", rule_code="S1001"",
+                                            location=f"{self.current_file_path} ({name})",
                                             details={
                                                 "pattern": pattern,
                                                 "file": name,
                                                 "file_type": "pickle",
-                                            }, rule_code="S1001"  # Blacklisted model)
+                                            },
+                                            rule_code="S1001",  # Blacklisted model
+                                        )
                             else:
                                 # For non-pickle files, try to decode as text
                                 try:
@@ -377,7 +381,9 @@ class PyTorchZipScanner(BaseScanner):
                 message=f"Error scanning PyTorch zip file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e)}, rule_code="S902", "exception_type": type(e).__name__}, rule_code="S902")
+                details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S902"
+            )
             result.finish(success=False)
             return result
 

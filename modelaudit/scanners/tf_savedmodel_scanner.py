@@ -435,8 +435,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.add_check(
                 name="PyFunc Code Extraction Check",
                 passed=False,
-                message=f"{node.op} operation detected (unable to extract Python code")",
-                rule_code="S902"",
+                message=f"{node.op} operation detected (unable to extract Python code)",
+                rule_code="S902",
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path} (node: {node.name})",
                 details={

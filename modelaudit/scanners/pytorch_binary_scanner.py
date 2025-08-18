@@ -80,7 +80,9 @@ class PyTorchBinaryScanner(BaseScanner):
                     message=f"Suspiciously small binary file: {file_size} bytes",
                     severity=IssueSeverity.INFO,
                     location=path,
-                    details={"file_size": file_size}, rule_code="S902")
+                    details={"file_size": file_size},
+                    rule_code="S902",
+                )
             else:
                 result.add_check(
                     name="File Size Validation",
@@ -88,8 +90,8 @@ class PyTorchBinaryScanner(BaseScanner):
                     message="File size is reasonable",
                     location=path,
                     details={"file_size": file_size},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
 
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
@@ -306,7 +308,7 @@ class PyTorchBinaryScanner(BaseScanner):
                         "ml_context_explanation": explanation,
                     },
                     why=f"These patterns were likely false positives in ML weight data. {explanation}",
-                    rule_code=None  # Passing check
+                    rule_code=None,  # Passing check
                 )
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:

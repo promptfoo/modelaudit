@@ -130,14 +130,13 @@ class JoblibScanner(BaseScanner):
                                 "ratio": ratio,
                                 "max_ratio": self.max_decompression_ratio,
                             },
-                            rule_code=None  # Passing check
+                            rule_code=None,  # Passing check
                         )
                 except ValueError as e:
                     result.add_check(
                         name="Compression Bomb Detection",
                         passed=False,
-                        message=str(e,
-                    rule_code="S902"),
+                        message=str(e, rule_code="S902"),
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"security_check": "compression_bomb_detection"},
@@ -151,9 +150,13 @@ class JoblibScanner(BaseScanner):
                         message=f"Error decompressing joblib file: {e}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"exception": str(e,
-                rule_code="S902",
-            ), "exception_type": type(e).__name__},
+                        details={
+                            "exception": str(
+                                e,
+                                rule_code="S902",
+                            ),
+                            "exception_type": type(e).__name__,
+                        },
                     )
                     result.finish(success=False)
                     return result
@@ -171,9 +174,13 @@ class JoblibScanner(BaseScanner):
                 message=f"Error scanning joblib file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e,
-                rule_code="S902",
-            ), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(
+                        e,
+                        rule_code="S902",
+                    ),
+                    "exception_type": type(e).__name__,
+                },
             )
             result.finish(success=False)
             return result
