@@ -21,6 +21,7 @@ ProgressPhase = None
 # Try to import progress tracking, handle circular import gracefully
 try:
     from ..progress import ProgressPhase, ProgressTracker  # type: ignore
+
     PROGRESS_AVAILABLE = True
 except (ImportError, RecursionError):
     # Keep None values to indicate unavailable

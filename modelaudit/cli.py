@@ -885,6 +885,7 @@ def scan_command(
                                 # Also update spinner if present
                                 if spinner_bound:
                                     spinner_bound.text = f"{message} ({percentage:.1f}%)"
+
                             return enhanced_progress_callback
 
                         progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
