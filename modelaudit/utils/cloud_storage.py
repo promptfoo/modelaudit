@@ -383,7 +383,12 @@ def download_from_cloud(
             return cached_path
 
     # Analyze target
-    metadata = asyncio.run(analyze_cloud_target(url))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        metadata = asyncio.run(analyze_cloud_target(url))
+    else:
+        metadata = asyncio.run_coroutine_threadsafe(analyze_cloud_target(url), loop).result()
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
