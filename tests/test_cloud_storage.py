@@ -1,12 +1,21 @@
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.cloud_storage import (
+    analyze_cloud_target,
     download_from_cloud,
     get_cloud_object_size,
     is_cloud_url,
 )
+
+
+def make_fs_mock() -> MagicMock:
+    fs = MagicMock()
+    fs.__enter__.return_value = fs
+    fs.__exit__.side_effect = lambda exc_type, exc, tb: fs.close()
+    return fs
 
 
 class TestCloudURLDetection:
@@ -34,11 +43,13 @@ class TestCloudURLDetection:
 
 @patch("fsspec.filesystem")
 def test_download_from_cloud(mock_fs, tmp_path):
-    fs = MagicMock()
-    mock_fs.return_value = fs
+    fs_meta = make_fs_mock()
+    fs_meta.info.return_value = {"type": "file", "size": 1024}
 
-    # Mock file info to indicate it's a file, not a directory
+    fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
+
+    mock_fs.side_effect = [fs_meta, fs]
 
     url = "s3://bucket/model.pt"
     result = download_from_cloud(url, cache_dir=tmp_path)
@@ -53,6 +64,9 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert result.name == "model.pt"
     assert result.exists() or True  # Mock doesn't create actual files
 
+    fs.close.assert_called_once()
+    fs_meta.close.assert_called_once()
+
 
 @patch("builtins.__import__")
 def test_download_missing_dependency(mock_import):
@@ -66,6 +80,18 @@ def test_download_missing_dependency(mock_import):
 
     with pytest.raises(ImportError):
         download_from_cloud("s3://bucket/model.pt")
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_closes_fs(mock_fs):
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    mock_fs.return_value = fs
+
+    metadata = asyncio.run(analyze_cloud_target("s3://bucket/model.pt"))
+
+    assert metadata["size"] == 1024
+    fs.close.assert_called_once()
 
 
 class TestCloudObjectSize:
@@ -109,8 +135,11 @@ class TestDiskSpaceCheckingForCloud:
     @patch("fsspec.filesystem")
     def test_download_insufficient_disk_space(self, mock_fs_class, mock_check_disk_space, mock_get_size):
         """Test download fails when disk space is insufficient."""
-        fs = MagicMock()
-        mock_fs_class.return_value = fs
+        fs_meta = make_fs_mock()
+        fs_meta.info.return_value = {"type": "file", "size": 1024}
+
+        fs = make_fs_mock()
+        mock_fs_class.side_effect = [fs_meta, fs]
 
         # Mock object size
         mock_get_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
@@ -124,17 +153,21 @@ class TestDiskSpaceCheckingForCloud:
 
         # Verify download was not attempted
         fs.get.assert_not_called()
+        fs.close.assert_called_once()
+        fs_meta.close.assert_called_once()
 
     @patch("modelaudit.utils.cloud_storage.get_cloud_object_size")
     @patch("modelaudit.utils.cloud_storage.check_disk_space")
     @patch("fsspec.filesystem")
     def test_download_with_disk_space_check(self, mock_fs_class, mock_check_disk_space, mock_get_size, tmp_path):
         """Test successful download with disk space check."""
-        fs = MagicMock()
-        mock_fs_class.return_value = fs
+        fs_meta = make_fs_mock()
+        fs_meta.info.return_value = {"type": "file", "size": 1024 * 1024 * 1024}
 
-        # Mock file info to indicate it's a file, not a directory
+        fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 1024 * 1024 * 1024}
+
+        mock_fs_class.side_effect = [fs_meta, fs]
 
         # Mock object size
         mock_get_size.return_value = 1024 * 1024 * 1024  # 1 GB
@@ -153,3 +186,6 @@ class TestDiskSpaceCheckingForCloud:
         # Result should be a path containing the filename
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
+
+        fs.close.assert_called_once()
+        fs_meta.close.assert_called_once()
