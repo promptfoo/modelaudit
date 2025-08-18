@@ -137,10 +137,13 @@ def detect_file_format(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    # Read first bytes for format detection
-    magic4 = read_magic_bytes(path, 4)
-    magic8 = read_magic_bytes(path, 8)
-    magic16 = read_magic_bytes(path, 16)
+    # Read first bytes for format detection using a single file handle
+    with file_path.open("rb") as f:
+        header = f.read(16)
+
+    magic4 = header[:4]
+    magic8 = header[:8]
+    magic16 = header[:16]
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
