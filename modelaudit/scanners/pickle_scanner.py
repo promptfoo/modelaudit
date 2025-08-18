@@ -1006,9 +1006,7 @@ class PickleScanner(BaseScanner):
                 return result
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
-                logger.info(
-                    f"Recursion limit reached scanning model file {path}. File contains complex nested structures."
-                )
+                logger.debug(f"Recursion limit reached: {path} (complex nested structure)")
                 result.metadata.update(
                     {
                         "recursion_limited": True,
@@ -1912,10 +1910,7 @@ class PickleScanner(BaseScanner):
 
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
-                logger.info(
-                    f"Recursion limit reached scanning model file {self.current_file_path}. "
-                    f"File contains complex nested structures."
-                )
+                logger.debug(f"Recursion limit reached: {self.current_file_path} (complex nested structure)")
                 result.metadata.update(
                     {
                         "recursion_limited": True,
