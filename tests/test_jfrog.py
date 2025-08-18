@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -100,17 +101,16 @@ class TestJFrogDownload:
         assert call_args[1]["headers"]["Authorization"] == "Bearer env-access-token"
 
     @patch("modelaudit.utils.jfrog.requests.get")
-    @patch("builtins.print")  # Mock print to avoid warning output in tests
-    def test_no_authentication(self, mock_print, mock_get, tmp_path):
+    def test_no_authentication(self, mock_get, tmp_path, caplog):
         """Test anonymous access when no authentication is provided."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 
-        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.jfrog"):
+            download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
 
-        # Verify warning was printed
-        mock_print.assert_called_once_with("Warning: No JFrog authentication provided. Attempting anonymous access.")
+        assert "No JFrog authentication provided. Attempting anonymous access." in caplog.text
 
         # Verify request was made without auth headers
         call_args = mock_get.call_args

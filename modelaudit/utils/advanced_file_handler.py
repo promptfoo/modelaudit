@@ -342,7 +342,7 @@ class AdvancedFileHandler:
         Returns:
             ScanResult with findings
         """
-        logger.info(f"Scanning large model file: {self.total_size:,} bytes, sharded={self.is_sharded}")
+        logger.debug(f"Advanced scan initialized: {self.total_size:,} bytes, sharded={self.is_sharded}")
 
         # Determine scanning strategy
         if self.is_sharded:
@@ -365,7 +365,7 @@ class AdvancedFileHandler:
         # Find and scan config file first
         config_path = ShardedModelDetector.find_model_config(self.file_path)
         if config_path:
-            logger.info(f"Found model config: {config_path}")
+            logger.debug(f"Model configuration detected: {config_path}")
             # Quick scan of config for metadata
             try:
                 with open(config_path) as f:

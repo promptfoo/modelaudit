@@ -1,11 +1,12 @@
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.cloud_storage import (
     analyze_cloud_target,
     download_from_cloud,
+    filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
 )
@@ -92,6 +93,15 @@ def test_analyze_cloud_target_closes_fs(mock_fs):
 
     assert metadata["size"] == 1024
     fs.close.assert_called_once()
+
+
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+def test_download_from_cloud_analysis_failure(mock_analyze, mock_fs):
+    mock_analyze.return_value = {"type": "unknown", "error": "boom"}
+    with pytest.raises(ValueError, match="Failed to analyze cloud target"):
+        download_from_cloud("s3://bucket/model.pt", use_cache=False)
+    mock_fs.assert_not_called()
 
 
 class TestCloudObjectSize:
@@ -189,3 +199,8 @@ class TestDiskSpaceCheckingForCloud:
 
         fs.close.assert_called_once()
         fs_meta.close.assert_called_once()
+
+
+def test_filter_scannable_files_recognizes_pdiparams():
+    files = [{"path": "model.pdiparams"}]
+    assert filter_scannable_files(files) == files
