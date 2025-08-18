@@ -314,8 +314,10 @@ pygments==2.19.2
 pyparsing==3.2.3
     # via matplotlib
 pytest==8.4.1
+    # via pytest-asyncio
     # via pytest-cov
     # via pytest-xdist
+pytest-asyncio==1.1.0
 pytest-cov==6.2.1
 pytest-xdist==3.7.0
 python-dateutil==2.9.0.post0
