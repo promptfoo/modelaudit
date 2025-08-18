@@ -26,8 +26,13 @@ def stream_analyze_file(
     scanner: BaseScanner,
     max_bytes: int = 10 * 1024 * 1024,  # 10MB default
 ) -> tuple[Optional[ScanResult], bool]:
-    """
-    Stream analyze a file from cloud storage.
+    """Stream analyze a file from cloud storage.
+
+    After downloading a configurable chunk of bytes, this function attempts to
+    run the provided ``scanner`` directly on the in-memory data. If the scanner
+    exposes a partial-scan capability, the resulting issues and metadata are
+    merged into the streaming result. When the scanner cannot operate on partial
+    content, limited header checks are performed instead.
 
     Returns:
         Tuple of (ScanResult or None, was_complete)
@@ -64,13 +69,39 @@ def stream_analyze_file(
         temp_file = io.BytesIO(content)
         temp_file.name = Path(url).name
 
-        # Attempt to scan the partial content
-        # Note: This may not work for all file formats
-        issues = []
+        issues: list[Issue] = []
+        metadata: dict[str, Any] = {}
 
-        # For pickle files, we can detect many security issues from the header
-        if Path(url).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
-            # Check for dangerous patterns in raw content
+        # Try to use scanner's partial capabilities if available
+        scan_result: Optional[ScanResult] = None
+        try:
+            temp_file.seek(0)
+            scan_result = scanner.scan(temp_file)  # type: ignore[arg-type]
+        except Exception:
+            scan_result = None
+
+        if scan_result is None:
+            partial_methods = [
+                ("scan_bytes", False),
+                ("scan_fileobj", False),
+                ("_scan_pickle_bytes", True),
+            ]
+            for method_name, needs_size in partial_methods:
+                if hasattr(scanner, method_name):
+                    method = getattr(scanner, method_name)
+                    try:
+                        temp_file.seek(0)
+                        scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
+                        break
+                    except Exception:
+                        scan_result = None
+
+        if scan_result is not None:
+            issues.extend(scan_result.issues)
+            metadata.update(scan_result.metadata)
+
+        # Fallback manual checks for pickle headers when scanner doesn't support partial scans
+        if scan_result is None and Path(url).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
             dangerous_patterns = [
                 b"os\nsystem",
                 b"subprocess",
@@ -118,11 +149,9 @@ def stream_analyze_file(
                         )
                     )
 
-            # Also check for pickle protocol version and opcodes
             if content.startswith(b"\x80"):  # Pickle protocol marker
                 protocol_version = content[1] if len(content) > 1 else 0
                 if protocol_version >= 3:
-                    # Protocol 3+ allows more dangerous operations
                     issues.append(
                         Issue(
                             message=f"Pickle protocol {protocol_version} detected",
@@ -142,7 +171,7 @@ def stream_analyze_file(
         # Create scan result
         if issues or was_complete:
             result = ScanResult(scanner_name="streaming")
-            result.bytes_scanned = bytes_to_read
+            result.bytes_scanned = scan_result.bytes_scanned if scan_result is not None else bytes_to_read
             result.issues = issues
             result.metadata = {
                 "streaming_analysis": True,
@@ -150,6 +179,7 @@ def stream_analyze_file(
                 "analysis_complete": was_complete,
                 "file_size": file_size,
             }
+            result.metadata.update(metadata)
             result.finish(success=True)
             return result, was_complete
         else:
