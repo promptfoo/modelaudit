@@ -1421,7 +1421,8 @@ class PickleScanner(BaseScanner):
             if stack_depth_warnings:
                 # Filter warnings based on adjusted limit
                 significant_warnings = [
-                    w for w in stack_depth_warnings
+                    w
+                    for w in stack_depth_warnings
                     if isinstance(w["current_depth"], int) and w["current_depth"] > adjusted_stack_depth_limit
                 ]
 
@@ -1429,6 +1430,7 @@ class PickleScanner(BaseScanner):
                     # Report only the most severe warning to avoid spam
                     def get_depth(x):
                         return x["current_depth"] if isinstance(x["current_depth"], int) else 0
+
                     worst_warning = max(significant_warnings, key=get_depth)
                     severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
 
@@ -1455,16 +1457,12 @@ class PickleScanner(BaseScanner):
                 else:
                     # Warnings were filtered out as benign for ML content
                     max_filtered_depth = max(
-                        w["current_depth"] for w in stack_depth_warnings
-                        if isinstance(w["current_depth"], int)
+                        w["current_depth"] for w in stack_depth_warnings if isinstance(w["current_depth"], int)
                     )
                     result.add_check(
                         name="Stack Depth Safety Check",
                         passed=True,
-                        message=(
-                            f"Stack depth warnings filtered as benign for ML content "
-                            f"(max: {max_filtered_depth})"
-                        ),
+                        message=(f"Stack depth warnings filtered as benign for ML content (max: {max_filtered_depth})"),
                         location=self.current_file_path,
                         details={
                             "max_depth_reached": max_stack_depth,
