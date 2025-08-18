@@ -206,7 +206,7 @@ class TarScanner(BaseScanner):
                 if member.isdir():
                     continue
 
-                max_entry_size = self.config.get("max_entry_size", 10485760)
+                max_entry_size = self.config.get("max_entry_size", 10 * 1024 * 1024 * 1024)  # 10GB default
                 data = b""
                 fileobj = tar.extractfile(member)
                 if fileobj is None:

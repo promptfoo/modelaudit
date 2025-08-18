@@ -21,11 +21,6 @@ from .utils.huggingface import download_model, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("modelaudit")
 
 
@@ -227,7 +222,7 @@ def cli() -> None:
 @click.option(
     "--large-model-support/--no-large-model-support",
     default=True,
-    help="Enable optimized scanning for large models (>10MB) [default: enabled]",
+    help="Enable optimized scanning for large models (≈10GB+) [default: enabled]",
 )
 def scan_command(
     paths: tuple[str, ...],
@@ -751,7 +746,7 @@ def scan_command(
                         ".css",
                     ):
                         if verbose:
-                            logger.info(f"Skipping non-model file: {path}")
+                            logger.debug(f"Skipped: {path} (non-model file)")
                         click.echo(f"Skipping non-model file: {path}")
                         continue
 
@@ -889,13 +884,13 @@ def scan_command(
                     try:
                         shutil.rmtree(temp_dir)
                         if verbose:
-                            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                            logger.debug(f"Temporary directory removed: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
-                    logger.info("Stopping scan due to interrupt")
+                    logger.info("Scan interrupted by user")
                     aggregated_results["success"] = False
                     issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
@@ -1097,6 +1092,29 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
         output_lines.append(rate_str)
+
+    # Show failed checks if any exist
+    failed_checks_list = [c for c in results.get("checks", []) if c.get("status") == "failed"]
+    if failed_checks_list:
+        output_lines.append("")
+        output_lines.append(style_text("  Failed Checks (non-critical):", fg="yellow"))
+        # Group failed checks by name to avoid repetition
+        check_groups: dict[str, list[str]] = {}
+        for check in failed_checks_list:
+            check_name = check.get("name", "Unknown check")
+            if check_name not in check_groups:
+                check_groups[check_name] = []
+            check_groups[check_name].append(check.get("message", ""))
+
+        # Show unique failed check types
+        for check_name, messages in list(check_groups.items())[:5]:  # Show first 5 types
+            unique_msg = messages[0] if messages else ""
+            if len(messages) > 1:
+                output_lines.append(f"    • {check_name} ({len(messages)} occurrences)")
+            else:
+                output_lines.append(f"    • {check_name}: {unique_msg}")
+        if len(check_groups) > 5:
+            output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
 
     # Add issue summary
     issues = results.get("issues", [])
@@ -1526,4 +1544,12 @@ def doctor(show_failed: bool):
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     cli()
+
+
+if __name__ == "__main__":
+    main()

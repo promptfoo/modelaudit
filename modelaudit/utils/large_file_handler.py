@@ -16,14 +16,14 @@ from ..scanners.base import IssueSeverity, ScanResult
 logger = logging.getLogger(__name__)
 
 # Size thresholds for different scanning strategies
-SMALL_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB - scan normally
-MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB - use chunking
-LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024  # 1GB - use streaming
-VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024  # 8GB - special handling
+SMALL_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024  # 10GB - scan normally
+MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024 * 1024  # 100GB - use chunking
+LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use streaming
+VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024 * 1024  # 8TB - special handling
 
 # Default chunk sizes for different file sizes
-DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks
-LARGE_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB chunks for very large files
+DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024 * 1024  # 10GB chunks
+LARGE_CHUNK_SIZE = 50 * 1024 * 1024 * 1024  # 50GB chunks for large files
 STREAM_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for streaming
 
 
@@ -86,7 +86,7 @@ class LargeFileHandler:
         Returns:
             ScanResult with findings
         """
-        logger.info(f"Scanning {self.file_name} ({self.file_size:,} bytes) using {self.strategy} strategy")
+        logger.debug(f"File scan strategy: {self.strategy} for {self.file_name} ({self.file_size:,} bytes)")
 
         if self.strategy == "normal":
             return self._scan_normal()
@@ -112,6 +112,7 @@ class LargeFileHandler:
         result = ScanResult(scanner_name=self.scanner.name)
         bytes_processed = 0
         chunk_size = DEFAULT_CHUNK_SIZE
+        success = True
 
         self._report_progress(f"Scanning {self.file_name} in chunks", 0)
 
@@ -121,6 +122,8 @@ class LargeFileHandler:
                 chunk_result: ScanResult = self.scanner._scan_pickle_chunks(
                     self.file_path, chunk_size, self.progress_callback
                 )
+                if chunk_result.end_time is None:
+                    chunk_result.finish(success=not chunk_result.has_errors)
                 return chunk_result
 
             # For other scanners, fall back to normal scanning
@@ -137,6 +140,7 @@ class LargeFileHandler:
                                 "percentage": (bytes_processed / self.file_size) * 100,
                             },
                         )
+                        success = False
                         break
 
                     chunk = f.read(chunk_size)
@@ -156,139 +160,34 @@ class LargeFileHandler:
 
             # If scanner doesn't support chunking, fall back to normal scan
             if bytes_processed == 0:
-                return self._scan_normal()
+                normal_result = self._scan_normal()
+                if normal_result.end_time is None:
+                    normal_result.finish(success=not normal_result.has_errors)
+                return normal_result
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")
-            result.add_issue(f"Scanning error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
+            result.add_issue(
+                f"Scanning error: {e!s}",
+                severity=IssueSeverity.WARNING,
+                details={"error": str(e)},
+            )
+            success = False
 
         result.bytes_scanned = bytes_processed
         self._report_progress(f"Completed {self.file_name}", 100)
+        result.finish(success=success and not result.has_errors)
         return result
 
     def _scan_streaming(self) -> ScanResult:
-        """Streaming scan for large files."""
-        result = ScanResult(scanner_name=self.scanner.name)
-        bytes_processed = 0
-
-        self._report_progress(f"Streaming analysis of {self.file_name}", 0)
-
-        try:
-            # For very large files, we only scan the header and sample sections
-            with open(self.file_path, "rb") as f:
-                # Scan first 10MB
-                header_size = min(10 * 1024 * 1024, self.file_size)
-                header_data = f.read(header_size)
-                bytes_processed += len(header_data)
-
-                self._report_progress(f"Analyzing header of {self.file_name}", (bytes_processed / self.file_size) * 100)
-
-                # Analyze header
-                if hasattr(self.scanner, "_analyze_header"):
-                    header_result = self.scanner._analyze_header(header_data)
-                    result.merge(header_result)
-
-                # Sample middle section if file is large enough
-                if self.file_size > 100 * 1024 * 1024:
-                    middle_pos = self.file_size // 2
-                    f.seek(middle_pos)
-                    middle_data = f.read(1024 * 1024)  # Read 1MB from middle
-                    bytes_processed += len(middle_data)
-
-                    self._report_progress(f"Sampling middle section of {self.file_name}", 50)
-
-                    if hasattr(self.scanner, "_analyze_chunk"):
-                        middle_result = self.scanner._analyze_chunk(middle_data, middle_pos)
-                        result.merge(middle_result)
-
-                # Sample end section
-                if self.file_size > 20 * 1024 * 1024:
-                    f.seek(max(0, self.file_size - 1024 * 1024))
-                    end_data = f.read()
-                    bytes_processed += len(end_data)
-
-                    self._report_progress(f"Sampling end section of {self.file_name}", 90)
-
-                    if hasattr(self.scanner, "_analyze_chunk"):
-                        end_result = self.scanner._analyze_chunk(end_data, self.file_size - len(end_data))
-                        result.merge(end_result)
-
-                result.add_issue(
-                    f"Partial scan completed for large file ({self.file_size:,} bytes)",
-                    severity=IssueSeverity.INFO,
-                    details={
-                        "strategy": "streaming",
-                        "bytes_sampled": bytes_processed,
-                        "total_bytes": self.file_size,
-                        "coverage": f"{(bytes_processed / self.file_size) * 100:.1f}%",
-                    },
-                )
-
-        except Exception as e:
-            logger.error(f"Error during streaming scan: {e}")
-            result.add_issue(f"Streaming scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
-
-        result.bytes_scanned = bytes_processed
-        self._report_progress(f"Completed streaming analysis of {self.file_name}", 100)
-        return result
+        """Streaming scan for large files - always scans completely for security."""
+        # Security requires complete file scanning
+        return self._scan_normal()
 
     def _scan_optimized(self) -> ScanResult:
-        """Optimized scanning for very large files (>8GB)."""
-        result = ScanResult(scanner_name=self.scanner.name)
-
-        self._report_progress(f"Optimized scan of very large file {self.file_name}", 0)
-
-        # For very large files, we use a highly optimized approach
-        # Only scan critical sections and use heuristics
-
-        try:
-            with open(self.file_path, "rb") as f:
-                # Quick header check (first 1MB)
-                header = f.read(1024 * 1024)
-
-                self._report_progress(f"Quick header analysis of {self.file_name}", 10)
-
-                # Look for obvious malicious patterns in header
-                if b"exec" in header or b"eval" in header or b"__import__" in header:
-                    result.add_issue(
-                        "Suspicious patterns found in file header",
-                        severity=IssueSeverity.CRITICAL,
-                        details={"patterns": ["exec", "eval", "__import__"], "location": "file header"},
-                    )
-
-                # Check file format markers
-                if header.startswith(b"\x80\x02"):  # Pickle protocol 2
-                    result.add_issue(
-                        "File uses Pickle protocol 2",
-                        severity=IssueSeverity.INFO,
-                        details={"format": "pickle", "protocol": 2},
-                    )
-                elif header.startswith(b"\x80\x03"):  # Pickle protocol 3
-                    result.add_issue(
-                        "File uses Pickle protocol 3",
-                        severity=IssueSeverity.INFO,
-                        details={"format": "pickle", "protocol": 3},
-                    )
-
-                # For very large files, we can't scan everything
-                result.add_issue(
-                    f"File too large for complete scanning ({self.file_size:,} bytes)",
-                    severity=IssueSeverity.WARNING,
-                    details={
-                        "file_size": self.file_size,
-                        "scan_strategy": "optimized",
-                        "recommendation": "Consider splitting the model or using SafeTensors format",
-                    },
-                )
-
-                result.bytes_scanned = len(header)
-
-        except Exception as e:
-            logger.error(f"Error during optimized scan: {e}")
-            result.add_issue(f"Optimized scan error: {e!s}", severity=IssueSeverity.WARNING, details={"error": str(e)})
-
-        self._report_progress(f"Completed optimized scan of {self.file_name}", 100)
-        return result
+        """Optimized scanning for large files (>8GB) - still scans completely."""
+        # Security requires complete file scanning
+        return self._scan_normal()
 
 
 def should_use_large_file_handler(file_path: str) -> bool:
@@ -299,7 +198,8 @@ def should_use_large_file_handler(file_path: str) -> bool:
         file_path: Path to the file
 
     Returns:
-        True if the file should use large file handler
+        True if the file exceeds approximately 10GB
+        and should use the large file handler
     """
     try:
         file_size = os.path.getsize(file_path)

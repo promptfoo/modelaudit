@@ -62,6 +62,8 @@ class WeightDistributionScanner(BaseScanner):
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
         # Use max_array_size for in-memory array size limits (default 100MB)
         self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        # Flag set when weight extraction would be unsafe
+        self.extraction_unsafe = False
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -96,6 +98,8 @@ class WeightDistributionScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        # Reset flag before extraction
+        self.extraction_unsafe = False
 
         try:
             # Extract weights based on file format
@@ -128,11 +132,16 @@ class WeightDistributionScanner(BaseScanner):
                     return result
 
             if not weights_info:
+                message = "Failed to extract weights from model"
+                severity = IssueSeverity.DEBUG
+                if self.extraction_unsafe:
+                    message = "Unsafe to extract weights from data.pkl in PyTorch archive"
+                    severity = IssueSeverity.WARNING
                 result.add_check(
                     name="Weight Extraction",
                     passed=False,
-                    message="Could not extract weights from model",
-                    severity=IssueSeverity.DEBUG,
+                    message=message,
+                    severity=severity,
                     location=path,
                 rule_code="S701"
             )
@@ -182,6 +191,9 @@ class WeightDistributionScanner(BaseScanner):
         if not HAS_TORCH:
             return {}
 
+        # Reset safety flag for each extraction
+        self.extraction_unsafe = False
+
         weights_info: dict[str, np.ndarray] = {}
 
         try:
@@ -227,13 +239,60 @@ class WeightDistributionScanner(BaseScanner):
             # Try loading as a zip file (newer PyTorch format)
             try:
                 with zipfile.ZipFile(path, "r") as z:
-                    # Look for data.pkl which contains the weights
-                    if "data.pkl" in z.namelist():
-                        # We can't easily extract weights from pickle without executing it
-                        # This is a limitation we should document
-                        pass
-            except Exception as e:
-                logger.debug(f"Failed to extract weights from {path}: {e}")
+                    data_pkl_path = next(
+                        (n for n in z.namelist() if n.endswith("/data.pkl") or n == "data.pkl"),
+                        None,
+                    )
+                    if data_pkl_path:
+                        import io
+                        import pickle
+                        import pickletools
+
+                        data = z.read(data_pkl_path)
+
+                        # Look for disallowed opcodes that could trigger code execution
+                        disallowed = {
+                            "GLOBAL",
+                            "STACK_GLOBAL",
+                            "REDUCE",
+                            "BUILD",
+                            "INST",
+                            "OBJ",
+                            "NEWOBJ",
+                            "NEWOBJ_EX",
+                        }
+                        unsafe = False
+                        for opcode, _arg, _pos in pickletools.genops(data):
+                            if opcode.name in disallowed:
+                                unsafe = True
+                                break
+
+                        if unsafe:
+                            self.extraction_unsafe = True
+                        else:
+                            try:
+
+                                class RestrictedUnpickler(pickle.Unpickler):
+                                    def find_class(self, module: str, name: str) -> Any:
+                                        raise pickle.UnpicklingError("global lookup not allowed")
+
+                                obj = RestrictedUnpickler(io.BytesIO(data)).load()
+                                if isinstance(obj, dict):
+                                    for key, value in obj.items():
+                                        array = np.array(value)
+                                        if len(array.shape) >= 2 and (
+                                            "weight" in key.lower() or "kernel" in key.lower()
+                                        ):
+                                            weights_info[key] = array
+                                else:
+                                    self.extraction_unsafe = True
+                            except Exception as e2:  # pragma: no cover - defensive
+                                logger.debug(
+                                    f"Failed restricted unpickle for {path}: {e2}",
+                                )
+                                self.extraction_unsafe = True
+            except Exception as e2:  # pragma: no cover - defensive
+                logger.debug(f"Failed to extract weights from {path}: {e2}")
 
         return weights_info
 
@@ -480,7 +539,7 @@ class WeightDistributionScanner(BaseScanner):
                     analysis["evidence"].append(f"Found vocabulary-sized layer: {matrix['output_dim']} ≈ {vocab_size}")
                     break
 
-        # Check for very large hidden dimensions typical of modern LLMs
+        # Check for large hidden dimensions typical of modern LLMs
         large_hidden_dims = [dim for dim in input_dims + output_dims if dim >= 768]
         if large_hidden_dims:
             analysis["confidence"] += 0.2
@@ -553,7 +612,7 @@ class WeightDistributionScanner(BaseScanner):
             n_outputs > self.llm_vocab_threshold
             # Large input dimensions (hidden layers in large models)
             or n_inputs > 2048
-            # Very large weight matrices (characteristic of large models)
+            # Large weight matrices (characteristic of large models)
             or weights.size > 10_000_000
         ):
             # Moderate relaxation for large models based on size analysis
