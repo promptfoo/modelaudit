@@ -104,7 +104,8 @@ class AuthClient:
             if not response.ok:
                 raise ValueError(f"Failed to get user info: {response.reason}")
 
-            return response.json()
+            json_response: dict[str, Any] = response.json()
+            return json_response
 
         except requests.RequestException as e:
             logger.error(f"Failed to get user info: {e!s}")

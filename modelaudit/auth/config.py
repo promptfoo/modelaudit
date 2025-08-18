@@ -2,7 +2,7 @@
 
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from platformdirs import user_config_dir
 
@@ -14,9 +14,9 @@ class ModelAuditConfig:
         """Initialize configuration."""
         self.config_dir = user_config_dir("modelaudit")
         self.config_file = os.path.join(self.config_dir, "config.json")
-        self._config_data = None
+        self._config_data: Optional[dict[str, Any]] = None
 
-    def _load_config(self) -> dict:
+    def _load_config(self) -> dict[str, Any]:
         """Load configuration from file."""
         if self._config_data is not None:
             return self._config_data
@@ -73,7 +73,7 @@ class ModelAuditConfig:
 
         # Fall back to config file
         config = self._load_config()
-        return config.get("api_host", "https://api.promptfoo.app")
+        return str(config.get("api_host", "https://api.promptfoo.app"))
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host in config."""
