@@ -128,6 +128,32 @@ class NetworkCommDetector:
         31337,  # Back Orifice
     ]
 
+    # Precompile port patterns to avoid repeated compilation during scanning
+    PORT_PATTERNS: ClassVar[dict[int, list[bytes]]] = {
+        port: [
+            f":{port}".encode(),
+            f"port={port}".encode(),
+            f"port {port}".encode(),
+            f"PORT={port}".encode(),
+        ]
+        for port in SUSPICIOUS_PORTS
+    }
+
+    EXPLICIT_PORT_PATTERNS: ClassVar[dict[int, list[re.Pattern]]] = {
+        port: [
+            re.compile(pattern, re.IGNORECASE | re.DOTALL)
+            for pattern in [
+                f"connect.*:{port}".encode(),
+                f"socket.*port={port}".encode(),
+                f"http://.*:{port}".encode(),
+                f"https://.*:{port}".encode(),
+                f"ssh.*:{port}".encode(),
+                f"telnet.*:{port}".encode(),
+            ]
+        ]
+        for port in SUSPICIOUS_PORTS
+    }
+
     # Blacklisted domains - empty by default, should be configured by user
     # via config parameter if they have specific domains to block
     BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = []
@@ -514,24 +540,13 @@ class NetworkCommDetector:
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
-        # Skip port detection in binary ML model files to avoid false positives
-        # Binary weights can randomly contain patterns like ":22" or ":23"
-        if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
-            # For ML model files, only check for very specific network patterns
-            # that are unlikely to occur randomly
-            for port in self.SUSPICIOUS_PORTS:
-                # Only check for explicit port references with more context
-                explicit_patterns = [
-                    f"connect(.*:{port}".encode(),
-                    f"socket.*port={port}".encode(),
-                    f"http://.*:{port}".encode(),
-                    f"https://.*:{port}".encode(),
-                    f"ssh.*:{port}".encode(),
-                    f"telnet.*:{port}".encode(),
-                ]
+        is_ml_model = context and any(
+            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]
+        )
 
-                for pattern_bytes in explicit_patterns:
-                    pattern = re.compile(pattern_bytes, re.IGNORECASE | re.DOTALL)
+        for port in self.SUSPICIOUS_PORTS:
+            if is_ml_model:
+                for pattern in self.EXPLICIT_PORT_PATTERNS[port]:
                     if pattern.search(data):
                         port_name = self._get_port_name(port)
                         self.findings.append(
@@ -546,17 +561,8 @@ class NetworkCommDetector:
                             }
                         )
                         break
-        else:
-            # For non-ML files, use the original detection
-            for port in self.SUSPICIOUS_PORTS:
-                patterns = [
-                    f":{port}".encode(),
-                    f"port={port}".encode(),
-                    f"port {port}".encode(),
-                    f"PORT={port}".encode(),
-                ]
-
-                for pattern_bytes in patterns:
+            else:
+                for pattern_bytes in self.PORT_PATTERNS[port]:
                     if pattern_bytes in data:
                         port_name = self._get_port_name(port)
 

@@ -448,7 +448,7 @@ class SecretsDetector:
         findings = []
 
         # Limit text size to prevent DoS
-        max_text_size = 10 * 1024 * 1024  # 10MB
+        max_text_size = 10 * 1024 * 1024 * 1024  # 10GB
         if len(text) > max_text_size:
             text = text[:max_text_size]
 
