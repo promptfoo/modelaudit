@@ -57,8 +57,8 @@ class TextScanner(BaseScanner):
                 result.add_check(
                     name="File Size Check",
                     passed=False,
-                    message=f"Unusually large text file: {file_size / (1024 * 1024})",
-                rule_code="S902":.1f}MB",
+                    message=f"Unusually large text file: {file_size / (1024 * 1024):.1f}MB",
+                    rule_code="S902",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"file_size": file_size},
@@ -70,8 +70,8 @@ class TextScanner(BaseScanner):
                     message="Text file size is reasonable",
                     location=path,
                     details={"file_size": file_size},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
 
             filename = os.path.basename(path).lower()
 
@@ -83,8 +83,8 @@ class TextScanner(BaseScanner):
                     message="Model documentation file",
                     location=path,
                     details={"file_type": "documentation"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
             elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
                 result.add_check(
                     name="File Type Identification",
@@ -92,8 +92,8 @@ class TextScanner(BaseScanner):
                     message="Tokenizer vocabulary file",
                     location=path,
                     details={"file_type": "vocabulary"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
             elif filename in ["labels.txt", "classes.txt"]:
                 result.add_check(
                     name="File Type Identification",
@@ -101,8 +101,8 @@ class TextScanner(BaseScanner):
                     message="Classification labels file",
                     location=path,
                     details={"file_type": "labels"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
             elif filename in ["license.txt", "license.md"]:
                 result.add_check(
                     name="File Type Identification",
@@ -110,8 +110,8 @@ class TextScanner(BaseScanner):
                     message="License file",
                     location=path,
                     details={"file_type": "license"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
             elif filename == "requirements.txt":
                 # Could scan for suspicious dependencies in the future
                 result.add_check(
@@ -120,8 +120,8 @@ class TextScanner(BaseScanner):
                     message="Python requirements file",
                     location=path,
                     details={"file_type": "requirements"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
             else:
                 result.add_check(
                     name="File Type Identification",
@@ -129,8 +129,8 @@ class TextScanner(BaseScanner):
                     message="ML-related text file",
                     location=path,
                     details={"file_type": "text"},
-                rule_code=None,  # Passing check
-            )
+                    rule_code=None,  # Passing check
+                )
 
             result.bytes_scanned = file_size
             result.finish(success=True)
@@ -142,9 +142,8 @@ class TextScanner(BaseScanner):
                 message=f"Error scanning text file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"error": str(e,
+                details={"error": str(e)},
                 rule_code="S902",
-            )},
             )
             result.finish(success=False)
 

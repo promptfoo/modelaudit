@@ -87,7 +87,9 @@ class TarScanner(BaseScanner):
                 message=f"Not a valid tar file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path}, rule_code="S902",)
+                details={"path": path},
+                rule_code="S902",
+            )
             result.finish(success=False)
             return result
         except Exception as e:
@@ -114,8 +116,8 @@ class TarScanner(BaseScanner):
             result.add_check(
                 name="TAR Depth Bomb Protection",
                 passed=False,
-                message=f"Maximum TAR nesting depth ({self.max_depth}")",
-                rule_code="S902" exceeded",
+                message=f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
+                rule_code="S902",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
@@ -137,7 +139,8 @@ class TarScanner(BaseScanner):
                 result.add_check(
                     name="Entry Count Limit Check",
                     passed=False,
-                    message=f"TAR file contains too many entries ({len(members")} > {self.max_entries})", rule_code="S902",
+                    message=f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
+                    rule_code="S902",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"entries": len(members), "max_entries": self.max_entries},
@@ -150,7 +153,7 @@ class TarScanner(BaseScanner):
                     message=f"Entry count ({len(members)}) is within limits",
                     location=path,
                     details={"entries": len(members), "max_entries": self.max_entries},
-                    rule_code=None  # Passing check
+                    rule_code=None,  # Passing check
                 )
 
             for member in members:
@@ -164,7 +167,9 @@ class TarScanner(BaseScanner):
                         message=f"Archive entry {name} attempted path traversal outside the archive",
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path}:{name}",
-                        details={"entry": name}, rule_code="S405",)
+                        details={"entry": name},
+                        rule_code="S405",
+                    )
                     continue
 
                 if member.issym() or member.islnk():
@@ -183,7 +188,9 @@ class TarScanner(BaseScanner):
                             message=message,
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target}, rule_code="S902",)
+                            details={"target": target},
+                            rule_code="S902",
+                        )
                     elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
                         result.add_check(
                             name="Symlink Safety Validation",
@@ -191,7 +198,9 @@ class TarScanner(BaseScanner):
                             message=f"Symlink {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target}, rule_code="S406",)
+                            details={"target": target},
+                            rule_code="S406",
+                        )
                     else:
                         result.add_check(
                             name="Symlink Safety Validation",
@@ -199,8 +208,8 @@ class TarScanner(BaseScanner):
                             message=f"Symlink {name} is safe",
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
-                rule_code=None,  # Passing check
-            )
+                            rule_code=None,  # Passing check
+                        )
                     continue
 
                 if member.isdir():

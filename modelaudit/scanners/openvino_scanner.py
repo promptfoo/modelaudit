@@ -73,12 +73,10 @@ class OpenVinoScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "exception": str(
-                        e,
-                        rule_code="S902",
-                    ),
+                    "exception": str(e),
                     "exception_type": type(e).__name__,
                 },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -102,6 +100,9 @@ class OpenVinoScanner(BaseScanner):
                     details={"layer_type": layer_type, "layer_name": layer_name},
                     rule_code="S902",
                 )
+
+            # Check for external library references in layer attributes
+            library = layer.attrib.get("library") or layer.attrib.get("implementation")
             if library:
                 result.add_check(
                     name="External Library Reference Check",

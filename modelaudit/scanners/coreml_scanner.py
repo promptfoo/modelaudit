@@ -63,12 +63,10 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "exception": str(
-                        e,
-                        rule_code="S902",
-                    ),
+                    "exception": str(e),
                     "exception_type": type(e).__name__,
                 },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -117,12 +115,7 @@ class CoreMLScanner(BaseScanner):
                     passed=True,
                     message="No custom layers detected in Core ML model",
                     location=path,
-                    details={
-                        "layer_count": len(
-                            nn.layers,
-                            rule_code=None,  # Passing check
-                        )
-                    },
+                    details={"layer_count": len(nn.layers)},
                 )
 
         if spec.HasField("linkedModel"):

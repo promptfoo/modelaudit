@@ -60,11 +60,11 @@ class TensorRTScanner(BaseScanner):
                 result.add_check(
                     name="Suspicious Pattern Detection",
                     passed=False,
-                    message=f"Suspicious pattern '{pattern.decode('utf-8', 'ignore'"})",
-                rule_code="S902"}' found",
+                    message=f"Suspicious pattern '{pattern.decode('utf-8', 'ignore')}' found",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"pattern": pattern.decode("utf-8", "ignore")},
+                    rule_code="S902",
                 )
 
         result.finish(success=not result.has_errors)

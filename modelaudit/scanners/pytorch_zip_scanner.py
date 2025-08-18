@@ -80,7 +80,9 @@ class PyTorchZipScanner(BaseScanner):
                 message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path}, rule_code="S902",)
+                details={"path": path},
+                rule_code="S902",
+            )
             result.finish(success=False)
             return result
         else:
@@ -109,7 +111,9 @@ class PyTorchZipScanner(BaseScanner):
                             message=f"Archive entry {name} attempted path traversal outside the archive",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"entry": name}, rule_code="S405",)
+                            details={"entry": name},
+                            rule_code="S405",
+                        )
                         path_traversal_found = True
                         continue
                     safe_entries.append(name)
@@ -121,7 +125,7 @@ class PyTorchZipScanner(BaseScanner):
                         message="All archive entries have safe paths",
                         location=path,
                         details={"entries_checked": len(z.namelist())},
-                        rule_code=None  # Passing check
+                        rule_code=None,  # Passing check
                     )
                 # Find pickle files - PyTorch models often use various names
                 # Common patterns: data.pkl, archive/data.pkl, *.pkl, or any file with pickle magic bytes
@@ -291,7 +295,9 @@ class PyTorchZipScanner(BaseScanner):
                         message="PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models.",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
-                        details={"missing_file": "data.pkl"}, rule_code="S1101",)
+                        details={"missing_file": "data.pkl"},
+                        rule_code="S1101",
+                    )
                 else:
                     result.add_check(
                         name="PyTorch Structure Validation",
@@ -339,12 +345,14 @@ class PyTorchZipScanner(BaseScanner):
                                                 passed=False,
                                                 message=f"Blacklisted pattern '{pattern}' found in file {name}",
                                                 severity=IssueSeverity.CRITICAL,
-                                                location=f"{self.current_file_path} ({name})", rule_code="S1001"",
+                                                location=f"{self.current_file_path} ({name})",
                                                 details={
                                                     "pattern": pattern,
                                                     "file": name,
                                                     "file_type": "text",
-                                                }, rule_code="S1001",)
+                                                },
+                                                rule_code="S1001",
+                                            )
                                 except UnicodeDecodeError:
                                     # Skip blacklist checking for binary files
                                     # that can't be decoded as text
@@ -355,12 +363,14 @@ class PyTorchZipScanner(BaseScanner):
                                 passed=False,
                                 message=f"Error reading file {name}: {e!s}",
                                 severity=IssueSeverity.DEBUG,
-                                location=f"{self.current_file_path} ({name})", rule_code="S902"",
+                                location=f"{self.current_file_path} ({name})",
                                 details={
                                     "zip_entry": name,
                                     "exception": str(e),
                                     "exception_type": type(e).__name__,
-                                }, rule_code="S902",)
+                                },
+                                rule_code="S902",
+                            )
 
                 result.bytes_scanned = bytes_scanned
 
@@ -371,7 +381,9 @@ class PyTorchZipScanner(BaseScanner):
                 message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"path": path}, rule_code="S902",)
+                details={"path": path},
+                rule_code="S902",
+            )
             result.finish(success=False)
             return result
         except Exception as e:
@@ -382,7 +394,7 @@ class PyTorchZipScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
-                rule_code="S902"
+                rule_code="S902",
             )
             result.finish(success=False)
             return result

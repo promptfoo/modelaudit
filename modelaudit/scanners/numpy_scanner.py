@@ -137,8 +137,7 @@ class NumPyScanner(BaseScanner):
             result.add_check(
                 name="NumPy Format Module Check",
                 passed=False,
-                message=f"NumPy format module not available (NumPy {NUMPY_VERSION}")",
-                rule_code="S902". May be a compatibility issue.",
+                message=f"NumPy format module not available (NumPy {NUMPY_VERSION}). May be a compatibility issue.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 rule_code=None,  # Library availability, no rule
