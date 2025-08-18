@@ -67,12 +67,8 @@ class OciLayerScanner(BaseScanner):
                 message=f"Error parsing manifest: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={
-                    "exception_type": type(
-                        e,
-                        rule_code="S902",
-                    ).__name__
-                },
+                details={"exception_type": type(e).__name__},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -166,7 +162,8 @@ class OciLayerScanner(BaseScanner):
                     message=f"Error processing layer {layer_ref}: {e}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
-                    details={"exception_type": type(e, rule_code="S902").__name__},
+                    details={"exception_type": type(e).__name__},
+                    rule_code="S902",
                 )
 
         result.finish(success=True)

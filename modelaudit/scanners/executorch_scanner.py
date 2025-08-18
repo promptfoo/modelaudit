@@ -144,12 +144,10 @@ class ExecuTorchScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "exception": str(
-                        e,
-                        rule_code="S902",
-                    ),
+                    "exception": str(e),
                     "exception_type": type(e).__name__,
                 },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result

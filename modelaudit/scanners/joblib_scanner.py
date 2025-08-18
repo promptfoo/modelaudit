@@ -136,10 +136,11 @@ class JoblibScanner(BaseScanner):
                     result.add_check(
                         name="Compression Bomb Detection",
                         passed=False,
-                        message=str(e, rule_code="S902"),
+                        message=str(e),
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"security_check": "compression_bomb_detection"},
+                        rule_code="S902",
                     )
                     result.finish(success=False)
                     return result
@@ -151,12 +152,10 @@ class JoblibScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
-                            "exception": str(
-                                e,
-                                rule_code="S902",
-                            ),
+                            "exception": str(e),
                             "exception_type": type(e).__name__,
                         },
+                        rule_code="S902",
                     )
                     result.finish(success=False)
                     return result
@@ -175,12 +174,10 @@ class JoblibScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "exception": str(
-                        e,
-                        rule_code="S902",
-                    ),
+                    "exception": str(e),
                     "exception_type": type(e).__name__,
                 },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result

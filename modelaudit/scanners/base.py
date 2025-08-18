@@ -194,9 +194,9 @@ class ScanResult:
 
         # Apply severity override from config
         if rule_code and severity is not None:
-            rule = RuleRegistry.get_rule(rule_code)
-            if rule:
-                configured_severity = config.get_severity(rule_code, rule.default_severity)
+            config_rule = RuleRegistry.get_rule(rule_code)
+            if config_rule:
+                configured_severity = config.get_severity(rule_code, config_rule.default_severity)
                 severity_map = {
                     Severity.CRITICAL: IssueSeverity.CRITICAL,
                     Severity.HIGH: IssueSeverity.CRITICAL,
@@ -276,9 +276,9 @@ class ScanResult:
 
         # Apply severity override from config
         if rule_code:
-            rule = RuleRegistry.get_rule(rule_code)
-            if rule:
-                configured_severity = config.get_severity(rule_code, rule.default_severity)
+            config_rule = RuleRegistry.get_rule(rule_code)
+            if config_rule:
+                configured_severity = config.get_severity(rule_code, config_rule.default_severity)
                 severity_map = {
                     Severity.CRITICAL: IssueSeverity.CRITICAL,
                     Severity.HIGH: IssueSeverity.CRITICAL,

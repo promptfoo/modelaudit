@@ -105,8 +105,8 @@ class PmmlScanner(BaseScanner):
                     location=path,
                     why="PMML files should be valid UTF-8 encoded XML. Non-UTF-8 characters may indicate "
                     "corruption or malicious content.",
-                rule_code="S902"
-            )
+                    rule_code="S902",
+                )
             except Exception as e:
                 result.add_check(
                     name="PMML Text Decoding",
@@ -136,8 +136,8 @@ class PmmlScanner(BaseScanner):
                     location=path,
                     why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. "
                     "Install defusedxml for better security.",
-                rule_code="S902"
-            )
+                    rule_code="S902",
+                )
                 root = UnsafeET.fromstring(text)
         except Exception as e:
             result.add_check(
@@ -182,10 +182,10 @@ class PmmlScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"construct": construct},
-                    why=f"{construct} declarations can enable XML External Entity (XXE), rule_code="S902" attacks, "
+                    why=f"{construct} declarations can enable XML External Entity (XXE) attacks, "
                     "allowing attackers to read local files, perform SSRF attacks, or cause denial of service.",
-                    rule_code="S902"
-            )
+                    rule_code="S902",
+                )
 
     def _validate_pmml_structure(self, root, result: ScanResult, path: str) -> None:
         """Validate basic PMML structure and extract metadata."""
@@ -197,7 +197,7 @@ class PmmlScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 why="Valid PMML files should have <PMML> as the root element.",
-                rule_code="S902"
+                rule_code="S902",
             )
         else:
             version = root.attrib.get("version", "")
@@ -210,8 +210,8 @@ class PmmlScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     why="PMML files should specify a version for compatibility.",
-                rule_code="S902"
-            )
+                    rule_code="S902",
+                )
 
     def _check_suspicious_content(self, root, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
@@ -240,8 +240,9 @@ class PmmlScanner(BaseScanner):
                         details={"tag": elem.tag, "url_pattern": url_pattern},
                         why=(
                             "External references in PMML files may be used to exfiltrate data or perform "
-                            "network requests."),
-                rule_code="S902",
+                            "network requests."
+                        ),
+                        rule_code="S902",
                     )
                     break
 
@@ -255,8 +256,8 @@ class PmmlScanner(BaseScanner):
                     location=path,
                     details={"tag": elem.tag},
                     why="Suspicious XML elements may contain executable code or scripts.",
-                rule_code="S902"
-            )
+                    rule_code="S902",
+                )
 
             # Special attention to Extension elements which can contain arbitrary content
             if elem.tag.lower() == "extension":
@@ -271,8 +272,9 @@ class PmmlScanner(BaseScanner):
                             details={"tag": elem.tag, "pattern": pattern},
                             why=(
                                 "Extension elements can contain arbitrary content and may be used to embed "
-                                "malicious code or scripts."),
-                rule_code="S902",
+                                "malicious code or scripts."
+                            ),
+                            rule_code="S902",
                         )
                         break
 
