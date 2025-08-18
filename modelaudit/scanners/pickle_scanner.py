@@ -1317,7 +1317,10 @@ class PickleScanner(BaseScanner):
             # Track stack depth for complexity analysis
             current_stack_depth = 0
             max_stack_depth = 0
-            stack_depth_limit = 1000  # Safety limit for stack depth
+            # Dynamic stack depth limit - will be adjusted based on ML context
+            base_stack_depth_limit = 1000  # Base limit for unknown content
+            # Store warnings for ML-context-aware processing
+            stack_depth_warnings: list[dict[str, Union[int, str]]] = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 # Check for interrupts periodically during opcode processing
@@ -1339,27 +1342,37 @@ class PickleScanner(BaseScanner):
                 elif opcode.name == "STOP":
                     current_stack_depth = 0
 
-                # Check if stack depth exceeds limit
-                if current_stack_depth > stack_depth_limit:
-                    result.add_check(
-                        name="Stack Depth Safety Check",
-                        passed=False,
-                        message=f"Stack depth ({current_stack_depth}) exceeds safety limit",
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        details={
-                            "current_depth": current_stack_depth,
-                            "max_allowed": stack_depth_limit,
-                            "position": pos,
-                            "opcode": opcode.name,
-                        },
-                        why=(
-                            "Excessive stack depth could indicate a maliciously crafted pickle "
-                            "designed to cause resource exhaustion."
-                        ),
-                        rule_code="S902",
+                # Store stack depth warnings for ML-context-aware processing later
+                if current_stack_depth > base_stack_depth_limit:
+                    # Don't break immediately - store the warning for context-aware processing
+                    stack_depth_warnings.append(
+                        {
+                            "current_depth": int(current_stack_depth),
+                            "position": int(pos) if pos is not None else 0,
+                            "opcode": str(opcode.name),
+                        }
                     )
-                    break
+                    # Only break if stack depth becomes extremely high (10x base limit)
+                    # to prevent actual resource exhaustion attacks
+                    if current_stack_depth > base_stack_depth_limit * 10:
+                        result.add_check(
+                            name="Stack Depth Safety Check",
+                            passed=False,
+                            message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            details={
+                                "current_depth": current_stack_depth,
+                                "max_allowed": base_stack_depth_limit * 10,
+                                "position": pos,
+                                "opcode": opcode.name,
+                            },
+                            why=(
+                                "Stack depth is extremely high and could indicate a maliciously crafted pickle "
+                                "designed to cause resource exhaustion."
+                            ),
+                        )
+                        break
 
                 # Track strings for STACK_GLOBAL analysis
                 if opcode.name in [
@@ -1422,8 +1435,82 @@ class PickleScanner(BaseScanner):
                     },
                 )
 
-            # Add stack depth validation check
-            if max_stack_depth <= stack_depth_limit:
+            # SMART DETECTION: Analyze ML context once for the entire pickle
+            ml_context = _detect_ml_context(opcodes)
+
+            # ML-context-aware stack depth validation
+            ml_confidence = ml_context.get("overall_confidence", 0)
+            is_ml_content = ml_context.get("is_ml_content", False)
+
+            # Determine appropriate stack depth limit based on ML context
+            if is_ml_content and ml_confidence > 0.5:
+                # High-confidence ML content gets much higher limits
+                adjusted_stack_depth_limit = 5000
+            elif is_ml_content and ml_confidence > 0.2:
+                # Medium-confidence ML content gets moderately higher limits
+                # PyTorch models often have lower confidence due to complex serialization
+                adjusted_stack_depth_limit = 2500
+            else:
+                # Unknown/suspicious content keeps the base limit
+                adjusted_stack_depth_limit = base_stack_depth_limit
+
+            # Process stored stack depth warnings with ML context
+            if stack_depth_warnings:
+                # Filter warnings based on adjusted limit
+                significant_warnings = [
+                    w
+                    for w in stack_depth_warnings
+                    if isinstance(w["current_depth"], int) and w["current_depth"] > adjusted_stack_depth_limit
+                ]
+
+                if significant_warnings:
+                    # Report only the most severe warning to avoid spam
+                    def get_depth(x):
+                        return x["current_depth"] if isinstance(x["current_depth"], int) else 0
+
+                    worst_warning = max(significant_warnings, key=get_depth)
+                    severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+
+                    result.add_check(
+                        name="Stack Depth Safety Check",
+                        passed=False,
+                        message=f"Stack depth ({worst_warning['current_depth']}) exceeds ML-context-aware limit",
+                        severity=severity,
+                        location=f"{self.current_file_path} (pos {worst_warning['position']})",
+                        details={
+                            "current_depth": worst_warning["current_depth"],
+                            "ml_adjusted_limit": adjusted_stack_depth_limit,
+                            "base_limit": base_stack_depth_limit,
+                            "opcode": worst_warning["opcode"],
+                            "ml_context_confidence": ml_confidence,
+                            "total_warnings": len(stack_depth_warnings),
+                            "significant_warnings": len(significant_warnings),
+                        },
+                        why=(
+                            "Excessive stack depth could indicate a maliciously crafted pickle designed to cause "
+                            "resource exhaustion. The limit has been adjusted based on detected ML framework patterns."
+                        ),
+                    )
+                else:
+                    # Warnings were filtered out as benign for ML content
+                    max_filtered_depth = max(
+                        w["current_depth"] for w in stack_depth_warnings if isinstance(w["current_depth"], int)
+                    )
+                    result.add_check(
+                        name="Stack Depth Safety Check",
+                        passed=True,
+                        message=(f"Stack depth warnings filtered as benign for ML content (max: {max_filtered_depth})"),
+                        location=self.current_file_path,
+                        details={
+                            "max_depth_reached": max_stack_depth,
+                            "ml_adjusted_limit": adjusted_stack_depth_limit,
+                            "base_limit": base_stack_depth_limit,
+                            "ml_context_confidence": ml_confidence,
+                            "warnings_filtered": len(stack_depth_warnings),
+                        },
+                    )
+            else:
+                # No stack depth warnings - everything is within base limits
                 result.add_check(
                     name="Stack Depth Validation",
                     passed=True,
@@ -1432,15 +1519,14 @@ class PickleScanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "max_depth_reached": max_stack_depth,
-                        "safe_threshold": stack_depth_limit,
+                        "ml_adjusted_limit": adjusted_stack_depth_limit,
+                        "base_limit": base_stack_depth_limit,
+                        "ml_context_confidence": ml_confidence,
                     },
                 )
 
             # Also add to metadata for analysis
             result.metadata["max_stack_depth"] = max_stack_depth
-
-            # SMART DETECTION: Analyze ML context once for the entire pickle
-            ml_context = _detect_ml_context(opcodes)
 
             # Add ML context to metadata for debugging
             result.metadata.update(
