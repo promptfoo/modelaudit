@@ -225,19 +225,50 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 <details>
 <summary><b>View all available extras and what they include</b></summary>
 
+**Core ML Frameworks:**
+
 | Extra           | Includes                      | Use When                                |
 | --------------- | ----------------------------- | --------------------------------------- |
-| `[tensorflow]`  | TensorFlow framework          | Scanning `.pb` SavedModel files         |
-| `[pytorch]`     | PyTorch framework             | Scanning `.pt`, `.pth` files            |
-| `[h5]`          | h5py library                  | Scanning `.h5`, `.keras`, `.hdf5` files |
-| `[onnx]`        | ONNX runtime                  | Scanning `.onnx` model files            |
-| `[safetensors]` | SafeTensors library           | Scanning `.safetensors` files           |
-| `[flax]`        | msgpack for JAX/Flax          | Scanning `.msgpack`, `.flax` files      |
-| `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure            |
-| `[mlflow]`      | MLflow library                | Scanning MLflow model registry          |
-| `[huggingface]` | huggingface-hub library       | Downloading models from HuggingFace     |
-| `[all]`         | All ML frameworks             | Maximum compatibility                   |
-| `[numpy1]`      | All ML frameworks + NumPy<2.0 | When facing NumPy conflicts             |
+| `[h5]`          | h5py                          | Scanning `.h5`, `.keras`, `.hdf5` files |
+| `[onnx]`        | onnx                          | Scanning `.onnx` model files            |
+| `[pytorch]`     | torch                         | Scanning `.pt`, `.pth`, `.ckpt` files   |
+| `[safetensors]` | safetensors                   | Scanning `.safetensors` files           |
+| `[tensorflow]`  | tensorflow                    | Scanning `.pb` SavedModel files         |
+
+**Specialized Tools:**
+
+| Extra           | Includes                      | Use When                                |
+| --------------- | ----------------------------- | --------------------------------------- |
+| `[coreml]`      | coremltools                   | Scanning `.mlmodel` Core ML files       |
+| `[flax]`        | msgpack                       | Scanning `.msgpack`, `.flax` JAX files  |
+| `[tensorrt]`    | tensorrt                      | Scanning TensorRT engine files          |
+| `[tflite]`      | tflite                        | Scanning `.tflite` TensorFlow Lite files|
+| `[yaml]`        | pyyaml                        | Scanning YAML configuration files       |
+
+**Data & Storage:**
+
+| Extra           | Includes                      | Use When                                |
+| --------------- | ----------------------------- | --------------------------------------- |
+| `[cloud]`       | fsspec, s3fs, gcsfs           | Scanning from S3, GCS, Azure storage    |
+| `[dill]`        | dill                          | Scanning `.dill` serialized files       |
+| `[joblib]`      | joblib, scikit-learn          | Scanning `.joblib` scikit-learn models  |
+
+**Integration:**
+
+| Extra           | Includes                      | Use When                                |
+| --------------- | ----------------------------- | --------------------------------------- |
+| `[huggingface]` | huggingface-hub (optional)    | Explicit HuggingFace model downloads¹   |
+| `[mlflow]`      | mlflow                        | Scanning MLflow model registry          |
+
+**Meta-packages:**
+
+| Extra           | Includes                      | Use When                                |
+| --------------- | ----------------------------- | --------------------------------------- |
+| `[all-ci]`      | All frameworks (no platform)  | CI/CD environments                      |
+| `[all]`         | All frameworks + tools        | Maximum compatibility                   |
+| `[numpy1]`      | All frameworks + NumPy<2.0    | Resolving NumPy compatibility conflicts |
+
+¹ *Note: `huggingface-hub` is included in base installation; this extra is optional for explicit dependency management.*
 
 </details>
 
