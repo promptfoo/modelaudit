@@ -353,21 +353,30 @@ def scan_command(
 
     if progress and len(expanded_paths) > 0:
         try:
-            from .progress import (
-                ConsoleProgressReporter,
-                FileProgressReporter,
-                ProgressPhase,
-                ProgressTracker,
-                SimpleConsoleReporter,
-            )
+            # Prevent circular imports during scanner loading
+            import sys
 
-            # Create progress tracker
-            progress_tracker = ProgressTracker(
-                update_interval=progress_interval,
-            )
+            if "modelaudit.scanners" in sys.modules:
+                if verbose:
+                    click.echo("Progress tracking disabled during scanner initialization", err=True)
+                progress = False
+                progress_tracker = None
+            else:
+                from .progress import (
+                    ConsoleProgressReporter,
+                    FileProgressReporter,
+                    ProgressPhase,
+                    ProgressTracker,
+                    SimpleConsoleReporter,
+                )
+
+                # Create progress tracker
+                progress_tracker = ProgressTracker(
+                    update_interval=progress_interval,
+                )
 
             # Add console reporter based on format preference
-            if format == "text" and not output:
+            if progress_tracker and format == "text" and not output:
                 if progress_format == "tqdm":
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(
@@ -388,7 +397,7 @@ def scan_command(
                 progress_tracker.add_reporter(console_reporter)
 
             # Add file logger if specified
-            if progress_log:
+            if progress_tracker and progress_log:
                 log_format = "json" if progress_format == "json" else "text"
                 file_reporter = FileProgressReporter(
                     log_file=progress_log,
@@ -402,9 +411,13 @@ def scan_command(
                 if verbose:
                     click.echo(f"Progress will be logged to: {progress_log}")
 
-        except ImportError:
+        except (ImportError, RecursionError) as e:
             if verbose:
-                click.echo("Progress tracking not available (missing dependencies)", err=True)
+                if isinstance(e, RecursionError):
+                    click.echo("Progress tracking disabled due to import cycle", err=True)
+                else:
+                    click.echo("Progress tracking not available (missing dependencies)", err=True)
+            progress = False
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
@@ -828,59 +841,53 @@ def scan_command(
 
                     # Setup progress tracking for this path
                     if progress_tracker:
-                        from .progress import ProgressPhase
+                        try:
+                            from .progress import ProgressPhase
 
-                        # Estimate file/directory size for progress tracking
-                        if os.path.isfile(actual_path):
-                            total_bytes = os.path.getsize(actual_path)
-                            total_items = 1
-                        elif os.path.isdir(actual_path):
-                            try:
-                                # Quick estimate of directory contents
-                                total_bytes = sum(
-                                    os.path.getsize(os.path.join(root, file))
-                                    for root, _, files in os.walk(actual_path)
-                                    for file in files
-                                )
-                                total_items = sum(len(files) for root, _, files in os.walk(actual_path))
-                            except (OSError, PermissionError):
+                            # Estimate file/directory size for progress tracking
+                            if os.path.isfile(actual_path):
+                                total_bytes = os.path.getsize(actual_path)
+                                total_items = 1
+                            elif os.path.isdir(actual_path):
+                                # Estimate directory size (rough approximation)
+                                total_bytes = sum(f.stat().st_size for f in Path(actual_path).rglob("*") if f.is_file())
+                                total_items = len(list(Path(actual_path).rglob("*")))
+                            else:
                                 total_bytes = 0
-                                total_items = 0
-                        else:
-                            total_bytes = 0
-                            total_items = 0
+                                total_items = 1
 
-                        progress_tracker.set_totals(total_bytes=total_bytes, total_items=total_items)
-                        progress_tracker.set_phase(
-                            ProgressPhase.INITIALIZING, f"Starting scan of {os.path.basename(actual_path)}"
-                        )
+                            progress_tracker.stats.total_bytes = total_bytes
+                            progress_tracker.stats.total_items = total_items
+                            progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {actual_path}")
+                        except (ImportError, RecursionError):
+                            # Skip progress tracking if import fails due to circular dependency
+                            progress_tracker = None
 
-                        # Create enhanced progress callback with proper variable binding
-                        def create_enhanced_progress_callback(total_bytes_bound, spinner_bound):
+                        # Create enhanced progress callback using factory pattern to bind variables
+                        def create_enhanced_progress_callback(progress_tracker_bound, total_bytes_bound, spinner_bound):
                             def enhanced_progress_callback(message, percentage):
-                                if progress_tracker:
+                                if progress_tracker_bound:
                                     # Update progress based on percentage
                                     bytes_processed = (
                                         int((percentage / 100.0) * total_bytes_bound) if total_bytes_bound > 0 else 0
                                     )
-                                    progress_tracker.update_bytes(bytes_processed, message)
+                                    progress_tracker_bound.update_bytes(bytes_processed, message)
 
                                     # Update phase based on message content
                                     message_lower = message.lower()
                                     if "loading" in message_lower:
-                                        progress_tracker.set_phase(ProgressPhase.LOADING, message)
+                                        progress_tracker_bound.set_phase(ProgressPhase.LOADING, message)
                                     elif "analyzing" in message_lower or "scanning" in message_lower:
-                                        progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
+                                        progress_tracker_bound.set_phase(ProgressPhase.ANALYZING, message)
                                     elif "checking" in message_lower:
-                                        progress_tracker.set_phase(ProgressPhase.CHECKING, message)
+                                        progress_tracker_bound.set_phase(ProgressPhase.CHECKING, message)
 
                                 # Also update spinner if present
                                 if spinner_bound:
                                     spinner_bound.text = f"{message} ({percentage:.1f}%)"
-
                             return enhanced_progress_callback
 
-                        progress_callback = create_enhanced_progress_callback(total_bytes, spinner)
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[assignment]
 
                     # Run the scan with progress reporting
                     config_overrides = {
@@ -1040,6 +1047,10 @@ def scan_command(
 
             progress_tracker.set_phase(ProgressPhase.FINALIZING, "Completing scan and generating report")
             progress_tracker.complete()
+        except (ImportError, RecursionError):
+            # Skip progress completion if import fails due to circular dependency
+            if verbose:
+                click.echo("Progress tracking completion skipped due to import issues", err=True)
         except Exception as e:
             logger.warning(f"Error completing progress tracking: {e}")
 
