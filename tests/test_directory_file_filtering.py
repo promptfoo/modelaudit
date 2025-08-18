@@ -112,7 +112,7 @@ class TestDirectoryFileFiltering:
             # Resolve paths to handle system-specific path resolution differences
             license_plain_resolved = str(license_plain.resolve())
             license_txt_resolved = str(license_txt.resolve())
-            
+
             assert license_plain_resolved in file_meta
             assert file_meta[license_plain_resolved]["license_info"]
             assert license_txt_resolved in file_meta
