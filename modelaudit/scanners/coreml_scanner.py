@@ -62,9 +62,13 @@ class CoreMLScanner(BaseScanner):
                 message=f"Invalid Core ML file or parse error: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e,
-                rule_code="S902",
-            ), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(
+                        e,
+                        rule_code="S902",
+                    ),
+                    "exception_type": type(e).__name__,
+                },
             )
             result.finish(success=False)
             return result
@@ -103,8 +107,8 @@ class CoreMLScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"layer": layer.name, "class_name": class_name},
-                rule_code="S902",
-            )
+                        rule_code="S902",
+                    )
                     custom_layers_found = True
 
             if not custom_layers_found and nn.layers:
@@ -113,9 +117,12 @@ class CoreMLScanner(BaseScanner):
                     passed=True,
                     message="No custom layers detected in Core ML model",
                     location=path,
-                    details={"layer_count": len(nn.layers,
-                rule_code=None,  # Passing check
-            )},
+                    details={
+                        "layer_count": len(
+                            nn.layers,
+                            rule_code=None,  # Passing check
+                        )
+                    },
                 )
 
         if spec.HasField("linkedModel"):
@@ -125,8 +132,8 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model links to external model",
                 severity=IssueSeverity.WARNING,
                 location=path,
-            rule_code="S610"
-                )
+                rule_code="S610",
+            )
         else:
             result.add_check(
                 name="External Model Link Check",
@@ -143,8 +150,8 @@ class CoreMLScanner(BaseScanner):
                 message="Core ML model contains serialized sub-model",
                 severity=IssueSeverity.WARNING,
                 location=path,
-            rule_code="S902"
-                )
+                rule_code="S902",
+            )
         else:
             result.add_check(
                 name="Serialized Sub-Model Check",

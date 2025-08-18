@@ -85,8 +85,9 @@ class SafeTensorsScanner(BaseScanner):
                         message="File too small to contain SafeTensors header length",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"bytes_read": len(header_len_bytes,
-                    rule_code="S902")}, rule_code="S902"  # Corrupted structure)
+                        details={"bytes_read": len(header_len_bytes)},
+                        rule_code="S902"  # Corrupted structure
+                    )
                     result.finish(success=False)
                     return result
 
@@ -98,7 +99,9 @@ class SafeTensorsScanner(BaseScanner):
                         message="Invalid SafeTensors header length",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"header_len": header_len, "max_allowed": file_size - 8}, rule_code="S902",  # Corrupted structure)
+                        details={"header_len": header_len, "max_allowed": file_size - 8},
+                        rule_code="S902",  # Corrupted structure
+                    )
                     result.finish(success=False)
                     return result
                 else:
@@ -119,8 +122,9 @@ class SafeTensorsScanner(BaseScanner):
                         message="Failed to read SafeTensors header",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"bytes_read": len(header_bytes,
-                    rule_code="S902"), "expected": header_len}, rule_code="S902"  # Corrupted structure)
+                        details={"bytes_read": len(header_bytes), "expected": header_len},
+                        rule_code="S902"  # Corrupted structure
+                    )
                     result.finish(success=False)
                     return result
 
@@ -132,7 +136,6 @@ class SafeTensorsScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         rule_code="S902",  # Corrupted structure
-            )
                     )
                     result.finish(success=False)
                     return result
@@ -154,7 +157,9 @@ class SafeTensorsScanner(BaseScanner):
                         message=f"Invalid JSON header: {e!s}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"exception": str(e)}, rule_code="S902"}, rule_code="S902"  # Corrupted structure)
+                        details={"exception": str(e)},
+                        rule_code="S902"  # Corrupted structure
+                    )
                     result.finish(success=False)
                     return result
 
@@ -175,8 +180,9 @@ class SafeTensorsScanner(BaseScanner):
                             message=f"Invalid tensor entry for {name}",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"tensor": name, "actual_type": type(info,
-                    rule_code="S902").__name__, "expected_type": "dict"}, rule_code="S902"  # Corrupted structure)
+                            details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
+                            rule_code="S902"  # Corrupted structure
+                        )
                         continue
 
                     begin, end = info.get("data_offsets", [0, 0])
@@ -340,7 +346,6 @@ class SafeTensorsScanner(BaseScanner):
                                         details={"key": key, "pattern": pattern},
                                         why="Metadata matched known suspicious pattern",
                                         rule_code="S905",  # Suspicious metadata
-            )
                                     )
                                     break
 
@@ -354,7 +359,9 @@ class SafeTensorsScanner(BaseScanner):
                 message=f"Error scanning SafeTensors file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), rule_code="S703", "exception_type": type(e).__name__}, rule_code="S902"  # Scan error/corruption)
+                details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S902"  # Scan error/corruption
+            )
             result.finish(success=False)
             return result
 

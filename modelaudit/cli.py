@@ -295,21 +295,20 @@ def scan_command(
     """
     # Configure rule suppression and severity overrides
     from .config import ModelAuditConfig, set_config
-    
+
     # Parse CLI severity overrides
     severity_overrides = {}
     for sev in severity:
         if "=" in sev:
             rule_code, sev_level = sev.split("=", 1)
             severity_overrides[rule_code] = sev_level
-    
+
     # Create config from CLI args
     cli_config = ModelAuditConfig.from_cli_args(
-        suppress=list(suppress) if suppress else None,
-        severity=severity_overrides if severity_overrides else None
+        suppress=list(suppress) if suppress else None, severity=severity_overrides if severity_overrides else None
     )
     set_config(cli_config)
-    
+
     # Expand DVC pointer files before scanning
     expanded_paths = []
     for p in paths:
@@ -1302,7 +1301,7 @@ def _format_issue(
 
     # Build the issue line
     icon = icons.get(severity, "    └─ ")
-    
+
     # Add rule code if available
     if rule_code:
         rule_str = style_text(f"[{rule_code}]", fg="yellow", bold=True)
@@ -1342,42 +1341,44 @@ def _format_issue(
 
 @cli.command("rules")
 @click.argument("rule_code", required=False)
-@click.option(
-    "--list", "list_rules", is_flag=True, help="List all rules"
-)
-@click.option(
-    "--category", help="Show rules in a category range (e.g., 100-199)"
-)
-@click.option(
-    "--format", type=click.Choice(["table", "json"]), default="table", help="Output format"
-)
+@click.option("--list", "list_rules", is_flag=True, help="List all rules")
+@click.option("--category", help="Show rules in a category range (e.g., 100-199)")
+@click.option("--format", type=click.Choice(["table", "json"]), default="table", help="Output format")
 def rules_command(rule_code: Optional[str], list_rules: bool, category: Optional[str], format: str) -> None:
     """View and explain security rules."""
     from .rules import RuleRegistry
-    
+
     # Initialize rules
     RuleRegistry.initialize()
-    
+
     if rule_code:
         # Show specific rule
         rule = RuleRegistry.get_rule(rule_code.upper())
         if not rule:
             click.echo(f"Rule {rule_code} not found", err=True)
             sys.exit(1)
-        
+
         if format == "json":
-            click.echo(json.dumps({
-                "code": rule.code,
-                "name": rule.name,
-                "severity": rule.default_severity.value,
-                "description": rule.description,
-            }, indent=2))
+            click.echo(
+                json.dumps(
+                    {
+                        "code": rule.code,
+                        "name": rule.name,
+                        "severity": rule.default_severity.value,
+                        "description": rule.description,
+                    },
+                    indent=2,
+                )
+            )
         else:
             click.echo(f"Code: {style_text(rule.code, bold=True)}")
             click.echo(f"Name: {rule.name}")
-            click.echo(f"Default Severity: {style_text(rule.default_severity.value, fg=get_severity_color(rule.default_severity.value))}")
+            severity_text = style_text(
+                rule.default_severity.value, fg=get_severity_color(rule.default_severity.value)
+            )
+            click.echo(f"Default Severity: {severity_text}")
             click.echo(f"Description: {rule.description}")
-    
+
     elif category:
         # Show category range
         try:
@@ -1389,17 +1390,17 @@ def rules_command(rule_code: Optional[str], list_rules: bool, category: Optional
                 # Single category like "100" means 100-199
                 start = int(category)
                 end = start + 99
-            
+
             rules = RuleRegistry.get_rules_by_range(start, end)
             if not rules:
                 click.echo(f"No rules found in range S{start}-S{end}", err=True)
                 sys.exit(1)
-            
+
             display_rules(rules, format)
         except ValueError:
             click.echo(f"Invalid category format: {category}", err=True)
             sys.exit(1)
-    
+
     else:
         # List all rules
         rules = RuleRegistry.get_all_rules()
@@ -1444,7 +1445,7 @@ def display_rules(rules: dict, format: str) -> None:
                     categories[cat].append(rule)
                 except ValueError:
                     continue
-        
+
         # Display by category
         category_names = {
             100: "Code Execution",
@@ -1459,11 +1460,11 @@ def display_rules(rules: dict, format: str) -> None:
             1000: "Supply Chain",
             1100: "Framework-Specific",
         }
-        
+
         for cat in sorted(categories.keys()):
-            cat_name = category_names.get(cat, f"S{cat}-S{cat+99}")
-            click.echo(f"\n{style_text(f'=== {cat_name} (S{cat}-S{cat+99}) ===', bold=True)}")
-            
+            cat_name = category_names.get(cat, f"S{cat}-S{cat + 99}")
+            click.echo(f"\n{style_text(f'=== {cat_name} (S{cat}-S{cat + 99}) ===', bold=True)}")
+
             for rule in categories[cat]:
                 severity_color = get_severity_color(rule.default_severity.value)
                 click.echo(

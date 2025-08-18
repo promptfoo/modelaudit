@@ -59,8 +59,8 @@ class OpenVinoScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=bin_path,
                 details={"expected_file": bin_path},
-            rule_code="S701"
-                )
+                rule_code="S701",
+            )
 
         try:
             tree = DefusedET.parse(path)
@@ -72,9 +72,13 @@ class OpenVinoScanner(BaseScanner):
                 message=f"Invalid OpenVINO XML: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e,
-                rule_code="S902",
-            ), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(
+                        e,
+                        rule_code="S902",
+                    ),
+                    "exception_type": type(e).__name__,
+                },
             )
             result.finish(success=False)
             return result
@@ -95,7 +99,8 @@ class OpenVinoScanner(BaseScanner):
                     message=f"OpenVINO model uses {layer_type} layer '{layer_name}'",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"layer_type": layer_type, "layer_name": layer_name},rule_code="S902"
+                    details={"layer_type": layer_type, "layer_name": layer_name},
+                    rule_code="S902",
                 )
             if library:
                 result.add_check(
@@ -105,8 +110,8 @@ class OpenVinoScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"layer_name": layer_name, "library": library},
-                rule_code="S902",
-            )
+                    rule_code="S902",
+                )
             for attr_val in layer.attrib.values():
                 if suspicious_pattern.search(str(attr_val)):
                     result.add_check(
@@ -116,8 +121,8 @@ class OpenVinoScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"attribute": attr_val},
-                rule_code="S902",
-            )
+                        rule_code="S902",
+                    )
 
         result.finish(success=not result.has_errors)
         return result

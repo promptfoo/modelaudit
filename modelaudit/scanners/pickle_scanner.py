@@ -1217,7 +1217,6 @@ class PickleScanner(BaseScanner):
                     why=(
                         f"The file contains the dangerous pattern '{pattern_str}' "
                         f"which could indicate malicious code execution during unpickling."),
-                rule_code="S902",
                     rule_code=pattern_rule_code
                 )
 
@@ -1270,11 +1269,11 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Pickle Protocol Version Check",
                         passed=False,
-                        message=f"Unsupported pickle protocol version {protocol_version} (max supported: 5")",
-                rule_code="S902"",
+                        message=f"Unsupported pickle protocol version {protocol_version} (max supported: 5)",
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"protocol_version": protocol_version, "max_supported": 5},
+                        rule_code="S902",
                     )
                 else:
                     result.add_check(
@@ -1343,8 +1342,7 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Stack Depth Safety Check",
                         passed=False,
-                        message=f"Stack depth ({current_stack_depth}")",
-                rule_code="S902" exceeds safety limit",
+                        message=f"Stack depth ({current_stack_depth}) exceeds safety limit",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (pos {pos})",
                         details={
@@ -1357,6 +1355,7 @@ class PickleScanner(BaseScanner):
                             "Excessive stack depth could indicate a maliciously crafted pickle "
                             "designed to cause resource exhaustion."
                         ),
+                        rule_code="S902",
                     )
                     break
 
@@ -1378,8 +1377,7 @@ class PickleScanner(BaseScanner):
                     result.add_check(
                         name="Opcode Count Check",
                         passed=False,
-                        message=f"Too many opcodes in pickle (> {self.max_opcodes}")",
-                rule_code="S902"",
+                        message=f"Too many opcodes in pickle (> {self.max_opcodes})",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={
@@ -1387,6 +1385,7 @@ class PickleScanner(BaseScanner):
                             "max_opcodes": self.max_opcodes,
                         },
                         why=get_pattern_explanation("pickle_size_limit"),
+                        rule_code="S902",
                     )
                     break
 
