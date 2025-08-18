@@ -183,6 +183,22 @@ class TestNetworkCommDetector:
         assert 4444 in ports  # Metasploit
         assert 6379 in ports  # Redis
 
+    def test_suspicious_port_scan_performance(self):
+        """Ensure port scanning remains performant with precompiled patterns."""
+        detector = NetworkCommDetector()
+        data = b"connect to server:1337" * 100
+        context = "model.bin"
+
+        import time
+
+        start = time.perf_counter()
+        for _ in range(50):
+            detector.findings = []
+            detector._scan_suspicious_ports(data, context)
+        duration = time.perf_counter() - start
+
+        assert duration < 1.0
+
     def test_blacklist_detection(self):
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
