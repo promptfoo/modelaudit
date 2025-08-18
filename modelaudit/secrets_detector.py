@@ -322,7 +322,9 @@ class SecretsDetector:
         try:
             # Try UTF-8 decoding with error handling
             text = data.decode("utf-8", errors="ignore")
-            text_findings = self.scan_text(text, context)
+            # Pass a flag indicating this is from binary data
+            # This helps filter out false positives from model weights
+            text_findings = self.scan_text(text, context, is_binary_source=True)
             findings.extend(text_findings)
         except Exception:
             pass
@@ -386,7 +388,54 @@ class SecretsDetector:
 
         return findings
 
-    def scan_text(self, text: str, context: str = "") -> list[dict[str, Any]]:
+    def _is_likely_binary_context(self, text: str, position: int, window: int = 100) -> bool:
+        """Check if the text around a position looks like binary data rather than text.
+
+        Args:
+            text: Full text being scanned
+            position: Position of the potential secret
+            window: Size of context window to check
+
+        Returns:
+            True if context appears to be binary data
+        """
+        # Get surrounding context
+        start = max(0, position - window)
+        end = min(len(text), position + window)
+        context = text[start:end]
+
+        # Count various character types
+        printable_count = sum(1 for c in context if c.isprintable() or c.isspace())
+        null_count = context.count("\x00")
+        control_chars = sum(1 for c in context if ord(c) < 32 and c not in "\n\r\t")
+
+        # Calculate ratios
+        total_chars = len(context)
+        if total_chars == 0:
+            return False
+
+        printable_ratio = printable_count / total_chars
+        null_ratio = null_count / total_chars
+        control_ratio = control_chars / total_chars
+
+        # Binary data indicators:
+        # - Low printable ratio (< 70%)
+        # - High null byte ratio (> 10%)
+        # - High control character ratio (> 20%)
+        is_binary = printable_ratio < 0.7 or null_ratio > 0.1 or control_ratio > 0.2
+
+        # Additional check: if we're looking at password patterns in what appears to be
+        # weight data (lots of numbers, scientific notation), it's likely a false positive
+        if "pwd" in text[position : position + 10].lower() or "password" in text[position : position + 20].lower():
+            # Check if surrounded by float-like patterns (common in weights)
+            float_pattern = r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?"
+            float_matches = len(re.findall(float_pattern, context))
+            if float_matches > 5:  # Many float-like values nearby
+                return True
+
+        return is_binary
+
+    def scan_text(self, text: str, context: str = "", is_binary_source: bool = False) -> list[dict[str, Any]]:
         """Scan text content for embedded secrets using regex patterns.
 
         Args:
@@ -399,7 +448,7 @@ class SecretsDetector:
         findings = []
 
         # Limit text size to prevent DoS
-        max_text_size = 10 * 1024 * 1024  # 10MB
+        max_text_size = 10 * 1024 * 1024 * 1024  # 10GB
         if len(text) > max_text_size:
             text = text[:max_text_size]
 
@@ -425,6 +474,13 @@ class SecretsDetector:
 
                 # Skip if likely false positive
                 if self._is_likely_false_positive(secret_text, context):
+                    continue
+
+                # NEW: Skip password patterns in binary context (model weights)
+                # Check both the text context and if it's from a binary source
+                if description == "Hardcoded Password" and (
+                    is_binary_source or self._is_likely_binary_context(text, position)
+                ):
                     continue
 
                 # Calculate confidence
@@ -486,7 +542,7 @@ class SecretsDetector:
 
             # Check the value
             if isinstance(value, str):
-                findings.extend(self.scan_text(value, key_context))
+                findings.extend(self.scan_text(value, key_context, is_binary_source=False))
             elif isinstance(value, bytes):
                 findings.extend(self.scan_bytes(value, key_context))
             elif isinstance(value, dict):

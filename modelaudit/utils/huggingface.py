@@ -199,6 +199,7 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
         # Configure progress display based on environment
         import os
 
+        from huggingface_hub import list_repo_files
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
         # Enable/disable progress bars based on parameter
@@ -209,13 +210,68 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # Download the model snapshot
-        local_path = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=str(download_path),
-            local_dir=str(download_path),
-            tqdm_class=None,  # Use default tqdm
-        )
+        # List files in the repository to identify model files
+        try:
+            repo_files = list_repo_files(repo_id)
+        except Exception:
+            repo_files = []
+
+        # Define model file extensions we're interested in
+        MODEL_EXTENSIONS = {
+            ".bin",
+            ".pt",
+            ".pth",
+            ".pkl",
+            ".safetensors",
+            ".onnx",
+            ".pb",
+            ".h5",
+            ".keras",
+            ".tflite",
+            ".ckpt",
+            ".pdparams",
+            ".joblib",
+            ".dill",
+        }
+
+        # Find model files in the repository
+        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
+
+        # If we found specific model files, download them
+        if model_files:
+            # Download only the model files (not docs, etc.)
+            local_path = snapshot_download(
+                repo_id=repo_id,
+                cache_dir=str(download_path),
+                local_dir=str(download_path),
+                allow_patterns=model_files,  # Explicitly request model files
+                tqdm_class=None,  # Use default tqdm
+            )
+        else:
+            # Fallback: download everything if no model files identified
+            # This handles edge cases where models might have unusual extensions
+            local_path = snapshot_download(
+                repo_id=repo_id,
+                cache_dir=str(download_path),
+                local_dir=str(download_path),
+                tqdm_class=None,  # Use default tqdm
+            )
+
+        # Verify we actually got model files
+        downloaded_path = Path(local_path)
+        found_models = any(downloaded_path.glob(f"*{ext}") for ext in MODEL_EXTENSIONS)
+
+        if not found_models and not any(downloaded_path.glob("config.json")):
+            # If no model files and no config, warn the user
+            import warnings
+
+            warnings.warn(
+                f"No model files found in {repo_id}. "
+                "The repository may not contain model weights or uses an unsupported format.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         return Path(local_path)
     except Exception as e:
         # Clean up temp directory on failure if we created one

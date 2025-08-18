@@ -298,18 +298,19 @@ class BaseScanner(ABC):
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
-        self.timeout = self.config.get("timeout", 300)  # Default 5 minutes
+        self.timeout = self.config.get("timeout", 1800)  # Default 30 minutes for large models
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
-            10 * 1024 * 1024,
-        )  # Default: 10MB chunks
+            10 * 1024 * 1024 * 1024,
+        )  # Default: 10GB chunks
         self.max_file_read_size = self.config.get(
             "max_file_read_size",
             0,
         )  # Default unlimited
         self._path_validation_result: Optional[ScanResult] = None
         self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
+        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -344,6 +345,68 @@ class BaseScanner(ABC):
             self._path_validation_result = None
 
         return result
+
+    def _start_scan_timer(self) -> None:
+        """Start the scan timer for timeout tracking"""
+        self.scan_start_time = time.time()
+
+    def _check_timeout(self, allow_partial: bool = False) -> bool:
+        """Check if the scan has exceeded the timeout.
+
+        Args:
+            allow_partial: If True, return True on timeout instead of raising exception
+
+        Returns:
+            True if timeout exceeded and allow_partial is True, False otherwise
+
+        Raises:
+            TimeoutError: If the scan has exceeded the configured timeout and allow_partial is False
+        """
+        if self.scan_start_time is None:
+            self.scan_start_time = time.time()
+            return False
+
+        elapsed = time.time() - self.scan_start_time
+        if elapsed > self.timeout:
+            if allow_partial:
+                return True
+            raise TimeoutError(f"Scan exceeded timeout of {self.timeout} seconds (elapsed: {elapsed:.1f}s)")
+
+        return False
+
+    def _get_remaining_time(self) -> float:
+        """Get the remaining time before timeout.
+
+        Returns:
+            Remaining time in seconds, or timeout value if timer not started
+        """
+        if self.scan_start_time is None:
+            return self.timeout
+
+        elapsed = time.time() - self.scan_start_time
+        remaining = self.timeout - elapsed
+        return max(0, remaining)
+
+    def _add_timeout_warning(self, result: ScanResult, bytes_scanned: int, total_bytes: int) -> None:
+        """Add a warning to the result indicating the scan was incomplete due to timeout.
+
+        Args:
+            result: The scan result to add the warning to
+            bytes_scanned: Number of bytes scanned before timeout
+            total_bytes: Total bytes in the file
+        """
+        percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
+        result.add_issue(
+            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+            severity=IssueSeverity.WARNING,
+            location=self.current_file_path,
+            details={
+                "bytes_scanned": bytes_scanned,
+                "total_bytes": total_bytes,
+                "percentage_complete": percentage,
+                "timeout_seconds": self.timeout,
+            },
+        )
 
     def add_file_integrity_check(self, path: str, result: ScanResult) -> None:
         """Add file integrity check with hashes to the scan result.

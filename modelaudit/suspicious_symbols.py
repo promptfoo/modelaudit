@@ -69,8 +69,10 @@ SUSPICIOUS_GLOBALS = {
     "posix": "*",  # Unix system calls (os.system equivalent)
     "sys": "*",  # Python runtime manipulation
     "subprocess": "*",  # Process spawning and control (call, run, Popen, check_output)
-    "runpy": "*",  # Dynamic module execution
+    "runpy": "*",  # Dynamic module execution (run_module, run_path)
     "commands": "*",  # Python 2 legacy command execution (getoutput, getstatusoutput)
+    "webbrowser": "*",  # Can open malicious URLs (open, open_new, open_new_tab)
+    "importlib": "*",  # Dynamic module imports (import_module, reload)
     # Code execution functions - CRITICAL RISK
     "builtins": [
         "eval",
@@ -102,13 +104,6 @@ SUSPICIOUS_GLOBALS = {
         "__import__",
     ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
-    "importlib": [
-        "import_module",  # Dynamic module loading
-        "__import__",  # Direct import function
-        "reload",  # Module reloading
-        "find_loader",  # Module loader access
-        "load_module",  # Direct module loading
-    ],  # CRITICAL RISK - Dynamic module imports can load malicious code
     "importlib.machinery": "*",  # Module machinery manipulation
     "importlib.util": "*",  # Module utilities for dynamic imports
     # Serialization/deserialization - MEDIUM RISK
@@ -124,8 +119,6 @@ SUSPICIOUS_GLOBALS = {
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
     "socket": ["*"],  # Network communication
-    # Web/Network interaction - CRITICAL RISK
-    "webbrowser": ["open", "open_new", "open_new_tab"],  # Can open malicious URLs
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",

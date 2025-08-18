@@ -1,0 +1,138 @@
+{
+  "bytes_scanned": 665,
+  "issues": [],
+  "checks": [],
+  "files_scanned": 6,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/config.json",
+      "type": "manifest",
+      "size": 665,
+      "keys": [
+        "activation_function",
+        "architectures",
+        "attn_pdrop",
+        "bos_token_id",
+        "embd_pdrop",
+        "eos_token_id",
+        "initializer_range",
+        "layer_norm_epsilon",
+        "model_type",
+        "n_ctx",
+        "n_embd",
+        "n_head",
+        "n_layer",
+        "n_positions",
+        "resid_pdrop",
+        "summary_activation",
+        "summary_first_dropout",
+        "summary_proj_to_labels",
+        "summary_type",
+        "summary_use_proj",
+        "task_specific_params",
+        "vocab_size"
+      ]
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/pytorch_model.bin",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/models--mkiani--gpt2-runpy/refs/main",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/config.json.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/README.md.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/pytorch_model.bin.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": ["manifest", "skipped"],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/config.json": {
+      "file_size": 665,
+      "keys": [
+        "activation_function",
+        "architectures",
+        "attn_pdrop",
+        "bos_token_id",
+        "embd_pdrop",
+        "eos_token_id",
+        "initializer_range",
+        "layer_norm_epsilon",
+        "model_type",
+        "n_ctx",
+        "n_embd",
+        "n_head",
+        "n_layer",
+        "n_positions",
+        "resid_pdrop",
+        "summary_activation",
+        "summary_first_dropout",
+        "summary_proj_to_labels",
+        "summary_type",
+        "summary_use_proj",
+        "task_specific_params",
+        "vocab_size"
+      ],
+      "model_info": {
+        "model_type": "gpt2",
+        "architectures": ["GPT2LMHeadModel"],
+        "vocab_size": 50257
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/pytorch_model.bin": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/models--mkiani--gpt2-runpy/refs/main": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/config.json.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/README.md.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/mkiani/gpt2-runpy/.cache/huggingface/download/pytorch_model.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false
+    }
+  },
+  "start_time": 1755214133.924445,
+  "duration": 10.291007041931152,
+  "total_checks": 5,
+  "passed_checks": 0,
+  "failed_checks": 5
+}

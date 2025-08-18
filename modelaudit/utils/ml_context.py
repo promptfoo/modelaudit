@@ -142,11 +142,11 @@ def _should_ignore_shebang_pattern(
             return True
 
     # Even with moderate confidence (0.5-0.6), ignore if pattern density is extremely low
-    # This handles cases like BERT with many patterns but spread across very large files
+    # This handles cases like BERT with many patterns but spread across large files
     if weight_confidence > 0.5 and pattern_density < 1.0:  # Less than 1 pattern per MB
         return True
 
-    # AGGRESSIVE FIX: For very large ML models with low density, always ignore shebang patterns
+    # AGGRESSIVE FIX: For large ML models with low density, always ignore shebang patterns
     # BERT case: 0.697 confidence, 0.0 density, 8 patterns in 440MB file
     if weight_confidence > 0.5 and pattern_density <= 0.1:  # Nearly 0 density patterns
         return True
