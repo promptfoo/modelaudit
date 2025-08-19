@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar, Union, cast
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Union, cast
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -115,7 +115,7 @@ class UserConfig:
         self._config_file = self._config_dir / "user_config.json"
         self._config = self._load_config()
 
-    def _load_config(self) -> dict[str, Any]:
+    def _load_config(self) -> Dict[str, Any]:
         """Load user configuration from file."""
         if not self._config_file.exists():
             return {}
@@ -233,7 +233,7 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
-    def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
+    def _send_event_internal(self, event: TelemetryEvent, properties: Dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
             **properties,
@@ -257,7 +257,7 @@ class TelemetryClient:
         # Send to Promptfoo's analytics endpoints for consistency
         self._send_to_promptfoo_endpoints(event.value, event_properties)
 
-    def _send_to_promptfoo_endpoints(self, event: str, properties: dict[str, Any]) -> None:
+    def _send_to_promptfoo_endpoints(self, event: str, properties: Dict[str, Any]) -> None:
         """Send event to Promptfoo's analytics endpoints following their pattern."""
         # Send to KA endpoint (following Promptfoo's pattern)
         try:
@@ -321,7 +321,7 @@ class TelemetryClient:
         except (URLError, OSError) as e:
             logger.debug(f"Failed to send event to R endpoint: {e}")
 
-    def record_event(self, event: TelemetryEvent, properties: Optional[dict[str, Any]] = None) -> None:
+    def record_event(self, event: TelemetryEvent, properties: Optional[Dict[str, Any]] = None) -> None:
         """Record a telemetry event."""
         if properties is None:
             properties = {}
@@ -336,7 +336,7 @@ class TelemetryClient:
         except Exception as e:
             logger.debug(f"Failed to record telemetry event: {e}")
 
-    def record_scan_started(self, paths: list[str], scan_options: dict[str, Any]) -> None:
+    def record_scan_started(self, paths: List[str], scan_options: Dict[str, Any]) -> None:
         """Record that a scan has started."""
         self.record_event(
             TelemetryEvent.SCAN_STARTED,
@@ -356,7 +356,7 @@ class TelemetryClient:
             },
         )
 
-    def record_scan_completed(self, duration: float, results: dict[str, Any]) -> None:
+    def record_scan_completed(self, duration: float, results: Dict[str, Any]) -> None:
         """Record that a scan has completed successfully."""
         self.record_event(
             TelemetryEvent.SCAN_COMPLETED,
@@ -532,18 +532,18 @@ class TelemetryClient:
         except Exception:
             return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-    def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
+    def _count_issue_severities(self, results: Dict[str, Any]) -> Dict[str, int]:
         """Count issues by severity."""
-        severities: dict[str, int] = {}
+        severities: Dict[str, int] = {}
         for asset in results.get("assets", []):
             for issue in asset.get("issues", []):
                 severity = issue.get("severity", "unknown")
                 severities[severity] = severities.get(severity, 0) + 1
         return severities
 
-    def _count_file_types(self, results: dict[str, Any]) -> dict[str, int]:
+    def _count_file_types(self, results: Dict[str, Any]) -> Dict[str, int]:
         """Count scanned files by type."""
-        file_types: dict[str, int] = {}
+        file_types: Dict[str, int] = {}
         for asset in results.get("assets", []):
             file_type = asset.get("file_type", "unknown")
             file_types[file_type] = file_types.get(file_type, 0) + 1
@@ -568,7 +568,7 @@ def get_telemetry_client() -> Optional[TelemetryClient]:
 
 # Convenience functions for common telemetry operations - all wrapped for safety
 @safe_telemetry
-def record_event(event: TelemetryEvent, properties: Optional[dict[str, Any]] = None) -> None:
+def record_event(event: TelemetryEvent, properties: Optional[Dict[str, Any]] = None) -> None:
     """Record a telemetry event using the global client."""
     client = get_telemetry_client()
     if client is not None:
@@ -576,7 +576,7 @@ def record_event(event: TelemetryEvent, properties: Optional[dict[str, Any]] = N
 
 
 @safe_telemetry
-def record_scan_started(paths: list[str], scan_options: dict[str, Any]) -> None:
+def record_scan_started(paths: List[str], scan_options: Dict[str, Any]) -> None:
     """Record that a scan has started."""
     client = get_telemetry_client()
     if client is not None:
@@ -584,7 +584,7 @@ def record_scan_started(paths: list[str], scan_options: dict[str, Any]) -> None:
 
 
 @safe_telemetry
-def record_scan_completed(duration: float, results: dict[str, Any]) -> None:
+def record_scan_completed(duration: float, results: Dict[str, Any]) -> None:
     """Record that a scan has completed."""
     client = get_telemetry_client()
     if client is not None:
