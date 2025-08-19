@@ -19,6 +19,16 @@ from .jfrog_integration import scan_jfrog_artifact
 from .models import ModelAuditResultModel
 from .sarif_formatter import format_sarif_output
 from .scanners.base import IssueSeverity
+from .telemetry import (
+    flush_telemetry,
+    record_command_used,
+    record_download_completed,
+    record_download_started,
+    record_feature_used,
+    record_scan_completed,
+    record_scan_failed,
+    record_scan_started,
+)
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_file_from_hf, download_model, is_huggingface_file_url, is_huggingface_url
@@ -589,6 +599,29 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
+    # Record telemetry for scan command usage
+    import time
+    scan_start_time = time.time()
+    scan_options = {
+        "format": format,
+        "timeout": timeout,
+        "max_file_size": max_file_size,
+        "max_total_size": max_total_size,
+        "blacklist_patterns": list(blacklist) if blacklist else [],
+        "large_model_support": large_model_support,
+        "progress": progress,
+        "has_output_file": bool(output),
+        "has_sbom": bool(sbom),
+        "verbose": verbose,
+        "cache_enabled": cache,
+        "strict_license": strict_license,
+        "stream_mode": stream,
+        "skip_file_types": not no_skip_files,
+    }
+
+    record_command_used("scan", **scan_options)
+    record_scan_started(list(paths), scan_options)
+
     # Expand and validate paths with type safety
     expanded_paths: list[str] = expand_paths(paths)
 
@@ -645,6 +678,7 @@ def scan_command(
     progress_reporters: list[Any] = []
 
     if progress and len(expanded_paths) > 0:
+        record_feature_used("progress_tracking", format=progress_format, interval=progress_interval)
         try:
             # Prevent circular imports during scanner loading
             import sys
@@ -820,10 +854,24 @@ def scan_command(
                             # Use default cache directory
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
 
+                        # Record download start and feature usage
+                        record_download_started("huggingface", path)
+                        record_feature_used("huggingface_download", cache_enabled=cache)
+                        download_start = time.time()
+
                         # Download with caching support and progress bar
                         download_path = download_model(
                             path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output)
                         )
+
+                        # Record download completion
+                        download_duration = time.time() - download_start
+                        try:
+                            download_size = sum(f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file())
+                            record_download_completed("huggingface", download_duration, download_size)
+                        except Exception:
+                            # If we can't get size, record without it
+                            record_download_completed("huggingface", download_duration, 0)
                         actual_path = str(download_path)
                         # Only track for cleanup if not using cache
                         temp_dir = str(download_path) if not cache else None
@@ -869,10 +917,23 @@ def scan_command(
                         click.echo(f"Downloading from {path}...")
 
                     try:
+                        # Record download start and feature usage
+                        record_download_started("pytorch_hub", path)
+                        record_feature_used("pytorch_hub_download", cache_enabled=bool(cache_dir))
+                        download_start = time.time()
+
                         download_path = download_pytorch_hub_model(
                             path,
                             cache_dir=Path(cache_dir) if cache_dir else None,
                         )
+
+                        # Record download completion
+                        download_duration = time.time() - download_start
+                        try:
+                            download_size = sum(f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file())
+                            record_download_completed("pytorch_hub", download_duration, download_size)
+                        except Exception:
+                            record_download_completed("pytorch_hub", download_duration, 0)
                         actual_path = str(download_path)
                         temp_dir = str(download_path)
 
@@ -1211,6 +1272,10 @@ def scan_command(
                         "cache_dir": cache_dir,
                     }
 
+                    # Record feature usage for large model support
+                    if large_model_support:
+                        record_feature_used("large_model_support", path=actual_path)
+
                     scan_results: ModelAuditResultModel = scan_model_directory_or_file(
                         actual_path,
                         blacklist_patterns=list(blacklist) if blacklist else None,
@@ -1421,6 +1486,17 @@ def scan_command(
         if format == "text":
             click.echo("\n" + "─" * 80)
         click.echo(output_text)
+
+    # Record telemetry for scan completion
+    scan_duration = time.time() - scan_start_time
+    try:
+        if audit_result.has_errors:
+            record_scan_failed(scan_duration, "Scan completed with errors")
+        else:
+            record_scan_completed(scan_duration, audit_result.model_dump())
+    finally:
+        # Always flush telemetry before exit
+        flush_telemetry()
 
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(audit_result)
