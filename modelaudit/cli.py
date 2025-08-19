@@ -619,7 +619,7 @@ def scan_command(
         "skip_file_types": not no_skip_files,
     }
 
-    record_command_used("scan", **scan_options)
+    record_command_used("scan", duration=None, **scan_options)
     record_scan_started(list(paths), scan_options)
 
     # Expand and validate paths with type safety

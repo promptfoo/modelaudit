@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, Callable, Optional, TypeVar, Union, cast
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -50,7 +50,7 @@ def safe_telemetry(func: F) -> F:
             logger.debug(f"Telemetry function {func.__name__} failed silently: {e}")
             return None
 
-    return wrapper
+    return cast(F, wrapper)
 
 
 @contextmanager
@@ -70,6 +70,8 @@ def is_telemetry_available() -> bool:
     """Check if telemetry is available and working."""
     try:
         client = get_telemetry_client()
+        if client is None:
+            return False
         return not client._is_disabled()
     except Exception:
         return False
@@ -120,7 +122,8 @@ class UserConfig:
 
         try:
             with open(self._config_file) as f:
-                return json.load(f)
+                config_data = json.load(f)
+                return config_data if isinstance(config_data, dict) else {}
         except (json.JSONDecodeError, OSError) as e:
             logger.debug(f"Failed to load user config: {e}")
             return {}
@@ -140,12 +143,13 @@ class UserConfig:
         if "user_id" not in self._config:
             self._config["user_id"] = str(uuid.uuid4())
             self._save_config()
-        return self._config["user_id"]
+        return str(self._config["user_id"])
 
     @property
     def email(self) -> Optional[str]:
         """Get user email if available."""
-        return self._config.get("email")
+        email = self._config.get("email")
+        return str(email) if email is not None else None
 
     @email.setter
     def email(self, value: Optional[str]) -> None:
@@ -160,7 +164,8 @@ class UserConfig:
     def telemetry_enabled(self) -> bool:
         """Check if telemetry is enabled for this user."""
         # Default to FALSE - require explicit opt-in
-        return self._config.get("telemetry_enabled", False)
+        enabled = self._config.get("telemetry_enabled", False)
+        return bool(enabled)
 
     @telemetry_enabled.setter
     def telemetry_enabled(self, value: bool) -> None:
@@ -677,6 +682,8 @@ def is_telemetry_enabled() -> bool:
     """Check if telemetry is enabled."""
     try:
         client = get_telemetry_client()
-        return client is not None and not client._is_disabled()
+        if client is None:
+            return False
+        return not client._is_disabled()
     except Exception:
         return False
