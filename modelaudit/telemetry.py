@@ -3,6 +3,8 @@ Telemetry system for ModelAudit - tracks usage analytics and performance metrics
 Follows privacy-first principles with comprehensive opt-out controls.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -14,7 +16,7 @@ from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Union, cast
+from typing import Any, Callable, TypeVar, cast
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -115,7 +117,7 @@ class UserConfig:
         self._config_file = self._config_dir / "user_config.json"
         self._config = self._load_config()
 
-    def _load_config(self) -> Dict[str, Any]:
+    def _load_config(self) -> dict[str, Any]:
         """Load user configuration from file."""
         if not self._config_file.exists():
             return {}
@@ -146,13 +148,13 @@ class UserConfig:
         return str(self._config["user_id"])
 
     @property
-    def email(self) -> Optional[str]:
+    def email(self) -> str | None:
         """Get user email if available."""
         email = self._config.get("email")
         return str(email) if email is not None else None
 
     @email.setter
-    def email(self, value: Optional[str]) -> None:
+    def email(self, value: str | None) -> None:
         """Set user email."""
         if value:
             self._config["email"] = value
@@ -233,7 +235,7 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
-    def _send_event_internal(self, event: TelemetryEvent, properties: Dict[str, Any]) -> None:
+    def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
             **properties,
@@ -257,7 +259,7 @@ class TelemetryClient:
         # Send to Promptfoo's analytics endpoints for consistency
         self._send_to_promptfoo_endpoints(event.value, event_properties)
 
-    def _send_to_promptfoo_endpoints(self, event: str, properties: Dict[str, Any]) -> None:
+    def _send_to_promptfoo_endpoints(self, event: str, properties: dict[str, Any]) -> None:
         """Send event to Promptfoo's analytics endpoints following their pattern."""
         # Send to KA endpoint (following Promptfoo's pattern)
         try:
@@ -321,7 +323,7 @@ class TelemetryClient:
         except (URLError, OSError) as e:
             logger.debug(f"Failed to send event to R endpoint: {e}")
 
-    def record_event(self, event: TelemetryEvent, properties: Optional[Dict[str, Any]] = None) -> None:
+    def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
         if properties is None:
             properties = {}
@@ -336,7 +338,7 @@ class TelemetryClient:
         except Exception as e:
             logger.debug(f"Failed to record telemetry event: {e}")
 
-    def record_scan_started(self, paths: List[str], scan_options: Dict[str, Any]) -> None:
+    def record_scan_started(self, paths: list[str], scan_options: dict[str, Any]) -> None:
         """Record that a scan has started."""
         self.record_event(
             TelemetryEvent.SCAN_STARTED,
@@ -356,7 +358,7 @@ class TelemetryClient:
             },
         )
 
-    def record_scan_completed(self, duration: float, results: Dict[str, Any]) -> None:
+    def record_scan_completed(self, duration: float, results: dict[str, Any]) -> None:
         """Record that a scan has completed successfully."""
         self.record_event(
             TelemetryEvent.SCAN_COMPLETED,
@@ -418,7 +420,7 @@ class TelemetryClient:
             },
         )
 
-    def record_command_used(self, command: str, duration: Optional[float] = None, **kwargs) -> None:
+    def record_command_used(self, command: str, duration: float | None = None, **kwargs) -> None:
         """Record usage of a CLI command."""
         properties = {"command": command, **kwargs}
         if duration is not None:
@@ -430,7 +432,7 @@ class TelemetryClient:
         """Record usage of a specific feature."""
         self.record_event(TelemetryEvent.FEATURE_USED, {"feature": feature, **kwargs})
 
-    def record_error(self, error: Exception, context: Optional[str] = None) -> None:
+    def record_error(self, error: Exception, context: str | None = None) -> None:
         """Record an error occurrence."""
         self.record_event(
             TelemetryEvent.ERROR_OCCURRED,
@@ -441,7 +443,7 @@ class TelemetryClient:
             },
         )
 
-    def record_performance_metric(self, metric_name: str, value: Union[int, float], unit: str = "ms") -> None:
+    def record_performance_metric(self, metric_name: str, value: int | float, unit: str = "ms") -> None:
         """Record a performance metric."""
         self.record_event(
             TelemetryEvent.PERFORMANCE_METRIC,
@@ -452,7 +454,7 @@ class TelemetryClient:
             },
         )
 
-    def record_download_started(self, source_type: str, url: str, size_bytes: Optional[int] = None) -> None:
+    def record_download_started(self, source_type: str, url: str, size_bytes: int | None = None) -> None:
         """Record that a download has started."""
         self.record_event(
             TelemetryEvent.DOWNLOAD_STARTED,
@@ -532,18 +534,18 @@ class TelemetryClient:
         except Exception:
             return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-    def _count_issue_severities(self, results: Dict[str, Any]) -> Dict[str, int]:
+    def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""
-        severities: Dict[str, int] = {}
+        severities: dict[str, int] = {}
         for asset in results.get("assets", []):
             for issue in asset.get("issues", []):
                 severity = issue.get("severity", "unknown")
                 severities[severity] = severities.get(severity, 0) + 1
         return severities
 
-    def _count_file_types(self, results: Dict[str, Any]) -> Dict[str, int]:
+    def _count_file_types(self, results: dict[str, Any]) -> dict[str, int]:
         """Count scanned files by type."""
-        file_types: Dict[str, int] = {}
+        file_types: dict[str, int] = {}
         for asset in results.get("assets", []):
             file_type = asset.get("file_type", "unknown")
             file_types[file_type] = file_types.get(file_type, 0) + 1
@@ -554,7 +556,7 @@ class TelemetryClient:
 _telemetry_client = None
 
 
-def get_telemetry_client() -> Optional[TelemetryClient]:
+def get_telemetry_client() -> TelemetryClient | None:
     """Get the global telemetry client instance."""
     global _telemetry_client
     try:
@@ -568,7 +570,7 @@ def get_telemetry_client() -> Optional[TelemetryClient]:
 
 # Convenience functions for common telemetry operations - all wrapped for safety
 @safe_telemetry
-def record_event(event: TelemetryEvent, properties: Optional[Dict[str, Any]] = None) -> None:
+def record_event(event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
     """Record a telemetry event using the global client."""
     client = get_telemetry_client()
     if client is not None:
@@ -576,7 +578,7 @@ def record_event(event: TelemetryEvent, properties: Optional[Dict[str, Any]] = N
 
 
 @safe_telemetry
-def record_scan_started(paths: List[str], scan_options: Dict[str, Any]) -> None:
+def record_scan_started(paths: list[str], scan_options: dict[str, Any]) -> None:
     """Record that a scan has started."""
     client = get_telemetry_client()
     if client is not None:
@@ -584,7 +586,7 @@ def record_scan_started(paths: List[str], scan_options: Dict[str, Any]) -> None:
 
 
 @safe_telemetry
-def record_scan_completed(duration: float, results: Dict[str, Any]) -> None:
+def record_scan_completed(duration: float, results: dict[str, Any]) -> None:
     """Record that a scan has completed."""
     client = get_telemetry_client()
     if client is not None:
@@ -600,7 +602,7 @@ def record_scan_failed(duration: float, error: str) -> None:
 
 
 @safe_telemetry
-def record_command_used(command: str, duration: Optional[float] = None, **kwargs) -> None:
+def record_command_used(command: str, duration: float | None = None, **kwargs) -> None:
     """Record usage of a CLI command."""
     client = get_telemetry_client()
     if client is not None:
@@ -640,7 +642,7 @@ def record_issue_found(issue_type: str, severity: str, scanner: str) -> None:
 
 
 @safe_telemetry
-def record_download_started(source_type: str, url: str, size_bytes: Optional[int] = None) -> None:
+def record_download_started(source_type: str, url: str, size_bytes: int | None = None) -> None:
     """Record that a download has started."""
     client = get_telemetry_client()
     if client is not None:
