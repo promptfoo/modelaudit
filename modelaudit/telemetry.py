@@ -3,6 +3,7 @@ Telemetry system for ModelAudit - tracks usage analytics and performance metrics
 Follows privacy-first principles with comprehensive opt-out controls.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Union
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -112,8 +114,8 @@ class UserConfig:
     @property
     def telemetry_enabled(self) -> bool:
         """Check if telemetry is enabled for this user."""
-        # Default to True unless explicitly disabled
-        return self._config.get("telemetry_enabled", True)
+        # Default to FALSE - require explicit opt-in
+        return self._config.get("telemetry_enabled", False)
 
     @telemetry_enabled.setter
     def telemetry_enabled(self, value: bool) -> None:
@@ -155,7 +157,7 @@ class TelemetryClient:
         if os.getenv("IS_TESTING", "").lower() in ("1", "true", "yes"):
             return True
 
-        # Check user configuration
+        # Check user configuration - NOW DEFAULTS TO DISABLED (opt-in only)
         return not self._user_config.telemetry_enabled
 
     def _identify_user(self) -> None:
@@ -290,13 +292,13 @@ class TelemetryClient:
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
-                "paths": paths,  # Include actual paths
+                "path_hashes": [self._hash_path(path) for path in paths],  # Hash paths for privacy
                 "path_types": [self._classify_path(path) for path in paths],
                 "timeout": scan_options.get("timeout"),
                 "max_file_size": scan_options.get("max_file_size"),
                 "format": scan_options.get("format", "text"),
                 "has_blacklist": bool(scan_options.get("blacklist_patterns")),
-                "blacklist_patterns": scan_options.get("blacklist_patterns", []),  # Include blacklist patterns
+                "num_blacklist_patterns": len(scan_options.get("blacklist_patterns", [])),  # Count only, not actual patterns
                 "large_model_support": scan_options.get("large_model_support", True),
                 "progress_enabled": scan_options.get("progress", True),
             },
@@ -347,8 +349,7 @@ class TelemetryClient:
             {
                 "file_type": detected_type,
                 "confidence": confidence,
-                "file_path": file_path,  # Include full file path
-                "file_name": Path(file_path).name,  # Include file name
+                "file_hash": self._hash_path(file_path),  # Hash path for privacy
                 "file_extension": Path(file_path).suffix.lower(),
                 "path_type": self._classify_path(file_path),
             },
@@ -405,7 +406,7 @@ class TelemetryClient:
             TelemetryEvent.DOWNLOAD_STARTED,
             {
                 "source_type": source_type,
-                "url": url,  # Include full URL
+                "url_hash": self._hash_url(url),  # Hash URL for privacy
                 "domain": self._extract_domain(url),
                 "size_bytes": size_bytes,
             },
@@ -460,11 +461,24 @@ class TelemetryClient:
     def _extract_domain(self, url: str) -> str:
         """Extract domain from URL for analytics."""
         try:
-            from urllib.parse import urlparse
-
             return urlparse(url).netloc
         except Exception:
             return "unknown"
+
+    def _hash_path(self, path: str) -> str:
+        """Hash file path for privacy while maintaining analytics value."""
+        # Use SHA-256 hash of the path for privacy
+        return hashlib.sha256(path.encode()).hexdigest()[:16]  # First 16 chars for brevity
+
+    def _hash_url(self, url: str) -> str:
+        """Hash URL for privacy while maintaining analytics value."""
+        # Remove query parameters and hash the clean URL
+        try:
+            parsed = urlparse(url)
+            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return hashlib.sha256(clean_url.encode()).hexdigest()[:16]
+        except Exception:
+            return hashlib.sha256(url.encode()).hexdigest()[:16]
 
     def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""
