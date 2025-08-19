@@ -145,11 +145,8 @@ class TelemetryClient:
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
-        # Check environment variables first - use Promptfoo's standard env var
+        # Check environment variables - use Promptfoo's standard env var
         if os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower() in ("1", "true", "yes"):
-            return True
-        # Keep backward compatibility with ModelAudit-specific env var
-        if os.getenv("MODELAUDIT_DISABLE_TELEMETRY", "").lower() in ("1", "true", "yes"):
             return True
         if os.getenv("NO_ANALYTICS", "").lower() in ("1", "true", "yes"):
             return True

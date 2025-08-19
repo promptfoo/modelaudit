@@ -117,8 +117,7 @@ ModelAudit supports multiple input sources:
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` - JFrog authentication
 - `NO_COLOR` - Disable color output (follows https://no-color.org standard)
 - `PROMPTFOO_DISABLE_TELEMETRY` - Disable telemetry/analytics collection (1, true, yes) - shared with Promptfoo
-- `MODELAUDIT_DISABLE_TELEMETRY` - Alternative way to disable analytics (1, true, yes)
-- `NO_ANALYTICS` - Another way to disable analytics (1, true, yes)
+- `NO_ANALYTICS` - Alternative way to disable analytics (1, true, yes)
 - `MODELAUDIT_POSTHOG_KEY` - PostHog API key for analytics (development only)
 - `.env` file is automatically loaded if present
 
@@ -150,7 +149,7 @@ ModelAudit includes telemetry to help improve the tool. **Telemetry is enabled b
 
 ### Privacy Controls
 
-- **Environment variables**: Set `PROMPTFOO_DISABLE_TELEMETRY=1` (shared with Promptfoo) or `MODELAUDIT_DISABLE_TELEMETRY=1` to disable
+- **Environment variables**: Set `PROMPTFOO_DISABLE_TELEMETRY=1` (shared with Promptfoo) or `NO_ANALYTICS=1` to disable
 - **CI detection**: Automatically disabled in CI environments
 
 ### What is collected:
