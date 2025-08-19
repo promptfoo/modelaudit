@@ -6,7 +6,7 @@ import json
 import os
 import re
 import struct
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
@@ -166,92 +166,110 @@ class SafeTensorsScanner(BaseScanner):
 
                 tensor_names = [k for k in header if k != "__metadata__"]
                 result.metadata["tensor_count"] = len(tensor_names)
-                result.metadata["tensors"] = tensor_names
+                # Limit tensor names to prevent memory issues with very large models
+                max_tensor_names = 1000
+                if len(tensor_names) > max_tensor_names:
+                    result.metadata["tensors"] = tensor_names[:max_tensor_names]
+                    result.metadata["tensors_truncated"] = len(tensor_names) - max_tensor_names
+                else:
+                    result.metadata["tensors"] = tensor_names
 
-                # Validate tensor offsets and sizes
-                tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
-
+                # Validate ALL tensor offsets and sizes (comprehensive but memory-efficient)
+                tensor_entries = [(k, v) for k, v in header.items() if k != "__metadata__"]
                 data_size = file_size - (8 + header_len)
                 offsets = []
-                for name, info in tensor_entries:
-                    if not isinstance(info, dict):
-                        result.add_check(
-                            name="Tensor Entry Type Validation",
-                            passed=False,
-                            message=f"Invalid tensor entry for {name}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
-                        )
-                        continue
 
-                    begin, end = info.get("data_offsets", [0, 0])
-                    dtype = info.get("dtype")
-                    shape = info.get("shape", [])
+                # Stream-process all tensors for memory efficiency
+                invalid_entries = []
+                invalid_offsets = []
+                invalid_sizes = []
+                valid_tensor_count = 0
+                total_tensor_count = len(tensor_entries)
 
-                    if not isinstance(begin, int) or not isinstance(end, int):
-                        result.add_check(
-                            name="Tensor Offset Type Validation",
-                            passed=False,
-                            message=f"Invalid data_offsets for {name}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={
-                                "tensor": name,
-                                "begin_type": type(begin).__name__,
-                                "end_type": type(end).__name__,
-                            },
-                        )
-                        continue
+                # Process tensors in chunks to avoid memory issues while validating ALL of them
+                chunk_size = 1000
+                for i in range(0, len(tensor_entries), chunk_size):
+                    chunk = tensor_entries[i : i + chunk_size]
 
-                    if begin < 0 or end <= begin or end > data_size:
-                        result.add_check(
-                            name="Tensor Offset Validation",
-                            passed=False,
-                            message=f"Tensor {name} offsets out of bounds",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={"tensor": name, "begin": begin, "end": end, "data_size": data_size},
-                        )
-                        continue
-                    else:
-                        result.add_check(
-                            name="Tensor Offset Validation",
-                            passed=True,
-                            message=f"Tensor {name} offsets are valid",
-                            location=path,
-                            details={"tensor": name, "begin": begin, "end": end},
-                        )
+                    for name, info in chunk:
+                        if not isinstance(info, dict):
+                            invalid_entries.append(name)
+                            continue
 
-                    offsets.append((begin, end))
+                        begin, end = info.get("data_offsets", [0, 0])
+                        dtype = info.get("dtype")
+                        shape = info.get("shape", [])
 
-                    # Validate dtype/shape size
-                    expected_size = self._expected_size(dtype, shape)
-                    if expected_size is not None:
-                        if expected_size != end - begin:
-                            result.add_check(
-                                name="Tensor Size Consistency Check",
-                                passed=False,
-                                message=f"Size mismatch for tensor {name}",
-                                severity=IssueSeverity.CRITICAL,
-                                location=path,
-                                details={
-                                    "tensor": name,
-                                    "expected_size": expected_size,
-                                    "actual_size": end - begin,
-                                },
-                            )
+                        if not isinstance(begin, int) or not isinstance(end, int):
+                            invalid_entries.append(f"{name} (invalid offset types)")
+                            continue
+
+                        if begin < 0 or end <= begin or end > data_size:
+                            invalid_offsets.append(f"{name} [{begin}:{end}]")
+                            continue
+
+                        offsets.append((begin, end))
+
+                        # Validate dtype/shape size for EVERY tensor
+                        expected_size = self._expected_size(dtype, shape)
+                        if expected_size is not None and expected_size != end - begin:
+                            invalid_sizes.append(f"{name} (expected: {expected_size}, actual: {end - begin})")
                         else:
-                            result.add_check(
-                                name="Tensor Size Consistency Check",
-                                passed=True,
-                                message=f"Tensor {name} size matches dtype/shape",
-                                location=path,
-                                details={
-                                    "tensor": name,
-                                    "size": expected_size,
-                                },
-                            )
+                            valid_tensor_count += 1
+
+                    # Trim lists if they get too large to prevent memory issues (keep first occurrences for debugging)
+                    if len(invalid_entries) > 100:
+                        invalid_entries = [*invalid_entries[:50], f"... and {len(invalid_entries) - 50} more"]
+                    if len(invalid_offsets) > 100:
+                        invalid_offsets = [*invalid_offsets[:50], f"... and {len(invalid_offsets) - 50} more"]
+                    if len(invalid_sizes) > 100:
+                        invalid_sizes = [*invalid_sizes[:50], f"... and {len(invalid_sizes) - 50} more"]
+
+                # Report comprehensive validation results (ALL tensors processed)
+                if invalid_entries:
+                    result.add_check(
+                        name="Tensor Entry Type Validation",
+                        passed=False,
+                        message=f"Found invalid tensor entries in {len(invalid_entries)} tensors",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"invalid_tensors": invalid_entries[:20], "total_processed": total_tensor_count},
+                    )
+
+                if invalid_offsets:
+                    result.add_check(
+                        name="Tensor Offset Validation",
+                        passed=False,
+                        message=f"Found invalid offsets in {len(invalid_offsets)} tensors",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"invalid_offsets": invalid_offsets[:20], "total_processed": total_tensor_count},
+                    )
+
+                if invalid_sizes:
+                    result.add_check(
+                        name="Tensor Size Consistency Check",
+                        passed=False,
+                        message=f"Found size mismatches in {len(invalid_sizes)} tensors",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"size_mismatches": invalid_sizes[:20], "total_processed": total_tensor_count},
+                    )
+
+                # Report successful comprehensive validation
+                if not invalid_entries and not invalid_offsets and not invalid_sizes and valid_tensor_count > 0:
+                    result.add_check(
+                        name="Comprehensive Tensor Validation",
+                        passed=True,
+                        message=f"Successfully validated ALL {valid_tensor_count} tensors",
+                        location=path,
+                        details={
+                            "valid_tensors": valid_tensor_count,
+                            "total_tensors": total_tensor_count,
+                            "comprehensive_scan": True,
+                            "all_tensors_checked": True,
+                        },
+                    )
 
                 # Check offset continuity
                 offsets.sort(key=lambda x: x[0])

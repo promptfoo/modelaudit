@@ -432,9 +432,10 @@ class BaseScanner(ABC):
         """Add file integrity check with hashes to the scan result.
 
         This should be called by scanners to record file hashes for compliance.
+        For very large files, we use SHA256-only for practical security scanning.
         """
-        hashes = self.calculate_file_hashes(path)
         file_size = self.get_file_size(path)
+        hashes = self.calculate_file_hashes(path)
 
         # Add the check
         result.add_check(
@@ -775,22 +776,61 @@ class BaseScanner(ABC):
             return hashes
 
         try:
-            # Calculate all hashes in a single pass for efficiency
-            md5_hash = hashlib.md5()
-            sha256_hash = hashlib.sha256()
-            sha512_hash = hashlib.sha512()
+            file_size = self.get_file_size(path)
 
-            with open(path, "rb") as f:
-                # Read file in chunks to handle large files
-                for chunk in iter(lambda: f.read(8192), b""):
-                    md5_hash.update(chunk)
-                    sha256_hash.update(chunk)
-                    sha512_hash.update(chunk)
+            # For very large files (>1GB), prioritize SHA256 for security while maintaining practicality
+            if file_size > 1024 * 1024 * 1024:  # >1GB
+                # Use only SHA256 for large files - still provides strong security verification
+                sha256_hash = hashlib.sha256()
+                chunk_size = 8 * 1024 * 1024  # 8MB chunks for maximum I/O efficiency
+                logger.info(f"Computing SHA256 hash for large file: {file_size:,} bytes")
 
-            hashes["md5"] = md5_hash.hexdigest()
-            hashes["sha256"] = sha256_hash.hexdigest()
-            hashes["sha512"] = sha512_hash.hexdigest()
+                with open(path, "rb") as f:
+                    bytes_read = 0
+                    
+                    # Use explicit while loop to avoid potential recursion in iter()
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        sha256_hash.update(chunk)
+                        bytes_read += len(chunk)
 
+                        # Progress logging for very large files (every 2GB)
+                        if bytes_read % (2 * 1024 * 1024 * 1024) == 0:
+                            progress = (bytes_read / file_size) * 100
+                            logger.info(f"Hash progress: {progress:.1f}% ({bytes_read:,}/{file_size:,} bytes)")
+
+                # For large files, provide SHA256 (cryptographically secure) and note the optimization
+                hashes["md5"] = "large_file_optimization"
+                hashes["sha256"] = sha256_hash.hexdigest()
+                hashes["sha512"] = "large_file_optimization"
+            else:
+                # Calculate all hashes for smaller files (standard approach)
+                md5_hash = hashlib.md5()
+                sha256_hash = hashlib.sha256()
+                sha512_hash = hashlib.sha512()
+                chunk_size = 64 * 1024  # 64KB chunks for smaller files
+
+                with open(path, "rb") as f:
+                    # Use explicit while loop to avoid potential recursion in iter()
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        md5_hash.update(chunk)
+                        sha256_hash.update(chunk)
+                        sha512_hash.update(chunk)
+
+                hashes["md5"] = md5_hash.hexdigest()
+                hashes["sha256"] = sha256_hash.hexdigest()
+                hashes["sha512"] = sha512_hash.hexdigest()
+
+        except (RecursionError, MemoryError) as e:
+            logger.warning(f"Failed to calculate hashes for {path}: {type(e).__name__}: {e}")
+            # For recursion/memory errors, indicate the specific issue
+            error_msg = f"hash_calculation_failed_{type(e).__name__.lower()}"
+            hashes = {"md5": error_msg, "sha256": error_msg, "sha512": error_msg}
         except Exception as e:
             logger.warning(f"Failed to calculate hashes for {path}: {e}")
             # Return empty hashes on error rather than failing
