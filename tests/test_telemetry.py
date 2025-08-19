@@ -25,7 +25,7 @@ class TestUserConfig:
     def test_user_config_creates_user_id(self):
         """Test that user config generates a UUID."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_file = Path(temp_dir) / "user_config.json"
+            config_file = Path(temp_dir) / ".modelaudit" / "user_config.json"
 
             with patch("modelaudit.telemetry.Path.home") as mock_home:
                 mock_home.return_value = Path(temp_dir)

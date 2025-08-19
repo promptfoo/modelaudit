@@ -9,13 +9,20 @@ import logging
 import os
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
+from functools import wraps
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, TypeVar, Union
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+# Type variable for generic function decoration
+F = TypeVar("F", bound=Callable[..., Any])
+
+from . import __version__
 
 try:
     from posthog import Posthog
@@ -25,9 +32,47 @@ except ImportError:
     POSTHOG_AVAILABLE = False
     Posthog = None
 
-from . import __version__
-
 logger = logging.getLogger("modelaudit.telemetry")
+
+
+def safe_telemetry(func: F) -> F:
+    """
+    Decorator that makes telemetry functions safe by catching all exceptions.
+
+    This ensures telemetry failures never interrupt core functionality.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.debug(f"Telemetry function {func.__name__} failed silently: {e}")
+            return None
+
+    return wrapper
+
+
+@contextmanager
+def telemetry_context():
+    """
+    Context manager for safe telemetry operations.
+
+    Ensures any telemetry errors don't propagate to core functionality.
+    """
+    try:
+        yield
+    except Exception as e:
+        logger.debug(f"Telemetry operation failed silently: {e}")
+
+
+def is_telemetry_available() -> bool:
+    """Check if telemetry is available and working."""
+    try:
+        client = get_telemetry_client()
+        return not client._is_disabled()
+    except Exception:
+        return False
 
 
 class TelemetryEvent(str, Enum):
@@ -178,9 +223,9 @@ class TelemetryClient:
             logger.debug(f"Failed to identify user: {e}")
 
     def _record_telemetry_disabled(self) -> None:
-        """Record that telemetry was disabled (ironically via telemetry)."""
+        """Mark that telemetry was disabled (no network calls for true decoupling)."""
         if not self._telemetry_disabled_recorded:
-            self._send_event_internal(TelemetryEvent.FEATURE_USED, {"feature": "telemetry_disabled"})
+            # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
@@ -504,88 +549,134 @@ class TelemetryClient:
 _telemetry_client = None
 
 
-def get_telemetry_client() -> TelemetryClient:
+def get_telemetry_client() -> Optional[TelemetryClient]:
     """Get the global telemetry client instance."""
     global _telemetry_client
-    if _telemetry_client is None:
-        _telemetry_client = TelemetryClient()
-    return _telemetry_client
+    try:
+        if _telemetry_client is None:
+            _telemetry_client = TelemetryClient()
+        return _telemetry_client
+    except Exception as e:
+        logger.debug(f"Failed to initialize telemetry client: {e}")
+        return None
 
 
-# Convenience functions for common telemetry operations
+# Convenience functions for common telemetry operations - all wrapped for safety
+@safe_telemetry
 def record_event(event: TelemetryEvent, properties: Optional[dict[str, Any]] = None) -> None:
     """Record a telemetry event using the global client."""
-    get_telemetry_client().record_event(event, properties)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_event(event, properties)
 
 
+@safe_telemetry
 def record_scan_started(paths: list[str], scan_options: dict[str, Any]) -> None:
     """Record that a scan has started."""
-    get_telemetry_client().record_scan_started(paths, scan_options)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_scan_started(paths, scan_options)
 
 
+@safe_telemetry
 def record_scan_completed(duration: float, results: dict[str, Any]) -> None:
     """Record that a scan has completed."""
-    get_telemetry_client().record_scan_completed(duration, results)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_scan_completed(duration, results)
 
 
+@safe_telemetry
 def record_scan_failed(duration: float, error: str) -> None:
     """Record that a scan has failed."""
-    get_telemetry_client().record_scan_failed(duration, error)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_scan_failed(duration, error)
 
 
+@safe_telemetry
 def record_command_used(command: str, duration: Optional[float] = None, **kwargs) -> None:
     """Record usage of a CLI command."""
-    get_telemetry_client().record_command_used(command, duration, **kwargs)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_command_used(command, duration, **kwargs)
 
 
+@safe_telemetry
 def record_feature_used(feature: str, **kwargs) -> None:
     """Record usage of a specific feature."""
-    get_telemetry_client().record_feature_used(feature, **kwargs)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_feature_used(feature, **kwargs)
 
 
+@safe_telemetry
 def record_scanner_used(scanner_name: str, file_type: str, duration: float) -> None:
     """Record usage of a specific scanner."""
-    get_telemetry_client().record_scanner_used(scanner_name, file_type, duration)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_scanner_used(scanner_name, file_type, duration)
 
 
+@safe_telemetry
 def record_file_type_detected(file_path: str, detected_type: str, confidence: float = 1.0) -> None:
     """Record detection of a file type."""
-    get_telemetry_client().record_file_type_detected(file_path, detected_type, confidence)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_file_type_detected(file_path, detected_type, confidence)
 
 
+@safe_telemetry
 def record_issue_found(issue_type: str, severity: str, scanner: str) -> None:
     """Record that a security issue was found."""
-    get_telemetry_client().record_issue_found(issue_type, severity, scanner)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_issue_found(issue_type, severity, scanner)
 
 
+@safe_telemetry
 def record_download_started(source_type: str, url: str, size_bytes: Optional[int] = None) -> None:
     """Record that a download has started."""
-    get_telemetry_client().record_download_started(source_type, url, size_bytes)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_download_started(source_type, url, size_bytes)
 
 
+@safe_telemetry
 def record_download_completed(source_type: str, duration: float, size_bytes: int) -> None:
     """Record that a download has completed."""
-    get_telemetry_client().record_download_completed(source_type, duration, size_bytes)
+    client = get_telemetry_client()
+    if client is not None:
+        client.record_download_completed(source_type, duration, size_bytes)
 
 
+@safe_telemetry
 def flush_telemetry() -> None:
     """Flush any pending telemetry events."""
     if _telemetry_client is not None:
         _telemetry_client.flush()
 
 
+@safe_telemetry
 def disable_telemetry() -> None:
     """Disable telemetry for the current user."""
     client = get_telemetry_client()
-    client._user_config.telemetry_enabled = False
+    if client is not None:
+        client._user_config.telemetry_enabled = False
 
 
+@safe_telemetry
 def enable_telemetry() -> None:
     """Enable telemetry for the current user."""
     client = get_telemetry_client()
-    client._user_config.telemetry_enabled = True
+    if client is not None:
+        client._user_config.telemetry_enabled = True
 
 
 def is_telemetry_enabled() -> bool:
     """Check if telemetry is enabled."""
-    return not get_telemetry_client()._is_disabled()
+    try:
+        client = get_telemetry_client()
+        return client is not None and not client._is_disabled()
+    except Exception:
+        return False
