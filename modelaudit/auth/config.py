@@ -194,12 +194,12 @@ class ModelAuditConfig:
         env_key = os.environ.get("MODELAUDIT_API_KEY")
         if env_key:
             return env_key
-            
+
         # 2. Check if delegated from promptfoo
         if os.environ.get("PROMPTFOO_DELEGATED"):
             # Use shared promptfoo config
             return self.cloud_config.get_api_key()
-            
+
         # 3. Fall back to regular config
         return self.cloud_config.get_api_key()
 
@@ -213,7 +213,7 @@ class ModelAuditConfig:
         env_host = os.environ.get("MODELAUDIT_API_HOST") or os.environ.get("API_HOST")
         if env_host:
             return env_host
-        
+
         # 2. Use shared promptfoo config (works for both delegated and normal cases)
         return self.cloud_config.get_api_host()
 
@@ -227,7 +227,7 @@ class ModelAuditConfig:
         env_email = os.environ.get("MODELAUDIT_USER_EMAIL")
         if env_email:
             return env_email
-        
+
         # 2. Use shared promptfoo config (works for both delegated and normal cases)
         return get_user_email()
 
@@ -256,11 +256,11 @@ class ModelAuditConfig:
     def is_authenticated(self) -> bool:
         """Check if user is authenticated."""
         return self.get_api_key() is not None
-    
+
     def is_delegated(self) -> bool:
         """Check if running in delegation mode from promptfoo."""
         return bool(os.environ.get("PROMPTFOO_DELEGATED"))
-    
+
     def get_auth_source(self) -> str:
         """Get the source of authentication (modelaudit or promptfoo)."""
         if self.is_delegated():

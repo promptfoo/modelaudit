@@ -13,7 +13,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .auth.client import auth_client
-from .auth.config import cloud_config, get_user_email, set_user_email, is_delegated_from_promptfoo, config
+from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
@@ -118,32 +118,31 @@ def auth():
 
 @auth.command()
 @click.option("-o", "--org", "org_id", help="The organization id to login to.")
-@click.option("-h", "--host", help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.")
+@click.option(
+    "-h",
+    "--host",
+    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+)
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id, host, api_key):
     """Login"""
     try:
         token = None
         api_host = host or cloud_config.get_api_host()
-        
+
         # Record telemetry (stub for now)
         # telemetry.record('command_used', {'name': 'auth login'})
-        
+
         if api_key:
             token = api_key
             result = auth_client.validate_and_set_api_token(token, api_host)
             user = result["user"]
-            organization = result["organization"]
-            app = result["app"]
-            
+
             # Store token in global config and handle email sync
             existing_email = get_user_email()
             if existing_email and existing_email != user.email:
                 click.echo(
-                    style_text(
-                        f"Updating local email configuration from {existing_email} to {user.email}",
-                        fg="yellow"
-                    )
+                    style_text(f"Updating local email configuration from {existing_email} to {user.email}", fg="yellow")
                 )
             set_user_email(user.email)
             click.echo(style_text("Successfully logged in", fg="green"))
@@ -153,11 +152,12 @@ def login(org_id, host, api_key):
                 f"Please login or sign up at {style_text('https://promptfoo.app', fg='green')} to get an API key."
             )
             click.echo(
-                f"After logging in, you can get your api token at {style_text('https://promptfoo.app/welcome', fg='green')}"
+                f"After logging in, you can get your api token at "
+                f"{style_text('https://promptfoo.app/welcome', fg='green')}"
             )
-        
+
         return
-        
+
     except Exception as error:
         error_message = str(error)
         click.echo(f"Authentication failed: {error_message}", err=True)
@@ -169,16 +169,11 @@ def logout():
     """Logout"""
     email = get_user_email()
     api_key = cloud_config.get_api_key()
-    
+
     if not email and not api_key:
-        click.echo(
-            style_text(
-                "You're already logged out - no active session to terminate",
-                fg="yellow"
-            )
-        )
+        click.echo(style_text("You're already logged out - no active session to terminate", fg="yellow"))
         return
-    
+
     cloud_config.delete()
     # Always unset email on logout
     set_user_email("")
@@ -192,24 +187,23 @@ def whoami():
     try:
         email = get_user_email()
         api_key = cloud_config.get_api_key()
-        
+
         if not email or not api_key:
             click.echo(f"Not logged in. Run {style_text('modelaudit auth login', bold=True)} to login.")
             return
-        
-        api_host = cloud_config.get_api_host()
+
         user_info = auth_client.get_user_info()
         user = user_info.get("user", {})
         organization = user_info.get("organization", {})
-        
+
         click.echo(style_text("Currently logged in as:", fg="green", bold=True))
         click.echo(f"User: {style_text(user.get('email', 'Unknown'), fg='cyan')}")
         click.echo(f"Organization: {style_text(organization.get('name', 'Unknown'), fg='cyan')}")
         click.echo(f"App URL: {style_text(cloud_config.get_app_url(), fg='cyan')}")
-        
+
         # Record telemetry (stub for now)
         # telemetry.record('command_used', {'name': 'auth whoami'})
-        
+
     except Exception as error:
         error_message = str(error)
         click.echo(f"Failed to get user info: {error_message}", err=True)
@@ -220,18 +214,15 @@ def whoami():
 def delegate_info():
     """Internal command to show delegation status"""
     import json
+
     from .auth.config import config
-    
+
     is_delegated = config.is_delegated()
     auth_source = config.get_auth_source()
     api_key_available = config.is_authenticated()
-    
-    info = {
-        "delegated": is_delegated,
-        "auth_source": auth_source,
-        "api_key_available": api_key_available
-    }
-    
+
+    info = {"delegated": is_delegated, "auth_source": auth_source, "api_key_available": api_key_available}
+
     click.echo(json.dumps(info, indent=2))
 
 
@@ -452,7 +443,7 @@ def scan_command(
         delegation_note = ""
         if is_delegated_from_promptfoo():
             delegation_note = style_text(" (via promptfoo)", dim=True)
-        
+
         header = [
             "─" * 80,
             style_text("ModelAudit Security Scanner", fg="blue", bold=True) + delegation_note,
