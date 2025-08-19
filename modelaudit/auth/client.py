@@ -1,27 +1,69 @@
-"""Authentication client for ModelAudit."""
+"""Authentication client for ModelAudit - mirrors promptfoo's implementation."""
 
 import logging
+import os
 from typing import Any, Optional
 
 import requests
 
-from .config import config
+from .config import cloud_config, get_user_email
 
 logger = logging.getLogger("modelaudit.auth")
 
 
-class AuthClient:
-    """Handles authentication API calls."""
+def fetch_with_proxy(url: str, **kwargs) -> requests.Response:
+    """Fetch with proxy support, mirroring promptfoo's fetchWithProxy."""
+    # Set default timeout
+    kwargs.setdefault("timeout", 30)
 
-    def __init__(self):
-        """Initialize auth client."""
-        self.session = requests.Session()
-        # Set a reasonable timeout
-        self.session.timeout = 30
+    # Add proxy configuration if environment variables are set
+    proxies = {}
+    if os.getenv("HTTP_PROXY"):
+        proxies["http"] = os.getenv("HTTP_PROXY")
+    if os.getenv("HTTPS_PROXY"):
+        proxies["https"] = os.getenv("HTTPS_PROXY")
+
+    if proxies:
+        kwargs["proxies"] = proxies
+
+    # Use requests for HTTP calls
+    return requests.get(url, **kwargs)
+
+
+class CloudUser:
+    """Cloud user data structure."""
+
+    def __init__(self, data: dict[str, Any]):
+        self.id = data.get("id")
+        self.name = data.get("name")
+        self.email = data.get("email")
+        self.created_at = data.get("createdAt")
+        self.updated_at = data.get("updatedAt")
+
+
+class CloudOrganization:
+    """Cloud organization data structure."""
+
+    def __init__(self, data: dict[str, Any]):
+        self.id = data.get("id")
+        self.name = data.get("name")
+        self.created_at = data.get("createdAt")
+        self.updated_at = data.get("updatedAt")
+
+
+class CloudApp:
+    """Cloud app data structure."""
+
+    def __init__(self, data: dict[str, Any]):
+        self.url = data.get("url")
+
+
+class AuthClient:
+    """Handles authentication API calls - mirrors promptfoo's CloudConfig methods."""
 
     def validate_and_set_api_token(self, token: str, api_host: Optional[str] = None) -> dict[str, Any]:
         """
-        Validate API token and set configuration.
+        Validate API token and set configuration - mirrors promptfoo's validateAndSetApiToken.
 
         Args:
             token: API token to validate
@@ -31,13 +73,12 @@ class AuthClient:
             Dictionary with user, organization, and app information
 
         Raises:
-            requests.RequestException: If API call fails
-            ValueError: If token is invalid
+            Exception: If token validation fails
         """
-        host = api_host or config.get_api_host()
+        host = api_host or cloud_config.get_api_host()
 
         try:
-            response = self.session.get(
+            response = fetch_with_proxy(
                 f"{host}/api/v1/users/me",
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -46,33 +87,30 @@ class AuthClient:
             )
 
             if not response.ok:
-                error_text = response.text
+                error_message = response.text
                 logger.error(
-                    f"Failed to validate API token: {error_text}. "
-                    f"HTTP Status: {response.status_code} - {response.reason}"
+                    f"[Cloud] Failed to validate API token: {error_message}. "
+                    f"HTTP Status: {response.status_code} - {response.reason}."
                 )
-                raise ValueError(f"Failed to validate API token: {response.reason}")
+                raise Exception(f"Failed to validate API token: {response.reason}")
 
             data = response.json()
             user = data.get("user", {})
             organization = data.get("organization", {})
             app = data.get("app", {})
 
-            # Store the validated credentials
-            config.set_api_key(token)
-            if api_host:
-                config.set_api_host(api_host)
-            if user.get("email"):
-                config.set_user_email(user["email"])
-            if app.get("url"):
-                config.set_app_url(app["url"])
+            # Set configuration exactly like promptfoo
+            cloud_config.set_api_key(token)
+            cloud_config.set_api_host(host)
+            cloud_config.set_app_url(app.get("url", "https://www.promptfoo.app"))
 
-            logger.info("Successfully authenticated with promptfoo")
+            return {"user": CloudUser(user), "organization": CloudOrganization(organization), "app": CloudApp(app)}
 
-            return {"user": user, "organization": organization, "app": app}
-
-        except requests.RequestException as e:
-            logger.error(f"Failed to validate API token with host {host}: {e!s}")
+        except requests.RequestException as error:
+            error_message = str(error)
+            logger.error(f"[Cloud] Failed to validate API token with host {host}: {error_message}")
+            if hasattr(error, "__cause__") and error.__cause__:
+                logger.error(f"Cause: {error.__cause__}")
             raise
 
     def get_user_info(self) -> dict[str, Any]:
@@ -83,17 +121,18 @@ class AuthClient:
             Dictionary with user information
 
         Raises:
-            ValueError: If not authenticated
-            requests.RequestException: If API call fails
+            Exception: If not authenticated or API call fails
         """
-        api_key = config.get_api_key()
-        if not api_key:
-            raise ValueError("Not authenticated. Please run 'modelaudit auth login' first.")
+        email = get_user_email()
+        api_key = cloud_config.get_api_key()
 
-        api_host = config.get_api_host()
+        if not email or not api_key:
+            raise Exception("Not logged in. Run 'modelaudit auth login' to login.")
+
+        api_host = cloud_config.get_api_host()
 
         try:
-            response = self.session.get(
+            response = fetch_with_proxy(
                 f"{api_host}/api/v1/users/me",
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -102,14 +141,14 @@ class AuthClient:
             )
 
             if not response.ok:
-                raise ValueError(f"Failed to get user info: {response.reason}")
+                raise Exception(f"Failed to fetch user info: {response.reason}")
 
-            json_response: dict[str, Any] = response.json()
-            return json_response
+            return response.json()
 
-        except requests.RequestException as e:
-            logger.error(f"Failed to get user info: {e!s}")
-            raise
+        except requests.RequestException as error:
+            error_message = str(error)
+            logger.error(f"Failed to get user info: {error_message}")
+            raise Exception(f"Failed to get user info: {error_message}") from error
 
 
 # Global auth client instance
