@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import requests
 
@@ -94,7 +94,7 @@ class AuthClient:
                 )
                 raise Exception(f"Failed to validate API token: {response.reason}")
 
-            data = response.json()
+            data = cast(dict[str, Any], response.json())
             user = data.get("user", {})
             organization = data.get("organization", {})
             app = data.get("app", {})
@@ -143,7 +143,7 @@ class AuthClient:
             if not response.ok:
                 raise Exception(f"Failed to fetch user info: {response.reason}")
 
-            return response.json()
+            return cast(dict[str, Any], response.json())
 
         except requests.RequestException as error:
             error_message = str(error)

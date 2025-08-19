@@ -1,7 +1,7 @@
 """Configuration management for ModelAudit authentication."""
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from uuid import uuid4
 
 import yaml
@@ -62,11 +62,11 @@ class CloudConfig:
 
     def get_api_key(self) -> Optional[str]:
         """Get API key."""
-        return self.config.get("apiKey")
+        return cast(Optional[str], self.config.get("apiKey"))
 
     def get_api_host(self) -> str:
         """Get API host."""
-        return self.config.get("apiHost", API_HOST)
+        return cast(str, self.config.get("apiHost", API_HOST))
 
     def set_app_url(self, app_url: str) -> None:
         """Set app URL."""
@@ -75,7 +75,7 @@ class CloudConfig:
 
     def get_app_url(self) -> str:
         """Get app URL."""
-        return self.config.get("appUrl", "https://www.promptfoo.app")
+        return cast(str, self.config.get("appUrl", "https://www.promptfoo.app"))
 
     def delete(self) -> None:
         """Delete cloud configuration."""
@@ -178,13 +178,13 @@ def get_user_id() -> str:
         write_global_config(updated_config)
         return new_id
 
-    return global_config.id
+    return cast(str, global_config.id)
 
 
 def get_user_email() -> Optional[str]:
     """Get user email from global config."""
     global_config = read_global_config()
-    return global_config.account.get("email")
+    return cast(Optional[str], global_config.account.get("email"))
 
 
 def set_user_email(email: str) -> None:
@@ -211,10 +211,10 @@ class ModelAuditConfig:
         # 2. Check if delegated from promptfoo
         if os.environ.get("PROMPTFOO_DELEGATED"):
             # Use shared promptfoo config
-            return self.cloud_config.get_api_key()
+            return cast(Optional[str], self.cloud_config.get_api_key())
 
         # 3. Fall back to regular config
-        return self.cloud_config.get_api_key()
+        return cast(Optional[str], self.cloud_config.get_api_key())
 
     def set_api_key(self, api_key: str) -> None:
         """Set API key in config."""
@@ -228,7 +228,7 @@ class ModelAuditConfig:
             return env_host
 
         # 2. Use shared promptfoo config (works for both delegated and normal cases)
-        return self.cloud_config.get_api_host()
+        return cast(str, self.cloud_config.get_api_host())
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host in config."""
@@ -255,7 +255,7 @@ class ModelAuditConfig:
         if env_url:
             return env_url
 
-        return self.cloud_config.get_app_url()
+        return cast(str, self.cloud_config.get_app_url())
 
     def set_app_url(self, app_url: str) -> None:
         """Set app URL in config."""
