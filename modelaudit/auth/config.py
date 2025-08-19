@@ -100,7 +100,12 @@ def get_config_directory_path(create_if_not_exists: bool = False) -> str:
     """Get configuration directory path."""
     config_dir = user_config_dir("promptfoo")
     if create_if_not_exists:
-        os.makedirs(config_dir, exist_ok=True)
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+        except (OSError, PermissionError):
+            # In Docker or restricted environments, use a temporary directory
+            config_dir = "/tmp/promptfoo"
+            os.makedirs(config_dir, exist_ok=True)
     return config_dir
 
 
@@ -123,20 +128,28 @@ def read_global_config() -> GlobalConfig:
             global_config_data["id"] = str(uuid4())
             write_global_config(GlobalConfig(global_config_data))
     else:
-        os.makedirs(config_dir, exist_ok=True)
-        with open(config_file_path, "w") as f:
-            yaml.dump(global_config_data, f)
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+            with open(config_file_path, "w") as f:
+                yaml.dump(global_config_data, f)
+        except (OSError, PermissionError):
+            # In Docker/restricted environments, skip file creation
+            pass
 
     return GlobalConfig(global_config_data)
 
 
 def write_global_config(config: GlobalConfig) -> None:
     """Write global configuration to file."""
-    config_dir = get_config_directory_path(create_if_not_exists=True)
-    config_file_path = os.path.join(config_dir, "promptfoo.yaml")
+    try:
+        config_dir = get_config_directory_path(create_if_not_exists=True)
+        config_file_path = os.path.join(config_dir, "promptfoo.yaml")
 
-    with open(config_file_path, "w") as f:
-        yaml.dump(config.to_dict(), f)
+        with open(config_file_path, "w") as f:
+            yaml.dump(config.to_dict(), f)
+    except (OSError, PermissionError):
+        # In Docker/restricted environments, skip file writing
+        pass
 
 
 def write_global_config_partial(partial_config: dict[str, Any]) -> None:
