@@ -1,6 +1,7 @@
 """
 Tests to ensure telemetry is properly decoupled from core functionality.
 """
+# ruff: noqa: SIM117
 
 import tempfile
 from pathlib import Path
@@ -130,9 +131,7 @@ class TestTelemetryDecoupling:
     def test_posthog_import_failure_handled(self):
         """Test that PostHog import failures don't break telemetry initialization."""
         with patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False):
-            with tempfile.TemporaryDirectory() as temp_dir, patch(
-                "modelaudit.telemetry.Path.home"
-            ) as mock_home:
+            with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
                 mock_home.return_value = Path(temp_dir)
 
                 from modelaudit.telemetry import get_telemetry_client
@@ -144,9 +143,7 @@ class TestTelemetryDecoupling:
 
     def test_network_failures_dont_break_functionality(self):
         """Test that network failures in telemetry don't affect core functionality."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "modelaudit.telemetry.Path.home"
-        ) as mock_home:
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
             mock_home.return_value = Path(temp_dir)
 
             # Enable telemetry but make all network calls fail
@@ -187,9 +184,7 @@ class TestTelemetryFunctionalityWhenWorking:
 
     def test_telemetry_works_when_enabled_and_available(self):
         """Test that telemetry actually works when properly configured."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "modelaudit.telemetry.Path.home"
-        ) as mock_home:
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
             mock_home.return_value = Path(temp_dir)
 
             from modelaudit.telemetry import get_telemetry_client

@@ -19,10 +19,10 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from . import __version__
+
 # Type variable for generic function decoration
 F = TypeVar("F", bound=Callable[..., Any])
-
-from . import __version__
 
 try:
     from posthog import Posthog
