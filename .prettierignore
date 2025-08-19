@@ -36,3 +36,6 @@ Thumbs.db
 # Test artifacts
 test-results/
 test-reports/
+
+# Copied external projects (for analysis only)
+promptfoo/

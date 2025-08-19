@@ -298,7 +298,9 @@ class TelemetryClient:
                 "max_file_size": scan_options.get("max_file_size"),
                 "format": scan_options.get("format", "text"),
                 "has_blacklist": bool(scan_options.get("blacklist_patterns")),
-                "num_blacklist_patterns": len(scan_options.get("blacklist_patterns", [])),  # Count only, not actual patterns
+                "num_blacklist_patterns": len(
+                    scan_options.get("blacklist_patterns", [])
+                ),  # Count only, not actual patterns
                 "large_model_support": scan_options.get("large_model_support", True),
                 "progress_enabled": scan_options.get("progress", True),
             },

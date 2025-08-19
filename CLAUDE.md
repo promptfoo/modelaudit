@@ -153,6 +153,7 @@ ModelAudit includes telemetry to help improve the tool. **Telemetry is enabled b
 - **CI detection**: Automatically disabled in CI environments
 
 ### What is collected:
+
 - Command usage and scan duration
 - File paths and model names being scanned
 - File types detected during scanning
@@ -162,6 +163,7 @@ ModelAudit includes telemetry to help improve the tool. **Telemetry is enabled b
 - Blacklist patterns used
 
 ### What is NOT collected:
+
 - File contents or model weights
 - Personal credentials or sensitive data
 
