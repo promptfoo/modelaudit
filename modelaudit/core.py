@@ -114,24 +114,20 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
     Raises:
         Exception: Logs errors but doesn't fail the scan if consolidation fails
     """
-    checks_list = cast(list[dict[str, Any]], results.get("checks", []))
+    checks_list = cast(list[Any], results.get("checks", []))
     if not checks_list:
         logger.debug("No checks to consolidate")
         return
 
     logger.debug(f"Starting consolidation of {len(checks_list)} checks")
 
-    # Validate input data
-    if not isinstance(checks_list, list):
-        logger.error(f"Invalid checks format: expected list, got {type(checks_list)}")
-        return
-
     # Group checks by (check_name, primary_asset_path)
     check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
 
     for i, check in enumerate(checks_list):
+        # Type guard: ensure check is a dictionary
         if not isinstance(check, dict):
-            logger.warning(f"Invalid check format at index {i}, skipping: {check}")
+            logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
             continue
 
         check_name = check.get("name", "Unknown Check")
