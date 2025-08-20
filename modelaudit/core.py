@@ -101,6 +101,186 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     return dict(content_groups)
 
 
+def _extract_primary_asset_from_location(location: str) -> str:
+    """Extract primary asset path from location string.
+
+    Args:
+        location: Location string in various formats
+
+    Returns:
+        Primary asset path, or "unknown" if cannot be determined
+    """
+    if not location or not isinstance(location, str):
+        return "unknown"
+
+    # Split on spaces first to handle duplicate file listings
+    locations = location.strip().split()
+    if not locations:
+        return "unknown"
+
+    primary_location = locations[0]
+    # Extract main file path (before any ':' separator for archive contents)
+    primary_asset = primary_location.split(":", 1)[0] if ":" in primary_location else primary_location
+
+    # Normalize empty paths
+    return primary_asset.strip() if primary_asset.strip() else "unknown"
+
+
+def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Group checks by (check_name, primary_asset_path).
+
+    Args:
+        checks_list: List of check dictionaries
+
+    Returns:
+        Dictionary mapping (check_name, asset_path) to list of checks
+    """
+    check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+    for i, check in enumerate(checks_list):
+        # Type guard: ensure check is a dictionary
+        if not isinstance(check, dict):
+            logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
+            continue
+
+        check_name = check.get("name", "Unknown Check")
+        location = check.get("location", "")
+        primary_asset = _extract_primary_asset_from_location(location)
+
+        group_key = (check_name, primary_asset)
+        check_groups[group_key].append(check)
+
+    return check_groups
+
+
+def _create_consolidated_message(check_name: str, group_checks: list[dict[str, Any]],
+                                consolidated_status: str, failed_count: int) -> str:
+    """Create appropriate consolidated message based on check results.
+
+    Args:
+        check_name: Name of the check
+        group_checks: List of checks in this group
+        consolidated_status: Overall status (passed/failed)
+        failed_count: Number of failed checks
+
+    Returns:
+        Consolidated message string
+    """
+    if consolidated_status == "passed":
+        # For passed checks, use the message from first check or create generic
+        messages = {c.get("message", "") for c in group_checks if c.get("status") == "passed"}
+
+        # If all passed checks have the same message, use it
+        if len(messages) == 1:
+            return str(next(iter(messages)))
+        else:
+            return f"{check_name} completed successfully"
+
+    else:  # failed status
+        # For failed checks, summarize or use common message
+        failed_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
+
+        if len(failed_messages) == 1:
+            return str(next(iter(failed_messages)))
+        elif failed_count == 1:
+            return f"{check_name} found 1 issue"
+        else:
+            return f"{check_name} found {failed_count} issues"
+
+
+def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collect and consolidate details from failed checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Consolidated details dictionary
+    """
+    consolidated_details: dict[str, Any] = {"component_count": len(group_checks)}
+    failed_details: list[Any] = []
+
+    for check in group_checks:
+        if check.get("status") == "failed" and check.get("details"):
+            failed_details.append(check["details"])
+
+    if failed_details:
+        consolidated_details["findings"] = failed_details
+
+    return consolidated_details
+
+
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+    """Extract severity and explanation from failed checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Tuple of (severity, explanation) from failed checks
+    """
+    consolidated_severity = None
+    consolidated_why = None
+
+    for check in group_checks:
+        if check.get("status") == "failed":
+            if not consolidated_severity and check.get("severity"):
+                consolidated_severity = check["severity"]
+            if not consolidated_why and check.get("why"):
+                consolidated_why = check["why"]
+
+            # Stop once we have both
+            if consolidated_severity and consolidated_why:
+                break
+
+    return consolidated_severity, consolidated_why
+
+
+def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
+    """Get the most recent timestamp from a group of checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Most recent timestamp, or current time if none found
+    """
+    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
+    return max(timestamps) if timestamps else time.time()
+
+
+def _update_result_counts(results: dict[str, Any], consolidated_checks: list[dict[str, Any]],
+                         original_count: int) -> None:
+    """Update result dictionary with consolidated check counts.
+
+    Args:
+        results: Results dictionary to update
+        consolidated_checks: List of consolidated checks
+        original_count: Original number of checks before consolidation
+    """
+    total_checks = len(consolidated_checks)
+    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
+    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
+    skipped_checks = total_checks - passed_checks - failed_checks
+
+    # Validate counts make sense
+    if passed_checks + failed_checks + skipped_checks != total_checks:
+        logger.warning(
+            f"Check count mismatch: {passed_checks}P + {failed_checks}F + {skipped_checks}S != {total_checks}T"
+        )
+
+    results["total_checks"] = total_checks
+    results["passed_checks"] = passed_checks
+    results["failed_checks"] = failed_checks
+
+    # Log consolidation summary
+    reduction_count = original_count - total_checks
+    logger.info(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
+
+    if skipped_checks > 0:
+        logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
+
+
 def _consolidate_checks(results: dict[str, Any]) -> None:
     """Consolidate duplicate checks by name and asset for cleaner reporting.
 
@@ -122,32 +302,7 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
     logger.debug(f"Starting consolidation of {len(checks_list)} checks")
 
     # Group checks by (check_name, primary_asset_path)
-    check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-
-    for i, check in enumerate(checks_list):
-        # Type guard: ensure check is a dictionary
-        if not isinstance(check, dict):
-            logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
-            continue
-
-        check_name = check.get("name", "Unknown Check")
-        location = check.get("location", "")
-
-        # Extract primary asset path from location with robust parsing
-        primary_asset = "unknown"
-        if location and isinstance(location, str):
-            # Split on spaces first to handle duplicate file listings
-            locations = location.strip().split()
-            if locations:
-                primary_location = locations[0]
-                # Extract main file path (before any ':' separator for archive contents)
-                primary_asset = primary_location.split(":", 1)[0] if ":" in primary_location else primary_location
-
-                # Normalize empty paths
-                primary_asset = primary_asset.strip() if primary_asset.strip() else "unknown"
-
-        group_key = (check_name, primary_asset)
-        check_groups[group_key].append(check)
+    check_groups = _group_checks_by_asset(checks_list)
 
     # Consolidate checks within each group
     consolidated_checks: list[dict[str, Any]] = []
@@ -161,64 +316,20 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
         # Multiple checks - consolidate them
         passed_count = sum(1 for c in group_checks if c.get("status") == "passed")
         failed_count = len(group_checks) - passed_count
-
-        # Determine consolidated status
         consolidated_status = "failed" if failed_count > 0 else "passed"
 
-        # Create consolidated message
-        if consolidated_status == "passed":
-            consolidated_message = group_checks[0].get("message", "Check passed")
-            # If all checks have the same message, use it; otherwise make generic
-            messages = {c.get("message", "") for c in group_checks}
-            if len(messages) > 1:
-                consolidated_message = f"{check_name} completed successfully"
-        else:
-            # For failed checks, create a summary message
-            unique_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
-            if len(unique_messages) == 1:
-                consolidated_message = next(iter(unique_messages))
-            else:
-                consolidated_message = f"{check_name} found {failed_count} issue(s)"
-
-        # Collect all details from failed checks
-        consolidated_details: dict[str, Any] = {"component_count": len(group_checks)}
-        failed_details: list[Any] = []
-
-        for check in group_checks:
-            if check.get("status") == "failed" and check.get("details"):
-                failed_details.append(check["details"])
-
-        if failed_details:
-            consolidated_details["findings"] = failed_details
-
-        # Use the most recent timestamp with safety check
-        timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
-        consolidated_timestamp = max(timestamps) if timestamps else time.time()
-
-        # Get consolidated location (preserve duplicate file info if present)
-        consolidated_location = group_checks[0].get("location", primary_asset)
-
-        # Get severity and why from failed checks (if any)
-        consolidated_severity = None
-        consolidated_why = None
-        for check in group_checks:
-            if check.get("status") == "failed":
-                if not consolidated_severity and check.get("severity"):
-                    consolidated_severity = check["severity"]
-                if not consolidated_why and check.get("why"):
-                    consolidated_why = check["why"]
-
-        # Create consolidated check
+        # Build consolidated check
         consolidated_check = {
             "name": check_name,
             "status": consolidated_status,
-            "message": consolidated_message,
-            "location": consolidated_location,
-            "details": consolidated_details,
-            "timestamp": consolidated_timestamp,
+            "message": _create_consolidated_message(check_name, group_checks, consolidated_status, failed_count),
+            "location": group_checks[0].get("location", primary_asset),
+            "details": _collect_consolidated_details(group_checks),
+            "timestamp": _get_consolidated_timestamp(group_checks),
         }
 
-        # Add severity and why for failed checks
+        # Add optional fields for failed checks
+        consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
         if consolidated_severity:
             consolidated_check["severity"] = consolidated_severity
         if consolidated_why:
@@ -227,37 +338,14 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
         consolidated_checks.append(consolidated_check)
 
         # Log consolidation info
-        if len(group_checks) > 1:
-            logger.debug(
-                f"Consolidated {len(group_checks)} '{check_name}' checks for {primary_asset} "
-                f"({passed_count} passed, {failed_count} failed)"
-            )
-
-    # Replace the original checks list with consolidated checks
-    results["checks"] = consolidated_checks
-
-    # Update check counts with validation
-    total_checks = len(consolidated_checks)
-    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
-    skipped_checks = total_checks - passed_checks - failed_checks
-
-    # Validate counts make sense
-    if passed_checks + failed_checks + skipped_checks != total_checks:
-        logger.warning(
-            f"Check count mismatch: {passed_checks}P + {failed_checks}F + {skipped_checks}S != {total_checks}T"
+        logger.debug(
+            f"Consolidated {len(group_checks)} '{check_name}' checks for {primary_asset} "
+            f"({passed_count} passed, {failed_count} failed)"
         )
 
-    results["total_checks"] = total_checks
-    results["passed_checks"] = passed_checks
-    results["failed_checks"] = failed_checks
-
-    # Log consolidation summary
-    reduction_count = len(checks_list) - total_checks
-    logger.info(f"Check consolidation: {len(checks_list)} -> {total_checks} ({reduction_count} duplicates removed)")
-
-    if skipped_checks > 0:
-        logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
+    # Update results with consolidated checks and counts
+    results["checks"] = consolidated_checks
+    _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
 def validate_scan_config(config: dict[str, Any]) -> None:
