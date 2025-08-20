@@ -1253,7 +1253,29 @@ def scan_command(
     if output:
         with open(output, "w", encoding="utf-8") as f:
             f.write(output_text)
+
+        # Always confirm file was written (expected by tests and users)
         click.echo(f"Results written to {output}")
+
+        # Show summary in verbose mode for better UX
+        if verbose:
+            issues = aggregated_results.get("issues", [])
+            visible_issues = issues  # In verbose mode, show all issues including debug
+            if visible_issues:
+                critical_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
+                )
+                warning_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
+                )
+                if critical_count > 0:
+                    click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
+                elif warning_count > 0:
+                    click.echo(f"Found {warning_count} warning(s)")
+                else:
+                    click.echo(f"Found {len(visible_issues)} informational issue(s)")
+            else:
+                click.echo("No security issues found")
     else:
         # Add a separator line between debug output and scan results
         if format == "text":
