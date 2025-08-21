@@ -327,12 +327,6 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
    rye publish --yes
    ```
 
-#### GitHub Release (Optional)
-
-8. **Create GitHub release** (optional, for major releases):
-   - Use GitHub UI or `gh release create`
-   - Add release notes highlighting key changes
-
 ## 🐛 Reporting Issues
 
 When reporting issues:
