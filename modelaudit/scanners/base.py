@@ -314,7 +314,7 @@ class BaseScanner(ABC):
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
-        self.timeout = self.config.get("timeout", 1800)  # Default 30 minutes for large models
+        self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",

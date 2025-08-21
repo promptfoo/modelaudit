@@ -35,7 +35,7 @@ class LargeFileHandler:
         file_path: str,
         scanner: Any,
         progress_callback: Optional[Callable[[str, float], None]] = None,
-        timeout: int = 1800,
+        timeout: int = 3600,
     ):
         """
         Initialize the large file handler.
@@ -212,7 +212,7 @@ def scan_large_file(
     file_path: str,
     scanner: Any,
     progress_callback: Optional[Callable[[str, float], None]] = None,
-    timeout: int = 1800,
+    timeout: int = 3600,
 ) -> ScanResult:
     """
     Scan a large file with appropriate strategy.
