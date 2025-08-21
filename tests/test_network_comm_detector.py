@@ -189,8 +189,8 @@ class TestNetworkCommDetector:
         data = b"connect to server:1337" * 100
         context = "model.bin"
 
-        import time
         import os
+        import time
 
         start = time.perf_counter()
         # Fewer iterations in CI environments

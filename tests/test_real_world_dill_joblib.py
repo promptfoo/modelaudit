@@ -233,6 +233,7 @@ class TestPerformanceBenchmarks:
 
         # Create multiple test files (fewer in CI)
         import os
+
         count = 6 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 10
         for i in range(count):
             file_path = tmp_path / f"file_{i}.joblib"
@@ -270,10 +271,11 @@ class TestPerformanceBenchmarks:
 
             pickle.dump({"test": "data"}, f)
 
-        from modelaudit.scanners.pickle_scanner import _is_legitimate_serialization_file
-
         # Benchmark validation time
         import os
+
+        from modelaudit.scanners.pickle_scanner import _is_legitimate_serialization_file
+
         iters = 30 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 100
         start_time = time.perf_counter()
         for _ in range(iters):  # Multiple calls to get meaningful measurement

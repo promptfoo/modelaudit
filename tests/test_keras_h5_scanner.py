@@ -10,8 +10,6 @@ import h5py
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
-  
-
 
 def test_keras_h5_scanner_can_handle(tmp_path):
     """Test the can_handle method of KerasH5Scanner."""
