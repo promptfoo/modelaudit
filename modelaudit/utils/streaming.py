@@ -229,7 +229,7 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> Optional[dict[str,
             preview["detected_format"] = "zip (possibly pytorch/tensorflow)"
         elif b"HDF" in header[:10]:
             preview["detected_format"] = "HDF5 (keras/tensorflow)"
-        elif header.startswith(b"\x08\x08"):
+        elif header.startswith(b"\x08\x01\x12\x00") or b"onnx" in header[:32].lower():
             preview["detected_format"] = "ONNX"
 
         return preview
