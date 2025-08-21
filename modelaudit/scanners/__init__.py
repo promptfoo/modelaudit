@@ -55,8 +55,19 @@ class ScannerRegistry:
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
-        self._numpy_compatible, self._numpy_status = _check_numpy_compatibility()
+        self._numpy_compatible: Optional[bool] = None  # Lazy initialization
+        self._numpy_status: Optional[str] = None
         self._init_registry()
+
+    def _ensure_numpy_status(self) -> None:
+        """Lazy initialization of NumPy compatibility status."""
+        if self._numpy_compatible is None:
+            try:
+                self._numpy_compatible, self._numpy_status = _check_numpy_compatibility()
+            except RecursionError:
+                # Handle environments with very low recursion limits
+                self._numpy_compatible = False
+                self._numpy_status = "NumPy compatibility check failed due to low recursion limit"
 
     # Class-level constant for AI/ML manifest patterns
     _AIML_MANIFEST_PATTERNS = frozenset(
@@ -398,6 +409,7 @@ class ScannerRegistry:
 
                 if _is_numpy_compatibility_error(e):
                     if is_numpy_sensitive:
+                        self._ensure_numpy_status()  # Lazy initialization
                         error_msg = (
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
@@ -418,6 +430,7 @@ class ScannerRegistry:
                 # Store failure reason and log appropriately
                 self._failed_scanners[scanner_id] = error_msg
 
+                self._ensure_numpy_status()  # Lazy initialization
                 if is_numpy_sensitive and not self._numpy_compatible:
                     logger.info(error_msg)  # Info level for expected NumPy issues
                 else:
@@ -486,6 +499,7 @@ class ScannerRegistry:
 
     def get_numpy_status(self) -> tuple[bool, str]:
         """Get NumPy compatibility status"""
+        self._ensure_numpy_status()  # Lazy initialization
         return self._numpy_compatible, self._numpy_status
 
     def _is_aiml_manifest_file(self, filename: str) -> bool:
