@@ -1,7 +1,9 @@
 import builtins
+import hashlib
 import logging
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from threading import Lock
 from typing import IO, Any, Callable, Optional, cast
@@ -53,6 +55,299 @@ def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None
     """Helper function to add an error asset entry to the results."""
     assets_list = cast(list[dict[str, Any]], results["assets"])
     assets_list.append({"path": file_path, "type": "error"})
+
+
+def _calculate_file_hash(file_path: str) -> str:
+    """Calculate SHA256 hash of a file for deduplication purposes."""
+    try:
+        hash_sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            # Read file in chunks to handle large files efficiently
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
+    except Exception as e:
+        logger.warning(f"Failed to calculate hash for {file_path}: {e}")
+        # Return a unique identifier based on file path and size as fallback
+        try:
+            file_size = os.path.getsize(file_path)
+            return f"fallback_{file_path}_{file_size}"
+        except Exception:
+            return f"fallback_{file_path}"
+
+
+def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
+    """Group files by their content hash to avoid scanning duplicates.
+
+    Args:
+        file_paths: List of file paths to group
+
+    Returns:
+        Dictionary mapping content hash to list of file paths with that content
+    """
+    content_groups: dict[str, list[str]] = defaultdict(list)
+
+    for file_path in file_paths:
+        content_hash = _calculate_file_hash(file_path)
+        content_groups[content_hash].append(file_path)
+
+    # Log information about duplicate content found
+    for content_hash, paths in content_groups.items():
+        if len(paths) > 1:
+            logger.info(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]}...)")
+            for path in paths:
+                logger.debug(f"  - {path}")
+
+    return dict(content_groups)
+
+
+def _extract_primary_asset_from_location(location: str) -> str:
+    """Extract primary asset path from location string.
+
+    Args:
+        location: Location string in various formats
+
+    Returns:
+        Primary asset path, or "unknown" if cannot be determined
+    """
+    if not location or not isinstance(location, str):
+        return "unknown"
+
+    # Split on spaces first to handle duplicate file listings
+    locations = location.strip().split()
+    if not locations:
+        return "unknown"
+
+    primary_location = locations[0]
+    # Extract main file path (before any ':' separator for archive contents)
+    primary_asset = primary_location.split(":", 1)[0] if ":" in primary_location else primary_location
+
+    # Normalize empty paths
+    return primary_asset.strip() if primary_asset.strip() else "unknown"
+
+
+def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Group checks by (check_name, primary_asset_path).
+
+    Args:
+        checks_list: List of check dictionaries
+
+    Returns:
+        Dictionary mapping (check_name, asset_path) to list of checks
+    """
+    check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+    for i, check in enumerate(checks_list):
+        # Type guard: ensure check is a dictionary
+        if not isinstance(check, dict):
+            logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
+            continue
+
+        check_name = check.get("name", "Unknown Check")
+        location = check.get("location", "")
+        primary_asset = _extract_primary_asset_from_location(location)
+
+        group_key = (check_name, primary_asset)
+        check_groups[group_key].append(check)
+
+    return check_groups
+
+
+def _create_consolidated_message(
+    check_name: str, group_checks: list[dict[str, Any]], consolidated_status: str, failed_count: int
+) -> str:
+    """Create appropriate consolidated message based on check results.
+
+    Args:
+        check_name: Name of the check
+        group_checks: List of checks in this group
+        consolidated_status: Overall status (passed/failed)
+        failed_count: Number of failed checks
+
+    Returns:
+        Consolidated message string
+    """
+    if consolidated_status == "passed":
+        # For passed checks, use the message from first check or create generic
+        messages = {c.get("message", "") for c in group_checks if c.get("status") == "passed"}
+
+        # If all passed checks have the same message, use it
+        if len(messages) == 1:
+            return str(next(iter(messages)))
+        else:
+            return f"{check_name} completed successfully"
+
+    else:  # failed status
+        # For failed checks, summarize or use common message
+        failed_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
+
+        if len(failed_messages) == 1:
+            return str(next(iter(failed_messages)))
+        elif failed_count == 1:
+            return f"{check_name} found 1 issue"
+        else:
+            return f"{check_name} found {failed_count} issues"
+
+
+def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collect and consolidate details from failed checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Consolidated details dictionary
+    """
+    consolidated_details: dict[str, Any] = {"component_count": len(group_checks)}
+    failed_details: list[Any] = []
+
+    for check in group_checks:
+        if check.get("status") == "failed" and check.get("details"):
+            failed_details.append(check["details"])
+
+    if failed_details:
+        consolidated_details["findings"] = failed_details
+
+    return consolidated_details
+
+
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+    """Extract severity and explanation from failed checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Tuple of (severity, explanation) from failed checks
+    """
+    consolidated_severity = None
+    consolidated_why = None
+
+    for check in group_checks:
+        if check.get("status") == "failed":
+            if not consolidated_severity and check.get("severity"):
+                consolidated_severity = check["severity"]
+            if not consolidated_why and check.get("why"):
+                consolidated_why = check["why"]
+
+            # Stop once we have both
+            if consolidated_severity and consolidated_why:
+                break
+
+    return consolidated_severity, consolidated_why
+
+
+def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
+    """Get the most recent timestamp from a group of checks.
+
+    Args:
+        group_checks: List of checks in this group
+
+    Returns:
+        Most recent timestamp, or current time if none found
+    """
+    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
+    return max(timestamps) if timestamps else time.time()
+
+
+def _update_result_counts(
+    results: dict[str, Any], consolidated_checks: list[dict[str, Any]], original_count: int
+) -> None:
+    """Update result dictionary with consolidated check counts.
+
+    Args:
+        results: Results dictionary to update
+        consolidated_checks: List of consolidated checks
+        original_count: Original number of checks before consolidation
+    """
+    total_checks = len(consolidated_checks)
+    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
+    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
+    skipped_checks = total_checks - passed_checks - failed_checks
+
+    # Validate counts make sense
+    if passed_checks + failed_checks + skipped_checks != total_checks:
+        logger.warning(
+            f"Check count mismatch: {passed_checks}P + {failed_checks}F + {skipped_checks}S != {total_checks}T"
+        )
+
+    results["total_checks"] = total_checks
+    results["passed_checks"] = passed_checks
+    results["failed_checks"] = failed_checks
+
+    # Log consolidation summary
+    reduction_count = original_count - total_checks
+    logger.info(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
+
+    if skipped_checks > 0:
+        logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
+
+
+def _consolidate_checks(results: dict[str, Any]) -> None:
+    """Consolidate duplicate checks by name and asset for cleaner reporting.
+
+    Groups checks by (check_name, primary_asset_path) and consolidates them into
+    single checks per asset. This provides a cleaner reporting view while preserving
+    all findings from thorough scanning.
+
+    Args:
+        results: Scan results dictionary containing 'checks' list
+
+    Raises:
+        Exception: Logs errors but doesn't fail the scan if consolidation fails
+    """
+    checks_list = cast(list[Any], results.get("checks", []))
+    if not checks_list:
+        logger.debug("No checks to consolidate")
+        return
+
+    logger.debug(f"Starting consolidation of {len(checks_list)} checks")
+
+    # Group checks by (check_name, primary_asset_path)
+    check_groups = _group_checks_by_asset(checks_list)
+
+    # Consolidate checks within each group
+    consolidated_checks: list[dict[str, Any]] = []
+
+    for (check_name, primary_asset), group_checks in check_groups.items():
+        if len(group_checks) == 1:
+            # Single check - use as-is
+            consolidated_checks.append(group_checks[0])
+            continue
+
+        # Multiple checks - consolidate them
+        passed_count = sum(1 for c in group_checks if c.get("status") == "passed")
+        failed_count = len(group_checks) - passed_count
+        consolidated_status = "failed" if failed_count > 0 else "passed"
+
+        # Build consolidated check
+        consolidated_check = {
+            "name": check_name,
+            "status": consolidated_status,
+            "message": _create_consolidated_message(check_name, group_checks, consolidated_status, failed_count),
+            "location": group_checks[0].get("location", primary_asset),
+            "details": _collect_consolidated_details(group_checks),
+            "timestamp": _get_consolidated_timestamp(group_checks),
+        }
+
+        # Add optional fields for failed checks
+        consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
+        if consolidated_severity:
+            consolidated_check["severity"] = consolidated_severity
+        if consolidated_why:
+            consolidated_check["why"] = consolidated_why
+
+        consolidated_checks.append(consolidated_check)
+
+        # Log consolidation info
+        logger.debug(
+            f"Consolidated {len(group_checks)} '{check_name}' checks for {primary_asset} "
+            f"({passed_count} passed, {failed_count} failed)"
+        )
+
+    # Update results with consolidated checks and counts
+    results["checks"] = consolidated_checks
+    _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
 def validate_scan_config(config: dict[str, Any]) -> None:
@@ -225,6 +520,9 @@ def scan_model_directory_or_file(
 
             base_dir = Path(path).resolve()
             scanned_paths: set[str] = set()
+
+            # First pass: collect all file paths that need scanning
+            files_to_scan: list[str] = []
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -319,90 +617,138 @@ def scan_model_directory_or_file(
                             )
                             continue
 
-                        # Check for interrupts
+                        # Add to files to scan list instead of scanning immediately
+                        files_to_scan.append(target_str)
+
+            # Second pass: group files by content and scan unique content only once
+            if files_to_scan:
+                content_groups = _group_files_by_content(files_to_scan)
+                content_processed = 0
+
+                for content_hash, file_paths in content_groups.items():
+                    if limit_reached:
+                        break
+
+                    # Scan the first file in each content group (representative)
+                    representative_file = file_paths[0]
+
+                    # Check for interrupts
+                    check_interrupted()
+
+                    # Check timeout
+                    if time.time() - start_time > timeout:
+                        raise TimeoutError(f"Scan timeout after {timeout} seconds")
+
+                    # Update progress
+                    if progress_callback:
+                        if total_files is not None and total_files > 0:
+                            progress_callback(
+                                f"Scanning file {processed_files + 1}/{total_files}: "
+                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                processed_files / total_files * 100,
+                            )
+                        else:
+                            progress_callback(
+                                f"Scanning file {processed_files + 1}: "
+                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                0.0,
+                            )
+
+                    try:
+                        # Check for interrupts before scanning each file
                         check_interrupted()
 
-                        # Check timeout
-                        if time.time() - start_time > timeout:
-                            raise TimeoutError(f"Scan timeout after {timeout} seconds")
+                        file_result = scan_file(representative_file, config)
+                        results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
+                        results["files_scanned"] = cast(int, results["files_scanned"]) + len(
+                            file_paths
+                        )  # Count all copies
+                        processed_files += len(file_paths)  # Count all copies for progress
+                        content_processed += 1
 
-                        # Update progress
-                        if progress_callback:
-                            if total_files is not None and total_files > 0:
-                                progress_callback(
-                                    f"Scanning file {processed_files + 1}/{total_files}: {Path(target_path).name}",
-                                    processed_files / total_files * 100,
-                                )
-                            else:
-                                progress_callback(
-                                    f"Scanning file {processed_files + 1}: {Path(target_path).name}",
-                                    0.0,
-                                )
+                        scanner_name = file_result.scanner_name
+                        scanners_list = cast(list[str], results["scanners"])
+                        if scanner_name and scanner_name not in scanners_list:
+                            scanners_list.append(scanner_name)
 
-                        try:
-                            # Check for interrupts before scanning each file
-                            check_interrupted()
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
 
-                            file_result = scan_file(str(target_path), config)
-                            results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
-                            results["files_scanned"] = cast(int, results["files_scanned"]) + 1
-                            processed_files += 1
+                        # Add issues for each file path that shares this content
+                        for issue in file_result.issues:
+                            issue_dict = issue.to_dict()
+                            # Update location to include all file paths with this content
+                            if len(file_paths) > 1:
+                                all_locations = " ".join(file_paths)
+                                issue_dict["location"] = all_locations
+                                # Add details about duplicate files
+                                if "details" not in issue_dict:
+                                    issue_dict["details"] = {}
+                                issue_dict["details"]["duplicate_files"] = file_paths
+                                issue_dict["details"]["content_hash"] = content_hash
+                            issues_list.append(issue_dict)
 
-                            scanner_name = file_result.scanner_name
-                            scanners_list = cast(list[str], results["scanners"])
-                            if scanner_name and scanner_name not in scanners_list:
-                                scanners_list.append(scanner_name)
+                        # Add checks for each file path that shares this content
+                        if hasattr(file_result, "checks"):
+                            checks_list = cast(list[dict[str, Any]], results["checks"])
+                            for check in file_result.checks:
+                                check_dict = check.to_dict()
+                                # Update location to include all file paths with this content
+                                if len(file_paths) > 1:
+                                    # For checks, we want to show all file locations affected
+                                    check_dict["location"] = " ".join(file_paths)
+                                    # Add details about duplicate files
+                                    if "details" not in check_dict:
+                                        check_dict["details"] = {}
+                                    check_dict["details"]["duplicate_files"] = file_paths
+                                    check_dict["details"]["content_hash"] = content_hash
+                                checks_list.append(check_dict)
 
-                            issues_list = cast(list[dict[str, Any]], results["issues"])
-                            for issue in file_result.issues:
-                                issues_list.append(issue.to_dict())
+                        # Add assets for all file paths that share this content
+                        for file_path in file_paths:
+                            _add_asset_to_results(results, file_path, file_result)
 
-                            # Add checks if available
-                            if hasattr(file_result, "checks"):
-                                checks_list = cast(list[dict[str, Any]], results["checks"])
-                                for check in file_result.checks:
-                                    checks_list.append(check.to_dict())
-
-                            _add_asset_to_results(results, str(target_path), file_result)
-
+                            # Add metadata for all file paths
                             file_meta = cast(dict[str, Any], results["file_metadata"])
-                            license_metadata = collect_license_metadata(str(target_path))
+                            license_metadata = collect_license_metadata(file_path)
                             combined_metadata = {**file_result.metadata, **license_metadata}
-                            file_meta[str(target_path)] = combined_metadata
+                            # Add information about content deduplication
+                            combined_metadata["content_hash"] = content_hash
+                            combined_metadata["duplicate_files"] = file_paths if len(file_paths) > 1 else None
+                            file_meta[file_path] = combined_metadata
 
-                            if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
-                                issues_list.append(
-                                    {
-                                        "message": (
-                                            f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
-                                            f"(max: {max_total_size})"
-                                        ),
-                                        "severity": IssueSeverity.WARNING.value,
-                                        "location": str(target_path),
-                                        "details": {"max_total_size": max_total_size},
-                                    }
-                                )
-                                limit_reached = True
-                                break
-                        except Exception as e:
-                            logger.warning(f"Error scanning file {target_path}: {e!s}")
-                            results["success"] = False
-                            issues_list = cast(list[dict[str, Any]], results["issues"])
+                        if max_total_size > 0 and cast(int, results["bytes_scanned"]) > max_total_size:
+                            issues_list.append(
+                                {
+                                    "message": (
+                                        f"Total scan size limit exceeded: {results['bytes_scanned']} bytes "
+                                        f"(max: {max_total_size})"
+                                    ),
+                                    "severity": IssueSeverity.WARNING.value,
+                                    "location": representative_file,
+                                    "details": {"max_total_size": max_total_size},
+                                }
+                            )
+                            limit_reached = True
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error scanning file {representative_file}: {e!s}")
+                        results["success"] = False
+                        issues_list = cast(list[dict[str, Any]], results["issues"])
+
+                        # Add error for all files that share this content
+                        for file_path in file_paths:
                             issues_list.append(
                                 {
                                     "message": f"Error scanning file: {e!s}",
                                     "severity": IssueSeverity.CRITICAL.value,
-                                    "location": str(target_path),
+                                    "location": file_path,
                                     "details": {"exception_type": type(e).__name__},
                                 }
                             )
-                            _add_error_asset_to_results(results, str(target_path))
+                            _add_error_asset_to_results(results, file_path)
 
-                    if limit_reached:
-                        break
-
-                if limit_reached:
-                    break
+                # This section is now handled by the content grouping logic above
+                pass
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
@@ -544,6 +890,12 @@ def scan_model_directory_or_file(
         float,
         results["start_time"],
     )
+
+    # Consolidate checks for cleaner reporting
+    try:
+        _consolidate_checks(results)
+    except Exception as e:
+        logger.warning(f"Error consolidating checks: {e!s}")
 
     # Add license warnings if any
     try:
