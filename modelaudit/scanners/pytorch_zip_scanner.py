@@ -157,8 +157,8 @@ class PyTorchZipScanner(BaseScanner):
                     # Set the current file path on the pickle scanner for proper error reporting
                     self.pickle_scanner.current_file_path = f"{path}:{name}"
 
-                    # For small pickle files (< 10GB), read normally
-                    if file_size < 10 * 1024 * 1024 * 1024:
+                    # For small pickle files (< 1TB), read normally
+                    if file_size < 1024 * 1024 * 1024 * 1024:
                         data = z.read(name)
                         bytes_scanned += len(data)
 
@@ -206,8 +206,8 @@ class PyTorchZipScanner(BaseScanner):
 
                     try:
                         info = z.getinfo(name)
-                        # Only check first 10GB of each file for JIT patterns
-                        check_size = min(info.file_size, 10 * 1024 * 1024 * 1024)
+                        # Only check first 100GB of each file for JIT patterns
+                        check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
 
                         with z.open(name, "r") as zf:
                             chunk = zf.read(check_size)

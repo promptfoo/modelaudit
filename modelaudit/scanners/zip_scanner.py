@@ -268,10 +268,13 @@ class ZipScanner(BaseScanner):
 
                 # Extract and scan the file
                 try:
+                    # Use max_file_size from CLI, fallback to max_entry_size, then default
                     max_entry_size = self.config.get(
-                        "max_entry_size",
-                        10 * 1024 * 1024 * 1024,
-                    )  # 10 GB default
+                        "max_file_size", self.config.get("max_entry_size", 1024 * 1024 * 1024 * 1024)
+                    )  # Use CLI max_file_size, then max_entry_size, then 1TB default
+                    # If max_file_size is 0 (unlimited), use the 1TB default for safety
+                    if max_entry_size == 0:
+                        max_entry_size = 1024 * 1024 * 1024 * 1024
 
                     if name.lower().endswith(".zip"):
                         suffix = ".zip"
