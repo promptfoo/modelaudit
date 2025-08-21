@@ -200,6 +200,7 @@ class KerasH5Scanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S1005",  # Invalid signature/corrupted file
             )
             result.finish(success=False)
             return result

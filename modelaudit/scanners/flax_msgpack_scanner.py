@@ -321,7 +321,7 @@ class FlaxMsgpackScanner(BaseScanner):
                                     "transform": transform,
                                     "context": value_str[:200] if len(value_str) > 200 else value_str,
                                 },
-                                rule_code="S902",
+                                rule_code="S510",  # JIT/TorchScript (closest match for JAX transforms)
                             )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
@@ -385,6 +385,16 @@ class FlaxMsgpackScanner(BaseScanner):
         """Check string values for suspicious patterns that might indicate code injection."""
         for pattern in self.suspicious_patterns:
             if re.search(pattern, value, re.IGNORECASE):
+                # Determine appropriate rule code based on pattern
+                if "eval" in pattern.lower():
+                    rule_code = "S104"  # eval/exec usage
+                elif "compile" in pattern.lower():
+                    rule_code = "S105"  # compile usage
+                elif "import\\s+os" in pattern.lower() or "os\\.system" in pattern.lower():
+                    rule_code = "S101"  # os module usage
+                else:
+                    rule_code = "S999"  # Unknown/generic suspicious pattern
+                
                 result.add_check(
                     name="Code Pattern Security Check",
                     passed=False,
@@ -396,7 +406,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         "sample": value[:200] + "..." if len(value) > 200 else value,
                         "full_length": len(value),
                     },
-                    rule_code="S902",
+                    rule_code=rule_code,
                 )
 
     def _check_suspicious_keys(
@@ -407,6 +417,12 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> None:
         """Check dictionary keys for suspicious names that might indicate serialization attacks."""
         if key in self.suspicious_keys:
+            # Determine appropriate rule code based on key
+            if key.lower() == "__reduce__":
+                rule_code = "S201"  # Pickle REDUCE opcode
+            else:
+                rule_code = "S999"  # Unknown/generic suspicious attribute
+            
             result.add_check(
                 name="Object Attribute Security Check",
                 passed=False,
@@ -414,7 +430,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=location,
                 details={"suspicious_key": key},
-                rule_code="S902",
+                rule_code=rule_code,
             )
 
     def _analyze_content(

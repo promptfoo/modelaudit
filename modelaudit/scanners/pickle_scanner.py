@@ -954,7 +954,7 @@ class PickleScanner(BaseScanner):
                                     location=issue.location,
                                     details=issue.details,
                                     why=issue.why,
-                                    rule_code="S902",
+                                    rule_code=issue.rule_code,  # Preserve original rule code
                                 )
 
                             # Update total bytes scanned
