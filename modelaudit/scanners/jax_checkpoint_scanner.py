@@ -34,7 +34,9 @@ class JaxCheckpointScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self.max_file_size = self.config.get("max_file_size", 2 * 1024 * 1024 * 1024)  # 2GB limit
+        self.max_file_size = self.config.get(
+            "max_file_size", 100 * 1024 * 1024 * 1024
+        )  # 100GB limit for large JAX models
 
         # JAX-specific suspicious patterns
         self.jax_suspicious_patterns = [

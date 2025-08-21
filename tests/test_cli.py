@@ -656,7 +656,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         "https://company.jfrog.io/artifactory/repo/model.bin",
         api_token=None,
         access_token=None,
-        timeout=300,
+        timeout=3600,
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,
@@ -748,7 +748,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
     mock_scan_mlflow.assert_called_once_with(
         "models:/TestModel/1",
         registry_uri="http://localhost:5000",
-        timeout=300,
+        timeout=3600,
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,

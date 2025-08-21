@@ -24,7 +24,7 @@ def can_stream_analyze(url: str, scanner: BaseScanner) -> bool:
 def stream_analyze_file(
     url: str,
     scanner: BaseScanner,
-    max_bytes: int = 10 * 1024 * 1024 * 1024,  # 10GB default
+    max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
 ) -> tuple[Optional[ScanResult], bool]:
     """Stream analyze a file from cloud storage.
 
@@ -171,7 +171,8 @@ def stream_analyze_file(
         # Create scan result
         if issues or was_complete:
             result = ScanResult(scanner_name="streaming")
-            result.bytes_scanned = scan_result.bytes_scanned if scan_result is not None else bytes_to_read
+            scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
+            result.bytes_scanned = scanned or bytes_to_read
             result.issues = issues
             result.metadata = {
                 "streaming_analysis": True,
@@ -228,7 +229,7 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> Optional[dict[str,
             preview["detected_format"] = "zip (possibly pytorch/tensorflow)"
         elif b"HDF" in header[:10]:
             preview["detected_format"] = "HDF5 (keras/tensorflow)"
-        elif header.startswith(b"\x08\x08"):
+        elif header.startswith(b"\x08\x01\x12\x00") or b"onnx" in header[:32].lower():
             preview["detected_format"] = "ONNX"
 
         return preview

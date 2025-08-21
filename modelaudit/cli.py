@@ -13,7 +13,7 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .auth.client import auth_client
-from .auth.config import config
+from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
@@ -118,90 +118,113 @@ def auth():
 
 
 @auth.command()
-@click.option("--api-key", "-k", help="API key for authentication")
-@click.option("--host", "-h", help="API host URL")
-def login(api_key, host):
-    """Login to promptfoo services"""
+@click.option("-o", "--org", "org_id", help="The organization id to login to.")
+@click.option(
+    "-h",
+    "--host",
+    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+)
+@click.option("-k", "--api-key", help="Login using an API key.")
+def login(org_id, host, api_key):
+    """Login"""
     try:
+        token = None
+        api_host = host or cloud_config.get_api_host()
+
+        # Record telemetry (stub for now)
+        # telemetry.record('command_used', {'name': 'auth login'})
+
         if api_key:
-            # Validate and set the API key
-            result = auth_client.validate_and_set_api_token(api_key, host)
-            user = result.get("user", {})
-            organization = result.get("organization", {})
-            app = result.get("app", {})
+            token = api_key
+            result = auth_client.validate_and_set_api_token(token, api_host)
+            user = result["user"]
 
-            # Check if email changed
-            existing_email = config.get_user_email()
-            if existing_email and existing_email != user.get("email"):
+            # Store token in global config and handle email sync
+            existing_email = get_user_email()
+            if existing_email and existing_email != user.email:
                 click.echo(
-                    click.style(
-                        f"Updating local email configuration from {existing_email} to {user.get('email')}",
-                        fg="yellow",
-                    )
+                    style_text(f"Updating local email configuration from {existing_email} to {user.email}", fg="yellow")
                 )
-
-            click.echo(click.style("Successfully logged in", fg="green", bold=True))
-            click.echo(click.style("Logged in as:", dim=True))
-            click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
-            click.echo(f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}")
-            click.echo(f"Access the app at {click.style(app.get('url', 'Unknown'), fg='cyan')}")
+            set_user_email(user.email)
+            click.echo(style_text("Successfully logged in", fg="green"))
+            return
         else:
             click.echo(
-                f"Please login or sign up at {click.style('https://promptfoo.app', fg='green')} to get an API key."
+                f"Please login or sign up at {style_text('https://promptfoo.app', fg='green')} to get an API key."
             )
             click.echo(
-                f"After logging in, you can get your API token at "
-                f"{click.style('https://promptfoo.app/welcome', fg='green')}"
+                f"After logging in, you can get your api token at "
+                f"{style_text('https://promptfoo.app/welcome', fg='green')}"
             )
-    except Exception as e:
-        error_message = str(e)
+
+        return
+
+    except Exception as error:
+        error_message = str(error)
         click.echo(f"Authentication failed: {error_message}", err=True)
         sys.exit(1)
 
 
 @auth.command()
 def logout():
-    """Logout and clear credentials"""
-    email = config.get_user_email()
-    api_key = config.get_api_key()
+    """Logout"""
+    email = get_user_email()
+    api_key = cloud_config.get_api_key()
 
     if not email and not api_key:
-        click.echo(
-            click.style(
-                "You're already logged out - no active session to terminate",
-                fg="yellow",
-            )
-        )
+        click.echo(style_text("You're already logged out - no active session to terminate", fg="yellow"))
         return
 
-    config.clear_credentials()
-    click.echo(click.style("Successfully logged out", fg="green"))
+    cloud_config.delete()
+    # Always unset email on logout
+    set_user_email("")
+    click.echo(style_text("Successfully logged out", fg="green"))
+    return
 
 
 @auth.command()
 def whoami():
     """Show current user information"""
     try:
-        api_key = config.get_api_key()
+        email = get_user_email()
+        api_key = cloud_config.get_api_key()
 
-        if not api_key:
-            click.echo(f"Not logged in. Run {click.style('modelaudit auth login', bold=True)} to login.")
+        if not email or not api_key:
+            click.echo(f"Not logged in. Run {style_text('modelaudit auth login', bold=True)} to login.")
             return
 
-        # Get current user info from API
         user_info = auth_client.get_user_info()
         user = user_info.get("user", {})
         organization = user_info.get("organization", {})
 
-        click.echo(click.style("Currently logged in as:", fg="green", bold=True))
-        click.echo(f"User: {click.style(user.get('email', 'Unknown'), fg='cyan')}")
-        click.echo(f"Organization: {click.style(organization.get('name', 'Unknown'), fg='cyan')}")
-        click.echo(f"App URL: {click.style(config.get_app_url(), fg='cyan')}")
+        click.echo(style_text("Currently logged in as:", fg="green", bold=True))
+        click.echo(f"User: {style_text(user.get('email', 'Unknown'), fg='cyan')}")
+        click.echo(f"Organization: {style_text(organization.get('name', 'Unknown'), fg='cyan')}")
+        click.echo(f"App URL: {style_text(cloud_config.get_app_url(), fg='cyan')}")
 
-    except Exception as e:
-        error_message = str(e)
+        # Record telemetry (stub for now)
+        # telemetry.record('command_used', {'name': 'auth whoami'})
+
+    except Exception as error:
+        error_message = str(error)
         click.echo(f"Failed to get user info: {error_message}", err=True)
         sys.exit(1)
+
+
+@cli.command("delegate-info", hidden=True)
+def delegate_info():
+    """Internal command to show delegation status"""
+    import json
+
+    from .auth.config import config
+
+    is_delegated = config.is_delegated()
+    auth_source = config.get_auth_source()
+    api_key_available = config.is_authenticated()
+
+    info = {"delegated": is_delegated, "auth_source": auth_source, "api_key_available": api_key_available}
+
+    click.echo(json.dumps(info, indent=2))
 
 
 @cli.command("scan")
@@ -244,8 +267,8 @@ def whoami():
     "--timeout",
     "-t",
     type=int,
-    default=300,
-    help="Scan timeout in seconds [default: 300]",
+    default=3600,
+    help="Scan timeout in seconds [default: 3600]",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option(
@@ -445,9 +468,14 @@ def scan_command(
 
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
+        # Add delegation indicator if running via promptfoo
+        delegation_note = ""
+        if is_delegated_from_promptfoo():
+            delegation_note = style_text(" (via promptfoo)", dim=True)
+
         header = [
             "─" * 80,
-            style_text("ModelAudit Security Scanner", fg="blue", bold=True),
+            style_text("ModelAudit Security Scanner", fg="blue", bold=True) + delegation_note,
             style_text(
                 "Scanning for potential security issues in ML model files",
                 fg="cyan",
@@ -1254,7 +1282,29 @@ def scan_command(
     if output:
         with open(output, "w", encoding="utf-8") as f:
             f.write(output_text)
+
+        # Always confirm file was written (expected by tests and users)
         click.echo(f"Results written to {output}")
+
+        # Show summary in verbose mode for better UX
+        if verbose:
+            issues = aggregated_results.get("issues", [])
+            visible_issues = issues  # In verbose mode, show all issues including debug
+            if visible_issues:
+                critical_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
+                )
+                warning_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
+                )
+                if critical_count > 0:
+                    click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
+                elif warning_count > 0:
+                    click.echo(f"Found {warning_count} warning(s)")
+                else:
+                    click.echo(f"Found {len(visible_issues)} informational issue(s)")
+            else:
+                click.echo("No security issues found")
     else:
         # Add a separator line between debug output and scan results
         if format == "text":

@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 
 # Size thresholds for different scanning strategies
 SMALL_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024  # 10GB - scan normally
-MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024 * 1024  # 100GB - use chunking
+MEDIUM_FILE_THRESHOLD = 500 * 1024 * 1024 * 1024  # 500GB - use chunking
 LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use streaming
-VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024 * 1024  # 8TB - special handling
+VERY_LARGE_FILE_THRESHOLD = 2 * 1024 * 1024 * 1024 * 1024  # 2TB - special handling
 
 # Default chunk sizes for different file sizes
 DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024 * 1024  # 10GB chunks
@@ -35,7 +35,7 @@ class LargeFileHandler:
         file_path: str,
         scanner: Any,
         progress_callback: Optional[Callable[[str, float], None]] = None,
-        timeout: int = 1800,
+        timeout: int = 3600,
     ):
         """
         Initialize the large file handler.
@@ -212,7 +212,7 @@ def scan_large_file(
     file_path: str,
     scanner: Any,
     progress_callback: Optional[Callable[[str, float], None]] = None,
-    timeout: int = 1800,
+    timeout: int = 3600,
 ) -> ScanResult:
     """
     Scan a large file with appropriate strategy.

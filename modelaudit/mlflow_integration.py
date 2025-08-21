@@ -13,7 +13,7 @@ def scan_mlflow_model(
     model_uri: str,
     *,
     registry_uri: Optional[str] = None,
-    timeout: int = 300,
+    timeout: int = 3600,
     blacklist_patterns: Optional[list[str]] = None,
     max_file_size: int = 0,
     max_total_size: int = 0,

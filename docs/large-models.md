@@ -2,7 +2,7 @@
 
 ## Overview
 
-ModelAudit now includes enhanced support for scanning large ML models (up to 8GB+) with optimized strategies based on file size.
+ModelAudit now includes enhanced support for scanning large ML models (up to 1TB+) with optimized strategies based on file size.
 
 ## Default Configuration Changes
 
@@ -23,32 +23,32 @@ ModelAudit now includes enhanced support for scanning large ML models (up to 8GB
 
 ModelAudit automatically selects the appropriate scanning strategy based on file size:
 
-### 1. Normal Scanning (<10MB)
+### 1. Normal Scanning (<100GB)
 
 - Full file loaded into memory
 - Complete analysis of all content
-- Fastest performance for small files
+- Fastest performance for smaller models
 
-### 2. Chunked Scanning (10MB - 100MB)
+### 2. Chunked Scanning (100GB - 1TB)
 
-- File read in 10MB chunks
+- File read in 50GB chunks
 - Progress reporting for each chunk
 - Memory-efficient processing
 - Complete coverage of file content
 
-### 3. Streaming Scanning (100MB - 1GB)
+### 3. Streaming Scanning (1TB - 5TB)
 
-- Analyzes file header (first 10MB)
+- Analyzes file header (first 100GB)
 - Samples middle and end sections
 - Reports partial scan completion
-- Suitable for most large models
+- Suitable for very large models
 
-### 4. Optimized Scanning (>1GB)
+### 4. Optimized Scanning (>5TB)
 
-- Quick header analysis only
-- Heuristic-based detection
-- Minimal memory usage
-- Recommended to split very large models
+- Enhanced header analysis (first 100GB)
+- Heuristic-based detection with large sampling
+- Minimal memory usage with advanced techniques
+- Supports extremely large models up to 10TB+
 
 ## CLI Usage
 
@@ -175,7 +175,7 @@ scan:
   timeout: 1800 # 30 minutes
   max_file_size: 0 # Unlimited
   large_model_support: true
-  chunk_size: 10485760 # 10MB chunks
+  chunk_size: 53687091200 # 50GB chunks
 
 # Progress reporting
 output:
