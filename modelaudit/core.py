@@ -153,8 +153,9 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
     return check_groups
 
 
-def _create_consolidated_message(check_name: str, group_checks: list[dict[str, Any]],
-                                consolidated_status: str, failed_count: int) -> str:
+def _create_consolidated_message(
+    check_name: str, group_checks: list[dict[str, Any]], consolidated_status: str, failed_count: int
+) -> str:
     """Create appropriate consolidated message based on check results.
 
     Args:
@@ -249,8 +250,9 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
     return max(timestamps) if timestamps else time.time()
 
 
-def _update_result_counts(results: dict[str, Any], consolidated_checks: list[dict[str, Any]],
-                         original_count: int) -> None:
+def _update_result_counts(
+    results: dict[str, Any], consolidated_checks: list[dict[str, Any]], original_count: int
+) -> None:
     """Update result dictionary with consolidated check counts.
 
     Args:
