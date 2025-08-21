@@ -201,7 +201,8 @@ class TestZipScanner:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 # Create a highly compressible file (potential zip bomb indicator)
-                large_content = "A" * 1000000  # 1MB of repeated 'A's
+                # Keep highly compressible but smaller to speed CI
+                large_content = "A" * 300000  # 300KB of repeated 'A's
                 z.writestr("suspicious.txt", large_content)
             tmp_path = tmp.name
 

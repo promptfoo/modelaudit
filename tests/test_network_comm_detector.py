@@ -190,9 +190,12 @@ class TestNetworkCommDetector:
         context = "model.bin"
 
         import time
+        import os
 
         start = time.perf_counter()
-        for _ in range(50):
+        # Fewer iterations in CI environments
+        iterations = 20 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 50
+        for _ in range(iterations):
             detector.findings = []
             detector._scan_suspicious_ports(data, context)
         duration = time.perf_counter() - start

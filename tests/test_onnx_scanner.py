@@ -1,15 +1,19 @@
 import struct
 from pathlib import Path
 
-import onnx
 import pytest
+
+# Skip if onnx is not available before importing it
+pytest.importorskip("onnx")
+
+import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
-pytest.importorskip("onnx")
+  
 
 
 def create_onnx_model(

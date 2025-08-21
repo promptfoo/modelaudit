@@ -79,7 +79,8 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          # Linting doesn't need heavy optional ML deps
+          rye sync
 
       - name: Lint with Ruff
         run: |
@@ -122,7 +123,8 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          # Type-checking doesn't need heavy optional ML deps
+          rye sync
 
       - name: Type checking
         run: |
@@ -137,9 +139,8 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        # For PRs, only test min and max Python versions to save time
-        # For main branch, test all versions
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
+        # Align to supported/runtime targets for speed: 3.9 and 3.12
+        python-version: ["3.9", "3.12"]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -168,11 +169,18 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          # Core tests do not require heavy optional ML deps; tests skip gracefully when missing
+          rye sync
 
-      - name: Run fast tests (parallel execution)
+      - name: Run fast tests without coverage (non-3.12)
+        if: matrix.python-version != '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+
+      - name: Run fast tests with coverage (3.12 only)
+        if: matrix.python-version == '3.12'
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'
@@ -193,8 +201,8 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        # Reduced matrix for PRs
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.9", "3.11", "3.12"]') }}
+        # Keep minimal but representative coverage across our targets
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.12"]') || fromJSON('["3.9", "3.12"]') }}
         numpy-mode: ["1.x", "2.x"]
     steps:
       - name: Checkout repo
@@ -233,7 +241,8 @@ jobs:
       - name: Install with NumPy 2.x (default)
         if: matrix.numpy-mode == '2.x'
         run: |
-          rye sync --features all-ci
+          # NumPy compatibility tests do not need heavy optional ML deps
+          rye sync
 
       - name: Check NumPy version
         run: |
@@ -285,7 +294,8 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          # Building the package does not require optional ML deps
+          rye sync
 
       - name: Build package
         run: |

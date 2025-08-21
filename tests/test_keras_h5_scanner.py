@@ -1,13 +1,16 @@
 import json
 
-import h5py
 import pytest
+
+# Skip if h5py is not available before importing it
+pytest.importorskip("h5py")
+
+import h5py
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
-# Skip all tests if h5py is not available
-pytest.importorskip("h5py")
+  
 
 
 def test_keras_h5_scanner_can_handle(tmp_path):
