@@ -59,8 +59,15 @@ class OnnxScanner(BaseScanner):
             return result
 
         try:
+            # Check for interrupts before starting the potentially long-running load
+            self.check_interrupted()
             model = onnx.load(path, load_external_data=False)
+            # Check for interrupts after loading completes
+            self.check_interrupted()
             result.bytes_scanned = file_size
+        except KeyboardInterrupt:
+            # Re-raise keyboard interrupt for graceful shutdown
+            raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
             result.add_check(
                 name="ONNX Model Parsing",
@@ -84,12 +91,23 @@ class OnnxScanner(BaseScanner):
         # Check for JIT/Script code execution risks in the ONNX model
         # Read the file as binary to scan for patterns
         try:
+            # Check for interrupts before file reading
+            self.check_interrupted()
             with open(path, "rb") as f:
                 model_data = f.read()
+            # Check for interrupts after file reading
+            self.check_interrupted()
             self.check_for_jit_script_code(
                 model_data,
                 result,
                 model_type="onnx",
+                context=path,
+            )
+
+            # Check for network communication patterns
+            self.check_for_network_communication(
+                model_data,
+                result,
                 context=path,
             )
         except Exception as e:
@@ -97,7 +115,7 @@ class OnnxScanner(BaseScanner):
             result.add_check(
                 name="JIT/Script Code Execution Detection",
                 passed=False,
-                message=f"Could not check for JIT/Script code: {e}",
+                message=f"Failed to check for JIT/Script code: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=path,
                 details={"exception": str(e)},
@@ -116,6 +134,8 @@ class OnnxScanner(BaseScanner):
         safe_nodes = 0
 
         for node in model.graph.node:
+            # Check for interrupts periodically during node processing
+            self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
                 result.add_check(
@@ -164,6 +184,8 @@ class OnnxScanner(BaseScanner):
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
         for tensor in model.graph.initializer:
+            # Check for interrupts during external data processing
+            self.check_interrupted()
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
@@ -247,13 +269,15 @@ class OnnxScanner(BaseScanner):
             result.add_check(
                 name="External Data Size Validation",
                 passed=False,
-                message=f"Could not validate external data size: {e}",
+                message=f"Failed to validate external data size: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=str(external_path),
             )
 
     def _check_tensor_sizes(self, model: Any, path: str, result: ScanResult) -> None:
         for tensor in model.graph.initializer:
+            # Check for interrupts during tensor size validation
+            self.check_interrupted()
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
@@ -290,7 +314,7 @@ class OnnxScanner(BaseScanner):
                     result.add_check(
                         name="Tensor Validation",
                         passed=False,
-                        message=f"Could not validate tensor '{tensor.name}': {e}",
+                        message=f"Failed to validate tensor '{tensor.name}': {e}",
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )

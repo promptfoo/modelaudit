@@ -12,6 +12,8 @@ from yaspin import yaspin
 from yaspin.spinners import Spinners
 
 from . import __version__
+from .auth.client import auth_client
+from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
@@ -21,11 +23,6 @@ from .utils.huggingface import download_model, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("modelaudit")
 
 
@@ -113,6 +110,122 @@ def cli() -> None:
     pass
 
 
+@cli.group()
+def auth():
+    """Manage authentication"""
+    pass
+
+
+@auth.command()
+@click.option("-o", "--org", "org_id", help="The organization id to login to.")
+@click.option(
+    "-h",
+    "--host",
+    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+)
+@click.option("-k", "--api-key", help="Login using an API key.")
+def login(org_id, host, api_key):
+    """Login"""
+    try:
+        token = None
+        api_host = host or cloud_config.get_api_host()
+
+        # Record telemetry (stub for now)
+        # telemetry.record('command_used', {'name': 'auth login'})
+
+        if api_key:
+            token = api_key
+            result = auth_client.validate_and_set_api_token(token, api_host)
+            user = result["user"]
+
+            # Store token in global config and handle email sync
+            existing_email = get_user_email()
+            if existing_email and existing_email != user.email:
+                click.echo(
+                    style_text(f"Updating local email configuration from {existing_email} to {user.email}", fg="yellow")
+                )
+            set_user_email(user.email)
+            click.echo(style_text("Successfully logged in", fg="green"))
+            return
+        else:
+            click.echo(
+                f"Please login or sign up at {style_text('https://promptfoo.app', fg='green')} to get an API key."
+            )
+            click.echo(
+                f"After logging in, you can get your api token at "
+                f"{style_text('https://promptfoo.app/welcome', fg='green')}"
+            )
+
+        return
+
+    except Exception as error:
+        error_message = str(error)
+        click.echo(f"Authentication failed: {error_message}", err=True)
+        sys.exit(1)
+
+
+@auth.command()
+def logout():
+    """Logout"""
+    email = get_user_email()
+    api_key = cloud_config.get_api_key()
+
+    if not email and not api_key:
+        click.echo(style_text("You're already logged out - no active session to terminate", fg="yellow"))
+        return
+
+    cloud_config.delete()
+    # Always unset email on logout
+    set_user_email("")
+    click.echo(style_text("Successfully logged out", fg="green"))
+    return
+
+
+@auth.command()
+def whoami():
+    """Show current user information"""
+    try:
+        email = get_user_email()
+        api_key = cloud_config.get_api_key()
+
+        if not email or not api_key:
+            click.echo(f"Not logged in. Run {style_text('modelaudit auth login', bold=True)} to login.")
+            return
+
+        user_info = auth_client.get_user_info()
+        user = user_info.get("user", {})
+        organization = user_info.get("organization", {})
+
+        click.echo(style_text("Currently logged in as:", fg="green", bold=True))
+        click.echo(f"User: {style_text(user.get('email', 'Unknown'), fg='cyan')}")
+        click.echo(f"Organization: {style_text(organization.get('name', 'Unknown'), fg='cyan')}")
+        click.echo(f"App URL: {style_text(cloud_config.get_app_url(), fg='cyan')}")
+
+        # Record telemetry (stub for now)
+        # telemetry.record('command_used', {'name': 'auth whoami'})
+
+    except Exception as error:
+        error_message = str(error)
+        click.echo(f"Failed to get user info: {error_message}", err=True)
+        sys.exit(1)
+
+
+@cli.command("delegate-info", hidden=True)
+def delegate_info():
+    """Internal command to show delegation status"""
+    import json
+
+    from .auth.config import config
+
+    is_delegated = config.is_delegated()
+    auth_source = config.get_auth_source()
+    api_key_available = config.is_authenticated()
+
+    info = {"delegated": is_delegated, "auth_source": auth_source, "api_key_available": api_key_available}
+
+    click.echo(json.dumps(info, indent=2))
+
+
 @cli.command("scan")
 @click.argument("paths", nargs=-1, type=str, required=True)
 @click.option(
@@ -143,8 +256,8 @@ def cli() -> None:
     "--timeout",
     "-t",
     type=int,
-    default=300,
-    help="Scan timeout in seconds [default: 300]",
+    default=3600,
+    help="Scan timeout in seconds [default: 3600]",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option(
@@ -214,6 +327,33 @@ def cli() -> None:
     is_flag=True,
     help="Use streaming analysis for large cloud files (experimental)",
 )
+@click.option(
+    "--large-model-support/--no-large-model-support",
+    default=True,
+    help="Enable optimized scanning for large models (≈10GB+) [default: enabled]",
+)
+@click.option(
+    "--progress/--no-progress",
+    default=True,
+    help="Enable progress reporting for large model scans [default: enabled]",
+)
+@click.option(
+    "--progress-log",
+    type=click.Path(exists=False, file_okay=True, dir_okay=False),
+    help="Write progress information to log file",
+)
+@click.option(
+    "--progress-format",
+    type=click.Choice(["tqdm", "simple", "json"]),
+    default="tqdm",
+    help="Progress display format [default: tqdm]",
+)
+@click.option(
+    "--progress-interval",
+    type=float,
+    default=2.0,
+    help="Progress update interval in seconds [default: 2.0]",
+)
 def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
@@ -235,6 +375,11 @@ def scan_command(
     preview: bool,
     selective: bool,
     stream: bool,
+    large_model_support: bool,
+    progress: bool,
+    progress_log: Optional[str],
+    progress_format: str,
+    progress_interval: float,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -294,9 +439,14 @@ def scan_command(
 
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
+        # Add delegation indicator if running via promptfoo
+        delegation_note = ""
+        if is_delegated_from_promptfoo():
+            delegation_note = style_text(" (via promptfoo)", dim=True)
+
         header = [
             "─" * 80,
-            style_text("ModelAudit Security Scanner", fg="blue", bold=True),
+            style_text("ModelAudit Security Scanner", fg="blue", bold=True) + delegation_note,
             style_text(
                 "Scanning for potential security issues in ML model files",
                 fg="cyan",
@@ -319,6 +469,78 @@ def scan_command(
     else:
         # Suppress INFO logs from core module in normal mode
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
+
+    # Setup progress tracking
+    progress_tracker = None
+    progress_reporters: list[Any] = []
+
+    if progress and len(expanded_paths) > 0:
+        try:
+            # Prevent circular imports during scanner loading
+            import sys
+
+            if "modelaudit.scanners" in sys.modules:
+                if verbose:
+                    click.echo("Progress tracking disabled during scanner initialization", err=True)
+                progress = False
+                progress_tracker = None
+            else:
+                from .progress import (
+                    ConsoleProgressReporter,
+                    FileProgressReporter,
+                    ProgressPhase,
+                    ProgressTracker,
+                    SimpleConsoleReporter,
+                )
+
+                # Create progress tracker
+                progress_tracker = ProgressTracker(
+                    update_interval=progress_interval,
+                )
+
+            # Add console reporter based on format preference
+            if progress_tracker and format == "text" and not output:
+                if progress_format == "tqdm":
+                    # Use tqdm progress bars if available and appropriate
+                    console_reporter = ConsoleProgressReporter(
+                        update_interval=progress_interval,
+                        disable_on_non_tty=True,
+                        show_bytes=True,
+                        show_items=True,
+                    )
+                else:
+                    # Use simple console reporter
+                    console_reporter = SimpleConsoleReporter(  # type: ignore[assignment]
+                        update_interval=progress_interval,
+                        show_percentage=True,
+                        show_speed=True,
+                        show_eta=True,
+                    )
+                progress_reporters.append(console_reporter)
+                progress_tracker.add_reporter(console_reporter)
+
+            # Add file logger if specified
+            if progress_tracker and progress_log:
+                log_format = "json" if progress_format == "json" else "text"
+                file_reporter = FileProgressReporter(
+                    log_file=progress_log,
+                    update_interval=progress_interval * 2,  # Less frequent for file logging
+                    format_type=log_format,
+                    append_mode=True,
+                )
+                progress_reporters.append(file_reporter)
+                progress_tracker.add_reporter(file_reporter)
+
+                if verbose:
+                    click.echo(f"Progress will be logged to: {progress_log}")
+
+        except (ImportError, RecursionError) as e:
+            if verbose:
+                if isinstance(e, RecursionError):
+                    click.echo("Progress tracking disabled due to import cycle", err=True)
+                else:
+                    click.echo("Progress tracking not available (missing dependencies)", err=True)
+            progress = False
 
     # Aggregated results
     aggregated_results: dict[str, Any] = {
@@ -716,7 +938,7 @@ def scan_command(
                         ".css",
                     ):
                         if verbose:
-                            logger.info(f"Skipping non-model file: {path}")
+                            logger.debug(f"Skipped: {path} (non-model file)")
                         click.echo(f"Skipping non-model file: {path}")
                         continue
 
@@ -731,16 +953,72 @@ def scan_command(
 
                 # Perform the scan with the specified options
                 try:
-                    # Define progress callback if using spinner
+                    # Define progress callback for legacy spinner support
                     progress_callback = None
-                    if spinner:
+                    if spinner and not progress_tracker:
 
                         def update_progress(message, percentage, spinner=spinner):
                             spinner.text = f"{message} ({percentage:.1f}%)"
 
                         progress_callback = update_progress
 
+                    # Setup progress tracking for this path
+                    if progress_tracker:
+                        try:
+                            from .progress import ProgressPhase
+
+                            # Estimate file/directory size for progress tracking
+                            if os.path.isfile(actual_path):
+                                total_bytes = os.path.getsize(actual_path)
+                                total_items = 1
+                            elif os.path.isdir(actual_path):
+                                # Estimate directory size (rough approximation)
+                                total_bytes = sum(f.stat().st_size for f in Path(actual_path).rglob("*") if f.is_file())
+                                total_items = len(list(Path(actual_path).rglob("*")))
+                            else:
+                                total_bytes = 0
+                                total_items = 1
+
+                            progress_tracker.stats.total_bytes = total_bytes
+                            progress_tracker.stats.total_items = total_items
+                            progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {actual_path}")
+                        except (ImportError, RecursionError):
+                            # Skip progress tracking if import fails due to circular dependency
+                            progress_tracker = None
+
+                        # Create enhanced progress callback using factory pattern to bind variables
+                        def create_enhanced_progress_callback(progress_tracker_bound, total_bytes_bound, spinner_bound):
+                            def enhanced_progress_callback(message, percentage):
+                                if progress_tracker_bound:
+                                    # Update progress based on percentage
+                                    bytes_processed = (
+                                        int((percentage / 100.0) * total_bytes_bound) if total_bytes_bound > 0 else 0
+                                    )
+                                    progress_tracker_bound.update_bytes(bytes_processed, message)
+
+                                    # Update phase based on message content
+                                    message_lower = message.lower()
+                                    if "loading" in message_lower:
+                                        progress_tracker_bound.set_phase(ProgressPhase.LOADING, message)
+                                    elif "analyzing" in message_lower or "scanning" in message_lower:
+                                        progress_tracker_bound.set_phase(ProgressPhase.ANALYZING, message)
+                                    elif "checking" in message_lower:
+                                        progress_tracker_bound.set_phase(ProgressPhase.CHECKING, message)
+
+                                # Also update spinner if present
+                                if spinner_bound:
+                                    spinner_bound.text = f"{message} ({percentage:.1f}%)"
+
+                            return enhanced_progress_callback
+
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
+
                     # Run the scan with progress reporting
+                    config_overrides = {
+                        "enable_progress": bool(progress_tracker),
+                        "progress_update_interval": progress_interval,
+                    }
+
                     results = scan_model_directory_or_file(
                         actual_path,
                         blacklist_patterns=list(blacklist) if blacklist else None,
@@ -750,6 +1028,7 @@ def scan_command(
                         strict_license=strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=not no_skip_files,  # CLI flag is inverted (--no-skip-files)
+                        **config_overrides,
                     )
 
                     # Aggregate results
@@ -841,11 +1120,19 @@ def scan_command(
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
                     aggregated_results["has_errors"] = True
 
+                    # Report error to progress tracker
+                    if progress_tracker:
+                        progress_tracker.report_error(e)
+
             except Exception as e:
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
                 aggregated_results["has_errors"] = True
+
+                # Report error to progress tracker
+                if progress_tracker:
+                    progress_tracker.report_error(e)
 
             finally:
                 # Clean up temporary directory if we downloaded a model
@@ -854,13 +1141,13 @@ def scan_command(
                     try:
                         shutil.rmtree(temp_dir)
                         if verbose:
-                            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+                            logger.debug(f"Temporary directory removed: {temp_dir}")
                     except Exception as e:
                         logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
-                    logger.info("Stopping scan due to interrupt")
+                    logger.info("Scan interrupted by user")
                     aggregated_results["success"] = False
                     issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
                     if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
@@ -876,6 +1163,30 @@ def scan_command(
             # Break outside of finally block if interrupted
             if should_break:
                 break
+
+    # Complete progress tracking
+    if progress_tracker:
+        try:
+            from .progress import ProgressPhase
+
+            progress_tracker.set_phase(ProgressPhase.FINALIZING, "Completing scan and generating report")
+            progress_tracker.complete()
+        except (ImportError, RecursionError):
+            # Skip progress completion if import fails due to circular dependency
+            if verbose:
+                click.echo("Progress tracking completion skipped due to import issues", err=True)
+        except Exception as e:
+            logger.warning(f"Error completing progress tracking: {e}")
+
+    # Cleanup progress reporters
+    for reporter in progress_reporters:
+        try:
+            if hasattr(reporter, "cleanup"):
+                reporter.cleanup()
+            elif hasattr(reporter, "close"):
+                reporter.close()
+        except Exception as e:
+            logger.warning(f"Error cleaning up progress reporter: {e}")
 
     # Calculate total duration
     aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
@@ -942,7 +1253,29 @@ def scan_command(
     if output:
         with open(output, "w", encoding="utf-8") as f:
             f.write(output_text)
+
+        # Always confirm file was written (expected by tests and users)
         click.echo(f"Results written to {output}")
+
+        # Show summary in verbose mode for better UX
+        if verbose:
+            issues = aggregated_results.get("issues", [])
+            visible_issues = issues  # In verbose mode, show all issues including debug
+            if visible_issues:
+                critical_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
+                )
+                warning_count = len(
+                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
+                )
+                if critical_count > 0:
+                    click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
+                elif warning_count > 0:
+                    click.echo(f"Found {warning_count} warning(s)")
+                else:
+                    click.echo(f"Found {len(visible_issues)} informational issue(s)")
+            else:
+                click.echo("No security issues found")
     else:
         # Add a separator line between debug output and scan results
         if format == "text":
@@ -1001,6 +1334,39 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         label_str = style_text(f"  {label}:", fg="bright_black")
         value_str = style_text(value, fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
+
+    # Add authentication status (inspired by semgrep's approach)
+    from .scanners import _registry
+
+    available_scanners = _registry.get_available_scanners()
+    total_scanners = len(_registry.get_scanner_classes())  # Total possible scanners
+    authenticated = config.is_authenticated()
+
+    if authenticated:
+        auth_label = style_text("  Authentication:", fg="bright_black")
+        auth_value = style_text("Logged in", fg="green", bold=True)
+        output_lines.append(f"{auth_label} {auth_value}")
+        # Show enhanced scanner count for authenticated users
+        scanner_label = style_text("  Enhanced Scanners:", fg="bright_black")
+        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="green", bold=True)
+        output_lines.append(f"{scanner_label} {scanner_value}")
+    else:
+        auth_label = style_text("  Authentication:", fg="bright_black")
+        auth_value = style_text("Anonymous", fg="yellow", bold=True)
+        output_lines.append(f"{auth_label} {auth_value}")
+        # Show limited scanner info for unauthenticated users
+        scanner_label = style_text("  Basic Scanners:", fg="bright_black")
+        scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="yellow", bold=True)
+        output_lines.append(f"{scanner_label} {scanner_value}")
+
+        # Add gentle encouragement to login (only if we have failures or limited functionality)
+        if len(available_scanners) < total_scanners:
+            output_lines.append("")
+            tip_icon = "💡"
+            tip_text = "Login for enhanced scanning with cloud models and fewer false positives"
+            login_cmd = style_text("modelaudit auth login", fg="cyan", bold=True)
+            output_lines.append(f"  {tip_icon} {tip_text}")
+            output_lines.append(f"     Run {login_cmd} to get started")
 
     # Add model information if available
     if "file_metadata" in results:
@@ -1062,6 +1428,29 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
         output_lines.append(rate_str)
+
+    # Show failed checks if any exist
+    failed_checks_list = [c for c in results.get("checks", []) if c.get("status") == "failed"]
+    if failed_checks_list:
+        output_lines.append("")
+        output_lines.append(style_text("  Failed Checks (non-critical):", fg="yellow"))
+        # Group failed checks by name to avoid repetition
+        check_groups: dict[str, list[str]] = {}
+        for check in failed_checks_list:
+            check_name = check.get("name", "Unknown check")
+            if check_name not in check_groups:
+                check_groups[check_name] = []
+            check_groups[check_name].append(check.get("message", ""))
+
+        # Show unique failed check types
+        for check_name, messages in list(check_groups.items())[:5]:  # Show first 5 types
+            unique_msg = messages[0] if messages else ""
+            if len(messages) > 1:
+                output_lines.append(f"    • {check_name} ({len(messages)} occurrences)")
+            else:
+                output_lines.append(f"    • {check_name}: {unique_msg}")
+        if len(check_groups) > 5:
+            output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
 
     # Add issue summary
     issues = results.get("issues", [])
@@ -1226,6 +1615,15 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     output_lines.append("═" * 80)
 
+    # Add encouragement message for unauthenticated users after successful scans
+    # (similar to promptfoo's approach)
+    if not config.is_authenticated() and not visible_issues:
+        output_lines.append("")
+        encouragement_msg = "» Want enhanced scanning with cloud models and team sharing?"
+        signup_link = style_text("https://promptfoo.app", fg="green", bold=True)
+        encouragement_line = f"  {encouragement_msg} Sign up at {signup_link}"
+        output_lines.append(encouragement_line)
+
     return "\n".join(output_lines)
 
 
@@ -1352,4 +1750,12 @@ def doctor(show_failed: bool):
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     cli()
+
+
+if __name__ == "__main__":
+    main()

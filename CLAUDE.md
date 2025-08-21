@@ -22,6 +22,11 @@ rye run modelaudit --format json --output results.json model.pkl
 # Or explicitly with scan command:
 rye run modelaudit scan model.pkl
 
+# Large Model Support (8GB+)
+rye run modelaudit large_model.bin --timeout 1800  # 30 min timeout for large models
+rye run modelaudit huge_model.bin --verbose  # Show progress for large files
+rye run modelaudit model.bin --no-large-model-support  # Disable optimizations
+
 # Testing (IMPORTANT: Tests should run fast!)
 rye run pytest -n auto -m "not slow and not integration"  # Fast development testing (recommended)
 rye run pytest -n auto                  # Run all tests with parallel execution
@@ -135,7 +140,7 @@ NO_COLOR=1 modelaudit model.pkl
 
 ## Additional Commands
 
-```bash
+````bash
 # Diagnose scanner compatibility
 rye run modelaudit doctor --show-failed
 
@@ -143,6 +148,25 @@ rye run modelaudit doctor --show-failed
 rye build
 
 # Publishing (maintainers only)
+
+## Clean Publishing Process
+
+```bash
+# 1. Build package (clean first)
+rye build --clean
+
+# 2. Verify only current version artifacts exist
+ls -la dist/
+
+# 3. Publish to PyPI
+rye publish --yes
+````
+
+## Manual Publishing Steps
+
+For interactive authentication (if --yes doesn't work):
+
+```bash
 rye publish
 ```
 

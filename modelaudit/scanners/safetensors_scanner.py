@@ -147,6 +147,7 @@ class SafeTensorsScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
+                        why="SafeTensors header contained invalid JSON.",
                     )
                     result.finish(success=False)
                     return result

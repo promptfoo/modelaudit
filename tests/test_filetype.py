@@ -1,7 +1,11 @@
+import io
+import tarfile
 import zipfile
+from pathlib import Path
 
 from modelaudit.utils.filetype import (
     detect_file_format,
+    detect_file_format_from_magic,
     detect_format_from_extension,
     find_sharded_files,
     is_zipfile,
@@ -22,6 +26,18 @@ def test_detect_file_format_directory(tmp_path):
 
     # Test detection
     assert detect_file_format(str(regular_dir)) == "directory"
+    assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
+
+
+def test_detect_file_format_large_directory(tmp_path):
+    """Ensure detection short-circuits in directories with many files."""
+    tf_dir = tmp_path / "tf_large"
+    tf_dir.mkdir()
+    (tf_dir / "saved_model.pb").write_bytes(b"dummy content")
+
+    for i in range(1000):
+        (tf_dir / f"file_{i}.txt").write_text("x")
+
     assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
 
 
@@ -91,6 +107,17 @@ def test_is_zipfile(tmp_path):
     assert is_zipfile(str(zip_path)) is True
     assert is_zipfile(str(non_zip_path)) is False
     assert is_zipfile("nonexistent_file.zip") is False
+
+
+def test_detect_file_format_tar(tmp_path):
+    """Detect tar archives by signature without extra I/O."""
+    tar_path = tmp_path / "archive.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        info = tarfile.TarInfo(name="test.txt")
+        tar.addfile(info, io.BytesIO(b"content"))
+
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
 
 
 def test_zip_magic_variants(tmp_path):
@@ -229,3 +256,15 @@ def test_validate_file_type(tmp_path):
     bin_pickle = tmp_path / "weights.bin"
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
+
+
+def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):
+    """Return 'unknown' when reading magic bytes fails."""
+    file_path = tmp_path / "unreadable.bin"
+    file_path.write_bytes(b"\x89HDF")
+
+    def open_raise(self, *args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "open", open_raise)
+    assert detect_file_format_from_magic(str(file_path)) == "unknown"

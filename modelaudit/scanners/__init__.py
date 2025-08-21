@@ -55,8 +55,19 @@ class ScannerRegistry:
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
-        self._numpy_compatible, self._numpy_status = _check_numpy_compatibility()
+        self._numpy_compatible: Optional[bool] = None  # Lazy initialization
+        self._numpy_status: Optional[str] = None
         self._init_registry()
+
+    def _ensure_numpy_status(self) -> None:
+        """Lazy initialization of NumPy compatibility status."""
+        if self._numpy_compatible is None:
+            try:
+                self._numpy_compatible, self._numpy_status = _check_numpy_compatibility()
+            except RecursionError:
+                # Handle environments with very low recursion limits
+                self._numpy_compatible = False
+                self._numpy_status = "NumPy compatibility check failed due to low recursion limit"
 
     # Class-level constant for AI/ML manifest patterns
     _AIML_MANIFEST_PATTERNS = frozenset(
@@ -97,7 +108,7 @@ class ScannerRegistry:
                 "class": "PyTorchBinaryScanner",
                 "description": "Scans PyTorch binary files",
                 "extensions": [".bin"],
-                "priority": 2,  # Must come before generic scanners for .bin files
+                "priority": 3,  # After pytorch_zip to allow ZIP detection first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
@@ -106,16 +117,25 @@ class ScannerRegistry:
                 "class": "TensorFlowSavedModelScanner",
                 "description": "Scans TensorFlow SavedModel files",
                 "extensions": [".pb", ""],  # Empty string for directories
-                "priority": 3,
+                "priority": 4,
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
+            },
+            "keras_zip": {
+                "module": "modelaudit.scanners.keras_zip_scanner",
+                "class": "KerasZipScanner",
+                "description": "Scans ZIP-based Keras model files",
+                "extensions": [".keras"],
+                "priority": 4,  # Higher priority than keras_h5 to check ZIP format first
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
             },
             "keras_h5": {
                 "module": "modelaudit.scanners.keras_h5_scanner",
                 "class": "KerasH5Scanner",
                 "description": "Scans Keras H5 model files",
                 "extensions": [".h5", ".hdf5", ".keras"],
-                "priority": 4,
+                "priority": 5,
                 "dependencies": ["h5py"],  # Heavy dependency
                 "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
             },
@@ -124,7 +144,7 @@ class ScannerRegistry:
                 "class": "OnnxScanner",
                 "description": "Scans ONNX model files",
                 "extensions": [".onnx"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
@@ -133,7 +153,7 @@ class ScannerRegistry:
                 "class": "CoreMLScanner",
                 "description": "Scans Apple Core ML model files",
                 "extensions": [".mlmodel"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": ["coreml"],  # Heavy dependency
                 "numpy_sensitive": True,
             },
@@ -142,7 +162,7 @@ class ScannerRegistry:
                 "class": "OpenVinoScanner",
                 "description": "Scans OpenVINO IR model files",
                 "extensions": [".xml"],
-                "priority": 5,
+                "priority": 6,
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
@@ -150,8 +170,8 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
                 "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [".pt", ".pth"],
-                "priority": 6,  # Must come before ZipScanner since .pt/.pth files are zip files
+                "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
+                "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
@@ -389,6 +409,7 @@ class ScannerRegistry:
 
                 if _is_numpy_compatibility_error(e):
                     if is_numpy_sensitive:
+                        self._ensure_numpy_status()  # Lazy initialization
                         error_msg = (
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
@@ -409,6 +430,7 @@ class ScannerRegistry:
                 # Store failure reason and log appropriately
                 self._failed_scanners[scanner_id] = error_msg
 
+                self._ensure_numpy_status()  # Lazy initialization
                 if is_numpy_sensitive and not self._numpy_compatible:
                     logger.info(error_msg)  # Info level for expected NumPy issues
                 else:
@@ -477,6 +499,10 @@ class ScannerRegistry:
 
     def get_numpy_status(self) -> tuple[bool, str]:
         """Get NumPy compatibility status"""
+        self._ensure_numpy_status()  # Lazy initialization
+        # After lazy initialization, these are guaranteed to be non-None
+        assert self._numpy_compatible is not None
+        assert self._numpy_status is not None
         return self._numpy_compatible, self._numpy_status
 
     def _is_aiml_manifest_file(self, filename: str) -> bool:

@@ -118,7 +118,7 @@ class KerasH5Scanner(BaseScanner):
                         result.add_check(
                             name="Keras Model Format Check",
                             passed=True,
-                            message="File appears to be a TensorFlow H5 model, not Keras format",
+                            message="File is a TensorFlow H5 model, not Keras format",
                             location=self.current_file_path,
                             details={"format": "tensorflow_h5"},
                         )
@@ -152,20 +152,25 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
+                    custom_objects_attr = f.attrs["custom_objects"]
+                    custom_objects_list = list(custom_objects_attr) if custom_objects_attr is not None else []
                     result.add_check(
                         name="Custom Objects Security Check",
                         passed=False,
                         message="Model contains custom objects which could contain arbitrary code",
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (model_config)",
-                        details={"custom_objects": list(f.attrs["custom_objects"])},
+                        details={"custom_objects": custom_objects_list},
                     )
 
                 # Check for custom metrics
                 if "training_config" in f.attrs:
                     training_config = json.loads(f.attrs["training_config"])
-                    if "metrics" in training_config:
-                        for metric in training_config["metrics"]:
+                    if "metrics" in training_config and training_config["metrics"] is not None:
+                        metrics_list = training_config["metrics"]
+                        if not isinstance(metrics_list, (list, tuple)):
+                            metrics_list = []
+                        for metric in metrics_list:
                             if isinstance(metric, dict) and metric.get(
                                 "class_name",
                             ) not in [
@@ -312,7 +317,6 @@ class KerasH5Scanner(BaseScanner):
             is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
 
             if is_safe_pattern:
-                # This is a safe normalization lambda - record as passed check
                 result.add_check(
                     name="Lambda Layer Code Analysis",
                     passed=True,

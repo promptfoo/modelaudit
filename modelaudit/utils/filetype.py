@@ -1,4 +1,5 @@
 import re
+import struct
 from pathlib import Path
 
 # Known GGML header variants (older formats like GGMF and GGJT)
@@ -17,8 +18,7 @@ def is_zipfile(path: str) -> bool:
     if not file_path.is_file():
         return False
     try:
-        with file_path.open("rb") as f:
-            signature = f.read(4)
+        signature = read_magic_bytes(path, 4)
         return signature.startswith(b"PK")
     except OSError:
         return False
@@ -40,63 +40,68 @@ def detect_file_format_from_magic(path: str) -> str:
     if not file_path.is_file():
         return "unknown"
 
-    size = file_path.stat().st_size
-    if size < 4:
+    try:
+        size = file_path.stat().st_size
+        if size < 4:
+            return "unknown"
+
+        with file_path.open("rb") as f:
+            header = f.read(16)
+
+            # Check for TAR format by looking for the "ustar" signature
+            if size >= 262:
+                f.seek(257)
+                if f.read(5).startswith(b"ustar"):
+                    return "tar"
+            # Reset to read from header for further checks
+            f.seek(0)
+
+            magic4 = header[:4]
+            magic8 = header[:8]
+            magic16 = header[:16]
+
+            hdf5_magic = b"\x89HDF\r\n\x1a\n"
+            if magic8 == hdf5_magic:
+                return "hdf5"
+
+            # NumPy magic check
+            numpy_magic = b"\x93NUMPY"
+            if magic8.startswith(numpy_magic):
+                return "numpy"
+
+            if magic4 == b"GGUF":
+                return "gguf"
+            if magic4 in GGML_MAGIC_VARIANTS:
+                return "ggml"
+
+            if magic4.startswith(b"PK"):
+                return "zip"
+
+            pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+            if any(magic4.startswith(m) for m in pickle_magics):
+                return "pickle"
+
+            # SafeTensors format check: 8-byte length header + JSON metadata
+            if size >= 12:  # Minimum: 8 bytes length + some JSON
+                try:
+                    json_length = struct.unpack("<Q", magic8)[0]
+                    # Sanity check: JSON length should be reasonable
+                    if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
+                        f.seek(8)
+                        json_start = f.read(min(32, json_length))
+                        if json_start.startswith(b"{") and b'"' in json_start:
+                            return "safetensors"
+                except (struct.error, OSError):
+                    pass
+
+    except OSError:
         return "unknown"
 
-    magic4 = read_magic_bytes(path, 4)
-    magic8 = read_magic_bytes(path, 8)
-    magic16 = read_magic_bytes(path, 16)
-
-    # Check for TAR format
-    try:
-        import tarfile
-
-        if tarfile.is_tarfile(path):
-            return "tar"
-    except Exception:
-        pass
-
-    hdf5_magic = b"\x89HDF\r\n\x1a\n"
-    if magic8 == hdf5_magic:
-        return "hdf5"
-
-    # NumPy magic check
-    numpy_magic = b"\x93NUMPY"
-    if magic8.startswith(numpy_magic):
-        return "numpy"
-
-    if magic4 == b"GGUF":
-        return "gguf"
-    if magic4 in GGML_MAGIC_VARIANTS:
-        return "ggml"
-
-    if magic4.startswith(b"PK"):
-        return "zip"
-
-    pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
-    if any(magic4.startswith(m) for m in pickle_magics):
-        return "pickle"
-
-    # SafeTensors format check: 8-byte length header + JSON metadata
-    if size >= 12:  # Minimum: 8 bytes length + some JSON
-        try:
-            import struct
-
-            # Read 8 bytes as little-endian u64 for JSON length
-            json_length = struct.unpack("<Q", magic8)[0]
-            # Sanity check: JSON length should be reasonable
-            if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
-                # Read some bytes after the header to check for JSON
-                with open(path, "rb") as f:
-                    f.seek(8)  # Skip the 8-byte header
-                    json_start = f.read(min(32, json_length))
-                    if json_start.startswith(b"{") and b'"' in json_start:
-                        return "safetensors"
-        except (struct.error, OSError):
-            pass
-
     # Fallback: check if it starts with JSON (for old safetensors or other JSON formats)
+    magic4 = header[:4]
+    magic8 = header[:8]
+    magic16 = header[:16]
+
     if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
         return "safetensors"
 
@@ -121,8 +126,7 @@ def detect_file_format(path: str) -> str:
     if file_path.is_dir():
         # We'll let the caller handle directory logic.
         # But we do a quick guess if there's a 'saved_model.pb'.
-        contents = list(file_path.iterdir())
-        if any(f.name == "saved_model.pb" for f in contents):
+        if any(f.name == "saved_model.pb" for f in file_path.iterdir()):
             return "tensorflow_directory"
         return "directory"
 
@@ -131,10 +135,13 @@ def detect_file_format(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    # Read first bytes for format detection
-    magic4 = read_magic_bytes(path, 4)
-    magic8 = read_magic_bytes(path, 8)
-    magic16 = read_magic_bytes(path, 16)
+    # Read first bytes for format detection using a single file handle
+    with file_path.open("rb") as f:
+        header = f.read(16)
+
+    magic4 = header[:4]
+    magic8 = header[:8]
+    magic16 = header[:16]
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
@@ -165,6 +172,9 @@ def detect_file_format(path: str) -> str:
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
+        # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
+        if magic4.startswith(b"PK"):
+            return "zip"
         # Check if it's a pickle file
         if any(magic4.startswith(m) for m in pickle_magics):
             return "pickle"

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.0"
+version = "0.2.3"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -35,6 +35,8 @@ dependencies = [
     "huggingface-hub>=0.23.0",
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
+    "platformdirs>=3.0.0",
+    "pyyaml>=6.0,<7.0",
 ]
 
 [project.optional-dependencies]
@@ -139,6 +141,7 @@ dev-dependencies = [
     "pytest-cov>=6.2.1",
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
+    "pytest-asyncio>=1.1.0",
 ]
 
 [tool.ruff]
@@ -195,6 +198,7 @@ markers = [
     "integration: marks tests as integration tests",
     "performance: marks tests as performance benchmarks",
     "unit: marks tests as unit tests (fast)",
+    "asyncio: marks tests as asyncio tests",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
