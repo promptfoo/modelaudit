@@ -271,10 +271,61 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 
 ### Release Process (Maintainers)
 
-1. Update version in `pyproject.toml`
-2. Create release PR
-3. After merge, create GitHub release
-4. Package will automatically publish to PyPI via GitHub Actions
+#### Version Bump and Release
+1. **Checkout main and pull latest changes**:
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+2. **Create version bump branch**:
+   ```bash
+   git checkout -b chore/bump-version-X.Y.Z
+   ```
+
+3. **Update version in `pyproject.toml`**:
+   ```bash
+   # Edit version = "X.Y.Z" in pyproject.toml
+   ```
+
+4. **Commit and push version bump**:
+   ```bash
+   git add pyproject.toml
+   git commit -m "chore: bump version to X.Y.Z"
+   git push -u origin chore/bump-version-X.Y.Z
+   ```
+
+5. **Create and merge version bump PR**:
+   ```bash
+   gh pr create --title "chore: bump version to X.Y.Z" --body "Bump version for release"
+   ```
+
+#### Publishing to PyPI
+6. **After version bump PR is merged, checkout main**:
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+7. **Clean and publish**:
+   ```bash
+   # Clean previous builds
+   rm -rf dist/*
+   
+   # Build package
+   rye build
+   
+   # Verify only current version exists
+   ls -la dist/
+   
+   # Publish to PyPI
+   rye publish --yes
+   ```
+
+#### GitHub Release (Optional)
+8. **Create GitHub release** (optional, for major releases):
+   - Use GitHub UI or `gh release create`
+   - Add release notes highlighting key changes
 
 ## 🐛 Reporting Issues
 

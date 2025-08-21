@@ -148,6 +148,27 @@ rye run modelaudit doctor --show-failed
 rye build
 
 # Publishing (maintainers only)
+
+## Clean Publishing Process
+
+```bash
+# 1. Clean dist directory
+rm -rf dist/*
+
+# 2. Build package
+rye build
+
+# 3. Verify only current version artifacts exist
+ls -la dist/
+
+# 4. Publish to PyPI
+rye publish --yes
+```
+
+## Manual Publishing Steps
+
+For interactive authentication (if --yes doesn't work):
+```bash
 rye publish
 ```
 
