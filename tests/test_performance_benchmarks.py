@@ -238,7 +238,7 @@ class TestPerformanceBenchmarks:
 
         # Compare with single-threaded performance
         single_result = scan_directory()
-        concurrency_overhead = avg_duration / single_result["duration"]
+        concurrency_overhead = avg_duration / single_result.duration
 
         # Allow some overhead but not excessive
         # More lenient threshold for CI environments
@@ -297,14 +297,14 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result["files_scanned"] == first_result["files_scanned"], (
+            assert result.files_scanned == first_result.files_scanned, (
                 f"Inconsistent files_scanned on run {i + 1}"
             )
-            assert result["bytes_scanned"] == first_result["bytes_scanned"], (
+            assert result.bytes_scanned == first_result.bytes_scanned, (
                 f"Inconsistent bytes_scanned on run {i + 1}"
             )
-            assert len(result["issues"]) == len(first_result["issues"]), f"Inconsistent issue count on run {i + 1}"
-            assert result["success"] == first_result["success"], f"Inconsistent success status on run {i + 1}"
+            assert len(result.issues) == len(first_result.issues), f"Inconsistent issue count on run {i + 1}"
+            assert result.success == first_result.success, f"Inconsistent success status on run {i + 1}"
 
     def test_timeout_performance(self, assets_dir):
         """Test that timeout handling doesn't significantly impact performance."""
