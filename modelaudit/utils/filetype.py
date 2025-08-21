@@ -255,10 +255,10 @@ def find_sharded_files(directory: str) -> list[str]:
     Look for sharded model files like:
     pytorch_model-00001-of-00002.bin
     """
-    dir_path = Path(directory)
+    dir_path = Path(directory).resolve()
     return sorted(
         [
-            str(dir_path / fname)
+            str(fname.resolve())
             for fname in dir_path.iterdir()
             if fname.is_file() and re.match(r"pytorch_model-\d{5}-of-\d{5}\.bin", fname.name)
         ],
