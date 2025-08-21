@@ -25,6 +25,7 @@ Usage:
         # Signal handlers are restored on exit
 """
 
+import contextlib
 import logging
 import os
 import signal
@@ -40,7 +41,7 @@ class InterruptHandler:
 
     This class is thread-safe and handles proper installation/restoration of signal
     handlers. It uses a threading.Event to track interrupt state across threads.
-    
+
     On the first interrupt (Ctrl+C), it initiates graceful shutdown. If a second
     interrupt is received while the first is still pending, it performs immediate termination.
     """
@@ -113,14 +114,14 @@ class InterruptHandler:
             try:
                 # Store original handlers
                 self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
-                
+
                 # SIGTERM might not be available on Windows
                 try:
                     self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
                 except (AttributeError, ValueError):
                     # SIGTERM not available on this platform
                     self._original_sigterm_handler = None
-                    
+
                 self._active = True
                 logger.debug("Interrupt handlers installed")
                 yield
@@ -129,10 +130,8 @@ class InterruptHandler:
                 if self._original_sigint_handler is not None:
                     signal.signal(signal.SIGINT, self._original_sigint_handler)
                 if self._original_sigterm_handler is not None:
-                    try:
+                    with contextlib.suppress(AttributeError, ValueError):
                         signal.signal(signal.SIGTERM, self._original_sigterm_handler)
-                    except (AttributeError, ValueError):
-                        pass  # SIGTERM not available on this platform
                 self._active = False
                 logger.debug("Interrupt handlers restored")
 
@@ -195,7 +194,7 @@ def interruptible_scan():
     This installs signal handlers for SIGINT and SIGTERM, allowing the
     scanning operation to be interrupted gracefully. The interrupt state
     is reset at the start, and signal handlers are restored on exit.
-    
+
     Behavior:
     - First Ctrl+C: Initiates graceful shutdown
     - Second Ctrl+C (while interrupt is pending): Forces immediate termination (exit code 130)
