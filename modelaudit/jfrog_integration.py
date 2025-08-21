@@ -19,7 +19,7 @@ def scan_jfrog_artifact(
     *,
     api_token: str | None = None,
     access_token: str | None = None,
-    timeout: int = 300,
+    timeout: int = 3600,
     blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
