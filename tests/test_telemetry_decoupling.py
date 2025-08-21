@@ -3,6 +3,7 @@ Tests to ensure telemetry is properly decoupled from core functionality.
 """
 # ruff: noqa: SIM117
 
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -184,7 +185,15 @@ class TestTelemetryFunctionalityWhenWorking:
 
     def test_telemetry_works_when_enabled_and_available(self):
         """Test that telemetry actually works when properly configured."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
             mock_home.return_value = Path(temp_dir)
 
             from modelaudit.telemetry import get_telemetry_client

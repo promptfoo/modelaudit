@@ -110,7 +110,15 @@ class TestTelemetryClient:
 
     def test_telemetry_enabled_when_opted_in(self):
         """Test that telemetry works when explicitly enabled."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
             client._user_config.telemetry_enabled = True
@@ -124,7 +132,15 @@ class TestTelemetryClient:
         mock_response.status = 200
         mock_urlopen.return_value.__enter__.return_value = mock_response
 
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
             client._user_config.telemetry_enabled = True
