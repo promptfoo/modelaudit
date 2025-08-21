@@ -278,7 +278,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     message=f"Executable signature found: {description}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {pos})",
-                    rule_code="S902",
+                    rule_code="S501",
                     details={
                         "signature": sig.hex(),
                         "description": description,
