@@ -206,8 +206,8 @@ class PyTorchZipScanner(BaseScanner):
 
                     try:
                         info = z.getinfo(name)
-                        # Only check first 10GB of each file for JIT patterns
-                        check_size = min(info.file_size, 10 * 1024 * 1024 * 1024)
+                        # Only check first 100GB of each file for JIT patterns
+                        check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
 
                         with z.open(name, "r") as zf:
                             chunk = zf.read(check_size)
