@@ -711,7 +711,7 @@ def scan_model_directory_or_file(
                             # Ensure scanners list exists and is properly typed
                             if "scanners" not in scan_metadata:
                                 scan_metadata["scanners"] = []
-                            scanners_list = scan_metadata["scanners"]  
+                            scanners_list = scan_metadata["scanners"]
                             if isinstance(scanners_list, list) and scanner_name not in scanners_list:
                                 scanners_list.append(scanner_name)
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":

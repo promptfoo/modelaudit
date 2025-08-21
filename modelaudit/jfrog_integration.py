@@ -8,9 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .models import ModelAuditResultModel
-
 from .core import scan_model_directory_or_file
+from .models import ModelAuditResultModel
 from .utils.jfrog import download_artifact
 
 logger = logging.getLogger(__name__)

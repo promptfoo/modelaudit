@@ -14,9 +14,9 @@ from . import __version__
 from .auth.client import auth_client
 from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
-from .models import ModelAuditResultModel
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
+from .models import ModelAuditResultModel
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
