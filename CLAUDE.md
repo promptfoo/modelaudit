@@ -140,7 +140,7 @@ NO_COLOR=1 modelaudit model.pkl
 
 ## Additional Commands
 
-```bash
+````bash
 # Diagnose scanner compatibility
 rye run modelaudit doctor --show-failed
 
@@ -148,6 +148,25 @@ rye run modelaudit doctor --show-failed
 rye build
 
 # Publishing (maintainers only)
+
+## Clean Publishing Process
+
+```bash
+# 1. Build package (clean first)
+rye build --clean
+
+# 2. Verify only current version artifacts exist
+ls -la dist/
+
+# 3. Publish to PyPI
+rye publish --yes
+````
+
+## Manual Publishing Steps
+
+For interactive authentication (if --yes doesn't work):
+
+```bash
 rye publish
 ```
 

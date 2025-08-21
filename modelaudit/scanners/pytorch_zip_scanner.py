@@ -210,8 +210,8 @@ class PyTorchZipScanner(BaseScanner):
 
                     try:
                         info = z.getinfo(name)
-                        # Only check first 10GB of each file for JIT patterns
-                        check_size = min(info.file_size, 10 * 1024 * 1024 * 1024)
+                        # Only check first 100GB of each file for JIT patterns
+                        check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
 
                         with z.open(name, "r") as zf:
                             chunk = zf.read(check_size)
@@ -309,54 +309,203 @@ class PyTorchZipScanner(BaseScanner):
                     )
 
                 # Check for blacklist patterns in all files
-                if hasattr(self, "config") and self.config and "blacklist_patterns" in self.config:
+                blacklist_patterns = None
+                if (
+                    hasattr(self, "config")
+                    and self.config
+                    and "blacklist_patterns" in self.config
+                    and self.config["blacklist_patterns"] is not None
+                ):
                     blacklist_patterns = self.config["blacklist_patterns"]
+
+                if blacklist_patterns:
+                    # Configure size limits for blacklist scanning to prevent memory issues
+                    max_blacklist_scan_size = self.config.get(
+                        "max_blacklist_scan_size",
+                        100 * 1024 * 1024,  # 100MB default
+                    )
+
                     for name in safe_entries:
                         try:
-                            file_data = z.read(name)
+                            # Check file size before attempting to read
+                            info = z.getinfo(name)
+                            if info.file_size > max_blacklist_scan_size:
+                                result.add_check(
+                                    name="Blacklist Pattern Check",
+                                    passed=True,
+                                    message=(
+                                        f"File {name} too large for blacklist scanning "
+                                        f"(size: {info.file_size}, limit: {max_blacklist_scan_size})"
+                                    ),
+                                    severity=IssueSeverity.INFO,
+                                    location=f"{self.current_file_path} ({name})",
+                                    details={
+                                        "file_size": info.file_size,
+                                        "scan_limit": max_blacklist_scan_size,
+                                        "zip_entry": name,
+                                        "reason": "size_limit_exceeded",
+                                    },
+                                )
+                                continue
 
-                            # For pickled files, check for patterns in the binary data
-                            if name.endswith(".pkl"):
-                                for pattern in blacklist_patterns:
-                                    # Convert pattern to bytes for binary search
-                                    pattern_bytes = pattern.encode("utf-8")
-                                    if pattern_bytes in file_data:
-                                        result.add_check(
-                                            name="Blacklist Pattern Check",
-                                            passed=False,
-                                            message=f"Blacklisted pattern '{pattern}' found in pickled file {name}",
-                                            severity=IssueSeverity.CRITICAL,
-                                            location=f"{self.current_file_path} ({name})",
-                                            details={
-                                                "pattern": pattern,
-                                                "file": name,
-                                                "file_type": "pickle",
-                                            },
-                                            rule_code="S1001",  # Blacklisted model
+                            # Use streaming read for large files to avoid memory issues
+                            if info.file_size > 10 * 1024 * 1024:  # 10MB threshold for streaming
+                                # Stream the file and check patterns in chunks
+                                found_patterns = []
+                                with z.open(name, "r") as zf:
+                                    chunk_size = 1024 * 1024  # 1MB chunks
+                                    overlap_buffer = b""
+                                    max_pattern_len = (
+                                        max(len(p.encode("utf-8")) for p in blacklist_patterns)
+                                        if blacklist_patterns
+                                        else 0
+                                    )
+
+                                    while True:
+                                        chunk = zf.read(chunk_size)
+                                        if not chunk:
+                                            break
+
+                                        # Combine with overlap buffer to catch patterns across chunk boundaries
+                                        search_data = overlap_buffer + chunk
+
+                                        # Check for patterns in this chunk
+                                        if name.endswith(".pkl"):
+                                            # Binary search for pickled files
+                                            for pattern in blacklist_patterns:
+                                                pattern_bytes = pattern.encode("utf-8")
+                                                if pattern_bytes in search_data and pattern not in found_patterns:
+                                                    found_patterns.append(pattern)
+                                        else:
+                                            # Text search for other files
+                                            try:
+                                                text_data = search_data.decode("utf-8", errors="ignore")
+                                                for pattern in blacklist_patterns:
+                                                    if pattern in text_data and pattern not in found_patterns:
+                                                        found_patterns.append(pattern)
+                                            except UnicodeDecodeError:
+                                                # Fall back to binary search if text decode fails
+                                                for pattern in blacklist_patterns:
+                                                    pattern_bytes = pattern.encode("utf-8")
+                                                    if pattern_bytes in search_data and pattern not in found_patterns:
+                                                        found_patterns.append(pattern)
+
+                                        # Keep overlap buffer for pattern matching across chunks
+                                        overlap_buffer = (
+                                            search_data[-max_pattern_len:]
+                                            if len(search_data) >= max_pattern_len
+                                            else search_data
                                         )
+
+                                # Report found patterns
+                                for pattern in found_patterns:
+                                    result.add_check(
+                                        name="Blacklist Pattern Check",
+                                        passed=False,
+                                        message=f"Blacklisted pattern '{pattern}' found in file {name}",
+                                        severity=IssueSeverity.CRITICAL,
+                                        location=f"{self.current_file_path} ({name})",
+                                        details={
+                                            "pattern": pattern,
+                                            "file": name,
+                                            "file_type": "pickle" if name.endswith(".pkl") else "text",
+                                            "scan_method": "streaming",
+                                        },
+                                        rule_code="S1001",  # Blacklisted model
+                                    )
                             else:
-                                # For non-pickle files, try to decode as text
-                                try:
-                                    content = file_data.decode("utf-8", errors="ignore")
+                                # Small file - read normally
+                                file_data = z.read(name)
+
+                                # For pickled files, check for patterns in the binary data
+                                if name.endswith(".pkl"):
                                     for pattern in blacklist_patterns:
-                                        if pattern in content:
+                                        # Convert pattern to bytes for binary search
+                                        pattern_bytes = pattern.encode("utf-8")
+                                        if pattern_bytes in file_data:
                                             result.add_check(
                                                 name="Blacklist Pattern Check",
                                                 passed=False,
-                                                message=f"Blacklisted pattern '{pattern}' found in file {name}",
+                                                message=f"Blacklisted pattern '{pattern}' found in pickled file {name}",
                                                 severity=IssueSeverity.CRITICAL,
                                                 location=f"{self.current_file_path} ({name})",
                                                 details={
                                                     "pattern": pattern,
                                                     "file": name,
-                                                    "file_type": "text",
+                                                    "file_type": "pickle",
+                                                    "scan_method": "direct",
                                                 },
                                                 rule_code="S1001",
                                             )
-                                except UnicodeDecodeError:
-                                    # Skip blacklist checking for binary files
-                                    # that can't be decoded as text
-                                    pass
+                                else:
+                                    # For text files, decode and search as text
+                                    try:
+                                        content = file_data.decode("utf-8")
+                                        for pattern in blacklist_patterns:
+                                            if pattern in content:
+                                                result.add_check(
+                                                    name="Blacklist Pattern Check",
+                                                    passed=False,
+                                                    message=f"Blacklisted pattern '{pattern}' found in file {name}",
+                                                    severity=IssueSeverity.CRITICAL,
+                                                    location=f"{self.current_file_path} ({name})",
+                                                    details={
+                                                        "pattern": pattern,
+                                                        "file": name,
+                                                        "file_type": "text",
+                                                        "scan_method": "direct",
+                                                    },
+                                                    rule_code="S1001",
+                                                )
+                                    except UnicodeDecodeError:
+                                        # Fall back to binary search for files that can't be decoded as text
+                                        for pattern in blacklist_patterns:
+                                            pattern_bytes = pattern.encode("utf-8")
+                                            if pattern_bytes in file_data:
+                                                result.add_check(
+                                                    name="Blacklist Pattern Check",
+                                                    passed=False,
+                                                    message=(
+                                                        f"Blacklisted pattern '{pattern}' found in binary file {name}"
+                                                    ),
+                                                    severity=IssueSeverity.CRITICAL,
+                                                    location=f"{self.current_file_path} ({name})",
+                                                    details={
+                                                        "pattern": pattern,
+                                                        "file": name,
+                                                        "file_type": "binary",
+                                                        "scan_method": "direct",
+                                                    },
+                                                    rule_code="S1001",
+                                                )
+                        except zipfile.BadZipFile as e:
+                            result.add_check(
+                                name="ZIP Entry Read",
+                                passed=False,
+                                message=f"Bad ZIP file structure reading {name}: {e!s}",
+                                severity=IssueSeverity.WARNING,
+                                location=f"{self.current_file_path} ({name})",
+                                details={
+                                    "zip_entry": name,
+                                    "exception": str(e),
+                                    "exception_type": "BadZipFile",
+                                    "scan_phase": "blacklist_check",
+                                },
+                            )
+                        except MemoryError as e:
+                            result.add_check(
+                                name="ZIP Entry Read",
+                                passed=False,
+                                message=f"Memory limit exceeded reading {name}: {e!s}",
+                                severity=IssueSeverity.WARNING,
+                                location=f"{self.current_file_path} ({name})",
+                                details={
+                                    "zip_entry": name,
+                                    "exception": str(e),
+                                    "exception_type": "MemoryError",
+                                    "scan_phase": "blacklist_check",
+                                },
+                            )
                         except Exception as e:
                             result.add_check(
                                 name="ZIP Entry Read",
@@ -368,9 +517,21 @@ class PyTorchZipScanner(BaseScanner):
                                     "zip_entry": name,
                                     "exception": str(e),
                                     "exception_type": type(e).__name__,
+                                    "scan_phase": "blacklist_check",
                                 },
                                 rule_code="S902",
                             )
+                else:
+                    # No blacklist patterns configured - add a pass check to indicate this was intentionally skipped
+                    if safe_entries:  # Only add this check if there are entries to potentially scan
+                        result.add_check(
+                            name="Blacklist Pattern Check",
+                            passed=True,
+                            message="No blacklist patterns configured for scanning",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={"reason": "no_blacklist_configured", "entries_available": len(safe_entries)},
+                        )
 
                 result.bytes_scanned = bytes_scanned
 

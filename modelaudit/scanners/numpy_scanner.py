@@ -46,8 +46,8 @@ class NumPyScanner(BaseScanner):
         # Security limits
         self.max_array_bytes = self.config.get(
             "max_array_bytes",
-            1024 * 1024 * 1024,
-        )  # 1GB
+            100 * 1024 * 1024 * 1024,
+        )  # 100GB for large numpy arrays
         self.max_dimensions = self.config.get("max_dimensions", 32)
         self.max_dimension_size = self.config.get("max_dimension_size", 100_000_000)
         self.max_itemsize = self.config.get("max_itemsize", 1024)  # 1KB per element

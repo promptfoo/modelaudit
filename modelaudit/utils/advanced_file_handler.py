@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Size thresholds for large models
 EXTREME_MODEL_THRESHOLD = 50 * 1024 * 1024 * 1024  # 50GB - use memory mapping
-LARGE_MODEL_THRESHOLD_200GB = 200 * 1024 * 1024 * 1024  # 200GB - distributed scanning
+LARGE_MODEL_THRESHOLD_200GB = 500 * 1024 * 1024 * 1024  # 500GB - distributed scanning
 COLOSSAL_MODEL_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - special handling
 
 # Memory mapping parameters

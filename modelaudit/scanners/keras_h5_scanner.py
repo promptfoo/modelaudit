@@ -155,6 +155,8 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check for custom objects in the model
                 if "custom_objects" in f.attrs:
+                    custom_objects_attr = f.attrs["custom_objects"]
+                    custom_objects_list = list(custom_objects_attr) if custom_objects_attr is not None else []
                     result.add_check(
                         name="Custom Objects Security Check",
                         passed=False,
@@ -162,14 +164,17 @@ class KerasH5Scanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (model_config)",
                         rule_code="S302",
-                        details={"custom_objects": list(f.attrs["custom_objects"])},
+                        details={"custom_objects": custom_objects_list},
                     )
 
                 # Check for custom metrics
                 if "training_config" in f.attrs:
                     training_config = json.loads(f.attrs["training_config"])
-                    if "metrics" in training_config:
-                        for metric in training_config["metrics"]:
+                    if "metrics" in training_config and training_config["metrics"] is not None:
+                        metrics_list = training_config["metrics"]
+                        if not isinstance(metrics_list, (list, tuple)):
+                            metrics_list = []
+                        for metric in metrics_list:
                             if isinstance(metric, dict) and metric.get(
                                 "class_name",
                             ) not in [

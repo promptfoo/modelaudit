@@ -55,9 +55,20 @@ python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', '
 modelaudit scan test_model.pkl
 ```
 
-### Running Tests
+### Running Tests - Fast & Efficient 🚀
 
 This project uses optimized parallel test execution for faster development:
+
+#### 🎯 Quick Reference
+
+| Command                                                    | Use Case               | Speed              | Tests                            |
+| ---------------------------------------------------------- | ---------------------- | ------------------ | -------------------------------- |
+| `rye run pytest -n auto -m "not slow and not integration"` | **Development**        | ⚡ Fastest         | Unit tests only                  |
+| `rye run pytest -n auto -x --tb=short`                     | **Quick feedback**     | ⚡ Fast, fail-fast | All tests, stop on first failure |
+| `rye run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | 🐌 Complete        | All tests with coverage          |
+| `rye run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | ⚡ Targeted        | Pattern-matched tests            |
+
+#### 🚀 Common Test Commands
 
 ```bash
 # 🚀 FAST - Development testing (excludes slow tests)
@@ -77,11 +88,34 @@ rye run pytest -k "test_scanner" -n auto
 rye run pytest --durations=10 --tb=no
 ```
 
-**Test Speed Optimizations:**
+#### 🏃‍♂️ Speed Optimizations Implemented
 
-- Parallel execution with `-n auto` (37% faster)
-- Smart test markers: `slow`, `integration`, `unit`, `performance`
-- Optimized pytest configuration in `pyproject.toml`
+**Parallel Execution:**
+
+- **37% faster** execution using `pytest-xdist`
+- Automatically detects CPU cores with `-n auto`
+- Uses 240%+ CPU utilization
+
+**Smart Test Selection:**
+
+- Exclude slow tests during development: `-m "not slow and not integration"`
+- Run only unit tests: `-m "unit"`
+- Test specific files: `pytest tests/test_specific.py -n auto`
+
+**Performance Comparison:**
+| Configuration | Time | Speedup |
+|--------------|------|---------|
+| Original (sequential) | 68.5s | Baseline |
+| **Parallel (all tests)** | **43.3s** | **37% faster** |
+| **Fast tests only** | **~45s** | **34% faster** |
+| **Specific file/pattern** | **~5-15s** | **80-90% faster** |
+
+**Test Markers Available:**
+
+- `@pytest.mark.slow` - Skip with `-m "not slow"`
+- `@pytest.mark.integration` - Skip with `-m "not integration"`
+- `@pytest.mark.unit` - Run only with `-m "unit"`
+- `@pytest.mark.performance` - Benchmark tests
 
 ### Development Workflow
 
@@ -237,10 +271,61 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 
 ### Release Process (Maintainers)
 
-1. Update version in `pyproject.toml`
-2. Create release PR
-3. After merge, create GitHub release
-4. Package will automatically publish to PyPI via GitHub Actions
+#### Version Bump and Release
+
+1. **Checkout main and pull latest changes**:
+
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+2. **Create version bump branch**:
+
+   ```bash
+   git checkout -b chore/bump-version-X.Y.Z
+   ```
+
+3. **Update version in `pyproject.toml`**:
+
+   ```bash
+   # Edit version = "X.Y.Z" in pyproject.toml
+   ```
+
+4. **Commit and push version bump**:
+
+   ```bash
+   git add pyproject.toml
+   git commit -m "chore: bump version to X.Y.Z"
+   git push -u origin chore/bump-version-X.Y.Z
+   ```
+
+5. **Create and merge version bump PR**:
+   ```bash
+   gh pr create --title "chore: bump version to X.Y.Z" --body "Bump version for release"
+   ```
+
+#### Publishing to PyPI
+
+6. **After version bump PR is merged, checkout main**:
+
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+7. **Clean and publish**:
+
+   ```bash
+   # Build package (clean first)
+   rye build --clean
+
+   # Verify only current version exists
+   ls -la dist/
+
+   # Publish to PyPI
+   rye publish --yes
+   ```
 
 ## 🐛 Reporting Issues
 
@@ -260,6 +345,35 @@ For feature requests:
 - Describe the use case clearly
 - Explain why it would benefit users
 - Consider proposing an implementation approach
+
+## 🐛 Known Issues & False Positives
+
+When contributing scanner improvements, be aware of these known false positive patterns:
+
+### Configuration Pattern False Positives
+
+- **Issue**: Manifest scanner flags `label2id` dictionary keys in HuggingFace `config.json` as security risks
+- **Affected Models**: `openai/clip-vit-base-patch32`, `google/vit-base-patch16-224`
+- **Solution**: Scanner should ignore `label2id` field or add ML context awareness
+
+### Flax Model Structure Warnings
+
+- **Issue**: "Suspicious data structure" warnings on legitimate `flax_model.msgpack` files
+- **Affected Models**: Standard HuggingFace Flax models
+- **Solution**: Improve Flax model structure recognition
+
+### PyTorch Opcode Sensitivity
+
+- **Issue**: "MANY_DANGEROUS_OPCODES" warnings on popular legitimate models
+- **Affected Models**: `ultralytics/yolov5n`, `pytorch/vision` models
+- **Solution**: Adjust opcode thresholds based on ML confidence levels
+
+### Scikit-learn Pickle Opcodes
+
+- **Issue**: `NEWOBJ` and `REDUCE` opcodes flagged in standard scikit-learn models
+- **Solution**: Better context analysis for legitimate ML serialization patterns
+
+When fixing scanner issues, ensure changes don't regress detection of actual malicious models listed in `models.md`.
 
 ## 📞 Getting Help
 
