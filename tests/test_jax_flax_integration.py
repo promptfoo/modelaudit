@@ -4,6 +4,7 @@ import json
 
 import msgpack
 import numpy as np
+import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner

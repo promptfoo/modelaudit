@@ -107,8 +107,6 @@ class TestPerformanceBenchmarks:
             if metrics["duration_stdev"] > 0:
                 cv = metrics["duration_stdev"] / metrics["duration_avg"]  # Coefficient of variation
                 # More lenient CV threshold for CI environments
-                import os
-
                 is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
                 cv_threshold = 2.0 if is_ci else 0.5
                 assert cv < cv_threshold, f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
