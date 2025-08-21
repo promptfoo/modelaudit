@@ -418,10 +418,7 @@ class FlaxMsgpackScanner(BaseScanner):
         """Check dictionary keys for suspicious names that might indicate serialization attacks."""
         if key in self.suspicious_keys:
             # Determine appropriate rule code based on key
-            if key.lower() == "__reduce__":
-                rule_code = "S201"  # Pickle REDUCE opcode
-            else:
-                rule_code = "S999"  # Unknown/generic suspicious attribute
+            rule_code = "S201" if key.lower() == "__reduce__" else "S999"
 
             result.add_check(
                 name="Object Attribute Security Check",
