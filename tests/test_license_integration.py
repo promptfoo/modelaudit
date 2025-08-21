@@ -263,7 +263,10 @@ class TestLicenseIntegration:
 
         # Issues should include license warnings
         all_issues = results.issues if hasattr(results, "issues") else []
-        license_issues = [issue for issue in all_issues if hasattr(issue, "details") and issue.details.get("type") == "license_warning"]
+        license_issues = [
+            issue for issue in all_issues
+            if hasattr(issue, "details") and issue.details.get("type") == "license_warning"
+        ]
         assert len(license_issues) > 0, "Should have license warning issues"
 
         # Should have AGPL warning
