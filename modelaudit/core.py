@@ -1058,9 +1058,12 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     # Skip HuggingFace cache files to reduce noise
     if _is_huggingface_cache_file(path):
         sr = ScanResult(scanner_name="skipped")
-        sr.add_issue(
-            "Skipped HuggingFace cache file",
-            severity=IssueSeverity.DEBUG,
+        sr.add_check(
+            name="HuggingFace Cache File Skip",
+            passed=True,
+            message="HuggingFace cache file skipped (not a model file)",
+            severity=IssueSeverity.INFO,
+            location=path,
             details={"path": path, "reason": "huggingface_cache_file"},
         )
         sr.finish(success=True)
