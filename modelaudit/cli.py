@@ -213,7 +213,6 @@ def whoami():
 @cli.command("delegate-info", hidden=True)
 def delegate_info():
     """Internal command to show delegation status"""
-    import json
 
     from .auth.config import config
 
@@ -1229,7 +1228,11 @@ def scan_command(
 
     # Format the output
     if format == "json":
+        # Use Pydantic models for type-safe JSON output that matches original format
+        from .models import create_audit_result_model
+        
         output_data = aggregated_results.copy()
+        
         # Filter out DEBUG issues unless verbose mode is enabled
         if not verbose and "issues" in output_data:
             output_data["issues"] = [
@@ -1244,7 +1247,10 @@ def scan_command(
                 for check in output_data["checks"]
                 if not isinstance(check, dict) or check.get("severity") != "debug"
             ]
-        output_text = json.dumps(output_data, indent=2)
+        
+        # Create Pydantic model and serialize to JSON
+        audit_result = create_audit_result_model(output_data)
+        output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
     else:
         # Text format
         output_text = format_text_output(aggregated_results, verbose)
