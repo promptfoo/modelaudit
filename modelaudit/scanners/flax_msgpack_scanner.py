@@ -394,7 +394,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     rule_code = "S101"  # os module usage
                 else:
                     rule_code = "S999"  # Unknown/generic suspicious pattern
-                
+
                 result.add_check(
                     name="Code Pattern Security Check",
                     passed=False,
@@ -422,7 +422,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 rule_code = "S201"  # Pickle REDUCE opcode
             else:
                 rule_code = "S999"  # Unknown/generic suspicious attribute
-            
+
             result.add_check(
                 name="Object Attribute Security Check",
                 passed=False,
