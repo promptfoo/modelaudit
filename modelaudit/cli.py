@@ -256,8 +256,8 @@ def delegate_info():
     "--timeout",
     "-t",
     type=int,
-    default=300,
-    help="Scan timeout in seconds [default: 300]",
+    default=3600,
+    help="Scan timeout in seconds [default: 3600]",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option(

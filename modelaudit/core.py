@@ -77,7 +77,7 @@ def validate_scan_config(config: dict[str, Any]) -> None:
 def scan_model_directory_or_file(
     path: str,
     blacklist_patterns: Optional[list[str]] = None,
-    timeout: int = 1800,  # Increased to 30 minutes for large models (up to 8GB+)
+    timeout: int = 3600,  # 1 hour for large models (up to 8GB+)
     max_file_size: int = 0,  # 0 means unlimited - support any size
     max_total_size: int = 0,  # 0 means unlimited
     strict_license: bool = False,
@@ -812,7 +812,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     # Now check if we should use regular large handler
     use_large_handler = should_use_large_file_handler(path) and not use_extreme_handler
     progress_callback = config.get("progress_callback")
-    timeout = config.get("timeout", 1800)
+    timeout = config.get("timeout", 3600)
 
     if preferred_scanner and preferred_scanner.can_handle(path):
         logger.debug(
@@ -838,7 +838,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                 f"Scan timeout: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"timeout": config.get("timeout", 300), "error": str(e)},
+                details={"timeout": config.get("timeout", 3600), "error": str(e)},
             )
             result.finish(success=False)
     else:
@@ -866,7 +866,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                     f"Scan timeout: {e}",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    details={"timeout": config.get("timeout", 300), "error": str(e)},
+                    details={"timeout": config.get("timeout", 3600), "error": str(e)},
                 )
                 result.finish(success=False)
         else:
