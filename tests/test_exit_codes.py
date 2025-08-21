@@ -204,7 +204,7 @@ def test_exit_code_file_scan_failure(tmp_path):
     with patch("modelaudit.core.scan_file", side_effect=RuntimeError("boom")):
         results = scan_model_directory_or_file(str(test_file))
 
-    assert results["has_errors"] is True
-    assert results["success"] is False
-    assert any(issue.get("severity") == "critical" for issue in results["issues"])
+    assert getattr(results, "has_errors", False) is True
+    assert results.success is False
+    assert any(getattr(issue, "severity", None) == "critical" for issue in results.issues)
     assert determine_exit_code(results) == 2

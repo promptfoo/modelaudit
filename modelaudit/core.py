@@ -1009,29 +1009,29 @@ def determine_exit_code(results: dict[str, Any]) -> int:
     - 2: Operational errors occurred during scanning or no files scanned
 
     Args:
-        results: Dictionary with scan results
+        results: ModelAuditResultModel with scan results
 
     Returns:
         Exit code (0, 1, or 2)
     """
     # Check for operational errors first (highest priority)
-    if results.get("has_errors", False):
+    if getattr(results, "has_errors", False):
         return 2
 
     # Check if no files were scanned
-    files_scanned = results.get("files_scanned", 0)
+    files_scanned = results.files_scanned
     if files_scanned == 0:
         return 2
 
     # Check for any security findings (warnings, errors, or critical issues)
-    issues = results.get("issues", [])
+    issues = results.issues
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
         security_issues = [
             issue
             for issue in issues
-            if isinstance(issue, dict) and issue.get("severity") in ["warning", "error", "critical"]
+            if hasattr(issue, "severity") and issue.severity in ["warning", "error", "critical"]
         ]
         if security_issues:
             return 1
