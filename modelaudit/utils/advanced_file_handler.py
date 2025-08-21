@@ -19,9 +19,9 @@ from ..scanners.base import IssueSeverity, ScanResult
 logger = logging.getLogger(__name__)
 
 # Size thresholds for large models
-EXTREME_MODEL_THRESHOLD = 200 * 1024 * 1024 * 1024  # 200GB - use memory mapping
-LARGE_MODEL_THRESHOLD_200GB = 1024 * 1024 * 1024 * 1024  # 1TB - distributed scanning
-COLOSSAL_MODEL_THRESHOLD = 5 * 1024 * 1024 * 1024 * 1024  # 5TB - special handling
+EXTREME_MODEL_THRESHOLD = 50 * 1024 * 1024 * 1024  # 50GB - use memory mapping
+LARGE_MODEL_THRESHOLD_200GB = 500 * 1024 * 1024 * 1024  # 500GB - distributed scanning
+COLOSSAL_MODEL_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - special handling
 
 # Memory mapping parameters
 MMAP_CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks for memory mapping
@@ -426,9 +426,7 @@ class AdvancedFileHandler:
             try:
                 # Let the scanner analyze the header (first 10GB)
                 with open(self.file_path, "rb") as f:
-                    header_data = f.read(
-                        min(100 * 1024 * 1024 * 1024, self.total_size)
-                    )  # Read first 100GB for analysis
+                    header_data = f.read(min(10 * 1024 * 1024 * 1024, self.total_size))
 
                     # If scanner has special header analysis, use it
                     if hasattr(self.scanner, "_analyze_header"):

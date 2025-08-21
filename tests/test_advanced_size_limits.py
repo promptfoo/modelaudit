@@ -134,8 +134,8 @@ class TestAdvancedSizeLimits:
 
     def test_size_thresholds_are_sensible(self):
         """Verify that size thresholds make sense."""
-        # Extreme threshold should be at least 200GB
-        assert EXTREME_MODEL_THRESHOLD >= 200 * 1024 * 1024 * 1024
+        # Extreme threshold should be at least 50GB
+        assert EXTREME_MODEL_THRESHOLD >= 50 * 1024 * 1024 * 1024
 
         # Massive threshold should be larger
         assert LARGE_MODEL_THRESHOLD_200GB > EXTREME_MODEL_THRESHOLD

@@ -16,14 +16,14 @@ from ..scanners.base import IssueSeverity, ScanResult
 logger = logging.getLogger(__name__)
 
 # Size thresholds for different scanning strategies
-SMALL_FILE_THRESHOLD = 100 * 1024 * 1024 * 1024  # 100GB - scan normally
-MEDIUM_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use chunking
-LARGE_FILE_THRESHOLD = 5 * 1024 * 1024 * 1024 * 1024  # 5TB - use streaming
-VERY_LARGE_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024 * 1024  # 10TB - special handling
+SMALL_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024  # 10GB - scan normally
+MEDIUM_FILE_THRESHOLD = 500 * 1024 * 1024 * 1024  # 500GB - use chunking  
+LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use streaming
+VERY_LARGE_FILE_THRESHOLD = 2 * 1024 * 1024 * 1024 * 1024  # 2TB - special handling
 
 # Default chunk sizes for different file sizes
-DEFAULT_CHUNK_SIZE = 50 * 1024 * 1024 * 1024  # 50GB chunks
-LARGE_CHUNK_SIZE = 200 * 1024 * 1024 * 1024  # 200GB chunks for large files
+DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024 * 1024  # 10GB chunks
+LARGE_CHUNK_SIZE = 50 * 1024 * 1024 * 1024  # 50GB chunks for large files
 STREAM_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for streaming
 
 
