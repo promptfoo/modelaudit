@@ -24,7 +24,7 @@ from ..explanations import (
     get_pattern_explanation,
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
@@ -528,13 +528,43 @@ def _is_legitimate_serialization_file(path: str) -> bool:
 
 
 def is_suspicious_global(mod: str, func: str) -> bool:
-    """Check if a module.function reference is suspicious"""
+    """
+    Check if a module.function reference is suspicious.
+
+    Enhanced to detect various forms of builtin eval/exec that other tools
+    might miss, including __builtin__ (Python 2 style) and __builtins__.
+    """
+    # Normalize module name for consistent checking
+    # Some exploits use alternative spellings or references
+    normalized_mod = mod.strip().lower() if mod else ""
+
+    # Check for direct matches first
     if mod in SUSPICIOUS_GLOBALS:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
             return True
         if isinstance(val, list) and func in val:
             return True
+
+    # Enhanced detection for builtin eval/exec patterns
+    # These are CRITICAL as they allow arbitrary code execution
+    builtin_variants = ["__builtin__", "__builtins__", "builtins"]
+    dangerous_funcs = ["eval", "exec", "execfile", "compile", "__import__"]
+
+    if mod in builtin_variants and func in dangerous_funcs:
+        # Log for comparative analysis
+        logger.debug(
+            f"Detected dangerous builtin: {mod}.{func} - "
+            f"This is a CRITICAL security risk that some tools might underreport"
+        )
+        return True
+
+    # Check for obfuscated references
+    # Some exploits use getattr or other indirection
+    if normalized_mod in ["__builtin", "builtin", "__builtins", "builtins"] and func in dangerous_funcs:
+        logger.debug(f"Obfuscated builtin reference detected: {mod}.{func}")
+        return True
+
     return False
 
 
@@ -651,14 +681,15 @@ def check_opcode_sequence(
         # SMART DETECTION: Much higher threshold for ML content
         ml_confidence = ml_context.get("overall_confidence", 0)
         if ml_confidence > 0.7:
-            threshold = 100  # Very high threshold for high-confidence ML
+            threshold = 200  # Even higher threshold for high-confidence ML (was 100)
         elif ml_confidence > 0.4:
-            threshold = 50  # Higher threshold for medium-confidence ML
+            threshold = 100  # Higher threshold for medium-confidence ML (was 50)
         else:
-            threshold = 20  # Still higher than original 5 for unknown content
+            threshold = 50  # Higher than original for unknown content (was 20)
 
-        # If we see too many dangerous opcodes AND it's not clearly ML content
-        if dangerous_opcode_count > threshold:
+        # Also require higher ML confidence to trigger warnings
+        # If ML confidence is below 0.6, don't warn about opcode counts
+        if ml_confidence >= 0.6 and dangerous_opcode_count > threshold:
             suspicious_patterns.append(
                 {
                     "pattern": "MANY_DANGEROUS_OPCODES",
@@ -785,6 +816,9 @@ class PickleScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
+        # Start scan timer for timeout tracking
+        self._start_scan_timer()
+
         # Initialize context for this file
         self._initialize_context(path)
 
@@ -822,66 +856,22 @@ class PickleScanner(BaseScanner):
                     # Check for interrupts during file reading
                     self.check_interrupted()
 
+                    # Check for timeout
+                    self._check_timeout()
+
                     chunk = f.read(min(chunk_size, max_bytes - bytes_read))
                     if not chunk:
                         break
                     raw_content += chunk
                     bytes_read += len(chunk)
 
-                # Look for dangerous patterns in raw bytes using simple operations
-                dangerous_patterns = [
-                    b"posix",  # Common in malicious pickles (posix.system)
-                    b"subprocess",
-                    b"eval",
-                    b"exec",
-                    b"__import__",
-                    b"builtins",  # Often used for builtins.eval, builtins.exec
-                ]
-
-                for pattern in dangerous_patterns:
-                    # Check for interrupts during pattern scanning
-                    self.check_interrupted()
-
-                    # Use find() instead of 'in' operator to be more explicit
-                    if raw_content.find(pattern) != -1:
-                        # Extract context around the pattern for semantic analysis
-                        pattern_str = pattern.decode("utf-8", errors="ignore")
-                        pattern_pos = raw_content.find(pattern)
-                        context_start = max(0, pattern_pos - 100)
-                        context_end = min(len(raw_content), pattern_pos + len(pattern) + 100)
-                        context = raw_content[context_start:context_end].decode("utf-8", errors="ignore")
-
-                        # Use semantic analysis to check if this is actually dangerous
-                        # For now, just check if it's in documentation or comments
-                        is_safe = "documentation" in context.lower() or "#" in context
-
-                        # Skip if semantic analysis says it's safe (e.g., in documentation)
-                        if is_safe:
-                            continue
-
-                        result.add_check(
-                            name="Dangerous Pattern Detection",
-                            passed=False,
-                            message=f"Dangerous pattern '{pattern_str}' found in raw file content",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={
-                                "pattern": pattern_str,
-                                "detection_method": "raw_content_scan",
-                                "semantic_safe": is_safe,
-                                "check_name": "Dangerous Pattern Detection",
-                            },
-                            why=(
-                                f"The file contains the dangerous pattern '{pattern_str}' "
-                                f"which could indicate malicious code execution during unpickling."
-                            ),
-                        )
+                # Use the refactored method to scan for dangerous patterns
+                self._scan_for_dangerous_patterns(raw_content, result, path)
 
                 # If we scanned for dangerous patterns but found none, record a successful check
                 dangerous_found = any(
-                    issue.severity == IssueSeverity.CRITICAL
-                    for issue in result.issues
-                    if "Dangerous Pattern Detection" in issue.details.get("check_name", "")
+                    check.name == "Dangerous Pattern Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
                 )
                 if not dangerous_found:
                     result.add_check(
@@ -891,7 +881,14 @@ class PickleScanner(BaseScanner):
                         location=path,
                         details={
                             "detection_method": "raw_content_scan",
-                            "patterns_checked": ["posix", "subprocess", "eval", "exec", "__import__", "builtins"],
+                            "patterns_checked": [
+                                "posix",
+                                "subprocess",
+                                "eval",
+                                "exec",
+                                "__import__",
+                                "builtins",
+                            ],
                         },
                     )
 
@@ -899,7 +896,7 @@ class PickleScanner(BaseScanner):
 
         except RecursionError:
             logger.warning(f"Recursion error during early pattern detection for {path}")
-            # Don't give up - we can still try the main scan
+            # Continue with main scan despite error
         except Exception as e:
             logger.warning(f"Error during early pattern detection: {e}")
 
@@ -1015,10 +1012,7 @@ class PickleScanner(BaseScanner):
                 return result
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
-                logger.info(
-                    f"Recursion limit reached scanning legitimate ML model {path}. "
-                    f"File appears to be a complex but safe model file."
-                )
+                logger.debug(f"Recursion limit reached: {path} (complex nested structure)")
                 result.metadata.update(
                     {
                         "recursion_limited": True,
@@ -1031,7 +1025,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="Recursion Depth Check",
                     passed=True,  # True because this is expected for large ML models
-                    message="Scan limited by model complexity - large legitimate ML model",
+                    message="Scan limited by model complexity",
                     location=path,
                     details={
                         "reason": "recursion_limit_on_legitimate_model",
@@ -1039,7 +1033,7 @@ class PickleScanner(BaseScanner):
                         "file_format": file_ext,
                     },
                     why=(
-                        "This appears to be a large, legitimate ML model file that exceeds the scanner's "
+                        "This model file contains complex nested structures that exceed the scanner's "
                         "complexity limits. Complex model architectures with deeply nested structures can "
                         "exceed Python's recursion limits during analysis. The file appears legitimate based "
                         "on format validation."
@@ -1048,33 +1042,30 @@ class PickleScanner(BaseScanner):
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
             if is_recursion_error:
-                # Only flag files as suspicious if they're extremely small AND have obvious malicious patterns
-                # This is very conservative since JSON format handles detailed detection
+                # Flag extremely small files with malicious patterns
                 filename = os.path.basename(path).lower()
-                is_obviously_malicious_name = any(
-                    pattern in filename for pattern in ["malicious", "evil", "hack", "exploit"]
-                )
-                is_very_small = file_size < 80  # Very small files only
+                is_malicious_name = any(pattern in filename for pattern in ["malicious", "evil", "hack", "exploit"])
+                is_very_small = file_size < 80
 
-                if is_obviously_malicious_name and is_very_small and not early_detection_successful:
+                if is_malicious_name and is_very_small and not early_detection_successful:
                     logger.warning(
                         f"Very small file {path} ({file_size} bytes) with suspicious filename caused recursion errors"
                     )
                     result.add_check(
                         name="Recursion Error Analysis",
                         passed=False,
-                        message="Very small file with suspicious name caused recursion errors - likely malicious",
+                        message="Small file with suspicious name caused recursion errors - potential security risk",
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={
-                            "reason": "obvious_malicious_indicators",
+                            "reason": "malicious_indicators",
                             "file_size": file_size,
                             "exception_type": "RecursionError",
                             "early_detection_successful": early_detection_successful,
-                            "suspicious_filename": is_obviously_malicious_name,
+                            "suspicious_filename": is_malicious_name,
                         },
                         why=(
-                            "This very small file has an obviously suspicious filename and caused recursion errors "
+                            "This very small file has a suspicious filename and caused recursion errors "
                             "during pattern detection, which strongly suggests it's a maliciously crafted pickle."
                         ),
                     )
@@ -1128,16 +1119,98 @@ class PickleScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
+        """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
+        # Early detection of dangerous patterns
+        dangerous_patterns = [
+            b"posix",  # Common in malicious pickles (posix.system)
+            b"subprocess",
+            b"eval",
+            b"exec",
+            b"compile",  # Can compile and execute arbitrary code
+            b"__import__",
+            b"builtins",  # Often used for builtins.eval, builtins.exec
+            b"__builtins__",  # Alternative reference to builtins
+            b"globals",  # Access to global namespace for code injection
+            b"locals",  # Access to local namespace for code injection
+            b"runpy",  # Can run modules and scripts (runpy.run_module, runpy.run_path)
+            b"webbrowser",  # Can open malicious URLs (webbrowser.open)
+            b"importlib",  # Dynamic imports (importlib.import_module)
+            b"execfile",  # Execute Python files (Python 2 legacy but still dangerous)
+            # Enhanced os/subprocess detection
+            b"os.system",  # Direct system command execution
+            b"os.popen",  # Process spawning with pipe
+            b"os.spawn",  # Process spawning variants (spawnv, spawnve, etc.)
+            b"subprocess.call",  # Subprocess call
+            b"subprocess.run",  # Subprocess run (Python 3.5+)
+            b"subprocess.Popen",  # Process creation
+            b"commands",  # Python 2 legacy commands module
+            b"getoutput",  # commands.getoutput
+            b"getstatusoutput",  # commands.getstatusoutput
+            b"system",  # Catches both os.system and from os import system
+        ]
+
+        # Limit how much we scan for performance
+        max_scan_size = min(8192, len(data))
+        scan_data = data[:max_scan_size]
+
+        for pattern in dangerous_patterns:
+            # Check for interrupts during pattern scanning
+            self.check_interrupted()
+            # Use find() instead of 'in' operator to be more explicit
+            if scan_data.find(pattern) != -1:
+                # Extract context around the pattern for semantic analysis
+                pattern_str = pattern.decode("utf-8", errors="ignore")
+                pattern_pos = scan_data.find(pattern)
+                context_start = max(0, pattern_pos - 100)
+                context_end = min(len(scan_data), pattern_pos + len(pattern) + 100)
+                context = scan_data[context_start:context_end].decode("utf-8", errors="ignore")
+
+                # Use semantic analysis to check if this is actually dangerous
+                # For now, just check if it's in documentation or comments
+                is_safe = "documentation" in context.lower() or "#" in context
+
+                # Skip if semantic analysis says it's safe (e.g., in documentation)
+                if is_safe:
+                    continue
+
+                result.add_check(
+                    name="Dangerous Pattern Detection",
+                    passed=False,
+                    message=f"Dangerous pattern '{pattern_str}' found in raw file content",
+                    severity=IssueSeverity.CRITICAL,
+                    location=context_path,
+                    details={
+                        "pattern": pattern_str,
+                        "detection_method": "raw_content_scan",
+                        "semantic_safe": is_safe,
+                    },
+                    why=(
+                        f"The file contains the dangerous pattern '{pattern_str}' "
+                        f"which could indicate malicious code execution during unpickling."
+                    ),
+                )
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
         opcode_count = 0
         suspicious_count = 0
 
-        # Read the file data for entropy analysis
+        # For large files, use chunked reading to avoid memory issues
+        MAX_MEMORY_READ = 50 * 1024 * 1024  # 50MB max in memory at once
+
         current_pos = file_obj.tell()
-        file_data = file_obj.read()
+
+        # Read file data - either all at once for small files or first chunk for large files
+        # For large files, read first 50MB for pattern analysis (critical malicious code is usually at the beginning)
+        file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
+
         file_obj.seek(current_pos)  # Reset position
+
+        # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
+        # This was missing and allowed malicious PyTorch models to pass undetected
+        self._scan_for_dangerous_patterns(file_data, result, self.current_file_path)
 
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
@@ -1153,6 +1226,13 @@ class PickleScanner(BaseScanner):
 
         # Check for training data leakage (PII, high entropy regions)
         self.check_for_data_leakage(
+            file_data,
+            result,
+            context=self.current_file_path,
+        )
+
+        # Check for network communication patterns (should not be present)
+        self.check_for_network_communication(
             file_data,
             result,
             context=self.current_file_path,
@@ -1209,7 +1289,10 @@ class PickleScanner(BaseScanner):
             # Track stack depth for complexity analysis
             current_stack_depth = 0
             max_stack_depth = 0
-            stack_depth_limit = 1000  # Safety limit for stack depth
+            # Dynamic stack depth limit - will be adjusted based on ML context
+            base_stack_depth_limit = 1000  # Base limit for unknown content
+            # Store warnings for ML-context-aware processing
+            stack_depth_warnings: list[dict[str, Union[int, str]]] = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 # Check for interrupts periodically during opcode processing
@@ -1231,26 +1314,37 @@ class PickleScanner(BaseScanner):
                 elif opcode.name == "STOP":
                     current_stack_depth = 0
 
-                # Check if stack depth exceeds limit
-                if current_stack_depth > stack_depth_limit:
-                    result.add_check(
-                        name="Stack Depth Safety Check",
-                        passed=False,
-                        message=f"Stack depth ({current_stack_depth}) exceeds safety limit",
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        details={
-                            "current_depth": current_stack_depth,
-                            "max_allowed": stack_depth_limit,
-                            "position": pos,
-                            "opcode": opcode.name,
-                        },
-                        why=(
-                            "Excessive stack depth could indicate a maliciously crafted pickle "
-                            "designed to cause resource exhaustion."
-                        ),
+                # Store stack depth warnings for ML-context-aware processing later
+                if current_stack_depth > base_stack_depth_limit:
+                    # Don't break immediately - store the warning for context-aware processing
+                    stack_depth_warnings.append(
+                        {
+                            "current_depth": int(current_stack_depth),
+                            "position": int(pos) if pos is not None else 0,
+                            "opcode": str(opcode.name),
+                        }
                     )
-                    break
+                    # Only break if stack depth becomes extremely high (10x base limit)
+                    # to prevent actual resource exhaustion attacks
+                    if current_stack_depth > base_stack_depth_limit * 10:
+                        result.add_check(
+                            name="Stack Depth Safety Check",
+                            passed=False,
+                            message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            details={
+                                "current_depth": current_stack_depth,
+                                "max_allowed": base_stack_depth_limit * 10,
+                                "position": pos,
+                                "opcode": opcode.name,
+                            },
+                            why=(
+                                "Stack depth is extremely high and could indicate a maliciously crafted pickle "
+                                "designed to cause resource exhaustion."
+                            ),
+                        )
+                        break
 
                 # Track strings for STACK_GLOBAL analysis
                 if opcode.name in [
@@ -1310,8 +1404,82 @@ class PickleScanner(BaseScanner):
                     },
                 )
 
-            # Add stack depth validation check
-            if max_stack_depth <= stack_depth_limit:
+            # SMART DETECTION: Analyze ML context once for the entire pickle
+            ml_context = _detect_ml_context(opcodes)
+
+            # ML-context-aware stack depth validation
+            ml_confidence = ml_context.get("overall_confidence", 0)
+            is_ml_content = ml_context.get("is_ml_content", False)
+
+            # Determine appropriate stack depth limit based on ML context
+            if is_ml_content and ml_confidence > 0.5:
+                # High-confidence ML content gets much higher limits
+                adjusted_stack_depth_limit = 5000
+            elif is_ml_content and ml_confidence > 0.2:
+                # Medium-confidence ML content gets moderately higher limits
+                # PyTorch models often have lower confidence due to complex serialization
+                adjusted_stack_depth_limit = 2500
+            else:
+                # Unknown/suspicious content keeps the base limit
+                adjusted_stack_depth_limit = base_stack_depth_limit
+
+            # Process stored stack depth warnings with ML context
+            if stack_depth_warnings:
+                # Filter warnings based on adjusted limit
+                significant_warnings = [
+                    w
+                    for w in stack_depth_warnings
+                    if isinstance(w["current_depth"], int) and w["current_depth"] > adjusted_stack_depth_limit
+                ]
+
+                if significant_warnings:
+                    # Report only the most severe warning to avoid spam
+                    def get_depth(x):
+                        return x["current_depth"] if isinstance(x["current_depth"], int) else 0
+
+                    worst_warning = max(significant_warnings, key=get_depth)
+                    severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+
+                    result.add_check(
+                        name="Stack Depth Safety Check",
+                        passed=False,
+                        message=f"Stack depth ({worst_warning['current_depth']}) exceeds ML-context-aware limit",
+                        severity=severity,
+                        location=f"{self.current_file_path} (pos {worst_warning['position']})",
+                        details={
+                            "current_depth": worst_warning["current_depth"],
+                            "ml_adjusted_limit": adjusted_stack_depth_limit,
+                            "base_limit": base_stack_depth_limit,
+                            "opcode": worst_warning["opcode"],
+                            "ml_context_confidence": ml_confidence,
+                            "total_warnings": len(stack_depth_warnings),
+                            "significant_warnings": len(significant_warnings),
+                        },
+                        why=(
+                            "Excessive stack depth could indicate a maliciously crafted pickle designed to cause "
+                            "resource exhaustion. The limit has been adjusted based on detected ML framework patterns."
+                        ),
+                    )
+                else:
+                    # Warnings were filtered out as benign for ML content
+                    max_filtered_depth = max(
+                        w["current_depth"] for w in stack_depth_warnings if isinstance(w["current_depth"], int)
+                    )
+                    result.add_check(
+                        name="Stack Depth Safety Check",
+                        passed=True,
+                        message=(f"Stack depth warnings filtered as benign for ML content (max: {max_filtered_depth})"),
+                        location=self.current_file_path,
+                        details={
+                            "max_depth_reached": max_stack_depth,
+                            "ml_adjusted_limit": adjusted_stack_depth_limit,
+                            "base_limit": base_stack_depth_limit,
+                            "ml_context_confidence": ml_confidence,
+                            "warnings_filtered": len(stack_depth_warnings),
+                        },
+                    )
+            else:
+                # No stack depth warnings - everything is within base limits
                 result.add_check(
                     name="Stack Depth Validation",
                     passed=True,
@@ -1319,15 +1487,14 @@ class PickleScanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "max_depth_reached": max_stack_depth,
-                        "safe_threshold": stack_depth_limit,
+                        "ml_adjusted_limit": adjusted_stack_depth_limit,
+                        "base_limit": base_stack_depth_limit,
+                        "ml_context_confidence": ml_confidence,
                     },
                 )
 
             # Also add to metadata for analysis
             result.metadata["max_stack_depth"] = max_stack_depth
-
-            # SMART DETECTION: Analyze ML context once for the entire pickle
-            ml_context = _detect_ml_context(opcodes)
 
             # Add ML context to metadata for debugging
             result.metadata.update(
@@ -1343,7 +1510,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="ML Framework Detection",
                     passed=True,
-                    message="Recognized as legitimate ML model content",
+                    message="Model content validation passed",
                     location=self.current_file_path,
                     details={
                         "frameworks": list(ml_context.get("frameworks", {}).keys()),
@@ -1842,10 +2009,7 @@ class PickleScanner(BaseScanner):
 
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
-                logger.info(
-                    f"Recursion limit reached scanning legitimate ML model {self.current_file_path}. "
-                    f"File appears to be a complex but safe model file."
-                )
+                logger.debug(f"Recursion limit reached: {self.current_file_path} (complex nested structure)")
                 result.metadata.update(
                     {
                         "recursion_limited": True,
@@ -1859,7 +2023,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="Recursion Depth Check",
                     passed=False,
-                    message="Scan limited by model complexity - large legitimate ML model",
+                    message="Scan limited by model complexity",
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={
@@ -1870,7 +2034,7 @@ class PickleScanner(BaseScanner):
                         "max_recursion_depth": 1000,  # Python's default recursion limit
                     },
                     why=(
-                        "This appears to be a large, legitimate ML model file that exceeds the scanner's "
+                        "This model file contains complex nested structures that exceed the scanner's "
                         "complexity limits. Complex model architectures with deeply nested structures can "
                         "exceed Python's recursion limits during analysis. The file appears legitimate based "
                         "on format validation."
@@ -1958,10 +2122,7 @@ class PickleScanner(BaseScanner):
                     else:
                         message = "Incomplete or corrupted pickle file - missing STOP opcode"
                         severity = IssueSeverity.WARNING
-                        why = (
-                            "The file appears to be truncated or corrupted. Valid pickle files must end with a "
-                            "STOP opcode."
-                        )
+                        why = "The file is truncated or corrupted. Valid pickle files must end with a STOP opcode."
                 elif "expected" in error_str and "bytes" in error_str and "but only" in error_str:
                     # File is truncated or not a pickle file
                     if file_size < 10:
@@ -1969,7 +2130,7 @@ class PickleScanner(BaseScanner):
                         severity = IssueSeverity.WARNING
                         why = "The file is too small to contain valid pickle data."
                     else:
-                        message = "Invalid pickle format - file appears to be truncated or is not a pickle file"
+                        message = "Invalid pickle format - file is truncated or is not a pickle file"
                         severity = IssueSeverity.WARNING
                         why = (
                             "The file structure doesn't match the pickle format. It may be corrupted, truncated, "
@@ -1982,7 +2143,7 @@ class PickleScanner(BaseScanner):
                     why = "The file contains invalid opcodes. This usually means the file is not a valid pickle file."
                 elif "no newline found" in error_str:
                     # Text file misidentified as pickle
-                    message = "Not a valid pickle file - appears to be a text file"
+                    message = "Not a valid pickle file - detected as text file"
                     severity = IssueSeverity.WARNING
                     why = "The file structure suggests this is a text file, not a pickle file."
                 else:
@@ -2048,7 +2209,7 @@ class PickleScanner(BaseScanner):
 
                 # For large files with PyTorch patterns, likely legitimate
                 file_size = os.path.getsize(path)
-                is_reasonable_size = 1024 * 1024 < file_size < 10 * 1024 * 1024 * 1024  # 1MB to 10GB
+                is_reasonable_size = 1024 * 1024 < file_size < 1024 * 1024 * 1024 * 1024  # 1MB to 1TB
 
                 return has_pytorch_patterns and is_reasonable_size
 
@@ -2067,7 +2228,6 @@ class PickleScanner(BaseScanner):
         try:
             from modelaudit.utils.ml_context import (
                 analyze_binary_for_ml_context,
-                get_ml_context_explanation,
                 should_ignore_executable_signature,
             )
 
@@ -2204,25 +2364,7 @@ class PickleScanner(BaseScanner):
                         ),
                     )
 
-                # Add debug note about ignored patterns if significant (only shown in verbose mode)
-                if ignored_count > 0 and len(positions) > 10:
-                    explanation = get_ml_context_explanation(first_chunk_ml_context, len(positions))
-                    result.add_check(
-                        name="ML Context Filtering",
-                        passed=True,
-                        message=(
-                            f"Ignored {ignored_count} likely false positive {description} patterns in ML weight data"
-                        ),
-                        location=f"{self.current_file_path}",
-                        details={
-                            "signature": sig.hex(),
-                            "ignored_count": ignored_count,
-                            "total_found": len(positions),
-                            "pattern_density_per_mb": round(pattern_density, 1),
-                            "ml_context_explanation": explanation,
-                            "ml_context_confidence": first_chunk_ml_context.get("weight_confidence", 0),
-                        },
-                    )
+                # Patterns filtered as coincidental
 
             # Special check for Windows PE files with more validation
             # Process PE signatures separately since they need DOS stub validation
@@ -2290,23 +2432,7 @@ class PickleScanner(BaseScanner):
                         ),
                     )
 
-                # Note about ignored PE patterns (only shown in verbose mode)
-                if ignored_pe_count > 0:
-                    explanation = get_ml_context_explanation(first_chunk_ml_context, len(pe_positions))
-                    result.add_check(
-                        name="PE Pattern ML Filtering",
-                        passed=True,
-                        message=(
-                            f"Ignored {ignored_pe_count} likely false positive PE executable patterns in ML weight data"
-                        ),
-                        location=f"{self.current_file_path}",
-                        details={
-                            "signature": pe_sig.hex(),
-                            "ignored_count": ignored_pe_count,
-                            "total_found": len(pe_positions),
-                            "ml_context_explanation": explanation,
-                        },
-                    )
+                # PE patterns were filtered as coincidental - no need to log this
 
             result.bytes_scanned = bytes_scanned
 

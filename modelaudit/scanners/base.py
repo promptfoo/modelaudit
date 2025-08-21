@@ -2,14 +2,30 @@ import hashlib
 import json
 import logging
 import os
+
+# Progress tracking imports with circular dependency detection
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, List, Optional  # noqa: UP035
 
 from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
+
+# Progress tracking imports with circular dependency detection
+PROGRESS_AVAILABLE = False
+ProgressTracker = None
+ProgressPhase = None
+
+# Try to import progress tracking, handle circular import gracefully
+try:
+    from ..progress import ProgressTracker  # type: ignore
+
+    PROGRESS_AVAILABLE = True
+except (ImportError, RecursionError):
+    # Keep None values to indicate unavailable
+    pass
 
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
@@ -123,8 +139,8 @@ class ScanResult:
 
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
-        self.issues: list[Issue] = []
-        self.checks: list[Check] = []  # All checks performed (passed and failed)
+        self.issues: List[Issue] = []  # noqa: UP006
+        self.checks: List[Check] = []  # All checks performed (passed and failed)  # noqa: UP006
         self.start_time = time.time()
         self.end_time: Optional[float] = None
         self.bytes_scanned: int = 0
@@ -293,23 +309,28 @@ class BaseScanner(ABC):
 
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
-    supported_extensions: ClassVar[list[str]] = []
+    supported_extensions: ClassVar[List[str]] = []  # noqa: UP006
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
-        self.timeout = self.config.get("timeout", 300)  # Default 5 minutes
+        self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
-            10 * 1024 * 1024,
-        )  # Default: 10MB chunks
+            10 * 1024 * 1024 * 1024,
+        )  # Default: 10GB chunks
         self.max_file_read_size = self.config.get(
             "max_file_read_size",
             0,
         )  # Default unlimited
         self._path_validation_result: Optional[ScanResult] = None
         self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
+        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
+
+        # Progress tracking setup
+        self.progress_tracker: Optional[Any] = None
+        self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -344,6 +365,68 @@ class BaseScanner(ABC):
             self._path_validation_result = None
 
         return result
+
+    def _start_scan_timer(self) -> None:
+        """Start the scan timer for timeout tracking"""
+        self.scan_start_time = time.time()
+
+    def _check_timeout(self, allow_partial: bool = False) -> bool:
+        """Check if the scan has exceeded the timeout.
+
+        Args:
+            allow_partial: If True, return True on timeout instead of raising exception
+
+        Returns:
+            True if timeout exceeded and allow_partial is True, False otherwise
+
+        Raises:
+            TimeoutError: If the scan has exceeded the configured timeout and allow_partial is False
+        """
+        if self.scan_start_time is None:
+            self.scan_start_time = time.time()
+            return False
+
+        elapsed = time.time() - self.scan_start_time
+        if elapsed > self.timeout:
+            if allow_partial:
+                return True
+            raise TimeoutError(f"Scan exceeded timeout of {self.timeout} seconds (elapsed: {elapsed:.1f}s)")
+
+        return False
+
+    def _get_remaining_time(self) -> float:
+        """Get the remaining time before timeout.
+
+        Returns:
+            Remaining time in seconds, or timeout value if timer not started
+        """
+        if self.scan_start_time is None:
+            return self.timeout
+
+        elapsed = time.time() - self.scan_start_time
+        remaining = self.timeout - elapsed
+        return max(0, remaining)
+
+    def _add_timeout_warning(self, result: ScanResult, bytes_scanned: int, total_bytes: int) -> None:
+        """Add a warning to the result indicating the scan was incomplete due to timeout.
+
+        Args:
+            result: The scan result to add the warning to
+            bytes_scanned: Number of bytes scanned before timeout
+            total_bytes: Total bytes in the file
+        """
+        percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
+        result.add_issue(
+            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+            severity=IssueSeverity.WARNING,
+            location=self.current_file_path,
+            details={
+                "bytes_scanned": bytes_scanned,
+                "total_bytes": total_bytes,
+                "percentage_complete": percentage,
+                "timeout_seconds": self.timeout,
+            },
+        )
 
     def add_file_integrity_check(self, path: str, result: ScanResult) -> None:
         """Add file integrity check with hashes to the scan result.
@@ -566,6 +649,71 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for data leakage: {e}")
             return 0
 
+    def check_for_network_communication(
+        self,
+        data: bytes,
+        result: ScanResult,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for network communication patterns in model data.
+
+        Args:
+            data: Binary model data to check
+            result: ScanResult to add findings to
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            Number of network communication patterns detected
+        """
+        if not enable_check or not self.config.get("check_network_comm", True):
+            return 0
+
+        try:
+            from modelaudit.network_comm_detector import NetworkCommDetector
+
+            detector = NetworkCommDetector(self.config.get("network_comm_config"))
+            findings = detector.scan(data, context)
+
+            for finding in findings:
+                severity_map = {
+                    "CRITICAL": IssueSeverity.CRITICAL,
+                    "HIGH": IssueSeverity.CRITICAL,
+                    "MEDIUM": IssueSeverity.WARNING,
+                    "LOW": IssueSeverity.INFO,
+                }
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+
+                result.add_check(
+                    name="Network Communication Detection",
+                    passed=False,
+                    message=finding.get("message", "Network communication pattern detected"),
+                    severity=severity,
+                    location=finding.get("context", context),
+                    details=finding,
+                    why="Models should not contain network communication capabilities",
+                )
+
+            # Add a passing check if no patterns were found
+            if not findings and context:
+                result.add_check(
+                    name="Network Communication Detection",
+                    passed=True,
+                    message="No network communication patterns detected",
+                    location=context,
+                )
+
+            return len(findings)
+
+        except ImportError:
+            # NetworkCommDetector not available, log as debug
+            logger.debug("NetworkCommDetector not available, skipping network comm check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for network communication: {e}")
+            return 0
+
     def _check_path(self, path: str) -> Optional[ScanResult]:
         """Common path checks and validation
 
@@ -576,23 +724,45 @@ class BaseScanner(ABC):
 
         # Check if path exists
         if not os.path.exists(path):
-            result.add_issue(
-                f"Path does not exist: {path}",
+            result.add_check(
+                name="Path Exists",
+                passed=False,
+                message=f"Path does not exist: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Exists",
+                passed=True,
+                message="Path exists",
+                location=path,
+                details={"path": path},
+            )
 
         # Check if path is readable
         if not os.access(path, os.R_OK):
-            result.add_issue(
-                f"Path is not readable: {path}",
+            result.add_check(
+                name="Path Readable",
+                passed=False,
+                message=f"Path is not readable: {path}",
                 severity=IssueSeverity.CRITICAL,
+                location=path,
                 details={"path": path},
             )
             result.finish(success=False)
             return result
+        else:
+            result.add_check(
+                name="Path Readable",
+                passed=True,
+                message="Path is readable",
+                location=path,
+                details={"path": path},
+            )
 
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
@@ -606,8 +776,10 @@ class BaseScanner(ABC):
                 if not validate_file_type(path):
                     header_format = detect_file_format_from_magic(path)
                     ext_format = detect_format_from_extension(path)
-                    result.add_issue(
-                        (
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=False,
+                        message=(
                             f"File type validation failed: extension indicates {ext_format} but magic bytes "
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
@@ -620,17 +792,26 @@ class BaseScanner(ABC):
                             "security_check": "file_type_validation",
                         },
                     )
+                else:
+                    result.add_check(
+                        name="File Type Validation",
+                        passed=True,
+                        message="File type validation passed",
+                        location=path,
+                    )
             except Exception as e:
                 # Don't fail the scan if file type validation has an error
-                result.add_issue(
-                    f"File type validation error: {e!s}",
+                result.add_check(
+                    name="File Type Validation",
+                    passed=False,
+                    message=f"File type validation error: {e!s}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
 
-        # Store validation warnings for the scanner to merge later
-        self._path_validation_result = result if result.issues else None
+        # Store validation checks or warnings for the scanner to merge later
+        self._path_validation_result = result if (result.issues or result.checks) else None
 
         # Only return result for CRITICAL issues that should stop the scan
         critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
@@ -683,24 +864,47 @@ class BaseScanner(ABC):
 
     def _check_size_limit(self, path: str) -> Optional[ScanResult]:
         """Check if the file exceeds the configured size limit."""
-        result = self._create_result()
         file_size = self.get_file_size(path)
-        result.metadata["file_size"] = file_size
 
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
-            result.add_issue(
-                f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+            result = self._create_result()
+            result.metadata["file_size"] = file_size
+            result.add_check(
+                name="File Size Limit",
+                passed=False,
+                message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
                 },
-                why="Large files may consume excessive memory or processing time. Consider whether this file "
-                "size is expected for your use case.",
+                why=(
+                    "Large files may consume excessive memory or processing time. "
+                    "Consider whether this file size is expected for your use case."
+                ),
             )
             result.finish(success=False)
             return result
+
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
+            self._path_validation_result.add_check(
+                name="File Size Limit",
+                passed=True,
+                message="File size within limit",
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+        else:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name)
+            self._path_validation_result.metadata["file_size"] = file_size
 
         return None
 
@@ -736,3 +940,113 @@ class BaseScanner(ABC):
         Raises KeyboardInterrupt if an interrupt has been requested.
         """
         check_interrupted()
+
+    def _initialize_progress_tracker(self) -> None:
+        """Initialize progress tracker for this scanner."""
+        if self._enable_progress and ProgressTracker:
+            self.progress_tracker = ProgressTracker()  # type: ignore
+            logger.debug(f"Progress tracker initialized for {self.name} scanner")
+
+    def _setup_progress_for_file(self, path: str) -> None:
+        """Setup progress tracking for a specific file."""
+        if self.progress_tracker and PROGRESS_AVAILABLE:
+            file_size = self.get_file_size(path)
+            self.progress_tracker.stats.total_bytes = file_size
+            # Import locally to avoid circular import but ensure type safety
+            from ..progress import ProgressPhase
+
+            self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
+
+    # All progress tracking methods disabled to fix CI circular import issues
+    def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:
+        """Update progress with bytes processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_bytes(bytes_processed, current_item)
+
+    def _increment_progress_bytes(self, bytes_delta: int, current_item: str = "") -> None:
+        """Increment progress by a number of bytes."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_bytes(bytes_delta, current_item)
+
+    def _update_progress_items(self, items_processed: int, current_item: str = "") -> None:
+        """Update progress with items processed."""
+        if self.progress_tracker:
+            self.progress_tracker.update_items(items_processed, current_item)
+
+    def _increment_progress_items(self, items_delta: int = 1, current_item: str = "") -> None:
+        """Increment progress by a number of items."""
+        if self.progress_tracker:
+            self.progress_tracker.increment_items(items_delta, current_item)
+
+    def _set_progress_phase(self, phase: Any, message: str = "") -> None:
+        """Set current progress phase."""
+        if self.progress_tracker and PROGRESS_AVAILABLE:
+            self.progress_tracker.set_phase(phase, message)
+
+    def _next_progress_phase(self, message: str = "") -> bool:
+        """Move to next progress phase."""
+        if self.progress_tracker and hasattr(self.progress_tracker, "next_phase"):
+            return self.progress_tracker.next_phase(message)
+        return False
+
+    def _set_progress_status(self, message: str) -> None:
+        """Set progress status message."""
+        if self.progress_tracker:
+            self.progress_tracker.set_status(message)
+
+    def _complete_progress(self) -> None:
+        """Mark progress as complete."""
+        if self.progress_tracker:
+            self.progress_tracker.complete()
+
+    def _report_progress_error(self, error: Exception) -> None:
+        """Report an error to progress tracker."""
+        if self.progress_tracker:
+            self.progress_tracker.report_error(error)
+
+    def scan_with_progress(self, path: str) -> ScanResult:
+        """Scan with progress tracking enabled.
+
+        This is a wrapper around the scan method that provides progress tracking.
+        Subclasses should override scan() but can call this method for progress support.
+        """
+        self.current_file_path = path
+
+        # Initialize progress tracking for this file
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self._setup_progress_for_file(path)
+
+        try:
+            result = self.scan(path)
+            self._complete_progress()
+            return result
+        except Exception as e:
+            self._report_progress_error(e)
+            raise
+
+    def get_progress_stats(self):
+        """Get current progress statistics."""
+        if self.progress_tracker:
+            return self.progress_tracker.get_stats()
+        return None
+
+    def add_progress_reporter(self, reporter: Any) -> None:
+        """Add a progress reporter to this scanner."""
+        # Initialize progress tracker if not already done
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self.progress_tracker.add_reporter(reporter)
+
+    def add_progress_callback(self, callback: Any) -> None:
+        """Add a progress callback to this scanner."""
+        # Initialize progress tracker if not already done
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self.progress_tracker.add_callback(callback)
