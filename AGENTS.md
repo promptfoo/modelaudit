@@ -407,3 +407,16 @@ rye run pytest -n auto -m "not slow and not integration and not performance" --c
 - **`tests/conftest.py`**: Test configuration and fixtures
 
 Understanding these files is crucial for effective contributions to the ModelAudit codebase.
+
+## 🧰 Non-Interactive Commands
+
+To keep automation reliable and prevent stalls:
+
+- Always run commands non-interactively: supply flags to avoid editors/prompts (e.g., `git merge --no-edit`, `git commit -m`, `gh pr checkout <n>`).
+- Run one command per invocation: avoid long `&&` chains or complex pipelines; check each command’s result before the next.
+- Keep merges clean: `git fetch origin` then `git merge --no-edit origin/main` on the PR branch before fixes.
+- Resolve conflicts deterministically: edit files, run `ruff check` and `ruff format` on specific paths you touched, then commit with a clear message.
+- Prevent lockups: if `/.git/index.lock` appears and no other git process is running, remove it (`rm .git/index.lock`) before continuing.
+- Be selective with staging: only `git add` intended paths; avoid committing local artifacts (e.g., `_temp_files/`).
+- Validate locally: run `ruff check` and `ruff format --check` on targeted files; run the minimal pytest matrix relevant to your changes where feasible.
+- Trigger CI safely: prefer a minimal “ci: trigger” empty commit or use `gh run rerun <run-id>` rather than force-pushing.
