@@ -171,7 +171,8 @@ def stream_analyze_file(
         # Create scan result
         if issues or was_complete:
             result = ScanResult(scanner_name="streaming")
-            result.bytes_scanned = scan_result.bytes_scanned if scan_result is not None else bytes_to_read
+            scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
+            result.bytes_scanned = scanned or bytes_to_read
             result.issues = issues
             result.metadata = {
                 "streaming_analysis": True,
