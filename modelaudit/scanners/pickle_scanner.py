@@ -2203,7 +2203,7 @@ class PickleScanner(BaseScanner):
 
                 # For large files with PyTorch patterns, likely legitimate
                 file_size = os.path.getsize(path)
-                is_reasonable_size = 1024 * 1024 < file_size < 10 * 1024 * 1024 * 1024  # 1MB to 10GB
+                is_reasonable_size = 1024 * 1024 < file_size < 1024 * 1024 * 1024 * 1024  # 1MB to 1TB
 
                 return has_pytorch_patterns and is_reasonable_size
 

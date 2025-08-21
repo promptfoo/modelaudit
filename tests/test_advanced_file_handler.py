@@ -194,13 +194,13 @@ class TestAdvancedFileHandler:
     @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     def test_extreme_file_detection(self, mock_getsize):
         """Test detection of extreme large files."""
-        # Test file over 50GB threshold
-        mock_getsize.return_value = 60 * 1024 * 1024 * 1024  # 60GB
+        # Test file over 200GB threshold
+        mock_getsize.return_value = 300 * 1024 * 1024 * 1024  # 300GB
 
         assert should_use_advanced_handler("large_model.bin")
 
         # Test file under threshold
-        mock_getsize.return_value = 5 * 1024 * 1024 * 1024  # 5GB
+        mock_getsize.return_value = 50 * 1024 * 1024 * 1024  # 50GB
 
         assert not should_use_advanced_handler("small_model.bin")
 

@@ -73,8 +73,8 @@ class GgufScanner(BaseScanner):
         super().__init__(config)
         self.max_uncompressed = self.config.get(
             "max_uncompressed",
-            2 * 1024 * 1024 * 1024,
-        )
+            100 * 1024 * 1024 * 1024,
+        )  # 100GB for large GGUF models
 
     @classmethod
     def can_handle(cls, path: str) -> bool:

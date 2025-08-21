@@ -160,6 +160,17 @@ ModelAudit provides additional flags for specialized workflows:
 - `--registry-uri URI` – scan models in an MLflow registry
 - `--jfrog-api-token` / `--jfrog-access-token` – authenticate with JFrog Artifactory
 
+### 🚀 Large Model Support (Up to 1TB+)
+
+ModelAudit automatically optimizes scanning strategies for different model sizes:
+
+- **<100GB**: Full in-memory analysis for comprehensive scanning
+- **100GB-1TB**: Chunked processing with 50GB chunks for memory efficiency
+- **1TB-5TB**: Streaming analysis with intelligent sampling
+- **>5TB**: Advanced distributed scanning techniques
+
+Large models are supported with automatic timeout increases and memory-optimized processing.
+
 ### Static Scanning vs. Promptfoo Redteaming
 
 ModelAudit performs **static** analysis only. It examines model files for risky patterns

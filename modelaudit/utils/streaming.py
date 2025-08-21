@@ -24,7 +24,7 @@ def can_stream_analyze(url: str, scanner: BaseScanner) -> bool:
 def stream_analyze_file(
     url: str,
     scanner: BaseScanner,
-    max_bytes: int = 10 * 1024 * 1024 * 1024,  # 10GB default
+    max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
 ) -> tuple[Optional[ScanResult], bool]:
     """Stream analyze a file from cloud storage.
 

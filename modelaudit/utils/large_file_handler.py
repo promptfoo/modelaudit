@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 
 # Size thresholds for different scanning strategies
 SMALL_FILE_THRESHOLD = 10 * 1024 * 1024 * 1024  # 10GB - scan normally
-MEDIUM_FILE_THRESHOLD = 100 * 1024 * 1024 * 1024  # 100GB - use chunking
+MEDIUM_FILE_THRESHOLD = 500 * 1024 * 1024 * 1024  # 500GB - use chunking
 LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024 * 1024  # 1TB - use streaming
-VERY_LARGE_FILE_THRESHOLD = 8 * 1024 * 1024 * 1024 * 1024  # 8TB - special handling
+VERY_LARGE_FILE_THRESHOLD = 2 * 1024 * 1024 * 1024 * 1024  # 2TB - special handling
 
 # Default chunk sizes for different file sizes
 DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024 * 1024  # 10GB chunks
