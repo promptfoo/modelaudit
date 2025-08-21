@@ -3,9 +3,8 @@ import logging
 import os
 import shutil
 import sys
-import time
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
 import click
 from yaspin import yaspin
@@ -541,18 +540,10 @@ def scan_command(
                     click.echo("Progress tracking not available (missing dependencies)", err=True)
             progress = False
 
-    # Aggregated results
-    aggregated_results: dict[str, Any] = {
-        "bytes_scanned": 0,
-        "issues": [],
-        "checks": [],  # Track all security checks performed
-        "files_scanned": 0,
-        "assets": [],
-        "has_errors": False,
-        "scanner_names": [],
-        "file_metadata": {},  # Track metadata from each file
-        "start_time": time.time(),
-    }
+    # Aggregated results using Pydantic model from the start
+    from .models import create_initial_audit_result
+
+    audit_result = create_initial_audit_result()
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
@@ -641,7 +632,7 @@ def scan_command(
                             logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
 
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 # Check if this is a PyTorch Hub URL
@@ -690,7 +681,7 @@ def scan_command(
                             logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
 
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 # Check if this is a cloud storage URL
@@ -709,7 +700,7 @@ def scan_command(
                                 max_download_bytes = int(max_download_size)
                             except ValueError:
                                 click.echo(f"Invalid max download size: {max_download_size}", err=True)
-                                aggregated_results["has_errors"] = True
+                                audit_result.has_errors = True
                                 continue
 
                     # Handle preview mode
@@ -744,7 +735,7 @@ def scan_command(
 
                         except Exception as e:
                             click.echo(f"Error analyzing {path}: {e!s}", err=True)
-                            aggregated_results["has_errors"] = True
+                            audit_result.has_errors = True
                             continue
 
                     # Normal download mode
@@ -799,7 +790,7 @@ def scan_command(
                             logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
                             click.echo(f"Error downloading from {path}: {error_msg}", err=True)
 
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 # Check if this is an MLflow URI
@@ -830,22 +821,8 @@ def scan_command(
                         elif format == "text" and not output:
                             click.echo("Downloaded and scanned successfully")
 
-                        # Aggregate results directly from MLflow scan
-                        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                        aggregated_results["issues"].extend(results.get("issues", []))
-                        aggregated_results["checks"].extend(results.get("checks", []))
-                        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
-                        aggregated_results["assets"].extend(results.get("assets", []))
-                        if results.get("has_errors", False):
-                            aggregated_results["has_errors"] = True
-                        # Aggregate file metadata
-                        if "file_metadata" in results:
-                            aggregated_results["file_metadata"].update(results["file_metadata"])
-
-                        # Track scanner names
-                        for scanner in results.get("scanners", []):
-                            if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                                aggregated_results["scanner_names"].append(scanner)
+                        # Aggregate results directly from MLflow scan using Pydantic model
+                        audit_result.aggregate_scan_result(results)
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -858,7 +835,7 @@ def scan_command(
 
                         logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
                         click.echo(f"Error downloading model from {path}: {e!s}", err=True)
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 # Check if this is a JFrog URL
@@ -891,17 +868,8 @@ def scan_command(
                         elif format == "text" and not output:
                             click.echo("Downloaded and scanned successfully")
 
-                        # Aggregate results
-                        aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                        aggregated_results["issues"].extend(results.get("issues", []))
-                        aggregated_results["checks"].extend(results.get("checks", []))
-                        aggregated_results["files_scanned"] += results.get("files_scanned", 1)
-                        aggregated_results["assets"].extend(results.get("assets", []))
-                        if results.get("has_errors", False):
-                            aggregated_results["has_errors"] = True
-                        # Aggregate file metadata
-                        if "file_metadata" in results:
-                            aggregated_results["file_metadata"].update(results["file_metadata"])
+                        # Aggregate results using Pydantic model
+                        audit_result.aggregate_scan_result(results)
 
                         continue  # Skip the regular scanning flow
 
@@ -913,14 +881,14 @@ def scan_command(
 
                         logger.error(f"Failed to download/scan model from {path}: {e!s}", exc_info=verbose)
                         click.echo(f"Error downloading/scanning model from {path}: {e!s}", err=True)
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 else:
                     # For local paths, check if they exist
                     if not os.path.exists(path):
                         click.echo(f"Error: Path does not exist: {path}", err=True)
-                        aggregated_results["has_errors"] = True
+                        audit_result.has_errors = True
                         continue
 
                 # Early exit for common non-model file extensions
@@ -1030,44 +998,42 @@ def scan_command(
                         **config_overrides,
                     )
 
-                    # Aggregate results
-                    aggregated_results["bytes_scanned"] += results.get("bytes_scanned", 0)
-                    aggregated_results["issues"].extend(results.get("issues", []))
-                    aggregated_results["checks"].extend(results.get("checks", []))
-                    aggregated_results["files_scanned"] += results.get(
-                        "files_scanned",
-                        1,
-                    )  # Count each file scanned
-                    aggregated_results["assets"].extend(results.get("assets", []))
-                    if results.get("has_errors", False):
-                        aggregated_results["has_errors"] = True
-
-                    # Aggregate file metadata
-                    if "file_metadata" in results:
-                        aggregated_results["file_metadata"].update(results["file_metadata"])
-
-                    # Track scanner names
-                    for scanner in results.get("scanners", []):
-                        if scanner and scanner not in aggregated_results["scanner_names"] and scanner != "unknown":
-                            aggregated_results["scanner_names"].append(scanner)
+                    # Core now returns ModelAuditResultModel, so merge it directly
+                    if hasattr(results, "model_dump"):
+                        # results is a ModelAuditResultModel, convert to dict for aggregation
+                        audit_result.aggregate_scan_result(results.model_dump())
+                    else:
+                        # Fallback for dict results
+                        audit_result.aggregate_scan_result(results)
 
                     # Show completion status if in text mode and not writing to a file
-                    if results.get("issues", []):
+                    result_issues = results.issues if hasattr(results, "issues") else results.get("issues", [])
+                    if result_issues:
                         # Filter out DEBUG severity issues when not in verbose mode
-                        visible_issues = [
-                            issue
-                            for issue in results.get("issues", [])
-                            if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                        ]
+                        if hasattr(results, "issues"):
+                            # results is ModelAuditResultModel
+                            visible_issues = [issue for issue in result_issues if verbose or issue.severity != "debug"]
+                        else:
+                            # results is dict
+                            visible_issues = [
+                                issue
+                                for issue in result_issues
+                                if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+                            ]
                         issue_count = len(visible_issues)
 
                         if issue_count > 0:
                             # Determine severity for coloring
-                            has_critical = any(
-                                issue.get("severity") == "critical"
-                                for issue in visible_issues
-                                if isinstance(issue, dict)
-                            )
+                            if hasattr(results, "issues"):
+                                # results is ModelAuditResultModel
+                                has_critical = any(issue.severity == "critical" for issue in visible_issues)
+                            else:
+                                # results is dict
+                                has_critical = any(
+                                    issue.get("severity") == "critical"
+                                    for issue in visible_issues
+                                    if isinstance(issue, dict)
+                                )
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 if has_critical:
@@ -1117,7 +1083,7 @@ def scan_command(
 
                     logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
-                    aggregated_results["has_errors"] = True
+                    audit_result.has_errors = True
 
                     # Report error to progress tracker
                     if progress_tracker:
@@ -1127,7 +1093,7 @@ def scan_command(
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
-                aggregated_results["has_errors"] = True
+                audit_result.has_errors = True
 
                 # Report error to progress tracker
                 if progress_tracker:
@@ -1147,16 +1113,19 @@ def scan_command(
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
                     logger.info("Scan interrupted by user")
-                    aggregated_results["success"] = False
-                    issues_list = cast(list[dict[str, Any]], aggregated_results["issues"])
-                    if not any(issue.get("message") == "Scan interrupted by user" for issue in issues_list):
-                        issues_list.append(
-                            {
-                                "message": "Scan interrupted by user",
-                                "severity": "info",
-                                "details": {"interrupted": True},
-                            }
+                    # Add interruption issue if not already present
+                    if not any(issue.message == "Scan interrupted by user" for issue in audit_result.issues):
+                        import time
+
+                        from .models import IssueModel
+
+                        interruption_issue = IssueModel(
+                            message="Scan interrupted by user",
+                            severity="info",
+                            details={"interrupted": True},
+                            timestamp=time.time(),
                         )
+                        audit_result.issues.append(interruption_issue)
                     should_break = True
 
             # Break outside of finally block if interrupted
@@ -1187,73 +1156,30 @@ def scan_command(
         except Exception as e:
             logger.warning(f"Error cleaning up progress reporter: {e}")
 
-    # Calculate total duration
-    aggregated_results["duration"] = time.time() - aggregated_results["start_time"]
-
-    # Calculate check statistics
-    total_checks = len(aggregated_results.get("checks", []))
-    passed_checks = sum(1 for c in aggregated_results.get("checks", []) if c.get("status") == "passed")
-    failed_checks = sum(1 for c in aggregated_results.get("checks", []) if c.get("status") == "failed")
-    aggregated_results["total_checks"] = total_checks
-    aggregated_results["passed_checks"] = passed_checks
-    aggregated_results["failed_checks"] = failed_checks
-
-    # Deduplicate issues based on message, severity, and location
-    seen_issues = set()
-    deduplicated_issues = []
-    for issue in aggregated_results["issues"]:
-        if isinstance(issue, dict):
-            # Include location in the deduplication key to avoid hiding issues in different files
-            issue_key = (
-                issue.get("message", ""),
-                issue.get("severity", ""),
-                issue.get("location", ""),
-            )
-            if issue_key not in seen_issues:
-                seen_issues.add(issue_key)
-                deduplicated_issues.append(issue)
-        else:
-            # Non-dict issues should be preserved as-is
-            deduplicated_issues.append(issue)
-
-    aggregated_results["issues"] = deduplicated_issues
+    # Finalize audit result statistics and deduplicate issues using Pydantic model methods
+    audit_result.finalize_statistics()
+    audit_result.deduplicate_issues()
 
     # Generate SBOM if requested
     if sbom:
         from .sbom import generate_sbom
 
-        sbom_text = generate_sbom(expanded_paths, aggregated_results)
+        sbom_text = generate_sbom(expanded_paths, audit_result.model_dump())
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
     # Format the output
     if format == "json":
-        # Use Pydantic models for type-safe JSON output that matches original format
-        from .models import create_audit_result_model
+        # Filter out DEBUG issues and checks unless verbose mode is enabled
+        if not verbose:
+            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != "debug"]
+            audit_result.checks = [check for check in audit_result.checks if check.severity != "debug"]
 
-        output_data = aggregated_results.copy()
-
-        # Filter out DEBUG issues unless verbose mode is enabled
-        if not verbose and "issues" in output_data:
-            output_data["issues"] = [
-                issue
-                for issue in output_data["issues"]
-                if not isinstance(issue, dict) or issue.get("severity") != "debug"
-            ]
-        # Also filter DEBUG checks unless verbose
-        if not verbose and "checks" in output_data:
-            output_data["checks"] = [
-                check
-                for check in output_data["checks"]
-                if not isinstance(check, dict) or check.get("severity") != "debug"
-            ]
-
-        # Create Pydantic model and serialize to JSON
-        audit_result = create_audit_result_model(output_data)
+        # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
     else:
-        # Text format
-        output_text = format_text_output(aggregated_results, verbose)
+        # Text format - convert to dict for backward compatibility with format_text_output
+        output_text = format_text_output(audit_result.model_dump(), verbose)
 
     # Send output to the specified destination
     if output:
@@ -1265,15 +1191,10 @@ def scan_command(
 
         # Show summary in verbose mode for better UX
         if verbose:
-            issues = aggregated_results.get("issues", [])
-            visible_issues = issues  # In verbose mode, show all issues including debug
+            visible_issues = audit_result.issues  # In verbose mode, show all issues including debug
             if visible_issues:
-                critical_count = len(
-                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "critical"]
-                )
-                warning_count = len(
-                    [i for i in visible_issues if isinstance(i, dict) and i.get("severity") == "warning"]
-                )
+                critical_count = len([i for i in visible_issues if i.severity == "critical"])
+                warning_count = len([i for i in visible_issues if i.severity == "warning"])
                 if critical_count > 0:
                     click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
                 elif warning_count > 0:
@@ -1289,7 +1210,7 @@ def scan_command(
         click.echo(output_text)
 
     # Exit with appropriate error code based on scan results
-    exit_code = determine_exit_code(aggregated_results)
+    exit_code = determine_exit_code(audit_result.model_dump())
     sys.exit(exit_code)
 
 

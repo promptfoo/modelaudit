@@ -20,7 +20,7 @@ def test_assets_safetensors(tmp_path: Path) -> None:
     create_safetensors_file(file_path)
 
     results = scan_model_directory_or_file(str(file_path))
-    assert results["assets"][0]["path"] == str(file_path)
+    assert results.assets[0].path == str(file_path)
 
 
 def test_assets_zip(tmp_path: Path) -> None:
@@ -30,8 +30,8 @@ def test_assets_zip(tmp_path: Path) -> None:
         z.writestr("b.txt", "world")
 
     results = scan_model_directory_or_file(str(zip_path))
-    top_asset = results["assets"][0]
-    inner = {a["path"] for a in top_asset.get("contents", [])}
+    top_asset = results.assets[0]
+    inner = {a["path"] for a in getattr(top_asset, "contents", [])}
     assert f"{zip_path}:a.txt" in inner
     assert f"{zip_path}:b.txt" in inner
 
@@ -47,15 +47,15 @@ def test_assets_safetensors_metadata(tmp_path: Path) -> None:
     save_file(tensor_data, str(file_path))
 
     results = scan_model_directory_or_file(str(file_path))
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
-    assert asset["type"] == "safetensors"
-    assert "tensors" in asset
-    assert "size" in asset
-    assert asset["size"] > 0
+    assert asset.type == "safetensors"
+    assert hasattr(asset, "tensors")
+    assert hasattr(asset, "size")
+    assert asset.size > 0
 
     # Check all tensor names are captured
-    tensor_names = asset["tensors"]
+    tensor_names = asset.tensors
     assert "layer1.weight" in tensor_names
     assert "layer1.bias" in tensor_names
     assert "layer2.weight" in tensor_names
@@ -75,14 +75,14 @@ def test_assets_json_manifest_metadata(tmp_path: Path) -> None:
     config_path.write_text(json.dumps(config_data, indent=2))
 
     results = scan_model_directory_or_file(str(config_path))
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
-    assert asset["type"] == "manifest"
-    assert "keys" in asset
-    assert "size" in asset
+    assert asset.type == "manifest"
+    assert hasattr(asset, "keys")
+    assert hasattr(asset, "size")
 
     # Check all keys are captured
-    keys = asset["keys"]
+    keys = asset.keys
     assert "model_type" in keys
     assert "hidden_size" in keys
     assert "num_attention_heads" in keys
@@ -100,12 +100,12 @@ def test_assets_pickle_file(tmp_path: Path) -> None:
         pickle.dump(data, f)
 
     results = scan_model_directory_or_file(str(pickle_path))
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
-    assert asset["path"] == str(pickle_path)
-    assert asset["type"] == "pickle"
-    assert "size" in asset
-    assert asset["size"] > 0
+    assert asset.path == str(pickle_path)
+    assert asset.type == "pickle"
+    assert hasattr(asset, "size")
+    assert asset.size > 0
 
 
 def test_assets_nested_zip_with_models(tmp_path: Path) -> None:
@@ -126,16 +126,16 @@ def test_assets_nested_zip_with_models(tmp_path: Path) -> None:
     inner_st_path.unlink()
 
     results = scan_model_directory_or_file(str(zip_path))
-    zip_asset = results["assets"][0]
+    zip_asset = results.assets[0]
 
-    assert zip_asset["type"] == "zip"
-    assert "contents" in zip_asset
-    assert len(zip_asset["contents"]) == 2
+    assert zip_asset.type == "zip"
+    assert hasattr(zip_asset, "contents")
+    assert len(zip_asset.contents) == 2
 
     # Find the SafeTensors asset within the ZIP
     st_asset = None
     json_asset = None
-    for content in zip_asset["contents"]:
+    for content in zip_asset.contents:
         if content["path"].endswith("model.safetensors"):
             st_asset = content
         elif content["path"].endswith("config.json"):
@@ -182,16 +182,16 @@ def test_assets_directory_scan_multiple_files(tmp_path: Path) -> None:
     results = scan_model_directory_or_file(str(model_dir))
 
     # Should have 4 assets (one for each file)
-    assert len(results["assets"]) == 4
-    assert results["files_scanned"] == 4
+    assert len(results.assets) == 4
+    assert results.files_scanned == 4
 
     # Check that we have the expected asset types
-    asset_types = {asset["type"] for asset in results["assets"]}
+    asset_types = {asset.type for asset in results.assets}
     expected_types = {"safetensors", "manifest", "pickle", "unknown"}
     assert asset_types == expected_types
 
     # Verify each file is represented
-    asset_paths = {Path(asset["path"]).name for asset in results["assets"]}
+    asset_paths = {Path(asset.path).name for asset in results.assets}
     expected_files = {"weights.safetensors", "config.json", "state.pkl", "data.dat"}
     assert asset_paths == expected_files
 
@@ -205,36 +205,36 @@ def test_assets_structure_validation(tmp_path: Path) -> None:
     results = scan_model_directory_or_file(str(file_path))
 
     # Validate top-level structure
-    assert "assets" in results
-    assert isinstance(results["assets"], list)
+    assert hasattr(results, "assets")
+    assert isinstance(results.assets, list)
 
     # Validate asset structure
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
     # Required fields
-    assert "path" in asset
-    assert "type" in asset
-    assert isinstance(asset["path"], str)
-    assert isinstance(asset["type"], str)
+    assert hasattr(asset, "path")
+    assert hasattr(asset, "type")
+    assert isinstance(asset.path, str)
+    assert isinstance(asset.type, str)
 
     # Optional fields (when present, should have correct types)
-    if "size" in asset:
-        assert isinstance(asset["size"], int)
-        assert asset["size"] >= 0
+    if hasattr(asset, "size") and asset.size is not None:
+        assert isinstance(asset.size, int)
+        assert asset.size >= 0
 
-    if "tensors" in asset:
-        assert isinstance(asset["tensors"], list)
-        for tensor_name in asset["tensors"]:
+    if hasattr(asset, "tensors") and asset.tensors is not None:
+        assert isinstance(asset.tensors, list)
+        for tensor_name in asset.tensors:
             assert isinstance(tensor_name, str)
 
-    if "keys" in asset:
-        assert isinstance(asset["keys"], list)
-        for key in asset["keys"]:
+    if hasattr(asset, "keys") and asset.keys is not None:
+        assert isinstance(asset.keys, list)
+        for key in asset.keys:
             assert isinstance(key, str)
 
-    if "contents" in asset:
-        assert isinstance(asset["contents"], list)
-        for content in asset["contents"]:
+    if hasattr(asset, "contents") and asset.contents is not None:
+        assert isinstance(asset.contents, list)
+        for content in asset.contents:
             assert isinstance(content, dict)
             assert "path" in content
             assert "type" in content
@@ -253,19 +253,19 @@ def test_assets_error_files_handling(tmp_path: Path) -> None:
     results = scan_model_directory_or_file(str(tmp_path))
 
     # Should have assets for both files
-    assert len(results["assets"]) == 2
+    assert len(results.assets) == 2
 
     # The corrupted file should be treated as unknown type (no specific error type)
-    unknown_assets = [a for a in results["assets"] if a.get("type") == "unknown"]
+    unknown_assets = [a for a in results.assets if a.type == "unknown"]
     assert len(unknown_assets) == 1
 
     unknown_asset = unknown_assets[0]
-    assert unknown_asset["path"] == str(bad_file)
+    assert unknown_asset.path == str(bad_file)
 
     # Good file should still be processed normally
-    good_assets = [a for a in results["assets"] if a["path"] == str(good_file)]
+    good_assets = [a for a in results.assets if a.path == str(good_file)]
     assert len(good_assets) == 1
-    assert good_assets[0]["type"] == "manifest"
+    assert good_assets[0].type == "manifest"
 
 
 def test_assets_empty_results(tmp_path: Path) -> None:
@@ -275,10 +275,10 @@ def test_assets_empty_results(tmp_path: Path) -> None:
 
     results = scan_model_directory_or_file(str(empty_dir))
 
-    assert "assets" in results
-    assert isinstance(results["assets"], list)
-    assert len(results["assets"]) == 0
-    assert results["files_scanned"] == 0
+    assert hasattr(results, "assets")
+    assert isinstance(results.assets, list)
+    assert len(results.assets) == 0
+    assert results.files_scanned == 0
 
 
 @pytest.mark.parametrize(
@@ -312,9 +312,9 @@ def test_assets_file_type_detection(
 
     results = scan_model_directory_or_file(str(file_path))
 
-    asset = results["assets"][0]
-    assert asset["type"] == expected_type
-    assert asset["path"] == str(file_path)
+    asset = results.assets[0]
+    assert asset.type == expected_type
+    assert asset.path == str(file_path)
 
 
 def test_assets_ml_config_json_detection(tmp_path: Path) -> None:
@@ -330,11 +330,11 @@ def test_assets_ml_config_json_detection(tmp_path: Path) -> None:
     config_file.write_text(json.dumps(config_data))
 
     results = scan_model_directory_or_file(str(config_file))
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
-    assert asset["type"] == "manifest"
-    assert "keys" in asset
-    assert set(asset["keys"]) == {
+    assert asset.type == "manifest"
+    assert hasattr(asset, "keys")
+    assert set(asset.keys) == {
         "model_type",
         "hidden_size",
         "num_attention_heads",
@@ -349,8 +349,8 @@ def test_assets_generic_json_detection(tmp_path: Path) -> None:
     json_file.write_text('{"test": "value", "number": 42}')
 
     results = scan_model_directory_or_file(str(json_file))
-    asset = results["assets"][0]
+    asset = results.assets[0]
 
     # Generic JSON should be unknown type since ManifestScanner only handles ML-specific configs
-    assert asset["type"] == "unknown"
-    assert asset["path"] == str(json_file)
+    assert asset.type == "unknown"
+    assert asset.path == str(json_file)

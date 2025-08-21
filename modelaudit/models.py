@@ -4,6 +4,7 @@ These models provide type safety and validation while producing the exact same
 JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
+import time
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +16,9 @@ class AssetModel(BaseModel):
     path: str = Field(..., description="Path to the asset")
     type: str = Field(..., description="Type of asset (e.g., 'pickle')")
     size: Optional[int] = Field(None, description="Size of the asset in bytes")
+    tensors: Optional[list[str]] = Field(None, description="List of tensor names (for safetensors)")
+    keys: Optional[list[str]] = Field(None, description="List of keys (for JSON manifests)")
+    contents: Optional[list[dict[str, Any]]] = Field(None, description="Contents list (for ZIP files)")
 
 
 class CheckModel(BaseModel):
@@ -73,7 +77,12 @@ class FileMetadataModel(BaseModel):
 class ModelAuditResultModel(BaseModel):
     """Pydantic model matching the exact current ModelAudit JSON output format"""
 
-    model_config = ConfigDict(use_enum_values=True, extra="allow")
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="allow",
+        validate_assignment=False,  # Disable validation on assignment for performance
+        frozen=False,  # Allow field mutations for efficient aggregation
+    )
 
     # Core scan results
     bytes_scanned: int = Field(..., description="Total bytes scanned")
@@ -93,6 +102,68 @@ class ModelAuditResultModel(BaseModel):
     total_checks: int = Field(..., description="Total number of checks performed")
     passed_checks: int = Field(..., description="Number of checks that passed")
     failed_checks: int = Field(..., description="Number of checks that failed")
+
+    # Legacy compatibility
+    success: bool = Field(default=True, description="Whether the scan completed successfully")
+
+    def aggregate_scan_result(self, results: dict[str, Any]) -> None:
+        """Efficiently aggregate scan results into this model.
+
+        This method updates the current model in-place for performance.
+        """
+        # Update scalar fields
+        self.bytes_scanned += results.get("bytes_scanned", 0)
+        self.files_scanned += results.get("files_scanned", 0)
+        if results.get("has_errors", False):
+            self.has_errors = True
+
+        # Convert and extend issues
+        new_issues = convert_issues_to_models(results.get("issues", []))
+        self.issues.extend(new_issues)
+
+        # Convert and extend checks
+        new_checks = convert_checks_to_models(results.get("checks", []))
+        self.checks.extend(new_checks)
+
+        # Convert and extend assets
+        new_assets = convert_assets_to_models(results.get("assets", []))
+        self.assets.extend(new_assets)
+
+        # Merge file metadata
+        for path, metadata in results.get("file_metadata", {}).items():
+            if isinstance(metadata, dict):
+                # Convert ml_context if present
+                ml_context = metadata.get("ml_context")
+                if ml_context and isinstance(ml_context, dict):
+                    metadata = metadata.copy()
+                    metadata["ml_context"] = MLContextModel(**ml_context)
+                self.file_metadata[path] = FileMetadataModel(**metadata)
+            else:
+                self.file_metadata[path] = metadata
+
+        # Track scanner names (avoid duplicates)
+        for scanner in results.get("scanners", []):
+            if scanner and scanner not in self.scanner_names and scanner != "unknown":
+                self.scanner_names.append(scanner)
+
+    def finalize_statistics(self) -> None:
+        """Calculate final statistics after all scan results are aggregated."""
+        self.duration = time.time() - self.start_time
+        self.total_checks = len(self.checks)
+        self.passed_checks = sum(1 for c in self.checks if c.status == "passed")
+        self.failed_checks = sum(1 for c in self.checks if c.status == "failed")
+
+    def deduplicate_issues(self) -> None:
+        """Remove duplicate issues based on message, severity, and location."""
+        seen_issues = set()
+        deduplicated_issues = []
+        for issue in self.issues:
+            # Include location in the deduplication key to avoid hiding issues in different files
+            issue_key = (issue.message, issue.severity, issue.location or "")
+            if issue_key not in seen_issues:
+                seen_issues.add(issue_key)
+                deduplicated_issues.append(issue)
+        self.issues = deduplicated_issues
 
 
 def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditResultModel:
@@ -149,4 +220,82 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
         total_checks=aggregated_results.get("total_checks", 0),
         passed_checks=aggregated_results.get("passed_checks", 0),
         failed_checks=aggregated_results.get("failed_checks", 0),
+    )
+
+
+def convert_issues_to_models(issues: list[Any]) -> list[IssueModel]:
+    """Convert list of issue dicts or objects to IssueModel instances."""
+    import time
+
+    result = []
+    for issue in issues:
+        if isinstance(issue, dict):
+            # Ensure required fields are present
+            issue_dict = issue.copy()
+            if "timestamp" not in issue_dict:
+                issue_dict["timestamp"] = time.time()
+            result.append(IssueModel(**issue_dict))
+        elif hasattr(issue, "to_dict"):
+            result.append(IssueModel(**issue.to_dict()))
+        elif isinstance(issue, IssueModel):
+            result.append(issue)
+        else:
+            # Skip unknown issue types
+            continue
+    return result
+
+
+def convert_checks_to_models(checks: list[Any]) -> list[CheckModel]:
+    """Convert list of check dicts or objects to CheckModel instances."""
+    import time
+
+    result = []
+    for check in checks:
+        if isinstance(check, dict):
+            # Ensure required fields are present
+            check_dict = check.copy()
+            if "timestamp" not in check_dict:
+                check_dict["timestamp"] = time.time()
+            result.append(CheckModel(**check_dict))
+        elif hasattr(check, "to_dict"):
+            result.append(CheckModel(**check.to_dict()))
+        elif isinstance(check, CheckModel):
+            result.append(check)
+        else:
+            # Skip unknown check types
+            continue
+    return result
+
+
+def convert_assets_to_models(assets: list[Any]) -> list[AssetModel]:
+    """Convert list of asset dicts to AssetModel instances."""
+    result = []
+    for asset in assets:
+        if isinstance(asset, dict):
+            result.append(AssetModel(**asset))
+        elif isinstance(asset, AssetModel):
+            result.append(asset)
+        else:
+            # Skip unknown asset types
+            continue
+    return result
+
+
+def create_initial_audit_result() -> ModelAuditResultModel:
+    """Create an initial ModelAuditResultModel for aggregating scan results."""
+    return ModelAuditResultModel(
+        bytes_scanned=0,
+        issues=[],
+        checks=[],
+        files_scanned=0,
+        assets=[],
+        has_errors=False,
+        scanner_names=[],
+        file_metadata={},
+        start_time=time.time(),
+        duration=0.0,
+        total_checks=0,
+        passed_checks=0,
+        failed_checks=0,
+        success=True,
     )
