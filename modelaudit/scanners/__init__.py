@@ -500,6 +500,9 @@ class ScannerRegistry:
     def get_numpy_status(self) -> tuple[bool, str]:
         """Get NumPy compatibility status"""
         self._ensure_numpy_status()  # Lazy initialization
+        # After lazy initialization, these are guaranteed to be non-None
+        assert self._numpy_compatible is not None
+        assert self._numpy_status is not None
         return self._numpy_compatible, self._numpy_status
 
     def _is_aiml_manifest_file(self, filename: str) -> bool:
