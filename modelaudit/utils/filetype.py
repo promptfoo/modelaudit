@@ -247,6 +247,25 @@ def detect_file_format(path: str) -> str:
     ):
         return "tar"
 
+    # For files without recognized extensions, check for SafeTensors format
+    # SafeTensors format check: 8-byte length header + JSON metadata
+    if size >= 12:  # Minimum: 8 bytes length + some JSON
+        try:
+            with file_path.open("rb") as f:
+                json_length_bytes = f.read(8)
+                json_length = struct.unpack("<Q", json_length_bytes)[0]
+                # Sanity check: JSON length should be reasonable
+                if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
+                    json_start = f.read(min(32, json_length))
+                    if json_start.startswith(b"{") and b'"' in json_start:
+                        return "safetensors"
+        except (struct.error, OSError):
+            pass
+
+    # Check for ONNX format (protobuf) for files without extensions
+    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+        return "onnx"
+
     return "unknown"
 
 
