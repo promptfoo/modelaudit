@@ -2248,7 +2248,7 @@ class PickleScanner(BaseScanner):
                         "opcodes_analyzed": opcode_count,
                         "file_size": file_size,
                     },
-                    rule_code="S902",
+                    rule_code="S901",
                     why=why,
                 )
 
