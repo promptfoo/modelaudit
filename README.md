@@ -165,7 +165,7 @@ ModelAudit provides additional flags for specialized workflows:
 ModelAudit automatically optimizes scanning strategies for different model sizes:
 
 - **<100GB**: Full in-memory analysis for comprehensive scanning
-- **100GB-1TB**: Chunked processing with 50GB chunks for memory efficiency  
+- **100GB-1TB**: Chunked processing with 50GB chunks for memory efficiency
 - **1TB-5TB**: Streaming analysis with intelligent sampling
 - **>5TB**: Advanced distributed scanning techniques
 
