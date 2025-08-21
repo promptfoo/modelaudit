@@ -136,6 +136,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S1005",  # Invalid signature/corrupted file
             )
             result.finish(success=False)
             return result
@@ -442,7 +443,7 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 32},
-                rule_code="S902",
+                rule_code="S1005",  # Invalid signature/corrupted file
             )
             return
 
