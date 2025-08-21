@@ -14,6 +14,7 @@ from . import __version__
 from .auth.client import auth_client
 from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
+from .models import ModelAuditResultModel
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
 from .utils import resolve_dvc_file
@@ -807,7 +808,7 @@ def scan_command(
                         from .mlflow_integration import scan_mlflow_model
 
                         # Use scan_mlflow_model to download and get scan results directly
-                        results = scan_mlflow_model(
+                        results: ModelAuditResultModel = scan_mlflow_model(
                             path,
                             registry_uri=registry_uri,
                             timeout=timeout,
@@ -822,7 +823,7 @@ def scan_command(
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan using Pydantic model
-                        audit_result.aggregate_scan_result(results)
+                        audit_result.aggregate_scan_result(results.model_dump())
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -851,7 +852,7 @@ def scan_command(
 
                     try:
                         # Use the integrated JFrog scanning function
-                        results = scan_jfrog_artifact(
+                        jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                             path,
                             api_token=jfrog_api_token,
                             access_token=jfrog_access_token,
@@ -869,7 +870,7 @@ def scan_command(
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results using Pydantic model
-                        audit_result.aggregate_scan_result(results)
+                        audit_result.aggregate_scan_result(jfrog_results.model_dump())
 
                         continue  # Skip the regular scanning flow
 
@@ -986,7 +987,7 @@ def scan_command(
                         "progress_update_interval": progress_interval,
                     }
 
-                    results = scan_model_directory_or_file(
+                    scan_results: ModelAuditResultModel = scan_model_directory_or_file(
                         actual_path,
                         blacklist_patterns=list(blacklist) if blacklist else None,
                         timeout=timeout,
@@ -999,41 +1000,21 @@ def scan_command(
                     )
 
                     # Core now returns ModelAuditResultModel, so merge it directly
-                    if hasattr(results, "model_dump"):
-                        # results is a ModelAuditResultModel, convert to dict for aggregation
-                        audit_result.aggregate_scan_result(results.model_dump())
-                    else:
-                        # Fallback for dict results
-                        audit_result.aggregate_scan_result(results)
+                    # scan_results is a ModelAuditResultModel, convert to dict for aggregation
+                    audit_result.aggregate_scan_result(scan_results.model_dump())
 
                     # Show completion status if in text mode and not writing to a file
-                    result_issues = results.issues if hasattr(results, "issues") else results.get("issues", [])
+                    result_issues = scan_results.issues
                     if result_issues:
                         # Filter out DEBUG severity issues when not in verbose mode
-                        if hasattr(results, "issues"):
-                            # results is ModelAuditResultModel
-                            visible_issues = [issue for issue in result_issues if verbose or issue.severity != "debug"]
-                        else:
-                            # results is dict
-                            visible_issues = [
-                                issue
-                                for issue in result_issues
-                                if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-                            ]
+                        # scan_results is ModelAuditResultModel
+                        visible_issues = [issue for issue in result_issues if verbose or issue.severity != "debug"]
                         issue_count = len(visible_issues)
 
                         if issue_count > 0:
                             # Determine severity for coloring
-                            if hasattr(results, "issues"):
-                                # results is ModelAuditResultModel
-                                has_critical = any(issue.severity == "critical" for issue in visible_issues)
-                            else:
-                                # results is dict
-                                has_critical = any(
-                                    issue.get("severity") == "critical"
-                                    for issue in visible_issues
-                                    if isinstance(issue, dict)
-                                )
+                            # scan_results is ModelAuditResultModel
+                            has_critical = any(issue.severity == "critical" for issue in visible_issues)
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 if has_critical:
@@ -1122,8 +1103,10 @@ def scan_command(
                         interruption_issue = IssueModel(
                             message="Scan interrupted by user",
                             severity="info",
+                            location=None,
                             details={"interrupted": True},
                             timestamp=time.time(),
+                            why=None,
                         )
                         audit_result.issues.append(interruption_issue)
                     should_break = True

@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .models import ModelAuditResultModel
+
 from .core import scan_model_directory_or_file
 from .utils.jfrog import download_artifact
 
@@ -24,7 +26,7 @@ def scan_jfrog_artifact(
     max_file_size: int = 0,
     max_total_size: int = 0,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ModelAuditResultModel:
     """Download and scan an artifact from JFrog Artifactory.
 
     Parameters

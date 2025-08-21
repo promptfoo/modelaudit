@@ -48,10 +48,10 @@ class TestPerformanceBenchmarks:
             results.append(
                 {
                     "duration": duration,
-                    "files_scanned": scan_result["files_scanned"],
-                    "bytes_scanned": scan_result["bytes_scanned"],
-                    "issues_found": len(scan_result["issues"]),
-                    "success": scan_result["success"],
+                    "files_scanned": scan_result.files_scanned,
+                    "bytes_scanned": scan_result.bytes_scanned,
+                    "issues_found": len(scan_result.issues),
+                    "success": scan_result.success,
                 },
             )
 

@@ -707,11 +707,13 @@ def scan_model_directory_or_file(
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
-                        scanners_list = scan_metadata.get("scanners", [])
-                        if scanner_name and scanner_name not in scanners_list:
+                        if scanner_name:
+                            # Ensure scanners list exists and is properly typed
                             if "scanners" not in scan_metadata:
                                 scan_metadata["scanners"] = []
-                            scan_metadata["scanners"].append(scanner_name)
+                            scanners_list = scan_metadata["scanners"]  
+                            if isinstance(scanners_list, list) and scanner_name not in scanners_list:
+                                scanners_list.append(scanner_name)
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":
                             results.scanner_names.append(scanner_name)
 

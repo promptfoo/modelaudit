@@ -52,10 +52,11 @@ def test_assets_safetensors_metadata(tmp_path: Path) -> None:
     assert asset.type == "safetensors"
     assert hasattr(asset, "tensors")
     assert hasattr(asset, "size")
-    assert asset.size > 0
+    assert asset.size is not None and asset.size > 0
 
     # Check all tensor names are captured
     tensor_names = asset.tensors
+    assert tensor_names is not None
     assert "layer1.weight" in tensor_names
     assert "layer1.bias" in tensor_names
     assert "layer2.weight" in tensor_names
@@ -83,6 +84,7 @@ def test_assets_json_manifest_metadata(tmp_path: Path) -> None:
 
     # Check all keys are captured
     keys = asset.keys
+    assert keys is not None
     assert "model_type" in keys
     assert "hidden_size" in keys
     assert "num_attention_heads" in keys
@@ -105,7 +107,7 @@ def test_assets_pickle_file(tmp_path: Path) -> None:
     assert asset.path == str(pickle_path)
     assert asset.type == "pickle"
     assert hasattr(asset, "size")
-    assert asset.size > 0
+    assert asset.size is not None and asset.size > 0
 
 
 def test_assets_nested_zip_with_models(tmp_path: Path) -> None:
@@ -130,6 +132,7 @@ def test_assets_nested_zip_with_models(tmp_path: Path) -> None:
 
     assert zip_asset.type == "zip"
     assert hasattr(zip_asset, "contents")
+    assert zip_asset.contents is not None
     assert len(zip_asset.contents) == 2
 
     # Find the SafeTensors asset within the ZIP
@@ -334,6 +337,7 @@ def test_assets_ml_config_json_detection(tmp_path: Path) -> None:
 
     assert asset.type == "manifest"
     assert hasattr(asset, "keys")
+    assert asset.keys is not None
     assert set(asset.keys) == {
         "model_type",
         "hidden_size",
