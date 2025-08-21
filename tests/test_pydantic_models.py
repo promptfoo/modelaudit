@@ -77,7 +77,7 @@ class TestPydanticModels:
             duration=1.5,
             total_checks=5,
             passed_checks=5,
-            failed_checks=0
+            failed_checks=0,
         )
 
         assert result.bytes_scanned == 1000
@@ -120,7 +120,7 @@ class TestPydanticModels:
             "duration": 1.0,
             "total_checks": 1,
             "passed_checks": 0,
-            "failed_checks": 1
+            "failed_checks": 1,
         }
 
         model = create_audit_result_model(aggregated_results)
@@ -139,21 +139,8 @@ class TestPydanticModels:
         # Create a realistic model
         model = ModelAuditResultModel(
             bytes_scanned=100,
-            issues=[
-                IssueModel(
-                    message="Test issue",
-                    severity="warning",
-                    timestamp=time.time()
-                )
-            ],
-            checks=[
-                CheckModel(
-                    name="Test Check",
-                    status="passed",
-                    message="Check passed",
-                    timestamp=time.time()
-                )
-            ],
+            issues=[IssueModel(message="Test issue", severity="warning", timestamp=time.time())],
+            checks=[CheckModel(name="Test Check", status="passed", message="Check passed", timestamp=time.time())],
             files_scanned=1,
             assets=[{"path": "test.pkl", "type": "pickle"}],
             has_errors=False,
@@ -163,7 +150,7 @@ class TestPydanticModels:
             duration=1.0,
             total_checks=1,
             passed_checks=1,
-            failed_checks=0
+            failed_checks=0,
         )
 
         # Serialize to JSON and verify structure
@@ -172,12 +159,22 @@ class TestPydanticModels:
 
         # Check that all expected top-level keys are present
         expected_keys = {
-            "bytes_scanned", "issues", "checks", "files_scanned", 
-            "assets", "has_errors", "scanner_names", "file_metadata",
-            "start_time", "duration", "total_checks", "passed_checks", "failed_checks"
+            "bytes_scanned",
+            "issues",
+            "checks",
+            "files_scanned",
+            "assets",
+            "has_errors",
+            "scanner_names",
+            "file_metadata",
+            "start_time",
+            "duration",
+            "total_checks",
+            "passed_checks",
+            "failed_checks",
         }
         assert set(parsed.keys()) >= expected_keys
-        
+
         # Check types and structure
         assert isinstance(parsed["bytes_scanned"], int)
         assert isinstance(parsed["issues"], list)
@@ -187,12 +184,7 @@ class TestPydanticModels:
 
     def test_pydantic_v2_features(self):
         """Test Pydantic v2 specific features."""
-        check = CheckModel(
-            name="Test Check",
-            status="passed",
-            message="Test message",
-            timestamp=time.time()
-        )
+        check = CheckModel(name="Test Check", status="passed", message="Test message", timestamp=time.time())
 
         # Test model_dump() method (v2 syntax)
         data = check.model_dump()
@@ -223,5 +215,5 @@ class TestPydanticModels:
                 name="Test",
                 status="invalid_status",  # Should be passed/failed/skipped
                 message="Test",
-                timestamp="not_a_number"  # Should be float
+                timestamp="not_a_number",  # Should be float
             )

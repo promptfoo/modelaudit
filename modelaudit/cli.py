@@ -1230,9 +1230,9 @@ def scan_command(
     if format == "json":
         # Use Pydantic models for type-safe JSON output that matches original format
         from .models import create_audit_result_model
-        
+
         output_data = aggregated_results.copy()
-        
+
         # Filter out DEBUG issues unless verbose mode is enabled
         if not verbose and "issues" in output_data:
             output_data["issues"] = [
@@ -1247,7 +1247,7 @@ def scan_command(
                 for check in output_data["checks"]
                 if not isinstance(check, dict) or check.get("severity") != "debug"
             ]
-        
+
         # Create Pydantic model and serialize to JSON
         audit_result = create_audit_result_model(output_data)
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
