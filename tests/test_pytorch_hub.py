@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.utils.pytorch_hub import (
+    _extract_weight_urls,
     download_pytorch_hub_model,
     is_pytorch_hub_url,
 )
@@ -57,3 +58,14 @@ def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp
 def test_download_pytorch_hub_model_invalid_url():
     with pytest.raises(ValueError):
         download_pytorch_hub_model("https://example.com/model")
+
+
+def test_extract_weight_urls_multi_part_extensions():
+    html = (
+        '<a href="https://download.pytorch.org/models/resnet50.pth.tar.gz">gz</a>'
+        '<a href="https://download.pytorch.org/models/resnet50.pth.zip">zip</a>'
+    )
+    assert _extract_weight_urls(html) == [
+        "https://download.pytorch.org/models/resnet50.pth.tar.gz",
+        "https://download.pytorch.org/models/resnet50.pth.zip",
+    ]

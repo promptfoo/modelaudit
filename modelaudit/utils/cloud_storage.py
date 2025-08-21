@@ -460,13 +460,23 @@ def download_from_cloud(
         # Download based on type
         if metadata["type"] == "directory":
             # Handle directory download
-            files = metadata.get("files", [])
+            raw_files = metadata.get("files")
+            if raw_files is None:
+                files = []
+            elif isinstance(raw_files, list):
+                files = raw_files
+            else:
+                raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
             if selective:
                 # Filter to only scannable files
                 files = filter_scannable_files(files)
                 if show_progress:
-                    click.echo(f"Found {len(files)} scannable files out of {metadata['file_count']} total files")
+                    total = metadata.get("file_count", 0)
+                    if files:
+                        click.echo(f"Found {len(files)} scannable files out of {total} total files")
+                    else:
+                        click.echo(f"No scannable files found out of {total} total files")
 
             if not files:
                 raise ValueError("No scannable model files found in directory")

@@ -120,7 +120,10 @@ def _extract_primary_asset_from_location(location: str) -> str:
 
     primary_location = locations[0]
     # Extract main file path (before any ':' separator for archive contents)
-    primary_asset = primary_location.split(":", 1)[0] if ":" in primary_location else primary_location
+    drive, tail = os.path.splitdrive(primary_location)
+    if ":" in tail:
+        tail = tail.split(":", 1)[0]
+    primary_asset = f"{drive}{tail}"
 
     # Normalize empty paths
     return primary_asset.strip() if primary_asset.strip() else "unknown"
