@@ -310,7 +310,7 @@ class TestFalsePositiveFixes:
 
         # Should not flag as executable
         assert result["exit_code"] == 0, "BERT model with random MZ bytes should not be flagged"
-        assert not any("Windows executable" in issue.get("message", "") for issue in result.get("issues", [])), (
+        assert not any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
             "Should not detect Windows executable in BERT model"
         )
 
@@ -371,7 +371,7 @@ class TestFalsePositiveFixes:
 
             result = self._run_cli_scan(str(exe_bin_path))
             assert result["exit_code"] == 1, "Real executable disguised as .bin should be detected"
-            assert any("Windows executable" in issue.get("message", "") for issue in result.get("issues", [])), (
+            assert any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
                 "Should detect Windows executable at start of file"
             )
 
@@ -524,16 +524,17 @@ class TestFalsePositiveFixes:
                 scan_results = {"issues": []}
 
             # Analyze results
+            issues = scan_results.get("issues", [])
             has_warnings = any(
-                issue.get("severity") in ["warning", "critical"] for issue in scan_results.get("issues", [])
+                issue.get("severity") in ["warning", "critical"] for issue in issues
             )
-            has_errors = any(issue.get("severity") == "critical" for issue in scan_results.get("issues", []))
+            has_errors = any(issue.get("severity") == "critical" for issue in issues)
 
             return {
                 "exit_code": exit_code or 0,
                 "has_warnings": has_warnings,
                 "has_errors": has_errors,
-                "issues": scan_results.get("issues", []),
+                "issues": issues,
                 "stdout": stdout_content,
                 "stderr": stderr_content,
             }

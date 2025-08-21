@@ -270,12 +270,12 @@ class TestNestedPickleIntegration:
 
         for test_file in all_files:
             result = scan_model_directory_or_file(str(test_file))
-            total_issues += len(result["issues"])
+            total_issues += len(result.issues)
 
             nested_issues = [
                 issue
-                for issue in result["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                for issue in result.issues
+                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
             ]
             total_nested_issues += len(nested_issues)
 
