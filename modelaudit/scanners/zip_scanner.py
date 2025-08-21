@@ -270,8 +270,8 @@ class ZipScanner(BaseScanner):
                 try:
                     max_entry_size = self.config.get(
                         "max_entry_size",
-                        10 * 1024 * 1024 * 1024,
-                    )  # 10 GB default
+                        100 * 1024 * 1024 * 1024,
+                    )  # 100 GB default - supports large language models
 
                     if name.lower().endswith(".zip"):
                         suffix = ".zip"
