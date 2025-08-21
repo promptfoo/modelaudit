@@ -317,11 +317,8 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 7. **Clean and publish**:
 
    ```bash
-   # Clean previous builds
-   rm -rf dist/*
-
-   # Build package
-   rye build
+   # Build package (clean first)
+   rye build --clean
 
    # Verify only current version exists
    ls -la dist/

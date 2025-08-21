@@ -152,16 +152,13 @@ rye build
 ## Clean Publishing Process
 
 ```bash
-# 1. Clean dist directory
-rm -rf dist/*
+# 1. Build package (clean first)
+rye build --clean
 
-# 2. Build package
-rye build
-
-# 3. Verify only current version artifacts exist
+# 2. Verify only current version artifacts exist
 ls -la dist/
 
-# 4. Publish to PyPI
+# 3. Publish to PyPI
 rye publish --yes
 ````
 
