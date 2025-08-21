@@ -91,20 +91,48 @@ def get_cloud_object_size(fs, url: str) -> Optional[int]:
         Total size in bytes, or None if size cannot be determined
     """
     try:
-        # Check if it's a single file or directory
         info = fs.info(url)
         if "size" in info:
             return int(info["size"])
 
-        # If it's a directory, sum up all file sizes
         total_size = 0
-        for item in fs.ls(url, detail=True):
-            if isinstance(item, dict) and "size" in item:
-                total_size += int(item["size"])
+
+        # Try using fs.walk to traverse directories
+        try:
+            for _, _, files in fs.walk(url):
+                for file_path in files:
+                    try:
+                        file_info = fs.info(file_path)
+                        if "size" in file_info:
+                            total_size += int(file_info["size"])
+                    except Exception:
+                        continue
+            if total_size > 0:
+                return total_size
+        except Exception:
+            pass
+
+        # Fallback to recursive ls if walk is unavailable
+        def _collect(path: str) -> None:
+            nonlocal total_size
+            try:
+                entries = fs.ls(path, detail=True)
+            except Exception:
+                return
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name") or entry.get("path")
+                if entry.get("type") == "directory" or (name and name.endswith("/")):
+                    if name:
+                        _collect(name)
+                elif "size" in entry:
+                    total_size += int(entry["size"])
+
+        _collect(url)
 
         return total_size if total_size > 0 else None
     except Exception:
-        # If we can't get the size, return None
         return None
 
 
