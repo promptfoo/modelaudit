@@ -55,7 +55,7 @@ class ScannerRegistry:
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
-        self._numpy_compatible: bool | None = None  # Lazy initialization
+        self._numpy_compatible: Optional[bool] = None  # Lazy initialization
         self._numpy_status: str | None = None
         self._init_registry()
 
@@ -596,7 +596,7 @@ def __getattr__(name: str) -> Any:
 
 
 # Helper function for getting scanner for a file
-def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> BaseScanner | None:
+def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
     """Get an instantiated scanner for a given file path"""
     scanner_class = _registry.get_scanner_for_path(path)
     if scanner_class:
