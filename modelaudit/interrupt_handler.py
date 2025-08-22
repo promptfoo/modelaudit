@@ -4,6 +4,10 @@ This module provides centralized interrupt handling for graceful shutdown
 of scanning operations. It captures SIGINT (Ctrl+C) and SIGTERM signals
 and allows scanners to check for interruption at safe points.
 
+The handler supports:
+- Graceful shutdown on first Ctrl+C
+- Immediate termination on second Ctrl+C (if interrupt is already pending)
+
 Usage:
     # In scanning loops:
     from modelaudit.interrupt_handler import check_interrupted
@@ -21,7 +25,9 @@ Usage:
         # Signal handlers are restored on exit
 """
 
+import contextlib
 import logging
+import os
 import signal
 import threading
 from collections.abc import Generator
@@ -37,15 +43,12 @@ class InterruptHandler:
     This class is thread-safe and handles proper installation/restoration of signal
     handlers. It uses a threading.Event to track interrupt state across threads.
 
-    Attributes:
-        _interrupted: Threading event that is set when an interrupt is received
-        _original_sigint_handler: Saved SIGINT handler to restore later
-        _original_sigterm_handler: Saved SIGTERM handler to restore later
-        _lock: Threading lock for thread-safe handler installation
-        _active: Boolean indicating if handlers are currently installed
+    On the first interrupt (Ctrl+C), it initiates graceful shutdown. If a second
+    interrupt is received while the first is still pending, it performs immediate termination.
     """
 
     def __init__(self) -> None:
+        """Initialize the interrupt handler."""
         self._interrupted = threading.Event()
         self._original_sigint_handler: Any = None
         self._original_sigterm_handler: Any = None
@@ -59,8 +62,15 @@ class InterruptHandler:
             signum: Signal number (SIGINT=2, SIGTERM=15)
             frame: Current stack frame (unused)
         """
-        logger.info(f"Signal {signum} received, initiating graceful shutdown")
-        self._interrupted.set()
+        if self._interrupted.is_set():
+            # Already interrupted - force immediate termination
+            logger.warning("Second interrupt received - forcing immediate termination")
+            os._exit(130)  # 130 is the standard exit code for SIGINT
+        else:
+            # First interrupt - initiate graceful shutdown
+            logger.info(f"Signal {signum} received, initiating graceful shutdown")
+            logger.info("Press Ctrl+C again to force immediate termination")
+            self._interrupted.set()
 
     def is_interrupted(self) -> bool:
         """Check if an interrupt has been requested.
@@ -96,16 +106,29 @@ class InterruptHandler:
         Yields:
             None
         """
+        # Check if already active outside the lock to avoid deadlock
+        if self._active:
+            # Already active, just yield without acquiring lock
+            yield
+            return
+
         with self._lock:
+            # Double-check inside lock (in case state changed)
             if self._active:
-                # Already active, just yield
                 yield
                 return
 
             try:
                 # Store original handlers
                 self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
-                self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
+
+                # SIGTERM might not be available on Windows
+                try:
+                    self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
+                except (AttributeError, ValueError):
+                    # SIGTERM not available on this platform
+                    self._original_sigterm_handler = None
+
                 self._active = True
                 logger.debug("Interrupt handlers installed")
                 yield
@@ -114,7 +137,8 @@ class InterruptHandler:
                 if self._original_sigint_handler is not None:
                     signal.signal(signal.SIGINT, self._original_sigint_handler)
                 if self._original_sigterm_handler is not None:
-                    signal.signal(signal.SIGTERM, self._original_sigterm_handler)
+                    with contextlib.suppress(AttributeError, ValueError):
+                        signal.signal(signal.SIGTERM, self._original_sigterm_handler)
                 self._active = False
                 logger.debug("Interrupt handlers restored")
 
@@ -177,6 +201,10 @@ def interruptible_scan() -> Generator["InterruptHandler", None, None]:
     This installs signal handlers for SIGINT and SIGTERM, allowing the
     scanning operation to be interrupted gracefully. The interrupt state
     is reset at the start, and signal handlers are restored on exit.
+
+    Behavior:
+    - First Ctrl+C: Initiates graceful shutdown
+    - Second Ctrl+C (while interrupt is pending): Forces immediate termination (exit code 130)
 
     Yields:
         InterruptHandler: The interrupt handler instance for checking state
