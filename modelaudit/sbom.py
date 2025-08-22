@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, Union, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -118,9 +118,17 @@ def _component_for_file(
     return component
 
 
-def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
+def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> str:
     bom = Bom()
     issues = results.get("issues", [])
+    # Convert issues to dicts if they are Pydantic models
+    issues_dicts = []
+    for issue in issues:
+        if hasattr(issue, "model_dump"):
+            issues_dicts.append(issue.model_dump())
+        else:
+            issues_dicts.append(issue)
+
     file_meta: dict[str, Any] = results.get("file_metadata", {})
 
     for input_path in paths:
@@ -128,12 +136,22 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
-                    meta = file_meta.get(fp, {})
-                    component = _component_for_file(fp, meta, issues)
+                    meta_model = file_meta.get(fp)
+                    # Convert Pydantic model to dict if needed
+                    if meta_model is not None and hasattr(meta_model, "model_dump"):
+                        meta = meta_model.model_dump()
+                    else:
+                        meta = meta_model or {}
+                    component = _component_for_file(fp, meta, issues_dicts)
                     bom.components.add(component)
         else:
-            meta = file_meta.get(input_path, {})
-            component = _component_for_file(input_path, meta, issues)
+            meta_model = file_meta.get(input_path)
+            # Convert Pydantic model to dict if needed
+            if meta_model is not None and hasattr(meta_model, "model_dump"):
+                meta = meta_model.model_dump()
+            else:
+                meta = meta_model or {}
+            component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)

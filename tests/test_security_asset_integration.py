@@ -129,7 +129,7 @@ class TestSecurityAssetIntegration:
             exit_code = determine_exit_code(results)
 
             # Should scan successfully
-            assert results["success"] is True, f"Scan failed for {malicious_file.name}"
+            assert results.success is True, f"Scan failed for {malicious_file.name}"
 
             # For files that can be scanned with available scanners, should detect issues
             if exit_code == 0:
@@ -142,11 +142,13 @@ class TestSecurityAssetIntegration:
             # Should detect security issues for files that can be properly scanned
             tested_files.append(malicious_file.name)
             assert exit_code == 1, f"Failed to detect malicious content in {malicious_file.name}"
-            assert len(results["issues"]) > 0, f"No issues found in {malicious_file.name}"
+            assert len(results.issues) > 0, f"No issues found in {malicious_file.name}"
 
             # Check for security-level issues
             security_issues = [
-                issue for issue in results["issues"] if issue.get("severity") in ["critical", "error", "warning"]
+                issue
+                for issue in results.issues
+                if getattr(issue, "severity", None) in ["critical", "error", "warning"]
             ]
             assert len(security_issues) > 0, f"No security issues found in {malicious_file.name}"
 
@@ -170,18 +172,18 @@ class TestSecurityAssetIntegration:
             results = scan_model_directory_or_file(str(safe_file))
             exit_code = determine_exit_code(results)
 
-            assert results["success"] is True, f"Scan failed for {safe_file.name}"
+            assert results.success is True, f"Scan failed for {safe_file.name}"
 
             # Any issues should be low-severity only (allow warnings but not critical/error)
             high_severity_issues = [
-                issue for issue in results["issues"] if issue.get("severity") in ["critical", "error"]
+                issue for issue in results.issues if getattr(issue, "severity", None) in ["critical", "error"]
             ]
             assert len(high_severity_issues) == 0, (
                 f"High-severity false positive in {safe_file.name}: {high_severity_issues}"
             )
 
             # Exit code should be 0 for clean files, or 1 for warnings-only (which is acceptable)
-            assert exit_code in [0, 1], f"Unexpected exit code {exit_code} for {safe_file.name}: {results['issues']}"
+            assert exit_code in [0, 1], f"Unexpected exit code {exit_code} for {safe_file.name}: {results.issues}"
 
             # If exit code is 1, make sure it's only due to warnings or info, not high-severity issues
             if exit_code == 1:
@@ -208,7 +210,7 @@ class TestSecurityAssetIntegration:
         if dill_func.exists():
             results = scan_model_directory_or_file(str(dill_func))
             exit_code = determine_exit_code(results)
-            assert results["success"] is True, "Should scan dill_func.pkl successfully"
+            assert results.success is True, "Should scan dill_func.pkl successfully"
             # dill_func.pkl should be flagged as suspicious (exit code 1) due to dill usage
             assert exit_code == 1, "dill_func.pkl should be flagged as suspicious due to dill usage"
 
@@ -223,7 +225,7 @@ class TestSecurityAssetIntegration:
         for scenario_dir in license_scenarios.iterdir():
             if scenario_dir.is_dir():
                 results = scan_model_directory_or_file(str(scenario_dir))
-                assert results["success"] is True, f"License scenario scan failed: {scenario_dir.name}"
+                assert results.success is True, f"License scenario scan failed: {scenario_dir.name}"
                 # License scenarios might have license issues but should scan successfully
 
     def test_security_scenarios(self, scenarios_dir):
@@ -240,7 +242,7 @@ class TestSecurityAssetIntegration:
 
                 # Security scenarios should be detected as malicious
                 assert exit_code == 1, f"Security scenario not detected: {scenario_dir.name}"
-                assert results["success"] is True, f"Scan failed for {scenario_dir.name}"
+                assert results.success is True, f"Scan failed for {scenario_dir.name}"
 
     def test_cli_organized_structure(self, samples_dir):
         """Test CLI scanning with organized structure."""
@@ -288,8 +290,8 @@ class TestSecurityAssetIntegration:
                 if copied_files:
                     # Scan the mixed directory
                     results = scan_model_directory_or_file(str(temp_path))
-                    assert results["success"] is True, "Mixed directory scan should succeed"
-                    assert results["files_scanned"] >= len(copied_files)
+                    assert results.success is True, "Mixed directory scan should succeed"
+                    assert results.files_scanned >= len(copied_files)
 
     def test_asset_discovery_completeness(self, assets_dir):
         """Test that asset discovery finds all expected file types."""
@@ -298,15 +300,15 @@ class TestSecurityAssetIntegration:
 
         # Scan the entire assets directory
         results = scan_model_directory_or_file(str(assets_dir))
-        assert results["success"] is True, "Assets directory scan should succeed"
+        assert results.success is True, "Assets directory scan should succeed"
 
         # Should find various file types
-        assert results["files_scanned"] > 0, "Should find some files to scan"
+        assert results.files_scanned > 0, "Should find some files to scan"
 
         # Check for different file extensions in issues (indicates they were processed)
         scanned_extensions = set()
-        for issue in results.get("issues", []):
-            location = issue.get("location", "")
+        for issue in results.issues:
+            location = getattr(issue, "location", "")
             if location:
                 ext = Path(location).suffix.lower()
                 if ext:
@@ -332,9 +334,9 @@ class TestSecurityAssetIntegration:
         duration = time.time() - start_time
 
         # Should complete in reasonable time
-        assert results["success"] is True, "Performance test scan should succeed"
+        assert results.success is True, "Performance test scan should succeed"
         assert duration < 30, f"Scan took too long: {duration:.2f}s"
 
         # Should provide performance metrics
-        assert "duration" in results, "Results should include timing information"
-        assert results["duration"] > 0, "Duration should be positive"
+        assert hasattr(results, "duration"), "Results should include timing information"
+        assert results.duration > 0, "Duration should be positive"

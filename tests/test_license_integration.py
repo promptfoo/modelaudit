@@ -54,7 +54,7 @@ class TestLicenseIntegration:
         assert len(nc_warnings) == 0, "MIT model should not trigger non-commercial warnings"
 
         # Check that MIT license is detected in metadata
-        file_metadata = results.get("file_metadata", {})
+        file_metadata = results.file_metadata if hasattr(results, "file_metadata") else {}
         license_detected = False
         for _file_path, metadata in file_metadata.items():
             licenses = metadata.get("license_info", [])
@@ -262,12 +262,12 @@ class TestLicenseIntegration:
         assert len(license_warnings) > 0, "Should generate license warnings"
 
         # Issues should include license warnings
-        all_issues = results.get("issues", [])
-        license_issues = [issue for issue in all_issues if issue.get("type") == "license_warning"]
+        all_issues = results.issues if hasattr(results, "issues") else []
+        license_issues = [issue for issue in all_issues if hasattr(issue, "type") and issue.type == "license_warning"]
         assert len(license_issues) > 0, "Should have license warning issues"
 
         # Should have AGPL warning
-        agpl_issues = [issue for issue in license_issues if "AGPL" in issue.get("message", "")]
+        agpl_issues = [issue for issue in license_issues if "AGPL" in getattr(issue, "message", "")]
         assert len(agpl_issues) > 0, "Should have AGPL warning issues"
 
     def test_copyright_detection(self, test_data_dir):

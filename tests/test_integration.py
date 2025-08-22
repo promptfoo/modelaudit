@@ -16,9 +16,9 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     )
 
     # Check basic results
-    assert results["success"] is True
-    assert results["files_scanned"] >= 4  # At least our 4 test files
-    assert results["bytes_scanned"] > 0
+    assert results.success is True
+    assert results.files_scanned >= 4  # At least our 4 test files
+    assert results.bytes_scanned > 0
 
     # Check progress callback was called
     assert len(mock_progress_callback.messages) > 0
@@ -36,19 +36,19 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
 
     # Should have found some issues overall (but not necessarily for each file)
     # Clean models might not have any issues, which is correct behavior
-    scanned_files = [issue.get("location") for issue in results["issues"] if issue.get("location")]
-    print(f"Debug: Found {len(results['issues'])} total issues")
+    scanned_files = [getattr(issue, "location", None) for issue in results.issues if getattr(issue, "location", None)]
+    print(f"Debug: Found {len(results.issues)} total issues")
     print(f"Debug: Issues locations: {scanned_files}")
 
     # Verify that the scan found and processed files
-    assert results["files_scanned"] > 0, "Should have scanned at least one file"
-    assert results["bytes_scanned"] >= 0, "Should have scanned some bytes"
+    assert results.files_scanned > 0, "Should have scanned at least one file"
+    assert results.bytes_scanned >= 0, "Should have scanned some bytes"
 
     # Validate exit code behavior
     expected_exit_code = determine_exit_code(results)
-    if results.get("has_errors", False):
+    if getattr(results, "has_errors", False):
         assert expected_exit_code == 2, f"Should return exit code 2 for operational errors, got {expected_exit_code}"
-    elif any(isinstance(issue, dict) and issue.get("severity") != "debug" for issue in results.get("issues", [])):
+    elif any(getattr(issue, "severity", None) != "debug" for issue in results.issues):
         assert expected_exit_code == 1, f"Should return exit code 1 for security issues, got {expected_exit_code}"
     else:
         assert expected_exit_code == 0, f"Should return exit code 0 for clean scan, got {expected_exit_code}"
@@ -106,9 +106,9 @@ def test_scan_with_all_options(temp_model_dir, mock_progress_callback):
         additional_option="test_value",
     )
 
-    assert results["success"] is True
-    assert results["files_scanned"] > 0
-    assert results["bytes_scanned"] > 0
+    assert results.success is True
+    assert results.files_scanned > 0
+    assert results.bytes_scanned > 0
 
     # Check progress callback was called
     assert len(mock_progress_callback.messages) > 0
@@ -166,8 +166,8 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     results2 = scan_model_directory_or_file(str(path2))
 
     # Filter debug issues from individual results to match CLI behavior (CLI filters debug by default)
-    results1_issues = [issue for issue in results1["issues"] if issue.get("severity") != "debug"]
-    results2_issues = [issue for issue in results2["issues"] if issue.get("severity") != "debug"]
+    results1_issues = [issue for issue in results1.issues if getattr(issue, "severity", None) != "debug"]
+    results2_issues = [issue for issue in results2.issues if getattr(issue, "severity", None) != "debug"]
 
     # Scan both files using CLI
     runner = CliRunner()
@@ -178,8 +178,8 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     combined_results = json.loads(result.output)
 
     # Combined results should have at least the sum of individual scans
-    assert combined_results["files_scanned"] >= results1["files_scanned"] + results2["files_scanned"]
-    assert combined_results["bytes_scanned"] >= results1["bytes_scanned"] + results2["bytes_scanned"]
+    assert combined_results["files_scanned"] >= results1.files_scanned + results2.files_scanned
+    assert combined_results["bytes_scanned"] >= results1.bytes_scanned + results2.bytes_scanned
     assert len(combined_results["issues"]) >= len(results1_issues) + len(results2_issues)
 
 
@@ -294,9 +294,9 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     results = scan_model_directory_or_file(str(savedmodel_path))
 
     # Basic assertions
-    assert results["success"] is True
-    assert results["files_scanned"] >= 1  # Should scan at least the savedmodel directory
-    assert results["bytes_scanned"] > 0  # Should have scanned some content
+    assert results.success is True
+    assert results.files_scanned >= 1  # Should scan at least the savedmodel directory
+    assert results.bytes_scanned > 0  # Should have scanned some content
 
     # Test using CLI
     runner = CliRunner()
@@ -333,8 +333,8 @@ def test_tensorflow_savedmodel_integration(tmp_path):
 
     # Test scanning the parent directory containing the SavedModel
     parent_results = scan_model_directory_or_file(str(tmp_path))
-    assert parent_results["success"] is True
-    assert parent_results["files_scanned"] >= 1
+    assert parent_results.success is True
+    assert parent_results.files_scanned >= 1
 
     # Test CLI scanning of parent directory
     parent_result = runner.invoke(cli, ["scan", str(tmp_path), "--format", "json"])
@@ -379,9 +379,9 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
     results = scan_model_directory_or_file(str(savedmodel_path))
 
     # Should complete successfully regardless of whether anomalies are detected
-    assert results["success"] is True
-    assert results["files_scanned"] >= 1
-    assert results["bytes_scanned"] > 0
+    assert results.success is True
+    assert results.files_scanned >= 1
+    assert results.bytes_scanned > 0
 
     # The weight distribution scanner should have been applied
     # (but may or may not find issues depending on the specific weight values)
