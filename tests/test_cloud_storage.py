@@ -146,11 +146,19 @@ class TestCloudObjectSize:
         """Test getting total size of a directory."""
         fs = MagicMock()
         fs.info.return_value = {}  # No size means it's a directory
-        fs.ls.return_value = [
-            {"size": 1024 * 1024},  # 1 MB
-            {"size": 2048 * 1024},  # 2 MB
-            {"size": 512 * 1024},  # 0.5 MB
-        ]
+
+        def ls_side_effect(path, detail=True):
+            if path == "s3://bucket/dir/":
+                return [
+                    {"name": "s3://bucket/dir/file1.bin", "size": 1024 * 1024, "type": "file"},
+                    {"name": "s3://bucket/dir/subdir", "type": "directory"},
+                    {"name": "s3://bucket/dir/file2.bin", "size": 2048 * 1024, "type": "file"},
+                ]
+            elif path == "s3://bucket/dir/subdir":
+                return [{"name": "s3://bucket/dir/subdir/file3.bin", "size": 512 * 1024, "type": "file"}]
+            return []
+
+        fs.ls.side_effect = ls_side_effect
 
         size = get_cloud_object_size(fs, "s3://bucket/dir/")
         assert size == (1024 + 2048 + 512) * 1024  # 3.5 MB
