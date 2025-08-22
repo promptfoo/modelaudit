@@ -68,7 +68,7 @@ class FileMetadataModel(BaseModel):
     opcode_count: Optional[int] = Field(None, description="Number of opcodes for pickle files")
     suspicious_count: Optional[int] = Field(None, description="Count of suspicious patterns")
     license_info: list[Any] = Field(default_factory=list, description="License information")
-    copyright_notices: list[str] = Field(default_factory=list, description="Copyright notices")
+    copyright_notices: list[Any] = Field(default_factory=list, description="Copyright notices")
     license_files_nearby: list[str] = Field(default_factory=list, description="License files found nearby")
     is_dataset: Optional[bool] = Field(None, description="Whether file appears to be a dataset")
     is_model: Optional[bool] = Field(None, description="Whether file appears to be a model")
