@@ -1193,7 +1193,7 @@ def scan_command(
         click.echo(output_text)
 
     # Exit with appropriate error code based on scan results
-    exit_code = determine_exit_code(audit_result.model_dump())
+    exit_code = determine_exit_code(audit_result)
     sys.exit(exit_code)
 
 

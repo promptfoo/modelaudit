@@ -237,14 +237,14 @@ class TestNestedPickleIntegration:
 
             # Should detect malicious files (exit code 1)
             assert exit_code == 1, "Should detect malicious files in mixed directory"
-            assert results["success"] is True, "Scan should complete successfully"
-            assert results["files_scanned"] >= len(copied_files)
+            assert results.success is True, "Scan should complete successfully"
+            assert results.files_scanned >= len(copied_files)
 
             # Should have both safe and malicious results
             nested_issues = [
                 issue
-                for issue in results["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                for issue in results.issues
+                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
             ]
 
             # Should detect the malicious files
