@@ -397,12 +397,12 @@ def scan_command(
     verbose: bool,
     max_file_size: int,
     max_total_size: int,
-    registry_uri: str | None,
-    jfrog_api_token: str | None,
-    jfrog_access_token: str | None,
-    max_download_size: str | None,
+    registry_uri: Optional[str],
+    jfrog_api_token: Optional[str],
+    jfrog_access_token: Optional[str],
+    max_download_size: Optional[str],
     cache: bool,
-    cache_dir: str | None,
+    cache_dir: Optional[str],
     no_skip_files: bool,
     strict_license: bool,
     preview: bool,
@@ -410,7 +410,7 @@ def scan_command(
     stream: bool,
     large_model_support: bool,
     progress: bool,
-    progress_log: str | None,
+    progress_log: Optional[str],
     progress_format: str,
     progress_interval: float,
 ) -> None:
@@ -1048,13 +1048,13 @@ def scan_command(
                     if result_issues:
                         # Filter out DEBUG severity issues when not in verbose mode
                         # scan_results is ModelAuditResultModel
-                        visible_issues = [issue for issue in result_issues if verbose or issue.severity != "debug"]
+                        visible_issues = [issue for issue in result_issues if verbose or issue.severity != IssueSeverity.DEBUG]
                         issue_count = len(visible_issues)
 
                         if issue_count > 0:
                             # Determine severity for coloring
                             # scan_results is ModelAuditResultModel
-                            has_critical = any(issue.severity == "critical" for issue in visible_issues)
+                            has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 if has_critical:
@@ -1142,7 +1142,7 @@ def scan_command(
 
                         interruption_issue = Issue(
                             message="Scan interrupted by user",
-                            severity="info",
+                            severity=IssueSeverity.INFO,
                             location=None,
                             details={"interrupted": True},
                             timestamp=time.time(),
@@ -1217,8 +1217,8 @@ def scan_command(
         if verbose:
             visible_issues = audit_result.issues  # In verbose mode, show all issues including debug
             if visible_issues:
-                critical_count = len([i for i in visible_issues if i.severity == "critical"])
-                warning_count = len([i for i in visible_issues if i.severity == "warning"])
+                critical_count = len([i for i in visible_issues if i.severity == IssueSeverity.CRITICAL])
+                warning_count = len([i for i in visible_issues if i.severity == IssueSeverity.WARNING])
                 if critical_count > 0:
                     click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
                 elif warning_count > 0:

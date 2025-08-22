@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 
 class FrameworkType(Enum):
@@ -339,7 +339,7 @@ class FrameworkKnowledgeBase:
 
         return pattern.risk_level in ["safe", "low"]
 
-    def get_framework_from_imports(self, imports: list[str]) -> FrameworkType | None:
+    def get_framework_from_imports(self, imports: list[str]) -> Optional[FrameworkType]:
         """Detect framework from import statements."""
         import_str = " ".join(imports).lower()
 

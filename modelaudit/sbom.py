@@ -293,8 +293,8 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     bom = Bom()
 
     # Use Pydantic models directly
-    issues: list[Issue] = results.issues
-    file_metadata: dict[str, FileMetadataModel] = results.file_metadata
+    issues: list[Issue] = results.issues or []
+    file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
 
     for input_path in paths:
         if os.path.isdir(input_path):

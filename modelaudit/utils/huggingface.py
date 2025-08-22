@@ -100,7 +100,7 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {url}: {e!s}") from e
 
 
-def get_model_size(repo_id: str) -> int | None:
+def get_model_size(repo_id: str) -> Optional[int]:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -128,7 +128,7 @@ def get_model_size(repo_id: str) -> int | None:
         return None
 
 
-def download_model(url: str, cache_dir: Path | None = None, show_progress: bool = True) -> Path:
+def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
     """Download a model from HuggingFace.
 
     Args:

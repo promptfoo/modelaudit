@@ -17,11 +17,11 @@ class PhaseStats:
 
     phase: ProgressPhase
     start_time: float = field(default_factory=time.time)
-    end_time: float | None = None
+    end_time: Optional[float] = None
     bytes_processed: int = 0
     items_processed: int = 0
     estimated_duration: float = 0.0
-    actual_duration: float | None = None
+    actual_duration: Optional[float] = None
 
     @property
     def is_complete(self) -> bool:
@@ -156,7 +156,7 @@ class MultiPhaseProgressTracker(ProgressTracker):
         """Get statistics for all phases."""
         return self._phase_stats.copy()
 
-    def get_current_phase_stats(self) -> PhaseStats | None:
+    def get_current_phase_stats(self) -> Optional[PhaseStats]:
         """Get statistics for current phase."""
         return self._phase_stats.get(self.stats.current_phase)
 
@@ -291,7 +291,7 @@ class MultiPhaseProgressTracker(ProgressTracker):
 class CheckpointProgressTracker(MultiPhaseProgressTracker):
     """Progress tracker with checkpoint/resume capability."""
 
-    def __init__(self, phases: list[ProgressPhase], checkpoint_file: str | None = None, **kwargs):
+    def __init__(self, phases: list[ProgressPhase], checkpoint_file: Optional[str] = None, **kwargs):
         """Initialize checkpoint progress tracker.
 
         Args:

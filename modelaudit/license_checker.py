@@ -12,12 +12,12 @@ import requests
 class LicenseInfo:
     """Information about a detected license."""
 
-    spdx_id: str | None = None
-    name: str | None = None
-    commercial_allowed: bool | None = None
+    spdx_id: Optional[str] = None
+    name: Optional[str] = None
+    commercial_allowed: Optional[bool] = None
     source: str = "unknown"  # Where the license was detected from
     confidence: float = 0.0  # Confidence score (0.0 to 1.0)
-    text: str | None = None
+    text: Optional[str] = None
 
 
 @dataclass
@@ -25,7 +25,7 @@ class CopyrightInfo:
     """Information about detected copyright notices."""
 
     holder: str
-    year: str | None = None
+    year: Optional[str] = None
     text: str = ""
 
 

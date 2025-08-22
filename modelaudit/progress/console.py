@@ -1,6 +1,7 @@
 """Console-based progress reporting with tqdm integration."""
 
 import sys
+from typing import Optional
 
 from .base import ProgressPhase, ProgressReporter, ProgressStats
 
@@ -51,11 +52,11 @@ class ConsoleProgressReporter(ProgressReporter):
         if disable_on_non_tty and not sys.stdout.isatty():
             self.use_tqdm = False
 
-        self._byte_pbar: tqdm | None = None
-        self._item_pbar: tqdm | None = None
+        self._byte_pbar: Optional[tqdm] = None
+        self._item_pbar: Optional[tqdm] = None
         self._current_phase = ProgressPhase.INITIALIZING
 
-    def _create_byte_progress_bar(self, stats: ProgressStats) -> "tqdm | None":
+    def _create_byte_progress_bar(self, stats: ProgressStats) -> "Optional[tqdm]":
         """Create byte-level progress bar."""
         if not self.use_tqdm or not self.show_bytes or stats.total_bytes <= 0:
             return None

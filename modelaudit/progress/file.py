@@ -3,7 +3,7 @@
 import json
 import time
 from pathlib import Path
-from typing import TextIO
+from typing import Optional, TextIO
 
 from .base import ProgressPhase, ProgressReporter, ProgressStats
 
@@ -42,7 +42,7 @@ class FileProgressReporter(ProgressReporter):
 
         # Open file
         mode = "a" if append_mode else "w"
-        self._file: TextIO | None = open(self.log_file, mode, encoding="utf-8")  # type: ignore[assignment] # noqa: SIM115
+        self._file: Optional[TextIO] = open(self.log_file, mode, encoding="utf-8")  # type: ignore[assignment] # noqa: SIM115
 
         # Write header for new files
         if not append_mode or self.log_file.stat().st_size == 0:
@@ -253,7 +253,7 @@ class CSVProgressReporter(ProgressReporter):
 
         # Open CSV file
         mode = "a" if append_mode else "w"
-        self._file: TextIO | None = open(self.csv_file, mode, encoding="utf-8")  # type: ignore[assignment] # noqa: SIM115
+        self._file: Optional[TextIO] = open(self.csv_file, mode, encoding="utf-8")  # type: ignore[assignment] # noqa: SIM115
 
         if write_header:
             self._write_header()

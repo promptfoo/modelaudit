@@ -164,9 +164,7 @@ class TestFileTypeValidationDemo:
         security_issues = [
             issue
             for issue in results["issues"]
-            if any(
-                keyword in issue.message.lower() for keyword in ["spoofing", "security", "validation failed"]
-            )
+            if any(keyword in issue.message.lower() for keyword in ["spoofing", "security", "validation failed"])
         ]
 
         print("📁 Mixed Directory (legitimate + malicious):")

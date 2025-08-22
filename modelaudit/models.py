@@ -5,12 +5,12 @@ JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
 import time
-from typing import TYPE_CHECKING, Any, Optional, Union, List, Dict
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 if TYPE_CHECKING:
-    from .scanners.base import Check, Issue
+    from .scanners.base import Check, CheckStatus, Issue
 
 # We'll use forward references and rebuild models after imports
 
@@ -87,9 +87,9 @@ class AssetModel(BaseModel, DictCompatMixin):
     path: str = Field(..., description="Path to the asset")
     type: str = Field(..., description="Type of asset (e.g., 'pickle')")
     size: Optional[int] = Field(None, description="Size of the asset in bytes")
-    tensors: Optional[List[str]] = Field(None, description="List of tensor names (for safetensors)")
-    keys: Optional[List[str]] = Field(None, description="List of keys (for JSON manifests)")
-    contents: Optional[List[Dict[str, Any]]] = Field(None, description="Contents list (for ZIP files)")
+    tensors: Optional[list[str]] = Field(None, description="List of tensor names (for safetensors)")
+    keys: Optional[list[str]] = Field(None, description="List of keys (for JSON manifests)")
+    contents: Optional[list[dict[str, Any]]] = Field(None, description="Contents list (for ZIP files)")
 
     # Dictionary-like access provided by DictCompatMixin
 
@@ -102,8 +102,8 @@ class MLFrameworkInfo(BaseModel):
     name: Optional[str] = Field(None, description="Framework name (e.g., 'pytorch', 'tensorflow')")
     version: Optional[str] = Field(None, description="Detected version if available")
     confidence: float = Field(0.0, description="Confidence in detection (0.0 to 1.0)", ge=0.0, le=1.0)
-    indicators: Optional[List[str]] = Field(default_factory=list, description="Patterns that indicated this framework")
-    file_patterns: Optional[List[str]] = Field(default_factory=list, description="File patterns that matched")
+    indicators: Optional[list[str]] = Field(default_factory=list, description="Patterns that indicated this framework")
+    file_patterns: Optional[list[str]] = Field(default_factory=list, description="File patterns that matched")
 
 
 class WeightAnalysisModel(BaseModel):
@@ -130,12 +130,12 @@ class MLContextModel(BaseModel):
     )
 
     # Framework detection
-    frameworks: Optional[Dict[str, MLFrameworkInfo]] = Field(
+    frameworks: dict[str, MLFrameworkInfo] = Field(
         default_factory=dict, description="Detected ML frameworks with details"
     )
     overall_confidence: float = Field(0.0, description="Overall ML content confidence score", ge=0.0, le=1.0)
     is_ml_content: bool = Field(False, description="Whether content is ML-related")
-    detected_patterns: Optional[List[str]] = Field(default_factory=list, description="Detected ML patterns")
+    detected_patterns: list[str] = Field(default_factory=list, description="Detected ML patterns")
 
     # Weight analysis
     weight_analysis: Optional[WeightAnalysisModel] = Field(None, description="Analysis of potential weight data")
@@ -148,15 +148,17 @@ class MLContextModel(BaseModel):
     # Training metadata
     training_framework: Optional[str] = Field(None, description="Framework likely used for training")
     precision_type: Optional[str] = Field(None, description="Detected precision (fp32, fp16, int8, etc.)")
-    optimization_hints: Optional[List[str]] = Field(default_factory=list, description="Detected optimization techniques")
+    optimization_hints: list[str] = Field(
+        default_factory=list, description="Detected optimization techniques"
+    )
 
     def add_framework(
         self,
         name: str,
         confidence: float,
         version: Optional[str] = None,
-        indicators: Optional[List[str]] = None,
-        file_patterns: Optional[List[str]] = None,
+        indicators: Optional[list[str]] = None,
+        file_patterns: Optional[list[str]] = None,
     ) -> None:
         """Add framework detection with validation"""
         framework_info = MLFrameworkInfo(
@@ -216,7 +218,7 @@ class FileHashesModel(BaseModel):
         """Check if any hash is present"""
         return any([self.md5, self.sha1, self.sha256, self.sha512])
 
-    def get_strongest_hash(self) -> tuple[str, str] | None:
+    def get_strongest_hash(self) -> Optional[tuple[str, str]]:
         """Get the strongest available hash as (algorithm, hash) tuple"""
         if self.sha512:
             return ("sha512", self.sha512)
@@ -251,13 +253,13 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
 
     # License and copyright information
     license: Optional[str] = Field(None, description="Legacy license field for backward compatibility")
-    license_info: Optional[List[LicenseInfoModel]] = Field(
+    license_info: list[LicenseInfoModel] = Field(
         default_factory=list, description="Structured license information"
     )
-    copyright_notices: Optional[List[CopyrightNoticeModel]] = Field(
+    copyright_notices: list[CopyrightNoticeModel] = Field(
         default_factory=list, description="Structured copyright notices"
     )
-    license_files_nearby: Optional[List[str]] = Field(default_factory=list, description="License files found nearby")
+    license_files_nearby: list[str] = Field(default_factory=list, description="License files found nearby")
 
     # File classification
     is_dataset: Optional[bool] = Field(None, description="Whether file appears to be a dataset")
@@ -341,13 +343,13 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
     # Core scan results
     bytes_scanned: int = Field(..., description="Total bytes scanned")
-    issues: Optional[List["Issue"]] = Field(default_factory=list, description="List of security issues found")
-    checks: Optional[List["Check"]] = Field(default_factory=list, description="List of all checks performed")
+    issues: list["Issue"] = Field(default_factory=list, description="List of security issues found")
+    checks: list["Check"] = Field(default_factory=list, description="List of all checks performed")
     files_scanned: int = Field(..., description="Number of files scanned")
-    assets: Optional[List[AssetModel]] = Field(default_factory=list, description="List of scanned assets")
+    assets: list[AssetModel] = Field(default_factory=list, description="List of scanned assets")
     has_errors: bool = Field(..., description="Whether any critical issues were found")
-    scanner_names: Optional[List[str]] = Field(default_factory=list, description="Names of scanners used")
-    file_metadata: Optional[Dict[str, FileMetadataModel]] = Field(
+    scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
+    file_metadata: dict[str, FileMetadataModel] = Field(
         default_factory=dict, description="Metadata for each file"
     )
 
@@ -363,7 +365,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Legacy compatibility
     success: bool = Field(default=True, description="Whether the scan completed successfully")
 
-    def aggregate_scan_result(self, results: "Union[Dict[str, Any], ModelAuditResultModel]") -> None:
+    def aggregate_scan_result(self, results: "Union[dict[str, Any], ModelAuditResultModel]") -> None:
         """Efficiently aggregate scan results into this model.
 
         This method updates the current model in-place for performance.
@@ -481,9 +483,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
     def _finalize_checks(self) -> None:
         """Calculate check statistics."""
+        from .scanners.base import CheckStatus
+        
         self.total_checks = len(self.checks)
-        self.passed_checks = sum(1 for c in self.checks if c.status == "passed")
-        self.failed_checks = sum(1 for c in self.checks if c.status == "failed")
+        self.passed_checks = sum(1 for c in self.checks if c.status == CheckStatus.PASSED)
+        self.failed_checks = sum(1 for c in self.checks if c.status == CheckStatus.FAILED)
 
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues based on message, severity, and location."""
@@ -658,7 +662,7 @@ class ScanConfigModel(BaseModel):
     chunk_size: int = Field(default=8192, description="Chunk size for streaming operations", gt=0)
 
     # Advanced options
-    blacklist_patterns: Optional[List[str]] = Field(None, description="Patterns to blacklist during scanning")
+    blacklist_patterns: Optional[list[str]] = Field(default=None, description="Patterns to blacklist during scanning")
     enable_large_model_support: bool = Field(True, description="Enable optimizations for large models")
     include_license_scan: bool = Field(True, description="Include license scanning in results")
     enable_network_detection: bool = Field(True, description="Enable network communication detection")
@@ -769,6 +773,6 @@ def rebuild_models() -> None:
 
     except ImportError:
         # If scanner models aren't available, just use Any
-        globals()["Issue"] = Any  # type: ignore
-        globals()["Check"] = Any  # type: ignore
+        globals()["Issue"] = Any
+        globals()["Check"] = Any
         ModelAuditResultModel.model_rebuild()

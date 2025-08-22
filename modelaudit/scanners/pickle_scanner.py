@@ -2450,24 +2450,24 @@ class PickleScanner(BaseScanner):
         context: str = "",
     ) -> None:
         """Check for JIT/Script code execution risks in pickle data.
-        
+
         Args:
             file_data: The binary file data to analyze
-            result: ScanResult to add findings to  
+            result: ScanResult to add findings to
             model_type: Type of model being scanned (e.g., 'pytorch')
             context: Context path for reporting
         """
         # Check if JIT script detection is enabled
         if not self.config.get("check_jit_script", True):
             return
-            
+
         try:
             from modelaudit.jit_script_detector import JITScriptDetector
-            from modelaudit.models import JITScriptFinding
-            
+            # from modelaudit.models import JITScriptFinding  # Imported but not used directly
+
             # Create JIT script detector
             detector = JITScriptDetector(self.config)
-            
+
             # Scan for JIT script patterns based on model type
             findings = []
             if model_type.lower() == "pytorch":
@@ -2479,24 +2479,24 @@ class PickleScanner(BaseScanner):
             else:
                 # Try to detect model type automatically
                 findings = detector.scan_model(file_data, context)
-            
+
             # Convert findings to Check objects
             if findings:
-                failed_findings = [f for f in findings if getattr(f, 'severity', '') in ['CRITICAL', 'WARNING']]
+                failed_findings = [f for f in findings if getattr(f, "severity", "") in ["CRITICAL", "WARNING"]]
                 if failed_findings:
                     # Add a failed check for JIT/Script risks
                     details = {
                         "findings_count": len(findings),
-                        "critical_findings": len([f for f in findings if getattr(f, 'severity', '') == 'CRITICAL']),
-                        "warning_findings": len([f for f in findings if getattr(f, 'severity', '') == 'WARNING']),
-                        "patterns": [getattr(f, 'pattern', '') for f in findings[:5]]  # First 5 patterns
+                        "critical_findings": len([f for f in findings if getattr(f, "severity", "") == "CRITICAL"]),
+                        "warning_findings": len([f for f in findings if getattr(f, "severity", "") == "WARNING"]),
+                        "patterns": [getattr(f, "pattern", "") for f in findings[:5]],  # First 5 patterns
                     }
-                    
+
                     # Add specific details for dangerous operations
                     for finding in findings[:3]:  # Include details for first 3 findings
-                        if hasattr(finding, 'message') and 'torch.ops.aten.system' in str(finding.message):
+                        if hasattr(finding, "message") and "torch.ops.aten.system" in str(finding.message):
                             details["torch.ops.aten.system"] = str(finding.message)
-                    
+
                     result.add_check(
                         name="JIT/Script Code Execution Risk",
                         passed=False,
@@ -2504,30 +2504,30 @@ class PickleScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=context,
                         details=details,
-                        why="JIT/Script code can execute arbitrary operations that bypass security controls"
+                        why="JIT/Script code can execute arbitrary operations that bypass security controls",
                     )
                 else:
                     # Add a passed check
                     result.add_check(
-                        name="JIT/Script Code Execution Risk", 
+                        name="JIT/Script Code Execution Risk",
                         passed=True,
                         message="No high-risk JIT/Script patterns detected",
                         severity=IssueSeverity.INFO,
                         location=context,
                         details={"findings_count": len(findings)},
-                        why="JIT/Script analysis completed with no critical security risks"
+                        why="JIT/Script analysis completed with no critical security risks",
                     )
             else:
                 # No findings at all - add a passed check
                 result.add_check(
                     name="JIT/Script Code Execution Risk",
-                    passed=True, 
+                    passed=True,
                     message="No JIT/Script patterns detected",
                     severity=IssueSeverity.INFO,
                     location=context,
-                    why="File contains no detectable JIT/Script code execution patterns"
+                    why="File contains no detectable JIT/Script code execution patterns",
                 )
-                
+
         except ImportError:
             # JIT script detector not available
             result.add_check(
@@ -2537,7 +2537,7 @@ class PickleScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=context,
                 details={"error": "JIT script detector dependencies not installed"},
-                why="JIT/Script detection requires additional dependencies"
+                why="JIT/Script detection requires additional dependencies",
             )
         except Exception as e:
             # Error during JIT script detection
@@ -2548,5 +2548,5 @@ class PickleScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=context,
                 details={"error": str(e), "error_type": type(e).__name__},
-                why="JIT/Script detection encountered an unexpected error"
+                why="JIT/Script detection encountered an unexpected error",
             )

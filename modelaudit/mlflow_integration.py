@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 def scan_mlflow_model(
     model_uri: str,
     *,
-    registry_uri: str | None = None,
+    registry_uri: Optional[str] = None,
     timeout: int = 3600,
     blacklist_patterns: Optional[list[str]] = None,
     max_file_size: int = 0,

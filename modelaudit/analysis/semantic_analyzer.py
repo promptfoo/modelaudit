@@ -4,7 +4,7 @@ import ast
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 
 class CodeRiskLevel(Enum):
@@ -85,7 +85,7 @@ class SemanticAnalyzer:
             r"pickle\.load\s*\(\s*open\s*\(\s*['\"][\w/\-_\.]+\.pkl['\"]": "model_loading",
         }
 
-    def extract_code_context(self, code: str) -> CodeContext | None:
+    def extract_code_context(self, code: str) -> Optional[CodeContext]:
         """Extract comprehensive context from Python code."""
         try:
             tree = ast.parse(code)

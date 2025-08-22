@@ -7,7 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Optional, Union, List
+from typing import Any, ClassVar, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 

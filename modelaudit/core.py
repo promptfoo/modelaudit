@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, Union, Dict, List, Tuple
+from typing import IO, Any, Callable, Optional, Union
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -290,7 +290,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
     """Extract severity and explanation from failed checks.
 
     Args:

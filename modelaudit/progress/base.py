@@ -307,7 +307,7 @@ class ProgressTracker:
             self.stats.status_message = message
             self._maybe_report_progress()
 
-    def set_totals(self, total_bytes: int | None = None, total_items: int | None = None) -> None:
+    def set_totals(self, total_bytes: Optional[int] = None, total_items: Optional[int] = None) -> None:
         """Update total counts.
 
         Args:

@@ -529,7 +529,9 @@ test,data
         results = scan_model_directory_or_file(str(test_file))
 
         # Should have license warning
-        license_issues = [issue for issue in results.get("issues", []) if getattr(issue, "type", None) == "license_warning"]
+        license_issues = [
+            issue for issue in results.get("issues", []) if getattr(issue, "type", None) == "license_warning"
+        ]
 
         assert len(license_issues) > 0
         assert any("Non-commercial" in issue.message for issue in license_issues)

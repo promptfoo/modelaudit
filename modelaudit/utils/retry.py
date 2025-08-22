@@ -16,7 +16,7 @@ T = TypeVar("T")
 class RetryError(Exception):
     """Raised when all retry attempts fail."""
 
-    def __init__(self, message: str, last_error: Exception | None = None):
+    def __init__(self, message: str, last_error: Optional[Exception] = None):
         super().__init__(message)
         self.last_error = last_error
 

@@ -2,6 +2,7 @@
 
 import shutil
 from pathlib import Path
+from typing import Optional
 
 
 def get_free_space_bytes(path: Path) -> int:
@@ -53,7 +54,7 @@ def format_bytes(num_bytes: int) -> str:
     return f"{value:.1f} PB"
 
 
-def estimate_model_size(url: str) -> int | None:
+def estimate_model_size(url: str) -> Optional[int]:
     """Estimate the size of a model based on URL or metadata.
 
     This is a best-effort estimation. Returns None if size cannot be determined.
