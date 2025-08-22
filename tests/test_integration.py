@@ -165,6 +165,10 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     results1 = scan_model_directory_or_file(str(path1))
     results2 = scan_model_directory_or_file(str(path2))
 
+    # Filter debug issues from individual results to match CLI behavior (CLI filters debug by default)
+    results1_issues = [issue for issue in results1.issues if getattr(issue, "severity", None) != "debug"]
+    results2_issues = [issue for issue in results2.issues if getattr(issue, "severity", None) != "debug"]
+
     # Scan both files using CLI
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(path1), str(path2), "--format", "json"])
@@ -173,11 +177,10 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     assert result.exit_code in [0, 1]
     combined_results = json.loads(result.output)
 
-    # Combined results should have at least the sum of individual scans for files and bytes
+    # Combined results should have at least the sum of individual scans
     assert combined_results["files_scanned"] >= results1.files_scanned + results2.files_scanned
     assert combined_results["bytes_scanned"] >= results1.bytes_scanned + results2.bytes_scanned
-    # Issues might be deduplicated or filtered differently in combined scan - just check it's valid
-    assert isinstance(combined_results["issues"], list)
+    assert len(combined_results["issues"]) >= len(results1_issues) + len(results2_issues)
 
 
 def test_file_type_validation_integration(tmp_path):
