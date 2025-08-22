@@ -40,7 +40,11 @@ rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
 rye run mypy modelaudit/                 # Type checking
 npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, JSON files
 
-# CI Checks - ALWAYS run these before committing:
+# Pre-Push Validation Pipeline - ALWAYS run these before pushing:
+# This catches CI issues locally in ~30 seconds instead of waiting 3-5 minutes for remote CI
+./scripts/pre-push-validation.sh  # Or run commands below manually
+
+# Manual Pre-Push Commands (run in sequence):
 # 1. rye run ruff format modelaudit/ tests/
 # 2. rye run ruff check modelaudit/ tests/  # IMPORTANT: Check without --fix first!
 # 3. rye run ruff check --fix modelaudit/ tests/  # Then fix any issues
@@ -219,3 +223,130 @@ docker run -v $(pwd):/data modelaudit /data/model.pkl
 - Reference related issues when applicable
 - Ensure all CI checks pass before requesting review
 - **PR titles must follow Conventional Commits format** (validated by CI)
+
+## CI Optimization Guide
+
+### Pre-Push Validation (Essential)
+
+**The Golden Rule**: Validate locally before pushing to get instant feedback instead of waiting 3-5 minutes for CI.
+
+```bash
+# Fast-fail approach - exit on first error to save time
+set -e
+
+# 1. Format check (fail fast if not formatted)
+rye run ruff format --check modelaudit/ tests/ || {
+    echo "❌ Format check failed - running formatter..."
+    rye run ruff format modelaudit/ tests/
+}
+
+# 2. Lint check (must be clean before proceeding)
+rye run ruff check modelaudit/ tests/ || exit 1
+
+# 3. Type checking
+rye run mypy modelaudit/ || exit 1
+
+# 4. Quick tests (target your changes)
+# See "Smart Test Execution" section below
+
+# 5. Documentation formatting (if changed)
+npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+```
+
+### Smart Test Execution
+
+Target tests related to your changes for faster feedback:
+
+```bash
+# For scanner changes
+rye run pytest tests/test_*scanner*.py -k "not slow" -v
+
+# For filetype/core changes
+rye run pytest tests/test_filetype.py tests/test_core*.py -v
+
+# For utility changes
+rye run pytest tests/test_utils/ -v
+
+# For specific module (example: pickle_scanner.py changes)
+rye run pytest tests/test_pickle_scanner.py -v
+
+# Full fast test suite (when unsure)
+rye run pytest -n auto -m "not slow and not integration and not performance" -v
+```
+
+### Branch Hygiene
+
+Clean merges prevent CI conflicts:
+
+```bash
+# Before making changes - get latest main
+git fetch origin main
+git merge --no-edit origin/main
+
+# After changes - validate before pushing
+./scripts/pre-push-validation.sh  # Or manual commands above
+git push origin your-branch-name
+```
+
+### CI Status Monitoring
+
+Efficient CI status checking:
+
+```bash
+# Check only failed/in-progress checks
+gh pr view <PR_NUMBER> --json statusCheckRollup --jq '
+  .statusCheckRollup[] | 
+  select(.status == "IN_PROGRESS" or .conclusion == "FAILURE") |
+  {name: .name, status: .status, conclusion: .conclusion}
+'
+
+# Monitor specific check
+gh pr view <PR_NUMBER> --json statusCheckRollup --jq '
+  .statusCheckRollup[] | 
+  select(.name == "Lint and Format") |
+  {name: .name, conclusion: .conclusion}
+'
+
+# Quick overall status
+gh pr view <PR_NUMBER> --json statusCheckRollup --jq '
+  [.statusCheckRollup[] | select(.conclusion == "SUCCESS")] | length
+' && echo "checks passing"
+```
+
+### Fast-Fail Patterns
+
+Exit early on failures to save development time:
+
+```bash
+# Example validation script
+#!/bin/bash
+set -e  # Exit on any failure
+
+echo "🔍 Checking format..."
+rye run ruff format --check . || { 
+    echo "❌ Format issues found - run: rye run ruff format ."
+    exit 1 
+}
+
+echo "🔍 Checking lint..."
+rye run ruff check . || { 
+    echo "❌ Lint issues found - run: rye run ruff check --fix ."
+    exit 1 
+}
+
+echo "🔍 Type checking..."
+rye run mypy modelaudit/ || exit 1
+
+echo "🔍 Running targeted tests..."
+# Add your specific test commands here based on changes
+
+echo "✅ All checks passed - safe to push!"
+```
+
+### Performance Tips
+
+- **Local validation takes ~30 seconds vs 3-5 minutes in CI**
+- **Target specific test files** instead of running full suite during development
+- **Use `--maxfail=1`** with pytest to exit on first test failure
+- **Check CI status efficiently** with jq filters to reduce noise
+- **Keep branches clean** - merge main regularly to avoid conflicts
