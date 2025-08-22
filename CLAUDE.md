@@ -40,11 +40,7 @@ rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
 rye run mypy modelaudit/                 # Type checking
 npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, JSON files
 
-# Pre-Push Validation Pipeline - ALWAYS run these before pushing:
-# This catches CI issues locally in ~30 seconds instead of waiting 3-5 minutes for remote CI
-./scripts/pre-push-validation.sh  # Or run commands below manually
-
-# Manual Pre-Push Commands (run in sequence):
+# CI Checks - ALWAYS run these before committing:
 # 1. rye run ruff format modelaudit/ tests/
 # 2. rye run ruff check modelaudit/ tests/  # IMPORTANT: Check without --fix first!
 # 3. rye run ruff check --fix modelaudit/ tests/  # Then fix any issues
@@ -284,7 +280,7 @@ git fetch origin main
 git merge --no-edit origin/main
 
 # After changes - validate before pushing
-./scripts/pre-push-validation.sh  # Or manual commands above
+# Run manual validation commands from above
 git push origin your-branch-name
 ```
 
@@ -295,14 +291,14 @@ Efficient CI status checking:
 ```bash
 # Check only failed/in-progress checks
 gh pr view <PR_NUMBER> --json statusCheckRollup --jq '
-  .statusCheckRollup[] | 
+  .statusCheckRollup[] |
   select(.status == "IN_PROGRESS" or .conclusion == "FAILURE") |
   {name: .name, status: .status, conclusion: .conclusion}
 '
 
 # Monitor specific check
 gh pr view <PR_NUMBER> --json statusCheckRollup --jq '
-  .statusCheckRollup[] | 
+  .statusCheckRollup[] |
   select(.name == "Lint and Format") |
   {name: .name, conclusion: .conclusion}
 '
@@ -323,15 +319,15 @@ Exit early on failures to save development time:
 set -e  # Exit on any failure
 
 echo "🔍 Checking format..."
-rye run ruff format --check . || { 
+rye run ruff format --check . || {
     echo "❌ Format issues found - run: rye run ruff format ."
-    exit 1 
+    exit 1
 }
 
 echo "🔍 Checking lint..."
-rye run ruff check . || { 
+rye run ruff check . || {
     echo "❌ Lint issues found - run: rye run ruff check --fix ."
-    exit 1 
+    exit 1
 }
 
 echo "🔍 Type checking..."
