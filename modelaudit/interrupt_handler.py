@@ -115,7 +115,6 @@ class InterruptHandler:
         with self._lock:
             # Double-check inside lock (in case state changed)
             if self._active:
-                yield
                 return
 
             try:
