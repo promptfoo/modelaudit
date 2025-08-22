@@ -36,7 +36,7 @@ class DetectorFinding(BaseModel):
         """Dictionary-style access for backward compatibility with tests"""
         try:
             value = getattr(self, key, default)
-            # Handle enum serialization for backward compatibility  
+            # Handle enum serialization for backward compatibility
             if hasattr(value, "value"):
                 return value.value
             return value
