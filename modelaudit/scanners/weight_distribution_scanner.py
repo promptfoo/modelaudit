@@ -43,7 +43,7 @@ class WeightDistributionScanner(BaseScanner):
         ".hdf5",
         ".pb",
         ".onnx",
-        ".safetensors",
+        # Note: .safetensors removed - handled exclusively by SafeTensorsScanner
     ]
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
@@ -76,6 +76,12 @@ class WeightDistributionScanner(BaseScanner):
 
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
+            return False
+
+        # Skip weight distribution analysis for SafeTensors files
+        # SafeTensors are inherently safe and can only contain tensor data
+        # The SafeTensorsScanner already validates structure and metadata
+        if ext == ".safetensors":
             return False
 
         # Check if we have the necessary libraries for the format

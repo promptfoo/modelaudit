@@ -4,6 +4,11 @@ import io
 import pickle
 import zipfile
 
+import pytest
+
+# Skip if torch is not available before importing it
+pytest.importorskip("torch")
+
 import torch
 
 from modelaudit.core import scan_file

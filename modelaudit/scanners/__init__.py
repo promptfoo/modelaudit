@@ -271,7 +271,7 @@ class ScannerRegistry:
                     ".hdf5",
                     ".pb",
                     ".onnx",
-                    ".safetensors",
+                    # Note: .safetensors removed - handled exclusively by SafeTensorsScanner
                 ],
                 "priority": 13,
                 "dependencies": [
