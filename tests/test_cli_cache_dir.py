@@ -16,11 +16,13 @@ def create_mock_scan_result(**kwargs):
     result.has_errors = kwargs.get("has_errors", False)
     result.bytes_scanned = kwargs.get("bytes_scanned", 1024)
     result.files_scanned = kwargs.get("files_scanned", 1)
-    
+
     # Add issues if provided
     if "issues" in kwargs:
-        from modelaudit.models import IssueModel
         import time
+
+        from modelaudit.models import IssueModel
+
         issues = []
         for issue_dict in kwargs["issues"]:
             issue = IssueModel(
@@ -28,11 +30,11 @@ def create_mock_scan_result(**kwargs):
                 severity=issue_dict.get("severity", "warning"),
                 location=issue_dict.get("location"),
                 timestamp=time.time(),
-                details=issue_dict.get("details", {})
+                details=issue_dict.get("details", {}),
             )
             issues.append(issue)
         result.issues = issues
-    
+
     result.finalize_statistics()
     return result
 

@@ -121,7 +121,13 @@ def _add_issue_to_model(
     from .models import IssueModel
 
     issue = IssueModel(
-        message=message, severity=severity, location=location, details=details or {}, timestamp=time.time(), why=None, type=issue_type
+        message=message,
+        severity=severity,
+        location=location,
+        details=details or {},
+        timestamp=time.time(),
+        why=None,
+        type=issue_type,
     )
     results.issues.append(issue)
 
@@ -893,7 +899,7 @@ def scan_model_directory_or_file(
                 license_metadata = collect_license_metadata(target)
                 if license_metadata:
                     from .models import FileMetadataModel
-                    
+
                     if target in results.file_metadata:
                         # Update the existing file metadata with license info
                         existing_metadata = results.file_metadata[target].model_dump()
@@ -950,7 +956,7 @@ def scan_model_directory_or_file(
                 severity=warning["severity"],
                 location="",
                 details=warning.get("details", {}),
-                issue_type=warning.get("type")
+                issue_type=warning.get("type"),
             )
     except Exception as e:
         logger.warning(f"Error checking license warnings: {e!s}")

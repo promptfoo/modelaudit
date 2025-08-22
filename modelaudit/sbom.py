@@ -124,11 +124,11 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
     # Convert issues to dicts if they are Pydantic models
     issues_dicts = []
     for issue in issues:
-        if hasattr(issue, 'model_dump'):
+        if hasattr(issue, "model_dump"):
             issues_dicts.append(issue.model_dump())
         else:
             issues_dicts.append(issue)
-    
+
     file_meta: dict[str, Any] = results.get("file_metadata", {})
 
     for input_path in paths:
@@ -138,13 +138,13 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
                     fp = os.path.join(root, f)
                     meta_model = file_meta.get(fp)
                     # Convert Pydantic model to dict if needed
-                    meta = meta_model.model_dump() if hasattr(meta_model, 'model_dump') else (meta_model or {})
+                    meta = meta_model.model_dump() if hasattr(meta_model, "model_dump") else (meta_model or {})
                     component = _component_for_file(fp, meta, issues_dicts)
                     bom.components.add(component)
         else:
             meta_model = file_meta.get(input_path)
             # Convert Pydantic model to dict if needed
-            meta = meta_model.model_dump() if hasattr(meta_model, 'model_dump') else (meta_model or {})
+            meta = meta_model.model_dump() if hasattr(meta_model, "model_dump") else (meta_model or {})
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
