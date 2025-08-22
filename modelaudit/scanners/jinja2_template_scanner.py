@@ -345,15 +345,15 @@ class Jinja2TemplateScanner(BaseScanner):
             # Look for tokenizer.chat_template in metadata
             for key, field in reader.fields.items():
                 if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
-                        value = field.parts[field.data[0]]
-                        if isinstance(value, (list, tuple)):
-                            # Convert list of integers to string
-                            template_str = "".join(chr(i) for i in value if isinstance(i, int) and 0 <= i <= 1114111)
-                        else:
-                            template_str = str(value)
+                    value = field.parts[field.data[0]]
+                    if isinstance(value, (list, tuple)):
+                        # Convert list of integers to string
+                        template_str = "".join(chr(i) for i in value if isinstance(i, int) and 0 <= i <= 1114111)
+                    else:
+                        template_str = str(value)
 
-                        if template_str and len(template_str) <= self.max_template_size:
-                            templates["tokenizer.chat_template"] = template_str
+                    if template_str and len(template_str) <= self.max_template_size:
+                        templates["tokenizer.chat_template"] = template_str
 
         except Exception as e:
             logger.debug(f"Error extracting GGUF templates: {e}")
@@ -397,9 +397,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
                 # Check for template-like strings (contain Jinja2 syntax)
                 elif (
-                    isinstance(value, str)
-                    and self._looks_like_template(value)
-                    and len(value) <= self.max_template_size
+                    isinstance(value, str) and self._looks_like_template(value) and len(value) <= self.max_template_size
                 ):
                     templates[current_path] = value
 
@@ -596,9 +594,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 f"System environment access: '{match_text}'. "
                 "This pattern attempts to access system information or configuration."
             ),
-            "sandbox_violation": (
-                "Template contains operations that violate Jinja2 sandboxing security restrictions."
-            ),
+            "sandbox_violation": ("Template contains operations that violate Jinja2 sandboxing security restrictions."),
         }
 
         return explanations.get(category, f"Suspicious pattern detected: {match_text}")
