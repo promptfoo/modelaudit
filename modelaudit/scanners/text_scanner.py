@@ -43,7 +43,7 @@ class TextScanner(BaseScanner):
 
         return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
-    def scan(self, path: str, timeout: int | None = None) -> ScanResult:
+    def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
         """Scan a text file for security issues."""
         result = ScanResult(scanner_name=self.name)
 

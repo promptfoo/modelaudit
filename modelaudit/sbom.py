@@ -104,7 +104,7 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
 
 def _component_for_file_pydantic(
     path: str,
-    metadata: FileMetadataModel | None,
+    metadata: Optional[FileMetadataModel],
     issues: list[Issue],
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""

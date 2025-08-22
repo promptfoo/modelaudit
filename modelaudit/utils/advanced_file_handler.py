@@ -82,7 +82,7 @@ class ShardedModelDetector:
         return None
 
     @classmethod
-    def find_model_config(cls, file_path: str) -> str | None:
+    def find_model_config(cls, file_path: str) -> Optional[str]:
         """Find the configuration file for a sharded model."""
         dir_path = Path(file_path).parent
 

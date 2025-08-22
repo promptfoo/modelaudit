@@ -56,7 +56,7 @@ class ScannerRegistry:
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
         self._numpy_compatible: Optional[bool] = None  # Lazy initialization
-        self._numpy_status: str | None = None
+        self._numpy_status: Optional[str] = None
         self._init_registry()
 
     def _ensure_numpy_status(self) -> None:

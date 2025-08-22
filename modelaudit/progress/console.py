@@ -72,7 +72,7 @@ class ConsoleProgressReporter(ProgressReporter):
             leave=True,
         )
 
-    def _create_item_progress_bar(self, stats: ProgressStats) -> "tqdm | None":
+    def _create_item_progress_bar(self, stats: ProgressStats) -> "Optional[tqdm]":
         """Create item-level progress bar."""
         if not self.use_tqdm or not self.show_items or stats.total_items <= 0:
             return None

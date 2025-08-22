@@ -2,7 +2,7 @@
 
 import io
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
 import click
@@ -25,7 +25,7 @@ def stream_analyze_file(
     url: str,
     scanner: BaseScanner,
     max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
-) -> tuple[ScanResult | None, bool]:
+) -> tuple[Optional[ScanResult], bool]:
     """Stream analyze a file from cloud storage.
 
     After downloading a configurable chunk of bytes, this function attempts to
@@ -73,7 +73,7 @@ def stream_analyze_file(
         metadata: dict[str, Any] = {}
 
         # Try to use scanner's partial capabilities if available
-        scan_result: ScanResult | None = None
+        scan_result: Optional[ScanResult] = None
         try:
             temp_file.seek(0)
             scan_result = scanner.scan(temp_file)  # type: ignore[arg-type]

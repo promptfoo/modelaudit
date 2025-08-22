@@ -267,7 +267,7 @@ class EmailProgressHook(ProgressHook):
         self.periodic_interval = periodic_interval
 
         self._last_periodic_email = 0.0
-        self._scan_start_time: float | None = None
+        self._scan_start_time: Optional[float] = None
 
     def _send_email(self, subject: str, body: str) -> bool:
         """Send email notification.
@@ -394,7 +394,7 @@ class SlackProgressHook(ProgressHook):
         self,
         name: str,
         webhook_url: str,
-        channel: str | None = None,
+        channel: Optional[str] = None,
         username: str = "ModelAudit",
         emoji: str = ":robot_face:",
         send_on_start: bool = True,
@@ -656,7 +656,7 @@ class ProgressHookManager:
             return True
         return False
 
-    def get_hook(self, name: str) -> ProgressHook | None:
+    def get_hook(self, name: str) -> Optional[ProgressHook]:
         """Get a progress hook by name.
 
         Args:
