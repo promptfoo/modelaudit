@@ -244,7 +244,7 @@ class TestPerformanceBenchmarks:
 
         # Compare with single-threaded performance
         single_result = scan_directory()
-        concurrency_overhead = avg_duration / single_result.duration
+        concurrency_overhead = avg_duration / single_result["duration"]
 
         # Allow some overhead but not excessive
         # More lenient threshold for CI environments

@@ -266,7 +266,7 @@ class TestLicenseIntegration:
         license_issues = [
             issue
             for issue in all_issues
-            if hasattr(issue, "details") and issue.details.get("type") == "license_warning"
+            if hasattr(issue, "type") and getattr(issue, "type") == "license_warning"
         ]
         assert len(license_issues) > 0, "Should have license warning issues"
 

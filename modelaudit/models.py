@@ -73,6 +73,7 @@ class IssueModel(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict, description="Additional issue details")
     timestamp: float = Field(..., description="Unix timestamp when issue was detected")
     why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
+    type: Optional[str] = Field(None, description="Type of issue (e.g., 'license_warning')")
 
     # Dictionary-like access for backward compatibility
     def get(self, key: str, default: Any = None) -> Any:

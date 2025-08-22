@@ -12,6 +12,7 @@ from unittest.mock import patch
 from modelaudit.interrupt_handler import check_interrupted
 from modelaudit.license_checker import (
     LICENSE_FILES,
+    check_commercial_use_warnings,
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
@@ -112,6 +113,7 @@ def _add_issue_to_model(
     severity: str = "warning",
     location: Optional[str] = None,
     details: Optional[dict] = None,
+    issue_type: Optional[str] = None,
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
@@ -119,7 +121,7 @@ def _add_issue_to_model(
     from .models import IssueModel
 
     issue = IssueModel(
-        message=message, severity=severity, location=location, details=details or {}, timestamp=time.time(), why=None
+        message=message, severity=severity, location=location, details=details or {}, timestamp=time.time(), why=None, type=issue_type
     )
     results.issues.append(issue)
 
@@ -887,15 +889,19 @@ def scan_model_directory_or_file(
 
                 _add_asset_to_results(results, target, file_result)
 
-                # License metadata is handled in _add_scan_result_to_model now
+                # Collect and apply license metadata for all files
                 license_metadata = collect_license_metadata(target)
-                if license_metadata and target in results.file_metadata:
-                    # Update the existing file metadata with license info
-                    existing_metadata = results.file_metadata[target].model_dump()
-                    combined_metadata = {**existing_metadata, **license_metadata}
+                if license_metadata:
                     from .models import FileMetadataModel
-
-                    results.file_metadata[target] = FileMetadataModel(**combined_metadata)
+                    
+                    if target in results.file_metadata:
+                        # Update the existing file metadata with license info
+                        existing_metadata = results.file_metadata[target].model_dump()
+                        combined_metadata = {**existing_metadata, **license_metadata}
+                        results.file_metadata[target] = FileMetadataModel(**combined_metadata)
+                    else:
+                        # Create new file metadata entry for files with no scanner
+                        results.file_metadata[target] = FileMetadataModel(**license_metadata)
 
                 if max_total_size > 0 and results.bytes_scanned > max_total_size:
                     _add_issue_to_model(
@@ -934,19 +940,20 @@ def scan_model_directory_or_file(
     # except Exception as e:
     #     logger.warning(f"Error consolidating checks: {e!s}")
 
-    # Add license warnings if any - temporarily disable while refactoring
-    # try:
-    #     license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
-    #     for warning in license_warnings:
-    #         _add_issue_to_model(
-    #             results,
-    #             warning["message"],
-    #             severity=warning["severity"],
-    #             location="",
-    #             details=warning.get("details", {})
-    #         )
-    # except Exception as e:
-    #     logger.warning(f"Error checking license warnings: {e!s}")
+    # Add license warnings if any
+    try:
+        license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
+        for warning in license_warnings:
+            _add_issue_to_model(
+                results,
+                warning["message"],
+                severity=warning["severity"],
+                location="",
+                details=warning.get("details", {}),
+                issue_type=warning.get("type")
+            )
+    except Exception as e:
+        logger.warning(f"Error checking license warnings: {e!s}")
 
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
