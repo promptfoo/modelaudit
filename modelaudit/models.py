@@ -165,10 +165,7 @@ class ModelAuditResultModel(BaseModel):
         Accepts either a dict or another ModelAuditResultModel.
         """
         # Handle ModelAuditResultModel input by converting to dict
-        if isinstance(results, ModelAuditResultModel):
-            results_dict = results.model_dump()
-        else:
-            results_dict = results
+        results_dict = results.model_dump() if isinstance(results, ModelAuditResultModel) else results
 
         # Update scalar fields
         self.bytes_scanned += results_dict.get("bytes_scanned", 0)

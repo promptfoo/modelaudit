@@ -526,7 +526,9 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
     return warnings
 
 
-def check_commercial_use_warnings(scan_results: Union[dict[str, Any], Any], *, strict: bool = False) -> list[dict[str, Any]]:
+def check_commercial_use_warnings(
+    scan_results: Union[dict[str, Any], Any], *, strict: bool = False
+) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 
