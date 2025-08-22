@@ -95,8 +95,8 @@ jobs:
 
   type-check:
     name: Type Check
-    needs: [changes, lint]
-    # Only run if Python files changed and linting passed
+    needs: changes
+    # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -128,10 +128,52 @@ jobs:
         run: |
           rye run mypy modelaudit/ tests/
 
+  # Fast feedback job for immediate results
+  quick-feedback:
+    name: Quick Feedback (Python 3.12)
+    needs: changes
+    # Always run for fastest feedback
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
+        with:
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin 3.12
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py3.12-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py3.12-
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
+
+      - name: Run fast tests with fail-fast
+        run: |
+          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+
   test:
     name: Test Python ${{ matrix.python-version }}
-    needs: [changes, lint]
-    # Only run if Python files changed and linting passed
+    needs: changes
+    # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -170,15 +212,20 @@ jobs:
         run: |
           rye sync --features all-ci
 
-      - name: Run fast tests without coverage (non-3.12)
-        if: matrix.python-version != '3.12'
+      - name: Run fast tests with fail-fast (no coverage on PRs)
+        if: github.event_name == 'pull_request'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
-      - name: Run fast tests with coverage (3.12 only)
-        if: matrix.python-version == '3.12'
+      - name: Run fast tests with coverage (main branch only)
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
           rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
+
+      - name: Run fast tests without coverage (main branch, non-3.12)
+        if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'
@@ -192,7 +239,7 @@ jobs:
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
-    needs: [changes, lint]
+    needs: changes
     # Only run on main branch or if dependencies changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
@@ -264,7 +311,7 @@ jobs:
 
   build:
     name: Build and Package
-    needs: [changes, lint, type-check]
+    needs: changes
     # Always build on main, otherwise only if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
@@ -306,7 +353,7 @@ jobs:
   # Summary job to ensure all required checks pass
   ci-success:
     name: CI Success
-    needs: [lint, type-check, test, test-numpy-compatibility, build]
+    needs: [quick-feedback, lint, type-check, test, test-numpy-compatibility, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -314,6 +361,7 @@ jobs:
         run: |
           # A job is considered successful if it either succeeded or was skipped
           # (skipped means the job's conditions weren't met, which is fine)
+          QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           TEST_RESULT="${{ needs.test.result }}"
@@ -321,6 +369,7 @@ jobs:
           BUILD_RESULT="${{ needs.build.result }}"
 
           echo "Job results:"
+          echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  test: $TEST_RESULT"
@@ -328,7 +377,8 @@ jobs:
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
-          if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
+          if [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ||
+                "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
                 "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
                 "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
                 "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||
