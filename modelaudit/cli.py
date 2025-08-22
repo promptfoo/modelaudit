@@ -1107,6 +1107,7 @@ def scan_command(
                             details={"interrupted": True},
                             timestamp=time.time(),
                             why=None,
+                            type=None,
                         )
                         audit_result.issues.append(interruption_issue)
                     should_break = True
