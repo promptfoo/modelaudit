@@ -154,6 +154,24 @@ def test_find_sharded_files(tmp_path):
     assert shards[2].endswith("pytorch_model-00003-of-00005.bin")
 
 
+def test_find_sharded_files_relative_path(tmp_path, monkeypatch):
+    """Sharded files should be discovered using relative paths without duplication."""
+    shard_dir = tmp_path / "model_dir"
+    shard_dir.mkdir()
+
+    (shard_dir / "pytorch_model-00001-of-00005.bin").write_bytes(b"shard1")
+    (shard_dir / "pytorch_model-00002-of-00005.bin").write_bytes(b"shard2")
+
+    monkeypatch.chdir(tmp_path)
+    shards = find_sharded_files("model_dir")
+
+    expected = [
+        str((shard_dir / "pytorch_model-00001-of-00005.bin").resolve()),
+        str((shard_dir / "pytorch_model-00002-of-00005.bin").resolve()),
+    ]
+    assert shards == expected
+
+
 def test_detect_format_from_extension(tmp_path):
     """Test extension-only format detection."""
     file_path = tmp_path / "model.pt"
