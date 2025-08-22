@@ -3,6 +3,7 @@
 import re
 import tempfile
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 from .disk_space import check_disk_space

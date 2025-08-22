@@ -17,6 +17,7 @@ from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
 from .models import ModelAuditResultModel
+from .scanners.base import IssueSeverity
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
@@ -1048,7 +1049,10 @@ def scan_command(
                     if result_issues:
                         # Filter out DEBUG severity issues when not in verbose mode
                         # scan_results is ModelAuditResultModel
-                        visible_issues = [issue for issue in result_issues if verbose or issue.severity != IssueSeverity.DEBUG]
+                        visible_issues = [
+                            issue for issue in result_issues
+                            if verbose or issue.severity != IssueSeverity.DEBUG
+                        ]
                         issue_count = len(visible_issues)
 
                         if issue_count > 0:

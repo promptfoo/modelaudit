@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 if TYPE_CHECKING:
-    from .scanners.base import Check, CheckStatus, Issue
+    from .scanners.base import Check, Issue
 
 # We'll use forward references and rebuild models after imports
 
@@ -484,7 +484,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     def _finalize_checks(self) -> None:
         """Calculate check statistics."""
         from .scanners.base import CheckStatus
-        
+
         self.total_checks = len(self.checks)
         self.passed_checks = sum(1 for c in self.checks if c.status == CheckStatus.PASSED)
         self.failed_checks = sum(1 for c in self.checks if c.status == CheckStatus.FAILED)
