@@ -158,14 +158,14 @@ class TestFileTypeValidationDemo:
         results = scan_model_directory_or_file(str(mixed_dir))
 
         validation_warnings = [
-            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
+            issue for issue in results["issues"] if "file type validation failed" in issue.message.lower()
         ]
 
         security_issues = [
             issue
             for issue in results["issues"]
             if any(
-                keyword in issue.get("message", "").lower() for keyword in ["spoofing", "security", "validation failed"]
+                keyword in issue.message.lower() for keyword in ["spoofing", "security", "validation failed"]
             )
         ]
 

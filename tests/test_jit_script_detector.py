@@ -21,10 +21,10 @@ class TestJITScriptDetector:
 
         findings = detector.scan_torchscript(data, "test_model.pt")
         assert len(findings) >= 2
-        assert any("torch.ops.aten.system" in getattr(f, "pattern", f.get("operation", "")) for f in findings)
-        assert any("torch.ops.aten.exec" in getattr(f, "pattern", f.get("operation", "")) for f in findings)
+        assert any("torch.ops.aten.system" in getattr(f, "pattern", getattr(f, "operation", "")) for f in findings)
+        assert any("torch.ops.aten.exec" in getattr(f, "pattern", getattr(f, "operation", "")) for f in findings)
         assert all(
-            getattr(f, "severity", f.get("severity", "")) == "CRITICAL"
+            getattr(f, "severity", getattr(f, "severity", "")) == "CRITICAL"
             for f in findings
             if hasattr(f, "pattern") or "operation" in f
         )

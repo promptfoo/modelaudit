@@ -304,7 +304,7 @@ class TestFileTypeValidationIntegration:
 
         results = scan_model_directory_or_file(str(attack_dir))
         all_validation_issues = [
-            issue for issue in results["issues"] if "file type validation failed" in issue.get("message", "").lower()
+            issue for issue in results["issues"] if "file type validation failed" in issue.message.lower()
         ]
 
         if len(all_validation_issues) == 0:

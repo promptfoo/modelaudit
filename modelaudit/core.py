@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, Union
+from typing import IO, Any, Callable, Optional, Union, Dict, List, Tuple
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -112,9 +112,9 @@ def _add_issue_to_model(
     results: ModelAuditResultModel,
     message: str,
     severity: str = "warning",
-    location: str | None = None,
-    details: dict | None = None,
-    issue_type: str | None = None,
+    location: Optional[str] = None,
+    details: Optional[dict] = None,
+    issue_type: Optional[str] = None,
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
@@ -290,7 +290,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+def _extract_failure_context(group_checks: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     """Extract severity and explanation from failed checks.
 
     Args:
@@ -1210,7 +1210,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
-    result: ScanResult | None
+    result: Optional[ScanResult]
 
     # We already checked use_extreme_handler above for size limit bypass
     # Now check if we should use regular large handler

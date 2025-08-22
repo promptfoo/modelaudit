@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import click
 from yaspin import yaspin
@@ -65,7 +65,7 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
     return expanded
 
 
-def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
+def create_progress_callback_wrapper(progress_callback: Optional[Any], spinner: Optional[Any]) -> Optional[Any]:
     """Create a type-safe progress callback wrapper."""
     if not progress_callback:
         return None
@@ -90,7 +90,7 @@ def is_mlflow_uri(path: str) -> bool:
 class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
-    def get_command(self, ctx, cmd_name) -> click.Command | None:
+    def get_command(self, ctx, cmd_name) -> Optional[click.Command]:
         """Get command by name, return None if not found"""
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
@@ -158,7 +158,7 @@ def auth() -> None:
     help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
-def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
+def login(org_id: Optional[str], host: Optional[str], api_key: Optional[str]) -> None:
     """Login"""
     try:
         token = None
@@ -391,8 +391,8 @@ def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
     format: str,
-    output: str | None,
-    sbom: str | None,
+    output: Optional[str],
+    sbom: Optional[str],
     timeout: int,
     verbose: bool,
     max_file_size: int,

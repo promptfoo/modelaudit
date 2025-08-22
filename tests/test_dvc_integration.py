@@ -287,7 +287,7 @@ class TestDvcSecurity:
             issue
             for issue in results["issues"]
             if any(
-                keyword in issue.get("message", "").lower()
+                keyword in issue.message.lower()
                 for keyword in ["malicious", "suspicious", "security", "dangerous"]
             )
         ]
