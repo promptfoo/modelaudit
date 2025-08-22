@@ -143,9 +143,9 @@ class ScanResult:
         passed: bool,
         message: str,
         severity: Optional[IssueSeverity] = None,
-        location: str | None = None,
-        details: dict[str, Any] | None = None,
-        why: str | None = None,
+        location: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add a check result (passed or failed)"""
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
@@ -199,9 +199,9 @@ class ScanResult:
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
-        location: str | None = None,
-        details: dict[str, Any] | None = None,
-        why: str | None = None,
+        location: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+        why: Optional[str] = None,
     ) -> None:
         """Add an issue to the result (for backward compatibility)"""
         if why is None:
@@ -332,7 +332,7 @@ class BaseScanner(ABC):
     description: ClassVar[str] = "Base scanner class"
     supported_extensions: ClassVar[list[str]] = []
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
         self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
@@ -983,7 +983,7 @@ class BaseScanner(ABC):
             self._report_progress_error(e)
             raise
 
-    def get_progress_stats(self) -> dict[str, Any] | None:
+    def get_progress_stats(self) -> Optional[dict[str, Any]]:
         """Get current progress statistics."""
         if self.progress_tracker:
             return self.progress_tracker.get_stats()

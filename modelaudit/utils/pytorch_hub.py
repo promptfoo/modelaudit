@@ -2,6 +2,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import requests
 
@@ -33,7 +34,7 @@ def _get_total_size(urls: list[str]) -> int:
     return total
 
 
-def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
+def download_pytorch_hub_model(url: str, cache_dir: Optional[Path] = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")

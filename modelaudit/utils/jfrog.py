@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 import click
@@ -27,9 +28,9 @@ def is_jfrog_url(url: str) -> bool:
 
 def download_artifact(
     url: str,
-    cache_dir: Path | None = None,
-    api_token: str | None = None,
-    access_token: str | None = None,
+    cache_dir: Optional[Path] = None,
+    api_token: Optional[str] = None,
+    access_token: Optional[str] = None,
     timeout: int = 30,
 ) -> Path:
     """
