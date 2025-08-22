@@ -3,6 +3,11 @@
 import json
 import pickle
 
+import pytest
+
+# Skip if h5py is not available before importing it
+pytest.importorskip("h5py")
+
 import h5py
 
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
