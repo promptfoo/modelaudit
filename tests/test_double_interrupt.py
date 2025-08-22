@@ -12,6 +12,19 @@ from modelaudit.interrupt_handler import InterruptHandler, get_interrupt_handler
 class TestDoubleInterrupt(unittest.TestCase):
     """Test cases for double interrupt (Ctrl+C) functionality."""
 
+    def setUp(self):
+        """Reset interrupt handler state before each test."""
+        handler = get_interrupt_handler()
+        handler.reset()
+        # Ensure not active
+        handler._active = False
+
+    def tearDown(self):
+        """Clean up after each test."""
+        handler = get_interrupt_handler()
+        handler.reset()
+        handler._active = False
+
     def test_single_interrupt_graceful_shutdown(self):
         """Test that single interrupt triggers graceful shutdown."""
         handler = InterruptHandler()
@@ -76,9 +89,11 @@ class TestDoubleInterrupt(unittest.TestCase):
         """Test that interrupt handler is thread-safe."""
         handler = InterruptHandler()
         results = []
+        started_event = threading.Event()
 
         def worker():
             """Worker thread that checks for interrupts."""
+            started_event.set()  # Signal that worker has started
             try:
                 for _ in range(10):
                     handler.check_interrupted()
@@ -91,12 +106,15 @@ class TestDoubleInterrupt(unittest.TestCase):
         thread = threading.Thread(target=worker)
         thread.start()
 
-        # Trigger interrupt from main thread
-        time.sleep(0.05)
+        # Wait for worker to start, then trigger interrupt
+        started_event.wait(timeout=1.0)
         handler._signal_handler(signal.SIGINT, None)
 
         # Wait for thread to finish
-        thread.join(timeout=1.0)
+        thread.join(timeout=2.0)
+
+        # Ensure thread completed (either normally or interrupted)
+        self.assertFalse(thread.is_alive(), "Thread should have finished")
 
         # Worker should have been interrupted
         self.assertEqual(results, ["interrupted"])
@@ -104,6 +122,9 @@ class TestDoubleInterrupt(unittest.TestCase):
     def test_nested_contexts(self):
         """Test that nested interruptible_scan contexts work correctly."""
         handler = get_interrupt_handler()
+
+        # Ensure clean state before test
+        handler.reset()
 
         with interruptible_scan():
             self.assertTrue(handler._active)

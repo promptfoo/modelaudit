@@ -105,9 +105,15 @@ class InterruptHandler:
         Yields:
             None
         """
+        # Check if already active outside the lock to avoid deadlock
+        if self._active:
+            # Already active, just yield without acquiring lock
+            yield
+            return
+
         with self._lock:
+            # Double-check inside lock (in case state changed)
             if self._active:
-                # Already active, just yield
                 yield
                 return
 
