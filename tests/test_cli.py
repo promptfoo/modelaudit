@@ -8,11 +8,58 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cli import cli, format_text_output
+from modelaudit.models import create_initial_audit_result
 
 
 def strip_ansi(text):
     """Strip ANSI color codes from text for testing."""
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def create_mock_scan_result(**kwargs):
+    """Create a mock ModelAuditResultModel for testing."""
+    result = create_initial_audit_result()
+    
+    # Set default values
+    result.bytes_scanned = kwargs.get("bytes_scanned", 1024)
+    result.files_scanned = kwargs.get("files_scanned", 1)
+    result.has_errors = kwargs.get("has_errors", False)
+    result.success = kwargs.get("success", True)
+    
+    # Add issues if provided
+    if "issues" in kwargs:
+        from modelaudit.models import IssueModel
+        import time
+        issues = []
+        for issue_dict in kwargs["issues"]:
+            issue = IssueModel(
+                message=issue_dict.get("message", "Test issue"),
+                severity=issue_dict.get("severity", "warning"),
+                location=issue_dict.get("location"),
+                timestamp=time.time(),
+                details=issue_dict.get("details", {})
+            )
+            issues.append(issue)
+        result.issues = issues
+    
+    # Add assets if provided  
+    if "assets" in kwargs:
+        from modelaudit.models import AssetModel
+        assets = []
+        for asset_dict in kwargs["assets"]:
+            asset = AssetModel(
+                path=asset_dict.get("path", "/test/path"),
+                type=asset_dict.get("type", "test")
+            )
+            assets.append(asset)
+        result.assets = assets
+    
+    # Add scanners if provided
+    if "scanners" in kwargs:
+        result.scanner_names = kwargs["scanners"]
+    
+    result.finalize_statistics()
+    return result
 
 
 def test_cli_help():
@@ -412,14 +459,14 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     (test_model_dir / "model.bin").write_text("dummy model")
 
     mock_download.return_value = test_model_dir
-    mock_scan.return_value = {
-        "bytes_scanned": 1024,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test_scanner"],
-    }
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=1024,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--no-cache", "https://huggingface.co/test/model"])
@@ -477,20 +524,20 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     (test_model_dir / "model.pkl").write_text("dummy model")
 
     mock_download.return_value = test_model_dir
-    mock_scan.return_value = {
-        "bytes_scanned": 2048,
-        "issues": [
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=2048,
+        issues=[
             {
                 "message": "Dangerous import detected",
                 "severity": "critical",
                 "location": "model.pkl",
             }
         ],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["pickle_scanner"],
-    }
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["pickle_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/malicious-model"])
@@ -535,14 +582,14 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
     test_dir.mkdir()
     (test_dir / "model.pt").write_text("dummy")
     mock_download.return_value = test_dir
-    mock_scan.return_value = {
-        "bytes_scanned": 1,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test"],
-    }
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=1,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/"])
@@ -577,14 +624,14 @@ def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_c
     test_dir.mkdir()
     (test_dir / "model.bin").write_text("dummy")
     mock_download.return_value = test_dir
-    mock_scan.return_value = {
-        "bytes_scanned": 123,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test"],
-    }
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--no-cache", "s3://bucket/model.bin"])
@@ -618,14 +665,14 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
     test_dir.mkdir()
     (test_dir / "model.pkl").write_text("dummy")
     mock_download.return_value = test_dir
-    mock_scan.return_value = {
-        "bytes_scanned": 123,
-        "issues": [{"message": "bad", "severity": "critical", "location": "model.pkl"}],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["pickle"],
-    }
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123,
+        issues=[{"message": "bad", "severity": "critical", "location": "model.pkl"}],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["pickle"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--no-cache", "gs://bucket/model.pkl"])
@@ -639,14 +686,14 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL."""
     mock_is_jfrog.return_value = True
-    mock_scan_jfrog.return_value = {
-        "bytes_scanned": 512,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test_scanner"],
-    }
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/model.bin"])
@@ -684,14 +731,14 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL with authentication."""
     mock_is_jfrog.return_value = True
-    mock_scan_jfrog.return_value = {
-        "bytes_scanned": 512,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test_scanner"],
-    }
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -724,14 +771,14 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
 def test_scan_mlflow_uri_success(mock_scan_mlflow):
     """Test successful scanning of an MLflow URI."""
     # Setup mock
-    mock_scan_mlflow.return_value = {
-        "bytes_scanned": 1024,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test_scanner"],
-    }
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=1024,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "models:/TestModel/1", "--registry-uri", "http://localhost:5000"])
@@ -759,14 +806,14 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
     """Test MLflow URI scanning with additional options."""
     # Setup mock
-    mock_scan_mlflow.return_value = {
-        "bytes_scanned": 2048,
-        "issues": [{"message": "Test issue", "severity": "warning"}],
-        "files_scanned": 1,
-        "assets": [],
-        "has_errors": False,
-        "scanners": ["test_scanner"],
-    }
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=2048,
+        issues=[{"message": "Test issue", "severity": "warning"}],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -823,14 +870,14 @@ def test_scan_mlflow_uri_error(mock_scan_mlflow):
 def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
     """Test MLflow URI scanning with JSON output format."""
     # Setup mock
-    mock_scan_mlflow.return_value = {
-        "bytes_scanned": 1024,
-        "issues": [],
-        "files_scanned": 1,
-        "assets": [{"path": "model.pkl", "type": "pickle"}],
-        "has_errors": False,
-        "scanners": ["pickle"],
-    }
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=1024,
+        issues=[],
+        files_scanned=1,
+        assets=[{"path": "model.pkl", "type": "pickle"}],
+        has_errors=False,
+        scanners=["pickle"]
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "models:/TestModel/1", "--format", "json"])
