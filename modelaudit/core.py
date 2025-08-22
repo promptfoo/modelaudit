@@ -119,11 +119,19 @@ def _add_issue_to_model(
     """Helper function to add an issue directly to the Pydantic model."""
     import time
 
-    from .scanners.base import Issue
+    from .scanners.base import Issue, IssueSeverity
+
+    # Convert string severity to enum
+    severity_enum = {
+        "debug": IssueSeverity.DEBUG,
+        "info": IssueSeverity.INFO,
+        "warning": IssueSeverity.WARNING,
+        "critical": IssueSeverity.CRITICAL,
+    }.get(severity.lower(), IssueSeverity.WARNING)
 
     issue = Issue(
         message=message,
-        severity=severity,
+        severity=severity_enum,
         location=location,
         details=details or {},
         timestamp=time.time(),
@@ -993,7 +1001,7 @@ def scan_model_directory_or_file(
         any(
             any(indicator in issue.message for indicator in operational_error_indicators)
             for issue in results.issues
-            if issue.severity in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         )
         or not scan_metadata["success"]
     )

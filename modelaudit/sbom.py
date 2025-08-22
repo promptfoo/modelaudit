@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Union, cast
+from typing import Any, Optional, Union, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -10,7 +10,7 @@ from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
-from .scanners.base import Issue
+from .scanners.base import Issue, IssueSeverity
 
 
 def _file_sha256(path: str) -> str:
@@ -26,11 +26,11 @@ def _calculate_risk_score(path: str, issues: list["Issue"]) -> int:
     score = 0
     for issue in issues:
         if issue.location == path:
-            if issue.severity == "critical":
+            if issue.severity == IssueSeverity.CRITICAL:
                 score += 5
-            elif issue.severity == "warning":
+            elif issue.severity == IssueSeverity.WARNING:
                 score += 2
-            elif issue.severity == "info":
+            elif issue.severity == IssueSeverity.INFO:
                 score += 1
     return min(score, 10)  # Cap at 10
 

@@ -1199,8 +1199,8 @@ def scan_command(
     if format == "json":
         # Filter out DEBUG issues and checks unless verbose mode is enabled
         if not verbose:
-            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != "debug"]
-            audit_result.checks = [check for check in audit_result.checks if check.severity != "debug"]
+            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
+            audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
 
         # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
