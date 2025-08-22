@@ -525,9 +525,7 @@ class TestFalsePositiveFixes:
 
             # Analyze results
             issues = scan_results.get("issues", [])
-            has_warnings = any(
-                issue.get("severity") in ["warning", "critical"] for issue in issues
-            )
+            has_warnings = any(issue.get("severity") in ["warning", "critical"] for issue in issues)
             has_errors = any(issue.get("severity") == "critical" for issue in issues)
 
             return {

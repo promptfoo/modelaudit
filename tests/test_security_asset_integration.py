@@ -146,7 +146,9 @@ class TestSecurityAssetIntegration:
 
             # Check for security-level issues
             security_issues = [
-                issue for issue in results.issues if getattr(issue, "severity", None) in ["critical", "error", "warning"]
+                issue
+                for issue in results.issues
+                if getattr(issue, "severity", None) in ["critical", "error", "warning"]
             ]
             assert len(security_issues) > 0, f"No security issues found in {malicious_file.name}"
 

@@ -297,12 +297,8 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result.files_scanned == first_result.files_scanned, (
-                f"Inconsistent files_scanned on run {i + 1}"
-            )
-            assert result.bytes_scanned == first_result.bytes_scanned, (
-                f"Inconsistent bytes_scanned on run {i + 1}"
-            )
+            assert result.files_scanned == first_result.files_scanned, f"Inconsistent files_scanned on run {i + 1}"
+            assert result.bytes_scanned == first_result.bytes_scanned, f"Inconsistent bytes_scanned on run {i + 1}"
             assert len(result.issues) == len(first_result.issues), f"Inconsistent issue count on run {i + 1}"
             assert result.success == first_result.success, f"Inconsistent success status on run {i + 1}"
 

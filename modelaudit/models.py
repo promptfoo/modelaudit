@@ -116,13 +116,12 @@ class ModelAuditResultModel(BaseModel):
         self.files_scanned += results.get("files_scanned", 0)
         if results.get("has_errors", False):
             self.has_errors = True
-            
+
         # Update success status - only set to False for operational errors, not security findings
-        if results.get("success", True) is False:
-            # Only set success to False if there are actual operational errors (has_errors=True)
-            # Security findings should not affect the success status
-            if results.get("has_errors", False):
-                self.success = False
+        # Only set success to False if there are actual operational errors (has_errors=True)
+        # Security findings should not affect the success status
+        if results.get("success", True) is False and results.get("has_errors", False):
+            self.success = False
 
         # Convert and extend issues
         new_issues = convert_issues_to_models(results.get("issues", []))

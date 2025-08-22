@@ -67,8 +67,10 @@ def test_exit_code_operational_errors():
         success=False,
         has_errors=True,
         issues=[
-            IssueModel(message="Error during scan: File not found", severity="error", location="test.pkl", timestamp=0.0),
-        ]
+            IssueModel(
+                message="Error during scan: File not found", severity="error", location="test.pkl", timestamp=0.0
+            ),
+        ],
     )
     assert determine_exit_code(results) == 2
 
@@ -79,9 +81,11 @@ def test_exit_code_mixed_issues():
         success=False,
         has_errors=True,
         issues=[
-            IssueModel(message="Error during scan: Scanner crashed", severity="error", location="test.pkl", timestamp=0.0),
+            IssueModel(
+                message="Error during scan: Scanner crashed", severity="error", location="test.pkl", timestamp=0.0
+            ),
             IssueModel(message="Also found suspicious code", severity="warning", location="test2.pkl", timestamp=0.0),
-        ]
+        ],
     )
     # Operational errors (exit code 2) should take precedence
     # over security issues (exit code 1)
@@ -129,7 +133,7 @@ def test_exit_code_no_files_scanned_with_issues():
         files_scanned=0,
         issues=[
             IssueModel(message="Some issue", severity="warning", location="test.pkl", timestamp=0.0),
-        ]
+        ],
     )
     assert determine_exit_code(results) == 2
 
@@ -146,7 +150,7 @@ def test_exit_code_files_scanned_with_issues():
         files_scanned=5,
         issues=[
             IssueModel(message="Security issue", severity="warning", location="test.pkl", timestamp=0.0),
-        ]
+        ],
     )
     assert determine_exit_code(results) == 1
 

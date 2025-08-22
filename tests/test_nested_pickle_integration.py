@@ -158,7 +158,8 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in results.issues
-                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
+                if "nested" in getattr(issue, "message", "").lower()
+                or "encoded" in getattr(issue, "message", "").lower()
             ]
 
             assert len(nested_issues) > 0, f"No nested pickle issues found for {description}"
@@ -244,7 +245,8 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in results.issues
-                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
+                if "nested" in getattr(issue, "message", "").lower()
+                or "encoded" in getattr(issue, "message", "").lower()
             ]
 
             # Should detect the malicious files
@@ -275,7 +277,8 @@ class TestNestedPickleIntegration:
             nested_issues = [
                 issue
                 for issue in result.issues
-                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
+                if "nested" in getattr(issue, "message", "").lower()
+                or "encoded" in getattr(issue, "message", "").lower()
             ]
             total_nested_issues += len(nested_issues)
 
