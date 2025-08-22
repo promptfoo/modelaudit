@@ -170,9 +170,15 @@ jobs:
         run: |
           rye sync --features all-ci
 
-      - name: Run fast tests (parallel execution)
+      - name: Run fast tests without coverage (non-3.12)
+        if: matrix.python-version != '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+
+      - name: Run fast tests with coverage (3.12 only)
+        if: matrix.python-version == '3.12'
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'

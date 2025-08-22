@@ -193,6 +193,7 @@ class TestRealJoblibFiles:
                 assert len(opcode_issues) > 0, "Critical issues should be opcode-related for numpy files"
 
 
+@pytest.mark.performance
 class TestPerformanceBenchmarks:
     """Performance benchmarks for A+ level testing."""
 
@@ -230,8 +231,11 @@ class TestPerformanceBenchmarks:
         """Benchmark scanning multiple files."""
         files = []
 
-        # Create multiple test files
-        for i in range(10):
+        # Create multiple test files (fewer in CI)
+        import os
+
+        count = 6 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 10
+        for i in range(count):
             file_path = tmp_path / f"file_{i}.joblib"
             with open(file_path, "wb") as f:
                 f.write(b"joblib")
@@ -267,16 +271,19 @@ class TestPerformanceBenchmarks:
 
             pickle.dump({"test": "data"}, f)
 
+        # Benchmark validation time
+        import os
+
         from modelaudit.scanners.pickle_scanner import _is_legitimate_serialization_file
 
-        # Benchmark validation time
+        iters = 30 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 100
         start_time = time.perf_counter()
-        for _ in range(100):  # Multiple calls to get meaningful measurement
+        for _ in range(iters):  # Multiple calls to get meaningful measurement
             _is_legitimate_serialization_file(str(test_file))
         validation_duration = time.perf_counter() - start_time
 
         # Validation should be very fast
-        avg_validation_time = validation_duration / 100
+        avg_validation_time = validation_duration / iters
         assert avg_validation_time < 0.001  # Under 1ms average
 
         print(f"Average validation time: {avg_validation_time:.6f}s")
