@@ -183,7 +183,12 @@ class JITScriptDetector:
                         context=context,
                         pattern=op,
                         recommendation="Review the model source - this operation can execute arbitrary code",
+                        confidence=1.0,
                         framework="TorchScript",
+                        code_snippet=None,
+                        type="dangerous_operation",
+                        operation=op,
+                        builtin=None,
                         details={"type": "dangerous_operation", "operation": op},
                     )
                 )
@@ -198,8 +203,14 @@ class JITScriptDetector:
                         message="TorchScript JIT compilation detected",
                         severity="WARNING",
                         context=context,
+                        pattern=None,
                         recommendation="JIT-compiled models can contain arbitrary code - verify source",
+                        confidence=0.8,
                         framework="TorchScript",
+                        code_snippet=None,
+                        type="jit_usage",
+                        operation=None,
+                        builtin=None,
                         details={"type": "jit_usage"},
                     )
                 )
@@ -219,8 +230,15 @@ class JITScriptDetector:
                     message="Embedded pickle data in TorchScript model",
                     severity="WARNING",
                     context=context,
+                    pattern=None,
                     recommendation="TorchScript with pickle can execute arbitrary code during loading",
+                    confidence=0.9,
                     framework="TorchScript",
+                    code_snippet=None,
+                    type="embedded_pickle",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
                     details={"type": "embedded_pickle"},
                 )
             )
@@ -555,11 +573,41 @@ def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -
     import os
 
     if not os.path.exists(file_path):
-        return [{"type": "error", "message": f"File not found: {file_path}"}]
+        from modelaudit.models import JITScriptFinding
+        return [JITScriptFinding(
+            message=f"File not found: {file_path}",
+            severity="WARNING",
+            context=file_path,
+            pattern=None,
+            recommendation="Verify the file path is correct",
+            confidence=1.0,
+            framework=None,
+            code_snippet=None,
+            type="error",
+            operation=None,
+            builtin=None,
+            import_=None,
+            details={"error_type": "file_not_found"},
+        )]
 
     file_size = os.path.getsize(file_path)
     if file_size > max_size:
-        return [{"type": "error", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
+        from modelaudit.models import JITScriptFinding
+        return [JITScriptFinding(
+            message=f"File too large: {file_size} bytes (max: {max_size})",
+            severity="WARNING", 
+            context=file_path,
+            pattern=None,
+            recommendation="Use a smaller file for analysis",
+            confidence=1.0,
+            framework=None,
+            code_snippet=None,
+            type="error",
+            operation=None,
+            builtin=None,
+            import_=None,
+            details={"error_type": "file_too_large", "file_size": file_size, "max_size": max_size},
+        )]
 
     # Detect model type from extension
     ext = os.path.splitext(file_path)[1].lower()
