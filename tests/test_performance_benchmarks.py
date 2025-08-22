@@ -10,6 +10,7 @@ import pytest
 from modelaudit.core import scan_model_directory_or_file
 
 
+@pytest.mark.performance
 class TestPerformanceBenchmarks:
     """Performance benchmarks for the model scanning system."""
 
@@ -82,12 +83,16 @@ class TestPerformanceBenchmarks:
             "malicious_keras.h5",
         ]
 
+        # Fewer runs in CI to reduce execution time
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        runs = 2 if is_ci else 5
+
         for filename in test_files:
             file_path = assets_dir / filename
             if not file_path.exists():
                 continue
 
-            metrics = self.measure_scan_performance(str(file_path), runs=5)
+            metrics = self.measure_scan_performance(str(file_path), runs=runs)
 
             # Performance assertions
             assert metrics["all_successful"], f"Not all scans successful for {filename}"
@@ -102,8 +107,6 @@ class TestPerformanceBenchmarks:
             if metrics["duration_stdev"] > 0:
                 cv = metrics["duration_stdev"] / metrics["duration_avg"]  # Coefficient of variation
                 # More lenient CV threshold for CI environments
-                import os
-
                 is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
                 cv_threshold = 2.0 if is_ci else 0.5
                 assert cv < cv_threshold, f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
@@ -113,7 +116,10 @@ class TestPerformanceBenchmarks:
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
-        metrics = self.measure_scan_performance(str(assets_dir), runs=3)
+        # Fewer runs in CI to reduce execution time
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        runs = 2 if is_ci else 3
+        metrics = self.measure_scan_performance(str(assets_dir), runs=runs)
 
         # Performance assertions
         assert metrics["all_successful"], "Not all directory scans successful"

@@ -147,3 +147,6 @@ test_*.pkl
 # Internal planning files
 TODO.md
 
+# Temporary analysis artifacts should never be committed
+_temp_files/
+

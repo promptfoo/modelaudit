@@ -1,12 +1,14 @@
 """Tests for HuggingFace URL handling."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.huggingface import (
     download_model,
+    get_model_info,
     get_model_size,
     is_huggingface_url,
     parse_huggingface_url,
@@ -265,3 +267,45 @@ class TestModelSizeAndDiskSpace:
         # Verify download proceeded
         mock_snapshot_download.assert_called_once()
         assert result == Path(mock_path)
+
+
+class TestGetModelInfo:
+    """Test retrieving model metadata from HuggingFace."""
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_with_author(self, mock_hf_api_class):
+        """Ensure author is returned when available."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+
+        model_info = SimpleNamespace(
+            siblings=[
+                SimpleNamespace(rfilename="config.json", size=100),
+                SimpleNamespace(rfilename="README.md", size=50),
+            ],
+            modelId="test/model",
+            author="test-author",
+        )
+        mock_api.model_info.return_value = model_info
+
+        info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["author"] == "test-author"
+        assert info["total_size"] == 100
+        assert info["file_count"] == 1
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_without_author(self, mock_hf_api_class):
+        """Default to empty string when author is missing."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+
+        model_info = SimpleNamespace(
+            siblings=[],
+            modelId="test/model",
+        )
+        mock_api.model_info.return_value = model_info
+
+        info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["author"] == ""
