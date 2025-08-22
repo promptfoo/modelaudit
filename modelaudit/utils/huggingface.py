@@ -95,7 +95,7 @@ def get_model_info(url: str) -> dict:
             "file_count": len(files),
             "files": files,
             "model_id": getattr(model_info, "modelId", repo_id),
-            "author": model_info.author,
+            "author": getattr(model_info, "author", ""),
         }
     except Exception as e:
         raise Exception(f"Failed to get model info for {url}: {e!s}") from e
