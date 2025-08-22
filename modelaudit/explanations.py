@@ -5,8 +5,6 @@ This module provides centralized, security-team-friendly explanations
 for common security issues found in ML model files.
 """
 
-from typing import Optional
-
 # Common explanations for dangerous imports and modules
 DANGEROUS_IMPORTS = {
     "os": (
@@ -237,7 +235,7 @@ TF_OP_EXPLANATIONS = {
 
 
 # Function to get explanation for a security issue
-def get_explanation(category: str, specific_item: Optional[str] = None) -> Optional[str]:
+def get_explanation(category: str, specific_item: str | None = None) -> str | None:
     """
     Get a security explanation for a given category and item.
 
@@ -261,24 +259,24 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
 
 
 # Convenience functions for common use cases
-def get_import_explanation(module_name: str) -> Optional[str]:
+def get_import_explanation(module_name: str) -> str | None:
     """Get explanation for a dangerous import/module."""
     # Handle module.function format (e.g., "os.system")
     base_module = module_name.split(".")[0]
     return get_explanation("import", base_module)
 
 
-def get_opcode_explanation(opcode_name: str) -> Optional[str]:
+def get_opcode_explanation(opcode_name: str) -> str | None:
     """Get explanation for a dangerous pickle opcode."""
     return get_explanation("opcode", opcode_name)
 
 
-def get_pattern_explanation(pattern_name: str) -> Optional[str]:
+def get_pattern_explanation(pattern_name: str) -> str | None:
     """Get explanation for a suspicious pattern."""
     return get_explanation("pattern", pattern_name)
 
 
-def get_tf_op_explanation(op_name: str) -> Optional[str]:
+def get_tf_op_explanation(op_name: str) -> str | None:
     """Get explanation for a suspicious TensorFlow operation."""
     return get_explanation("tf_op", op_name)
 
@@ -390,7 +388,7 @@ COMMON_MESSAGE_EXPLANATIONS = {
 }
 
 
-def get_message_explanation(message: str, context: Optional[str] = None) -> Optional[str]:
+def get_message_explanation(message: str, context: str | None = None) -> str | None:
     """Return a default explanation for an issue message if available.
 
     Args:
@@ -421,7 +419,7 @@ def get_message_explanation(message: str, context: Optional[str] = None) -> Opti
     return base_explanation
 
 
-def _enhance_explanation_with_context(message: str, base_explanation: str, context: str) -> Optional[str]:
+def _enhance_explanation_with_context(message: str, base_explanation: str, context: str) -> str | None:
     """Enhance explanations based on context information."""
     context_lower = context.lower()
 

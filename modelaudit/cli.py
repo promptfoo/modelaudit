@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -65,7 +65,7 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
     return expanded
 
 
-def create_progress_callback_wrapper(progress_callback: Optional[Any], spinner: Optional[Any]) -> Optional[Any]:
+def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
     """Create a type-safe progress callback wrapper."""
     if not progress_callback:
         return None
@@ -90,7 +90,7 @@ def is_mlflow_uri(path: str) -> bool:
 class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
-    def get_command(self, ctx, cmd_name) -> Optional[click.Command]:
+    def get_command(self, ctx, cmd_name) -> click.Command | None:
         """Get command by name, return None if not found"""
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
@@ -158,7 +158,7 @@ def auth() -> None:
     help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
-def login(org_id: Optional[str], host: Optional[str], api_key: Optional[str]) -> None:
+def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     """Login"""
     try:
         token = None
@@ -391,18 +391,18 @@ def scan_command(
     paths: tuple[str, ...],
     blacklist: tuple[str, ...],
     format: str,
-    output: Optional[str],
-    sbom: Optional[str],
+    output: str | None,
+    sbom: str | None,
     timeout: int,
     verbose: bool,
     max_file_size: int,
     max_total_size: int,
-    registry_uri: Optional[str],
-    jfrog_api_token: Optional[str],
-    jfrog_access_token: Optional[str],
-    max_download_size: Optional[str],
+    registry_uri: str | None,
+    jfrog_api_token: str | None,
+    jfrog_access_token: str | None,
+    max_download_size: str | None,
     cache: bool,
-    cache_dir: Optional[str],
+    cache_dir: str | None,
     no_skip_files: bool,
     strict_license: bool,
     preview: bool,
@@ -410,7 +410,7 @@ def scan_command(
     stream: bool,
     large_model_support: bool,
     progress: bool,
-    progress_log: Optional[str],
+    progress_log: str | None,
     progress_format: str,
     progress_interval: float,
 ) -> None:
@@ -1138,9 +1138,9 @@ def scan_command(
                     if not any(issue.message == "Scan interrupted by user" for issue in audit_result.issues):
                         import time
 
-                        from .models import IssueModel
+                        from .scanners.base import Issue
 
-                        interruption_issue = IssueModel(
+                        interruption_issue = Issue(
                             message="Scan interrupted by user",
                             severity="info",
                             location=None,

@@ -11,7 +11,10 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import re
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from modelaudit.models import JITScriptFinding
 
 # Dangerous TorchScript operations that can execute arbitrary code
 DANGEROUS_TORCH_OPS = [
@@ -126,11 +129,11 @@ CODE_EXECUTION_PATTERNS = [
 class JITScriptDetector:
     """Detects dangerous JIT/Script code execution patterns in ML models."""
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the JIT/Script detector.
 
         Args:
-            config: Optional configuration dictionary with settings like:
+            config: Configuration dictionary with settings like:
                 - strict_mode: If True, flag any JIT/script usage (default: False)
                 - check_ast: If True, parse and check embedded Python AST (default: True)
                 - custom_dangerous_ops: Additional operations to flag
@@ -150,7 +153,7 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
@@ -171,30 +174,34 @@ class JITScriptDetector:
         # Check for dangerous Torch operations
         for op in self.dangerous_torch_ops:
             if op in text_data:
+                from modelaudit.models import JITScriptFinding
+
                 findings.append(
-                    {
-                        "type": "dangerous_operation",
-                        "severity": "CRITICAL",
-                        "operation": op,
-                        "framework": "TorchScript",
-                        "message": f"Dangerous TorchScript operation found: {op}",
-                        "context": context,
-                        "recommendation": "Review the model source - this operation can execute arbitrary code",
-                    }
+                    JITScriptFinding(
+                        message=f"Dangerous TorchScript operation found: {op}",
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=op,
+                        recommendation="Review the model source - this operation can execute arbitrary code",
+                        framework="TorchScript",
+                        details={"type": "dangerous_operation", "operation": op},
+                    )
                 )
 
         # Check for TorchScript markers
         if b"TorchScript" in data or b"torch.jit" in data:
             if self.strict_mode:
+                from modelaudit.models import JITScriptFinding
+
                 findings.append(
-                    {
-                        "type": "jit_usage",
-                        "severity": "WARNING",
-                        "framework": "TorchScript",
-                        "message": "TorchScript JIT compilation detected",
-                        "context": context,
-                        "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
-                    }
+                    JITScriptFinding(
+                        message="TorchScript JIT compilation detected",
+                        severity="WARNING",
+                        context=context,
+                        recommendation="JIT-compiled models can contain arbitrary code - verify source",
+                        framework="TorchScript",
+                        details={"type": "jit_usage"},
+                    )
                 )
 
             # Look for embedded Python code
@@ -205,20 +212,22 @@ class JITScriptDetector:
 
         # Check for pickle within TorchScript (common attack vector)
         if b"GLOBAL" in data and b"torch" in data:
+            from modelaudit.models import JITScriptFinding
+
             findings.append(
-                {
-                    "type": "embedded_pickle",
-                    "severity": "WARNING",
-                    "framework": "TorchScript",
-                    "message": "Embedded pickle data in TorchScript model",
-                    "context": context,
-                    "recommendation": "TorchScript with pickle can execute arbitrary code during loading",
-                }
+                JITScriptFinding(
+                    message="Embedded pickle data in TorchScript model",
+                    severity="WARNING",
+                    context=context,
+                    recommendation="TorchScript with pickle can execute arbitrary code during loading",
+                    framework="TorchScript",
+                    details={"type": "embedded_pickle"},
+                )
             )
 
         return findings
 
-    def scan_tensorflow(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TensorFlow SavedModel for dangerous operations.
 
         Args:
@@ -285,7 +294,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_onnx(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_onnx(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan ONNX model for custom operators and dangerous patterns.
 
         Args:
@@ -338,7 +347,7 @@ class JITScriptDetector:
 
         return findings
 
-    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list[dict[str, Any]]:
+    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list["JITScriptFinding"]:
         """Extract and analyze embedded Python code.
 
         Args:
@@ -424,7 +433,7 @@ class JITScriptDetector:
 
         return findings
 
-    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list[dict[str, Any]]:
+    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list["JITScriptFinding"]:
         """Analyze Python AST for dangerous patterns.
 
         Args:
@@ -491,7 +500,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list[dict[str, Any]]:
+    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list["JITScriptFinding"]:
         """Main entry point to scan a model for JIT/Script code execution risks.
 
         Args:
@@ -533,7 +542,7 @@ class JITScriptDetector:
         return findings
 
 
-def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list[dict[str, Any]]:
+def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list["JITScriptFinding"]:
     """Convenience function to scan a file for JIT/Script execution risks.
 
     Args:

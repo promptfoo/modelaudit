@@ -21,9 +21,13 @@ class TestJITScriptDetector:
 
         findings = detector.scan_torchscript(data, "test_model.pt")
         assert len(findings) >= 2
-        assert any("torch.ops.aten.system" in f["operation"] for f in findings)
-        assert any("torch.ops.aten.exec" in f["operation"] for f in findings)
-        assert all(f["severity"] == "CRITICAL" for f in findings if "operation" in f)
+        assert any("torch.ops.aten.system" in getattr(f, "pattern", f.get("operation", "")) for f in findings)
+        assert any("torch.ops.aten.exec" in getattr(f, "pattern", f.get("operation", "")) for f in findings)
+        assert all(
+            getattr(f, "severity", f.get("severity", "")) == "CRITICAL"
+            for f in findings
+            if hasattr(f, "pattern") or "operation" in f
+        )
 
     def test_detect_torch_jit_compilation(self):
         """Test detection of TorchScript JIT compilation."""
@@ -38,7 +42,7 @@ class TestJITScriptDetector:
         """
 
         findings = detector.scan_torchscript(data, "jit_model.pt")
-        assert any(f["type"] == "jit_usage" for f in findings)
+        assert any(f.type == "jit_usage" for f in findings)
 
     def test_detect_embedded_pickle_in_torch(self):
         """Test detection of embedded pickle in TorchScript."""
@@ -48,8 +52,8 @@ class TestJITScriptDetector:
         data = b"TorchScript\x00GLOBAL torch.nn Module\x00"
 
         findings = detector.scan_torchscript(data)
-        assert any(f["type"] == "embedded_pickle" for f in findings)
-        assert any("pickle" in f["message"].lower() for f in findings)
+        assert any(f.type == "embedded_pickle" for f in findings)
+        assert any("pickle" in f.message.lower() for f in findings)
 
     def test_detect_dangerous_tf_ops(self):
         """Test detection of dangerous TensorFlow operations."""
@@ -64,8 +68,8 @@ class TestJITScriptDetector:
 
         findings = detector.scan_tensorflow(data, "model.pb")
         assert len(findings) >= 2
-        assert any("tf.py_func" in f["operation"] for f in findings)
-        assert any("tf.numpy_function" in f["operation"] for f in findings)
+        assert any("tf.py_func" in f.operation for f in findings)
+        assert any("tf.numpy_function" in f.operation for f in findings)
 
     def test_detect_keras_lambda_layers(self):
         """Test detection of Keras Lambda layers."""
@@ -78,8 +82,8 @@ class TestJITScriptDetector:
         """
 
         findings = detector.scan_tensorflow(data)
-        assert any(f["type"] == "lambda_layer" for f in findings)
-        assert any("Lambda" in f["message"] for f in findings)
+        assert any(f.type == "lambda_layer" for f in findings)
+        assert any("Lambda" in f.message for f in findings)
 
     def test_detect_onnx_custom_operators(self):
         """Test detection of ONNX custom operators."""
@@ -92,8 +96,8 @@ class TestJITScriptDetector:
         """
 
         findings = detector.scan_onnx(data, "model.onnx")
-        assert any(f["type"] == "custom_operator" for f in findings)
-        assert any(f["type"] == "python_operator" for f in findings)
+        assert any(f.type == "custom_operator" for f in findings)
+        assert any(f.type == "python_operator" for f in findings)
 
     def test_detect_dangerous_imports_in_code(self):
         """Test detection of dangerous imports in embedded code."""
@@ -109,9 +113,9 @@ class TestJITScriptDetector:
         """
 
         findings = detector._extract_and_check_python_code(data, "Test", "test.model")
-        assert any("os" in f.get("import", "") for f in findings)
-        assert any("subprocess" in f.get("import", "") for f in findings)
-        assert any(f["severity"] == "CRITICAL" for f in findings)
+        assert any("os" in getattr(f, "import_", "") for f in findings)
+        assert any("subprocess" in getattr(f, "import_", "") for f in findings)
+        assert any(f.severity == "CRITICAL" for f in findings)
 
     def test_detect_dangerous_builtins(self):
         """Test detection of dangerous builtins like eval, exec."""
@@ -125,9 +129,9 @@ class TestJITScriptDetector:
         """
 
         findings = detector._extract_and_check_python_code(data, "Test", "test.model")
-        assert any("eval" in f.get("builtin", "") for f in findings)
-        assert any("exec" in f.get("builtin", "") for f in findings)
-        assert any("__import__" in f.get("builtin", "") for f in findings)
+        assert any("eval" in getattr(f, "builtin", "") for f in findings)
+        assert any("exec" in getattr(f, "builtin", "") for f in findings)
+        assert any("__import__" in getattr(f, "builtin", "") for f in findings)
 
     def test_detect_code_execution_patterns(self):
         """Test detection of code execution patterns in binary data."""
@@ -143,9 +147,9 @@ class TestJITScriptDetector:
         """
 
         findings = detector._extract_and_check_python_code(data, "Test", "test.model")
-        assert any("subprocess" in f.get("pattern", "").lower() for f in findings)
-        assert any("os command" in f.get("pattern", "").lower() for f in findings)
-        assert any("socket" in f.get("pattern", "").lower() for f in findings)
+        assert any("subprocess" in getattr(f, "pattern", "").lower() for f in findings)
+        assert any("os command" in getattr(f, "pattern", "").lower() for f in findings)
+        assert any("socket" in getattr(f, "pattern", "").lower() for f in findings)
 
     def test_auto_detect_model_type(self):
         """Test automatic model type detection."""
@@ -177,9 +181,9 @@ class TestJITScriptDetector:
         findings_strict = detector_strict.scan_torchscript(data)
 
         # Strict mode should flag JIT usage
-        assert any(f["type"] == "jit_usage" for f in findings_strict)
+        assert any(f.type == "jit_usage" for f in findings_strict)
         # Normal mode might not flag it as severely
-        strict_warnings = [f for f in findings_strict if f["type"] == "jit_usage"]
+        strict_warnings = [f for f in findings_strict if f.type == "jit_usage"]
         assert len(strict_warnings) > 0
 
     def test_custom_dangerous_ops(self):
@@ -195,12 +199,12 @@ class TestJITScriptDetector:
         # Test custom Torch op
         torch_data = b"my.custom.dangerous.op(payload)"
         findings = detector.scan_torchscript(torch_data)
-        assert any("my.custom.dangerous.op" in f.get("operation", "") for f in findings)
+        assert any("my.custom.dangerous.op" in getattr(f, "operation", "") for f in findings)
 
         # Test custom TF op
         tf_data = b"tf.my.dangerous.function(exploit)"
         findings = detector.scan_tensorflow(tf_data)
-        assert any("tf.my.dangerous.function" in f.get("operation", "") for f in findings)
+        assert any("tf.my.dangerous.function" in getattr(f, "operation", "") for f in findings)
 
     def test_ast_analysis(self):
         """Test Python AST analysis for dangerous patterns."""
@@ -220,9 +224,9 @@ def malicious():
         findings = detector._extract_and_check_python_code(python_code, "Test", "test")
 
         # Should detect through AST analysis
-        ast_findings = [f for f in findings if "ast_" in f.get("type", "")]
+        ast_findings = [f for f in findings if "ast_" in getattr(f, "type", "")]
         assert len(ast_findings) > 0
-        assert any("os" in f.get("import", "") for f in ast_findings)
+        assert any("os" in getattr(f, "import_", "") for f in ast_findings)
 
 
 class TestDetectJITScriptRisks:

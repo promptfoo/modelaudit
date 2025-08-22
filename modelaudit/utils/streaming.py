@@ -25,7 +25,7 @@ def stream_analyze_file(
     url: str,
     scanner: BaseScanner,
     max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
-) -> tuple[Optional[ScanResult], bool]:
+) -> tuple[ScanResult | None, bool]:
     """Stream analyze a file from cloud storage.
 
     After downloading a configurable chunk of bytes, this function attempts to
@@ -73,7 +73,7 @@ def stream_analyze_file(
         metadata: dict[str, Any] = {}
 
         # Try to use scanner's partial capabilities if available
-        scan_result: Optional[ScanResult] = None
+        scan_result: ScanResult | None = None
         try:
             temp_file.seek(0)
             scan_result = scanner.scan(temp_file)  # type: ignore[arg-type]

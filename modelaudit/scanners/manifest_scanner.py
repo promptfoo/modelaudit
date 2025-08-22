@@ -278,7 +278,7 @@ class ManifestScanner(BaseScanner):
         self,
         path: str,
         ext: str,
-        result: Optional[ScanResult] = None,
+        result: ScanResult | None = None,
     ) -> Optional[dict[str, Any]]:
         """Parse the file based on its extension"""
         try:
@@ -323,7 +323,7 @@ class ManifestScanner(BaseScanner):
 
         return None
 
-    def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
+    def _extract_license_info(self, content: dict[str, Any]) -> str | None:
         """Return license string if found in manifest content"""
 
         potential_keys = ["license", "licence", "licenses"]

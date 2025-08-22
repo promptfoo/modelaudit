@@ -60,9 +60,9 @@ class CloudConfig:
         self.config["apiKey"] = api_key
         self._save_config()
 
-    def get_api_key(self) -> Optional[str]:
+    def get_api_key(self) -> str | None:
         """Get API key."""
-        return cast(Optional[str], self.config.get("apiKey"))
+        return cast(str | None, self.config.get("apiKey"))
 
     def get_api_host(self) -> str:
         """Get API host."""
@@ -181,10 +181,10 @@ def get_user_id() -> str:
     return cast(str, global_config.id)
 
 
-def get_user_email() -> Optional[str]:
+def get_user_email() -> str | None:
     """Get user email from global config."""
     global_config = read_global_config()
-    return cast(Optional[str], global_config.account.get("email"))
+    return cast(str | None, global_config.account.get("email"))
 
 
 def set_user_email(email: str) -> None:
@@ -201,7 +201,7 @@ class ModelAuditConfig:
         """Initialize configuration."""
         self.cloud_config = CloudConfig()
 
-    def get_api_key(self) -> Optional[str]:
+    def get_api_key(self) -> str | None:
         """Get API key with delegation-aware precedence."""
         # 1. Environment (ModelAudit-specific)
         env_key = os.environ.get("MODELAUDIT_API_KEY")
@@ -211,10 +211,10 @@ class ModelAuditConfig:
         # 2. Check if delegated from promptfoo
         if os.environ.get("PROMPTFOO_DELEGATED"):
             # Use shared promptfoo config
-            return cast(Optional[str], self.cloud_config.get_api_key())
+            return cast(str | None, self.cloud_config.get_api_key())
 
         # 3. Fall back to regular config
-        return cast(Optional[str], self.cloud_config.get_api_key())
+        return cast(str | None, self.cloud_config.get_api_key())
 
     def set_api_key(self, api_key: str) -> None:
         """Set API key in config."""
@@ -234,7 +234,7 @@ class ModelAuditConfig:
         """Set API host in config."""
         self.cloud_config.set_api_host(api_host)
 
-    def get_user_email(self) -> Optional[str]:
+    def get_user_email(self) -> str | None:
         """Get user email with delegation-aware precedence."""
         # 1. Environment (ModelAudit-specific)
         env_email = os.environ.get("MODELAUDIT_USER_EMAIL")

@@ -68,7 +68,8 @@ def _add_scan_result_to_model(
 ) -> None:
     """Helper function to add scan result data to Pydantic model."""
 
-    from .models import CheckModel, FileMetadataModel, IssueModel
+    from .models import FileMetadataModel
+    from .scanners.base import Check, Issue
 
     # Update byte counts
     results.bytes_scanned += file_result.bytes_scanned
@@ -88,13 +89,13 @@ def _add_scan_result_to_model(
     for issue in file_result.issues:
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
-            results.issues.append(IssueModel(**issue_dict))
+            results.issues.append(Issue(**issue_dict))
 
     # Convert and add checks
     for check in file_result.checks:
         check_dict = check.to_dict() if hasattr(check, "to_dict") else check
         if isinstance(check_dict, dict):
-            results.checks.append(CheckModel(**check_dict))
+            results.checks.append(Check(**check_dict))
 
     # Add file metadata if available
     if hasattr(file_result, "metadata") and file_result.metadata:
@@ -111,16 +112,16 @@ def _add_issue_to_model(
     results: ModelAuditResultModel,
     message: str,
     severity: str = "warning",
-    location: Optional[str] = None,
-    details: Optional[dict] = None,
-    issue_type: Optional[str] = None,
+    location: str | None = None,
+    details: dict | None = None,
+    issue_type: str | None = None,
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
 
-    from .models import IssueModel
+    from .scanners.base import Issue
 
-    issue = IssueModel(
+    issue = Issue(
         message=message,
         severity=severity,
         location=location,
@@ -289,7 +290,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
     """Extract severity and explanation from failed checks.
 
     Args:
@@ -424,9 +425,9 @@ def _consolidate_checks(results: ModelAuditResultModel) -> None:
         )
 
     # Update results with consolidated checks and counts - convert to Pydantic models
-    from .models import CheckModel
+    from .models import Check
 
-    results.checks = [CheckModel(**check) if isinstance(check, dict) else check for check in consolidated_checks]
+    results.checks = [Check(**check) if isinstance(check, dict) else check for check in consolidated_checks]
     _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
@@ -720,7 +721,7 @@ def scan_model_directory_or_file(
                             results.scanner_names.append(scanner_name)
 
                         # Add issues for each file path that shares this content using Pydantic models
-                        from .models import IssueModel
+                        from .scanners.base import Issue
 
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
@@ -739,11 +740,11 @@ def scan_model_directory_or_file(
                                 if "timestamp" not in issue_dict:
                                     issue_dict["timestamp"] = time.time()
 
-                                results.issues.append(IssueModel(**issue_dict))
+                                results.issues.append(Issue(**issue_dict))
 
                         # Add checks for each file path that shares this content using Pydantic models
                         if hasattr(file_result, "checks"):
-                            from .models import CheckModel
+                            from .models import Check
 
                             for check in file_result.checks:
                                 check_dict = check.to_dict() if hasattr(check, "to_dict") else check
@@ -762,7 +763,7 @@ def scan_model_directory_or_file(
                                     if "timestamp" not in check_dict:
                                         check_dict["timestamp"] = time.time()
 
-                                    results.checks.append(CheckModel(**check_dict))
+                                    results.checks.append(Check(**check_dict))
 
                         # Add assets for all file paths that share this content
                         for file_path in file_paths:
@@ -1035,10 +1036,12 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
+        from modelaudit.scanners.base import IssueSeverity
+
         security_issues = [
             issue
             for issue in issues
-            if hasattr(issue, "severity") and issue.severity in ["warning", "error", "critical"]
+            if hasattr(issue, "severity") and issue.severity in [IssueSeverity.WARNING, IssueSeverity.CRITICAL]
         ]
         if security_issues:
             return 1
@@ -1207,7 +1210,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
-    result: Optional[ScanResult]
+    result: ScanResult | None
 
     # We already checked use_extreme_handler above for size limit bypass
     # Now check if we should use regular large handler

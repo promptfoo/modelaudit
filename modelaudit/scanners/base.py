@@ -7,9 +7,9 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, List, Optional  # noqa: UP035
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
@@ -55,17 +55,27 @@ class Check(BaseModel):
 
     model_config = ConfigDict(
         validate_assignment=True,
-        extra="allow"  # Allow extra fields for extensibility
+        extra="allow",  # Allow extra fields for extensibility
     )
 
     name: str = Field(..., description="Name of the check performed")
     status: CheckStatus = Field(..., description="Whether the check passed or failed")
     message: str = Field(..., description="Description of what was checked")
-    severity: Optional[IssueSeverity] = Field(None, description="Severity (only for failed checks)")
-    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    severity: IssueSeverity | None = Field(None, description="Severity (only for failed checks)")
+    location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
-    why: Optional[str] = Field(None, description="Explanation (mainly for failed checks)")
+    why: str | None = Field(None, description="Explanation (mainly for failed checks)")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
+
+    @field_serializer("status")
+    def serialize_status(self, status: CheckStatus) -> str:
+        """Serialize status enum to string value"""
+        return status.value
+
+    @field_serializer("severity")
+    def serialize_severity(self, severity: IssueSeverity | None) -> str | None:
+        """Serialize severity enum to string value"""
+        return severity.value if severity else None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the check to a dictionary for serialization (backward compatibility)"""
@@ -85,16 +95,21 @@ class Issue(BaseModel):
 
     model_config = ConfigDict(
         validate_assignment=True,
-        extra="allow"  # Allow extra fields for extensibility
+        extra="allow",  # Allow extra fields for extensibility
     )
 
     message: str = Field(..., description="Description of the issue")
     severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
-    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
-    why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
+    why: str | None = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
-    type: Optional[str] = Field(None, description="Type of issue for categorization")
+    type: str | None = Field(None, description="Type of issue for categorization")
+
+    @field_serializer("severity")
+    def serialize_severity(self, severity: IssueSeverity) -> str:
+        """Serialize severity enum to string value"""
+        return severity.value
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for serialization (backward compatibility)"""
@@ -102,7 +117,8 @@ class Issue(BaseModel):
 
     def __str__(self) -> str:
         """String representation of the issue"""
-        prefix = f"[{self.severity.value.upper()}]"
+        severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
+        prefix = f"[{severity_str.upper()}]"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -113,10 +129,10 @@ class ScanResult:
 
     def __init__(self, scanner_name: str = "unknown"):
         self.scanner_name = scanner_name
-        self.issues: List[Issue] = []  # noqa: UP006
-        self.checks: List[Check] = []  # All checks performed (passed and failed)  # noqa: UP006
+        self.issues: list[Issue] = []
+        self.checks: list[Check] = []  # All checks performed (passed and failed)
         self.start_time = time.time()
-        self.end_time: Optional[float] = None
+        self.end_time: float | None = None
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
@@ -126,10 +142,10 @@ class ScanResult:
         name: str,
         passed: bool,
         message: str,
-        severity: Optional[IssueSeverity] = None,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
+        severity: IssueSeverity | None = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
     ) -> None:
         """Add a check result (passed or failed)"""
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
@@ -145,7 +161,7 @@ class ScanResult:
             severity=severity,
             location=location,
             details=details or {},
-            why=why
+            why=why,
         )
         self.checks.append(check)
 
@@ -161,7 +177,7 @@ class ScanResult:
                 location=location,
                 details=details or {},
                 why=why,
-                type=f"{self.scanner_name}_check"
+                type=f"{self.scanner_name}_check",
             )
             self.issues.append(issue)
 
@@ -183,9 +199,9 @@ class ScanResult:
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
     ) -> None:
         """Add an issue to the result (for backward compatibility)"""
         if why is None:
@@ -198,7 +214,7 @@ class ScanResult:
             location=location,
             details=details or {},
             why=why,
-            type=f"{self.scanner_name}_issue"
+            type=f"{self.scanner_name}_issue",
         )
         self.issues.append(issue)
 
@@ -211,7 +227,7 @@ class ScanResult:
             severity=severity,
             location=location,
             details=details or {},
-            why=why
+            why=why,
         )
         self.checks.append(check)
 
@@ -314,9 +330,9 @@ class BaseScanner(ABC):
 
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
-    supported_extensions: ClassVar[List[str]] = []  # noqa: UP006
+    supported_extensions: ClassVar[list[str]] = []
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
         self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
@@ -329,12 +345,12 @@ class BaseScanner(ABC):
             "max_file_read_size",
             0,
         )  # Default unlimited
-        self._path_validation_result: Optional[ScanResult] = None
-        self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
-        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
+        self._path_validation_result: ScanResult | None = None
+        self.context: UnifiedMLContext | None = None  # Will be initialized when scanning a file
+        self.scan_start_time: float | None = None  # Track scan start time for timeout
 
         # Progress tracking setup
-        self.progress_tracker: Optional[Any] = None
+        self.progress_tracker: Any | None = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
     @classmethod
@@ -654,7 +670,7 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for network communication: {e}")
             return 0
 
-    def _check_path(self, path: str) -> Optional[ScanResult]:
+    def _check_path(self, path: str) -> ScanResult | None:
         """Common path checks and validation
 
         Returns:
@@ -802,7 +818,7 @@ class BaseScanner(ABC):
 
         return hashes
 
-    def _check_size_limit(self, path: str) -> Optional[ScanResult]:
+    def _check_size_limit(self, path: str) -> ScanResult | None:
         """Check if the file exceeds the configured size limit."""
         file_size = self.get_file_size(path)
 
@@ -967,7 +983,7 @@ class BaseScanner(ABC):
             self._report_progress_error(e)
             raise
 
-    def get_progress_stats(self) -> Optional[dict[str, Any]]:
+    def get_progress_stats(self) -> dict[str, Any] | None:
         """Get current progress statistics."""
         if self.progress_tracker:
             return self.progress_tracker.get_stats()

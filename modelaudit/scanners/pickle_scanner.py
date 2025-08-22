@@ -252,7 +252,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     return is_suspicious_global(mod, func)
 
 
-def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
+def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
     Now includes py_compile validation to reduce false positives.
@@ -568,7 +568,7 @@ def is_suspicious_global(mod: str, func: str) -> bool:
     return False
 
 
-def is_suspicious_string(s: str) -> Optional[str]:
+def is_suspicious_string(s: str) -> str | None:
     """Check if a string contains suspicious patterns"""
     import re
 

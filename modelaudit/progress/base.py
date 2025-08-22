@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, List, Optional  # noqa: UP035
+from typing import Callable, Optional
 
 logger = logging.getLogger("modelaudit.progress")
 
@@ -189,7 +189,7 @@ class ProgressTracker:
         self,
         total_bytes: int = 0,
         total_items: int = 0,
-        reporters: Optional[List[ProgressReporter]] = None,  # noqa: UP006
+        reporters: Optional[list[ProgressReporter]] = None,
         update_interval: float = 1.0,
     ):
         """Initialize progress tracker.
@@ -207,7 +207,7 @@ class ProgressTracker:
         self.reporters = reporters or []
         self.update_interval = update_interval
         self._lock = threading.Lock()
-        self._callbacks: List[ProgressCallback] = []  # noqa: UP006
+        self._callbacks: list[ProgressCallback] = []
         self._last_update_time = 0.0
 
     def add_reporter(self, reporter: ProgressReporter) -> None:
@@ -307,7 +307,7 @@ class ProgressTracker:
             self.stats.status_message = message
             self._maybe_report_progress()
 
-    def set_totals(self, total_bytes: Optional[int] = None, total_items: Optional[int] = None) -> None:
+    def set_totals(self, total_bytes: int | None = None, total_items: int | None = None) -> None:
         """Update total counts.
 
         Args:

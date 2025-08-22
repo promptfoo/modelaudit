@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union, cast
+from typing import Any, Union, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -9,7 +9,8 @@ from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
-from .models import FileMetadataModel, IssueModel, ModelAuditResultModel
+from .models import FileMetadataModel, ModelAuditResultModel
+from .scanners.base import Issue
 
 
 def _file_sha256(path: str) -> str:
@@ -20,7 +21,7 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _calculate_risk_score(path: str, issues: list[IssueModel]) -> int:
+def _calculate_risk_score(path: str, issues: list["Issue"]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
     for issue in issues:
@@ -103,8 +104,8 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
 
 def _component_for_file_pydantic(
     path: str,
-    metadata: Optional[FileMetadataModel],
-    issues: list[IssueModel],
+    metadata: FileMetadataModel | None,
+    issues: list[Issue],
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
     size = os.path.getsize(path) if os.path.exists(path) else 0
@@ -292,7 +293,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     bom = Bom()
 
     # Use Pydantic models directly
-    issues: list[IssueModel] = results.issues
+    issues: list[Issue] = results.issues
     file_metadata: dict[str, FileMetadataModel] = results.file_metadata
 
     for input_path in paths:

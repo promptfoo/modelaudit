@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 class ModelArchitecture(Enum):
@@ -55,8 +55,8 @@ class UnifiedMLContext:
 
     # ML Framework detection
     frameworks: dict[str, float] = field(default_factory=dict)  # framework -> confidence
-    primary_framework: Optional[str] = None
-    framework_version: Optional[str] = None
+    primary_framework: str | None = None
+    framework_version: str | None = None
 
     # Architecture analysis
     architecture: ModelArchitecture = ModelArchitecture.UNKNOWN

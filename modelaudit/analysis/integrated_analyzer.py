@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from modelaudit.analysis.anomaly_detector import AnomalyDetector
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -59,8 +59,8 @@ class IntegratedAnalyzer:
         pattern: str,
         pattern_type: str,
         context: UnifiedMLContext,
-        raw_data: Optional[bytes] = None,
-        code_snippet: Optional[str] = None,
+        raw_data: bytes | None = None,
+        code_snippet: str | None = None,
     ) -> IntegratedAnalysisResult:
         """Perform integrated analysis on a suspicious pattern."""
 

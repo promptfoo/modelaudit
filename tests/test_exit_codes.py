@@ -3,7 +3,12 @@
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.models import IssueModel, ModelAuditResultModel
+
+# Ensure models are rebuilt for forward references
+from modelaudit.models import ModelAuditResultModel, rebuild_models
+from modelaudit.scanners.base import Issue, IssueSeverity
+
+rebuild_models()
 
 
 def _create_result_model(**kwargs):
@@ -35,7 +40,7 @@ def test_exit_code_clean_scan_with_debug_issues():
     """Test exit code 0 for scan with only debug issues."""
     results = _create_result_model(
         issues=[
-            IssueModel(message="Debug info", severity="debug", location="test.pkl", timestamp=0.0),
+            Issue(message="Debug info", severity=IssueSeverity.DEBUG, location="test.pkl", timestamp=0.0),
         ]
     )
     assert determine_exit_code(results) == 0
@@ -45,7 +50,7 @@ def test_exit_code_security_issues():
     """Test exit code 1 for security issues found."""
     results = _create_result_model(
         issues=[
-            IssueModel(message="Suspicious operation", severity="warning", location="test.pkl", timestamp=0.0),
+            Issue(message="Suspicious operation", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0),
         ]
     )
     assert determine_exit_code(results) == 1
@@ -55,7 +60,9 @@ def test_exit_code_security_errors():
     """Test exit code 1 for security errors found."""
     results = _create_result_model(
         issues=[
-            IssueModel(message="Malicious code detected", severity="error", location="test.pkl", timestamp=0.0),
+            Issue(
+                message="Malicious code detected", severity=IssueSeverity.CRITICAL, location="test.pkl", timestamp=0.0
+            ),
         ]
     )
     assert determine_exit_code(results) == 1
@@ -67,8 +74,11 @@ def test_exit_code_operational_errors():
         success=False,
         has_errors=True,
         issues=[
-            IssueModel(
-                message="Error during scan: File not found", severity="error", location="test.pkl", timestamp=0.0
+            Issue(
+                message="Error during scan: File not found",
+                severity=IssueSeverity.CRITICAL,
+                location="test.pkl",
+                timestamp=0.0,
             ),
         ],
     )
@@ -81,10 +91,18 @@ def test_exit_code_mixed_issues():
         success=False,
         has_errors=True,
         issues=[
-            IssueModel(
-                message="Error during scan: Scanner crashed", severity="error", location="test.pkl", timestamp=0.0
+            Issue(
+                message="Error during scan: Scanner crashed",
+                severity=IssueSeverity.CRITICAL,
+                location="test.pkl",
+                timestamp=0.0,
             ),
-            IssueModel(message="Also found suspicious code", severity="warning", location="test2.pkl", timestamp=0.0),
+            Issue(
+                message="Also found suspicious code",
+                severity=IssueSeverity.WARNING,
+                location="test2.pkl",
+                timestamp=0.0,
+            ),
         ],
     )
     # Operational errors (exit code 2) should take precedence
@@ -96,9 +114,11 @@ def test_exit_code_mixed_severity():
     """Test with mixed severity levels (no operational errors)."""
     results = _create_result_model(
         issues=[
-            IssueModel(message="Debug info", severity="debug", location="test.pkl", timestamp=0.0),
-            IssueModel(message="Info message", severity="info", location="test.pkl", timestamp=0.0),
-            IssueModel(message="Warning about something", severity="warning", location="test.pkl", timestamp=0.0),
+            Issue(message="Debug info", severity=IssueSeverity.DEBUG, location="test.pkl", timestamp=0.0),
+            Issue(message="Info message", severity=IssueSeverity.INFO, location="test.pkl", timestamp=0.0),
+            Issue(
+                message="Warning about something", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0
+            ),
         ]
     )
     # Should return 1 because there are non-debug issues
@@ -109,7 +129,7 @@ def test_exit_code_info_level_issues():
     """Test exit code 0 for info level issues (INFO is not a security problem)."""
     results = _create_result_model(
         issues=[
-            IssueModel(message="Information about model", severity="info", location="test.pkl", timestamp=0.0),
+            Issue(message="Information about model", severity=IssueSeverity.INFO, location="test.pkl", timestamp=0.0),
         ]
     )
     assert determine_exit_code(results) == 0  # INFO level should not trigger exit code 1
@@ -132,7 +152,7 @@ def test_exit_code_no_files_scanned_with_issues():
     results = _create_result_model(
         files_scanned=0,
         issues=[
-            IssueModel(message="Some issue", severity="warning", location="test.pkl", timestamp=0.0),
+            Issue(message="Some issue", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0),
         ],
     )
     assert determine_exit_code(results) == 2
@@ -149,7 +169,7 @@ def test_exit_code_files_scanned_with_issues():
     results = _create_result_model(
         files_scanned=5,
         issues=[
-            IssueModel(message="Security issue", severity="warning", location="test.pkl", timestamp=0.0),
+            Issue(message="Security issue", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0),
         ],
     )
     assert determine_exit_code(results) == 1
@@ -165,5 +185,5 @@ def test_exit_code_file_scan_failure(tmp_path):
 
     assert getattr(results, "has_errors", False) is True
     assert results.success is False
-    assert any(getattr(issue, "severity", None) == "critical" for issue in results.issues)
+    assert any(getattr(issue, "severity", None) == IssueSeverity.CRITICAL for issue in results.issues)
     assert determine_exit_code(results) == 2

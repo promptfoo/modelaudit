@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import click
@@ -80,7 +80,7 @@ def format_size(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def get_cloud_object_size(fs, url: str) -> Optional[int]:
+def get_cloud_object_size(fs, url: str) -> int | None:
     """Get the size of a cloud storage object or directory.
 
     Args:
@@ -219,7 +219,7 @@ def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
 class GCSCache:
     """Smart caching system for cloud downloads."""
 
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(self, cache_dir: Path | None = None):
         if cache_dir is None:
             self.cache_dir = Path.home() / ".modelaudit" / "cache"
         else:
@@ -249,7 +249,7 @@ class GCSCache:
         """Generate cache key for URL."""
         return hashlib.sha256(url.encode()).hexdigest()
 
-    def get_cached_path(self, url: str, etag: Optional[str] = None) -> Optional[Path]:
+    def get_cached_path(self, url: str, etag: str | None = None) -> Path | None:
         """Return cached file if still valid."""
         cache_key = self.get_cache_key(url)
 
@@ -275,7 +275,7 @@ class GCSCache:
 
         return None
 
-    def cache_file(self, url: str, local_path: Path, etag: Optional[str] = None) -> None:
+    def cache_file(self, url: str, local_path: Path, etag: str | None = None) -> None:
         """Cache downloaded file with metadata."""
         cache_key = self.get_cache_key(url)
 
@@ -389,8 +389,8 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def download_from_cloud(
     url: str,
-    cache_dir: Optional[Path] = None,
-    max_size: Optional[int] = None,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
     use_cache: bool = True,
     show_progress: bool = True,
     selective: bool = True,
