@@ -95,44 +95,44 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(complex_model_dir))
 
         # Should have scanned multiple files
-        assert results["files_scanned"] >= 4
-        assert results["success"] is True
+        assert results.files_scanned >= 4
+        assert results.success is True
 
         # Should have assets for each file
-        assets = results["assets"]
+        assets = results.assets
         assert len(assets) >= 4
 
         # Check for SafeTensors file with tensor metadata
-        safetensors_assets = [a for a in assets if a["path"].endswith("model.safetensors")]
+        safetensors_assets = [a for a in assets if a.path.endswith("model.safetensors")]
         assert len(safetensors_assets) == 1
         st_asset = safetensors_assets[0]
-        assert st_asset["type"] == "safetensors"
-        assert "tensors" in st_asset
-        assert "embedding.weight" in st_asset["tensors"]
-        assert "decoder.weight" in st_asset["tensors"]
-        assert "layer_norm.bias" in st_asset["tensors"]
-        assert "size" in st_asset
+        assert st_asset.type == "safetensors"
+        assert hasattr(st_asset, "tensors") and st_asset.tensors is not None
+        assert "embedding.weight" in st_asset.tensors
+        assert "decoder.weight" in st_asset.tensors
+        assert "layer_norm.bias" in st_asset.tensors
+        assert hasattr(st_asset, "size") and st_asset.size is not None
 
         # Check for main JSON config with keys metadata
-        main_config_assets = [a for a in assets if a["path"].endswith("/config.json")]
+        main_config_assets = [a for a in assets if a.path.endswith("/config.json")]
         assert len(main_config_assets) == 1
         config_asset = main_config_assets[0]
-        assert config_asset["type"] == "manifest"
-        assert "keys" in config_asset
+        assert config_asset.type == "manifest"
+        assert hasattr(config_asset, "keys") and config_asset.keys is not None
         expected_keys = ["model_type", "hidden_size", "vocab_size", "num_layers"]
         for key in expected_keys:
-            assert key in config_asset["keys"]
+            assert key in config_asset.keys
 
         # Check for ZIP file with contents
-        zip_assets = [a for a in assets if a["path"].endswith("weights.zip")]
+        zip_assets = [a for a in assets if a.path.endswith("weights.zip")]
         assert len(zip_assets) == 1
         zip_asset = zip_assets[0]
-        assert zip_asset["type"] == "zip"
-        assert "contents" in zip_asset
-        assert len(zip_asset["contents"]) >= 3  # pickle, safetensors, text file
+        assert zip_asset.type == "zip"
+        assert hasattr(zip_asset, "contents") and zip_asset.contents is not None
+        assert len(zip_asset.contents) >= 3  # pickle, safetensors, text file
 
         # Verify nested contents have correct paths
-        nested_paths = {c["path"] for c in zip_asset["contents"]}
+        nested_paths = {c["path"] for c in zip_asset.contents}
         expected_nested = {
             f"{complex_model_dir}/weights.zip:model_state.pkl",
             f"{complex_model_dir}/weights.zip:optimizer.safetensors",
@@ -142,7 +142,7 @@ class TestAssetInventoryIntegration:
 
         # Check nested SafeTensors asset has tensor metadata
         nested_st = next(
-            (c for c in zip_asset["contents"] if c["path"].endswith("optimizer.safetensors")),
+            (c for c in zip_asset.contents if c["path"].endswith("optimizer.safetensors")),
             None,
         )
         assert nested_st is not None
@@ -154,8 +154,8 @@ class TestAssetInventoryIntegration:
         """Test that asset inventory correctly handles subdirectories."""
         results = scan_model_directory_or_file(str(complex_model_dir))
 
-        assets = results["assets"]
-        asset_paths = {a["path"] for a in assets}
+        assets = results.assets
+        asset_paths = {a.path for a in assets}
 
         # Should include files from subdirectories
         tokenizer_config_path = str(
@@ -164,13 +164,13 @@ class TestAssetInventoryIntegration:
         assert tokenizer_config_path in asset_paths
 
         # Check tokenizer config asset
-        tokenizer_assets = [a for a in assets if "tokenizer_config.json" in a["path"]]
+        tokenizer_assets = [a for a in assets if "tokenizer_config.json" in a.path]
         assert len(tokenizer_assets) == 1
         tokenizer_asset = tokenizer_assets[0]
-        assert tokenizer_asset["type"] == "manifest"
-        assert "keys" in tokenizer_asset
-        assert "tokenizer_class" in tokenizer_asset["keys"]
-        assert "special_tokens" in tokenizer_asset["keys"]
+        assert tokenizer_asset.type == "manifest"
+        assert hasattr(tokenizer_asset, "keys") and tokenizer_asset.keys is not None
+        assert "tokenizer_class" in tokenizer_asset.keys
+        assert "special_tokens" in tokenizer_asset.keys
 
     def test_asset_inventory_cli_text_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI text output."""
@@ -245,15 +245,15 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(outer_zip))
 
         # Should have the outer ZIP as main asset
-        assets = results["assets"]
+        assets = results.assets
         assert len(assets) == 1
         outer_asset = assets[0]
-        assert outer_asset["type"] == "zip"
-        assert "contents" in outer_asset
+        assert outer_asset.type == "zip"
+        assert hasattr(outer_asset, "contents") and outer_asset.contents is not None
 
         # Should have the inner ZIP in contents
         inner_zip_asset = None
-        for content in outer_asset["contents"]:
+        for content in outer_asset.contents:
             if content["path"].endswith("inner.zip"):
                 inner_zip_asset = content
                 break
@@ -287,18 +287,18 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(tmp_path))
 
         # Should still have assets even with errors
-        assert "assets" in results
-        assets = results["assets"]
+        assert hasattr(results, "assets")
+        assets = results.assets
         assert len(assets) >= 2
 
         # Should have unknown type for corrupted file (no specific scanner handles .xyz files)
-        unknown_assets = [a for a in assets if a.get("type") == "unknown"]
+        unknown_assets = [a for a in assets if a.type == "unknown"]
         assert len(unknown_assets) >= 1
 
         # Should still have valid file asset
-        valid_assets = [a for a in assets if a["path"].endswith("config.json")]
+        valid_assets = [a for a in assets if a.path.endswith("config.json")]
         assert len(valid_assets) == 1
-        assert valid_assets[0]["type"] == "manifest"
+        assert valid_assets[0].type == "manifest"
 
     def test_asset_inventory_single_file_scan(self, tmp_path: Path):
         """Test asset inventory when scanning a single file."""
@@ -313,17 +313,17 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(single_file))
 
         # Should have exactly one asset
-        assert "assets" in results
-        assets = results["assets"]
+        assert hasattr(results, "assets")
+        assets = results.assets
         assert len(assets) == 1
 
         asset = assets[0]
-        assert asset["path"] == str(single_file)
-        assert asset["type"] == "safetensors"
-        assert "tensors" in asset
-        assert "layer1.weight" in asset["tensors"]
-        assert "layer1.bias" in asset["tensors"]
-        assert "size" in asset
+        assert asset.path == str(single_file)
+        assert asset.type == "safetensors"
+        assert hasattr(asset, "tensors") and asset.tensors is not None
+        assert "layer1.weight" in asset.tensors
+        assert "layer1.bias" in asset.tensors
+        assert hasattr(asset, "size") and asset.size is not None
 
     def test_asset_inventory_empty_directory(self, tmp_path: Path):
         """Test asset inventory with empty directory."""
@@ -333,12 +333,12 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(empty_dir))
 
         # Should complete successfully
-        assert results["success"] is True
-        assert results["files_scanned"] == 0
+        assert results.success is True
+        assert results.files_scanned == 0
 
         # Should have empty assets list
-        assert "assets" in results
-        assert len(results["assets"]) == 0
+        assert hasattr(results, "assets")
+        assert len(results.assets) == 0
 
     def test_asset_inventory_with_integration_test_data(self):
         """Test asset inventory with existing integration test data."""
@@ -351,19 +351,19 @@ class TestAssetInventoryIntegration:
         if mit_dir.exists():
             results = scan_model_directory_or_file(str(mit_dir))
 
-            assert results["success"] is True
-            assert "assets" in results
-            assets = results["assets"]
+            assert results.success is True
+            assert hasattr(results, "assets")
+            assets = results.assets
             assert len(assets) > 0
 
             # Should have different asset types
-            asset_types = {a["type"] for a in assets}
+            asset_types = {a.type for a in assets}
             assert len(asset_types) > 1  # Should have multiple file types
 
             # Check that paths are correct
             for asset in assets:
-                assert asset["path"].startswith(str(mit_dir))
-                assert Path(asset["path"]).exists()
+                assert asset.path.startswith(str(mit_dir))
+                assert Path(asset.path).exists()
 
     def test_asset_inventory_large_tensor_metadata(self, tmp_path: Path):
         """Test asset inventory with models containing many tensors."""
@@ -397,15 +397,15 @@ class TestAssetInventoryIntegration:
 
         results = scan_model_directory_or_file(str(large_model))
 
-        assets = results["assets"]
+        assets = results.assets
         assert len(assets) == 1
 
         asset = assets[0]
-        assert asset["type"] == "safetensors"
-        assert "tensors" in asset
+        assert asset.type == "safetensors"
+        assert hasattr(asset, "tensors") and asset.tensors is not None
 
         # Should capture all tensor names
-        tensor_names = asset["tensors"]
+        tensor_names = asset.tensors
         assert len(tensor_names) == 12 * 6  # 12 layers * 6 tensors per layer
 
         # Verify some expected tensor names are present
@@ -458,18 +458,18 @@ class TestAssetInventoryIntegration:
         results = scan_model_directory_or_file(str(large_dir))
 
         # Should complete successfully
-        assert results["success"] is True
-        assert results["files_scanned"] == 50
+        assert results.success is True
+        assert results.files_scanned == 50
 
         # Should have 50 assets
-        assert len(results["assets"]) == 50
+        assert len(results.assets) == 50
 
         # Each asset should have correct metadata
-        for _i, asset in enumerate(results["assets"]):
-            assert asset["type"] == "manifest"
-            assert "keys" in asset
-            assert "id" in asset["keys"]
-            assert "name" in asset["keys"]
+        for _i, asset in enumerate(results.assets):
+            assert asset.type == "manifest"
+            assert hasattr(asset, "keys") and asset.keys is not None
+            assert "id" in asset.keys
+            assert "name" in asset.keys
 
         # Scan should complete in reasonable time (this test verifies no major performance regression)
-        assert results["duration"] < 30.0  # Should take less than 30 seconds
+        assert results.duration < 30.0  # Should take less than 30 seconds

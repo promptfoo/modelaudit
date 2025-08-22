@@ -142,8 +142,8 @@ class TestTimeoutConfiguration:
             results = scan_model_directory_or_file(tmpdir, timeout=1)
 
             # Should complete and return results
-            assert "files_scanned" in results
-            assert results["files_scanned"] >= 0
+            assert hasattr(results, "files_scanned")
+            assert results.files_scanned >= 0
 
     def test_check_timeout_methods(self):
         """Test the timeout checking helper methods"""

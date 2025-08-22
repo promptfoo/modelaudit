@@ -49,10 +49,10 @@ class TestPerformanceBenchmarks:
             results.append(
                 {
                     "duration": duration,
-                    "files_scanned": scan_result["files_scanned"],
-                    "bytes_scanned": scan_result["bytes_scanned"],
-                    "issues_found": len(scan_result["issues"]),
-                    "success": scan_result["success"],
+                    "files_scanned": scan_result.files_scanned,
+                    "bytes_scanned": scan_result.bytes_scanned,
+                    "issues_found": len(scan_result.issues),
+                    "success": scan_result.success,
                 },
             )
 
@@ -200,7 +200,7 @@ class TestPerformanceBenchmarks:
         # Perform multiple scans
         for _ in range(5):
             results = scan_model_directory_or_file(str(assets_dir))
-            assert results["success"], "Scan should succeed"
+            assert results.success, "Scan should succeed"
 
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
         memory_growth = final_memory - initial_memory
@@ -223,8 +223,8 @@ class TestPerformanceBenchmarks:
             duration = time.time() - start_time
             return {
                 "duration": duration,
-                "success": results["success"],
-                "files_scanned": results["files_scanned"],
+                "success": results.success,
+                "files_scanned": results.files_scanned,
             }
 
         # Test with 3 concurrent scans
@@ -280,7 +280,7 @@ class TestPerformanceBenchmarks:
 
             # Should handle large files reasonably
             assert duration < 10.0, f"Large file scan took too long: {duration:.2f}s"
-            assert results["success"], "Large file scan should succeed"
+            assert results.success, "Large file scan should succeed"
 
             # Calculate throughput
             throughput = large_file_size / duration if duration > 0 else 0
@@ -303,14 +303,10 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result["files_scanned"] == first_result["files_scanned"], (
-                f"Inconsistent files_scanned on run {i + 1}"
-            )
-            assert result["bytes_scanned"] == first_result["bytes_scanned"], (
-                f"Inconsistent bytes_scanned on run {i + 1}"
-            )
-            assert len(result["issues"]) == len(first_result["issues"]), f"Inconsistent issue count on run {i + 1}"
-            assert result["success"] == first_result["success"], f"Inconsistent success status on run {i + 1}"
+            assert result.files_scanned == first_result.files_scanned, f"Inconsistent files_scanned on run {i + 1}"
+            assert result.bytes_scanned == first_result.bytes_scanned, f"Inconsistent bytes_scanned on run {i + 1}"
+            assert len(result.issues) == len(first_result.issues), f"Inconsistent issue count on run {i + 1}"
+            assert result.success == first_result.success, f"Inconsistent success status on run {i + 1}"
 
     def test_timeout_performance(self, assets_dir):
         """Test that timeout handling doesn't significantly impact performance."""
@@ -341,12 +337,12 @@ class TestPerformanceBenchmarks:
         duration_short = time.time() - start_time
 
         # Both should succeed for small test directory
-        assert results_long_timeout["success"], "Long timeout scan should succeed"
-        assert results_short_timeout["success"], "Short timeout scan should succeed"
+        assert results_long_timeout.success, "Long timeout scan should succeed"
+        assert results_short_timeout.success, "Short timeout scan should succeed"
 
         # Results should be consistent
-        assert results_long_timeout["files_scanned"] == results_short_timeout["files_scanned"]
-        assert results_long_timeout["bytes_scanned"] == results_short_timeout["bytes_scanned"]
+        assert results_long_timeout.files_scanned == results_short_timeout.files_scanned
+        assert results_long_timeout.bytes_scanned == results_short_timeout.bytes_scanned
 
         # Performance should be similar (timeout mechanism shouldn't add overhead)
         timeout_overhead = abs(duration_long - duration_short) / min(
@@ -385,7 +381,7 @@ class TestPerformanceBenchmarks:
             duration = time.time() - start_time
             durations.append(duration)
 
-            assert results["success"], f"Iteration {i + 1} should succeed"
+            assert results.success, f"Iteration {i + 1} should succeed"
 
         # Remove outliers using IQR method
         q1 = statistics.quantiles(durations, n=4)[0]

@@ -5,6 +5,7 @@ import tempfile
 from typing import Any, Optional
 
 from .core import scan_model_directory_or_file
+from .models import ModelAuditResultModel
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ def scan_mlflow_model(
     max_file_size: int = 0,
     max_total_size: int = 0,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ModelAuditResultModel:
     """Download and scan a model from the MLflow model registry.
 
     Parameters
