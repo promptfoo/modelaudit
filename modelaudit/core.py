@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional
+from typing import IO, Any, Callable, Optional, Union
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -15,7 +15,7 @@ from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
-from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
@@ -430,23 +430,17 @@ def _consolidate_checks(results: ModelAuditResultModel) -> None:
     _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
-def validate_scan_config(config: dict[str, Any]) -> None:
-    """Validate configuration parameters for scanning."""
-    timeout = config.get("timeout")
-    if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
-        raise ValueError("timeout must be a positive integer")
+def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
+    """Validate configuration parameters for scanning using Pydantic model."""
+    try:
+        return ScanConfigModel.from_dict(config)
+    except Exception as e:
+        raise ValueError(f"Invalid scan configuration: {e}") from e
 
-    max_file_size = config.get("max_file_size")
-    if max_file_size is not None and (not isinstance(max_file_size, int) or max_file_size < 0):
-        raise ValueError("max_file_size must be a non-negative integer")
 
-    max_total_size = config.get("max_total_size")
-    if max_total_size is not None and (not isinstance(max_total_size, int) or max_total_size < 0):
-        raise ValueError("max_total_size must be a non-negative integer")
-
-    chunk_size = config.get("chunk_size")
-    if chunk_size is not None and (not isinstance(chunk_size, int) or chunk_size <= 0):
-        raise ValueError("chunk_size must be a positive integer")
+def create_scan_config(**kwargs: Any) -> ScanConfigModel:
+    """Create a validated scan configuration from keyword arguments."""
+    return ScanConfigModel(**kwargs)
 
 
 def scan_model_directory_or_file(
@@ -1307,17 +1301,18 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
 def merge_scan_result(
     results: ModelAuditResultModel,
-    scan_result: ScanResult,
+    scan_result: Union[ScanResult, dict[str, Any]],
 ) -> None:
     """
     Merge a ScanResult object into the ModelAuditResultModel.
 
     Args:
         results: The existing ModelAuditResultModel
-        scan_result: The ScanResult object to merge
+        scan_result: The ScanResult object or dict to merge
     """
-    # Convert scan_result to dict if it's a ScanResult object
-    scan_dict = scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
-
-    # Use the existing aggregate_scan_result method instead of manual merging
-    results.aggregate_scan_result(scan_dict)
+    # Use the new direct aggregation method for better performance and type safety
+    if isinstance(scan_result, ScanResult):
+        results.aggregate_scan_result_direct(scan_result)
+    else:
+        # Fallback to dict-based aggregation for backward compatibility
+        results.aggregate_scan_result(scan_result)

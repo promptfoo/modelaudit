@@ -1,13 +1,15 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Union, cast
+from typing import Any, Optional, Union, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
+
+from .models import FileMetadataModel, IssueModel, ModelAuditResultModel
 
 
 def _file_sha256(path: str) -> str:
@@ -16,6 +18,125 @@ def _file_sha256(path: str) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _calculate_risk_score(path: str, issues: list[IssueModel]) -> int:
+    """Calculate risk score for a file based on associated issues."""
+    score = 0
+    for issue in issues:
+        if issue.location == path:
+            if issue.severity == "critical":
+                score += 5
+            elif issue.severity == "warning":
+                score += 2
+            elif issue.severity == "info":
+                score += 1
+    return min(score, 10)  # Cap at 10
+
+
+def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExpression]:
+    """Extract license expressions from file metadata."""
+    license_expressions: list[LicenseExpression] = []
+    license_identifiers: list[str] = []
+
+    # Check for legacy license field
+    if metadata.license:
+        license_identifiers.append(str(metadata.license))
+
+    # Check for new license metadata
+    if metadata.license_info:
+        for lic in metadata.license_info:
+            if lic.spdx_id:
+                license_identifiers.append(str(lic.spdx_id))
+            elif lic.name:
+                license_identifiers.append(str(lic.name))
+
+    # Remove duplicates while preserving order
+    unique_licenses: list[str] = []
+    seen = set()
+    for lic_id in license_identifiers:
+        if lic_id not in seen:
+            unique_licenses.append(lic_id)
+            seen.add(lic_id)
+
+    # Create license expressions
+    if len(unique_licenses) == 1:
+        license_expressions.append(LicenseExpression(unique_licenses[0]))
+    elif len(unique_licenses) > 1:
+        compound_expression = " OR ".join(unique_licenses)
+        license_expressions.append(LicenseExpression(compound_expression))
+
+    return license_expressions
+
+
+def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
+    """Create CycloneDX properties from file metadata."""
+    props: list[Property] = []
+
+    # Add file type properties
+    if metadata.is_dataset:
+        props.append(Property(name="is_dataset", value="true"))
+    if metadata.is_model:
+        props.append(Property(name="is_model", value="true"))
+
+    # Add copyright information
+    if metadata.copyright_notices:
+        copyright_holders = []
+        for cr in metadata.copyright_notices:
+            if cr.holder:
+                copyright_holders.append(cr.holder)
+
+        if copyright_holders:
+            props.append(
+                Property(
+                    name="copyright_holders",
+                    value=", ".join(copyright_holders),
+                )
+            )
+
+    # Add license files information
+    if metadata.license_files_nearby:
+        props.append(Property(name="license_files_found", value=str(len(metadata.license_files_nearby))))
+
+    return props
+
+
+def _component_for_file_pydantic(
+    path: str,
+    metadata: Optional[FileMetadataModel],
+    issues: list[IssueModel],
+) -> Component:
+    """Create a CycloneDX component from Pydantic models (type-safe version)."""
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    sha256 = _file_sha256(path) if os.path.exists(path) else ""
+
+    # Start with basic properties
+    props = [Property(name="size", value=str(size))]
+
+    # Calculate and add risk score
+    risk_score = _calculate_risk_score(path, issues)
+    props.append(Property(name="risk_score", value=str(risk_score)))
+
+    # Add metadata-based properties if available
+    license_expressions: list[LicenseExpression] = []
+    if metadata:
+        license_expressions = _extract_license_expressions(metadata)
+        props.extend(_create_metadata_properties(metadata))
+
+    # Create the component
+    component = Component(
+        name=os.path.basename(path),
+        bom_ref=path,
+        type=ComponentType.FILE,
+        hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
+        properties=props,
+    )
+
+    # Add license expressions
+    for license_expr in license_expressions:
+        component.licenses.add(license_expr)
+
+    return component
 
 
 def _component_for_file(
@@ -159,3 +280,33 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
         str,
         outputter.output_as_string(indent=2),
     )
+
+
+def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
+    """
+    Generate SBOM directly from Pydantic models (type-safe version).
+
+    This is the preferred method that works directly with Pydantic models
+    without any dict conversions, providing full type safety.
+    """
+    bom = Bom()
+
+    # Use Pydantic models directly
+    issues: list[IssueModel] = results.issues
+    file_metadata: dict[str, FileMetadataModel] = results.file_metadata
+
+    for input_path in paths:
+        if os.path.isdir(input_path):
+            for root, _, files in os.walk(input_path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    metadata = file_metadata.get(fp)
+                    component = _component_for_file_pydantic(fp, metadata, issues)
+                    bom.components.add(component)
+        else:
+            metadata = file_metadata.get(input_path)
+            component = _component_for_file_pydantic(input_path, metadata, issues)
+            bom.components.add(component)
+
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    return outputter.output_as_string(indent=2)

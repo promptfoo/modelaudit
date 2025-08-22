@@ -275,7 +275,7 @@ class GCSCache:
 
         return None
 
-    def cache_file(self, url: str, local_path: Path, etag: Optional[str] = None):
+    def cache_file(self, url: str, local_path: Path, etag: Optional[str] = None) -> None:
         """Cache downloaded file with metadata."""
         cache_key = self.get_cache_key(url)
 
@@ -313,7 +313,7 @@ class GCSCache:
         }
         self._save_metadata()
 
-    def clean_old_cache(self, max_age_days: int = 7):
+    def clean_old_cache(self, max_age_days: int = 7) -> None:
         """Clean cache entries older than max_age_days."""
         now = datetime.now()
         keys_to_remove = []

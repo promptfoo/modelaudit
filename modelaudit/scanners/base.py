@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, ClassVar, List, Optional  # noqa: UP035
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from ..context.unified_context import UnifiedMLContext
 from ..explanations import get_message_explanation
 from ..interrupt_handler import check_interrupted
@@ -48,43 +50,26 @@ class CheckStatus(Enum):
     SKIPPED = "skipped"  # Check was skipped
 
 
-class Check:
-    """Represents a single security check performed during scanning"""
+class Check(BaseModel):
+    """Pydantic model representing a single security check performed during scanning"""
 
-    def __init__(
-        self,
-        name: str,
-        status: CheckStatus,
-        message: str,
-        severity: Optional[IssueSeverity] = None,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-    ):
-        self.name = name  # Name of the check performed
-        self.status = status  # Whether the check passed or failed
-        self.message = message  # Description of what was checked
-        self.severity = severity  # Severity (only for failed checks)
-        self.location = location  # File position, line number, etc.
-        self.details = details or {}
-        self.why = why  # Explanation (mainly for failed checks)
-        self.timestamp = time.time()
+    model_config = ConfigDict(
+        validate_assignment=True,
+        extra="allow"  # Allow extra fields for extensibility
+    )
+
+    name: str = Field(..., description="Name of the check performed")
+    status: CheckStatus = Field(..., description="Whether the check passed or failed")
+    message: str = Field(..., description="Description of what was checked")
+    severity: Optional[IssueSeverity] = Field(None, description="Severity (only for failed checks)")
+    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
+    why: Optional[str] = Field(None, description="Explanation (mainly for failed checks)")
+    timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the check to a dictionary for serialization"""
-        result = {
-            "name": self.name,
-            "status": self.status.value,
-            "message": self.message,
-            "location": self.location,
-            "details": self.details,
-            "timestamp": self.timestamp,
-        }
-        if self.severity:
-            result["severity"] = self.severity.value
-        if self.why:
-            result["why"] = self.why
-        return result
+        """Convert the check to a dictionary for serialization (backward compatibility)"""
+        return self.model_dump(exclude_none=True, mode="json")
 
     def __str__(self) -> str:
         """String representation of the check"""
@@ -95,36 +80,25 @@ class Check:
         return f"{prefix}: {self.message}"
 
 
-class Issue:
-    """Represents a single issue found during scanning"""
+class Issue(BaseModel):
+    """Pydantic model representing a single issue found during scanning"""
 
-    def __init__(
-        self,
-        message: str,
-        severity: IssueSeverity = IssueSeverity.WARNING,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-    ):
-        self.message = message
-        self.severity = severity
-        self.location = location  # File position, line number, etc.
-        self.details = details or {}
-        self.why = why  # Explanation of why this is a security concern
-        self.timestamp = time.time()
+    model_config = ConfigDict(
+        validate_assignment=True,
+        extra="allow"  # Allow extra fields for extensibility
+    )
+
+    message: str = Field(..., description="Description of the issue")
+    severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
+    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
+    why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
+    timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
+    type: Optional[str] = Field(None, description="Type of issue for categorization")
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the issue to a dictionary for serialization"""
-        result = {
-            "message": self.message,
-            "severity": self.severity.value,
-            "location": self.location,
-            "details": self.details,
-            "timestamp": self.timestamp,
-        }
-        if self.why:
-            result["why"] = self.why
-        return result
+        """Convert the issue to a dictionary for serialization (backward compatibility)"""
+        return self.model_dump(exclude_none=True, mode="json")
 
     def __str__(self) -> str:
         """String representation of the issue"""
@@ -164,7 +138,15 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
-        check = Check(name, status, message, severity, location, details, why)
+        check = Check(
+            name=name,
+            status=status,
+            message=message,
+            severity=severity,
+            location=location,
+            details=details or {},
+            why=why
+        )
         self.checks.append(check)
 
         # If the check failed, also add it as an issue for backward compatibility
@@ -173,7 +155,14 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
-            issue = Issue(message, severity, location, details, why)
+            issue = Issue(
+                message=message,
+                severity=severity,
+                location=location,
+                details=details or {},
+                why=why,
+                type=f"{self.scanner_name}_check"
+            )
             self.issues.append(issue)
 
             log_level = (
@@ -202,12 +191,28 @@ class ScanResult:
         if why is None:
             # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
-        issue = Issue(message, severity, location, details, why)
+
+        issue = Issue(
+            message=message,
+            severity=severity,
+            location=location,
+            details=details or {},
+            why=why,
+            type=f"{self.scanner_name}_issue"
+        )
         self.issues.append(issue)
 
         # Also add as a failed check for consistency
         check_name = details.get("check_name", "Security Check") if details else "Security Check"
-        check = Check(check_name, CheckStatus.FAILED, message, severity, location, details, why)
+        check = Check(
+            name=check_name,
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=severity,
+            location=location,
+            details=details or {},
+            why=why
+        )
         self.checks.append(check)
 
         log_level = (
@@ -962,7 +967,7 @@ class BaseScanner(ABC):
             self._report_progress_error(e)
             raise
 
-    def get_progress_stats(self):
+    def get_progress_stats(self) -> Optional[dict[str, Any]]:
         """Get current progress statistics."""
         if self.progress_tracker:
             return self.progress_tracker.get_stats()

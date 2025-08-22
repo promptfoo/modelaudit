@@ -48,6 +48,40 @@ def style_text(text: str, **kwargs) -> str:
     return text
 
 
+def expand_paths(paths: tuple[str, ...]) -> list[str]:
+    """Expand and validate input paths with type safety."""
+    expanded: list[str] = []
+    for path_str in paths:
+        # Handle glob patterns and resolve paths
+        path = Path(path_str)
+        if "*" in path_str or "?" in path_str:
+            # Handle glob patterns
+            import glob
+
+            matches = glob.glob(path_str, recursive=True)
+            expanded.extend(matches)
+        else:
+            expanded.append(str(path.resolve()) if path.exists() else path_str)
+    return expanded
+
+
+def create_progress_callback_wrapper(progress_callback: Optional[Any], spinner: Optional[Any]) -> Optional[Any]:
+    """Create a type-safe progress callback wrapper."""
+    if not progress_callback:
+        return None
+
+    def wrapped_callback(message: str, percentage: float) -> None:
+        """Wrapped progress callback with type safety."""
+        try:
+            progress_callback(message, percentage)
+            if spinner and hasattr(spinner, "text"):
+                spinner.text = message
+        except Exception as e:
+            logger.warning(f"Progress callback error: {e}")
+
+    return wrapped_callback
+
+
 def is_mlflow_uri(path: str) -> bool:
     """Check if a path is an MLflow model URI."""
     return path.startswith("models:/")
@@ -56,12 +90,12 @@ def is_mlflow_uri(path: str) -> bool:
 class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
-    def get_command(self, ctx, cmd_name):
+    def get_command(self, ctx, cmd_name) -> Optional[click.Command]:
         """Get command by name, return None if not found"""
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
 
-    def resolve_command(self, ctx, args):
+    def resolve_command(self, ctx, args) -> tuple[str, click.Command, list[str]]:
         """Resolve command, using 'scan' as default when paths are provided"""
         # If we have args and the first arg is not a known command, use 'scan' as default
         if args and args[0] not in self.list_commands(ctx):
@@ -70,7 +104,7 @@ class DefaultCommandGroup(click.Group):
 
         return super().resolve_command(ctx, args)
 
-    def format_help(self, ctx, formatter):
+    def format_help(self, ctx, formatter) -> None:
         """Show help with both commands but emphasize scan as primary"""
         formatter.write_text("ModelAudit - Security scanner for ML model files")
         formatter.write_paragraph()
@@ -111,7 +145,7 @@ def cli() -> None:
 
 
 @cli.group()
-def auth():
+def auth() -> None:
     """Manage authentication"""
     pass
 
@@ -124,7 +158,7 @@ def auth():
     help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
-def login(org_id, host, api_key):
+def login(org_id: Optional[str], host: Optional[str], api_key: Optional[str]) -> None:
     """Login"""
     try:
         token = None
@@ -165,7 +199,7 @@ def login(org_id, host, api_key):
 
 
 @auth.command()
-def logout():
+def logout() -> None:
     """Logout"""
     email = get_user_email()
     api_key = cloud_config.get_api_key()
@@ -182,7 +216,7 @@ def logout():
 
 
 @auth.command()
-def whoami():
+def whoami() -> None:
     """Show current user information"""
     try:
         email = get_user_email()
@@ -211,7 +245,7 @@ def whoami():
 
 
 @cli.command("delegate-info", hidden=True)
-def delegate_info():
+def delegate_info() -> None:
     """Internal command to show delegation status"""
 
     from .auth.config import config
@@ -424,17 +458,23 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
-    # Expand DVC pointer files before scanning
-    expanded_paths = []
-    for p in paths:
+    # Expand and validate paths with type safety
+    expanded_paths: list[str] = expand_paths(paths)
+
+    # Process DVC pointer files
+    dvc_expanded_paths: list[str] = []
+    for p in expanded_paths:
         if os.path.isfile(p) and p.endswith(".dvc"):
             targets = resolve_dvc_file(p)
             if targets:
-                expanded_paths.extend(targets)
+                dvc_expanded_paths.extend(targets)
             else:
-                expanded_paths.append(p)
+                dvc_expanded_paths.append(p)
         else:
-            expanded_paths.append(p)
+            dvc_expanded_paths.append(p)
+
+    # Use the DVC-expanded paths as the final list
+    expanded_paths = dvc_expanded_paths
 
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
@@ -1596,7 +1636,7 @@ def _format_issue(
     is_flag=True,
     help="Show detailed information about failed scanners",
 )
-def doctor(show_failed: bool):
+def doctor(show_failed: bool) -> None:
     """Diagnose scanner compatibility and system status"""
     import sys
 

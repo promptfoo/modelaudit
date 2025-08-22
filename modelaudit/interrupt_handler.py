@@ -24,8 +24,9 @@ Usage:
 import logging
 import signal
 import threading
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger("modelaudit.interrupt")
 
@@ -46,8 +47,8 @@ class InterruptHandler:
 
     def __init__(self) -> None:
         self._interrupted = threading.Event()
-        self._original_sigint_handler: Optional[Callable[[int, Any], None]] = None
-        self._original_sigterm_handler: Optional[Callable[[int, Any], None]] = None
+        self._original_sigint_handler: Any = None
+        self._original_sigterm_handler: Any = None
         self._lock = threading.Lock()
         self._active = False
 
@@ -86,7 +87,7 @@ class InterruptHandler:
             raise KeyboardInterrupt("Scan interrupted by user")
 
     @contextmanager
-    def install_handlers(self):
+    def install_handlers(self) -> Generator[None, None, None]:
         """Context manager to install and uninstall signal handlers.
 
         This ensures signal handlers are properly restored even if an
@@ -170,7 +171,7 @@ def reset_interrupt() -> None:
 
 
 @contextmanager
-def interruptible_scan():
+def interruptible_scan() -> Generator["InterruptHandler", None, None]:
     """Context manager for interruptible scanning operations.
 
     This installs signal handlers for SIGINT and SIGTERM, allowing the
