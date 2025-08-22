@@ -140,18 +140,16 @@ class Jinja2TemplateScanner(BaseScanner):
             return True
 
         # JSON files containing templates
-        if ext == ".json":
-            # Tokenizer configuration files
-            if any(
-                pattern in filename
-                for pattern in [
-                    "tokenizer_config.json",
-                    "tokenizer.json",
-                    "chat_template.json",
-                    "generation_config.json",
-                ]
-            ):
-                return True
+        if ext == ".json" and any(
+            pattern in filename
+            for pattern in [
+                "tokenizer_config.json",
+                "tokenizer.json",
+                "chat_template.json",
+                "generation_config.json",
+            ]
+        ):
+            return True
 
         # YAML files in ML contexts
         if ext in [".yaml", ".yml"]:
@@ -346,9 +344,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
             # Look for tokenizer.chat_template in metadata
             for key, field in reader.fields.items():
-                if key == "tokenizer.chat_template":
-                    # Convert bytes/integers to string
-                    if hasattr(field, "parts") and hasattr(field, "data"):
+                if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
                         value = field.parts[field.data[0]]
                         if isinstance(value, (list, tuple)):
                             # Convert list of integers to string
@@ -387,19 +383,25 @@ class Jinja2TemplateScanner(BaseScanner):
                 current_path = f"{path}.{key}" if path else key
 
                 # Check for known template fields
-                if key in ["chat_template", "template", "jinja_template", "custom_chat_template"]:
-                    if isinstance(value, str) and value.strip():
-                        if len(value) <= self.max_template_size:
-                            templates[current_path] = value
+                if (
+                    key in ["chat_template", "template", "jinja_template", "custom_chat_template"]
+                    and isinstance(value, str)
+                    and value.strip()
+                    and len(value) <= self.max_template_size
+                ):
+                    templates[current_path] = value
 
                 # Recursively check nested structures
                 elif isinstance(value, (dict, list)):
                     self._find_json_templates(value, templates, current_path)
 
                 # Check for template-like strings (contain Jinja2 syntax)
-                elif isinstance(value, str) and self._looks_like_template(value):
-                    if len(value) <= self.max_template_size:
-                        templates[current_path] = value
+                elif (
+                    isinstance(value, str)
+                    and self._looks_like_template(value)
+                    and len(value) <= self.max_template_size
+                ):
+                    templates[current_path] = value
 
         elif isinstance(data, list):
             for i, item in enumerate(data):
@@ -549,20 +551,21 @@ class Jinja2TemplateScanner(BaseScanner):
         base_severity = base_severity_map.get(detection.risk_level, IssueSeverity.WARNING)
 
         # Context-based adjustments
-        if context.confidence >= 3 and context.framework == "huggingface":
-            # High confidence ML context - might downgrade some warnings
-            if detection.pattern_type in ["control_flow", "environment_access"]:
-                if base_severity == IssueSeverity.WARNING:
-                    return IssueSeverity.INFO
+        if (
+            context.confidence >= 3
+            and context.framework == "huggingface"
+            and detection.pattern_type in ["control_flow", "environment_access"]
+            and base_severity == IssueSeverity.WARNING
+        ):
+            return IssueSeverity.INFO
 
         # Sensitivity level adjustments
         if self.sensitivity_level == "high":
             # Keep original severity
             pass
-        elif self.sensitivity_level == "low":
+        elif self.sensitivity_level == "low" and base_severity == IssueSeverity.WARNING:
             # Downgrade non-critical issues
-            if base_severity == IssueSeverity.WARNING:
-                return IssueSeverity.INFO
+            return IssueSeverity.INFO
 
         return base_severity
 
