@@ -2444,22 +2444,27 @@ class PickleScanner(BaseScanner):
 
     def check_for_jit_script_code(
         self,
-        file_data: bytes,
+        data: bytes,
         result: ScanResult,
         model_type: str = "pytorch",
         context: str = "",
-    ) -> None:
+        enable_check: bool = True,
+    ) -> int:
         """Check for JIT/Script code execution risks in pickle data.
 
         Args:
-            file_data: The binary file data to analyze
+            data: The binary file data to analyze
             result: ScanResult to add findings to
             model_type: Type of model being scanned (e.g., 'pytorch')
             context: Context path for reporting
+            enable_check: Whether to enable this check (inherited from base)
+
+        Returns:
+            Number of findings discovered
         """
         # Check if JIT script detection is enabled
-        if not self.config.get("check_jit_script", True):
-            return
+        if not enable_check or not self.config.get("check_jit_script", True):
+            return 0
 
         try:
             from modelaudit.jit_script_detector import JITScriptDetector
@@ -2471,14 +2476,14 @@ class PickleScanner(BaseScanner):
             # Scan for JIT script patterns based on model type
             findings = []
             if model_type.lower() == "pytorch":
-                findings = detector.scan_torchscript(file_data, context)
+                findings = detector.scan_torchscript(data, context)
             elif model_type.lower() == "tensorflow":
-                findings = detector.scan_tensorflow(file_data, context)
+                findings = detector.scan_tensorflow(data, context)
             elif model_type.lower() == "onnx":
-                findings = detector.scan_onnx(file_data, context)
+                findings = detector.scan_onnx(data, context)
             else:
                 # Try to detect model type automatically
-                findings = detector.scan_model(file_data, context)
+                findings = detector.scan_model(data, context)
 
             # Convert findings to Check objects
             if findings:
@@ -2517,6 +2522,7 @@ class PickleScanner(BaseScanner):
                         details={"findings_count": len(findings)},
                         why="JIT/Script analysis completed with no critical security risks",
                     )
+                return len(findings)
             else:
                 # No findings at all - add a passed check
                 result.add_check(
@@ -2527,6 +2533,7 @@ class PickleScanner(BaseScanner):
                     location=context,
                     why="File contains no detectable JIT/Script code execution patterns",
                 )
+                return 0
 
         except ImportError:
             # JIT script detector not available
@@ -2539,6 +2546,7 @@ class PickleScanner(BaseScanner):
                 details={"error": "JIT script detector dependencies not installed"},
                 why="JIT/Script detection requires additional dependencies",
             )
+            return 0
         except Exception as e:
             # Error during JIT script detection
             result.add_check(
@@ -2550,3 +2558,4 @@ class PickleScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 why="JIT/Script detection encountered an unexpected error",
             )
+            return 0

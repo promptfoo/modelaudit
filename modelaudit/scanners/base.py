@@ -115,6 +115,17 @@ class Issue(BaseModel):
         """Convert the issue to a dictionary for serialization (backward compatibility)"""
         return self.model_dump(exclude_none=True, mode="json")
 
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dictionary-style access for backward compatibility with tests"""
+        try:
+            value = getattr(self, key, default)
+            # Handle enum serialization for backward compatibility
+            if key == "severity" and hasattr(value, "value"):
+                return value.value
+            return value
+        except AttributeError:
+            return default
+
     def __str__(self) -> str:
         """String representation of the issue"""
         severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
@@ -574,16 +585,39 @@ class BaseScanner(ABC):
                     "WARNING": IssueSeverity.WARNING,
                     "INFO": IssueSeverity.INFO,
                 }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                # Handle both dict and Pydantic model findings
+                if hasattr(finding, "model_dump"):
+                    # Pydantic model (JITScriptFinding)
+                    severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
+                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                    message = finding.message
+                    location = finding.context
+                    recommendation = finding.recommendation or "Review JIT/Script code for security"
+                    details = finding.model_dump()
+                elif hasattr(finding, "get"):
+                    # Dict format (backward compatibility)
+                    severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                    message = finding.get("message", "JIT/Script code risk detected")
+                    location = finding.get("context", context)
+                    recommendation = finding.get("recommendation", "Review JIT/Script code for security")
+                    details = dict(finding)  # Ensure it's a dict
+                else:
+                    # Object with attributes but not Pydantic
+                    severity_value = getattr(finding, "severity", "WARNING")
+                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                    message = getattr(finding, "message", "JIT/Script code risk detected")
+                    location = getattr(finding, "context", context)
+                    recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
+                    details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
 
                 result.add_check(
                     name="JIT/Script Code Execution Detection",
                     passed=False,
-                    message=finding.get("message", "JIT/Script code risk detected"),
+                    message=message,
                     severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why=finding.get("recommendation", "Review JIT/Script code for security"),
+                    location=location,
+                    details=details,
+                    why=recommendation,
                 )
 
             # Add a passing check if no risks were found

@@ -628,7 +628,7 @@ class CustomFunctionHook(ProgressHook):
 class ProgressHookManager:
     """Manager for progress hooks."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize progress hook manager."""
         self._hooks: dict[str, ProgressHook] = {}
 

@@ -112,34 +112,37 @@ class InterruptHandler:
             yield
             return
 
+        # Not active, need to acquire lock and install handlers
         with self._lock:
-            # Double-check inside lock (in case state changed)
+            # Double-check inside lock (in case state changed while acquiring lock)
             if self._active:
-                return
-
-            try:
-                # Store original handlers
-                self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
-
-                # SIGTERM might not be available on Windows
+                # Another thread activated it while we were waiting for the lock
+                yield  # type: ignore[unreachable]
+            else:
+                # We need to install handlers
                 try:
-                    self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
-                except (AttributeError, ValueError):
-                    # SIGTERM not available on this platform
-                    self._original_sigterm_handler = None
+                    # Store original handlers
+                    self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
 
-                self._active = True
-                logger.debug("Interrupt handlers installed")
-                yield
-            finally:
-                # Restore original handlers
-                if self._original_sigint_handler is not None:
-                    signal.signal(signal.SIGINT, self._original_sigint_handler)
-                if self._original_sigterm_handler is not None:
-                    with contextlib.suppress(AttributeError, ValueError):
-                        signal.signal(signal.SIGTERM, self._original_sigterm_handler)
-                self._active = False
-                logger.debug("Interrupt handlers restored")
+                    # SIGTERM might not be available on Windows
+                    try:
+                        self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
+                    except (AttributeError, ValueError):
+                        # SIGTERM not available on this platform
+                        self._original_sigterm_handler = None
+
+                    self._active = True
+                    logger.debug("Interrupt handlers installed")
+                    yield
+                finally:
+                    # Restore original handlers
+                    if self._original_sigint_handler is not None:
+                        signal.signal(signal.SIGINT, self._original_sigint_handler)
+                    if self._original_sigterm_handler is not None:
+                        with contextlib.suppress(AttributeError, ValueError):
+                            signal.signal(signal.SIGTERM, self._original_sigterm_handler)
+                    self._active = False
+                    logger.debug("Interrupt handlers restored")
 
 
 # Global interrupt handler instance
