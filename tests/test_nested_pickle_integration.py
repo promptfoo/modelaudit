@@ -157,8 +157,8 @@ class TestNestedPickleIntegration:
             # Should have nested pickle issues
             nested_issues = [
                 issue
-                for issue in results["issues"]
-                if "nested" in issue.get("message", "").lower() or "encoded" in issue.get("message", "").lower()
+                for issue in results.issues
+                if "nested" in getattr(issue, "message", "").lower() or "encoded" in getattr(issue, "message", "").lower()
             ]
 
             assert len(nested_issues) > 0, f"No nested pickle issues found for {description}"
