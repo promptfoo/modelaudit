@@ -148,9 +148,7 @@ class MLContextModel(BaseModel):
     # Training metadata
     training_framework: Optional[str] = Field(None, description="Framework likely used for training")
     precision_type: Optional[str] = Field(None, description="Detected precision (fp32, fp16, int8, etc.)")
-    optimization_hints: list[str] = Field(
-        default_factory=list, description="Detected optimization techniques"
-    )
+    optimization_hints: list[str] = Field(default_factory=list, description="Detected optimization techniques")
 
     def add_framework(
         self,
@@ -253,9 +251,7 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
 
     # License and copyright information
     license: Optional[str] = Field(None, description="Legacy license field for backward compatibility")
-    license_info: list[LicenseInfoModel] = Field(
-        default_factory=list, description="Structured license information"
-    )
+    license_info: list[LicenseInfoModel] = Field(default_factory=list, description="Structured license information")
     copyright_notices: list[CopyrightNoticeModel] = Field(
         default_factory=list, description="Structured copyright notices"
     )
@@ -349,9 +345,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     assets: list[AssetModel] = Field(default_factory=list, description="List of scanned assets")
     has_errors: bool = Field(..., description="Whether any critical issues were found")
     scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
-    file_metadata: dict[str, FileMetadataModel] = Field(
-        default_factory=dict, description="Metadata for each file"
-    )
+    file_metadata: dict[str, FileMetadataModel] = Field(default_factory=dict, description="Metadata for each file")
 
     # Timing and performance
     start_time: float = Field(..., description="Scan start timestamp")

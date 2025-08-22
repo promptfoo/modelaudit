@@ -1050,8 +1050,7 @@ def scan_command(
                         # Filter out DEBUG severity issues when not in verbose mode
                         # scan_results is ModelAuditResultModel
                         visible_issues = [
-                            issue for issue in result_issues
-                            if verbose or issue.severity != IssueSeverity.DEBUG
+                            issue for issue in result_issues if verbose or issue.severity != IssueSeverity.DEBUG
                         ]
                         issue_count = len(visible_issues)
 
