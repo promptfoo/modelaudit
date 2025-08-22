@@ -999,7 +999,7 @@ def scan_model_directory_or_file(
     return results
 
 
-def determine_exit_code(results: dict[str, Any]) -> int:
+def determine_exit_code(results: ModelAuditResultModel) -> int:
     """
     Determine the appropriate exit code based on scan results.
 
