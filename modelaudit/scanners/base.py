@@ -102,7 +102,7 @@ class Issue(BaseModel):
     severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
     location: Optional[str] = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
-    why: str | None = Field(None, description="Explanation of why this is a security concern")
+    why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
     type: Optional[str] = Field(None, description="Type of issue for categorization")
 

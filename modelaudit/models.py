@@ -38,6 +38,10 @@ class JITScriptFinding(DetectorFinding):
 
     framework: Optional[str] = Field(None, description="Framework where finding was detected")
     code_snippet: Optional[str] = Field(None, description="Relevant code snippet")
+    type: Optional[str] = Field(None, description="Type of JIT/Script finding")
+    operation: Optional[str] = Field(None, description="Detected operation or pattern")
+    builtin: Optional[str] = Field(None, description="Detected builtin function")
+    import_: Optional[str] = Field(None, description="Detected import statement", alias="import")
 
 
 class NetworkCommFinding(DetectorFinding):

@@ -529,10 +529,10 @@ test,data
         results = scan_model_directory_or_file(str(test_file))
 
         # Should have license warning
-        license_issues = [issue for issue in results.get("issues", []) if issue.get("type") == "license_warning"]
+        license_issues = [issue for issue in results.get("issues", []) if getattr(issue, "type", None) == "license_warning"]
 
         assert len(license_issues) > 0
-        assert any("Non-commercial" in issue.get("message", "") for issue in license_issues)
+        assert any("Non-commercial" in issue.message for issue in license_issues)
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):
         """Test that ML model directories don't generate false positive license warnings."""
