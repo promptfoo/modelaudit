@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "GPT2Tokenizer",
+  "chat_template": "{% for message in messages %}{{ message['role'].title() }}: {{ message['content'] }}\\n{% endfor %}",
+  "model_max_length": 1024
+}

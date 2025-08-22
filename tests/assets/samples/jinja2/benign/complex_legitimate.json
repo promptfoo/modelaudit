@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "BertTokenizer",
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'system' and loop.first %}System: {{ message['content'] }}\\n\\n{% elif message['role'] == 'user' %}Human: {{ message['content'] }}\\n\\n{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% if not loop.last %}\\n\\n{% endif %}{% endif %}{% endfor %}",
+  "model_max_length": 512
+}

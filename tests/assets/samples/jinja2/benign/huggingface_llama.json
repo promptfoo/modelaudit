@@ -1,0 +1,13 @@
+{
+  "add_bos_token": false,
+  "add_eos_token": false,
+  "bos_token": {
+    "content": "<s>"
+  },
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'system' %}{{ '<<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token }}{% endif %}{% endfor %}",
+  "eos_token": {
+    "content": "</s>"
+  },
+  "tokenizer_class": "LlamaTokenizer",
+  "model_max_length": 4096
+}

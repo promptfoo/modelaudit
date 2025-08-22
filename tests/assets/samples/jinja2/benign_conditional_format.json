@@ -1,0 +1,8 @@
+{
+  "tokenizer_class": "T5Tokenizer",
+  "model_max_length": 512,
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'user' %}User: {{ message['content'] }}{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% endif %}{% if not loop.last %}\\n{% endif %}{% endfor %}",
+  "extra_ids": 100,
+  "model_type": "t5",
+  "vocab_size": 32128
+}

