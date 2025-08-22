@@ -109,7 +109,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _compile_all_patterns(self) -> dict[str, list[tuple[re.Pattern, str]]]:
         """Compile all regex patterns for efficient matching"""
-        compiled = {}
+        compiled: dict[str, list[tuple[re.Pattern, str]]] = {}
 
         for category, patterns in JINJA2_SSTI_PATTERNS.items():
             compiled[category] = []
@@ -366,7 +366,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _extract_json_templates(self, path: str) -> dict[str, str]:
         """Extract templates from JSON configuration files"""
-        templates = {}
+        templates: dict[str, str] = {}
 
         try:
             with open(path, encoding="utf-8") as f:
@@ -408,7 +408,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _extract_yaml_templates(self, path: str) -> dict[str, str]:
         """Extract templates from YAML configuration files"""
-        templates = {}
+        templates: dict[str, str] = {}
 
         if not HAS_YAML:
             return templates
@@ -457,7 +457,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _analyze_template(self, template_content: str, context: MLContext, location: str) -> list[DetectionResult]:
         """Analyze template content for SSTI patterns"""
-        detections = []
+        detections: list[DetectionResult] = []
 
         # Skip empty or very short templates
         if not template_content or len(template_content.strip()) < 3:
@@ -561,9 +561,7 @@ class Jinja2TemplateScanner(BaseScanner):
             pass
         elif self.sensitivity_level == "low":
             # Downgrade non-critical issues
-            if base_severity == IssueSeverity.ERROR:
-                return IssueSeverity.WARNING
-            elif base_severity == IssueSeverity.WARNING:
+            if base_severity == IssueSeverity.WARNING:
                 return IssueSeverity.INFO
 
         return base_severity
@@ -571,13 +569,33 @@ class Jinja2TemplateScanner(BaseScanner):
     def _get_pattern_explanation(self, category: str, match_text: str) -> str:
         """Get explanation for a specific pattern match"""
         explanations = {
-            "critical_injection": f"Direct code execution pattern detected: '{match_text}'. This indicates an attempt to execute arbitrary Python code through template injection.",
-            "object_traversal": f"Python object traversal detected: '{match_text}'. This pattern navigates Python's object hierarchy to access dangerous functions.",
-            "global_access": f"Global namespace access detected: '{match_text}'. This pattern attempts to access Python's global namespace to reach restricted functions.",
-            "obfuscation": f"Obfuscation technique detected: '{match_text}'. This pattern may be attempting to bypass security filters.",
-            "control_flow": f"Suspicious template control flow: '{match_text}'. This pattern uses Jinja2 control structures in potentially malicious ways.",
-            "environment_access": f"System environment access: '{match_text}'. This pattern attempts to access system information or configuration.",
-            "sandbox_violation": "Template contains operations that violate Jinja2 sandboxing security restrictions.",
+            "critical_injection": (
+                f"Direct code execution pattern detected: '{match_text}'. "
+                "This indicates an attempt to execute arbitrary Python code through template injection."
+            ),
+            "object_traversal": (
+                f"Python object traversal detected: '{match_text}'. "
+                "This pattern navigates Python's object hierarchy to access dangerous functions."
+            ),
+            "global_access": (
+                f"Global namespace access detected: '{match_text}'. "
+                "This pattern attempts to access Python's global namespace to reach restricted functions."
+            ),
+            "obfuscation": (
+                f"Obfuscation technique detected: '{match_text}'. "
+                "This pattern may be attempting to bypass security filters."
+            ),
+            "control_flow": (
+                f"Suspicious template control flow: '{match_text}'. "
+                "This pattern uses Jinja2 control structures in potentially malicious ways."
+            ),
+            "environment_access": (
+                f"System environment access: '{match_text}'. "
+                "This pattern attempts to access system information or configuration."
+            ),
+            "sandbox_violation": (
+                "Template contains operations that violate Jinja2 sandboxing security restrictions."
+            ),
         }
 
         return explanations.get(category, f"Suspicious pattern detected: {match_text}")
@@ -585,21 +603,51 @@ class Jinja2TemplateScanner(BaseScanner):
     def _get_why_explanation(self, detection: DetectionResult, context: MLContext) -> str:
         """Get detailed 'why' explanation for the issue"""
         base_why = {
-            "critical_injection": "This pattern indicates a direct attempt to execute arbitrary code through Jinja2 template injection (SSTI). Such patterns are commonly used in CVE-2024-34359 and similar attacks to achieve remote code execution on systems processing untrusted templates.",
-            "object_traversal": "This pattern exploits Python's object model to navigate from safe objects to dangerous functions. Attackers use object traversal to bypass template sandboxing and reach system functions like os.system() or subprocess.call().",
-            "global_access": "This pattern attempts to access Python's global namespace, which contains references to dangerous built-in functions. This is a common technique in template injection attacks to bypass restrictions and access system functions.",
-            "obfuscation": "This pattern uses encoding or alternative syntax to evade basic security filters. Obfuscation techniques are often employed by attackers to bypass Web Application Firewalls (WAFs) and template sanitization.",
-            "control_flow": "This pattern uses Jinja2's control structures (loops, conditionals) to implement complex attack logic. While these structures are legitimate in templates, they can be used to iterate through Python classes or conditionally execute payloads.",
-            "environment_access": "This pattern attempts to access system environment variables or configuration data. While not directly dangerous, it can lead to information disclosure and aid in further exploitation.",
+            "critical_injection": (
+                "This pattern indicates a direct attempt to execute arbitrary code through Jinja2 template "
+                "injection (SSTI). Such patterns are commonly used in CVE-2024-34359 and similar attacks to "
+                "achieve remote code execution on systems processing untrusted templates."
+            ),
+            "object_traversal": (
+                "This pattern exploits Python's object model to navigate from safe objects to dangerous functions. "
+                "Attackers use object traversal to bypass template sandboxing and reach system functions like "
+                "os.system() or subprocess.call()."
+            ),
+            "global_access": (
+                "This pattern attempts to access Python's global namespace, which contains references to "
+                "dangerous built-in functions. This is a common technique in template injection attacks to "
+                "bypass restrictions and access system functions."
+            ),
+            "obfuscation": (
+                "This pattern uses encoding or alternative syntax to evade basic security filters. "
+                "Obfuscation techniques are often employed by attackers to bypass Web Application "
+                "Firewalls (WAFs) and template sanitization."
+            ),
+            "control_flow": (
+                "This pattern uses Jinja2's control structures (loops, conditionals) to implement complex "
+                "attack logic. While these structures are legitimate in templates, they can be used to iterate "
+                "through Python classes or conditionally execute payloads."
+            ),
+            "environment_access": (
+                "This pattern attempts to access system environment variables or configuration data. "
+                "While not directly dangerous, it can lead to information disclosure and aid in further "
+                "exploitation."
+            ),
         }
 
         why = base_why.get(detection.pattern_type, "This pattern matches known template injection techniques.")
 
         # Add context-specific information
         if context.file_type == "gguf":
-            why += " This is particularly concerning in GGUF models due to CVE-2024-34359, which affects llama-cpp-python when processing malicious chat templates."
+            why += (
+                " This is particularly concerning in GGUF models due to CVE-2024-34359, "
+                "which affects llama-cpp-python when processing malicious chat templates."
+            )
         elif context.is_tokenizer:
-            why += " Template injection in tokenizer configurations can execute when the tokenizer processes chat messages, potentially compromising applications using the model."
+            why += (
+                " Template injection in tokenizer configurations can execute when the tokenizer "
+                "processes chat messages, potentially compromising applications using the model."
+            )
 
         return why
 
