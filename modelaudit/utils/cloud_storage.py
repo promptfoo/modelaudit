@@ -343,13 +343,18 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ".model",
         ".mlmodel",
         ".ov",
+        ".tar",
+        ".tar.gz",
+        ".tgz",
     }
-
     scannable = []
     for file in files:
         path = Path(file["path"])
-        if path.suffix.lower() in SCANNABLE_EXTENSIONS:
-            scannable.append(file)
+        suffixes = [s.lower() for s in path.suffixes]
+        for i in range(1, len(suffixes) + 1):
+            if "".join(suffixes[-i:]) in SCANNABLE_EXTENSIONS:
+                scannable.append(file)
+                break
 
     return scannable
 
