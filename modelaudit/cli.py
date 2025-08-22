@@ -823,7 +823,7 @@ def scan_command(
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan using Pydantic model
-                        audit_result.aggregate_scan_result(results.model_dump())
+                        audit_result.aggregate_scan_result(results)
 
                         # Skip the normal scanning logic since we already have results
                         continue

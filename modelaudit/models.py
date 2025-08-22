@@ -5,7 +5,7 @@ JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,6 +19,19 @@ class AssetModel(BaseModel):
     tensors: Optional[list[str]] = Field(None, description="List of tensor names (for safetensors)")
     keys: Optional[list[str]] = Field(None, description="List of keys (for JSON manifests)")
     contents: Optional[list[dict[str, Any]]] = Field(None, description="Contents list (for ZIP files)")
+
+    # Dictionary-like access for backward compatibility
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict-style get() method for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
+    def __getitem__(self, key: str) -> Any:
+        """Support dict-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found in AssetModel")
 
 
 class CheckModel(BaseModel):
@@ -35,6 +48,19 @@ class CheckModel(BaseModel):
     severity: Optional[str] = Field(None, description="Severity for failed checks")
     why: Optional[str] = Field(None, description="Explanation for failed checks")
 
+    # Dictionary-like access for backward compatibility
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict-style get() method for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
+    def __getitem__(self, key: str) -> Any:
+        """Support dict-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found in CheckModel")
+
 
 class IssueModel(BaseModel):
     """Model for security issues matching current format"""
@@ -47,6 +73,19 @@ class IssueModel(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict, description="Additional issue details")
     timestamp: float = Field(..., description="Unix timestamp when issue was detected")
     why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
+
+    # Dictionary-like access for backward compatibility
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict-style get() method for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
+    def __getitem__(self, key: str) -> Any:
+        """Support dict-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found in IssueModel")
 
 
 class MLContextModel(BaseModel):
@@ -72,6 +111,19 @@ class FileMetadataModel(BaseModel):
     license_files_nearby: list[str] = Field(default_factory=list, description="License files found nearby")
     is_dataset: Optional[bool] = Field(None, description="Whether file appears to be a dataset")
     is_model: Optional[bool] = Field(None, description="Whether file appears to be a model")
+
+    # Dictionary-like access for backward compatibility
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict-style get() method for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
+    def __getitem__(self, key: str) -> Any:
+        """Support dict-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found in FileMetadataModel")
 
 
 class ModelAuditResultModel(BaseModel):
@@ -106,37 +158,44 @@ class ModelAuditResultModel(BaseModel):
     # Legacy compatibility
     success: bool = Field(default=True, description="Whether the scan completed successfully")
 
-    def aggregate_scan_result(self, results: dict[str, Any]) -> None:
+    def aggregate_scan_result(self, results: Union[dict[str, Any], "ModelAuditResultModel"]) -> None:
         """Efficiently aggregate scan results into this model.
 
         This method updates the current model in-place for performance.
+        Accepts either a dict or another ModelAuditResultModel.
         """
+        # Handle ModelAuditResultModel input by converting to dict
+        if isinstance(results, ModelAuditResultModel):
+            results_dict = results.model_dump()
+        else:
+            results_dict = results
+
         # Update scalar fields
-        self.bytes_scanned += results.get("bytes_scanned", 0)
-        self.files_scanned += results.get("files_scanned", 0)
-        if results.get("has_errors", False):
+        self.bytes_scanned += results_dict.get("bytes_scanned", 0)
+        self.files_scanned += results_dict.get("files_scanned", 0)
+        if results_dict.get("has_errors", False):
             self.has_errors = True
 
         # Update success status - only set to False for operational errors, not security findings
         # Only set success to False if there are actual operational errors (has_errors=True)
         # Security findings should not affect the success status
-        if results.get("success", True) is False and results.get("has_errors", False):
+        if results_dict.get("success", True) is False and results_dict.get("has_errors", False):
             self.success = False
 
         # Convert and extend issues
-        new_issues = convert_issues_to_models(results.get("issues", []))
+        new_issues = convert_issues_to_models(results_dict.get("issues", []))
         self.issues.extend(new_issues)
 
         # Convert and extend checks
-        new_checks = convert_checks_to_models(results.get("checks", []))
+        new_checks = convert_checks_to_models(results_dict.get("checks", []))
         self.checks.extend(new_checks)
 
         # Convert and extend assets
-        new_assets = convert_assets_to_models(results.get("assets", []))
+        new_assets = convert_assets_to_models(results_dict.get("assets", []))
         self.assets.extend(new_assets)
 
         # Merge file metadata
-        for path, metadata in results.get("file_metadata", {}).items():
+        for path, metadata in results_dict.get("file_metadata", {}).items():
             if isinstance(metadata, dict):
                 # Convert ml_context if present
                 ml_context = metadata.get("ml_context")
@@ -148,13 +207,34 @@ class ModelAuditResultModel(BaseModel):
                 self.file_metadata[path] = metadata
 
         # Track scanner names (avoid duplicates)
-        for scanner in results.get("scanners", []):
+        for scanner in results_dict.get("scanners", []):
             if scanner and scanner not in self.scanner_names and scanner != "unknown":
                 self.scanner_names.append(scanner)
 
     def finalize_statistics(self) -> None:
         """Calculate final statistics after all scan results are aggregated."""
         self.duration = time.time() - self.start_time
+        self._finalize_checks()
+
+    # Dictionary-like access for backward compatibility
+    def __getitem__(self, key: str) -> Any:
+        """Support dict-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found in ModelAuditResultModel")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict-style get() method for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
+    def __contains__(self, key: str) -> bool:
+        """Support 'in' operator for backward compatibility."""
+        return hasattr(self, key)
+
+    def _finalize_checks(self) -> None:
+        """Calculate check statistics."""
         self.total_checks = len(self.checks)
         self.passed_checks = sum(1 for c in self.checks if c.status == "passed")
         self.failed_checks = sum(1 for c in self.checks if c.status == "failed")

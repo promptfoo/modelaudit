@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, Union, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -118,7 +118,7 @@ def _component_for_file(
     return component
 
 
-def generate_sbom(paths: Iterable[str], results: dict[str, Any]) -> str:
+def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> str:
     bom = Bom()
     issues = results.get("issues", [])
     file_meta: dict[str, Any] = results.get("file_metadata", {})

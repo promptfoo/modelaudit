@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import requests
 
@@ -436,7 +436,7 @@ def _is_ml_model_directory(file_paths: list[str]) -> bool:
     return has_ml_files or (has_weight_files and has_config_files)
 
 
-def detect_agpl_components(scan_results: dict[str, Any]) -> list[str]:
+def detect_agpl_components(scan_results: Union[dict[str, Any], Any]) -> list[str]:
     """
     Detect components that use AGPL licensing.
 
@@ -526,7 +526,7 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
     return warnings
 
 
-def check_commercial_use_warnings(scan_results: dict[str, Any], *, strict: bool = False) -> list[dict[str, Any]]:
+def check_commercial_use_warnings(scan_results: Union[dict[str, Any], Any], *, strict: bool = False) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 
