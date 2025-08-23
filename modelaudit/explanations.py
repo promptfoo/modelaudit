@@ -19,6 +19,18 @@ DANGEROUS_IMPORTS = {
         "it can execute arbitrary system commands and manipulate the file system. The 'posix.system' function is "
         "equivalent to 'os.system' and poses the same security risks."
     ),
+    "nt": (
+        "The 'nt' module is a Windows-specific alias for 'os', exposing the same system command and file operations. "
+        "Attackers can invoke functions like 'nt.system' to execute arbitrary commands.",
+    ),
+    "ntpath": (
+        "The 'ntpath' module provides Windows path manipulation utilities. These can be abused to access or modify "
+        "restricted system paths, facilitating privilege escalation or data exfiltration.",
+    ),
+    "posixpath": (
+        "The 'posixpath' module provides POSIX path manipulation utilities. Attackers can leverage it to traverse or "
+        "access restricted paths on Unix-like systems.",
+    ),
     "sys": (
         "The 'sys' module provides access to interpreter internals and system-specific parameters. It can be used to "
         "modify the Python runtime, access command-line arguments, or manipulate the module import system to load "

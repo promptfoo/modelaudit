@@ -57,6 +57,30 @@ from typing import Any
 
 from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 
+# OS module aliases that provide system access similar to the 'os' module
+OS_MODULE_ALIASES: dict[str, dict[str, Any]] = {
+    "nt": {
+        "severity": "CRITICAL",
+        "description": "Windows OS module alias - provides system access including os.system()",
+        "functions": "*",
+    },
+    "posix": {
+        "severity": "CRITICAL",
+        "description": "Unix/Linux OS module alias - provides system access including os.system()",
+        "functions": "*",
+    },
+    "ntpath": {
+        "severity": "HIGH",
+        "description": "Windows path manipulation - can access restricted paths",
+        "functions": "*",
+    },
+    "posixpath": {
+        "severity": "HIGH",
+        "description": "Unix path manipulation - can access restricted paths",
+        "functions": "*",
+    },
+}
+
 # =============================================================================
 # PICKLE SECURITY PATTERNS
 # =============================================================================
@@ -67,7 +91,6 @@ from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 SUSPICIOUS_GLOBALS = {
     # System interaction modules - HIGH RISK
     "os": "*",  # File system operations, command execution (system, popen, spawn*)
-    "posix": "*",  # Unix system calls (os.system equivalent)
     "sys": "*",  # Python runtime manipulation
     "subprocess": "*",  # Process spawning and control (call, run, Popen, check_output)
     "runpy": "*",  # Dynamic module execution (run_module, run_path)
@@ -131,6 +154,9 @@ SUSPICIOUS_GLOBALS = {
     # References to the private dill._dill module are also suspicious
     "dill._dill": "*",
 }
+
+# Include OS module aliases in suspicious globals
+SUSPICIOUS_GLOBALS.update({alias: data["functions"] for alias, data in OS_MODULE_ALIASES.items()})
 
 # Builtin functions that enable dynamic code execution or module loading
 DANGEROUS_BUILTINS = [
