@@ -21,8 +21,13 @@ DANGEROUS_TF_OPERATIONS = {
     "PyCall": IssueSeverity.CRITICAL,  # Python code execution
     "ShellExecute": IssueSeverity.CRITICAL,  # Shell command execution
     "MergeV2Checkpoints": IssueSeverity.CRITICAL,  # Checkpoint manipulation
-    "Save": IssueSeverity.WARNING,  # Save operations
-    "SaveV2": IssueSeverity.WARNING,  # SaveV2 operations
+    "Save": IssueSeverity.CRITICAL,  # Save operations
+    "SaveV2": IssueSeverity.CRITICAL,  # SaveV2 operations
+    "ExecuteOp": IssueSeverity.CRITICAL,  # Execute arbitrary operations
+    "SystemConfig": IssueSeverity.CRITICAL,  # System configuration access
+    "DecodeRaw": IssueSeverity.CRITICAL,  # Raw data decoding - potential exploitation
+    "DecodeJpeg": IssueSeverity.CRITICAL,  # JPEG decoding - potential exploitation
+    "DecodePng": IssueSeverity.CRITICAL,  # PNG decoding - potential exploitation
 }
 
 # Try to import TensorFlow, but handle the case where it's not installed
