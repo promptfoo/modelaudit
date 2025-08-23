@@ -10,10 +10,9 @@ exclude AGENTS.md
 exclude CLAUDE.md
 exclude GEMINI.md
 exclude CONTRIBUTING.md
-exclude generate_llm_context.py
-exclude verify_models.py
 exclude evil.pickle
 exclude package.json
 exclude package-lock.json
 prune node_modules
 prune scan_results
+prune mlruns

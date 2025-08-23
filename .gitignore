@@ -154,3 +154,9 @@ _temp_files/
 modelscan/
 picklescan/
 
+# MLflow experiment tracking (temporary data)
+mlruns/
+
+# Scan results output (temporary data)
+scan_results/
+
