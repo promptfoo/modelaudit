@@ -37,11 +37,11 @@ class IssueSeverity(Enum):
     """Graduated severity levels matching industry standards"""
 
     CRITICAL = "critical"  # RCE, data exfiltration, system compromise
-    HIGH = "high"         # File system access, network operations
-    MEDIUM = "medium"     # Suspicious patterns, potential issues
-    LOW = "low"          # Informational findings, best practices
-    DEBUG = "debug"      # Debug information (keep existing)
-    INFO = "info"        # Informational (keep existing)
+    HIGH = "high"  # File system access, network operations
+    MEDIUM = "medium"  # Suspicious patterns, potential issues
+    LOW = "low"  # Informational findings, best practices
+    DEBUG = "debug"  # Debug information (keep existing)
+    INFO = "info"  # Informational (keep existing)
     WARNING = "warning"  # Backward compatibility - maps to MEDIUM
 
 

@@ -95,7 +95,7 @@ PICKLE_SEVERITY_MAP = {
         "os": "*",
         "subprocess": "*",
         "sys": "*",
-        "nt": "*",     # Windows os alias
+        "nt": "*",  # Windows os alias
         "posix": "*",  # Unix os alias
         "socket": "*",
         "pty": "*",
@@ -129,7 +129,7 @@ PICKLE_SEVERITY_MAP = {
         "warnings": "*",
         "logging": "*",
         "inspect": "*",
-    }
+    },
 }
 
 # TensorFlow operation severity mapping
@@ -137,7 +137,7 @@ TENSORFLOW_SEVERITY_MAP = {
     "CRITICAL": ["PyFunc", "PyCall", "ShellExecute"],
     "HIGH": ["ReadFile", "WriteFile", "MergeV2Checkpoints"],
     "MEDIUM": ["Save", "SaveV2"],
-    "LOW": []
+    "LOW": [],
 }
 
 # =============================================================================
