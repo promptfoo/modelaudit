@@ -1,22 +1,60 @@
 """Utilities for handling HuggingFace model downloads."""
 
 import re
-import tempfile
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
+from urllib.parse import unquote, urlparse
 
 from .disk_space import check_disk_space
 
 
 def is_huggingface_url(url: str) -> bool:
     """Check if a URL is a HuggingFace model URL."""
+    # More robust patterns that handle special characters in model names
     patterns = [
-        r"^https?://huggingface\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
-        r"^https?://hf\.co/[\w\-\.]+(/[\w\-\.]+)?/?$",
-        r"^hf://[\w\-\.]+(/[\w\-\.]+)?/?$",
+        r"^https?://huggingface\.co/[^/]+(/[^/]+)?/?$",
+        r"^https?://hf\.co/[^/]+(/[^/]+)?/?$",
+        r"^hf://[^/]+(/[^/]+)?/?$",
     ]
     return any(re.match(pattern, url) for pattern in patterns)
+
+
+def is_huggingface_file_url(url: str) -> bool:
+    """Check if a URL is a direct HuggingFace file URL."""
+    try:
+        # Reuse the stricter URL structure validation
+        parse_huggingface_file_url(url)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
+    """Parse a HuggingFace file URL to extract repo_id and filename.
+
+    Args:
+        url: HuggingFace file URL like https://huggingface.co/user/repo/resolve/main/file.bin
+
+    Returns:
+        Tuple of (repo_id, branch, filename)
+
+    Raises:
+        ValueError: If URL format is invalid
+    """
+    parsed = urlparse(url)
+    if parsed.netloc not in ["huggingface.co", "hf.co"]:
+        raise ValueError(f"Not a HuggingFace URL: {url}")
+
+    path_parts = parsed.path.strip("/").split("/")
+    if len(path_parts) < 5 or path_parts[2] != "resolve":
+        raise ValueError(f"Invalid HuggingFace file URL format: {url}")
+
+    repo_id = f"{path_parts[0]}/{path_parts[1]}"
+    # URL-decode individual parts to handle percent-encoded characters
+    branch = unquote(path_parts[3])  # This will now be properly decoded
+    filename = "/".join(unquote(part) for part in path_parts[4:])
+
+    return repo_id, branch, filename
 
 
 def parse_huggingface_url(url: str) -> tuple[str, str]:
@@ -33,7 +71,9 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     """
     # Handle hf:// format
     if url.startswith("hf://"):
-        parts = url[5:].strip("/").split("/")
+        # URL-decode the path portion
+        path = unquote(url[5:])
+        parts = path.strip("/").split("/")
         if len(parts) == 1 and parts[0]:
             # Single component like "bert-base-uncased" - treat as model without namespace
             return parts[0], ""
@@ -46,7 +86,9 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     if parsed.netloc not in ["huggingface.co", "hf.co"]:
         raise ValueError(f"Not a HuggingFace URL: {url}")
 
-    path_parts = parsed.path.strip("/").split("/")
+    # URL-decode the path to handle percent-encoded characters
+    path = unquote(parsed.path)
+    path_parts = path.strip("/").split("/")
     if len(path_parts) == 1 and path_parts[0]:
         # Single component like "bert-base-uncased" - treat as model without namespace
         return path_parts[0], ""
@@ -155,7 +197,10 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
 
-    # Use a cache directory structure if cache_dir is provided
+    # Disk space check and path setup
+    model_size = get_model_size(repo_id)
+    download_path = None  # Will be set only if cache_dir is provided
+
     if cache_dir is not None:
         # Create a structured cache directory
         download_path = cache_dir / "huggingface" / namespace
@@ -175,25 +220,16 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
             ]
             if any((download_path / f).exists() for f in expected_files):
                 return download_path
+
+        # Check available disk space when using custom cache directory
+        if model_size:
+            has_space, message = check_disk_space(download_path, model_size)
+            if not has_space:
+                raise Exception(f"Cannot download model from {url}: {message}")
     else:
-        # Use temporary directory if no cache specified
-        temp_dir = tempfile.mkdtemp(prefix="modelaudit_hf_")
-        download_path = Path(temp_dir)
-
-    # Check available disk space before downloading
-    model_size = get_model_size(repo_id)
-    if model_size:
-        # Ensure the parent directory exists for disk space check
-        download_path.mkdir(parents=True, exist_ok=True)
-
-        has_space, message = check_disk_space(download_path, model_size)
-        if not has_space:
-            # Clean up temp directory if we created one
-            if cache_dir is None and download_path.exists():
-                import shutil
-
-                shutil.rmtree(download_path)
-            raise Exception(f"Cannot download model from {url}: {message}")
+        # When no cache_dir is provided, let HuggingFace handle caching
+        # We skip disk space checks as we don't control where HF stores its cache
+        pass
 
     try:
         # Configure progress display based on environment
@@ -237,25 +273,30 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
         # Find model files in the repository
         model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
 
+        # Download strategy:
+        # - When cache_dir is provided: Use local_dir to place files directly there (safer)
+        # - When cache_dir is None: Use HF's default caching mechanism (avoid interfering)
+
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "tqdm_class": None,  # Use default tqdm
+        }
+
+        if cache_dir is not None:
+            # User provided cache directory - use local_dir for direct placement
+            download_kwargs["local_dir"] = str(download_path)
+        else:
+            # No cache directory provided - let HF use its default cache
+            # This is safer as it doesn't risk deleting user's global cache
+            pass
+
         # If we found specific model files, download them
         if model_files:
-            # Download only the model files (not docs, etc.)
-            local_path = snapshot_download(
-                repo_id=repo_id,
-                cache_dir=str(download_path),
-                local_dir=str(download_path),
-                allow_patterns=model_files,  # Explicitly request model files
-                tqdm_class=None,  # Use default tqdm
-            )
+            download_kwargs["allow_patterns"] = model_files
+            local_path = snapshot_download(**download_kwargs)
         else:
             # Fallback: download everything if no model files identified
-            # This handles edge cases where models might have unusual extensions
-            local_path = snapshot_download(
-                repo_id=repo_id,
-                cache_dir=str(download_path),
-                local_dir=str(download_path),
-                tqdm_class=None,  # Use default tqdm
-            )
+            local_path = snapshot_download(**download_kwargs)
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
@@ -274,9 +315,47 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
 
         return Path(local_path)
     except Exception as e:
-        # Clean up temp directory on failure if we created one
-        if cache_dir is None and download_path.exists():
+        # Clean up directory on failure only if we created a custom cache directory
+        # When cache_dir is None, we use HF's default cache and shouldn't clean it up
+        if cache_dir is not None and download_path is not None and download_path.exists():
             import shutil
 
             shutil.rmtree(download_path)
         raise Exception(f"Failed to download model from {url}: {e!s}") from e
+
+
+def download_file_from_hf(url: str, cache_dir: Optional[Path] = None) -> Path:
+    """Download a single file from HuggingFace using direct file URL.
+
+    Args:
+        url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
+        cache_dir: Optional cache directory for downloads
+
+    Returns:
+        Path to the downloaded file
+
+    Raises:
+        ValueError: If URL is invalid
+        Exception: If download fails
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    repo_id, branch, filename = parse_huggingface_file_url(url)
+
+    try:
+        # Use hf_hub_download for single file downloads
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=branch,
+            cache_dir=str(cache_dir) if cache_dir else None,
+        )
+        return Path(local_path)
+    except Exception as e:
+        raise Exception(f"Failed to download file from {url}: {e!s}") from e

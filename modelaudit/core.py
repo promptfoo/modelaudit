@@ -562,6 +562,9 @@ def scan_model_directory_or_file(
 
     validate_scan_config(config)
 
+    # Check if metadata scanner is available once (optimization - avoids loading scanner)
+    metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
+
     try:
         # Handle streaming paths
         if path.startswith("stream://"):
@@ -687,7 +690,9 @@ def scan_model_directory_or_file(
 
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
-                    if skip_file_types and should_skip_file(file_path):
+                    if skip_file_types and should_skip_file(
+                        file_path, metadata_scanner_available=metadata_scanner_available
+                    ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
                             try:

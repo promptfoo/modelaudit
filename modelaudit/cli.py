@@ -20,7 +20,7 @@ from .models import ModelAuditResultModel
 from .scanners.base import IssueSeverity
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
-from .utils.huggingface import download_model, is_huggingface_url
+from .utils.huggingface import download_file_from_hf, download_model, is_huggingface_file_url, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
@@ -716,8 +716,60 @@ def scan_command(
             should_break = False
 
             try:
-                # Check if this is a HuggingFace URL
-                if is_huggingface_url(path):
+                # Check if this is a direct HuggingFace file URL
+                if is_huggingface_file_url(path):
+                    # Handle direct file downloads
+                    download_spinner = None
+                    if format == "text" and not output and should_show_spinner():
+                        download_spinner = yaspin(
+                            Spinners.dots, text=f"Downloading file from {style_text(path, fg='cyan')}"
+                        )
+                        download_spinner.start()
+                    elif format == "text" and not output:
+                        click.echo(f"Downloading file from {path}...")
+
+                    try:
+                        # Determine cache directory behavior for single-file downloads
+                        hf_cache_dir = None
+                        tmp_dl_dir = None
+                        if cache and cache_dir:
+                            hf_cache_dir = Path(cache_dir) / "huggingface"
+                        elif cache:
+                            # Use tool-scoped cache directory, not the global HF cache
+                            hf_cache_dir = Path.home() / ".modelaudit" / "cache" / "huggingface"
+                        else:
+                            # No cache: use an ephemeral directory we control (safe to delete later)
+                            import tempfile
+
+                            tmp_dl_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                            hf_cache_dir = tmp_dl_dir
+
+                        # Download single file
+                        download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
+                        actual_path = str(download_path)
+                        # Only track for cleanup if we created an ephemeral cache above
+                        temp_dir = str(hf_cache_dir) if not cache else None
+
+                        if download_spinner:
+                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                        elif format == "text" and not output:
+                            click.echo(style_text("✅ Download complete", fg="green", bold=True))
+
+                    except Exception as e:
+                        if download_spinner:
+                            download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
+                        elif format == "text" and not output:
+                            click.echo(style_text("❌ Download failed", fg="red", bold=True))
+
+                        error_msg = str(e)
+                        logger.error(f"Failed to download file from {path}: {error_msg}", exc_info=verbose)
+                        click.echo(f"Error downloading file from {path}: {error_msg}", err=True)
+
+                        audit_result.has_errors = True
+                        continue
+
+                # Check if this is a HuggingFace model URL
+                elif is_huggingface_url(path):
                     # Show initial message and get model info
                     if format == "text" and not output:
                         click.echo(f"\n📥 Preparing to download from {style_text(path, fg='cyan')}")
@@ -1054,12 +1106,11 @@ def scan_command(
                         continue
 
                 # Early exit for common non-model file extensions
-                # Note: Allow .json, .yaml, .yml as they can be model config files
+                # Note: Allow .json, .yaml, .yml, .md as they can be model config/documentation files
                 if os.path.isfile(path):
                     _, ext = os.path.splitext(path)
                     ext = ext.lower()
                     if ext in (
-                        ".md",
                         ".txt",
                         ".py",
                         ".js",
