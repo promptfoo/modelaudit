@@ -25,6 +25,7 @@ When tasked with fixing bugs, adding features, or refactoring:
 # Git Repository
 
 - **Branching:** Always create a new branch before making any changes. Never commit directly to `main`. Start by running `git checkout -b your-branch-name`.
+- **Changelog:** Each feature branch should add exactly one entry to CHANGELOG.md in the [Unreleased] section following Keep a Changelog format.
 - **Gather Context:** Before committing, use `git status`, `git diff HEAD`, and `git log -n 3` to understand the state of the repository and match the commit style.
 - **Propose Message:** Always propose a clear and concise commit message, focusing on the "why" of the change.
 - **Confirm Success:** After committing, run `git status` to confirm the commit was successful.
