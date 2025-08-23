@@ -13,9 +13,9 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 133 models cataloged
+- Total Models: 143 models cataloged (including 10 archived models moved to bottom for historical reference)
 - Safe Models: 45 legitimate models (baseline testing)
-- Malicious Models: 88 models with attack vectors
+- Malicious Models: 98 models with attack vectors
 - Archived Models: 10 models no longer available
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
 - Attack Types: 7+ distinct exploitation methods
