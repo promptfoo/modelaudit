@@ -1826,12 +1826,12 @@ def _format_issue(
     help="Show detailed information about failed scanners",
 )
 def doctor(show_failed: bool) -> None:
-    """Diagnose scanner compatibility and system status"""
+    """Diagnose scanner availability and dependencies"""
     import sys
 
     from .scanners import _registry
 
-    click.echo("ModelAudit System Diagnostics")
+    click.echo("ModelAudit Scanner Diagnostic Report")
     click.echo("=" * 40)
 
     # System information
@@ -1843,50 +1843,54 @@ def doctor(show_failed: bool) -> None:
     click.echo("NumPy status: ", nl=False)
     click.secho(numpy_status, fg=numpy_color)
 
-    # Scanner status
-    available_scanners = _registry.get_available_scanners()
-    failed_scanners = _registry.get_failed_scanners()
-    loaded_count = len(available_scanners) - len(failed_scanners)
+    # Get comprehensive summary
+    summary = _registry.get_available_scanners_summary()
 
-    click.echo("\nScanner Status:")
-    click.echo(f"  Available: {len(available_scanners)} total")
-    click.echo(f"  Loaded: {loaded_count}")
-    click.echo(f"  Failed: {len(failed_scanners)}")
+    click.echo(f"\nTotal scanners: {summary['total_scanners']}")
+    click.echo(f"Loaded successfully: {summary['loaded_scanners']}")
+    click.echo(f"Failed to load: {summary['failed_scanners']}")
 
-    if show_failed and failed_scanners:
-        click.echo("\nFailed Scanners:")
-        for scanner_id, error_msg in failed_scanners.items():
-            click.echo(f"  {scanner_id}: {error_msg}")
+    if summary['failed_scanners'] > 0:
+        click.echo("\n" + style_text("Failed Scanners:", fg="red"))
+        for scanner, error in summary['failed_scanner_details'].items():
+            click.echo(f"  ❌ {scanner}: {error}")
 
-    # Recommendations
-    if failed_scanners:
-        click.echo("\nRecommendations:")
+    if summary['loaded_scanner_list']:
+        click.echo("\n" + style_text("Available Scanners:", fg="green"))
+        for scanner in summary['loaded_scanner_list']:
+            click.echo(f"  ✅ {scanner}")
 
+    # Enhanced recommendations
+    if summary['failed_scanners'] > 0:
+        click.echo("\n" + style_text("Recommendations:", fg="blue"))
+        
         # Check for NumPy compatibility issues
         numpy_sensitive_failed = []
-        for scanner_id in failed_scanners:
+        for scanner_id in summary['failed_scanner_details'].keys():
             scanner_info = _registry.get_scanner_info(scanner_id)
             if scanner_info and scanner_info.get("numpy_sensitive", False):
                 numpy_sensitive_failed.append(scanner_id)
-
+        
         if numpy_sensitive_failed and not numpy_compatible:
             click.echo("• NumPy compatibility issues detected:")
             click.echo("  For NumPy 1.x compatibility: pip install 'numpy<2.0'")
             click.echo("  Then reinstall ML frameworks: pip install --force-reinstall tensorflow torch h5py")
-
+        
         # Check for missing dependencies
         missing_deps = set()
-        for scanner_id in failed_scanners:
+        for scanner_id in summary['failed_scanner_details'].keys():
             scanner_info = _registry.get_scanner_info(scanner_id)
             if scanner_info:
                 deps = scanner_info.get("dependencies", [])
                 missing_deps.update(deps)
-
+        
         if missing_deps:
             click.echo(f"• Install missing dependencies: pip install modelaudit[{','.join(missing_deps)}]")
-
-    if not failed_scanners:
-        click.secho("✓ All scanners loaded successfully!", fg="green")
+        
+        click.echo("• Core functionality works even with missing optional dependencies")
+        click.echo("• Run 'modelaudit doctor --show-failed' for detailed error messages")
+    else:
+        click.secho("\n✓ All scanners loaded successfully!", fg="green")
 
 
 def main() -> None:

@@ -418,12 +418,33 @@ class ScannerRegistry:
                 logger.debug(f"Loaded scanner: {scanner_id}")
                 return scanner_class
 
-            except Exception as e:
-                # Enhanced error handling for all types of import failures
+            except ImportError as e:
+                # Missing dependency - provide helpful message
                 scanner_deps = scanner_info.get("dependencies", [])
                 is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
-                error_msg = f"Failed to load scanner {scanner_id}: {e}"
+                if scanner_deps:
+                    error_msg = (
+                        f"Scanner {scanner_id} requires dependencies: {scanner_deps}. "
+                        f"Install with 'pip install modelaudit[{','.join(scanner_deps)}]'"
+                    )
+                else:
+                    error_msg = f"Scanner {scanner_id} import failed: {e}"
+
+                self._failed_scanners[scanner_id] = error_msg
+                
+                # For expected dependency issues, use info level
+                if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
+                    logger.info(error_msg)
+                else:
+                    logger.debug(error_msg)
+
+                return None
+
+            except Exception as e:
+                # Unexpected error - provide detailed information
+                scanner_deps = scanner_info.get("dependencies", [])
+                is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
                 if _is_numpy_compatibility_error(e):
                     if is_numpy_sensitive:
@@ -432,28 +453,18 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
+                        logger.info(error_msg)  # Info level - expected for NumPy issues
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
-                elif isinstance(e, ImportError):
-                    if scanner_deps:
-                        error_msg = (
-                            f"Scanner {scanner_id} requires dependencies: {scanner_deps}. "
-                            f"Install with 'pip install modelaudit[{','.join(scanner_deps)}]'"
-                        )
-                    else:
-                        error_msg = f"Scanner {scanner_id} import failed: {e}"
+                        logger.warning(error_msg)  # Warning - unexpected NumPy issue
                 elif isinstance(e, AttributeError):
                     error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-
-                # Store failure reason and log appropriately
-                self._failed_scanners[scanner_id] = error_msg
-
-                self._ensure_numpy_status()  # Lazy initialization
-                if is_numpy_sensitive and not self._numpy_compatible:
-                    logger.info(error_msg)  # Info level for expected NumPy issues
+                    logger.warning(error_msg)  # Warning - code structure issue
                 else:
-                    logger.debug(error_msg)  # Debug level for other issues
+                    error_msg = f"Scanner {scanner_id} failed to load: {e}"
+                    logger.warning(error_msg)  # Warning - unexpected error
 
+                self._failed_scanners[scanner_id] = error_msg
                 return None
 
     def has_scanner_class(self, class_name: str) -> bool:
@@ -525,6 +536,18 @@ class ScannerRegistry:
     def get_failed_scanners(self) -> dict[str, str]:
         """Get information about scanners that failed to load"""
         return self._failed_scanners.copy()
+
+    def get_available_scanners_summary(self) -> dict[str, Any]:
+        """Get summary of scanner availability for diagnostics"""
+        loaded_scanners = [s for s in self._scanners.keys() if s not in self._failed_scanners]
+        
+        return {
+            "total_scanners": len(self._scanners),
+            "loaded_scanners": len(loaded_scanners),
+            "failed_scanners": len(self._failed_scanners),
+            "loaded_scanner_list": loaded_scanners,
+            "failed_scanner_details": self._failed_scanners.copy()
+        }
 
     def get_numpy_status(self) -> tuple[bool, str]:
         """Get NumPy compatibility status"""
