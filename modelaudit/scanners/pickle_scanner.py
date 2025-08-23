@@ -2512,16 +2512,31 @@ class PickleScanner(BaseScanner):
     def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple]) -> list[dict]:
         """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques"""
         patterns = []
-
+        
+        # Count dangerous opcodes and torch references for overall analysis
+        dangerous_opcodes_count = 0
+        torch_references = 0
+        dangerous_opcodes_found = []
+        
         for i, (opcode, arg, pos) in enumerate(opcodes):
-            # Pattern 1: GLOBAL + torch related imports followed by dangerous opcodes
+            # Count dangerous opcodes
+            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL"]:
+                dangerous_opcodes_count += 1
+                dangerous_opcodes_found.append((opcode.name, pos))
+            
+            # Count torch references
+            if opcode.name in ["GLOBAL", "STACK_GLOBAL"] and arg:
+                if any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"]):
+                    torch_references += 1
+            
+            # Pattern 1: GLOBAL + torch related imports followed by dangerous opcodes (expanded search)
             if (
                 opcode.name in ["GLOBAL", "STACK_GLOBAL"]
                 and arg
                 and any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"])
             ):
-                # Look for dangerous opcodes within next 10 positions
-                for j in range(i + 1, min(i + 11, len(opcodes))):
+                # Look for dangerous opcodes within next 25 positions (increased range)
+                for j in range(i + 1, min(i + 26, len(opcodes))):
                     next_opcode, next_arg, next_pos = opcodes[j]
                     if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
                         patterns.append(
@@ -2628,6 +2643,21 @@ class PickleScanner(BaseScanner):
                         )
                         break
 
+        # Pattern 6: Overall suspicious density check (CVE-2025-32434 indicator)
+        # High concentration of dangerous opcodes in a PyTorch model is suspicious
+        if dangerous_opcodes_count > 50 and torch_references > 0:
+            patterns.append(
+                {
+                    "pattern_type": "high_risk_opcode_density",
+                    "description": f"High concentration of dangerous opcodes ({dangerous_opcodes_count}) in PyTorch model indicates potential CVE-2025-32434 exploitation",
+                    "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
+                    "exploitation_method": "weights_only=True bypass via opcode density attack",
+                    "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
+                    "dangerous_count": dangerous_opcodes_count,
+                    "torch_references": torch_references,
+                }
+            )
+        
         return patterns
 
     def check_for_jit_script_code(
