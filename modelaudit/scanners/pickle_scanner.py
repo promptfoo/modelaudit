@@ -13,6 +13,8 @@ from modelaudit.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
+    classify_global_safety,
+    is_safe_global,
 )
 from modelaudit.utils.code_validation import (
     is_code_potentially_dangerous,
@@ -261,21 +263,6 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         context["is_ml_content"] = context["overall_confidence"] > 0.15  # Was 0.3
 
     return context
-
-
-def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
-    """
-    Smart global reference analysis - distinguishes between legitimate ML operations
-    and actual dangerous operations.
-    """
-    # If we have high ML confidence, be more lenient with "suspicious" globals
-    if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5 and mod in ML_SAFE_GLOBALS:
-        safe_funcs = ML_SAFE_GLOBALS[mod]
-        if safe_funcs == ["*"] or func in safe_funcs:
-            return False
-
-    # Use original suspicious global check for genuinely suspicious patterns
-    return is_suspicious_global(mod, func)
 
 
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
@@ -553,18 +540,39 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         return False
 
 
-def is_suspicious_global(mod: str, func: str) -> bool:
+def is_suspicious_global(mod: str, func: str, security_config=None) -> bool:
     """
-    Check if a module.function reference is suspicious.
+    Check if a module.function reference is suspicious using PickleScan safety classification.
 
-    Enhanced to detect various forms of builtin eval/exec that other tools
-    might miss, including __builtin__ (Python 2 style) and __builtins__.
+    Enhanced with PickleScan's three-tier safety system:
+    1. First checks SAFE_GLOBALS whitelist (innocuous operations)
+    2. Then checks SUSPICIOUS_GLOBALS blacklist (dangerous operations)
+    3. Falls back to builtin detection and configuration rules
+
+    This reduces false positives for legitimate ML models while maintaining security.
     """
-    # Normalize module name for consistent checking
-    # Some exploits use alternative spellings or references
-    normalized_mod = mod.strip().lower() if mod else ""
+    # Early return for known safe operations - reduces false positives
+    if is_safe_global(mod, func):
+        logger.debug(f"Safe global reference: {mod}.{func} (whitelisted)")
+        return False
 
-    # Check for direct matches first
+    # Use safety classification for better granularity
+    safety_level, severity = classify_global_safety(mod, func)
+
+    if safety_level == "innocuous":
+        # Confirmed safe - not suspicious
+        logger.debug(f"Innocuous global reference: {mod}.{func}")
+        return False
+    elif safety_level == "dangerous":
+        # Confirmed dangerous - definitely suspicious
+        logger.debug(f"Dangerous global reference: {mod}.{func} (severity: {severity})")
+        return True
+    # For "suspicious" level, continue with additional checks below
+
+    # Note: Configuration system integration reserved for future enhancement
+    # For now, safety classification provides the primary logic
+
+    # Check for direct matches in legacy hardcoded rules (fallback)
     if mod in SUSPICIOUS_GLOBALS:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
@@ -587,8 +595,15 @@ def is_suspicious_global(mod: str, func: str) -> bool:
 
     # Check for obfuscated references
     # Some exploits use getattr or other indirection
+    normalized_mod = mod.strip().lower() if mod else ""
     if normalized_mod in ["__builtin", "builtin", "__builtins", "builtins"] and func in dangerous_funcs:
         logger.debug(f"Obfuscated builtin reference detected: {mod}.{func}")
+        return True
+
+    # For suspicious level - be conservative and flag as suspicious
+    # This allows for manual review of unknown operations
+    if safety_level == "suspicious":
+        logger.debug(f"Suspicious global reference: {mod}.{func} (unknown operation - manual review recommended)")
         return True
 
     return False
@@ -784,10 +799,27 @@ class PickleScanner(BaseScanner):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
+
+        # Extract security configuration if available
+        self.security_config = self.config.get("security_config", None)
         # Initialize analyzers
         self.entropy_analyzer = EntropyAnalyzer()
         self.semantic_analyzer = SemanticAnalyzer()
         self.framework_kb = FrameworkKnowledgeBase()
+
+    def _is_actually_dangerous_global(self, mod: str, func: str, ml_context: dict) -> bool:
+        """
+        Smart global reference analysis - distinguishes between legitimate ML operations
+        and actual dangerous operations. Uses security configuration when available.
+        """
+        # If we have high ML confidence, be more lenient with "suspicious" globals
+        if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5 and mod in ML_SAFE_GLOBALS:
+            safe_funcs = ML_SAFE_GLOBALS[mod]
+            if safe_funcs == ["*"] or func in safe_funcs:
+                return False
+
+        # Use configuration-driven security rules when available
+        return is_suspicious_global(mod, func, self.security_config)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -1817,22 +1849,35 @@ class PickleScanner(BaseScanner):
 
             # Analyze globals extracted from all pickle streams
             for mod, func in advanced_globals:
-                if _is_actually_dangerous_global(mod, func, ml_context):
+                if self._is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
-                    severity = _get_context_aware_severity(
-                        IssueSeverity.CRITICAL,
-                        ml_context,
-                    )
+
+                    # Use PickleScan safety classification for appropriate severity
+                    safety_level, safety_severity = classify_global_safety(mod, func)
+
+                    # Map string severity to IssueSeverity enum
+                    severity_mapping = {
+                        "critical": IssueSeverity.CRITICAL,
+                        "warning": IssueSeverity.WARNING,
+                        "info": IssueSeverity.INFO,
+                        "debug": IssueSeverity.DEBUG,
+                    }
+                    base_severity = severity_mapping.get(safety_severity, IssueSeverity.CRITICAL)
+
+                    # Apply ML context awareness to the safety-classified severity
+                    severity = _get_context_aware_severity(base_severity, ml_context)
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
-                        message=f"Suspicious reference {mod}.{func}",
+                        message=f"Suspicious reference {mod}.{func} (safety: {safety_level})",
                         severity=severity,
                         location=self.current_file_path,
                         details={
                             "module": mod,
                             "function": func,
                             "opcode": "STACK_GLOBAL",
+                            "safety_level": safety_level,
+                            "safety_severity": safety_severity,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
@@ -1864,16 +1909,27 @@ class PickleScanner(BaseScanner):
 
                     if len(parts) == 2:
                         mod, func = parts
-                        if _is_actually_dangerous_global(mod, func, ml_context):
+                        if self._is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
-                            severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
-                                ml_context,
-                            )
+
+                            # Use PickleScan safety classification for appropriate severity
+                            safety_level, safety_severity = classify_global_safety(mod, func)
+
+                            # Map string severity to IssueSeverity enum
+                            severity_mapping = {
+                                "critical": IssueSeverity.CRITICAL,
+                                "warning": IssueSeverity.WARNING,
+                                "info": IssueSeverity.INFO,
+                                "debug": IssueSeverity.DEBUG,
+                            }
+                            base_severity = severity_mapping.get(safety_severity, IssueSeverity.CRITICAL)
+
+                            # Apply ML context awareness to the safety-classified severity
+                            severity = _get_context_aware_severity(base_severity, ml_context)
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=False,
-                                message=f"Suspicious reference {mod}.{func}",
+                                message=f"Suspicious reference {mod}.{func} (safety: {safety_level})",
                                 severity=severity,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
@@ -1881,6 +1937,8 @@ class PickleScanner(BaseScanner):
                                     "function": func,
                                     "position": pos,
                                     "opcode": opcode.name,
+                                    "safety_level": safety_level,
+                                    "safety_severity": safety_severity,
                                     "ml_context_confidence": ml_context.get(
                                         "overall_confidence",
                                         0,
@@ -2146,7 +2204,7 @@ class PickleScanner(BaseScanner):
                         # The two strings are module and function in that order
                         mod = recent_strings[0]  # First string pushed (module)
                         func = recent_strings[1]  # Second string pushed (function)
-                        if _is_actually_dangerous_global(mod, func, ml_context):
+                        if self._is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
                                 IssueSeverity.CRITICAL,

@@ -53,7 +53,7 @@ Version History:
     - v1.1: Added documentation and architecture overview
 """
 
-from typing import Any
+from typing import Any, Union
 
 from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 
@@ -79,6 +79,165 @@ OS_MODULE_ALIASES: dict[str, dict[str, Any]] = {
         "description": "Unix path manipulation - can access restricted paths",
         "functions": "*",
     },
+}
+
+# =============================================================================
+# PICKLE SAFETY CLASSIFICATION SYSTEM
+# =============================================================================
+
+# Safe globals whitelist - PickleScan's safety classification adapted to ModelAudit
+# These modules/functions are considered safe for ML model deserialization
+# Based on PickleScan's three-tier safety system but using ModelAudit's severity levels
+SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
+    # Core ML libraries - universally safe operations
+    "numpy": "*",  # Numeric computing library - core to most ML models
+    "numpy.core": "*",  # NumPy core operations
+    "numpy.core.multiarray": "*",  # Low-level array operations
+    "numpy.core.numeric": "*",  # Numeric operations
+    "numpy.core.umath": "*",  # Universal math functions
+    "numpy.linalg": "*",  # Linear algebra operations
+    "numpy.random": "*",  # Random number generation (state restoration)
+    "numpy.lib": "*",  # NumPy library functions
+    "numpy.lib.format": "*",  # Array format handling
+    "numpy.ma": "*",  # Masked array operations
+    "numpy.fft": "*",  # Fast Fourier Transform
+    "numpy.polynomial": "*",  # Polynomial operations
+    "numpy.testing": "*",  # Testing utilities
+
+    # PyTorch framework - comprehensive safe operations
+    "torch": [
+        "FloatTensor", "DoubleTensor", "HalfTensor", "ByteTensor", "CharTensor",
+        "ShortTensor", "IntTensor", "LongTensor", "BoolTensor",
+        "Tensor", "tensor", "from_numpy", "zeros", "ones", "empty", "randn", "rand",
+        "arange", "linspace", "eye", "stack", "cat", "split", "chunk",
+        "Size", "dtype", "device", "memory_format", "layout",
+    ],
+    "torch.nn": "*",  # Neural network modules
+    "torch.nn.functional": "*",  # Functional neural network operations
+    "torch.nn.modules": "*",  # Neural network module classes
+    "torch.nn.parameter": ["Parameter"],  # Model parameters
+    "torch.optim": "*",  # Optimization algorithms
+    "torch.utils": "*",  # Utility functions
+    "torch.utils.data": "*",  # Data loading utilities
+    "torch._utils": "*",  # Internal PyTorch utilities
+    "torch.jit": "*",  # TorchScript operations
+    "torch.autograd": "*",  # Automatic differentiation
+    "torch.cuda": "*",  # CUDA operations
+    "torch.distributed": "*",  # Distributed training
+    "torchvision": "*",  # Computer vision utilities
+    "torchvision.transforms": "*",  # Image transformations
+    "torchvision.models": "*",  # Pre-trained models
+
+    # TensorFlow ecosystem - safe operations
+    "tensorflow": "*",  # Core TensorFlow operations (specific ops checked elsewhere)
+    "tensorflow.keras": "*",  # Keras high-level API
+    "tensorflow.python": "*",  # TensorFlow Python API
+    "tf": "*",  # Common TensorFlow alias
+
+    # Scikit-learn - ML algorithms and utilities
+    "sklearn": "*",  # Core scikit-learn functionality
+    "sklearn.base": "*",  # Base classes and utilities
+    "sklearn.cluster": "*",  # Clustering algorithms
+    "sklearn.decomposition": "*",  # Dimensionality reduction
+    "sklearn.ensemble": "*",  # Ensemble methods
+    "sklearn.feature_extraction": "*",  # Feature extraction
+    "sklearn.feature_selection": "*",  # Feature selection
+    "sklearn.linear_model": "*",  # Linear models
+    "sklearn.metrics": "*",  # Evaluation metrics
+    "sklearn.model_selection": "*",  # Model selection utilities
+    "sklearn.naive_bayes": "*",  # Naive Bayes classifiers
+    "sklearn.neighbors": "*",  # Nearest neighbors
+    "sklearn.neural_network": "*",  # Neural network models
+    "sklearn.preprocessing": "*",  # Data preprocessing
+    "sklearn.svm": "*",  # Support Vector Machines
+    "sklearn.tree": "*",  # Decision trees
+    "sklearn.utils": "*",  # Utility functions
+    "sklearn.pipeline": "*",  # ML pipelines
+
+    # Standard library - safe operations only
+    "collections": ["OrderedDict", "namedtuple", "defaultdict", "deque", "Counter"],
+    "functools": ["partial", "reduce", "wraps", "lru_cache"],
+    "itertools": "*",  # Iterator building blocks
+    "operator": ["itemgetter", "methodcaller", "add", "sub", "mul", "truediv", "mod"],  # Exclude attrgetter
+    "copy": ["copy", "deepcopy"],  # Safe copying operations
+    "math": "*",  # Mathematical functions
+    "random": "*",  # Random number generation (for reproducible models)
+    "re": ["compile", "match", "search", "findall", "finditer", "sub", "split"],  # Safe regex operations
+    "string": "*",  # String operations
+    "datetime": "*",  # Date/time operations
+    "time": ["time", "sleep", "strftime", "strptime"],  # Safe time operations
+    "json": ["loads", "dumps", "load", "dump"],  # JSON serialization (safe)
+    "uuid": "*",  # UUID generation
+    "hashlib": "*",  # Cryptographic hashing
+    "hmac": "*",  # HMAC operations
+    "base64": ["b64encode", "b32encode", "b16encode"],  # Encoding only (not decoding)
+    "binascii": ["hexlify", "unhexlify", "crc32"],  # Binary/ASCII conversions
+    "struct": "*",  # Binary data packing/unpacking
+    "array": "*",  # Array operations
+    "decimal": "*",  # Decimal arithmetic
+    "fractions": "*",  # Rational number arithmetic
+    "statistics": "*",  # Statistical functions
+    "enum": "*",  # Enumeration support
+    "dataclasses": "*",  # Dataclass support
+    "typing": "*",  # Type hints
+
+    # ML-specific libraries - safe operations
+    "scipy": "*",  # Scientific computing
+    "scipy.sparse": "*",  # Sparse matrix operations
+    "scipy.linalg": "*",  # Linear algebra
+    "scipy.optimize": "*",  # Optimization algorithms
+    "scipy.stats": "*",  # Statistical functions
+    "scipy.signal": "*",  # Signal processing
+    "scipy.ndimage": "*",  # Multi-dimensional image processing
+    "pandas": "*",  # Data manipulation and analysis
+    "matplotlib": "*",  # Plotting library
+    "matplotlib.pyplot": "*",  # Matplotlib pyplot interface
+    "seaborn": "*",  # Statistical visualization
+    "plotly": "*",  # Interactive plotting
+    "PIL": "*",  # Python Imaging Library
+    "cv2": "*",  # OpenCV computer vision
+    "skimage": "*",  # Image processing
+
+    # Model serialization libraries - framework-specific safe operations
+    "joblib": ["load", "dump"],  # Scikit-learn model persistence (limited to core functions)
+    "pickle": [],  # Empty list = no safe operations (all pickle operations are suspicious)
+    "dill": [],  # Empty list = no safe operations (all dill operations are suspicious)
+    "_pickle": [],  # Empty list = no safe operations (low-level pickle is suspicious)
+
+    # Hugging Face ecosystem - transformer models
+    "transformers": "*",  # Hugging Face transformers
+    "datasets": "*",  # Hugging Face datasets
+    "tokenizers": "*",  # Fast tokenizers
+
+    # Other ML frameworks
+    "xgboost": "*",  # Gradient boosting framework
+    "lightgbm": "*",  # Light gradient boosting
+    "catboost": "*",  # CatBoost gradient boosting
+    "onnx": "*",  # Open Neural Network Exchange
+    "onnxruntime": "*",  # ONNX runtime
+
+    # Specialized ML libraries
+    "gym": "*",  # OpenAI Gym for RL
+    "stable_baselines3": "*",  # RL algorithms
+    "optuna": "*",  # Hyperparameter optimization
+    "hyperopt": "*",  # Hyperparameter optimization
+    "ray": "*",  # Distributed computing
+    "mlflow": "*",  # ML experiment tracking
+    "wandb": "*",  # Weights & Biases tracking
+
+    # Data format libraries - safe operations
+    "h5py": "*",  # HDF5 file format
+    "zarr": "*",  # Chunked, compressed arrays
+    "netCDF4": "*",  # Network Common Data Form
+    "pyarrow": "*",  # Apache Arrow
+    "faiss": "*",  # Facebook AI Similarity Search
+    "annoy": "*",  # Approximate Nearest Neighbors
+
+    # Linear algebra backends
+    "mkl": "*",  # Intel Math Kernel Library
+    "openblas": "*",  # OpenBLAS library
+    "lapack": "*",  # Linear Algebra Package
+    "blas": "*",  # Basic Linear Algebra Subprograms
 }
 
 # =============================================================================
@@ -622,6 +781,117 @@ JINJA2_SSTI_PATTERNS = {
         r"settings\.",  # Settings access
     ],
 }
+
+# =============================================================================
+# SAFETY CLASSIFICATION FUNCTIONS
+# =============================================================================
+
+
+def classify_global_safety(module: str, name: str) -> tuple[str, str]:
+    """
+    Classify global import using PickleScan's safety logic adapted to ModelAudit severities.
+
+    This implements PickleScan's three-tier safety classification system:
+    - Innocuous: Known safe ML operations (mapped to INFO severity)
+    - Suspicious: Unknown operations requiring review (mapped to WARNING severity)
+    - Dangerous: Known malicious operations (mapped to CRITICAL severity)
+
+    Args:
+        module: Module name (e.g., 'numpy', 'os')
+        name: Function/class name (e.g., 'array', 'system')
+
+    Returns:
+        Tuple of (safety_level, severity) where:
+        - safety_level: "innocuous", "suspicious", or "dangerous"
+        - severity: ModelAudit severity level ("info", "warning", "critical")
+    """
+    # Check if it's definitely dangerous first
+    dangerous_filter = SUSPICIOUS_GLOBALS.get(module)
+    if (dangerous_filter is not None and
+        (dangerous_filter == "*" or (isinstance(dangerous_filter, list) and name in dangerous_filter))):
+        return "dangerous", "critical"
+
+    # Check OS module aliases for dangerous operations
+    if module in OS_MODULE_ALIASES:
+        alias_data = OS_MODULE_ALIASES[module]
+        alias_filter = alias_data["functions"]
+        if alias_filter == "*" or (isinstance(alias_filter, list) and name in alias_filter):
+            # Map severity from alias data to ModelAudit severity levels
+            alias_severity = alias_data["severity"]
+            if alias_severity == "CRITICAL":
+                return "dangerous", "critical"
+            elif alias_severity == "HIGH":
+                return "dangerous", "critical"  # Map HIGH to critical for security
+            else:
+                return "suspicious", "warning"
+
+    # Check if it's a known safe operation
+    safe_filter = SAFE_GLOBALS.get(module)
+    if safe_filter is not None:
+        if isinstance(safe_filter, list) and name in safe_filter:
+            # Explicit function whitelist - definitely safe
+            return "innocuous", "info"
+        elif safe_filter == "*":
+            # Wildcard safe module - be conservative for core ML libraries only
+            core_ml_modules = {
+                "numpy", "numpy.core", "numpy.core.multiarray", "numpy.core.numeric",
+                "numpy.core.umath", "numpy.linalg", "numpy.random", "numpy.lib",
+                "numpy.lib.format", "numpy.ma", "numpy.fft", "numpy.polynomial",
+                "numpy.testing", "torch.nn", "torch.nn.functional", "torch.nn.modules",
+                "torch.optim", "torch.utils", "torch.utils.data", "torch._utils",
+                "torch.jit", "torch.autograd", "torch.cuda", "torch.distributed",
+                "torchvision", "torchvision.transforms", "torchvision.models",
+                "tensorflow", "tensorflow.keras", "tensorflow.python", "tf",
+                "sklearn", "sklearn.base", "sklearn.cluster", "sklearn.decomposition",
+                "sklearn.ensemble", "sklearn.feature_extraction", "sklearn.feature_selection",
+                "sklearn.linear_model", "sklearn.metrics", "sklearn.model_selection",
+                "sklearn.naive_bayes", "sklearn.neighbors", "sklearn.neural_network",
+                "sklearn.preprocessing", "sklearn.svm", "sklearn.tree", "sklearn.utils",
+                "sklearn.pipeline", "scipy", "scipy.sparse", "scipy.linalg", "scipy.optimize",
+                "scipy.stats", "scipy.signal", "scipy.ndimage", "pandas", "matplotlib",
+                "matplotlib.pyplot"
+            }
+
+            if module in core_ml_modules:
+                # Core ML libraries with wildcard are considered safe
+                return "innocuous", "info"
+            else:
+                # Non-core modules with wildcard should be reviewed
+                return "suspicious", "warning"
+
+    # Unknown import - mark as suspicious for manual review
+    return "suspicious", "warning"
+
+
+def is_safe_global(module: str, name: str) -> bool:
+    """
+    Quick check if a global import is considered safe.
+
+    Args:
+        module: Module name
+        name: Function/class name
+
+    Returns:
+        True if the global is known to be safe, False otherwise
+    """
+    safety_level, _ = classify_global_safety(module, name)
+    return safety_level == "innocuous"
+
+
+def is_dangerous_global(module: str, name: str) -> bool:
+    """
+    Quick check if a global import is considered dangerous.
+
+    Args:
+        module: Module name
+        name: Function/class name
+
+    Returns:
+        True if the global is known to be dangerous, False otherwise
+    """
+    safety_level, _ = classify_global_safety(module, name)
+    return safety_level == "dangerous"
+
 
 # =============================================================================
 # UTILITY FUNCTIONS
