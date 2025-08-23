@@ -1149,7 +1149,7 @@ class PickleScanner(BaseScanner):
             b"getstatusoutput",  # commands.getstatusoutput
             b"system",  # Catches both os.system and from os import system
         ]
-        
+
         # CVE-2025-32434 specific patterns - PyTorch weights_only=True bypass techniques
         cve_2025_32434_patterns = [
             # Patterns that specifically exploit the weights_only=True assumption
@@ -1168,7 +1168,7 @@ class PickleScanner(BaseScanner):
             # Base64/hex encoded PyTorch payloads
             b"dG9yY2g",  # base64 "torch"
             b"746f726368",  # hex "torch"
-            b"UHlUb3JjaA",  # base64 "PyTorch" 
+            b"UHlUb3JjaA",  # base64 "PyTorch"
             b"507954617268",  # hex "PyTorch"
             # Obfuscated torch references
             b"__torch__",  # Torch module references
@@ -1182,7 +1182,7 @@ class PickleScanner(BaseScanner):
             b"torchvision.transforms",  # Transform pipeline injection
             b"torch.utils.data",  # Data pipeline manipulation
         ]
-        
+
         # Combine all patterns
         all_dangerous_patterns = dangerous_patterns + cve_2025_32434_patterns
 
@@ -1205,13 +1205,16 @@ class PickleScanner(BaseScanner):
                 # Use semantic analysis to check if this is actually dangerous
                 # For now, just check if it's in documentation or comments
                 is_safe = "documentation" in context.lower() or "#" in context
-                
+
                 # Additional PyTorch-specific safety checks
                 if pattern == b"torch._utils":
                     # torch._utils is safe when used with legitimate tensor rebuilding functions
                     legitimate_pytorch_functions = [
-                        b"_rebuild_tensor_v2", b"_rebuild_parameter", b"_rebuild_tensor",
-                        b"_rebuild_sparse_tensor", b"_rebuild_nested_tensor"
+                        b"_rebuild_tensor_v2",
+                        b"_rebuild_parameter",
+                        b"_rebuild_tensor",
+                        b"_rebuild_sparse_tensor",
+                        b"_rebuild_nested_tensor",
                     ]
                     is_safe = is_safe or any(func in context.encode() for func in legitimate_pytorch_functions)
 
@@ -1445,7 +1448,7 @@ class PickleScanner(BaseScanner):
 
             # SMART DETECTION: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
-            
+
             # CVE-2025-32434 specific opcode sequence analysis
             cve_patterns = self._detect_cve_2025_32434_sequences(opcodes)
             for cve_pattern in cve_patterns:
@@ -1461,8 +1464,8 @@ class PickleScanner(BaseScanner):
                         "description": cve_pattern["description"],
                         "opcodes_involved": cve_pattern["opcodes"],
                         "exploitation_method": cve_pattern["exploitation_method"],
-                        "position": cve_pattern["position"]
-                    }
+                        "position": cve_pattern["position"],
+                    },
                 )
 
             # ML-context-aware stack depth validation
@@ -2509,29 +2512,36 @@ class PickleScanner(BaseScanner):
     def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple]) -> list[dict]:
         """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques"""
         patterns = []
-        
+
         for i, (opcode, arg, pos) in enumerate(opcodes):
             # Pattern 1: GLOBAL + torch related imports followed by dangerous opcodes
-            if opcode.name in ["GLOBAL", "STACK_GLOBAL"] and arg:
-                if any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"]):
+            if (
+                opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                and arg
+                and any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"])
+            ):
                     # Look for dangerous opcodes within next 10 positions
                     for j in range(i + 1, min(i + 11, len(opcodes))):
                         next_opcode, next_arg, next_pos = opcodes[j]
                         if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
-                            patterns.append({
-                                "pattern_type": "torch_import_with_execution",
-                                "description": f"PyTorch import ({arg}) followed by code execution opcode ({next_opcode.name})",
-                                "opcodes": [opcode.name, next_opcode.name],
-                                "exploitation_method": "weights_only=True bypass via PyTorch internal access",
-                                "position": pos
-                            })
+                            patterns.append(
+                                {
+                                    "pattern_type": "torch_import_with_execution",
+                                    "description": (
+                                        f"PyTorch import ({arg}) followed by code execution opcode ({next_opcode.name})"
+                                    ),
+                                    "opcodes": [opcode.name, next_opcode.name],
+                                    "exploitation_method": "weights_only=True bypass via PyTorch internal access",
+                                    "position": pos,
+                                }
+                            )
                             break
-            
+
             # Pattern 2: Multiple REDUCE opcodes in sequence (common in CVE-2025-32434 exploits)
             if opcode.name == "REDUCE" and i < len(opcodes) - 2:
                 reduce_sequence = [opcode.name]
                 reduce_positions = [pos]
-                
+
                 # Look for subsequent REDUCE opcodes
                 for j in range(i + 1, min(i + 6, len(opcodes))):
                     next_opcode, next_arg, next_pos = opcodes[j]
@@ -2543,67 +2553,79 @@ class PickleScanner(BaseScanner):
                         continue
                     else:
                         break
-                
+
                 # If we found 3+ REDUCE opcodes in close proximity
                 if len(reduce_sequence) >= 3:
-                    patterns.append({
-                        "pattern_type": "chained_reduce_execution",
-                        "description": f"Chain of {len(reduce_sequence)} REDUCE opcodes indicating complex exploit",
-                        "opcodes": reduce_sequence,
-                        "exploitation_method": "Chained __reduce__ method exploitation",
-                        "position": pos
-                    })
-            
+                    patterns.append(
+                        {
+                            "pattern_type": "chained_reduce_execution",
+                            "description": f"Chain of {len(reduce_sequence)} REDUCE opcodes indicating complex exploit",
+                            "opcodes": reduce_sequence,
+                            "exploitation_method": "Chained __reduce__ method exploitation",
+                            "position": pos,
+                        }
+                    )
+
             # Pattern 3: GLOBAL builtins.eval/exec followed by data loading
-            if opcode.name in ["GLOBAL", "STACK_GLOBAL"] and arg:
-                if any(dangerous in str(arg).lower() for dangerous in ["eval", "exec", "compile", "__import__"]):
+            if (
+                opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                and arg
+                and any(dangerous in str(arg).lower() for dangerous in ["eval", "exec", "compile", "__import__"])
+            ):
                     # Look for data loading opcodes that could contain payload
                     for j in range(i + 1, min(i + 8, len(opcodes))):
                         next_opcode, next_arg, next_pos = opcodes[j]
                         if next_opcode.name in ["UNICODE", "STRING", "BINUNICODE", "SHORT_BINSTRING"]:
-                            patterns.append({
-                                "pattern_type": "eval_exec_with_payload",
-                                "description": f"Code execution function ({arg}) with string payload",
-                                "opcodes": [opcode.name, next_opcode.name],
-                                "exploitation_method": "Direct code execution via eval/exec",
-                                "position": pos
-                            })
+                            patterns.append(
+                                {
+                                    "pattern_type": "eval_exec_with_payload",
+                                    "description": f"Code execution function ({arg}) with string payload",
+                                    "opcodes": [opcode.name, next_opcode.name],
+                                    "exploitation_method": "Direct code execution via eval/exec",
+                                    "position": pos,
+                                }
+                            )
                             break
-            
+
             # Pattern 4: BUILD opcode with suspicious GLOBAL preceding it (setstate exploitation)
             if opcode.name == "BUILD" and i > 0:
                 # Look backwards for GLOBAL opcodes
                 for j in range(max(0, i - 5), i):
                     prev_opcode, prev_arg, prev_pos = opcodes[j]
-                    if prev_opcode.name in ["GLOBAL", "STACK_GLOBAL"] and prev_arg:
-                        if any(suspicious in str(prev_arg).lower() 
-                               for suspicious in ["os", "subprocess", "eval", "exec", "torch"]):
-                            patterns.append({
-                                "pattern_type": "setstate_exploitation",
-                                "description": f"BUILD opcode with suspicious import ({prev_arg})",
-                                "opcodes": [prev_opcode.name, opcode.name],
-                                "exploitation_method": "__setstate__ method exploitation",
-                                "position": pos
-                            })
+                    if prev_opcode.name in ["GLOBAL", "STACK_GLOBAL"] and prev_arg and any(
+                        suspicious in str(prev_arg).lower()
+                        for suspicious in ["os", "subprocess", "eval", "exec", "torch"]
+                    ):
+                            patterns.append(
+                                {
+                                    "pattern_type": "setstate_exploitation",
+                                    "description": f"BUILD opcode with suspicious import ({prev_arg})",
+                                    "opcodes": [prev_opcode.name, opcode.name],
+                                    "exploitation_method": "__setstate__ method exploitation",
+                                    "position": pos,
+                                }
+                            )
                             break
-            
+
             # Pattern 5: Lambda exploitation sequences (GLOBAL lambda followed by REDUCE)
-            if (opcode.name in ["UNICODE", "STRING", "BINUNICODE"] and arg and 
-                "lambda" in str(arg).lower()):
+            if opcode.name in ["UNICODE", "STRING", "BINUNICODE"] and arg and "lambda" in str(arg).lower():
                 # Look for REDUCE opcodes following lambda
                 for j in range(i + 1, min(i + 8, len(opcodes))):
                     next_opcode, next_arg, next_pos = opcodes[j]
                     if next_opcode.name == "REDUCE":
-                        patterns.append({
-                            "pattern_type": "lambda_exploitation",
-                            "description": "Lambda function with REDUCE opcode execution",
-                            "opcodes": [opcode.name, next_opcode.name],
-                            "exploitation_method": "Lambda function code injection",
-                            "position": pos
-                        })
+                        patterns.append(
+                            {
+                                "pattern_type": "lambda_exploitation",
+                                "description": "Lambda function with REDUCE opcode execution",
+                                "opcodes": [opcode.name, next_opcode.name],
+                                "exploitation_method": "Lambda function code injection",
+                                "position": pos,
+                            }
+                        )
                         break
-        
+
         return patterns
+
     def check_for_jit_script_code(
         self,
         data: bytes,

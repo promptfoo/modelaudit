@@ -41,6 +41,7 @@ A comprehensive guide to securing PyTorch models and preventing ML supply chain 
 ### ✅ Recommended Approaches
 
 #### 1. Use SafeTensors Format (Best)
+
 ```python
 from safetensors.torch import load_file, save_file
 import torch
@@ -57,6 +58,7 @@ model.load_state_dict(state_dict)
 ```
 
 #### 2. Updated PyTorch with Validation
+
 ```python
 import torch
 import hashlib
@@ -64,19 +66,19 @@ import os
 
 def safe_load_pytorch_model(model_path, expected_hash=None, trusted_source=False):
     """Safely load PyTorch model with validation"""
-    
+
     # 1. Verify file hash if provided
     if expected_hash:
         with open(model_path, 'rb') as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash != expected_hash:
             raise ValueError(f"Model hash mismatch: {actual_hash} != {expected_hash}")
-    
+
     # 2. Check PyTorch version
     torch_version = torch.__version__
     if not trusted_source and torch_version <= "2.5.1":
         raise ValueError(f"PyTorch {torch_version} vulnerable to CVE-2025-32434")
-    
+
     # 3. Load with weights_only (but don't rely on it for security)
     try:
         return torch.load(model_path, weights_only=True, map_location='cpu')
@@ -85,13 +87,14 @@ def safe_load_pytorch_model(model_path, expected_hash=None, trusted_source=False
 
 # Usage
 model_dict = safe_load_pytorch_model(
-    "model.pt", 
+    "model.pt",
     expected_hash="abc123...",
     trusted_source=True
 )
 ```
 
 #### 3. Sandboxed Loading
+
 ```python
 import subprocess
 import tempfile
@@ -99,7 +102,7 @@ import json
 
 def load_model_in_sandbox(model_path):
     """Load model in isolated process"""
-    
+
     # Create sandbox script
     sandbox_script = '''
 import torch
@@ -119,17 +122,17 @@ except Exception as e:
     result = {"success": False, "error": str(e)}
     print(json.dumps(result))
     '''
-    
+
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(sandbox_script)
         script_path = f.name
-    
+
     try:
         # Run in isolated process
         result = subprocess.run([
             'python', script_path, model_path
         ], capture_output=True, text=True, timeout=30)
-        
+
         return json.loads(result.stdout)
     finally:
         os.unlink(script_path)
@@ -157,13 +160,13 @@ def load_any_model(url):
 
 ## Model Format Security Comparison
 
-| Format | Security Level | Pros | Cons |
-|--------|---------------|------|------|
-| **SafeTensors** | 🟢 **Highest** | No code execution, fast loading, cross-framework | Newer format, limited ecosystem |
-| **ONNX** | 🟡 **Medium-High** | Standardized, some protections | Custom operators can be risky |
-| **PyTorch (weights_only=True)** | 🟡 **Medium** | Built-in, widely supported | Still vulnerable to sophisticated attacks |
-| **PyTorch (full)** | 🔴 **Lowest** | Complete model serialization | Arbitrary code execution |
-| **Pickle Files** | 🔴 **Lowest** | Python native | Inherently unsafe |
+| Format                          | Security Level     | Pros                                             | Cons                                      |
+| ------------------------------- | ------------------ | ------------------------------------------------ | ----------------------------------------- |
+| **SafeTensors**                 | 🟢 **Highest**     | No code execution, fast loading, cross-framework | Newer format, limited ecosystem           |
+| **ONNX**                        | 🟡 **Medium-High** | Standardized, some protections                   | Custom operators can be risky             |
+| **PyTorch (weights_only=True)** | 🟡 **Medium**      | Built-in, widely supported                       | Still vulnerable to sophisticated attacks |
+| **PyTorch (full)**              | 🔴 **Lowest**      | Complete model serialization                     | Arbitrary code execution                  |
+| **Pickle Files**                | 🔴 **Lowest**      | Python native                                    | Inherently unsafe                         |
 
 ### Migration Priority
 
@@ -176,6 +179,7 @@ def load_any_model(url):
 ### Model Source Validation
 
 #### 1. Trusted Repositories
+
 ```python
 TRUSTED_SOURCES = [
     'huggingface.co',
@@ -191,6 +195,7 @@ def validate_model_source(url):
 ```
 
 #### 2. Cryptographic Verification
+
 ```python
 import hashlib
 from cryptography.hazmat.primitives import hashes
@@ -198,15 +203,15 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 
 def verify_model_signature(model_path, signature_path, public_key):
     """Verify model cryptographic signature"""
-    
+
     # Read model file
     with open(model_path, 'rb') as f:
         model_data = f.read()
-    
+
     # Read signature
     with open(signature_path, 'rb') as f:
         signature = f.read()
-    
+
     # Verify signature
     try:
         public_key.verify(
@@ -224,33 +229,34 @@ def verify_model_signature(model_path, signature_path, public_key):
 ```
 
 #### 3. Model Registry Integration
+
 ```python
 class SecureModelRegistry:
     def __init__(self, registry_url, api_key):
         self.registry_url = registry_url
         self.api_key = api_key
-    
+
     def download_model(self, model_id, verify_signature=True):
         """Download model with security validation"""
-        
+
         # Get model metadata
         metadata = self.get_model_metadata(model_id)
-        
+
         # Validate metadata
         if not self.validate_metadata(metadata):
             raise ValueError("Model metadata validation failed")
-        
+
         # Download model file
         model_path = self.download_file(metadata['download_url'])
-        
+
         # Verify hash
         if not self.verify_hash(model_path, metadata['sha256']):
             raise ValueError("Model hash verification failed")
-        
+
         # Verify signature if required
         if verify_signature and not self.verify_signature(model_path, metadata):
             raise ValueError("Model signature verification failed")
-        
+
         return model_path
 ```
 
@@ -259,6 +265,7 @@ class SecureModelRegistry:
 ### Safe TorchScript Practices
 
 #### 1. Avoid Dynamic Code Generation
+
 ```python
 # ✅ SAFE: Static script compilation
 class SafeModel(torch.nn.Module):
@@ -274,22 +281,24 @@ def create_dynamic_model(user_code):
 ```
 
 #### 2. Validate Script Modules
+
 ```python
 def validate_script_module(module):
     """Validate TorchScript module for security"""
-    
+
     # Check for dangerous operations
     dangerous_ops = ['aten::system', 'aten::exec', 'aten::eval']
-    
+
     graph = module.graph
     for node in graph.nodes():
         if any(op in str(node) for op in dangerous_ops):
             raise ValueError(f"Dangerous operation found: {node}")
-    
+
     return True
 ```
 
 #### 3. Hook Security
+
 ```python
 # ❌ DANGEROUS: Arbitrary hook functions
 def dangerous_hook(module, input, output):
@@ -310,6 +319,7 @@ model.register_forward_hook(safe_logging_hook)
 ### Automated Security Scanning
 
 #### 1. Development Workflow
+
 ```bash
 # Install ModelAudit with PyTorch support
 pip install modelaudit[pytorch]
@@ -325,39 +335,41 @@ fi
 ```
 
 #### 2. Python Integration
+
 ```python
 from modelaudit import scan_file
 import json
 
 def secure_model_loading(model_path):
     """Load model only after security validation"""
-    
+
     # Scan with ModelAudit
     result = scan_file(model_path)
-    
+
     # Check for critical issues
     critical_issues = [
-        issue for issue in result.issues 
+        issue for issue in result.issues
         if issue.severity == 'CRITICAL'
     ]
-    
+
     if critical_issues:
         raise ValueError(f"Critical security issues found: {critical_issues}")
-    
+
     # Check for CVE-2025-32434 specifically
     cve_issues = [
         issue for issue in result.issues
         if 'CVE-2025-32434' in issue.message
     ]
-    
+
     if cve_issues:
         raise ValueError("Model vulnerable to CVE-2025-32434")
-    
+
     # Proceed with safe loading
     return torch.load(model_path, weights_only=True, map_location='cpu')
 ```
 
 #### 3. CI/CD Integration
+
 ```yaml
 # .github/workflows/model-security.yml
 name: Model Security Scan
@@ -365,19 +377,19 @@ name: Model Security Scan
 on:
   pull_request:
     paths:
-      - '**/*.pt'
-      - '**/*.pth'
-      - '**/*.pkl'
+      - "**/*.pt"
+      - "**/*.pth"
+      - "**/*.pkl"
 
 jobs:
   security-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install ModelAudit
         run: pip install modelaudit[all]
-      
+
       - name: Scan PyTorch Models
         run: |
           find . -name "*.pt" -o -name "*.pth" -o -name "*.pkl" | while read model; do
@@ -393,7 +405,7 @@ jobs:
             
             echo "✅ $model passed security scan"
           done
-      
+
       - name: Archive Security Reports
         uses: actions/upload-artifact@v4
         with:
@@ -467,7 +479,7 @@ If you discover you've loaded a malicious model:
 PyTorch model security requires a multi-layered approach combining:
 
 - **Safe loading practices** with proper validation
-- **Modern formats** like SafeTensors when possible  
+- **Modern formats** like SafeTensors when possible
 - **Automated scanning** with tools like ModelAudit
 - **Supply chain security** with verification and trusted sources
 - **Continuous monitoring** and updates

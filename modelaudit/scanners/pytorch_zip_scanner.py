@@ -148,7 +148,7 @@ class PyTorchZipScanner(BaseScanner):
                 # Extract PyTorch version information for CVE-2025-32434 detection
                 pytorch_version_info = self._extract_pytorch_version_info(z, safe_entries)
                 result.metadata.update(pytorch_version_info)
-                
+
                 # Check for CVE-2025-32434 vulnerability based on version
                 self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
 
@@ -203,7 +203,7 @@ class PyTorchZipScanner(BaseScanner):
 
                     # Add CVE-2025-32434 specific warnings for PyTorch models with dangerous opcodes
                     self._add_weights_only_safety_warnings(sub_result, result, path, name)
-                    
+
                     # Merge results
                     result.merge(sub_result)
 
@@ -553,12 +553,12 @@ class PyTorchZipScanner(BaseScanner):
 
     def _extract_pytorch_version_info(self, zipfile_obj, safe_entries: list[str]) -> dict[str, Any]:
         """Extract PyTorch version information from model archive for CVE-2025-32434 detection"""
-        version_info = {
+        version_info: dict[str, Any] = {
             "pytorch_archive_version": None,
             "pytorch_framework_version": None,
             "pytorch_version_source": None,
         }
-        
+
         try:
             # Check for PyTorch archive version file
             if "version" in safe_entries:
@@ -569,7 +569,7 @@ class PyTorchZipScanner(BaseScanner):
                 version_data = zipfile_obj.read("archive/version").decode("utf-8", errors="ignore").strip()
                 version_info["pytorch_archive_version"] = version_data
                 version_info["pytorch_version_source"] = "archive/version"
-            
+
             # Try to extract PyTorch framework version from pickle files
             # Look for torch.__version__ references in pickle GLOBAL opcodes
             for name in safe_entries:
@@ -584,13 +584,14 @@ class PyTorchZipScanner(BaseScanner):
                             break
                     except Exception:
                         continue
-            
+
             # Look for version information in other metadata files
             metadata_files = ["meta.json", "config.json", "pytorch_model.bin.index.json"]
             for meta_file in metadata_files:
                 if meta_file in safe_entries:
                     try:
                         import json
+
                         meta_data = json.loads(zipfile_obj.read(meta_file).decode("utf-8"))
                         # Look for version fields in metadata
                         for key in ["pytorch_version", "torch_version", "framework_version", "version"]:
@@ -600,78 +601,89 @@ class PyTorchZipScanner(BaseScanner):
                                 break
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
-                        
-        except Exception as e:
+
+        except Exception:
             # Log but don't fail - version detection is best effort
             pass
-        
+
         return version_info
-    
+
     def _extract_framework_version_from_pickle(self, pickle_data: bytes) -> Optional[str]:
         """Extract PyTorch framework version from pickle data by examining opcodes"""
         try:
-            import pickletools
             import io
-            
+            import pickletools
+
             # Use pickletools to examine opcodes without executing the pickle
             opcodes = []
             with io.BytesIO(pickle_data) as f:
                 for opcode, arg, pos in pickletools.genops(f):
                     opcodes.append((opcode, arg, pos))
-                    
+
             # Look for GLOBAL opcodes that reference torch.__version__
-            for i, (opcode, arg, pos) in enumerate(opcodes):
-                if opcode.name == "GLOBAL" and arg:
-                    if "torch" in arg and ("version" in arg or "__version__" in arg):
+            for i, (opcode, arg, _pos) in enumerate(opcodes):
+                if opcode.name == "GLOBAL" and arg and "torch" in arg and ("version" in arg or "__version__" in arg):
                         # Found a reference to torch version - try to get the value
                         # Look for subsequent opcodes that might contain the version string
                         for j in range(i + 1, min(i + 10, len(opcodes))):
                             next_opcode, next_arg, next_pos = opcodes[j]
-                            if next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]:
-                                if next_arg and isinstance(next_arg, str) and self._looks_like_version(next_arg):
+                            if (
+                                next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                                and next_arg
+                                and isinstance(next_arg, str)
+                                and self._looks_like_version(next_arg)
+                            ):
                                     return next_arg
-                                    
+
             # Look for any version-like strings in the pickle
-            for opcode, arg, pos in opcodes:
-                if opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]:
-                    if arg and isinstance(arg, str) and self._looks_like_pytorch_version(arg):
+            for opcode, arg, _pos in opcodes:
+                if (
+                    opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                    and arg
+                    and isinstance(arg, str)
+                    and self._looks_like_pytorch_version(arg)
+                ):
                         return arg
-                        
+
         except Exception:
             pass
-        
+
         return None
-    
+
     def _looks_like_version(self, text: str) -> bool:
         """Check if a string looks like a version number"""
         import re
+
         # Match patterns like 2.5.1, 1.13.0+cu117, 2.0.0.dev20230101
-        version_pattern = r'^\d+\.\d+\.\d+(?:\+\w+)?(?:\.dev\d+)?$'
+        version_pattern = r"^\d+\.\d+\.\d+(?:\+\w+)?(?:\.dev\d+)?$"
         return bool(re.match(version_pattern, text.strip()))
-    
+
     def _looks_like_pytorch_version(self, text: str) -> bool:
         """Check if a string looks specifically like a PyTorch version"""
         if not self._looks_like_version(text):
             return False
         # PyTorch versions typically start with 1.x or 2.x
-        return text.strip().startswith(('1.', '2.'))
-    
+        return text.strip().startswith(("1.", "2."))
+
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2025-32434 vulnerability based on PyTorch version"""
-        
+
         # Get the framework version to check
         framework_version = version_info.get("pytorch_framework_version")
         version_source = version_info.get("pytorch_version_source", "unknown")
-        
+
         if framework_version:
             # Check if this is a vulnerable PyTorch version (≤2.5.1)
             is_vulnerable = self._is_vulnerable_pytorch_version(framework_version)
-            
+
             if is_vulnerable:
                 result.add_check(
                     name="CVE-2025-32434 PyTorch Version Check",
                     passed=False,
-                    message=f"Model uses vulnerable PyTorch version {framework_version} susceptible to CVE-2025-32434 RCE",
+                    message=(
+                        f"Model uses vulnerable PyTorch version {framework_version} "
+                        "susceptible to CVE-2025-32434 RCE"
+                    ),
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
@@ -680,20 +692,23 @@ class PyTorchZipScanner(BaseScanner):
                         "version_source": version_source,
                         "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
                         "fixed_in": "PyTorch 2.6.0",
-                        "recommendation": "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
-                    }
+                        "recommendation": (
+                            "Update to PyTorch 2.6.0 or later, "
+                            "avoid torch.load(weights_only=True) with untrusted models"
+                        ),
+                    },
                 )
             else:
                 result.add_check(
-                    name="CVE-2025-32434 PyTorch Version Check", 
+                    name="CVE-2025-32434 PyTorch Version Check",
                     passed=True,
                     message=f"Model uses PyTorch version {framework_version} which is not affected by CVE-2025-32434",
                     location=path,
                     details={
                         "pytorch_version": framework_version,
                         "version_source": version_source,
-                        "cve_status": "not_vulnerable"
-                    }
+                        "cve_status": "not_vulnerable",
+                    },
                 )
         else:
             # No version detected - add informational check
@@ -706,22 +721,26 @@ class PyTorchZipScanner(BaseScanner):
                 details={
                     "cve_id": "CVE-2025-32434",
                     "version_detection": "failed",
-                    "recommendation": "Verify PyTorch version manually - avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
-                }
+                    "recommendation": (
+                        "Verify PyTorch version manually - "
+                        "avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
+                    ),
+                },
             )
-    
+
     def _is_vulnerable_pytorch_version(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2025-32434 (≤2.5.1)"""
         try:
             import re
+
             # Parse version string
-            version_match = re.match(r'^(\d+)\.(\d+)\.(\d+)', version.strip())
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version.strip())
             if not version_match:
                 # If we can't parse it, assume vulnerable for safety
                 return True
-                
+
             major, minor, patch = map(int, version_match.groups())
-            
+
             # CVE-2025-32434 affects PyTorch ≤2.5.1
             if major < 2:
                 return True  # All 1.x versions are vulnerable
@@ -734,23 +753,25 @@ class PyTorchZipScanner(BaseScanner):
                     return False  # 2.6.0+ are fixed
             else:
                 return False  # 3.x+ would not be vulnerable (future versions)
-                
+
         except Exception:
             # If version parsing fails, assume vulnerable for safety
             return True
 
-    def _add_weights_only_safety_warnings(self, pickle_result: ScanResult, pytorch_result: ScanResult, model_path: str, pickle_name: str) -> None:
+    def _add_weights_only_safety_warnings(
+        self, pickle_result: ScanResult, pytorch_result: ScanResult, model_path: str, pickle_name: str
+    ) -> None:
         """Add CVE-2025-32434 specific warnings when dangerous opcodes detected in PyTorch models"""
-        
+
         # Check if the pickle scan found any dangerous opcodes that would make weights_only=True unsafe
         dangerous_opcodes_found = []
         code_execution_risks = []
-        
+
         # Analyze the pickle scan results for dangerous patterns
         for issue in pickle_result.issues:
             issue_msg = issue.message.lower()
             issue_details = issue.details or {}
-            
+
             # Look for specific dangerous opcodes
             if "reduce" in issue_msg or "REDUCE" in str(issue_details):
                 dangerous_opcodes_found.append("REDUCE")
@@ -773,17 +794,17 @@ class PyTorchZipScanner(BaseScanner):
             if "build" in issue_msg or "BUILD" in str(issue_details):
                 dangerous_opcodes_found.append("BUILD")
                 code_execution_risks.append("__setstate__ method exploitation")
-            
+
             # Look for any code execution patterns
             if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
                 code_execution_risks.append("Direct code execution patterns")
-        
+
         # If dangerous opcodes were found, add specific CVE-2025-32434 warning
         if dangerous_opcodes_found or code_execution_risks:
             # Create detailed warning message
             opcode_list = ", ".join(set(dangerous_opcodes_found)) if dangerous_opcodes_found else "unknown"
-            risk_description = "; ".join(set(code_execution_risks)) if code_execution_risks else "code execution"
-            
+            # risk_description = "; ".join(set(code_execution_risks)) if code_execution_risks else "code execution"
+
             pytorch_result.add_check(
                 name="CVE-2025-32434 weights_only=True Safety Warning",
                 passed=False,
@@ -808,8 +829,8 @@ class PyTorchZipScanner(BaseScanner):
                         "safer serialization formats like SafeTensors. Always validate model sources."
                     ),
                     "affected_pytorch_versions": "All versions ≤2.5.1",
-                    "fixed_in": "PyTorch 2.6.0"
-                }
+                    "fixed_in": "PyTorch 2.6.0",
+                },
             )
         else:
             # No dangerous opcodes found - add informational check
@@ -832,6 +853,6 @@ class PyTorchZipScanner(BaseScanner):
                     "recommendation": (
                         "Use PyTorch 2.6.0+ and prefer SafeTensors format for better security. "
                         "Always validate model sources and avoid loading untrusted models."
-                    )
-                }
+                    ),
+                },
             )

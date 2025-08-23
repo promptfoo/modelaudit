@@ -9,16 +9,19 @@ This plan outlines comprehensive enhancements to ModelAudit's static model vulne
 ### CVE-2025-32434: PyTorch torch.load weights_only=True RCE
 
 **Vulnerability Details:**
+
 - **Impact**: Critical RCE vulnerability in PyTorch ≤2.5.1
 - **Attack Vector**: Malicious model files exploit `torch.load(weights_only=True)` assumption of safety
 - **Root Cause**: False security assumption that `weights_only=True` prevents code execution
 
 **Current ModelAudit Coverage:**
+
 - ✅ **Strong**: Pickle scanner detects dangerous opcodes (REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL)
 - ✅ **Good**: PyTorchZipScanner analyzes .pt/.pth files and extracts pickles
 - ⚠️ **Gap**: No specific warnings about `weights_only=True` false security assumption
 
 **Enhancement Strategy:**
+
 1. **PyTorch Version Detection**: Add scanner to detect vulnerable PyTorch versions in model metadata
 2. **Safety Assumption Warnings**: Flag models that may be loaded with `weights_only=True` and warn users
 3. **Enhanced Pickle Analysis**: Develop specific detection patterns for CVE-2025-32434 exploitation techniques
@@ -28,11 +31,13 @@ This plan outlines comprehensive enhancements to ModelAudit's static model vulne
 
 **Assessment for Static Model Scanning:**
 These CVEs affect TorchServe deployment and configuration, not model files themselves:
+
 - **CVE-2023-43654**: SSRF in Management API - server configuration issue
 - **CVE-2024-35198**: Path traversal in URL downloads - server-side validation bypass
 - **CVE-2024-35199**: gRPC port exposure - network configuration issue
 
 **ModelAudit Coverage Decision:**
+
 - ❌ **Out of Scope**: These are infrastructure/deployment vulnerabilities
 - ✅ **Focus**: Static model file analysis remains core strength
 - 📋 **Note**: While ModelAudit could detect malicious models that exploit these server vulnerabilities, the vulnerabilities themselves are not detectable through static model file analysis
@@ -44,12 +49,14 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Strong (Pickle, some SafeTensors)
 
 **Enhancement Priorities:**
+
 - **Protocol Buffer Attacks**: Add protobuf vulnerability scanner
 - **torch.jit Script Injection**: Enhanced TorchScript security analysis (existing: basic)
 - **Custom Serialization Formats**: Framework for extensible serialization vulnerability detection
 - **SafeTensors Metadata Injection**: Deeper SafeTensors security analysis beyond current scope
 
 **Implementation:**
+
 - New `SerializationSecurityScanner` base class
 - Framework-specific serialization analyzers
 - Metadata injection pattern detection
@@ -59,6 +66,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Limited (basic blacklist, model name policies)
 
 **Enhancement Priorities:**
+
 - **Model Provenance Tracking**: Detect unsigned or unverified models
 - **Dependency Analysis**: Scan for malicious dependencies in model packages
 - **Training Data Lineage**: Detect potential data poisoning indicators
@@ -66,6 +74,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Repository Security**: Analyze model sources for compromise indicators
 
 **Implementation:**
+
 - `SupplyChainScanner` module
 - Integration with model registries and repositories
 - Cryptographic signature verification
@@ -76,6 +85,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Basic (manifest scanning)
 
 **Enhancement Priorities:**
+
 - **Model Configuration Analysis**: Scan for insecure model configurations in metadata
 - **Framework Version Detection**: Identify vulnerable framework versions in model artifacts
 - **Model Signature Verification**: Validate cryptographic signatures when present
@@ -83,6 +93,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Dependency Analysis**: Scan embedded dependency information for known vulnerabilities
 
 **Implementation:**
+
 - Enhanced manifest and metadata scanning
 - Framework version vulnerability database
 - Signature verification capabilities
@@ -93,6 +104,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Good (PyTorch, TensorFlow basics)
 
 **Enhancement Priorities:**
+
 - **ONNX Runtime Exploits**: Advanced ONNX graph manipulation detection in model files
 - **Hugging Face Security**: Scan transformer model files for embedded vulnerabilities
 - **JAX/Flax Security**: Enhanced JAX checkpoint and msgpack security scanning
@@ -100,6 +112,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Model Graph Analysis**: Deep analysis of computational graphs for malicious operations
 
 **Implementation:**
+
 - Framework-specific vulnerability pattern databases
 - Version-specific vulnerability detection from model artifacts
 - Advanced computational graph analysis for anomalous operations
@@ -110,6 +123,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Minimal
 
 **Enhancement Priorities:**
+
 - **PII Detection in Models**: Scan model weights, metadata, and embedded strings for personal information
 - **Training Data Leakage**: Detect direct training data embedded in model files
 - **Model Fingerprinting**: Identify models with extractable training data characteristics
@@ -117,6 +131,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Weight Analysis for Data Traces**: Statistical analysis of weights for embedded information patterns
 
 **Implementation:**
+
 - `PrivacyScanner` module for static analysis
 - PII pattern detection in all model artifacts
 - Statistical weight analysis for anomalous patterns
@@ -128,6 +143,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 **Current Coverage:** Basic
 
 **Enhancement Priorities:**
+
 - **Backdoor Pattern Detection**: Analyze model weights for statistical anomalies indicating backdoors
 - **Model Poisoning Indicators**: Detect unusual weight distributions suggesting training-time attacks
 - **Transfer Learning Risks**: Analyze pre-trained model components for known vulnerabilities
@@ -135,6 +151,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Multi-Modal Consistency Checks**: Cross-validate different model components for anomalies
 
 **Implementation:**
+
 - Advanced statistical analysis of model weight patterns
 - Anomaly detection in weight distributions and model architecture
 - Transfer learning security analysis through base model fingerprinting
@@ -148,6 +165,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 1-2: CVE-2025-32434 PyTorch RCE Detection
 
 **1.1 PyTorch Version Detection Enhancement**
+
 - **Location**: Enhance `pytorch_zip_scanner.py` and `pytorch_binary_scanner.py`
 - **Implementation Details**:
   - Extract PyTorch version from model metadata in `.pt`/`.pth` files
@@ -161,6 +179,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Test Cases**: Create 10+ test models with different PyTorch versions
 
 **1.2 weights_only=True Safety Warnings**
+
 - **Location**: New warning system in PyTorch scanners
 - **Implementation Details**:
   - Add specific warning when dangerous opcodes detected in PyTorch models
@@ -173,6 +192,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - **Deliverables**: Enhanced warnings with clear CVE references
 
 **1.3 Enhanced Pickle Pattern Detection**
+
 - **Location**: `modelaudit/scanners/pickle_scanner.py`
 - **Implementation Details**:
   - Add specific detection patterns for CVE-2025-32434 exploitation techniques
@@ -191,6 +211,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 3-4: Enhanced Serialization Security
 
 **2.1 Pickle Scanner Improvements**
+
 - **Location**: `modelaudit/scanners/pickle_scanner.py`
 - **Implementation Details**:
   - Add detection for new pickle exploitation patterns discovered in 2024-2025
@@ -204,6 +225,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Custom unpickler exploitation
 
 **2.2 SafeTensors Metadata Injection Detection**
+
 - **Location**: `modelaudit/scanners/safetensors_scanner.py`
 - **Implementation Details**:
   - Enhanced JSON metadata parsing for injection attacks
@@ -217,6 +239,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Malformed JSON exploitation
 
 **2.3 Protocol Buffer Vulnerability Scanner**
+
 - **Location**: New file `modelaudit/scanners/protobuf_scanner.py`
 - **Implementation Details**:
   - Detect models using protobuf serialization (TensorFlow SavedModel, ONNX)
@@ -229,6 +252,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Custom ML framework protobuf usage
 
 **2.4 Advanced TorchScript Security Analysis**
+
 - **Location**: Enhance existing JIT script detection in `pytorch_zip_scanner.py`
 - **Implementation Details**:
   - Improved detection of malicious TorchScript code
@@ -239,6 +263,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 5-6: Documentation & Testing
 
 **3.1 CVE-Specific Documentation**
+
 - **Location**: `modelaudit/explanations.py` and new documentation files
 - **Implementation Details**:
   - Detailed CVE-2025-32434 explanation with examples
@@ -250,6 +275,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - `docs/pytorch-security-guide.md`: PyTorch-specific security guidance
 
 **3.2 Enhanced Help Text and Warnings**
+
 - **Location**: CLI and scanner output improvements
 - **Implementation Details**:
   - Actionable warning messages with remediation steps
@@ -258,6 +284,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Severity escalation logic for critical vulnerabilities
 
 **3.3 Comprehensive Test Suite**
+
 - **Location**: `tests/test_cve_2025_32434.py` and related test files
 - **Test Cases**:
   - 15+ malicious PyTorch models exploiting CVE-2025-32434
@@ -273,6 +300,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 7-9: Framework-Specific Vulnerability Detection
 
 **1.1 ONNX Graph Security Analysis**
+
 - **Location**: Enhance `modelaudit/scanners/onnx_scanner.py`
 - **Implementation Details**:
   - Deep analysis of ONNX computation graphs for malicious operations
@@ -295,6 +323,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Graph topology indicating backdoor operations
 
 **1.2 Hugging Face Transformer Security Scanning**
+
 - **Location**: New file `modelaudit/scanners/huggingface_scanner.py`
 - **Implementation Details**:
   - Scan transformer model architectures for security vulnerabilities
@@ -313,6 +342,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Custom model code injection in configuration
 
 **1.3 JAX/Flax Checkpoint Security Enhancement**
+
 - **Location**: Enhance `modelaudit/scanners/flax_msgpack_scanner.py`
 - **Implementation Details**:
   - Enhanced msgpack security analysis for JAX models
@@ -326,6 +356,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Anomalous checkpoint metadata
 
 **1.4 Framework Version Vulnerability Database**
+
 - **Location**: New file `modelaudit/knowledge/vulnerability_db.py`
 - **Implementation Details**:
   - Comprehensive database of known framework vulnerabilities
@@ -342,7 +373,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
       },
       "tensorflow": {
           "2.13.0": ["CVE-YYYY-YYYY"],
-          # ... more versions  
+          # ... more versions
       }
   }
   ```
@@ -350,6 +381,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 10-12: Model Metadata & Configuration Security
 
 **2.1 Enhanced Manifest and Configuration Scanning**
+
 - **Location**: Enhance `modelaudit/scanners/manifest_scanner.py`
 - **Implementation Details**:
   - Deep analysis of model manifest files (`config.json`, `model.safetensors.index.json`)
@@ -368,6 +400,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - `README.md`: Model documentation for security information
 
 **2.2 Training Environment Artifact Analysis**
+
 - **Location**: New functionality in multiple scanners
 - **Implementation Details**:
   - Extract and analyze training environment information from models
@@ -387,6 +420,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Evidence of supply chain compromise
 
 **2.3 Dependency Vulnerability Scanning**
+
 - **Location**: New file `modelaudit/scanners/dependency_scanner.py`
 - **Implementation Details**:
   - Extract dependency information from model metadata
@@ -405,6 +439,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Supply chain security indicators
 
 **2.4 Cryptographic Signature Verification**
+
 - **Location**: New file `modelaudit/scanners/signature_scanner.py`
 - **Implementation Details**:
   - Verify digital signatures when present in model files
@@ -425,6 +460,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 #### Week 13-14: Supply Chain Security Foundation
 
 **3.1 Model Provenance Tracking**
+
 - **Location**: New file `modelaudit/scanners/provenance_scanner.py`
 - **Implementation Details**:
   - Extract provenance information from model metadata
@@ -443,6 +479,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Training data lineage analysis
 
 **3.2 Hash-based Model Integrity Verification**
+
 - **Location**: Enhance existing scanners with integrity checking
 - **Implementation Details**:
   - Calculate and verify model file hashes
@@ -461,6 +498,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Version consistency validation
 
 **3.3 Repository Source Risk Assessment**
+
 - **Location**: New functionality integrated across scanners
 - **Implementation Details**:
   - Analyze model source repository information
@@ -479,7 +517,8 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
   - Unusual distribution patterns
 
 **3.4 Model Substitution Detection**
-- **Location**: Enhanced analysis across multiple scanners  
+
+- **Location**: Enhanced analysis across multiple scanners
 - **Implementation Details**:
   - Detect evidence of model substitution attacks
   - Compare model signatures against expected patterns
@@ -501,6 +540,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 ### Phase 1 & 2 Success Criteria
 
 #### Phase 1 Deliverables (Week 6):
+
 - ✅ 100% detection rate for CVE-2025-32434 test cases
 - ✅ PyTorch version detection from 95% of PyTorch model files
 - ✅ <2% false positive rate on legitimate PyTorch models
@@ -509,6 +549,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - ✅ Complete documentation for CVE-2025-32434
 
 #### Phase 2 Deliverables (Week 14):
+
 - ✅ ONNX security scanner detecting 90% of malicious graph operations
 - ✅ Hugging Face scanner covering 5+ transformer architectures
 - ✅ Framework vulnerability database with 100+ CVE mappings
@@ -517,6 +558,7 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 - ✅ Performance impact <50% for new scanning capabilities
 
 #### Integration Requirements:
+
 - All new scanners integrate with existing `BaseScanner` architecture
 - Maintain backward compatibility with current CLI and API
 - Follow existing code style and testing patterns
@@ -567,16 +609,16 @@ These CVEs affect TorchServe deployment and configuration, not model files thems
 # Enhanced base scanner with CVE-specific capabilities
 class CVEAwareScanner(BaseScanner):
     """Base scanner with CVE tracking and version-specific detection"""
-    
+
     @classmethod
     def get_applicable_cves(cls) -> List[str]:
         """Return list of CVEs this scanner can detect"""
         pass
-    
+
     def check_version_vulnerabilities(self, version_info: Dict) -> List[Issue]:
         """Check for version-specific vulnerabilities"""
         pass
-    
+
     def assess_configuration_security(self, config: Dict) -> List[Issue]:
         """Analyze configuration for security issues"""
         pass
@@ -587,19 +629,19 @@ class CVEAwareScanner(BaseScanner):
 ```python
 class ModelMetadataScanner(BaseScanner):
     """Enhanced scanning for model metadata and configuration security"""
-    
+
     def scan_framework_versions(self, metadata: Dict) -> List[Issue]:
         """Check for vulnerable framework versions in model metadata"""
         pass
-    
+
     def scan_training_artifacts(self, metadata: Dict) -> List[Issue]:
         """Analyze training environment artifacts for security issues"""
         pass
-    
+
     def verify_model_signatures(self, signature_data: bytes) -> List[Issue]:
         """Validate cryptographic signatures when present"""
         pass
-    
+
     def scan_dependencies(self, deps_info: Dict) -> List[Issue]:
         """Scan embedded dependency information for vulnerabilities"""
         pass
@@ -610,15 +652,15 @@ class ModelMetadataScanner(BaseScanner):
 ```python
 class CVEDatabase:
     """Database of ML-specific CVE information and detection patterns"""
-    
+
     def get_cve_details(self, cve_id: str) -> CVEInfo:
         """Get detailed CVE information"""
         pass
-    
+
     def get_framework_vulnerabilities(self, framework: str, version: str) -> List[str]:
         """Get applicable CVEs for framework version"""
         pass
-    
+
     def update_threat_intelligence(self) -> None:
         """Update CVE database from threat intelligence sources"""
         pass
@@ -661,12 +703,14 @@ class CVEDatabase:
 ## Success Metrics
 
 ### Detection Effectiveness
+
 - **CVE Coverage**: 100% detection rate for targeted CVEs
 - **False Positive Rate**: <5% for production deployments
 - **Detection Speed**: <2x performance impact from current baseline
 - **Threat Coverage**: 80%+ coverage of OWASP ML Top 10
 
 ### Operational Excellence
+
 - **Documentation Completeness**: 100% of new features documented
 - **Test Coverage**: >90% code coverage for new modules
 - **Integration Success**: <1 hour setup time for new environments
@@ -677,42 +721,45 @@ class CVEDatabase:
 ### Implementation Risks
 
 1. **Performance Impact**
-   - *Risk*: New scanners may slow down model analysis
-   - *Mitigation*: Implement parallel scanning, optimize hot paths, provide configuration options
+   - _Risk_: New scanners may slow down model analysis
+   - _Mitigation_: Implement parallel scanning, optimize hot paths, provide configuration options
 
 2. **False Positive Rate**
-   - *Risk*: Enhanced detection may increase false positives
-   - *Mitigation*: ML context awareness, extensive testing, user feedback integration
+   - _Risk_: Enhanced detection may increase false positives
+   - _Mitigation_: ML context awareness, extensive testing, user feedback integration
 
 3. **Maintenance Complexity**
-   - *Risk*: Increased codebase complexity
-   - *Mitigation*: Modular architecture, comprehensive documentation, automated testing
+   - _Risk_: Increased codebase complexity
+   - _Mitigation_: Modular architecture, comprehensive documentation, automated testing
 
 ### Security Risks
 
 1. **Scanner Bypass**
-   - *Risk*: Attackers develop evasion techniques
-   - *Mitigation*: Regular red team exercises, threat intelligence integration, rapid update capability
+   - _Risk_: Attackers develop evasion techniques
+   - _Mitigation_: Regular red team exercises, threat intelligence integration, rapid update capability
 
 2. **Supply Chain Attacks on Scanner**
-   - *Risk*: ModelAudit itself becomes attack vector
-   - *Mitigation*: Secure development practices, dependency scanning, reproducible builds
+   - _Risk_: ModelAudit itself becomes attack vector
+   - _Mitigation_: Secure development practices, dependency scanning, reproducible builds
 
 ## Future Considerations
 
 ### Emerging Threats
+
 - Quantum computing impacts on ML security
 - Edge device-specific vulnerabilities
 - Synthetic data poisoning techniques
 - AI-generated malware in models
 
 ### Technology Evolution
+
 - Integration with formal verification tools
 - Automated patch generation for vulnerable models
 - Federated learning security scanning
 - Privacy-preserving vulnerability detection
 
 ### Community & Ecosystem
+
 - Open-source threat intelligence sharing
 - Industry collaboration on vulnerability research
 - Academic partnerships for advanced research
@@ -725,6 +772,7 @@ This comprehensive plan enhances ModelAudit's static model vulnerability detecti
 The phased approach ensures immediate protection against critical vulnerabilities while building long-term capabilities for the evolving ML security landscape. Success depends on balancing detection effectiveness with operational efficiency, maintaining focus on static analysis while maximizing threat coverage through model file inspection.
 
 **Next Steps:**
+
 1. Review and approve this plan
 2. Begin Phase 1 implementation immediately
 3. Establish success metrics and monitoring
@@ -732,6 +780,6 @@ The phased approach ensures immediate protection against critical vulnerabilitie
 
 ---
 
-*Plan authored: 2025-08-23*
-*Version: 1.0*
-*Status: Under Review*
+_Plan authored: 2025-08-23_
+_Version: 1.0_
+_Status: Under Review_

@@ -320,7 +320,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
         result.metadata["suspicious_op_found"] = suspicious_op_found
-        
+
         # Enhanced protobuf vulnerability scanning
         self._scan_protobuf_vulnerabilities(saved_model, result)
 
@@ -614,30 +614,30 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
-        
+
         # Check for protobuf schema validation bypasses
         self._check_protobuf_schema_attacks(saved_model, result)
-        
+
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
-        
+
         # Check for buffer overflow patterns
         self._check_protobuf_buffer_overflow(saved_model, result)
-        
+
         # Check for large field counts (DoS via memory exhaustion)
         self._check_protobuf_field_bomb(saved_model, result)
-    
+
     def _check_protobuf_schema_attacks(self, saved_model: Any, result: ScanResult) -> None:
         """Check for protobuf schema validation bypass attempts"""
-        
+
         for meta_graph in saved_model.meta_graphs:
             # Check for unknown/unexpected fields in the meta graph
-            if hasattr(meta_graph, 'ListFields'):
+            if hasattr(meta_graph, "ListFields"):
                 fields = meta_graph.ListFields()
-                
+
                 # Look for fields with unusually large sizes
                 for field_desc, field_value in fields:
-                    if hasattr(field_value, '__len__'):
+                    if hasattr(field_value, "__len__"):
                         try:
                             field_size = len(field_value)
                             # Check for abnormally large repeated fields
@@ -645,97 +645,95 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 result.add_check(
                                     name="Protobuf Field Size Check",
                                     passed=False,
-                                    message=f"Abnormally large protobuf field '{field_desc.name}' with {field_size} elements",
+                                    message=(
+                        f"Abnormally large protobuf field '{field_desc.name}' with {field_size} elements"
+                    ),
                                     severity=IssueSeverity.WARNING,
                                     location=self.current_file_path,
                                     details={
                                         "field_name": field_desc.name,
                                         "field_size": field_size,
                                         "size_threshold": 10000,
-                                        "potential_attack": "protobuf_field_bomb"
-                                    }
+                                        "potential_attack": "protobuf_field_bomb",
+                                    },
                                 )
                         except (AttributeError, TypeError):
                             continue
-            
+
             # Check the graph definition for schema bypass attempts
             graph_def = meta_graph.graph_def
-            
+
             # Look for nodes with excessive attributes (potential DoS)
             for node in graph_def.node:
-                if hasattr(node, 'attr') and len(node.attr) > 1000:
+                if hasattr(node, "attr") and len(node.attr) > 1000:
                     result.add_check(
                         name="Protobuf Node Attribute Bomb Check",
                         passed=False,
                         message=f"Node '{node.name}' has excessive attributes ({len(node.attr)})",
-                        severity=IssueSeverity.HIGH,
+                        severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (node: {node.name})",
                         details={
                             "node_name": node.name,
                             "attribute_count": len(node.attr),
                             "threshold": 1000,
-                            "attack_type": "protobuf_attribute_bomb"
-                        }
+                            "attack_type": "protobuf_attribute_bomb",
+                        },
                     )
-    
+
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
-        
+
         # Patterns that indicate potential injection attacks
         injection_patterns = [
             # Code injection patterns
-            (r'eval\s*\(', 'code_injection', 'eval function call'),
-            (r'exec\s*\(', 'code_injection', 'exec function call'),
-            (r'__import__\s*\(', 'code_injection', 'import function call'),
-            (r'compile\s*\(', 'code_injection', 'compile function call'),
-            (r'os\.system\s*\(', 'system_command', 'OS system call'),
-            (r'subprocess\.[a-zA-Z_]+\s*\(', 'system_command', 'subprocess call'),
-            
+            (r"eval\s*\(", "code_injection", "eval function call"),
+            (r"exec\s*\(", "code_injection", "exec function call"),
+            (r"__import__\s*\(", "code_injection", "import function call"),
+            (r"compile\s*\(", "code_injection", "compile function call"),
+            (r"os\.system\s*\(", "system_command", "OS system call"),
+            (r"subprocess\.[a-zA-Z_]+\s*\(", "system_command", "subprocess call"),
             # Path traversal patterns
-            (r'\.\./+', 'path_traversal', 'directory traversal'),
-            (r'\.\.\\+', 'path_traversal', 'Windows directory traversal'),
-            (r'/etc/passwd', 'path_traversal', 'system file access'),
-            (r'/proc/', 'path_traversal', 'proc filesystem access'),
-            
+            (r"\.\./+", "path_traversal", "directory traversal"),
+            (r"\.\.\\+", "path_traversal", "Windows directory traversal"),
+            (r"/etc/passwd", "path_traversal", "system file access"),
+            (r"/proc/", "path_traversal", "proc filesystem access"),
             # Encoding bypass attempts
-            (r'\\x[0-9a-fA-F]{2}', 'encoding_bypass', 'hex encoding'),
-            (r'\\u[0-9a-fA-F]{4}', 'encoding_bypass', 'unicode escape'),
-            (r'%[0-9a-fA-F]{2}', 'encoding_bypass', 'URL encoding'),
-            
+            (r"\\x[0-9a-fA-F]{2}", "encoding_bypass", "hex encoding"),
+            (r"\\u[0-9a-fA-F]{4}", "encoding_bypass", "unicode escape"),
+            (r"%[0-9a-fA-F]{2}", "encoding_bypass", "URL encoding"),
             # Script injection
-            (r'<script[^>]*>', 'script_injection', 'HTML script tag'),
-            (r'javascript:', 'script_injection', 'JavaScript URI'),
-            (r'vbscript:', 'script_injection', 'VBScript URI'),
-            
+            (r"<script[^>]*>", "script_injection", "HTML script tag"),
+            (r"javascript:", "script_injection", "JavaScript URI"),
+            (r"vbscript:", "script_injection", "VBScript URI"),
             # Base64 encoded payloads
-            (r'[A-Za-z0-9+/]{20,}={0,2}', 'encoded_payload', 'potential base64 payload'),
+            (r"[A-Za-z0-9+/]{20,}={0,2}", "encoded_payload", "potential base64 payload"),
         ]
-        
+
         import re
-        
+
         for meta_graph in saved_model.meta_graphs:
             graph_def = meta_graph.graph_def
-            
+
             for node in graph_def.node:
                 # Check string values in node attributes
-                if hasattr(node, 'attr'):
+                if hasattr(node, "attr"):
                     for attr_name, attr_value in node.attr.items():
                         string_vals_to_check = []
-                        
+
                         # Extract string values from different attribute types
-                        if hasattr(attr_value, 's'):  # String attribute
+                        if hasattr(attr_value, "s"):  # String attribute
                             try:
-                                string_vals_to_check.append(attr_value.s.decode('utf-8', errors='ignore'))
+                                string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
                             except (UnicodeDecodeError, AttributeError):
                                 continue
-                        
-                        elif hasattr(attr_value, 'list') and hasattr(attr_value.list, 's'):  # String list
+
+                        elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
                             for s_val in attr_value.list.s:
                                 try:
-                                    string_vals_to_check.append(s_val.decode('utf-8', errors='ignore'))
+                                    string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
                                 except (UnicodeDecodeError, AttributeError):
                                     continue
-                        
+
                         # Check each string value against injection patterns
                         for string_val in string_vals_to_check:
                             if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
@@ -749,11 +747,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         "node_name": node.name,
                                         "attribute_name": attr_name,
                                         "string_length": len(string_val),
-                                        "attack_type": "protobuf_string_bomb"
-                                    }
+                                        "attack_type": "protobuf_string_bomb",
+                                    },
                                 )
                                 continue
-                            
+
                             for pattern, attack_type, description in injection_patterns:
                                 matches = re.findall(pattern, string_val, re.IGNORECASE)
                                 if matches:
@@ -761,7 +759,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         name="Protobuf String Injection Check",
                                         passed=False,
                                         message=f"Potential {description} detected in protobuf string",
-                                        severity=IssueSeverity.CRITICAL if attack_type in ['code_injection', 'system_command'] else IssueSeverity.WARNING,
+                                        severity=IssueSeverity.CRITICAL
+                                        if attack_type in ["code_injection", "system_command"]
+                                        else IssueSeverity.WARNING,
                                         location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
                                         details={
                                             "node_name": node.name,
@@ -770,34 +770,37 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                             "matches": matches[:5],  # Limit to first 5 matches
                                             "attack_type": attack_type,
                                             "description": description,
-                                            "total_matches": len(matches)
-                                        }
+                                            "total_matches": len(matches),
+                                        },
                                     )
                                     break  # Only report first match per string to avoid spam
 
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
-        
+
         for meta_graph in saved_model.meta_graphs:
             graph_def = meta_graph.graph_def
-            
+
             # Check for nodes with extremely long names (potential buffer overflow)
             for node in graph_def.node:
                 if len(node.name) > 2048:  # 2KB threshold for node names
                     result.add_check(
                         name="Protobuf Node Name Length Check",
                         passed=False,
-                        message=f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt",
-                        severity=IssueSeverity.HIGH,
+                        message=(
+                            f"Abnormally long node name (length: {len(node.name)}) "
+                            "may indicate buffer overflow attempt"
+                        ),
+                        severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (node: {node.name[:100]}...)",
                         details={
                             "node_name_length": len(node.name),
                             "name_threshold": 2048,
                             "attack_type": "protobuf_buffer_overflow",
-                            "node_name_preview": node.name[:200]  # First 200 chars
-                        }
+                            "node_name_preview": node.name[:200],  # First 200 chars
+                        },
                     )
-                
+
                 # Check input names for excessive length
                 for input_name in node.input:
                     if len(input_name) > 2048:
@@ -805,46 +808,46 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             name="Protobuf Input Name Length Check",
                             passed=False,
                             message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
-                            severity=IssueSeverity.HIGH,
+                            severity=IssueSeverity.WARNING,
                             location=f"{self.current_file_path} (node: {node.name})",
                             details={
                                 "node_name": node.name,
                                 "input_name_length": len(input_name),
                                 "name_threshold": 2048,
-                                "attack_type": "protobuf_buffer_overflow"
-                            }
+                                "attack_type": "protobuf_buffer_overflow",
+                            },
                         )
 
     def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
         """Check for protobuf field bombs (DoS via excessive fields)"""
-        
+
         total_nodes = 0
         total_attrs = 0
-        
+
         for meta_graph in saved_model.meta_graphs:
             graph_def = meta_graph.graph_def
             meta_graph_nodes = len(graph_def.node)
             total_nodes += meta_graph_nodes
-            
+
             # Count total attributes across all nodes
-            meta_graph_attrs = sum(len(node.attr) if hasattr(node, 'attr') else 0 for node in graph_def.node)
+            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
             total_attrs += meta_graph_attrs
-            
+
             # Check for excessive nodes in single meta graph
             if meta_graph_nodes > 50000:  # 50k nodes threshold
                 result.add_check(
                     name="Protobuf Node Count Bomb Check",
                     passed=False,
                     message=f"Meta graph contains excessive nodes ({meta_graph_nodes:,}) - potential DoS attack",
-                    severity=IssueSeverity.HIGH,
+                    severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={
                         "node_count": meta_graph_nodes,
                         "node_threshold": 50000,
-                        "attack_type": "protobuf_node_bomb"
-                    }
+                        "attack_type": "protobuf_node_bomb",
+                    },
                 )
-        
+
         # Check total model complexity
         if total_nodes > 100000:  # 100k total nodes
             result.add_check(
@@ -857,6 +860,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "total_nodes": total_nodes,
                     "total_attributes": total_attrs,
                     "node_threshold": 100000,
-                    "attack_type": "protobuf_complexity_bomb"
-                }
+                    "attack_type": "protobuf_complexity_bomb",
+                },
             )

@@ -575,37 +575,38 @@ class NetworkCommDetector:
         """Scan for very explicit network patterns in ML models with high confidence."""
         # Only look for very explicit network communication patterns that are unlikely
         # to occur in legitimate model weights. These patterns require clear context.
-        
+
         explicit_network_patterns = [
             # Very explicit URL patterns that are unlikely in model weights
-            (rb'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*', "url"),
+            (rb"https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*", "url"),
             # Explicit socket connection patterns with clear text context
             (rb'socket\.connect\s*\(\s*["\']?[a-zA-Z0-9.-]+["\']?\s*,\s*\d+', "socket_connection"),
             # Clear HTTP request patterns
-            (rb'(GET|POST|PUT|DELETE)\s+\/[^\s]*\s+HTTP\/1\.[01]', "http_request"),
+            (rb"(GET|POST|PUT|DELETE)\s+\/[^\s]*\s+HTTP\/1\.[01]", "http_request"),
             # Explicit network library imports in clear text
-            (rb'import\s+(socket|urllib|requests|httplib)', "network_import"),
+            (rb"import\s+(socket|urllib|requests|httplib)", "network_import"),
         ]
-        
+
         for pattern, pattern_type in explicit_network_patterns:
             import re
+
             regex = re.compile(pattern, re.IGNORECASE)
             matches = regex.finditer(data)
-            
+
             for match in matches:
                 # Get context around the match to validate it's not in binary weights
                 start_pos = max(0, match.start() - 100)
                 end_pos = min(len(data), match.end() + 100)
                 context_data = data[start_pos:end_pos]
-                
+
                 # Check if this looks like legitimate text (not binary weights)
                 try:
-                    context_str = context_data.decode('utf-8', errors='strict')
+                    context_str = context_data.decode("utf-8", errors="strict")
                     # If we can decode it as UTF-8, it's likely text-based and suspicious
                     printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
-                    
+
                     if printable_ratio > 0.7:  # High ratio of printable characters
-                        matched_text = match.group().decode('utf-8', errors='ignore')
+                        matched_text = match.group().decode("utf-8", errors="ignore")
                         self.findings.append(
                             {
                                 "type": "explicit_network_pattern",
