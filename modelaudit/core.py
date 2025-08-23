@@ -506,6 +506,12 @@ def scan_model_directory_or_file(
 
     validate_scan_config(config)
 
+    # Check if metadata scanner is available once (optimization)
+    metadata_scanner_available = any(
+        scanner_class.__name__ == "MetadataScanner"
+        for scanner_class in _registry.get_scanner_classes()
+    )
+
     try:
         # Handle streaming paths
         if path.startswith("stream://"):
@@ -631,11 +637,6 @@ def scan_model_directory_or_file(
 
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
-                    # Check if metadata scanner is available to handle metadata files
-                    metadata_scanner_available = any(
-                        scanner_class.__name__ == "MetadataScanner"
-                        for scanner_class in _registry.get_scanner_classes()
-                    )
                     if skip_file_types and should_skip_file(
                         file_path, metadata_scanner_available=metadata_scanner_available
                     ):

@@ -22,8 +22,12 @@ class MetadataScanner(BaseScanner):
         if path.name.lower() in ["config.json", "tokenizer_config.json", "generation_config.json"]:
             return True
 
-        # Handle README/model card files
-        return path.name.lower() in ["readme.md", "model_card.md", "model-index.yml"]
+        # Handle README/model card files (including extensionless README files)
+        return path.name.lower() in [
+            "readme", "readme.md", "readme.txt",
+            "model_card.md", "model_card.txt",
+            "model-index.yml", "model-index.yaml"
+        ]
 
     def scan(self, file_path: str, timeout: int = 300) -> ScanResult:
         """Scan metadata file for security issues."""

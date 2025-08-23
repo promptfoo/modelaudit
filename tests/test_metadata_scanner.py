@@ -23,9 +23,14 @@ class TestMetadataScanner:
         """Test that scanner handles text metadata files."""
         scanner = MetadataScanner()
 
+        assert scanner.can_handle("README")
+        assert scanner.can_handle("readme")
         assert scanner.can_handle("README.md")
+        assert scanner.can_handle("readme.txt")
         assert scanner.can_handle("model_card.md")
+        assert scanner.can_handle("model_card.txt")
         assert scanner.can_handle("model-index.yml")
+        assert scanner.can_handle("model-index.yaml")
 
     def test_cannot_handle_other_files(self):
         """Test that scanner rejects non-metadata files."""

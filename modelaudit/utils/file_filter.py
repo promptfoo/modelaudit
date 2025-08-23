@@ -123,8 +123,8 @@ def should_skip_file(
     ext = ext.lower()
 
     # Special handling for metadata files that scanners can handle
-    metadata_extensions = {".md", ".yml", ".yaml"}
-    metadata_filenames = {"README", "readme"}
+    metadata_extensions = {".md", ".yml", ".yaml", ".txt"}
+    metadata_filenames = {"readme", "model_card", "model-index"}
 
     # If metadata scanner is available, don't skip metadata files
     if metadata_scanner_available and (ext in metadata_extensions or filename.lower() in metadata_filenames):
