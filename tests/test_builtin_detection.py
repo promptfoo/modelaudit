@@ -11,6 +11,7 @@ dangerous builtin functions, including:
 import os
 import tempfile
 
+from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
@@ -61,7 +62,7 @@ class TestBuiltinDetection:
             result = scanner.scan(temp_path)
 
             # Should have critical issues
-            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(critical_issues) > 0, "Should detect __builtin__.eval as CRITICAL"
 
             # Check that it specifically detected __builtin__.eval
@@ -202,7 +203,7 @@ class TestBuiltinDetection:
             result = scanner.scan(temp_path)
 
             # Should have multiple CRITICAL issues
-            critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(critical_issues) >= 2, "Should have multiple CRITICAL issues for eval with malicious code"
 
             # Should detect both the eval and the os.system in the string

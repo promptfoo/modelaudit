@@ -2604,3 +2604,120 @@ class PickleScanner(BaseScanner):
                         break
         
         return patterns
+    def check_for_jit_script_code(
+        self,
+        data: bytes,
+        result: ScanResult,
+        model_type: str = "pytorch",
+        context: str = "",
+        enable_check: bool = True,
+    ) -> int:
+        """Check for JIT/Script code execution risks in pickle data.
+
+        Args:
+            data: The binary file data to analyze
+            result: ScanResult to add findings to
+            model_type: Type of model being scanned (e.g., 'pytorch')
+            context: Context path for reporting
+            enable_check: Whether to enable this check (inherited from base)
+
+        Returns:
+            Number of findings discovered
+        """
+        # Check if JIT script detection is enabled
+        if not enable_check or not self.config.get("check_jit_script", True):
+            return 0
+
+        try:
+            from modelaudit.jit_script_detector import JITScriptDetector
+            # from modelaudit.models import JITScriptFinding  # Imported but not used directly
+
+            # Create JIT script detector
+            detector = JITScriptDetector(self.config)
+
+            # Scan for JIT script patterns based on model type
+            findings = []
+            if model_type.lower() == "pytorch":
+                findings = detector.scan_torchscript(data, context)
+            elif model_type.lower() == "tensorflow":
+                findings = detector.scan_tensorflow(data, context)
+            elif model_type.lower() == "onnx":
+                findings = detector.scan_onnx(data, context)
+            else:
+                # Try to detect model type automatically
+                findings = detector.scan_model(data, context)
+
+            # Convert findings to Check objects
+            if findings:
+                failed_findings = [f for f in findings if getattr(f, "severity", "") in ["CRITICAL", "WARNING"]]
+                if failed_findings:
+                    # Add a failed check for JIT/Script risks
+                    details = {
+                        "findings_count": len(findings),
+                        "critical_findings": len([f for f in findings if getattr(f, "severity", "") == "CRITICAL"]),
+                        "warning_findings": len([f for f in findings if getattr(f, "severity", "") == "WARNING"]),
+                        "patterns": [getattr(f, "pattern", "") for f in findings[:5]],  # First 5 patterns
+                    }
+
+                    # Add specific details for dangerous operations
+                    for finding in findings[:3]:  # Include details for first 3 findings
+                        if hasattr(finding, "message") and "torch.ops.aten.system" in str(finding.message):
+                            details["torch.ops.aten.system"] = str(finding.message)
+
+                    result.add_check(
+                        name="JIT/Script Code Execution Risk",
+                        passed=False,
+                        message=f"Detected {len(failed_findings)} JIT/Script security risks",
+                        severity=IssueSeverity.CRITICAL,
+                        location=context,
+                        details=details,
+                        why="JIT/Script code can execute arbitrary operations that bypass security controls",
+                    )
+                else:
+                    # Add a passed check
+                    result.add_check(
+                        name="JIT/Script Code Execution Risk",
+                        passed=True,
+                        message="No high-risk JIT/Script patterns detected",
+                        severity=IssueSeverity.INFO,
+                        location=context,
+                        details={"findings_count": len(findings)},
+                        why="JIT/Script analysis completed with no critical security risks",
+                    )
+                return len(findings)
+            else:
+                # No findings at all - add a passed check
+                result.add_check(
+                    name="JIT/Script Code Execution Risk",
+                    passed=True,
+                    message="No JIT/Script patterns detected",
+                    severity=IssueSeverity.INFO,
+                    location=context,
+                    why="File contains no detectable JIT/Script code execution patterns",
+                )
+                return 0
+
+        except ImportError:
+            # JIT script detector not available
+            result.add_check(
+                name="JIT/Script Code Execution Risk",
+                passed=True,
+                message="JIT/Script detection not available (missing dependencies)",
+                severity=IssueSeverity.INFO,
+                location=context,
+                details={"error": "JIT script detector dependencies not installed"},
+                why="JIT/Script detection requires additional dependencies",
+            )
+            return 0
+        except Exception as e:
+            # Error during JIT script detection
+            result.add_check(
+                name="JIT/Script Code Execution Risk",
+                passed=False,
+                message=f"Error during JIT/Script detection: {e!s}",
+                severity=IssueSeverity.WARNING,
+                location=context,
+                details={"error": str(e), "error_type": type(e).__name__},
+                why="JIT/Script detection encountered an unexpected error",
+            )
+            return 0

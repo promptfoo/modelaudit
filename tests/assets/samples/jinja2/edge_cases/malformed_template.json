@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "RobertaTokenizer",
+  "chat_template": "{{ unclosed_bracket",
+  "model_max_length": 512
+}

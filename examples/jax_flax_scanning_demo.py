@@ -191,7 +191,7 @@ def demo_flax_msgpack_scanning():
         print(f"  🚨 Issues found: {len(result.issues)}")
 
         # Show critical issues
-        critical_issues = [issue for issue in result.issues if issue.severity.value == "critical"]
+        critical_issues = [issue for issue in result.issues if issue.severity == "critical"]
         if critical_issues:
             print("  🔴 Critical security issues:")
             for i, issue in enumerate(critical_issues[:3], 1):  # Show first 3
@@ -310,8 +310,8 @@ def demo_security_threat_detection():
 
             result = scanner.scan(threat_path)
 
-            critical_issues = [issue for issue in result.issues if issue.severity.value == "critical"]
-            warning_issues = [issue for issue in result.issues if issue.severity.value == "warning"]
+            critical_issues = [issue for issue in result.issues if issue.severity == "critical"]
+            warning_issues = [issue for issue in result.issues if issue.severity == "warning"]
 
             if critical_issues or warning_issues:
                 print(f"  🚨 Threats detected: {len(critical_issues)} critical, {len(warning_issues)} warnings")

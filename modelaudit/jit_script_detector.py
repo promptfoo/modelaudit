@@ -11,7 +11,21 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import re
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from modelaudit.models import JITScriptFinding
+
+
+def create_jit_finding(**kwargs) -> "JITScriptFinding":
+    """Helper to create JITScriptFinding with proper field handling."""
+    from modelaudit.models import JITScriptFinding
+
+    # Handle the import field alias properly
+    if "import_" in kwargs:
+        kwargs["import"] = kwargs.pop("import_")
+    return JITScriptFinding(**kwargs)
+
 
 # Dangerous TorchScript operations that can execute arbitrary code
 DANGEROUS_TORCH_OPS = [
@@ -130,7 +144,7 @@ class JITScriptDetector:
         """Initialize the JIT/Script detector.
 
         Args:
-            config: Optional configuration dictionary with settings like:
+            config: Configuration dictionary with settings like:
                 - strict_mode: If True, flag any JIT/script usage (default: False)
                 - check_ast: If True, parse and check embedded Python AST (default: True)
                 - custom_dangerous_ops: Additional operations to flag
@@ -150,7 +164,7 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
@@ -172,30 +186,40 @@ class JITScriptDetector:
         for op in self.dangerous_torch_ops:
             if op in text_data:
                 findings.append(
-                    {
-                        "type": "dangerous_operation",
-                        "severity": "CRITICAL",
-                        "operation": op,
-                        "framework": "TorchScript",
-                        "message": f"Dangerous TorchScript operation found: {op}",
-                        "context": context,
-                        "recommendation": "Review the model source - this operation can execute arbitrary code",
-                    }
+                    create_jit_finding(
+                        message=f"Dangerous TorchScript operation found: {op}",
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=op,
+                        recommendation="Review the model source - this operation can execute arbitrary code",
+                        confidence=1.0,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        type="dangerous_operation",
+                        operation=op,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
         # Check for TorchScript markers
         if b"TorchScript" in data or b"torch.jit" in data:
             if self.strict_mode:
-                findings.append(
-                    {
-                        "type": "jit_usage",
-                        "severity": "WARNING",
-                        "framework": "TorchScript",
-                        "message": "TorchScript JIT compilation detected",
-                        "context": context,
-                        "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
-                    }
-                )
+                finding_data = {
+                    "message": "TorchScript JIT compilation detected",
+                    "severity": "WARNING",
+                    "context": context,
+                    "pattern": None,
+                    "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
+                    "confidence": 0.8,
+                    "framework": "TorchScript",
+                    "code_snippet": None,
+                    "type": "jit_usage",
+                    "operation": None,
+                    "builtin": None,
+                    "import": None,
+                }
+                findings.append(create_jit_finding(**finding_data))
 
             # Look for embedded Python code
             if b"def " in data or b"class " in data:
@@ -206,19 +230,25 @@ class JITScriptDetector:
         # Check for pickle within TorchScript (common attack vector)
         if b"GLOBAL" in data and b"torch" in data:
             findings.append(
-                {
-                    "type": "embedded_pickle",
-                    "severity": "WARNING",
-                    "framework": "TorchScript",
-                    "message": "Embedded pickle data in TorchScript model",
-                    "context": context,
-                    "recommendation": "TorchScript with pickle can execute arbitrary code during loading",
-                }
+                create_jit_finding(
+                    message="Embedded pickle data in TorchScript model",
+                    severity="WARNING",
+                    context=context,
+                    pattern=None,
+                    recommendation="TorchScript with pickle can execute arbitrary code during loading",
+                    confidence=0.9,
+                    framework="TorchScript",
+                    code_snippet=None,
+                    type="embedded_pickle",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
             )
 
         return findings
 
-    def scan_tensorflow(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TensorFlow SavedModel for dangerous operations.
 
         Args:
@@ -228,7 +258,7 @@ class JITScriptDetector:
         Returns:
             List of findings with details
         """
-        findings = []
+        findings: list[JITScriptFinding] = []
 
         # Convert to string for pattern matching
         try:
@@ -240,29 +270,40 @@ class JITScriptDetector:
         for op in self.dangerous_tf_ops:
             if op in text_data:
                 findings.append(
-                    {
-                        "type": "dangerous_operation",
-                        "severity": "CRITICAL",
-                        "operation": op,
-                        "framework": "TensorFlow",
-                        "message": f"Dangerous TensorFlow operation found: {op}",
-                        "context": context,
-                        "recommendation": "This operation can execute arbitrary Python code",
-                    }
+                    create_jit_finding(
+                        message=f"Dangerous TensorFlow operation found: {op}",
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=None,
+                        recommendation="This operation can execute arbitrary Python code",
+                        confidence=0.9,
+                        framework="TensorFlow",
+                        code_snippet=None,
+                        type="dangerous_operation",
+                        operation=op,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
         # Check for SavedFunction markers
         if b"SavedFunction" in data or b"saved_model.pb" in data:
             if b"py_func" in data or b"numpy_function" in data:
                 findings.append(
-                    {
-                        "type": "py_func_usage",
-                        "severity": "CRITICAL",
-                        "framework": "TensorFlow",
-                        "message": "TensorFlow py_func/numpy_function allows arbitrary code execution",
-                        "context": context,
-                        "recommendation": "Remove py_func operations or verify their implementation",
-                    }
+                    create_jit_finding(
+                        message="TensorFlow py_func/numpy_function allows arbitrary code execution",
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=None,
+                        recommendation="Remove py_func operations or verify their implementation",
+                        confidence=0.9,
+                        framework="TensorFlow",
+                        code_snippet=None,
+                        type="py_func_usage",
+                        operation=None,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
             # Check for embedded Python code in SavedFunction
@@ -273,19 +314,25 @@ class JITScriptDetector:
         # Check for Keras Lambda layers (can contain arbitrary code)
         if b"Lambda" in data and (b"keras" in data or b"tensorflow.keras" in data):
             findings.append(
-                {
-                    "type": "lambda_layer",
-                    "severity": "WARNING",
-                    "framework": "TensorFlow/Keras",
-                    "message": "Keras Lambda layer detected - may contain arbitrary code",
-                    "context": context,
-                    "recommendation": "Lambda layers can execute arbitrary Python - verify implementation",
-                }
+                create_jit_finding(
+                    message="Keras Lambda layer detected - may contain arbitrary code",
+                    severity="WARNING",
+                    context=context,
+                    pattern=None,
+                    recommendation="Lambda layers can execute arbitrary Python - verify implementation",
+                    confidence=0.8,
+                    framework="TensorFlow/Keras",
+                    code_snippet=None,
+                    type="lambda_layer",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
             )
 
         return findings
 
-    def scan_onnx(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_onnx(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan ONNX model for custom operators and dangerous patterns.
 
         Args:
@@ -295,50 +342,70 @@ class JITScriptDetector:
         Returns:
             List of findings with details
         """
-        findings = []
+        from modelaudit.models import JITScriptFinding
+
+        findings: list[JITScriptFinding] = []
 
         # Check for custom operators (potential security risk)
         if b"custom_op" in data or b"ai.onnx.contrib" in data:
             findings.append(
-                {
-                    "type": "custom_operator",
-                    "severity": "WARNING",
-                    "framework": "ONNX",
-                    "message": "Custom ONNX operator detected",
-                    "context": context,
-                    "recommendation": "Custom operators can contain native code - verify implementation",
-                }
+                create_jit_finding(
+                    message="Custom ONNX operator detected",
+                    severity="WARNING",
+                    context=context,
+                    pattern=None,
+                    recommendation="Custom operators can contain native code - verify implementation",
+                    confidence=0.7,
+                    framework="ONNX",
+                    code_snippet=None,
+                    type="custom_operator",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
             )
 
         # Check for Python operators (ONNX-Script)
         if b"PythonOp" in data or b"PyOp" in data:
             findings.append(
-                {
-                    "type": "python_operator",
-                    "severity": "CRITICAL",
-                    "framework": "ONNX",
-                    "message": "Python operator in ONNX model - can execute arbitrary code",
-                    "context": context,
-                    "recommendation": "Remove Python operators or thoroughly audit their code",
-                }
+                create_jit_finding(
+                    message="Python operator in ONNX model - can execute arbitrary code",
+                    severity="CRITICAL",
+                    context=context,
+                    pattern=None,
+                    recommendation="Remove Python operators or thoroughly audit their code",
+                    confidence=0.9,
+                    framework="ONNX",
+                    code_snippet=None,
+                    type="python_operator",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
             )
 
         # Check for function extensions
         if b"onnx.function" in data:
             findings.append(
-                {
-                    "type": "function_extension",
-                    "severity": "INFO",
-                    "framework": "ONNX",
-                    "message": "ONNX function extension detected",
-                    "context": context,
-                    "recommendation": "Review function implementations for security",
-                }
+                create_jit_finding(
+                    message="ONNX function extension detected",
+                    severity="INFO",
+                    context=context,
+                    pattern=None,
+                    recommendation="Review function implementations for security",
+                    confidence=0.5,
+                    framework="ONNX",
+                    code_snippet=None,
+                    type="function_extension",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
             )
 
         return findings
 
-    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list[dict[str, Any]]:
+    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list["JITScriptFinding"]:
         """Extract and analyze embedded Python code.
 
         Args:
@@ -349,7 +416,9 @@ class JITScriptDetector:
         Returns:
             List of findings from code analysis
         """
-        findings: list[dict[str, Any]] = []
+        from modelaudit.models import JITScriptFinding
+
+        findings: list[JITScriptFinding] = []
 
         if not self.check_ast:
             return findings
@@ -366,32 +435,40 @@ class JITScriptDetector:
                 for dangerous_import in DANGEROUS_IMPORTS:
                     if f"import {dangerous_import}" in code_str or f"from {dangerous_import}" in code_str:
                         findings.append(
-                            {
-                                "type": "dangerous_import",
-                                "severity": "CRITICAL",
-                                "import": dangerous_import,
-                                "framework": framework,
-                                "message": f"Dangerous import '{dangerous_import}' in embedded code",
-                                "context": context,
-                                "code_snippet": code_str[:200],
-                                "recommendation": f"Remove {dangerous_import} import - it can be used maliciously",
-                            }
+                            create_jit_finding(
+                                message=f"Dangerous import '{dangerous_import}' in embedded code",
+                                severity="CRITICAL",
+                                context=context,
+                                pattern=None,
+                                recommendation=f"Remove {dangerous_import} import - it can be used maliciously",
+                                confidence=0.9,
+                                framework=framework,
+                                code_snippet=code_str[:200],
+                                type="dangerous_import",
+                                operation=None,
+                                builtin=None,
+                                import_=dangerous_import,
+                            )
                         )
 
                 # Check for dangerous builtins
                 for builtin in DANGEROUS_BUILTINS:
                     if builtin in code_str:
                         findings.append(
-                            {
-                                "type": "dangerous_builtin",
-                                "severity": "CRITICAL",
-                                "builtin": builtin,
-                                "framework": framework,
-                                "message": f"Dangerous builtin '{builtin}' used in embedded code",
-                                "context": context,
-                                "code_snippet": code_str[:200],
-                                "recommendation": f"Remove {builtin} usage - it can execute arbitrary code",
-                            }
+                            create_jit_finding(
+                                message=f"Dangerous builtin '{builtin}' used in embedded code",
+                                severity="CRITICAL",
+                                context=context,
+                                pattern=None,
+                                recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
+                                confidence=0.9,
+                                framework=framework,
+                                code_snippet=code_str[:200],
+                                type="dangerous_builtin",
+                                operation=None,
+                                builtin=builtin,
+                                import_=None,
+                            )
                         )
 
                 # Try to parse as AST for deeper analysis
@@ -411,20 +488,25 @@ class JITScriptDetector:
         for pattern, description in CODE_EXECUTION_PATTERNS:
             if re.search(pattern, data[:1000000]):  # Limit search size
                 findings.append(
-                    {
-                        "type": "code_execution_pattern",
-                        "severity": "CRITICAL",
-                        "pattern": description,
-                        "framework": framework,
-                        "message": description,
-                        "context": context,
-                        "recommendation": "This pattern indicates potential code execution - review carefully",
-                    }
+                    create_jit_finding(
+                        message=description,
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=description,
+                        recommendation="This pattern indicates potential code execution - review carefully",
+                        confidence=0.8,
+                        framework=framework,
+                        code_snippet=None,
+                        type="code_execution_pattern",
+                        operation=None,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
         return findings
 
-    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list[dict[str, Any]]:
+    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list["JITScriptFinding"]:
         """Analyze Python AST for dangerous patterns.
 
         Args:
@@ -435,53 +517,73 @@ class JITScriptDetector:
         Returns:
             List of findings from AST analysis
         """
-        findings: list[dict[str, Any]] = []
+        from modelaudit.models import JITScriptFinding
+
+        findings: list[JITScriptFinding] = []
 
         class DangerousNodeVisitor(ast.NodeVisitor):
-            def __init__(self):
-                self.findings: list[dict[str, Any]] = []
+            def __init__(self) -> None:
+                self.findings: list[JITScriptFinding] = []
 
-            def visit_Import(self, node):
+            def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
                     if alias.name in DANGEROUS_IMPORTS:
                         self.findings.append(
-                            {
-                                "type": "ast_dangerous_import",
-                                "severity": "CRITICAL",
-                                "import": alias.name,
-                                "framework": framework,
-                                "message": f"AST analysis: Dangerous import '{alias.name}'",
-                                "context": context,
-                            }
+                            create_jit_finding(
+                                message=f"AST analysis: Dangerous import '{alias.name}'",
+                                severity="CRITICAL",
+                                context=context,
+                                pattern=None,
+                                recommendation="Remove dangerous imports to prevent code execution",
+                                confidence=0.9,
+                                framework=framework,
+                                code_snippet=None,
+                                type="ast_dangerous_import",
+                                operation=None,
+                                builtin=None,
+                                import_=alias.name,
+                            )
                         )
                 self.generic_visit(node)
 
-            def visit_ImportFrom(self, node):
-                if node.module in DANGEROUS_IMPORTS:
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module and node.module in DANGEROUS_IMPORTS:
                     self.findings.append(
-                        {
-                            "type": "ast_dangerous_import",
-                            "severity": "CRITICAL",
-                            "import": node.module,
-                            "framework": framework,
-                            "message": f"AST analysis: Dangerous import from '{node.module}'",
-                            "context": context,
-                        }
+                        create_jit_finding(
+                            message=f"AST analysis: Dangerous import from '{node.module}'",
+                            severity="CRITICAL",
+                            context=context,
+                            pattern=None,
+                            recommendation="Remove dangerous imports to prevent code execution",
+                            confidence=0.9,
+                            framework=framework,
+                            code_snippet=None,
+                            type="ast_dangerous_import",
+                            operation=None,
+                            builtin=None,
+                            import_=node.module,
+                        )
                     )
                 self.generic_visit(node)
 
-            def visit_Call(self, node):
+            def visit_Call(self, node: ast.Call) -> None:
                 # Check for dangerous function calls
                 if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
                     self.findings.append(
-                        {
-                            "type": "ast_dangerous_call",
-                            "severity": "CRITICAL",
-                            "function": node.func.id,
-                            "framework": framework,
-                            "message": f"AST analysis: Dangerous function call '{node.func.id}'",
-                            "context": context,
-                        }
+                        create_jit_finding(
+                            message=f"AST analysis: Dangerous function call '{node.func.id}'",
+                            severity="CRITICAL",
+                            context=context,
+                            pattern=None,
+                            recommendation="Remove dangerous function calls to prevent code execution",
+                            confidence=0.9,
+                            framework=framework,
+                            code_snippet=None,
+                            type="ast_dangerous_call",
+                            operation=None,
+                            builtin=node.func.id,
+                            import_=None,
+                        )
                     )
                 self.generic_visit(node)
 
@@ -693,7 +795,7 @@ class JITScriptDetector:
         
         return findings
 
-    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list[dict[str, Any]]:
+    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list["JITScriptFinding"]:
         """Main entry point to scan a model for JIT/Script code execution risks.
 
         Args:
@@ -738,7 +840,7 @@ class JITScriptDetector:
         return findings
 
 
-def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list[dict[str, Any]]:
+def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list["JITScriptFinding"]:
     """Convenience function to scan a file for JIT/Script execution risks.
 
     Args:
@@ -751,11 +853,41 @@ def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -
     import os
 
     if not os.path.exists(file_path):
-        return [{"type": "error", "message": f"File not found: {file_path}"}]
+        return [
+            create_jit_finding(
+                message=f"File not found: {file_path}",
+                severity="WARNING",
+                context=file_path,
+                pattern=None,
+                recommendation="Verify the file path is correct",
+                confidence=1.0,
+                framework=None,
+                code_snippet=None,
+                type="error",
+                operation=None,
+                builtin=None,
+                import_=None,
+            )
+        ]
 
     file_size = os.path.getsize(file_path)
     if file_size > max_size:
-        return [{"type": "error", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
+        return [
+            create_jit_finding(
+                message=f"File too large: {file_size} bytes (max: {max_size})",
+                severity="WARNING",
+                context=file_path,
+                pattern=None,
+                recommendation="Use a smaller file for analysis",
+                confidence=1.0,
+                framework=None,
+                code_snippet=None,
+                type="error",
+                operation=None,
+                builtin=None,
+                import_=None,
+            )
+        ]
 
     # Detect model type from extension
     ext = os.path.splitext(file_path)[1].lower()

@@ -48,6 +48,12 @@ modelaudit/
 
 ## 🔧 Development Conventions
 
+### Branching & Changelog
+
+- **Each feature branch should add exactly one entry to CHANGELOG.md** in the [Unreleased] section following Keep a Changelog format
+- Use conventional commit format (feat:, fix:, docs:, chore:, test:, refactor:)
+- Never commit directly to main branch
+
 ### Code Style & Standards
 
 **Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12, 3.13)

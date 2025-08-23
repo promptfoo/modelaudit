@@ -197,6 +197,7 @@ docker run -v $(pwd):/data modelaudit /data/model.pkl
 
 - **NEVER commit directly to the main branch** - always create a feature branch
 - Use Conventional Commit format for ALL commit messages (e.g., `feat:`, `fix:`, `docs:`, `chore:`, `test:`, `refactor:`)
+- **Each feature branch should add exactly one entry to CHANGELOG.md** in the [Unreleased] section following Keep a Changelog format
 - Keep commit messages concise and descriptive
 - Examples:
   - `feat: add support for TensorFlow SavedModel scanning`

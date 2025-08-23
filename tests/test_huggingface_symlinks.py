@@ -148,4 +148,4 @@ class TestHuggingFaceSymlinks:
 
         broken_issues = [i for i in results.issues if "broken symlink" in getattr(i, "message", "").lower()]
         assert len(broken_issues) == 1
-        assert broken_issues[0].severity == IssueSeverity.WARNING.value
+        assert broken_issues[0].severity == IssueSeverity.WARNING

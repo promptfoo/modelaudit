@@ -286,10 +286,7 @@ class TestDvcSecurity:
         security_issues = [
             issue
             for issue in results["issues"]
-            if any(
-                keyword in issue.get("message", "").lower()
-                for keyword in ["malicious", "suspicious", "security", "dangerous"]
-            )
+            if any(keyword in issue.message.lower() for keyword in ["malicious", "suspicious", "security", "dangerous"])
         ]
         assert len(security_issues) > 0
 
