@@ -124,9 +124,7 @@ class TestFileTypeValidationDemo:
             results = scan_model_directory_or_file(str(mit_dir))
 
             validation_warnings = [
-                issue
-                for issue in results["issues"]
-                if "file type validation failed" in issue.get("message", "").lower()
+                issue for issue in results["issues"] if "file type validation failed" in issue.message.lower()
             ]
 
             print("📁 MIT Model Directory:")
