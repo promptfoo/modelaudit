@@ -10,6 +10,7 @@ import os
 import pickle
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 # Only try to import py7zr if available
 try:
@@ -194,7 +195,7 @@ def generate_empty_7z(assets_dir: Path) -> None:
     print(f"Created {empty_7z}")
 
 
-def generate_all_7z_assets(assets_dir: Path | None = None) -> None:
+def generate_all_7z_assets(assets_dir: Optional[Path] = None) -> None:
     """Generate all 7z test assets"""
     if assets_dir is None:
         # Default to tests/assets directory
