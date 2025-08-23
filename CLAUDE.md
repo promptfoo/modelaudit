@@ -22,7 +22,7 @@ rye run modelaudit --format json --output results.json model.pkl
 # Or explicitly with scan command:
 rye run modelaudit scan model.pkl
 
-# Large Model Support (8GB+)
+# Large Model Support (8 GB+)
 rye run modelaudit large_model.bin --timeout 1800  # 30 min timeout for large models
 rye run modelaudit huge_model.bin --verbose  # Show progress for large files
 rye run modelaudit model.bin --no-large-model-support  # Disable optimizations
