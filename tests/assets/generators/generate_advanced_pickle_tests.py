@@ -1,5 +1,8 @@
 import io
 import pickle
+from pathlib import Path
+
+OUTPUT_DIR = Path("tests/assets/pickles")
 
 
 def generate_stack_global_attack() -> None:
@@ -7,10 +10,11 @@ def generate_stack_global_attack() -> None:
 
     class StackGlobalAttack:
         def __reduce__(self):
-            return (__import__("os").system, ("echo STACK_GLOBAL_PAYLOAD",))
+            return (__import__("os").system, ("# STACK_GLOBAL_PAYLOAD",))
 
-    with open("tests/assets/pickles/stack_global_attack.pkl", "wb") as f:
-        pickle.dump(StackGlobalAttack(), f)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with (OUTPUT_DIR / "stack_global_attack.pkl").open("wb") as f:
+        pickle.dump(StackGlobalAttack(), f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def generate_memo_based_attack() -> None:
@@ -19,10 +23,12 @@ def generate_memo_based_attack() -> None:
     class MemoAttack:
         def __reduce__(self):
             dangerous_module = __import__("subprocess")
-            return (dangerous_module.call, (["echo", "MEMO_ATTACK_PAYLOAD"],))
+            # Use inert command vector; still references subprocess.call for scanner coverage
+            return (dangerous_module.call, (["#", "MEMO_ATTACK_PAYLOAD"],))
 
-    with open("tests/assets/pickles/memo_attack.pkl", "wb") as f:
-        pickle.dump(MemoAttack(), f)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with (OUTPUT_DIR / "memo_attack.pkl").open("wb") as f:
+        pickle.dump(MemoAttack(), f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def generate_multiple_pickle_attack() -> None:
@@ -35,9 +41,10 @@ def generate_multiple_pickle_attack() -> None:
 
     class HiddenAttack:
         def __reduce__(self):
-            return (eval, ("__import__('os').system('HIDDEN_ATTACK_PAYLOAD')",))
+            return (eval, ("'HIDDEN_ATTACK_PAYLOAD'",))
 
     pickle.dump(HiddenAttack(), buffer)
 
-    with open("tests/assets/pickles/multiple_stream_attack.pkl", "wb") as f:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with (OUTPUT_DIR / "multiple_stream_attack.pkl").open("wb") as f:
         f.write(buffer.getvalue())

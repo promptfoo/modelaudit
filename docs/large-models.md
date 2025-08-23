@@ -2,7 +2,7 @@
 
 ## Overview
 
-ModelAudit now includes enhanced support for scanning large ML models (up to 1 TB+) with optimized strategies based on file size.
+ModelAudit now includes enhanced support for scanning large ML models (up to 1 TB) with optimized strategies based on file size.
 
 ## Default Configuration Changes
 
@@ -128,10 +128,10 @@ modelaudit scan hf://bert-large-uncased --timeout 1800
 
 ### Memory Usage
 
-- Small files (<10 MB): ~2x file size
-- Medium files (10-100 MB): ~50 MB constant
-- Large files (>100 MB): ~20 MB constant
-- Very large files (>1 GB): ~10 MB constant
+- Small files (<10 MB): typically ~2x file size
+- Medium files (10-100 MB): typically ~50 MB constant
+- Large files (>100 MB): typically ~20 MB constant
+- Very large files (>1 GB): typically ~10 MB constant
 
 ### Scan Times
 
@@ -175,7 +175,7 @@ scan:
   timeout: 1800 # 30 minutes
   max_file_size: 0 # Unlimited
   large_model_support: true
-  chunk_size: 53687091200 # 50 GB chunks
+  chunk_size: 53687091200 # bytes (50 GB chunks)
 
 # Progress reporting
 output:
@@ -206,7 +206,7 @@ modelaudit scan model.bin --timeout 0
 # Limit file size to prevent OOM
 modelaudit scan model.bin --max-file-size 1073741824  # 1 GB
 
-# Use streaming for all files >10 MB
+# Use streaming for all files > 10 MB
 modelaudit scan model.bin --stream
 ```
 
