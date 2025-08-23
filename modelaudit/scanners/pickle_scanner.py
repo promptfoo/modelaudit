@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, Dict, List, Optional, Union, cast
+from typing import IO, Any, BinaryIO, ClassVar, Optional, Union, cast
 
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
@@ -32,9 +32,9 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 def _get_graduated_severity(module: str, function: Optional[str] = None) -> IssueSeverity:
     """Get graduated severity level for a module/function based on security impact"""
     for severity_level, modules in PICKLE_SEVERITY_MAP.items():
-        modules_dict = cast(Dict[str, Union[str, List[str]]], modules)  # Type hint for mypy
+        modules_dict = cast(dict[str, Union[str, list[str]]], modules)  # Type hint for mypy
         if module in modules_dict:
-            module_spec = modules_dict[module] 
+            module_spec = modules_dict[module]
             # Check if all functions match or specific function matches
             if module_spec == "*" or (isinstance(module_spec, list) and function and function in module_spec):
                 return getattr(IssueSeverity, severity_level)
