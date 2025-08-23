@@ -13,9 +13,9 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 100 models cataloged
-- Safe Models: 18 legitimate models (baseline testing)
-- Malicious Models: 82 models with attack vectors
+- Total Models: 143 models cataloged
+- Safe Models: 47 legitimate models (baseline testing)
+- Malicious Models: 96 models with attack vectors
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
 - Attack Types: 7+ distinct exploitation methods
 
@@ -23,26 +23,55 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 These models should scan clean and serve as negative controls for false positive detection.
 
-| #   | Model Name                              | Type            | Source       | Status | Scan Results                                        |
-| --- | --------------------------------------- | --------------- | ------------ | ------ | --------------------------------------------------- |
-| 1   | `vikhyatk/moondream-2`                  | Computer Vision | Hugging Face | Failed | Repository not found                                |
-| 2   | `openai/clip-vit-base-patch32`          | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`     |
-| 3   | `google/vit-base-patch16-224`           | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`      |
-| 4   | `facebook/detr-resnet-50`               | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`          |
-| 5   | `microsoft/beit-base-patch16-224`       | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`  |
-| 6   | `ultralytics/yolov5n`                   | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`              |
-| 7   | `pytorch/vision:v0.13.0-mobilenet_v2`   | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`             |
-| 8   | `scikit-learn/logistic-regression`      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt` |
-| 9   | `scikit-learn/decision-tree`            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 10  | `scikit-learn/svm`                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 11  | `scikit-learn/random-forest`            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 12  | `scikit-learn/gradient-boosting`        | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 13  | `scikit-learn/k-means`                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 14  | `scikit-learn/linear-regression`        | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 15  | `scikit-learn/ridge`                    | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 16  | `scikit-learn/lasso`                    | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 17  | `scikit-learn/pca`                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 18  | `scikit-learn/agglomerative-clustering` | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
+| #   | Model Name                                                        | Type            | Source       | Status | Scan Results                                                                                               |
+| --- | ----------------------------------------------------------------- | --------------- | ------------ | ------ | ---------------------------------------------------------------------------------------------------------- |
+| 1   | `vikhyatk/moondream-2`                                            | Computer Vision | Hugging Face | Failed | Repository not found                                                                                       |
+| 2   | `openai/clip-vit-base-patch32`                                    | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`                                                            |
+| 3   | `google/vit-base-patch16-224`                                     | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`                                                             |
+| 4   | `facebook/detr-resnet-50`                                         | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`                                                                 |
+| 5   | `microsoft/beit-base-patch16-224`                                 | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`                                                         |
+| 6   | `ultralytics/yolov5n`                                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`                                                                     |
+| 7   | `pytorch/vision:v0.13.0-mobilenet_v2`                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`                                                                    |
+| 8   | `scikit-learn/logistic-regression`                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt`                                                        |
+| 9   | `scikit-learn/decision-tree`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 10  | `scikit-learn/svm`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 11  | `scikit-learn/random-forest`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 12  | `scikit-learn/gradient-boosting`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 13  | `scikit-learn/k-means`                                            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 14  | `scikit-learn/linear-regression`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 15  | `scikit-learn/ridge`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 16  | `scikit-learn/lasso`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 17  | `scikit-learn/pca`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 18  | `scikit-learn/agglomerative-clustering`                           | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 19  | `sentence-transformers/all-MiniLM-L6-v2`                          | Text Embeddings | Hugging Face | Clean  | Safetensors format - no pickle execution risk                                                              |
+| 20  | `timm/resnet50.a1_in1k`                                           | Computer Vision | Hugging Face | Clean  | Timm model with safetensors - validates timm coverage                                                      |
+| 21  | `facebook/dinov2-base`                                            | Computer Vision | Hugging Face | Clean  | Vision backbone with safetensors - large file handling                                                     |
+| 22  | `microsoft/resnet-50`                                             | Computer Vision | Hugging Face | Clean  | Classic ResNet with safetensors - ResNet repo validation                                                   |
+| 23  | `google-bert/bert-base-uncased`                                   | NLP             | Hugging Face | Clean  | Base BERT with safetensors and ONNX - core NLP baseline                                                    |
+| 24  | `distilbert/distilbert-base-uncased`                              | NLP             | Hugging Face | Clean  | DistilBERT with safetensors - minimal transformer control                                                  |
+| 25  | `FacebookAI/roberta-base`                                         | NLP             | Hugging Face | Clean  | RoBERTa with safetensors - confirms RoBERTa configs clean                                                  |
+| 26  | `google-t5/t5-small`                                              | NLP             | Hugging Face | Clean  | T5 with safetensors - encoder-decoder validation                                                           |
+| 27  | `facebook/wav2vec2-base-960h`                                     | Audio ASR       | Hugging Face | Clean  | Wav2Vec2 with safetensors - audio feature extractors                                                       |
+| 28  | `openai/whisper-tiny`                                             | Audio ASR       | Hugging Face | Clean  | Whisper with safetensors - small ASR baseline                                                              |
+| 29  | `Xenova/clip-vit-base-patch16`                                    | ONNX            | Hugging Face | Clean  | CLIP vision-text ONNX - transformer ONNX validation                                                        |
+| 30  | `Xenova/clip-vit-large-patch14`                                   | ONNX            | Hugging Face | Clean  | Large CLIP ONNX - bigger graph handling                                                                    |
+| 31  | `onnx-community/mobilenet_v2_1.0_224`                             | ONNX            | Hugging Face | Clean  | MobileNetV2 ONNX - mobile CNN baseline                                                                     |
+| 32  | `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k`           | ONNX            | Hugging Face | Clean  | MobileNetV4 ONNX - modern opsets validation                                                                |
+| 33  | `Kalray/resnet50`                                                 | ONNX            | Hugging Face | Clean  | ResNet50 ONNX with INT8 - quantized ONNX validation                                                        |
+| 34  | `Kalray/deeplabv3plus-resnet50`                                   | ONNX            | Hugging Face | Clean  | Segmentation ONNX - segmentation graph coverage                                                            |
+| 35  | `Qualcomm/MobileNet-v2`                                           | ONNX            | Hugging Face | Clean  | Vendor ONNX reference - vendor-packaged graphs                                                             |
+| 36  | `webnn/yolov8m`                                                   | ONNX            | Hugging Face | Clean  | YOLOv8 ONNX - confirms YOLO-in-ONNX doesn't FP like .pt                                                    |
+| 37  | `OpenVINO/bert-base-uncased-sst2-unstructured80-int8-ov`          | OpenVINO        | Hugging Face | Clean  | OpenVINO IR (XML+BIN) - mixed asset repo validation                                                        |
+| 38  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
+| 39  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
+| 40  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
+| 41  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
+| 42  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
+| 43  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
+| 44  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
+| 45  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
+| 46  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
+| 47  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
 
 ## Malicious Models (Threat Detection Testing)
 
@@ -52,23 +81,27 @@ These models contain various attack vectors and should be detected as unsafe.
 
 Classic pickle deserialization attacks in PyTorch model files.
 
-| #   | Model Name                           | Attack Vector | Source       | Primary Artifact                    | Detection Notes                                                                  |
-| --- | ------------------------------------ | ------------- | ------------ | ----------------------------------- | -------------------------------------------------------------------------------- |
-| 19  | `drhyrum/bert-tiny-torch-picklebomb` | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Recommended test - Explicit picklebomb demo                                      |
-| 20  | `Frase/tiny-bert-model-unsafe`       | Pickle RCE    | Hugging Face | `archive/data.pkl`                  | Contains webbrowser.open and torch rebuild helpers                               |
-| 21  | `kojino/bert-tiny-torch-picklebomb`  | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Fork of picklebomb PoC                                                           |
-| 22  | `drhyrum/bert-tiny-torch-vuln`       | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Flagged unsafe in HF UI                                                          |
-| 23  | `ykilcher/totally-harmless-model`    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Contains `__builtin__.eval` imports                                              |
-| 24  | `hf-internal-testing/unsafe-model`   | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Recommended test - Known-bad control model                                       |
-| 25  | `matanby/unsafe-diffusion`           | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Dummy model demonstrating unsafe pickle loading                                  |
-| 26  | `MustEr/bert_locked`                 | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Labeled "Security Research - Do NOT download"                                    |
-| 27  | `MustEr/gpt2-elite`                  | Pickle RCE    | Hugging Face | `pytorch_model.bin`                 | Flagged with suspicious imports, real-world example                              |
-| 28  | `TencentAIGC/poisoned-model`         | Pickle RCE    | Hugging Face | `poisoned_model.pth`                | Explicit `posix.system` import detection                                         |
-| 29  | `DSfsdasgaa/shell`                   | Pickle RCE    | Hugging Face | `kcp.pth`, `ws.pth`                 | `.pth` files with `posix.system`, includes ELF                                   |
-| 30  | `nono31/malicious-models-repo`       | Multi-format  | Hugging Face | Multiple files                      | Multiple unsafe files: PyTorch, GGUF, TensorFlow                                 |
-| 31  | `YuhengSSS/VSSD`                     | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth` | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage. |
-| 32  | `XavierJiezou/ktda-models`           | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`               | "Detected Pickle imports (11)." Useful for PyTorch load path test.               |
-| 33  | `trackinglaboratory/CAMELTrack`      | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`             | Marked **Unsafe**. Exercises compressed pickle handling.                         |
+| #   | Model Name                              | Attack Vector | Source       | Primary Artifact                               | Detection Notes                                                                                                                    |
+| --- | --------------------------------------- | ------------- | ------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 19  | `drhyrum/bert-tiny-torch-picklebomb`    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Explicit picklebomb demo                                                                                        |
+| 20  | `Frase/tiny-bert-model-unsafe`          | Pickle RCE    | Hugging Face | `archive/data.pkl`                             | Contains webbrowser.open and torch rebuild helpers                                                                                 |
+| 21  | `kojino/bert-tiny-torch-picklebomb`     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Fork of picklebomb PoC                                                                                                             |
+| 22  | `drhyrum/bert-tiny-torch-vuln`          | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged unsafe in HF UI                                                                                                            |
+| 23  | `ykilcher/totally-harmless-model`       | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Contains `__builtin__.eval` imports                                                                                                |
+| 24  | `hf-internal-testing/unsafe-model`      | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Known-bad control model                                                                                         |
+| 25  | `matanby/unsafe-diffusion`              | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Dummy model demonstrating unsafe pickle loading                                                                                    |
+| 26  | `MustEr/bert_locked`                    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Labeled "Security Research - Do NOT download"                                                                                      |
+| 27  | `MustEr/gpt2-elite`                     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged with suspicious imports, real-world example                                                                                |
+| 28  | `TencentAIGC/poisoned-model`            | Pickle RCE    | Hugging Face | `poisoned_model.pth`                           | Explicit `posix.system` import detection                                                                                           |
+| 29  | `DSfsdasgaa/shell`                      | Pickle RCE    | Hugging Face | `kcp.pth`, `ws.pth`                            | `.pth` files with `posix.system`, includes ELF                                                                                     |
+| 30  | `nono31/malicious-models-repo`          | Multi-format  | Hugging Face | Multiple files                                 | Multiple unsafe files: PyTorch, GGUF, TensorFlow                                                                                   |
+| 31  | `YuhengSSS/VSSD`                        | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth`            | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage.                                                   |
+| 32  | `XavierJiezou/ktda-models`              | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`                          | "Detected Pickle imports (11)." Useful for PyTorch load path test.                                                                 |
+| 33  | `trackinglaboratory/CAMELTrack`         | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`                        | Marked **Unsafe**. Exercises compressed pickle handling.                                                                           |
+| 101 | `LiheYoung/Depth-Anything`              | Pickle RCE    | HF Space     | `checkpoints_semseg/ade20k_vitl_mIoU_59.4.pth` | File Security Scans mark file **Unsafe**. "Detected Pickle imports (11)" listed.                                                   |
+| 102 | `rodrigomiranda98/tweet-eval-emotion`   | Raw pickle    | Hugging Face | `model.pkl`                                    | File page shows **Unsafe** status for the pickle file. Good for generic pickle‑load path tests.                                    |
+| 103 | `cesaenv/rottenTomatoes`                | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (97)" including FastAI, spaCy, and torch rebuild opcodes. Stresses large import surfaces. |
+| 104 | `luisvarona/intel-image-classification` | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (94)". Useful FastAI‑style pickle corpus.                                                 |
 
 ### Alternative Execution Vectors
 
@@ -84,34 +117,39 @@ Different methods of achieving code execution beyond standard pickle.
 
 YOLO and PyTorch model files with embedded malicious pickle payloads.
 
-| #   | Model Name                           | Attack Vector | Source       | Primary Artifact          | Detection Notes                             |
-| --- | ------------------------------------ | ------------- | ------------ | ------------------------- | ------------------------------------------- |
-| 37  | `echo840/MonkeyOCR`                  | YOLO pickle   | Hugging Face | `Structure/layout_zh.pt`  | Flagged "Detected Pickle imports (33)"      |
-| 38  | `Uminosachi/FastSAM`                 | YOLO pickle   | Hugging Face | `FastSAM-s.pt`            | YOLO .pt with pickle imports                |
-| 39  | `jags/yolov8_model_segmentation-set` | YOLO pickle   | Hugging Face | `face_yolov8n-seg2_60.pt` | YOLOv8 .pt flagged unsafe                   |
-| 40  | `StableDiffusionVN/yolo`             | YOLO pickle   | Hugging Face | `yolo-human-parse-v2.pt`  | YOLO .pt flagged unsafe                     |
-| 41  | `Zhao-Xuanxiang/yolov7-seg`          | YOLO pickle   | Hugging Face | `yolov7-seg.pt`           | YOLO .pt flagged unsafe                     |
-| 42  | `ashllay/YOLO_Models`                | YOLO pickle   | Hugging Face | `segm/unwanted-3x.pt`     | YOLO .pt flagged unsafe                     |
-| 43  | `hfmaster/models-moved/face-restore` | Mixed formats | Hugging Face | Mixed files               | Mixed files with dill and torch pickle sigs |
+| #   | Model Name                              | Attack Vector | Source       | Primary Artifact            | Detection Notes                                                                                        |
+| --- | --------------------------------------- | ------------- | ------------ | --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| 37  | `echo840/MonkeyOCR`                     | YOLO pickle   | Hugging Face | `Structure/layout_zh.pt`    | Flagged "Detected Pickle imports (33)"                                                                 |
+| 38  | `Uminosachi/FastSAM`                    | YOLO pickle   | Hugging Face | `FastSAM-s.pt`              | YOLO .pt with pickle imports                                                                           |
+| 39  | `jags/yolov8_model_segmentation-set`    | YOLO pickle   | Hugging Face | `face_yolov8n-seg2_60.pt`   | YOLOv8 .pt flagged unsafe                                                                              |
+| 40  | `StableDiffusionVN/yolo`                | YOLO pickle   | Hugging Face | `yolo-human-parse-v2.pt`    | YOLO .pt flagged unsafe                                                                                |
+| 41  | `Zhao-Xuanxiang/yolov7-seg`             | YOLO pickle   | Hugging Face | `yolov7-seg.pt`             | YOLO .pt flagged unsafe                                                                                |
+| 42  | `ashllay/YOLO_Models`                   | YOLO pickle   | Hugging Face | `segm/unwanted-3x.pt`       | YOLO .pt flagged unsafe                                                                                |
+| 43  | `hfmaster/models-moved/face-restore`    | Mixed formats | Hugging Face | Mixed files                 | Mixed files with dill and torch pickle sigs                                                            |
+| 105 | `guon/hand-eyes`                        | YOLO pickle   | Hugging Face | `PitHandDetailer-v1-seg.pt` | **Unsafe** with "Detected Pickle imports (33)". Exercises YOLOv8 seg task deserialization path.        |
+| 106 | `keremberke/yolov8m-hard-hat-detection` | YOLO pickle   | Hugging Face | `*.pt` in repo root         | "Detected Pickle imports (24)" on scanned YOLO weights. Good for real‑world YOLO import lists.         |
+| 107 | `deepghs/imgutils-models`               | YOLO pickle   | Hugging Face | `person_detect/*.pt`        | "Detected Pickle imports (24)" across person detection checkpoints. Useful for multiple file coverage. |
+| 108 | `JCTN/adetailer`                        | YOLO pickle   | Hugging Face | `*.pt` in repo              | "Detected Pickle imports (33)". Alternative ADetailer variants beyond `Bingsu/adetailer`.              |
 
 ### Keras & TensorFlow Exploits
 
 Malicious Keras models with Lambda layer exploits and TensorFlow SavedModel attacks.
 
-| #   | Model Name                                | Attack Vector | Source       | Primary Artifact                      | Detection Notes                                                                                               |
-| --- | ----------------------------------------- | ------------- | ------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| 41  | `mkiani/unsafe-keras`                     | Keras Lambda  | Hugging Face | `unsafe_model.keras`                  | Recommended test - HF marks unsafe                                                                            |
-| 42  | `mkiani/unsafe-saved-model`               | TF SavedModel | Hugging Face | `saved_model.pb`                      | Unsafe SavedModel example                                                                                     |
-| 43  | `mkiani/keras-unsafe-models`              | Keras Lambda  | Hugging Face | `unsafe_model.h5`                     | Keras H5 unsafe format                                                                                        |
-| 44  | `Juna190825/github_jeffprosise_model`     | Keras Lambda  | Hugging Face | `*.keras`                             | Keras serialization flagged unsafe by HF                                                                      |
-| 45  | `warmiros/unsafe_models`                  | Keras Lambda  | Hugging Face | `unsafe.h5`, `unsafe.keras`           | Tiny PoCs for fast tests                                                                                      |
-| 46  | `Sag1012/machine-translation`             | Keras Lambda  | Hugging Face | `BiLSTM/my_model (1).keras`           | Flagged with PAIT-KERAS-301                                                                                   |
-| 47  | `ScanMe/test-models`                      | Keras Lambda  | Hugging Face | `eval_lambda.keras`, `eval_lambda.h5` | Keras Lambda serialization PoCs                                                                               |
-| 48  | `JackVines/ds_saliency_inference`         | TF SavedModel | Hugging Face | `saved_model.pb`                      | File Security Scans mark the SavedModel **Unsafe**. Use to validate SavedModel handling and scanner verdicts. |
-| 49  | `alexanderkroner/MSI-Net`                 | TF SavedModel | Hugging Face | `saved_model.pb`                      | File Security Scans mark the SavedModel **Unsafe**. Good real‑world SavedModel test.                          |
-| 50  | `dini15/Skin_Type`                        | Keras         | Hugging Face | `model_aug.keras`                     | `.keras` file flagged **Unsafe** in File Security Scans. Useful for Lambda‑layer serialization checks.        |
-| 51  | `m7142yosuke/english2kana`                | Keras         | Hugging Face | `english2kana-v1.keras`               | `.keras` file flagged **Unsafe**. Simple repro for Keras payload detection.                                   |
-| 52  | `ckavili/totally_harmless_no_scan_needed` | TF SavedModel | Hugging Face | `saved_model.pb`                      | Marked **Unsafe**. Model card even jokes "totally harmless," making it a nice red‑team control.               |
+| #   | Model Name                                | Attack Vector | Source       | Primary Artifact                                   | Detection Notes                                                                                                             |
+| --- | ----------------------------------------- | ------------- | ------------ | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| 41  | `mkiani/unsafe-keras`                     | Keras Lambda  | Hugging Face | `unsafe_model.keras`                               | Recommended test - HF marks unsafe                                                                                          |
+| 42  | `mkiani/unsafe-saved-model`               | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Unsafe SavedModel example                                                                                                   |
+| 43  | `mkiani/keras-unsafe-models`              | Keras Lambda  | Hugging Face | `unsafe_model.h5`                                  | Keras H5 unsafe format                                                                                                      |
+| 44  | `Juna190825/github_jeffprosise_model`     | Keras Lambda  | Hugging Face | `*.keras`                                          | Keras serialization flagged unsafe by HF                                                                                    |
+| 45  | `warmiros/unsafe_models`                  | Keras Lambda  | Hugging Face | `unsafe.h5`, `unsafe.keras`                        | Tiny PoCs for fast tests                                                                                                    |
+| 46  | `Sag1012/machine-translation`             | Keras Lambda  | Hugging Face | `BiLSTM/my_model (1).keras`                        | Flagged with PAIT-KERAS-301                                                                                                 |
+| 47  | `ScanMe/test-models`                      | Keras Lambda  | Hugging Face | `eval_lambda.keras`, `eval_lambda.h5`              | Keras Lambda serialization PoCs                                                                                             |
+| 48  | `JackVines/ds_saliency_inference`         | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Use to validate SavedModel handling and scanner verdicts.               |
+| 49  | `alexanderkroner/MSI-Net`                 | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Good real‑world SavedModel test.                                        |
+| 50  | `dini15/Skin_Type`                        | Keras         | Hugging Face | `model_aug.keras`                                  | `.keras` file flagged **Unsafe** in File Security Scans. Useful for Lambda‑layer serialization checks.                      |
+| 51  | `m7142yosuke/english2kana`                | Keras         | Hugging Face | `english2kana-v1.keras`                            | `.keras` file flagged **Unsafe**. Simple repro for Keras payload detection.                                                 |
+| 52  | `ckavili/totally_harmless_no_scan_needed` | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Marked **Unsafe**. Model card even jokes "totally harmless," making it a nice red‑team control.                             |
+| 109 | `Anggads01/trashnet-classifier`           | Keras         | Hugging Face | `best_model.keras` or `DenseNet121_02_model.keras` | File Security Scans show **Unsafe** with `PAIT-KERAS-301` on multiple `.keras` files. Good for Lambda serialization checks. |
 
 ### Sklearn/Joblib/Pickle Exploits
 
@@ -166,24 +204,27 @@ Models specifically designed to test scanner capabilities and known CVE exploits
 
 Novel attack vectors using GGUF metadata and template injection.
 
-| #   | Model Name                         | Attack Vector | Source       | Primary Artifact                 | Detection Notes                                                                          |
-| --- | ---------------------------------- | ------------- | ------------ | -------------------------------- | ---------------------------------------------------------------------------------------- |
-| 81  | `nono31/malicious-models-repo`     | GGUF SSTI     | Hugging Face | `malicious_sample.gguf`          | GGUF chat-template SSTI, pair with JFrog's write-up                                      |
-| 82  | **CVE-2024-34359 Test Case**       | Jinja2 SSTI   | Local Test   | `tokenizer_config.json`          | **✅ CONFIRMED** - retr0reg payload detected by ModelAudit's Jinja2 scanner              |
-| 83  | `LGAI-EXAONE/EXAONE-4.0-1.2B-GGUF` | Jinja2 SSTI   | Hugging Face | `chat_template.jinja`            | Explicit Jinja chat template present. Use to ensure template scanning.                   |
-| 84  | `meetkai/functionary-7b-v1.4-GGUF` | Jinja2 SSTI   | Hugging Face | tokenizer `chat_template` commit | Commit shows embedded Jinja template in config. Useful for scanner diff‑based detection. |
-| 85  | `openai/gpt-oss-20b`               | Jinja2 SSTI   | Hugging Face | `chat_template.jinja`            | Large Jinja template. Good for edge‑case parsing and filter evasion tests.               |
+| #   | Model Name                                  | Attack Vector | Source       | Primary Artifact                  | Detection Notes                                                                                                                                                   |
+| --- | ------------------------------------------- | ------------- | ------------ | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 81  | `nono31/malicious-models-repo`              | GGUF SSTI     | Hugging Face | `malicious_sample.gguf`           | GGUF chat-template SSTI, pair with JFrog's write-up                                                                                                               |
+| 82  | **CVE-2024-34359 Test Case**                | Jinja2 SSTI   | Local Test   | `tokenizer_config.json`           | **✅ CONFIRMED** - retr0reg payload detected by ModelAudit's Jinja2 scanner                                                                                       |
+| 83  | `LGAI-EXAONE/EXAONE-4.0-1.2B-GGUF`          | Jinja2 SSTI   | Hugging Face | `chat_template.jinja`             | Explicit Jinja chat template present. Use to ensure template scanning.                                                                                            |
+| 84  | `meetkai/functionary-7b-v1.4-GGUF`          | Jinja2 SSTI   | Hugging Face | tokenizer `chat_template` commit  | Commit shows embedded Jinja template in config. Useful for scanner diff‑based detection.                                                                          |
+| 85  | `openai/gpt-oss-20b`                        | Jinja2 SSTI   | Hugging Face | `chat_template.jinja`             | Large Jinja template. Good for edge‑case parsing and filter evasion tests.                                                                                        |
+| 110 | `microsoft/Phi-3-mini-4k-instruct-gguf`     | Jinja2 SSTI   | Hugging Face | `*.gguf`                          | GGUF metadata includes `tokenizer.chat_template` string. Use to validate GGUF template scanning and SSTI guards. Presence ≠ exploit, but required for SSTI tests. |
+| 111 | `gorilla-llm/gorilla-openfunctions-v0-gguf` | Jinja2 SSTI   | Hugging Face | `gorilla-openfunctions-v0-*.gguf` | Model card shows embedded `chat_template` Jinja. Good for tool‑calling templates and edge parsing.                                                                |
 
 ### Configuration-based Exploits
 
 Attacks leveraging model configuration files to execute remote code.
 
-| #   | Model Name                           | Attack Vector  | Source       | Primary Artifact | Detection Notes                                                                                                     |
-| --- | ------------------------------------ | -------------- | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------- |
-| 86  | `cpack3z/NeoBERT-4x`                 | Config exploit | Hugging Face | `config.json`    | Config includes `trust_remote_code=True` for AutoConfig/AutoModel                                                   |
-| 87  | `internlm/internlm2-chat-7b`         | Config exploit | Hugging Face | `config.json`    | `auto_map` points to custom code. Transformers requires `trust_remote_code=True`. Use for remote‑code gating tests. |
-| 88  | `deepseek-ai/DeepSeek-V3`            | Config exploit | Hugging Face | `config.json`    | Uses `auto_map` to custom modules. Validates your "no remote code" default.                                         |
-| 89  | `microsoft/Phi-3-mini-128k-instruct` | Config exploit | Hugging Face | `config.json`    | `auto_map` present. Known pattern that requires `trust_remote_code=True` when not natively supported.               |
+| #   | Model Name                           | Attack Vector  | Source       | Primary Artifact | Detection Notes                                                                                                                       |
+| --- | ------------------------------------ | -------------- | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 86  | `cpack3z/NeoBERT-4x`                 | Config exploit | Hugging Face | `config.json`    | Config includes `trust_remote_code=True` for AutoConfig/AutoModel                                                                     |
+| 87  | `internlm/internlm2-chat-7b`         | Config exploit | Hugging Face | `config.json`    | `auto_map` points to custom code. Transformers requires `trust_remote_code=True`. Use for remote‑code gating tests.                   |
+| 88  | `deepseek-ai/DeepSeek-V3`            | Config exploit | Hugging Face | `config.json`    | Uses `auto_map` to custom modules. Validates your "no remote code" default.                                                           |
+| 89  | `microsoft/Phi-3-mini-128k-instruct` | Config exploit | Hugging Face | `config.json`    | `auto_map` present. Known pattern that requires `trust_remote_code=True` when not natively supported.                                 |
+| 112 | `chandar-lab/NeoBERT`                | Config exploit | Hugging Face | `config.json`    | Config includes `auto_map` to custom modules and `"trust_remote_code": true`. Use to ensure remote code is hard‑gated by your loader. |
 
 ### Real-world Suspicious Models
 
@@ -223,6 +264,15 @@ Sophisticated attacks using template injection and configuration manipulation.
 | --- | --------------------------------- | --------------- | ------------ | ----------------------- | --------------------------------------------------------- |
 | 99  | GGUF-SSTI Demo                    | Template inject | JFrog        | GGUF with chat_template | Jinja2 SSTI in chat_template metadata                     |
 | 100 | `microsoft/Dayhoff-170m-UR50-BRq` | Config exploit  | Hugging Face | `config.json`           | auto_map pointing to remote code, needs trust_remote_code |
+
+### KerasHub Config Files flagged by Protect AI
+
+Keras configuration files with dynamic module references flagged by security scanners.
+
+| #   | Model Name                        | Attack Vector | Source       | Primary Artifact    | Detection Notes                                                                                                                    |
+| --- | --------------------------------- | ------------- | ------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 113 | `keras/siglip2_large_patch16_256` | Keras config  | Hugging Face | `tokenizer.json`    | Protect AI marks file **Unsafe** with `PAIT-KERAS-301` due to dynamic module references. Useful to test config‑parsing allowlists. |
+| 114 | `yuto-urushima/my_gemma2_pt`      | Keras config  | Hugging Face | `preprocessor.json` | Protect AI flags **PAIT-KERAS-301**. Tests resilience to KerasHub JSON with module paths.                                          |
 
 ## Model Discovery & Intelligence
 
