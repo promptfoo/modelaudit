@@ -152,10 +152,12 @@ class TestModelDownload:
         """Test error when huggingface-hub is not installed."""
         real_import = __import__
         with patch("builtins.__import__") as mock_import:
+
             def side_effect(name, *args, **kwargs):
                 if name == "huggingface_hub":
                     raise ImportError("No module named 'huggingface_hub'")
                 return real_import(name, *args, **kwargs)
+
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_model("https://huggingface.co/test/model")
@@ -426,10 +428,12 @@ class TestHuggingFaceFileURLs:
         """Test error when huggingface-hub is not installed."""
         real_import = __import__
         with patch("builtins.__import__") as mock_import:
+
             def side_effect(name, *args, **kwargs):
                 if name == "huggingface_hub":
                     raise ImportError("No module named 'huggingface_hub'")
                 return real_import(name, *args, **kwargs)
+
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")

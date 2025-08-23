@@ -178,7 +178,7 @@ class MetadataScanner(BaseScanner):
                 secret_part = matched_text
                 if "=" in matched_text:
                     # For token assignments like "api_key=abc123", extract just the value
-                    secret_part = matched_text.split("=", 1)[1].strip(' "\'')
+                    secret_part = matched_text.split("=", 1)[1].strip(" \"'")
                 elif " " in matched_text and "Bearer" in matched_text:
                     # For Bearer tokens, extract just the token part
                     secret_part = matched_text.split(" ", 1)[1].strip()

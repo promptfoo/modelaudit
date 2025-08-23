@@ -620,6 +620,7 @@ def scan_command(
                         else:
                             # No cache: use an ephemeral directory we control (safe to delete later)
                             import tempfile
+
                             tmp_dl_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                             hf_cache_dir = tmp_dl_dir
 

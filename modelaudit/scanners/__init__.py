@@ -465,10 +465,7 @@ class ScannerRegistry:
         Returns:
             True if the scanner is registered and can potentially be loaded
         """
-        return any(
-            scanner_info.get("class") == class_name
-            for scanner_info in self._scanners.values()
-        )
+        return any(scanner_info.get("class") == class_name for scanner_info in self._scanners.values())
 
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
