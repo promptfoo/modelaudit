@@ -4,14 +4,12 @@ Based on comprehensive codebase analysis, these tasks will improve ModelAudit's 
 
 ## Task Status Summary
 
-### ✅ Completed Tasks
-- **Task 2**: STACK_GLOBAL pickle scanner enhancement *(already implemented)*
-- **Task 5**: Multiple pickle stream support *(already implemented)*
-- **Task 6**: OS alias detection (Windows/Unix) *(already implemented)*
-- **Task 9**: Direct URL and HuggingFace scanning *(already implemented)*
-- **Task 10**: Magic byte and file format detection *(already implemented)*
+### ✅ Completed Tasks _(removed - focusing on active work)_
+
+Tasks 2, 5, 6, 9, and 10 have been removed from this file as they are already implemented in the current codebase.
 
 ### 🔄 Active Security Enhancement Tasks
+
 - **Task 1**: Complete TensorFlow operation detection (ReadFile, WriteFile, ShellExecute)
 - **Task 3**: Graduated severity classification system (HIGH/MEDIUM/LOW)
 - **Task 4**: Configuration-driven security rules
@@ -20,11 +18,13 @@ Based on comprehensive codebase analysis, these tasks will improve ModelAudit's 
 - **Task 11**: 7-Zip archive support
 
 ### 🔧 Critical Refactoring Tasks
+
 - **Task R-1**: Refactor 1,026-line monster function in pickle_scanner.py
 - **Task R-2**: Refactor god classes (BaseScanner with 35 methods)
 - **Task R-3**: Refactor large scanner methods (498-line PyTorch ZIP scan)
 
 ### 🏗️ Infrastructure Tasks
+
 - **Task I-1**: Fix circular import dependencies
 - **Task I-2**: Thread-safe cache manager
 - **Task I-3**: Consolidate duplicate caching logic
@@ -32,6 +32,7 @@ Based on comprehensive codebase analysis, these tasks will improve ModelAudit's 
 - **Task I-5**: Performance optimization
 
 ### 🎯 CLI Usability Tasks
+
 - **Task U-1**: Eliminate CLI flag explosion (24+ → ~12 flags)
 - **Task U-2**: Implement smart CLI defaults
 - **Task U-3**: Add modern usability features
@@ -182,241 +183,6 @@ tests/assets/tensorflow/
 - [ ] Comprehensive test coverage (>95%)
 - [ ] No false positives on clean TensorFlow models
 - [ ] Clear, actionable issue messages explaining the security risk
-
----
-
-## ✅ ~~Task 2: Enhance Pickle Scanner with STACK_GLOBAL and Memo Tracking~~ **COMPLETED**
-
-**Status**: ✅ **ALREADY IMPLEMENTED** (commit 501f138)
-
-This task has been completed. The current codebase includes:
-- STACK_GLOBAL opcode parsing
-- Memo object tracking 
-- Advanced pickle stream analysis
-- Multiple pickle stream support within single files
-
-**Remove this task - it's done.**
-
-### Files to Modify
-
-- `modelaudit/scanners/pickle_scanner.py` - Main pickle scanner
-- `modelaudit/suspicious_symbols.py` - Add pickle opcode patterns
-- `tests/test_pickle_scanner.py` - Enhanced pickle tests
-
-### Implementation Details
-
-1. **Enhance Pickle Scanner** (`modelaudit/scanners/pickle_scanner.py`):
-
-   ```python
-   import pickletools
-   from typing import Dict, Set, Tuple, Union, List
-
-   def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> Set[Tuple[str, str]]:
-       """Advanced pickle global extraction with STACK_GLOBAL and memo support"""
-       globals_found: Set[Tuple[str, str]] = set()
-       memo: Dict[Union[int, str], str] = {}
-
-       # Scan for multiple pickle streams
-       last_byte = b"dummy"
-       while last_byte != b"":
-           try:
-               ops: List[Tuple[Any, Any, Union[int, None]]] = list(pickletools.genops(data))
-           except Exception as e:
-               # Return any globals found so far
-               if len(globals_found) > 0:
-                   logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                   return globals_found
-               raise
-
-           last_byte = data.read(1)
-           data.seek(-1, 1)
-
-           # Process opcodes
-           for n, (opcode, arg, pos) in enumerate(ops):
-               op_name = opcode.name
-
-               # Handle memo operations
-               if op_name == "MEMOIZE" and n > 0:
-                   memo[len(memo)] = ops[n - 1][1]
-               elif op_name in ["PUT", "BINPUT", "LONG_BINPUT"] and n > 0:
-                   memo[arg] = ops[n - 1][1]
-
-               # Handle global imports
-               elif op_name in ("GLOBAL", "INST"):
-                   globals_found.add(tuple(arg.split(" ", 1)))
-
-               # Handle STACK_GLOBAL - this is the sophisticated part ModelScan has
-               elif op_name == "STACK_GLOBAL":
-                   values = self._extract_stack_global_values(ops, n, memo)
-                   if len(values) == 2:
-                       globals_found.add((values[1], values[0]))  # module, name
-                   else:
-                       logger.debug(f"STACK_GLOBAL parsing failed at position {n}, found {len(values)} values")
-                       globals_found.add(("unknown", "unknown"))  # Flag as suspicious
-
-           if not multiple_pickles:
-               break
-
-       return globals_found
-
-   def _extract_stack_global_values(self, ops: List, position: int, memo: Dict) -> List[str]:
-       """Extract values for STACK_GLOBAL opcode by walking backwards through stack"""
-       values = []
-
-       for offset in range(1, min(position + 1, 10)):  # Look back max 10 operations
-           prev_op = ops[position - offset]
-           op_name = prev_op[0].name
-           op_value = prev_op[1]
-
-           # Skip memo operations
-           if op_name in ["MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"]:
-               continue
-
-           # Handle memo references
-           elif op_name in ["GET", "BINGET", "LONG_BINGET"]:
-               if op_value in memo:
-                   values.append(memo[op_value])
-               else:
-                   values.append("unknown")
-
-           # Handle string values
-           elif op_name in ["SHORT_BINUNICODE", "UNICODE", "BINUNICODE", "BINUNICODE8"]:
-               values.append(op_value)
-
-           # Unknown opcode in stack - flag as suspicious
-           else:
-               logger.debug(f"Non-string opcode {op_name} in STACK_GLOBAL analysis")
-               values.append("unknown")
-
-           if len(values) == 2:
-               break
-
-       return values
-   ```
-
-2. **Update suspicious_symbols.py**:
-
-   ```python
-   # Add sophisticated pickle patterns
-   ADVANCED_PICKLE_PATTERNS = {
-       # OS aliases that ModelScan detects but ModelAudit might miss
-       "nt": "*",           # Windows os module alias
-       "posix": "*",        # Unix os module alias
-
-       # Advanced exploitation patterns
-       "operator": ["attrgetter"],  # Attribute access bypass
-       "pty": "*",          # Pseudo-terminal spawning
-       "bdb": "*",          # Python debugger access
-       "asyncio": "*",      # Asynchronous execution
-       "_pickle": "*",      # Low-level pickle module
-
-       # Memo-based attacks
-       "types": ["CodeType", "FunctionType"],  # Code object construction
-   }
-   ```
-
-### Test Assets Required
-
-Create sophisticated pickle test files in `tests/assets/pickles/`:
-
-```python
-# tests/assets/generators/generate_advanced_pickle_tests.py
-import pickle
-import pickletools
-
-def generate_stack_global_attack():
-    """Generate pickle that uses STACK_GLOBAL to obfuscate os.system"""
-    class StackGlobalAttack:
-        def __reduce__(self):
-            # This will generate STACK_GLOBAL opcodes
-            return (getattr, (__import__('os'), 'system')), ('echo pwned',)
-
-    with open('tests/assets/pickles/stack_global_attack.pkl', 'wb') as f:
-        pickle.dump(StackGlobalAttack(), f)
-
-def generate_memo_based_attack():
-    """Generate pickle that uses memo objects to hide malicious references"""
-    class MemoAttack:
-        def __reduce__(self):
-            dangerous_module = __import__('subprocess')
-            # Force memo storage
-            return (dangerous_module.call, (['echo', 'memo_attack'],))
-
-    with open('tests/assets/pickles/memo_attack.pkl', 'wb') as f:
-        pickle.dump(MemoAttack(), f)
-
-def generate_multiple_pickle_attack():
-    """Generate file with multiple pickle streams"""
-    import io
-
-    buffer = io.BytesIO()
-
-    # First pickle - appears safe
-    safe_data = {'model': 'safe_weights'}
-    pickle.dump(safe_data, buffer)
-
-    # Second pickle - malicious
-    class HiddenAttack:
-        def __reduce__(self):
-            return (eval, ("__import__('os').system('hidden_attack')",))
-
-    pickle.dump(HiddenAttack(), buffer)
-
-    with open('tests/assets/pickles/multiple_stream_attack.pkl', 'wb') as f:
-        f.write(buffer.getvalue())
-```
-
-### Validation Steps
-
-1. **Unit Tests** (`tests/test_pickle_advanced.py`):
-
-   ```python
-   def test_stack_global_detection():
-       scanner = PickleScanner()
-       result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
-
-       # Should detect the obfuscated os.system reference
-       assert len(result.issues) > 0
-       os_issues = [i for i in result.issues if "os" in i.message.lower()]
-       assert len(os_issues) > 0
-
-   def test_memo_object_tracking():
-       scanner = PickleScanner()
-       result = scanner.scan("tests/assets/pickles/memo_attack.pkl")
-
-       # Should detect subprocess even when accessed via memo
-       assert len(result.issues) > 0
-       subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
-       assert len(subprocess_issues) > 0
-
-   def test_multiple_pickle_streams():
-       scanner = PickleScanner()
-       result = scanner.scan("tests/assets/pickles/multiple_stream_attack.pkl")
-
-       # Should find the malicious second pickle
-       assert len(result.issues) > 0
-       eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
-       assert len(eval_issues) > 0
-   ```
-
-2. **Integration Tests**:
-
-   ```bash
-   # Test against ModelScan's test cases if available
-   rye run pytest tests/test_pickle_advanced.py -v
-
-   # Performance test - should handle large pickle files
-   rye run modelaudit tests/assets/pickles/large_pickle_with_multiple_streams.pkl --timeout 30
-   ```
-
-### Acceptance Criteria
-
-- [ ] Detects STACK_GLOBAL-based attacks that simple pattern matching misses
-- [ ] Properly tracks memo objects across pickle operations
-- [ ] Supports multiple pickle streams in single file
-- [ ] Maintains performance on large pickle files
-- [ ] Comprehensive test coverage including edge cases
-- [ ] No regression in existing pickle detection capability
 
 ---
 
@@ -829,245 +595,6 @@ Implement external TOML configuration files for security rules, allowing enterpr
 
 ---
 
-## ✅ ~~Task 5: Implement Multiple Pickle Stream Support~~ **COMPLETED** 
-
-**Status**: ✅ **ALREADY IMPLEMENTED** as part of enhanced pickle scanner
-
-Multiple pickle stream support is already implemented in the current pickle scanner. The `_extract_globals_advanced()` method includes a `multiple_pickles=True` parameter and processes multiple pickle streams within single files.
-
-**Remove this task - it's done.**
-
-### Files to Modify
-
-- `modelaudit/scanners/pickle_scanner.py` - Extend pickle scanning logic
-- `tests/test_pickle_multiple_streams.py` - New comprehensive tests
-
-### Implementation Details
-
-1. **Enhance Pickle Scanner** (extend Task 2 implementation):
-
-   ```python
-   def _scan_multiple_pickle_streams(self, file_path: str) -> List[ScanResult]:
-       """Scan file for multiple pickle streams"""
-       results = []
-
-       with open(file_path, 'rb') as f:
-           stream_number = 0
-
-           while True:
-               try:
-                   # Record current position
-                   start_pos = f.tell()
-
-                   # Try to load next pickle object
-                   data = pickle.load(f)
-                   end_pos = f.tell()
-
-                   # Create sub-result for this stream
-                   stream_result = self._create_result()
-                   stream_result.metadata['stream_number'] = stream_number
-                   stream_result.metadata['stream_range'] = (start_pos, end_pos)
-
-                   # Analyze this specific pickle stream
-                   f.seek(start_pos)
-                   stream_data = f.read(end_pos - start_pos)
-                   stream_issues = self._analyze_pickle_stream(io.BytesIO(stream_data))
-
-                   for issue in stream_issues:
-                       issue.location = f"{file_path}:stream_{stream_number}"
-
-                   stream_result.issues.extend(stream_issues)
-                   results.append(stream_result)
-
-                   stream_number += 1
-
-               except EOFError:
-                   # End of file reached
-                   break
-               except Exception as e:
-                   logger.debug(f"Error reading pickle stream {stream_number}: {e}")
-                   break
-
-       return results
-   ```
-
-### Test Assets Required
-
-Generate test files with multiple pickle streams:
-
-```python
-# tests/assets/generators/generate_multiple_stream_tests.py
-def generate_hidden_malicious_stream():
-    """Safe pickle followed by malicious pickle"""
-    buffer = io.BytesIO()
-
-    # Stream 1: Legitimate model data
-    legitimate_data = {
-        'model_weights': [1.0, 2.0, 3.0],
-        'metadata': {'version': '1.0', 'author': 'legitimate_user'}
-    }
-    pickle.dump(legitimate_data, buffer)
-
-    # Stream 2: Hidden malicious payload
-    class HiddenMalware:
-        def __reduce__(self):
-            return (exec, ("import os; os.system('hidden_payload')",))
-
-    pickle.dump(HiddenMalware(), buffer)
-
-    # Stream 3: More legitimate-looking data
-    more_data = {'config': {'batch_size': 32}}
-    pickle.dump(more_data, buffer)
-
-    with open('tests/assets/pickles/hidden_multiple_stream.pkl', 'wb') as f:
-        f.write(buffer.getvalue())
-```
-
-### Validation Steps
-
-```python
-def test_multiple_stream_detection():
-    scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/hidden_multiple_stream.pkl")
-
-    # Should detect the malicious stream even when mixed with legitimate data
-    assert len(result.issues) > 0
-    exec_issues = [i for i in result.issues if "exec" in i.message.lower()]
-    assert len(exec_issues) > 0
-
-    # Should identify which stream contains the issue
-    assert "stream_1" in exec_issues[0].location
-
-def test_stream_isolation():
-    scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/mixed_streams.pkl")
-
-    # Each stream should be analyzed independently
-    stream_results = [i for i in result.issues if "stream_" in i.location]
-    assert len(stream_results) > 0
-```
-
-### Acceptance Criteria
-
-- [ ] Detects malicious content in any pickle stream within a file
-- [ ] Provides clear location information (stream number)
-- [ ] Handles files with dozens of pickle streams efficiently
-- [ ] No false negatives when malicious content is in later streams
-- [ ] Graceful handling of corrupted pickle streams
-
----
-
-## ✅ ~~Task 6: Add OS Alias Detection (Windows/Unix)~~ **COMPLETED**
-
-**Status**: ✅ **ALREADY IMPLEMENTED**
-
-**Remove this task - it's done.** The current codebase includes OS alias detection:
-- `nt` and `posix` modules are detected in `modelaudit/explanations.py`
-- OS aliases are included in suspicious symbol patterns
-- Detection covers Windows and Unix system call aliases
-
-### Objective
-
-Detect Windows (`nt`) and Unix (`posix`) OS module aliases that attackers use to evade basic `os` module detection.
-
-### Files to Modify
-
-- `modelaudit/suspicious_symbols.py` - Add OS alias patterns
-- `tests/test_os_alias_detection.py` - Comprehensive tests
-
-### Implementation Details
-
-1. **Update Suspicious Symbols**:
-
-   ```python
-   # Add to SUSPICIOUS_GLOBALS
-   OS_MODULE_ALIASES = {
-       # Windows OS module aliases
-       "nt": {
-           "severity": "CRITICAL",
-           "description": "Windows OS module alias - provides system access including os.system()",
-           "functions": "*"  # All functions are dangerous
-       },
-
-       # Unix/Linux OS module aliases
-       "posix": {
-           "severity": "CRITICAL",
-           "description": "Unix/Linux OS module alias - provides system access including os.system()",
-           "functions": "*"
-       },
-
-       # Platform-specific dangerous functions
-       "ntpath": {
-           "severity": "HIGH",
-           "description": "Windows path manipulation - can access restricted paths",
-           "functions": "*"
-       },
-
-       "posixpath": {
-           "severity": "HIGH",
-           "description": "Unix path manipulation - can access restricted paths",
-           "functions": "*"
-       }
-   }
-   ```
-
-### Test Assets Required
-
-```python
-# tests/assets/generators/generate_os_alias_tests.py
-def generate_nt_alias_attack():
-    """Generate pickle using nt module (Windows os alias)"""
-    class NTAttack:
-        def __reduce__(self):
-            # Use nt instead of os to evade detection
-            return (__import__('nt').system, ('calc.exe',))
-
-    with open('tests/assets/pickles/nt_alias_attack.pkl', 'wb') as f:
-        pickle.dump(NTAttack(), f)
-
-def generate_posix_alias_attack():
-    """Generate pickle using posix module (Unix os alias)"""
-    class PosixAttack:
-        def __reduce__(self):
-            # Use posix instead of os to evade detection
-            return (__import__('posix').system, ('/bin/sh -c "echo pwned"',))
-
-    with open('tests/assets/pickles/posix_alias_attack.pkl', 'wb') as f:
-        pickle.dump(PosixAttack(), f)
-```
-
-### Validation Steps
-
-```python
-def test_nt_alias_detection():
-    scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/nt_alias_attack.pkl")
-
-    assert len(result.issues) > 0
-    nt_issues = [i for i in result.issues if "nt" in i.message.lower()]
-    assert len(nt_issues) > 0
-    assert nt_issues[0].severity == IssueSeverity.CRITICAL
-
-def test_posix_alias_detection():
-    scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/posix_alias_attack.pkl")
-
-    assert len(result.issues) > 0
-    posix_issues = [i for i in result.issues if "posix" in i.message.lower()]
-    assert len(posix_issues) > 0
-    assert posix_issues[0].severity == IssueSeverity.CRITICAL
-```
-
-### Acceptance Criteria
-
-- [ ] Detects `nt` module usage with CRITICAL severity
-- [ ] Detects `posix` module usage with CRITICAL severity
-- [ ] Provides clear explanation of why these aliases are dangerous
-- [ ] Works across all pickle formats and opcode types
-- [ ] No performance impact on legitimate pickle scanning
-
----
-
 ## Task 7: Implement Better Error Handling and Graceful Degradation
 
 **Priority**: P3 - Reliability Enhancement
@@ -1414,369 +941,6 @@ def test_suspicious_vs_dangerous_classification():
 
 ---
 
-## ✅ ~~Task 9: Add Direct URL and HuggingFace Scanning Support~~ **COMPLETED**
-
-**Status**: ✅ **ALREADY IMPLEMENTED** (commit 56b17c1)
-
-**Remove this task - it's done.** The current codebase includes:
-- HuggingFace model URL support (hf:// protocol)
-- Direct file URL downloads 
-- Cloud storage integration (S3, GCS)
-- MLflow model support
-
-### Objective
-
-Implement PickleScan's direct URL scanning and HuggingFace model scanning capabilities to enhance ModelAudit's accessibility for scanning remote models.
-
-### Files to Modify
-
-- `modelaudit/utils/` - Add remote scanning utilities
-- `modelaudit/utils/remote_scanner.py` - New remote scanning logic
-- `modelaudit/cli.py` - Add --url and enhanced --hf flags
-- `tests/test_remote_scanning.py` - Remote scanning tests
-
-### Implementation Details
-
-1. **Remote Scanning Utilities** (`modelaudit/utils/remote_scanner.py`):
-
-   ```python
-   import http.client
-   import urllib.parse
-   import json
-   from typing import Dict, List, Optional
-
-   class RemoteScanner:
-       def __init__(self, timeout: int = 30):
-           self.timeout = timeout
-
-       def http_get(self, url: str) -> bytes:
-           """HTTP GET with redirect following"""
-           parsed_url = urllib.parse.urlparse(url)
-           path_and_query = parsed_url.path + ("?" + parsed_url.query if parsed_url.query else "")
-
-           conn = http.client.HTTPSConnection(parsed_url.netloc, timeout=self.timeout)
-           try:
-               conn.request("GET", path_and_query)
-               response = conn.getresponse()
-
-               if response.status == 302:  # Follow redirects
-                   return self.http_get(response.headers["Location"])
-               elif response.status >= 400:
-                   raise RuntimeError(f"HTTP {response.status} ({response.reason}) calling GET {url}")
-
-               return response.read()
-           finally:
-               conn.close()
-
-       def scan_huggingface_model(self, repo_id: str) -> List[str]:
-           """Get scannable files from HuggingFace model"""
-           api_url = f"https://huggingface.co/api/models/{repo_id}"
-           model_data = json.loads(self.http_get(api_url).decode('utf-8'))
-
-           scannable_extensions = {
-               '.pkl', '.pickle', '.pt', '.pth', '.bin', '.ckpt',
-               '.h5', '.keras', '.pb', '.onnx', '.zip', '.npz'
-           }
-
-           file_urls = []
-           for sibling in model_data.get("siblings", []):
-               filename = sibling.get("rfilename")
-               if filename and any(filename.endswith(ext) for ext in scannable_extensions):
-                   url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-                   file_urls.append(url)
-
-           return file_urls
-   ```
-
-2. **Enhanced CLI Support** (`modelaudit/cli.py`):
-
-   ```python
-   @click.option(
-       "--url",
-       type=str,
-       help="URL to scan directly (supports HTTP/HTTPS)"
-   )
-   @click.option(
-       "--hf-scan-all",
-       is_flag=True,
-       help="Scan all compatible files in HuggingFace model (not just pytorch_model.bin)"
-   )
-   def scan(paths, url, huggingface, hf_scan_all, **kwargs):
-       if url:
-           # Scan direct URL
-           return scan_remote_url(url, **kwargs)
-       elif huggingface and hf_scan_all:
-           # Scan all files in HuggingFace model
-           return scan_huggingface_comprehensive(huggingface, **kwargs)
-
-   def scan_remote_url(url: str, **kwargs):
-       """Scan a model from a direct URL"""
-       remote_scanner = RemoteScanner()
-
-       with yaspin(text=f"Downloading {url}...") as spinner:
-           try:
-               data = remote_scanner.http_get(url)
-               spinner.text = f"Scanning downloaded content ({len(data)} bytes)..."
-
-               # Create temporary file for scanning
-               import tempfile
-               with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                   tmp_file.write(data)
-                   tmp_file.flush()
-
-                   result = scan_model_directory_or_file(tmp_file.name, **kwargs)
-
-               os.unlink(tmp_file.name)
-               return result
-
-           except Exception as e:
-               spinner.fail(f"Failed to scan URL: {e}")
-               return create_error_result(str(e))
-
-   def scan_huggingface_comprehensive(repo_id: str, **kwargs):
-       """Scan all compatible files in a HuggingFace model"""
-       remote_scanner = RemoteScanner()
-
-       with yaspin(text=f"Discovering files in {repo_id}...") as spinner:
-           try:
-               file_urls = remote_scanner.scan_huggingface_model(repo_id)
-               spinner.text = f"Found {len(file_urls)} scannable files"
-
-               combined_result = create_initial_audit_result()
-
-               for i, file_url in enumerate(file_urls):
-                   spinner.text = f"Scanning {os.path.basename(file_url)} ({i+1}/{len(file_urls)})"
-                   file_result = scan_remote_url(file_url, **kwargs)
-                   # Merge results
-                   combined_result.issues.extend(file_result.issues)
-                   combined_result.files_scanned += file_result.files_scanned
-
-               return combined_result
-
-           except Exception as e:
-               spinner.fail(f"Failed to scan HuggingFace model: {e}")
-               return create_error_result(str(e))
-   ```
-
-### Test Implementation
-
-```python
-def test_direct_url_scanning():
-    """Test scanning model from direct URL"""
-    # Mock HTTP response with malicious pickle
-    with patch('http.client.HTTPSConnection') as mock_conn:
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_response.read.return_value = create_malicious_pickle_bytes()
-        mock_conn.return_value.__enter__.return_value.getresponse.return_value = mock_response
-
-        result = runner.invoke(cli, ['--url', 'https://example.com/model.pkl'])
-        assert result.exit_code == 1  # Should detect malicious content
-        assert "eval" in result.output.lower()
-
-def test_huggingface_comprehensive_scan():
-    """Test comprehensive HuggingFace model scanning"""
-    with patch('modelaudit.utils.remote_scanner.RemoteScanner.scan_huggingface_model') as mock_hf:
-        mock_hf.return_value = ['https://hf.co/model/pytorch_model.bin', 'https://hf.co/model/config.json']
-
-        result = runner.invoke(cli, ['--hf', 'test/model', '--hf-scan-all'])
-        assert result.exit_code == 0
-        assert "Found 2 scannable files" in result.output
-```
-
-### Acceptance Criteria
-
-- [ ] Direct URL scanning with HTTP/HTTPS support
-- [ ] Comprehensive HuggingFace model scanning (all compatible files)
-- [ ] Progress indicators for remote downloads
-- [ ] Proper error handling for network failures
-- [ ] Timeout configuration for remote requests
-- [ ] Support for redirects and common HTTP status codes
-
----
-
-## ✅ ~~Task 10: Implement Magic Byte and File Format Detection~~ **COMPLETED**
-
-**Status**: ✅ **ALREADY IMPLEMENTED**
-
-**Remove this task - it's done.** The current codebase includes comprehensive magic byte detection in `modelaudit/utils/filetype.py`:
-- Magic byte detection for all major ML formats (GGUF, GGML, HDF5, SafeTensors, etc.)
-- Format validation against file extensions
-- Comprehensive file type detection system
-
-### Objective
-
-Add PickleScan's magic byte detection for more reliable file format identification, reducing reliance on file extensions and improving detection of disguised malicious files.
-
-### Files to Modify
-
-- `modelaudit/utils/filetype.py` - Enhanced magic byte detection
-- `modelaudit/scanners/pickle_scanner.py` - Use magic byte detection
-- `tests/test_magic_byte_detection.py` - Magic byte tests
-
-### Implementation Details
-
-1. **Enhanced Magic Byte Detection** (`modelaudit/utils/filetype.py`):
-
-   ```python
-   # From PickleScan analysis - comprehensive magic byte patterns
-   PICKLE_MAGIC_BYTES = {
-       b"\x80\x00",  # Pickle protocol 0
-       b"\x80\x01",  # Pickle protocol 1
-       b"\x80\x02",  # Pickle protocol 2
-       b"\x80\x03",  # Pickle protocol 3
-       b"\x80\x04",  # Pickle protocol 4
-       b"\x80\x05",  # Pickle protocol 5
-   }
-
-   NUMPY_MAGIC_BYTES = b"\x93NUMPY"
-   PYTORCH_MAGIC_NUMBER = 0x1950a86a20f9469cfc6c
-   ZIP_MAGIC_BYTES = {b"PK\x03\x04", b"PK\x05\x06"}  # ZIP file signatures
-
-   def detect_file_format_by_magic(file_path: str) -> Optional[str]:
-       """Detect file format using magic bytes, not just extension"""
-       try:
-           with open(file_path, 'rb') as f:
-               # Read enough bytes for magic number detection
-               header = f.read(32)
-
-               # Check pickle magic bytes (protocol 2+)
-               if any(header.startswith(magic) for magic in PICKLE_MAGIC_BYTES):
-                   return "pickle"
-
-               # Check NumPy magic
-               if header.startswith(NUMPY_MAGIC_BYTES):
-                   return "numpy"
-
-               # Check ZIP magic (for PyTorch ZIP format)
-               if any(header.startswith(magic) for magic in ZIP_MAGIC_BYTES):
-                   return "zip"
-
-               # Check PyTorch magic number (old format)
-               if len(header) >= 8:
-                   try:
-                       import struct
-                       magic_num = struct.unpack('<Q', header[:8])[0]
-                       if magic_num == PYTORCH_MAGIC_NUMBER:
-                           return "pytorch_legacy"
-                   except struct.error:
-                       pass
-
-               return None
-
-       except (IOError, OSError):
-           return None
-
-   def should_scan_file(file_path: str) -> Tuple[bool, Optional[str]]:
-       """Determine if file should be scanned and what format it is"""
-       # First try magic byte detection
-       magic_format = detect_file_format_by_magic(file_path)
-       if magic_format:
-           return True, magic_format
-
-       # Fallback to extension-based detection
-       ext = os.path.splitext(file_path)[1].lower()
-       extension_formats = {
-           '.pkl': 'pickle', '.pickle': 'pickle', '.dill': 'pickle',
-           '.pt': 'pytorch', '.pth': 'pytorch', '.bin': 'pytorch',
-           '.npy': 'numpy', '.npz': 'numpy',
-           '.h5': 'keras', '.keras': 'keras',
-           '.pb': 'tensorflow',
-           '.zip': 'zip', '.tar': 'tar'
-       }
-
-       if ext in extension_formats:
-           return True, extension_formats[ext]
-
-       return False, None
-   ```
-
-2. **Integration with Pickle Scanner**:
-
-   ```python
-   def can_handle(cls, path: str) -> bool:
-       """Enhanced file detection using magic bytes"""
-       should_scan, file_format = should_scan_file(path)
-       return should_scan and file_format in ['pickle', 'pytorch', 'numpy']
-
-   def scan(self, path: str) -> ScanResult:
-       """Scan with format-aware detection"""
-       should_scan, detected_format = should_scan_file(path)
-
-       if not should_scan:
-           result = self._create_result()
-           result.add_check(
-               name="File Format Detection",
-               passed=False,
-               message=f"File format not recognized for scanning: {path}",
-               severity=IssueSeverity.INFO
-           )
-           return result
-
-       # Use detected format to guide scanning approach
-       if detected_format == 'pickle':
-           return self._scan_pickle_format(path)
-       elif detected_format == 'pytorch':
-           return self._scan_pytorch_format(path)
-       # ... etc
-   ```
-
-### Test Assets Required
-
-```python
-# tests/assets/generators/generate_disguised_files.py
-def generate_disguised_pickle():
-    """Create malicious pickle with wrong extension"""
-    class MaliciousPayload:
-        def __reduce__(self):
-            return (eval, ("__import__('os').system('echo disguised')",))
-
-    # Save as .txt file but it's actually a pickle
-    with open('tests/assets/disguised/malicious.txt', 'wb') as f:
-        pickle.dump(MaliciousPayload(), f, protocol=4)
-
-def generate_pickle_without_magic():
-    """Create pickle using protocol 0 (no magic bytes)"""
-    class OldProtocolAttack:
-        def __reduce__(self):
-            return (eval, ("print('old_protocol_attack')",))
-
-    with open('tests/assets/pickles/old_protocol.pkl', 'wb') as f:
-        pickle.dump(OldProtocolAttack(), f, protocol=0)
-```
-
-### Validation Steps
-
-```python
-def test_magic_byte_detection():
-    """Test magic byte detection overrides extension"""
-    # Pickle file with wrong extension should still be detected
-    should_scan, format_type = should_scan_file("tests/assets/disguised/malicious.txt")
-    assert should_scan == True
-    assert format_type == "pickle"
-
-def test_disguised_file_scanning():
-    """Test scanning of disguised malicious files"""
-    scanner = PickleScanner()
-    result = scanner.scan("tests/assets/disguised/malicious.txt")
-
-    # Should detect malicious content despite .txt extension
-    assert len(result.issues) > 0
-    eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
-    assert len(eval_issues) > 0
-```
-
-### Acceptance Criteria
-
-- [ ] Magic byte detection for all supported formats
-- [ ] Accurate detection regardless of file extension
-- [ ] Fallback to extension-based detection when magic bytes unavailable
-- [ ] Detection of disguised malicious files (wrong extensions)
-- [ ] Support for both old and new pickle protocols
-- [ ] Performance optimization - magic byte reading should be fast
-
----
-
 ## Task 11: Add 7-Zip Archive Support
 
 **Priority**: P3 - Format Extension
@@ -2001,14 +1165,17 @@ The following tasks address critical infrastructure issues identified in the cod
 ## TASK R-1: Refactor Monster Functions 🔴 **CRITICAL**
 
 ### Problem Description
+
 The codebase contains several extremely large functions that are unmaintainable, untestable, and error-prone:
+
 - `_scan_pickle_bytes`: **1,026 lines** (should be <50)
-- `scan_command` (CLI): **903 lines** (should be <100) 
+- `scan_command` (CLI): **903 lines** (should be <100)
 - `scan_model_directory_or_file`: **565 lines** (should be <200)
 
 These massive functions violate single responsibility principle and are major technical debt.
 
 ### Files to Modify
+
 - `modelaudit/scanners/pickle_scanner.py` - `_scan_pickle_bytes` method
 - `modelaudit/cli.py` - `scan_command` function
 - `modelaudit/core.py` - `scan_model_directory_or_file` function
@@ -2016,6 +1183,7 @@ These massive functions violate single responsibility principle and are major te
 ### Specific Changes Required
 
 #### Step 1: Break Down `_scan_pickle_bytes` (1,026 lines)
+
 Split into logical components:
 
 ```python
@@ -2023,38 +1191,39 @@ Split into logical components:
 def _scan_pickle_bytes(self, data: BinaryIO, context: str = "") -> ScanResult:
     """Main entry point - orchestrates the scan process."""
     result = self._create_result()
-    
+
     # Delegate to specialized methods
     self._analyze_pickle_structure(data, result)
-    self._extract_and_validate_globals(data, result)  
+    self._extract_and_validate_globals(data, result)
     self._detect_malicious_patterns(data, result)
     self._analyze_torch_references(data, result)
     self._perform_entropy_analysis(data, result)
-    
+
     return result
 
 def _analyze_pickle_structure(self, data: BinaryIO, result: ScanResult) -> None:
     """Analyze pickle opcodes and structure (200-300 lines)."""
     # Move opcode analysis logic here
-    
+
 def _extract_and_validate_globals(self, data: BinaryIO, result: ScanResult) -> None:
     """Extract globals and validate against known dangerous patterns (200-300 lines)."""
     # Move global extraction and validation here
-    
+
 def _detect_malicious_patterns(self, data: BinaryIO, result: ScanResult) -> None:
-    """Detect specific malicious patterns and CVEs (200-300 lines).""" 
+    """Detect specific malicious patterns and CVEs (200-300 lines)."""
     # Move pattern detection here
-    
+
 def _analyze_torch_references(self, data: BinaryIO, result: ScanResult) -> None:
     """Analyze PyTorch-specific patterns (100-200 lines)."""
     # Move PyTorch analysis here
-    
+
 def _perform_entropy_analysis(self, data: BinaryIO, result: ScanResult) -> None:
     """Perform entropy and semantic analysis (100-200 lines)."""
     # Move entropy analysis here
 ```
 
 #### Step 2: Break Down `scan_command` (903 lines)
+
 Split CLI logic into focused functions:
 
 ```python
@@ -2063,7 +1232,7 @@ def scan_command(paths, **kwargs):
     """Main scan command - delegates to specialized handlers."""
     # Input validation and setup (50 lines)
     scan_config = _prepare_scan_configuration(**kwargs)
-    
+
     if kwargs.get('url'):
         return _handle_url_scan(kwargs['url'], scan_config)
     elif kwargs.get('huggingface'):
@@ -2074,17 +1243,17 @@ def scan_command(paths, **kwargs):
 def _prepare_scan_configuration(**kwargs) -> dict:
     """Prepare and validate scan configuration (100-150 lines)."""
     # Move config preparation logic here
-    
+
 def _handle_url_scan(url: str, config: dict) -> None:
     """Handle URL-based scanning (150-200 lines)."""
     # Move URL scanning logic here
-    
+
 def _handle_huggingface_scan(model_id: str, config: dict) -> None:
     """Handle HuggingFace model scanning (150-200 lines)."""
     # Move HF scanning logic here
-    
+
 def _handle_local_scan(paths: list, config: dict) -> None:
-    """Handle local file/directory scanning (200-300 lines).""" 
+    """Handle local file/directory scanning (200-300 lines)."""
     # Move local scanning logic here
 
 def _format_and_output_results(results, config: dict) -> None:
@@ -2093,6 +1262,7 @@ def _format_and_output_results(results, config: dict) -> None:
 ```
 
 #### Step 3: Break Down `scan_model_directory_or_file` (565 lines)
+
 Refactor core scanning logic:
 
 ```python
@@ -2104,32 +1274,33 @@ def scan_model_directory_or_file(path: str, config: dict = None) -> ScanResult:
 
 class ScannerCoordinator:
     """Coordinates scanning across multiple scanners and handles complex logic."""
-    
+
     def __init__(self, config: dict = None):
         self.config = config or {}
         self.progress_tracker = self._setup_progress_tracking()
-        
+
     def scan(self, path: str) -> ScanResult:
         """Coordinate the scanning process."""
         return self._scan_with_validation_and_progress(path)
-        
+
     def _scan_with_validation_and_progress(self, path: str) -> ScanResult:
         """Handle validation, progress tracking, and error recovery (150-200 lines)."""
         # Move validation and progress logic here
-        
+
     def _coordinate_scanner_execution(self, path: str) -> ScanResult:
         """Execute appropriate scanners and aggregate results (150-200 lines)."""
         # Move scanner coordination here
-        
+
     def _handle_scan_errors_and_timeouts(self, path: str) -> ScanResult:
         """Handle errors, timeouts, and edge cases (100-150 lines)."""
         # Move error handling here
 ```
 
 ### Success Criteria
+
 1. ✅ No function longer than 200 lines
 2. ✅ `_scan_pickle_bytes` split into 5+ focused methods
-3. ✅ `scan_command` split into 6+ focused functions  
+3. ✅ `scan_command` split into 6+ focused functions
 4. ✅ `scan_model_directory_or_file` refactored using coordinator pattern
 5. ✅ All existing tests pass
 6. ✅ New unit tests for each extracted function
@@ -2145,22 +1316,22 @@ def test_analyze_pickle_structure():
     """Test pickle structure analysis in isolation."""
     scanner = PickleScanner()
     result = ScanResult("pickle")
-    
+
     with io.BytesIO(create_test_pickle_bytes()) as data:
         scanner._analyze_pickle_structure(data, result)
-    
+
     # Verify specific structure analysis results
     assert len(result.checks) > 0
     assert any("opcode" in check.name.lower() for check in result.checks)
 
 def test_extract_and_validate_globals():
-    """Test global extraction and validation in isolation.""" 
+    """Test global extraction and validation in isolation."""
     scanner = PickleScanner()
     result = ScanResult("pickle")
-    
+
     with io.BytesIO(create_malicious_pickle_bytes()) as data:
         scanner._extract_and_validate_globals(data, result)
-    
+
     # Verify globals were extracted and validated
     assert len(result.issues) > 0
     assert any("eval" in issue.message.lower() for issue in result.issues)
@@ -2169,6 +1340,7 @@ def test_extract_and_validate_globals():
 ### Validation Steps
 
 1. **Complexity Analysis**:
+
    ```bash
    # Before refactoring
    python -c "
@@ -2179,11 +1351,12 @@ def test_extract_and_validate_globals():
        if isinstance(node, ast.FunctionDef) and node.name == '_scan_pickle_bytes':
            print(f'Lines: {node.end_lineno - node.lineno}')
    "
-   
+
    # After refactoring - should be <100 lines per function
    ```
 
 2. **Test Coverage**:
+
    ```bash
    # Ensure coverage doesn't decrease
    rye run pytest --cov=modelaudit.scanners.pickle_scanner --cov-report=html
@@ -2192,20 +1365,21 @@ def test_extract_and_validate_globals():
    ```
 
 3. **Performance Verification**:
+
    ```bash
    # Ensure refactoring doesn't impact performance
    rye run python -c "
    import time
    import tempfile
    from modelaudit.scanners.pickle_scanner import PickleScanner
-   
+
    scanner = PickleScanner()
-   
+
    # Time before/after refactoring
    start = time.time()
    result = scanner.scan('tests/assets/large_pickle.pkl')
    duration = time.time() - start
-   
+
    print(f'Scan time: {duration:.3f}s')
    assert duration < 5.0, 'Refactoring caused performance regression'
    "
@@ -2216,17 +1390,21 @@ def test_extract_and_validate_globals():
 ## TASK R-2: Refactor God Classes 🟡 **HIGH**
 
 ### Problem Description
+
 Several classes have too many responsibilities:
+
 - `BaseScanner`: **35 methods** (should be <20)
 - `ScanResultsCache`: **19 methods** (should be <15)
 
 ### Files to Modify
+
 - `modelaudit/scanners/base.py` - BaseScanner class
 - `modelaudit/cache/scan_results_cache.py` - ScanResultsCache class
 
 ### Specific Changes Required
 
 #### Step 1: Extract Mixins from BaseScanner
+
 ```python
 # Create scanners/mixins/
 class ValidationMixin:
@@ -2235,12 +1413,12 @@ class ValidationMixin:
     def check_file_access(self, path: str) -> bool: ...
     def validate_file_size(self, path: str) -> bool: ...
 
-class ProgressMixin: 
+class ProgressMixin:
     """Handles progress tracking and timeout management."""
     def setup_progress_tracking(self): ...
     def update_progress(self, bytes_scanned: int): ...
     def handle_timeout(self): ...
-    
+
 class AnalysisMixin:
     """Handles ML context and semantic analysis integration."""
     def analyze_ml_context(self, data): ...
@@ -2251,7 +1429,8 @@ class BaseScanner(ValidationMixin, ProgressMixin, AnalysisMixin):
     # Core scanning methods only
 ```
 
-#### Step 2: Split ScanResultsCache  
+#### Step 2: Split ScanResultsCache
+
 ```python
 # Create cache/components/
 class CacheKeyGenerator:
@@ -2260,7 +1439,7 @@ class CacheKeyGenerator:
     def hash_file_content(self, path: str) -> str: ...
 
 class CacheValidator:
-    """Responsible only for cache validation.""" 
+    """Responsible only for cache validation."""
     def is_entry_valid(self, entry: dict, path: str) -> bool: ...
     def validate_cache_integrity(self, entry: dict) -> bool: ...
 
@@ -2278,6 +1457,7 @@ class ScanResultsCache:
 ```
 
 ### Success Criteria
+
 1. ✅ No class with more than 20 methods
 2. ✅ Clear separation of concerns
 3. ✅ Improved testability
@@ -2288,6 +1468,7 @@ class ScanResultsCache:
 ## TASK R-3: Refactor Large Scanner Methods 🟡 **HIGH**
 
 ### Problem Description
+
 Several scanner classes have excessively long methods that violate the single responsibility principle and are hard to test and maintain.
 
 ### Critical Functions to Refactor
@@ -2307,6 +1488,7 @@ Several scanner classes have excessively long methods that violate the single re
    - Complex nested analysis logic
 
 ### Files to Modify
+
 - `modelaudit/scanners/pytorch_zip_scanner.py`
 - `modelaudit/cli.py`
 - `modelaudit/scanners/flax_msgpack_scanner.py`
@@ -2314,12 +1496,13 @@ Several scanner classes have excessively long methods that violate the single re
 ### Refactoring Strategy
 
 **PyTorch ZIP Scanner breakdown:**
+
 ```python
 # Current 498-line scan() method should become:
 def scan(self, path: str) -> ScanResult:
     """Main scan orchestrator - keep under 50 lines"""
     result = ScanResult(path)
-    
+
     try:
         with ZipFile(path, 'r') as zip_file:
             safe_entries = self._validate_zip_entries(zip_file, result)
@@ -2328,18 +1511,19 @@ def scan(self, path: str) -> ScanResult:
             self._check_vulnerabilities(zip_file, result)
     except Exception as e:
         self._handle_scan_error(e, result)
-    
+
     return result
 
 # Split into focused methods:
 def _validate_zip_entries(self, zip_file, result) -> list[str]
 def _scan_pickle_files(self, zip_file, entries, result) -> None
-def _extract_and_validate_metadata(self, zip_file, entries, result) -> None  
+def _extract_and_validate_metadata(self, zip_file, entries, result) -> None
 def _check_vulnerabilities(self, zip_file, result) -> None
 def _handle_scan_error(self, error, result) -> None
 ```
 
 ### Success Criteria
+
 1. ✅ No method over 100 lines (target: <80 lines each)
 2. ✅ Each method has single responsibility
 3. ✅ All existing functionality preserved
@@ -2347,6 +1531,7 @@ def _handle_scan_error(self, error, result) -> None
 5. ✅ Performance not degraded
 
 ### Validation Steps
+
 ```bash
 # Check method lengths
 python -c "
@@ -2375,22 +1560,25 @@ rye run modelaudit tests/assets/pytorch/malicious_pickle.zip
 ## TASK U-1: Eliminate CLI Flag Explosion 🔴 **CRITICAL USABILITY**
 
 ### Problem Description
+
 The CLI currently has **24+ flags** making it overwhelming and unusable for most users. The help output is massive, options are confusing, and there are multiple redundant ways to accomplish similar tasks.
 
 **Current flag count**: 24+ flags in scan command alone
 **User impact**: Overwhelming, hard to discover features, analysis paralysis
 
 ### Files to Modify
+
 - `modelaudit/cli.py` - Remove/consolidate redundant flags
 - Update help text and documentation
 
 ### Specific Changes Required
 
 #### 1. **ELIMINATE: Redundant Size Controls** (Remove 2 of 3)
+
 ```python
 # CURRENT (confusing):
 --max-file-size INTEGER         # Individual file size limit
---max-total-size INTEGER        # Total scan size limit  
+--max-total-size INTEGER        # Total scan size limit
 --max-download-size TEXT        # Cloud download size limit
 
 # PROPOSED (simple):
@@ -2398,11 +1586,12 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 ```
 
 #### 2. **ELIMINATE: Progress Control Overkill** (Remove 3 of 4)
+
 ```python
 # CURRENT (overkill):
 --progress/--no-progress
 --progress-log FILE
---progress-format [tqdm|simple|json]  
+--progress-format [tqdm|simple|json]
 --progress-interval FLOAT
 
 # PROPOSED (simple):
@@ -2410,6 +1599,7 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 ```
 
 #### 3. **ELIMINATE: Authentication Confusion** (Remove 1 of 2)
+
 ```python
 # CURRENT (redundant):
 --jfrog-api-token TEXT
@@ -2420,6 +1610,7 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 ```
 
 #### 4. **ELIMINATE: Double Negative Confusion**
+
 ```python
 # CURRENT (confusing):
 --no-skip-files/--skip-files    # Double negative is confusing
@@ -2430,6 +1621,7 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 ```
 
 #### 5. **ELIMINATE: Experimental/Internal Flags**
+
 ```python
 # REMOVE ENTIRELY:
 --stream                       # Experimental - hide until stable
@@ -2439,6 +1631,7 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 ```
 
 ### Success Criteria
+
 1. ✅ **Reduce flags from 24+ to ~12** (50% reduction)
 2. ✅ **Help output fits on single screen** without scrolling
 3. ✅ **No redundant functionality** - one way to do each task
@@ -2446,6 +1639,7 @@ The CLI currently has **24+ flags** making it overwhelming and unusable for most
 5. ✅ **Maintain all core functionality** - same capabilities, simpler interface
 
 ### Validation Steps
+
 ```bash
 # Test flag reduction
 modelaudit scan --help | wc -l    # Should be <40 lines
@@ -2462,15 +1656,18 @@ modelaudit scan --help | grep -E "(no-.*-.*|not-.*-.*)" # Should be empty
 ## TASK U-2: Implement Smart CLI Defaults 🟡 **HIGH USABILITY**
 
 ### Problem Description
+
 Many flags require explicit configuration that should be automatic. Users shouldn't need to think about cache directories, progress formats, or timeout values for 90% of use cases.
 
-### Files to Modify  
+### Files to Modify
+
 - `modelaudit/cli.py` - Implement intelligent defaults
 - `modelaudit/core.py` - Auto-detection logic
 
 ### Smart Defaults to Implement
 
 #### 1. **Auto-detect Large Model Support**
+
 ```python
 # CURRENT: User must specify
 --large-model-support/--no-large-model-support
@@ -2480,7 +1677,8 @@ Many flags require explicit configuration that should be automatic. Users should
 ```
 
 #### 2. **Auto-detect Progress Display**
-```python  
+
+```python
 # CURRENT: User must specify format
 --progress-format [tqdm|simple|json]
 
@@ -2489,6 +1687,7 @@ Many flags require explicit configuration that should be automatic. Users should
 ```
 
 #### 3. **Intelligent Cache Management**
+
 ```python
 # CURRENT: User must specify cache dir
 --cache-dir DIRECTORY
@@ -2498,6 +1697,7 @@ Many flags require explicit configuration that should be automatic. Users should
 ```
 
 #### 4. **Smart Timeout Scaling**
+
 ```python
 # CURRENT: Fixed 3600 second timeout
 --timeout 3600
@@ -2507,6 +1707,7 @@ Many flags require explicit configuration that should be automatic. Users should
 ```
 
 ### Success Criteria
+
 1. ✅ **90% of scans work without any flags** beyond the file path
 2. ✅ **Auto-detection works correctly** in different environments
 3. ✅ **Performance improves** due to better defaults
@@ -2514,24 +1715,27 @@ Many flags require explicit configuration that should be automatic. Users should
 
 ---
 
-## TASK U-3: Add CLI Usability Features 🟢 **MEDIUM USABILITY**  
+## TASK U-3: Add CLI Usability Features 🟢 **MEDIUM USABILITY**
 
 ### Problem Description
+
 CLI lacks modern usability features that users expect from contemporary tools.
 
 ### Features to Add
 
 #### 1. **Interactive Mode for Complex Scans**
+
 ```bash
 # For users who don't want to learn all flags
 modelaudit scan --interactive
 ? What would you like to scan? /path/to/model
-? Output format? (text/json) text  
+? Output format? (text/json) text
 ? Include all file types? (Y/n) n
 ? Enable verbose output? (y/N) n
 ```
 
 #### 2. **Configuration File Support**
+
 ```toml
 # ~/.modelaudit/config.toml
 [scan]
@@ -2542,26 +1746,29 @@ include-all-files = false
 ```
 
 #### 3. **Scan Presets for Common Use Cases**
+
 ```bash
 modelaudit scan --preset security      # High security, strict settings
-modelaudit scan --preset fast         # Quick scan, skip expensive checks  
+modelaudit scan --preset fast         # Quick scan, skip expensive checks
 modelaudit scan --preset compliance   # Generate SBOM, detailed reporting
 ```
 
 #### 4. **Better Error Messages with Suggestions**
+
 ```bash
-# Current: 
+# Current:
 Error: Cannot access file
 
 # Proposed:
 Error: Cannot access '/path/to/model.pkl'
 Suggestions:
-  • Check if file exists: ls -la /path/to/model.pkl  
+  • Check if file exists: ls -la /path/to/model.pkl
   • Check permissions: stat /path/to/model.pkl
   • Try with sudo if needed: sudo modelaudit scan /path/to/model.pkl
 ```
 
-### Success Criteria  
+### Success Criteria
+
 1. ✅ **Interactive mode works** for complex scenarios
 2. ✅ **Config file reduces common flag usage** by 80%
 3. ✅ **Presets cover 3 major use cases**
@@ -2572,9 +1779,11 @@ Suggestions:
 ## TASK I-1: Fix Circular Import Dependencies 🔴 **CRITICAL**
 
 ### Problem Description
+
 Circular import dependency between `modelaudit/scanners/base.py` and `modelaudit/core.py` causes potential import failures and makes testing difficult.
 
 ### Files to Modify
+
 - `modelaudit/scanners/base.py` (lines 405)
 - `modelaudit/core.py` (lines 419-456)
 - Create new file: `modelaudit/utils/result_conversion.py`
@@ -2582,6 +1791,7 @@ Circular import dependency between `modelaudit/scanners/base.py` and `modelaudit
 ### Specific Changes Required
 
 #### Step 1: Create Result Conversion Utility
+
 Create `modelaudit/utils/result_conversion.py`:
 
 ```python
@@ -2598,25 +1808,25 @@ def scan_result_from_dict(result_dict: Dict[str, Any]) -> "ScanResult":
     """
     Convert a dictionary representation back to a ScanResult object.
     This is used when retrieving cached scan results that were stored as dictionaries.
-    
+
     Args:
         result_dict: Dictionary representation of a ScanResult
     Returns:
         Reconstructed ScanResult object
     """
     from ..scanners.base import ScanResult, Check, CheckStatus, Issue, IssueSeverity
-    
+
     # Create new ScanResult with the same scanner name
     scanner_name = result_dict.get("scanner", "cached")
     result = ScanResult(scanner_name=scanner_name)
-    
+
     # Restore basic properties
     result.success = result_dict.get("success", True)
     result.bytes_scanned = result_dict.get("bytes_scanned", 0)
     result.start_time = result_dict.get("start_time", time.time())
     result.end_time = result_dict.get("end_time", time.time())
     result.metadata.update(result_dict.get("metadata", {}))
-    
+
     # Restore issues from cached data
     for issue_dict in result_dict.get("issues", []):
         result.add_issue(
@@ -2626,7 +1836,7 @@ def scan_result_from_dict(result_dict: Dict[str, Any]) -> "ScanResult":
             details=issue_dict.get("details", {}),
             why=issue_dict.get("why"),
         )
-    
+
     # Restore checks from cached data
     for check_dict in result_dict.get("checks", []):
         try:
@@ -2644,11 +1854,12 @@ def scan_result_from_dict(result_dict: Dict[str, Any]) -> "ScanResult":
         except Exception as e:
             # If we can't reconstruct a check, log and continue
             logger.debug(f"Could not reconstruct check from cache: {e}")
-    
+
     return result
 ```
 
 #### Step 2: Update Scanner Base Class
+
 In `modelaudit/scanners/base.py`, replace the import on line 405:
 
 ```python
@@ -2666,6 +1877,7 @@ return scan_result_from_dict(result_dict)
 ```
 
 #### Step 3: Update Core Module
+
 In `modelaudit/core.py`, replace the function definition (lines 419-456):
 
 ```python
@@ -2679,6 +1891,7 @@ return scan_result_from_dict(result_dict)
 ```
 
 ### Success Criteria
+
 1. ✅ No circular import warnings when running `python -c "import modelaudit"`
 2. ✅ All existing tests pass: `rye run pytest -n auto`
 3. ✅ Import graph is acyclic (verify with `pydeps modelaudit --show-cycles`)
@@ -2712,9 +1925,11 @@ rye run pytest -n auto -m "not slow and not integration"
 ## TASK I-2: Fix Thread-Safe Cache Manager 🟡 **HIGH**
 
 ### Problem Description
+
 Global cache manager singleton is not thread-safe, causing potential race conditions in multi-threaded environments.
 
 ### Files to Modify
+
 - `modelaudit/cache/cache_manager.py` (lines 149-174)
 
 ### Specific Changes Required
@@ -2732,23 +1947,23 @@ _global_cache_manager: Optional[CacheManager] = None
 def get_cache_manager(cache_dir: Optional[str] = None, enabled: bool = True) -> CacheManager:
     """
     Get global cache manager instance (thread-safe).
-    
+
     Args:
         cache_dir: Optional cache directory path
         enabled: Whether caching should be enabled
-    
+
     Returns:
         Global cache manager instance
     """
     global _global_cache_manager
-    
+
     # Double-checked locking pattern for thread safety
     if _global_cache_manager is None:
         with _cache_manager_lock:
             # Check again inside the lock
             if _global_cache_manager is None:
                 _global_cache_manager = CacheManager(cache_dir, enabled)
-    
+
     return _global_cache_manager
 
 
@@ -2760,6 +1975,7 @@ def reset_cache_manager() -> None:
 ```
 
 ### Success Criteria
+
 1. ✅ All existing cache tests pass: `rye run pytest tests/test_cache_cli.py -v`
 2. ✅ No race conditions in concurrent cache access
 3. ✅ Performance impact is negligible (< 5% overhead)
@@ -2799,9 +2015,11 @@ rye run pytest tests/test_cache_cli.py tests/test_cli_cache_dir.py -v
 ## TASK I-3: Consolidate Duplicate Caching Logic 🟡 **HIGH**
 
 ### Problem Description
+
 Caching logic is duplicated between core-level (`modelaudit/core.py`) and scanner-level (`modelaudit/scanners/base.py`), leading to maintenance issues and potential double-caching.
 
 ### Files to Modify
+
 - `modelaudit/core.py` (lines 520-548)
 - `modelaudit/scanners/base.py` (lines 380-413)
 - Create new file: `modelaudit/utils/cache_decorator.py`
@@ -2809,6 +2027,7 @@ Caching logic is duplicated between core-level (`modelaudit/core.py`) and scanne
 ### Specific Changes Required
 
 #### Step 1: Create Cache Decorator
+
 Create `modelaudit/utils/cache_decorator.py`:
 
 ```python
@@ -2838,25 +2057,25 @@ def cached_scan(
                 config = args[1] or {}
             else:
                 config = kwargs.get("config", {})
-            
+
             # Check cache configuration
             cache_enabled = config.get(cache_enabled_key, True)
             cache_dir = config.get(cache_dir_key)
-            
+
             # If caching is disabled, call function directly
             if not cache_enabled:
                 return func(*args, **kwargs)
-            
+
             # Get file path (assume first argument is path)
             file_path = args[0] if args else kwargs.get('path', '')
             if not file_path:
                 return func(*args, **kwargs)
-            
+
             # Use cache manager for cache-enabled operations
             try:
                 from ..cache import get_cache_manager
                 cache_manager = get_cache_manager(cache_dir, enabled=True)
-                
+
                 def cached_func_wrapper(fpath: str) -> dict:
                     result = func(*args, **kwargs)
                     if hasattr(result, 'to_dict'):
@@ -2865,20 +2084,20 @@ def cached_scan(
                         return result
                     else:
                         return {"result": str(result), "success": True}
-                
+
                 result_dict = cache_manager.cached_scan(file_path, cached_func_wrapper)
-                
+
                 # Convert back to original type if needed
                 if hasattr(result_dict, 'get') and 'scanner' in result_dict:
                     from .result_conversion import scan_result_from_dict
                     return scan_result_from_dict(result_dict)
-                
+
                 return result_dict
-                
+
             except Exception as e:
                 logger.warning(f"Cache system error for {file_path}: {e}. Falling back to direct execution.")
                 return func(*args, **kwargs)
-        
+
         return wrapper
     return decorator
 ```
@@ -2886,6 +2105,7 @@ def cached_scan(
 #### Step 2: Update Core Module and Scanner Base Class
 
 In `modelaudit/core.py`:
+
 ```python
 from .utils.cache_decorator import cached_scan
 
@@ -2896,6 +2116,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 ```
 
 In `modelaudit/scanners/base.py`:
+
 ```python
 from ..utils.cache_decorator import cached_scan
 
@@ -2906,6 +2127,7 @@ def scan_with_cache(self, path: str) -> ScanResult:
 ```
 
 ### Success Criteria
+
 1. ✅ All existing cache tests pass
 2. ✅ No double-caching occurs (verified via logging)
 3. ✅ Code duplication reduced by 80+ lines
@@ -2955,15 +2177,18 @@ os.unlink(test_file)
 ## TASK I-4: Improve Exception Handling Specificity 🟢 **MEDIUM**
 
 ### Problem Description
+
 The codebase uses broad `except Exception` blocks that silently catch and mask legitimate errors, making debugging difficult.
 
 ### Files to Modify
+
 - `modelaudit/cache/scan_results_cache.py` (lines 100, 152, 214, 274, 327, 380, 444, 455)
 - `modelaudit/cache/cache_manager.py` (lines 108)
 
 ### Specific Changes Required
 
 #### Step 1: Create Custom Cache Exceptions
+
 Create `modelaudit/cache/exceptions.py`:
 
 ```python
@@ -3017,6 +2242,7 @@ except Exception as e:
 ```
 
 ### Success Criteria
+
 1. ✅ All existing tests pass
 2. ✅ New specific exception types are used appropriately
 3. ✅ Error messages are more informative and actionable
@@ -3044,7 +2270,7 @@ result = cache.get_cached_result('/non/existent/file.pkl')
 assert result is None
 print('✅ Handles non-existent files')
 
-# Should handle valid operations normally  
+# Should handle valid operations normally
 cache.store_result(test_file, {'test': 'data'})
 result = cache.get_cached_result(test_file)
 assert result is not None
@@ -3061,9 +2287,11 @@ print('All error resilience tests passed!')
 ## TASK I-5: Performance Optimization - Reduce File System Calls 🔵 **LOW**
 
 ### Problem Description
+
 Redundant file system calls in cache operations slow down performance, particularly `os.stat()` being called multiple times for the same file.
 
 ### Files to Modify
+
 - `modelaudit/cache/scan_results_cache.py` (lines 120-130, 255-275)
 
 ### Specific Changes Required
@@ -3075,7 +2303,7 @@ def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result
     """Generate cache key with optional stat reuse."""
     if file_stat is None:
         file_stat = os.stat(file_path)
-    
+
     # Use file_stat.st_size and file_stat.st_mtime instead of calling os.stat() again
     # ... rest of method
 
@@ -3084,13 +2312,14 @@ def store_result(self, file_path: str, scan_result: dict[str, Any]) -> None:
     try:
         # Get file stats ONCE and reuse
         file_stat = os.stat(file_path)
-        
+
         # Pass file_stat to avoid redundant calls
         cache_key = self._generate_cache_key(file_path, file_stat=file_stat)
         # ... use file_stat throughout method
 ```
 
 ### Success Criteria
+
 1. ✅ File system calls reduced by 30-50%
 2. ✅ Cache operations are 10-20% faster
 3. ✅ All existing functionality preserved
@@ -3138,7 +2367,7 @@ After completing infrastructure tasks I-1 through I-5:
 # 1. Full test suite
 rye run pytest -n auto
 
-# 2. Static analysis  
+# 2. Static analysis
 pydeps modelaudit --show-cycles  # Should show no cycles
 rye run ruff check modelaudit/
 rye run mypy modelaudit/
@@ -3147,15 +2376,16 @@ rye run mypy modelaudit/
 rye run modelaudit scan tests/assets/samples/pickles/safe_data.pkl --format json
 rye run modelaudit cache stats
 
-# 4. Performance validation  
+# 4. Performance validation
 # Run timing tests to ensure no performance regressions
 ```
 
 ## Success Metrics
 
 After completing infrastructure tasks:
+
 - ✅ Circular import dependencies: 0
 - ✅ Thread-safe cache operations
-- ✅ 80+ lines of duplicate code eliminated  
+- ✅ 80+ lines of duplicate code eliminated
 - ✅ Broad exception handlers reduced by 70%
 - ✅ File system calls reduced by 30-50%
