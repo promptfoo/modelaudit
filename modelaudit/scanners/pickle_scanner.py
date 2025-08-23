@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import Any, BinaryIO, ClassVar, Optional, Union
+from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
 
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
@@ -27,6 +27,30 @@ from ..explanations import (
 )
 from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+
+
+def _compute_pickle_length(path: str) -> int:
+    """
+    Compute the exact length of pickle data by finding the STOP opcode position.
+
+    Args:
+        path: Path to the file containing pickle data
+
+    Returns:
+        The byte position where pickle data ends, or a fallback estimate
+    """
+    try:
+        with open(path, "rb") as f:
+            for opcode, _arg, pos in pickletools.genops(f):
+                if opcode.name == "STOP" and pos is not None:
+                    return pos + 1  # Include the STOP opcode itself
+        # If no STOP found, fallback to file size (malformed pickle)
+        return os.path.getsize(path)
+    except Exception:
+        # Fallback to conservative estimate on any error
+        file_size = os.path.getsize(path)
+        return min(file_size // 2, 64)
+
 
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
@@ -990,6 +1014,9 @@ class PickleScanner(BaseScanner):
                         "recursion_limited": True,
                         "file_size": file_size,
                         "security_issues_found": True,
+                        # Add precise metadata fields using pickletools for accuracy
+                        "pickle_bytes": _compute_pickle_length(path),
+                        "binary_bytes": max(file_size - _compute_pickle_length(path), 0),
                     }
                 )
                 # Add a note about the recursion limit but don't treat it as the main issue
@@ -1106,7 +1133,99 @@ class PickleScanner(BaseScanner):
                 result.finish(success=True)  # Mark as successful scan despite limitation
                 return result
 
-            # Handle as critical error for unknown/suspicious cases
+            # Handle different types of parsing errors more gracefully
+            error_message = str(e).lower()
+            if "opcode" in error_message or "unknown" in error_message:
+                # This could be a complex pickle file, corrupted data, or binary file
+                file_ext = os.path.splitext(path)[1].lower()
+
+                if is_bin_file:
+                    # Binary file that's not a pickle - handle gracefully
+                    logger.debug(f"Binary file {path} does not contain valid pickle data: {e}")
+                    result.add_check(
+                        name="Pickle Format Check",
+                        passed=True,  # Not failing this as it's expected for binary files
+                        message="File appears to be binary data rather than pickle format",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "file_type": "binary",
+                            "pickle_parse_error": str(e),
+                            "early_detection_successful": early_detection_successful,
+                        },
+                        why=(
+                            "This binary file does not contain valid pickle data structure. "
+                            "Binary content was analyzed for security patterns instead."
+                        ),
+                    )
+
+                    # If early detection was successful, also perform comprehensive binary scan
+                    if early_detection_successful:
+                        result.metadata.update(
+                            {
+                                "file_type": "binary",
+                                "pickle_parsing_failed": True,
+                            }
+                        )
+
+                        # Perform comprehensive binary scan of the entire file
+                        try:
+                            with open(path, "rb") as f:
+                                binary_result = self._scan_binary_content(f, 0, file_size)
+                                # Add binary scanning results
+                                for issue in binary_result.issues:
+                                    result.add_check(
+                                        name="Binary Content Check",
+                                        passed=False,
+                                        message=issue.message,
+                                        severity=issue.severity,
+                                        location=issue.location,
+                                        details=issue.details,
+                                        why=issue.why,
+                                    )
+                                result.metadata["binary_scan_completed"] = True
+                                result.metadata["binary_bytes"] = file_size
+                        except Exception as binary_scan_error:
+                            logger.warning(f"Binary scan failed for {path}: {binary_scan_error}")
+                            result.metadata["binary_scan_failed"] = str(binary_scan_error)
+
+                        result.finish(success=True)
+                        return result
+
+                elif file_ext in [".pkl", ".pickle", ".joblib", ".dill"]:
+                    # Pickle-like file with parsing issues - handle as format complexity
+                    logger.debug(f"Pickle file {path} truncated due to format complexity: {e}")
+                    result.add_check(
+                        name="Pickle Format Complexity",
+                        passed=True,  # Not a failure, just complex format
+                        message="Scan truncated due to format complexity",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "file_type": "pickle_complex",
+                            "parse_error": str(e),
+                            "early_detection_successful": early_detection_successful,
+                            "truncation_reason": "format_complexity",
+                        },
+                        why=(
+                            "This pickle file contains complex structures that could not be fully parsed. "
+                            "Early security pattern analysis was performed."
+                        ),
+                    )
+
+                    # Always update metadata for complex pickle files
+                    result.metadata.update(
+                        {
+                            "file_type": "pickle_complex",
+                            "parsing_truncated": True,
+                            "truncation_reason": "format_complexity",
+                        }
+                    )
+
+                    result.finish(success=True)
+                    return result
+
+            # Handle as critical error for truly suspicious cases
             result.add_check(
                 name="Pickle File Open",
                 passed=False,
@@ -1123,7 +1242,7 @@ class PickleScanner(BaseScanner):
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
         """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
-        # Early detection of dangerous patterns (existing + CVE-specific)
+        # Early detection of dangerous patterns (existing + CVE-specific + binary code patterns)
         dangerous_patterns = [
             b"posix",  # Common in malicious pickles (posix.system)
             b"subprocess",
@@ -1151,6 +1270,9 @@ class PickleScanner(BaseScanner):
             b"getstatusoutput",  # commands.getstatusoutput
             b"system",  # Catches both os.system and from os import system
         ]
+
+        # Add all binary code patterns to ensure consistency with binary scanning
+        dangerous_patterns.extend(BINARY_CODE_PATTERNS)
 
         # Add CVE-specific binary patterns
         dangerous_patterns.extend(CVE_BINARY_PATTERNS)
@@ -1230,7 +1352,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="Dangerous Pattern Detection",
                     passed=False,
-                    message=f"Dangerous pattern '{pattern_str}' found in raw file content",
+                    message=f"Suspicious code pattern in binary data: {pattern_str}",
                     severity=IssueSeverity.CRITICAL,
                     location=context_path,
                     details={
@@ -1290,6 +1412,79 @@ class PickleScanner(BaseScanner):
                     f"This could indicate potential exploitation attempts. {attr.remediation}",
                 )
 
+    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+        """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
+        globals_found: set[tuple[str, str]] = set()
+        memo: dict[Union[int, str], str] = {}
+
+        last_byte = b"dummy"
+        while last_byte != b"":
+            try:
+                ops: list[tuple[Any, Any, Union[int, None]]] = list(pickletools.genops(data))
+            except Exception as e:
+                if globals_found:
+                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
+                    return globals_found
+                # For internal scanner calls (like joblib), don't fail the entire scan
+                # Just log the issue and return empty set
+                logger.debug(f"Pickle parsing failed with no globals found: {e}")
+                return set()
+
+            last_byte = data.read(1)
+            if last_byte:
+                data.seek(-1, 1)
+
+            for n, (opcode, arg, _pos) in enumerate(ops):
+                op_name = opcode.name
+                if op_name == "MEMOIZE" and n > 0:
+                    memo[len(memo)] = ops[n - 1][1]
+                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
+                    memo[arg] = ops[n - 1][1]
+                elif op_name in {"GLOBAL", "INST"}:
+                    parts = str(arg).split(" ", 1)
+                    if len(parts) == 2:
+                        globals_found.add((parts[0], parts[1]))
+                    elif parts:
+                        globals_found.add((parts[0], ""))
+                elif op_name == "STACK_GLOBAL":
+                    values = self._extract_stack_global_values(ops, n, memo)
+                    if len(values) == 2:
+                        globals_found.add((values[1], values[0]))
+                    else:
+                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}, found {len(values)} values")
+                        globals_found.add(("unknown", "unknown"))
+
+            if not multiple_pickles:
+                break
+
+        return globals_found
+
+    def _extract_stack_global_values(
+        self, ops: list[tuple[Any, Any, Union[int, None]]], position: int, memo: dict[Union[int, str], str]
+    ) -> list[str]:
+        """Extract values for STACK_GLOBAL opcode by walking backwards through stack."""
+        values: list[str] = []
+
+        for offset in range(1, min(position + 1, 10)):
+            prev_op = ops[position - offset]
+            op_name = prev_op[0].name
+            op_value = prev_op[1]
+
+            if op_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
+                continue
+            if op_name in {"GET", "BINGET", "LONG_BINGET"}:
+                values.append(memo.get(op_value, "unknown"))
+            elif op_name in {"SHORT_BINUNICODE", "UNICODE", "BINUNICODE", "BINUNICODE8"}:
+                values.append(str(op_value))
+            else:
+                logger.debug(f"Non-string opcode {op_name} in STACK_GLOBAL analysis")
+                values.append("unknown")
+
+            if len(values) == 2:
+                break
+
+        return values
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
@@ -1306,6 +1501,9 @@ class PickleScanner(BaseScanner):
         file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
 
         file_obj.seek(current_pos)  # Reset position
+        # Extract global references across all pickle streams
+        advanced_globals = self._extract_globals_advanced(file_obj)
+        file_obj.seek(current_pos)  # Reset again after extraction
 
         # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
         # This was missing and allowed malicious PyTorch models to pass undetected
@@ -1616,6 +1814,32 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+
+            # Analyze globals extracted from all pickle streams
+            for mod, func in advanced_globals:
+                if _is_actually_dangerous_global(mod, func, ml_context):
+                    suspicious_count += 1
+                    severity = _get_context_aware_severity(
+                        IssueSeverity.CRITICAL,
+                        ml_context,
+                    )
+                    result.add_check(
+                        name="Advanced Global Reference Check",
+                        passed=False,
+                        message=f"Suspicious reference {mod}.{func}",
+                        severity=severity,
+                        location=self.current_file_path,
+                        details={
+                            "module": mod,
+                            "function": func,
+                            "opcode": "STACK_GLOBAL",
+                            "ml_context_confidence": ml_context.get(
+                                "overall_confidence",
+                                0,
+                            ),
+                        },
+                        why=get_import_explanation(mod),
+                    )
 
             # Record successful ML context validation if content appears safe
             if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5:
