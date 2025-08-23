@@ -369,41 +369,43 @@ class BaseScanner(ABC):
     def scan_with_cache(self, path: str) -> ScanResult:
         """
         Scan with optional caching support.
-        
+
         This method provides caching capabilities for individual scanners.
         If caching is disabled in the config, it falls back to the regular scan() method.
-        
+
         Args:
             path: Path to the file to scan
-            
+
         Returns:
             ScanResult object (either from cache or fresh scan)
         """
         # Check if caching is enabled in scanner config
-        cache_enabled = self.config.get('cache_enabled', True)
-        cache_dir = self.config.get('cache_dir')
-        
+        cache_enabled = self.config.get("cache_enabled", True)
+        cache_dir = self.config.get("cache_dir")
+
         # If caching is disabled, proceed with direct scan
         if not cache_enabled:
             return self.scan(path)
-        
+
         # Use cache manager for scanner-level caching
         try:
             from ..cache import get_cache_manager
+
             cache_manager = get_cache_manager(cache_dir, enabled=True)
-            
+
             # Create cache-aware scan function
             def cached_scanner_wrapper(fpath: str) -> dict:
                 result = self.scan(fpath)
                 return result.to_dict()
-            
+
             # Get cached result or perform scan
             result_dict = cache_manager.cached_scan(path, cached_scanner_wrapper)
-            
+
             # Convert back to ScanResult
             from ..core import _scan_result_from_dict
+
             return _scan_result_from_dict(result_dict)
-            
+
         except Exception as e:
             # If cache system fails, fall back to direct scanning
             logger.warning(f"Scanner cache error for {path} ({self.name}): {e}. Falling back to direct scan.")

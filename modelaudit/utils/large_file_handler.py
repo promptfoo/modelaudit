@@ -227,31 +227,33 @@ def scan_large_file(
         ScanResult with findings
     """
     # Check if caching is enabled in scanner config
-    config = getattr(scanner, 'config', {})
-    cache_enabled = config.get('cache_enabled', True)
-    cache_dir = config.get('cache_dir')
-    
+    config = getattr(scanner, "config", {})
+    cache_enabled = config.get("cache_enabled", True)
+    cache_dir = config.get("cache_dir")
+
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
         return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
-    
+
     # Use cache manager for large file scans
     try:
         from ..cache import get_cache_manager
+
         cache_manager = get_cache_manager(cache_dir, enabled=True)
-        
+
         # Create wrapper function for cache manager
         def cached_large_scan_wrapper(fpath: str) -> dict:
             result = _scan_large_file_internal(fpath, scanner, progress_callback, timeout)
             return result.to_dict()
-        
+
         # Get cached result or perform scan
         result_dict = cache_manager.cached_scan(file_path, cached_large_scan_wrapper)
-        
+
         # Convert back to ScanResult
         from ..core import _scan_result_from_dict
+
         return _scan_result_from_dict(result_dict)
-        
+
     except Exception as e:
         # If cache system fails, fall back to direct scanning
         logger.warning(f"Large file cache error for {file_path}: {e}. Falling back to direct scan.")
@@ -266,7 +268,7 @@ def _scan_large_file_internal(
 ) -> ScanResult:
     """
     Internal implementation of large file scanning (cache-agnostic).
-    
+
     Args:
         file_path: Path to the file to scan
         scanner: Scanner instance to use

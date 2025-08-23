@@ -70,10 +70,10 @@ def scan_mlflow_model(
         # Remove cache config from kwargs to avoid conflicts
         scan_kwargs = kwargs.copy()
         cache_config = {
-            'cache_enabled': scan_kwargs.pop('cache_enabled', True),
-            'cache_dir': scan_kwargs.pop('cache_dir', None),
+            "cache_enabled": scan_kwargs.pop("cache_enabled", True),
+            "cache_dir": scan_kwargs.pop("cache_dir", None),
         }
-        
+
         return scan_model_directory_or_file(
             download_path,
             timeout=timeout,
