@@ -193,9 +193,9 @@ Educational demonstrations and models with multiple attack vectors.
 
 Models specifically designed to test scanner capabilities and known CVE exploits.
 
-| #   | Model Name                   | Attack Vector  | Source       | Primary Artifact                      | Detection Notes                                   |
-| --- | ---------------------------- | -------------- | ------------ | ------------------------------------- | ------------------------------------------------- |
-| 78  | `Retr0REG/CVE-2024-3568-poc` | Pickle CVE     | Hugging Face | `extra_data.pickle`, `pickle.pkl`     | CVE PoC with posix.system, opcode signature tests |
+| #   | Model Name                   | Attack Vector | Source       | Primary Artifact                  | Detection Notes                                   |
+| --- | ---------------------------- | ------------- | ------------ | --------------------------------- | ------------------------------------------------- |
+| 78  | `Retr0REG/CVE-2024-3568-poc` | Pickle CVE    | Hugging Face | `extra_data.pickle`, `pickle.pkl` | CVE PoC with posix.system, opcode signature tests |
 
 ### GGUF & Template Injection Attacks
 
