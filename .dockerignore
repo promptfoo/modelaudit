@@ -37,7 +37,6 @@ tests/
 
 # Scratch/development
 scratch/
-llm_context.txt
 
 # CI/CD
 .github/
