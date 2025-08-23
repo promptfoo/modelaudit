@@ -6,6 +6,7 @@ import os
 import zlib
 from typing import Any, ClassVar
 
+from ..cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..utils.filetype import read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
@@ -72,6 +73,103 @@ class JoblibScanner(BaseScanner):
 
         return decompressed
 
+    def _detect_cve_patterns(self, data: bytes, result: ScanResult, context: str) -> None:
+        """Detect CVE-specific patterns in joblib file data."""
+        # Convert bytes to string for pattern analysis (ignore decode errors)
+        try:
+            content_str = data.decode("utf-8", errors="ignore")
+        except UnicodeDecodeError:
+            content_str = ""
+
+        # Analyze for CVE patterns
+        cve_attributions = analyze_cve_patterns(content_str, data)
+
+        if cve_attributions:
+            # Add CVE information to result
+            enhance_scan_result_with_cve(result, [content_str], data)
+
+            # Add specific checks for each CVE found
+            for attr in cve_attributions:
+                severity = IssueSeverity.CRITICAL if attr.severity == "CRITICAL" else IssueSeverity.WARNING
+
+                result.add_check(
+                    name=f"CVE Detection: {attr.cve_id}",
+                    passed=False,
+                    message=f"Detected {attr.cve_id}: {attr.description}",
+                    severity=severity,
+                    location=f"{context}",
+                    details={
+                        "cve_id": attr.cve_id,
+                        "cvss": attr.cvss,
+                        "cwe": attr.cwe,
+                        "affected_versions": attr.affected_versions,
+                        "confidence": attr.confidence,
+                        "patterns_matched": attr.patterns_matched,
+                        "remediation": attr.remediation,
+                    },
+                    why=f"This file contains patterns associated with {attr.cve_id}, "
+                    f"a {attr.severity.lower()} vulnerability affecting {attr.affected_versions}. "
+                    f"Remediation: {attr.remediation}",
+                )
+
+    def _scan_for_joblib_specific_threats(self, data: bytes, result: ScanResult, context: str) -> None:
+        """Scan for joblib-specific security threats beyond general pickle issues."""
+        # CVE-2024-34997 specific detection
+        numpy_wrapper_patterns = [
+            b"NumpyArrayWrapper",
+            b"read_array",
+            b"numpy_pickle",
+        ]
+
+        found_numpy_patterns = []
+        for pattern in numpy_wrapper_patterns:
+            if pattern in data:
+                found_numpy_patterns.append(pattern.decode("utf-8", errors="ignore"))
+
+        if found_numpy_patterns and b"pickle.load" in data:
+            result.add_check(
+                name="CVE-2024-34997 Risk Detection",
+                passed=False,
+                message="Detected NumpyArrayWrapper with pickle.load - potential CVE-2024-34997 exploitation",
+                severity=IssueSeverity.WARNING,
+                location=context,
+                details={
+                    "cve": "CVE-2024-34997",
+                    "patterns": found_numpy_patterns,
+                    "risk": "NumpyArrayWrapper deserialization vulnerability",
+                },
+                why="NumpyArrayWrapper.read_array() combined with pickle.load() can be exploited "
+                "for arbitrary code execution if the data source is untrusted.",
+            )
+
+        # Check for sklearn model loading patterns with dangerous operations
+        if b"sklearn" in data and b"joblib.load" in data:
+            dangerous_combos = [
+                (b"os.system", "system command execution"),
+                (b"subprocess", "process spawning"),
+                (b"eval", "code evaluation"),
+                (b"exec", "code execution"),
+            ]
+
+            for pattern, description in dangerous_combos:
+                if pattern in data:
+                    result.add_check(
+                        name="CVE-2020-13092 Risk Detection",
+                        passed=False,
+                        message=f"Detected sklearn/joblib.load with {description} - "
+                        f"potential CVE-2020-13092 exploitation",
+                        severity=IssueSeverity.CRITICAL,
+                        location=context,
+                        details={
+                            "cve": "CVE-2020-13092",
+                            "sklearn_pattern": "sklearn + joblib.load",
+                            "dangerous_pattern": pattern.decode("utf-8", errors="ignore"),
+                            "risk": "scikit-learn deserialization vulnerability",
+                        },
+                        why=f"scikit-learn models loaded via joblib.load() with {description} "
+                        f"can execute arbitrary code during deserialization.",
+                    )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -103,6 +201,10 @@ class JoblibScanner(BaseScanner):
                 return result
 
             if magic.startswith(b"\x80"):
+                # Scan for CVE patterns in raw pickle data
+                self._detect_cve_patterns(data, result, path)
+                self._scan_for_joblib_specific_threats(data, result, path)
+
                 with io.BytesIO(data) as file_like:
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
                         file_like,
@@ -153,6 +255,10 @@ class JoblibScanner(BaseScanner):
                     )
                     result.finish(success=False)
                     return result
+                # Scan decompressed data for CVE patterns
+                self._detect_cve_patterns(decompressed, result, f"{path} (decompressed)")
+                self._scan_for_joblib_specific_threats(decompressed, result, f"{path} (decompressed)")
+
                 with io.BytesIO(decompressed) as file_like:
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
                         file_like,
