@@ -84,7 +84,7 @@ def _scan_result_from_dict(result_dict: dict) -> ScanResult:
                 name=check_dict.get("name", ""),
                 status=CheckStatus(check_dict.get("status", "passed")),
                 message=check_dict.get("message", ""),
-                severity=IssueSeverity(check_dict["severity"]) if check_dict.get("severity") else None,
+                severity=IssueSeverity(check_dict.get("severity")) if check_dict.get("severity") else None,
                 location=check_dict.get("location"),
                 details=check_dict.get("details", {}),
                 why=check_dict.get("why"),

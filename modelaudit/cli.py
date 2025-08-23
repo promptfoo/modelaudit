@@ -277,10 +277,19 @@ def clear(cache_dir: Optional[str], dry_run: bool) -> None:
         total_size_mb = stats.get("total_size_mb", 0.0)
 
         # Clear the cache
-        cache_manager.clear()
-
-        success_msg = f"Cleared {total_entries} cache entries ({total_size_mb:.1f}MB)"
-        click.echo(style_text(success_msg, fg="green"))
+        try:
+            cache_manager.clear()
+            success_msg = f"Cleared {total_entries} cache entries ({total_size_mb:.1f}MB)"
+            click.echo(style_text(success_msg, fg="green"))
+        except PermissionError as e:
+            error_msg = f"Permission denied while clearing cache: {e}"
+            click.echo(style_text(error_msg, fg="red"), err=True)
+            click.echo("Try running with elevated permissions or check cache directory permissions.", err=True)
+            sys.exit(1)
+        except OSError as e:
+            error_msg = f"File system error while clearing cache: {e}"
+            click.echo(style_text(error_msg, fg="red"), err=True)
+            sys.exit(1)
 
     except Exception as e:
         error_msg = f"Failed to clear cache: {e}"

@@ -74,8 +74,13 @@ class SecureFileHasher:
         try:
             if file_size < 100 * 1024 * 1024:  # < 100MB - use memory mapping
                 try:
-                    with open(file_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        hasher.update(mm)
+                    with open(file_path, "rb") as f:
+                        pre_mmap_size = os.fstat(f.fileno()).st_size
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                            post_mmap_size = os.fstat(f.fileno()).st_size
+                            if pre_mmap_size != post_mmap_size or pre_mmap_size != mm.size():
+                                raise ValueError(f"File size changed during hashing (TOCTTOU detected) for {file_path}")
+                            hasher.update(mm)
                 except (OSError, ValueError) as mmap_error:
                     # Fallback to reading in chunks if mmap fails (empty files, unsupported file types)
                     logger.debug(f"mmap failed for {file_path}: {mmap_error}. Falling back to chunked read.")
