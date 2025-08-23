@@ -44,6 +44,8 @@ class MetadataScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=file_path,
                     details={"error": str(e)},
+                    why="Failed to process metadata file during scanning",
+                    type="scan_error",
                 )
             )
 
@@ -79,6 +81,8 @@ class MetadataScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=file_path,
                     details={"error": str(e)},
+                    why="Malformed JSON could indicate tampering or corruption",
+                    type="json_error",
                 )
             )
         except Exception as e:
@@ -88,6 +92,8 @@ class MetadataScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=file_path,
                     details={"error": str(e)},
+                    why="File access errors may indicate permission issues or tampering",
+                    type="file_error",
                 )
             )
 
@@ -114,6 +120,8 @@ class MetadataScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=file_path,
                     details={"error": str(e)},
+                    why="File access errors may indicate permission issues or tampering",
+                    type="file_error",
                 )
             )
 
@@ -144,6 +152,8 @@ class MetadataScanner(BaseScanner):
                                 severity=IssueSeverity.WARNING,
                                 location=file_path,
                                 details={"url": value, "key_path": key_path, "suspicious_domain": domain},
+                                why="URL shorteners and tunnel services can hide malicious endpoints",
+                                type="suspicious_url",
                             )
                         )
 
@@ -208,6 +218,8 @@ class MetadataScanner(BaseScanner):
                                 "key_path": key_path,
                                 "value_preview": value[:10] + "..." if len(value) > 10 else value,
                             },
+                            why="Exposed secrets in metadata files can lead to unauthorized access",
+                            type="exposed_secret",
                         )
                     )
 
@@ -245,6 +257,8 @@ class MetadataScanner(BaseScanner):
                                 severity=IssueSeverity.WARNING,
                                 location=file_path,
                                 details={"key_path": key_path, "value": value, "dangerous_pattern": dangerous},
+                                why="Custom code references can execute arbitrary malicious code",
+                                type="custom_code",
                             )
                         )
 
@@ -274,6 +288,8 @@ class MetadataScanner(BaseScanner):
                                 severity=IssueSeverity.WARNING,
                                 location=file_path,
                                 details={"auto_map_key": key, "file_path": value},
+                                why="Directory traversal paths can access unauthorized files",
+                                type="path_traversal",
                             )
                         )
 
@@ -304,6 +320,8 @@ class MetadataScanner(BaseScanner):
                                         "code_reference": value,
                                         "dangerous_pattern": pattern,
                                     },
+                                    why="Code execution patterns in auto_map can run arbitrary commands",
+                                    type="code_execution",
                                 )
                             )
                             break  # Only report the first match to avoid duplicates
@@ -340,6 +358,8 @@ class MetadataScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=file_path,
                             details={"url": url, "suspicious_domain": domain},
+                            why="URL shorteners and tunnel services can hide malicious endpoints",
+                            type="suspicious_url",
                         )
                     )
 
@@ -377,6 +397,8 @@ class MetadataScanner(BaseScanner):
                                 "pattern_description": description,
                                 "match_preview": matched_text[:20] + "..." if len(matched_text) > 20 else matched_text,
                             },
+                            why="Exposed secrets in documentation can lead to unauthorized access",
+                            type="exposed_secret",
                         )
                     )
 
