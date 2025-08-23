@@ -167,10 +167,10 @@ SUSPICIOUS_GLOBALS = {
 # These patterns represent high-risk modules/functions used in advanced attacks
 ADVANCED_PICKLE_PATTERNS = {
     "operator": ["attrgetter"],  # CRITICAL: Can bypass attribute access restrictions to reach dangerous methods
-    "pty": "*",                  # CRITICAL: Pseudo-terminal spawning enables shell access
-    "bdb": "*",                  # HIGH: Python debugger can inspect/modify runtime state
-    "asyncio": "*",              # MEDIUM: Async execution can obfuscate malicious operations
-    "_pickle": "*",              # HIGH: Low-level pickle operations bypass safety checks
+    "pty": "*",  # CRITICAL: Pseudo-terminal spawning enables shell access
+    "bdb": "*",  # HIGH: Python debugger can inspect/modify runtime state
+    "asyncio": "*",  # MEDIUM: Async execution can obfuscate malicious operations
+    "_pickle": "*",  # HIGH: Low-level pickle operations bypass safety checks
     "types": ["CodeType", "FunctionType"],  # CRITICAL: Direct code object construction enables arbitrary code execution
 }
 
