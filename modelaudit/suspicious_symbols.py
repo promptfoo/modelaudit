@@ -373,12 +373,14 @@ SUSPICIOUS_OPS = {
     "SaveV2",  # SaveV2 operations
     # Code execution - CRITICAL RISK
     "PyFunc",  # Execute Python functions
+    "PyFuncStateless",  # Execute Python functions (stateless variant)
+    "EagerPyFunc",  # Execute Python functions (eager execution)
     "PyCall",  # Call Python code
     # System operations - CRITICAL RISK
     "ShellExecute",  # Execute shell commands
     "ExecuteOp",  # Execute arbitrary operations
     "SystemConfig",  # System configuration access
-    # Data decoding - MEDIUM RISK (can process untrusted data)
+    # Data decoding - MEDIUM RISK (documented but not actively scanned as CRITICAL)
     "DecodeRaw",  # Raw data decoding
     "DecodeJpeg",  # JPEG decoding (image processing)
     "DecodePng",  # PNG decoding (image processing)
@@ -400,7 +402,7 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "ShellExecute": "Can execute shell commands",
     "ExecuteOp": "Can execute arbitrary operations",
     "SystemConfig": "Can access system configuration",
-    # Data decoding - MEDIUM RISK (can process untrusted data)
+    # Data decoding - MEDIUM RISK (documented but not actively scanned as CRITICAL)
     "DecodeRaw": "Can decode raw image data, potential injection of malicious content",
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
@@ -659,6 +661,11 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "description": "Dangerous TensorFlow operations",
             "risk_level": "HIGH",
         },
+        "tensorflow_dangerous_ops": {
+            "patterns": TENSORFLOW_DANGEROUS_OPS,
+            "description": "TensorFlow operations with security risk explanations",
+            "risk_level": "CRITICAL",
+        },
         "keras_layers": {
             "patterns": SUSPICIOUS_LAYER_TYPES,
             "description": "Risky Keras layer types",
@@ -750,6 +757,15 @@ def validate_patterns() -> list[str]:
     for opcode in DANGEROUS_OPCODES:
         if not isinstance(opcode, str):
             warnings.append(f"Opcode name must be string: {opcode}")  # pragma: no cover
+
+    # Validate TensorFlow dangerous ops mapping
+    for op, desc in TENSORFLOW_DANGEROUS_OPS.items():
+        if not isinstance(op, str) or not op:
+            warnings.append(f"TF dangerous op key must be non-empty string: {op!r}")
+        if not isinstance(desc, str) or not desc:
+            warnings.append(f"TF dangerous op description must be non-empty string for {op!r}")
+        if op not in SUSPICIOUS_OPS:
+            warnings.append(f"TF dangerous op '{op}' not present in SUSPICIOUS_OPS (possible drift)")
 
     # Validate binary code patterns
     for binary_pattern in BINARY_CODE_PATTERNS:
