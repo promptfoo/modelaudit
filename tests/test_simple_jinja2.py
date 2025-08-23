@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-import tempfile
 import json
 import os
-from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
+import tempfile
+
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 
 
 def test_cve_detection():
@@ -14,7 +15,12 @@ def test_cve_detection():
     # CVE-2024-34359 payload
     config = {
         "tokenizer_class": "LlamaTokenizer",
-        "chat_template": "{% for c in [].__class__.__base__.__subclasses__() %}{% if c.__name__ == 'catch_warnings' %}{{ c()._module.__builtins__['__import__']('os').system('touch /tmp/retr0reg') }}{% endif %}{% endfor %}",
+        "chat_template": (
+            "{% for c in [].__class__.__base__.__subclasses__() %}"
+            "{% if c.__name__ == 'catch_warnings' %}"
+            "{{ c()._module.__builtins__['__import__']('os').system('touch /tmp/retr0reg') }}"
+            "{% endif %}{% endfor %}"
+        ),
     }
 
     fd, path = tempfile.mkstemp(suffix=".json")
