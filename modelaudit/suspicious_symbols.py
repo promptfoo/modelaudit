@@ -57,6 +57,30 @@ from typing import Any
 
 from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 
+# OS module aliases that provide system access similar to the 'os' module
+OS_MODULE_ALIASES: dict[str, dict[str, Any]] = {
+    "nt": {
+        "severity": "CRITICAL",
+        "description": "Windows OS module alias - provides system access including os.system()",
+        "functions": "*",
+    },
+    "posix": {
+        "severity": "CRITICAL",
+        "description": "Unix/Linux OS module alias - provides system access including os.system()",
+        "functions": "*",
+    },
+    "ntpath": {
+        "severity": "HIGH",
+        "description": "Windows path manipulation - can access restricted paths",
+        "functions": "*",
+    },
+    "posixpath": {
+        "severity": "HIGH",
+        "description": "Unix path manipulation - can access restricted paths",
+        "functions": "*",
+    },
+}
+
 # =============================================================================
 # PICKLE SECURITY PATTERNS
 # =============================================================================
@@ -67,7 +91,6 @@ from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 SUSPICIOUS_GLOBALS = {
     # System interaction modules - HIGH RISK
     "os": "*",  # File system operations, command execution (system, popen, spawn*)
-    "posix": "*",  # Unix system calls (os.system equivalent)
     "sys": "*",  # Python runtime manipulation
     "subprocess": "*",  # Process spawning and control (call, run, Popen, check_output)
     "runpy": "*",  # Dynamic module execution (run_module, run_path)
@@ -132,6 +155,9 @@ SUSPICIOUS_GLOBALS = {
     "dill._dill": "*",
 }
 
+# Include OS module aliases in suspicious globals
+SUSPICIOUS_GLOBALS.update({alias: data["functions"] for alias, data in OS_MODULE_ALIASES.items()})
+
 # Builtin functions that enable dynamic code execution or module loading
 DANGEROUS_BUILTINS = [
     "eval",
@@ -174,6 +200,89 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"lambda",  # Anonymous function creation
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
+]
+
+# =============================================================================
+# CVE-SPECIFIC SECURITY PATTERNS
+# =============================================================================
+
+# CVE-2020-13092: scikit-learn joblib.load deserialization vulnerability
+# Patterns that indicate potential exploitation of insecure joblib.load() usage
+CVE_2020_13092_PATTERNS = [
+    # Direct exploitation patterns - require both components for higher specificity
+    r"joblib\.load.*os\.system",  # joblib.load with system calls
+    r"joblib\.load.*subprocess",  # joblib.load with subprocess
+    r"sklearn.*joblib\.load.*system",  # sklearn + joblib.load + system calls
+    # Attack vector patterns - __reduce__ method exploitation
+    r"__reduce__.*os\.system.*sklearn",  # sklearn context with __reduce__ + system
+    r"__reduce__.*subprocess.*sklearn",  # sklearn context with __reduce__ + subprocess
+    r"__reduce__.*eval.*sklearn",  # sklearn context with __reduce__ + eval
+    # Sklearn model with dangerous operations - require both sklearn AND dangerous operation
+    r"sklearn.*joblib.*os\.system",  # sklearn + joblib + system calls
+    r"sklearn.*joblib.*subprocess",  # sklearn + joblib + subprocess
+    r"Pipeline.*__reduce__.*system",  # Pipeline with __reduce__ + system calls
+    # File extension indicators - more specific patterns
+    r"\.joblib.*sklearn.*os\.system",  # .joblib files with sklearn and system calls
+    r"\.pkl.*sklearn.*joblib.*system",  # .pkl files with sklearn + joblib + system
+]
+
+# CVE-2024-34997: joblib NumpyArrayWrapper deserialization vulnerability
+# Patterns that indicate potential exploitation of NumpyArrayWrapper.read_array()
+CVE_2024_34997_PATTERNS = [
+    # Direct exploitation patterns - require dangerous combinations
+    r"NumpyArrayWrapper.*pickle\.load",  # NumpyArrayWrapper with pickle.load
+    r"numpy_pickle.*read_array.*pickle\.load",  # numpy_pickle + read_array + pickle.load
+    r"joblib.*NumpyArrayWrapper.*system",  # joblib + NumpyArrayWrapper + system calls
+    # Attack vector patterns - pickle.load exploitation via NumpyArrayWrapper
+    r"NumpyArrayWrapper.*pickle\.load.*system",  # NumpyArrayWrapper + pickle.load + system
+    r"read_array.*pickle\.load.*subprocess",  # read_array + pickle.load + subprocess
+    r"numpy_pickle.*pickle\.load.*eval",  # numpy_pickle + pickle.load + eval
+    # Cache-related exploitation patterns - require dangerous operations
+    r"joblib.*cache.*NumpyArrayWrapper.*system",  # joblib cache + NumpyArrayWrapper + system
+    r"NumpyArrayWrapper.*cache.*pickle\.load",  # NumpyArrayWrapper + cache + pickle.load
+    r"read_array.*cache.*__reduce__",  # read_array + cache + __reduce__
+    # Combined patterns indicating sophisticated attacks
+    r"NumpyArrayWrapper.*__reduce__.*system",  # NumpyArrayWrapper + __reduce__ + system
+    r"numpy_pickle.*__reduce__.*subprocess",  # numpy_pickle + __reduce__ + subprocess
+]
+
+# Combined CVE patterns for efficient scanning
+# Used by scanners to detect CVE-specific exploitation attempts
+CVE_COMBINED_PATTERNS = {
+    "CVE-2020-13092": {
+        "patterns": CVE_2020_13092_PATTERNS,
+        "description": "scikit-learn joblib.load deserialization vulnerability",
+        "severity": "CRITICAL",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 9.8,  # Critical severity
+        "affected_versions": "scikit-learn <= 0.23.0",
+        "remediation": "Update scikit-learn, validate input sources, avoid joblib.load() with untrusted data",
+    },
+    "CVE-2024-34997": {
+        "patterns": CVE_2024_34997_PATTERNS,
+        "description": "joblib NumpyArrayWrapper deserialization vulnerability",
+        "severity": "HIGH",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 8.1,  # High severity
+        "affected_versions": "joblib v1.4.2",
+        "remediation": "Update joblib, validate cache integrity, avoid untrusted NumpyArrayWrapper data",
+    },
+}
+
+# Binary patterns for CVE detection in raw file content
+CVE_BINARY_PATTERNS = [
+    # CVE-2020-13092 binary signatures
+    b"joblib.load",
+    b"sklearn",
+    b"__reduce__",
+    b"os.system",
+    b"Pipeline",
+    # CVE-2024-34997 binary signatures
+    b"NumpyArrayWrapper",
+    b"read_array",
+    b"numpy_pickle",
+    b"pickle.load",
+    b"joblib.cache",
 ]
 
 # Suspicious metadata patterns used by SafeTensorsScanner and others
@@ -547,6 +656,16 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "description": "Jinja2 Server-Side Template Injection patterns",
             "risk_level": "CRITICAL",
         },
+        "cve_patterns": {
+            "patterns": CVE_COMBINED_PATTERNS,
+            "description": "CVE-specific vulnerability patterns",
+            "risk_level": "CRITICAL",
+        },
+        "cve_binary_signatures": {
+            "patterns": CVE_BINARY_PATTERNS,
+            "description": "Binary signatures for CVE detection",
+            "risk_level": "HIGH",
+        },
     }
 
 
@@ -562,11 +681,30 @@ def validate_patterns() -> list[str]:
     warnings = []
 
     # Validate regex patterns
-    for pattern in SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS:
+    all_string_patterns = (
+        SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS + CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
+    )
+    for pattern in all_string_patterns:
         try:
             re.compile(pattern)
         except re.error as e:
             warnings.append(f"Invalid regex pattern '{pattern}': {e}")
+
+    # Validate CVE pattern structure
+    for cve_id, cve_info in CVE_COMBINED_PATTERNS.items():
+        if not isinstance(cve_id, str):
+            warnings.append(f"CVE ID must be string: {cve_id}")
+        if not isinstance(cve_info, dict):
+            warnings.append(f"CVE info must be dict for {cve_id}")
+        required_fields = ["patterns", "description", "severity", "cwe", "cvss"]
+        for field in required_fields:
+            if field not in cve_info:
+                warnings.append(f"Missing required field '{field}' in {cve_id}")
+
+    # Validate CVE binary patterns
+    for binary_pattern in CVE_BINARY_PATTERNS:
+        if not isinstance(binary_pattern, bytes):
+            warnings.append(f"CVE binary pattern must be bytes: {binary_pattern!r}")
 
     # Validate global patterns structure
     for module, funcs in SUSPICIOUS_GLOBALS.items():

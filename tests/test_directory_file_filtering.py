@@ -22,8 +22,8 @@ class TestDirectoryFileFiltering:
             # Scan with file filtering enabled (default)
             results = scan_model_directory_or_file(tmp_dir, skip_file_types=True)
 
-            # Should only scan model files
-            assert results["files_scanned"] == 2  # model.pkl and config.json
+            # Should scan model files and README for security
+            assert results["files_scanned"] == 3  # model.pkl, config.json, and README.md
             assert results["success"] is True
 
     def test_skip_file_types_disabled(self):
@@ -78,8 +78,8 @@ class TestDirectoryFileFiltering:
             # Scan with filtering enabled
             results = scan_model_directory_or_file(tmp_dir)
 
-            # Should only scan .pkl files
-            assert results["files_scanned"] == 2  # model1.pkl and model2.pkl
+            # Should scan .pkl files and README files for security
+            assert results["files_scanned"] == 4  # model1.pkl, model2.pkl, and 2 README.md files
             assert results["success"] is True
 
     def test_cli_compatibility(self):
