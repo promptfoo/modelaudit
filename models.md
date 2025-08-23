@@ -155,6 +155,7 @@ Novel attack vectors using GGUF metadata and template injection.
 | #   | Model Name                     | Attack Vector | Source       | Primary Artifact        | Detection Notes                                     |
 | --- | ------------------------------ | ------------- | ------------ | ----------------------- | --------------------------------------------------- |
 | 70  | `nono31/malicious-models-repo` | GGUF SSTI     | Hugging Face | `malicious_sample.gguf` | GGUF chat-template SSTI, pair with JFrog's write-up |
+| 83  | **CVE-2024-34359 Test Case**  | Jinja2 SSTI   | Local Test   | `tokenizer_config.json` | **✅ CONFIRMED** - retr0reg payload detected by ModelAudit's Jinja2 scanner |
 
 ### Configuration-based Exploits
 
@@ -248,7 +249,7 @@ site:huggingface.co "CVE-2024" pickle
 | YOLO .pt Exploits       | 7     | MonkeyOCR, FastSAM              | Pickle imports in .pt files        |
 | Keras Lambda RCE        | 7     | unsafe-keras, eval_lambda.keras | Lambda layer serialization         |
 | Sklearn/Joblib          | 13    | joblib-payload-chatbot          | Joblib/pickle deserialization      |
-| GGUF Template Injection | 2     | malicious_sample.gguf           | Jinja2 SSTI in chat_template       |
+| GGUF Template Injection | 3     | malicious_sample.gguf, **CVE-2024-34359** | **Jinja2 SSTI in chat_template** |
 | Configuration Exploits  | 2     | NeoBERT-4x                      | trust_remote_code, auto_map        |
 | Alternative Frameworks  | 2     | PaddleNLP models                | Paddle pickle.loads                |
 
