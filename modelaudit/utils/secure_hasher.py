@@ -73,8 +73,15 @@ class SecureFileHasher:
 
         try:
             if file_size < 100 * 1024 * 1024:  # < 100MB - use memory mapping
-                with open(file_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    hasher.update(mm)
+                try:
+                    with open(file_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        hasher.update(mm)
+                except (OSError, ValueError) as mmap_error:
+                    # Fallback to reading in chunks if mmap fails (empty files, unsupported file types)
+                    logger.debug(f"mmap failed for {file_path}: {mmap_error}. Falling back to chunked read.")
+                    with open(file_path, "rb") as f:
+                        while chunk := f.read(self.chunk_size):
+                            hasher.update(chunk)
             else:
                 # Stream large files in chunks
                 with open(file_path, "rb") as f:
