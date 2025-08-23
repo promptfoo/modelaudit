@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **feat**: add Jinja2 template injection scanner (#323)
+- **feat**: comprehensive deep Pydantic integration with advanced type safety (#322)
 - **feat**: add Pydantic models for JSON export with type safety (#315)
 - **feat**: add support for multi-part archive suffixes (#307)
 - **feat**: optimize CI for faster feedback (#320)
