@@ -115,16 +115,6 @@ class Issue(BaseModel):
         """Convert the issue to a dictionary for serialization (backward compatibility)"""
         return self.model_dump(exclude_none=True, mode="json")
 
-    def get(self, key: str, default: Any = None) -> Any:
-        """Dictionary-style access for backward compatibility with tests"""
-        try:
-            value = getattr(self, key, default)
-            # Handle enum serialization for backward compatibility
-            if key == "severity" and hasattr(value, "value"):
-                return value.value
-            return value
-        except AttributeError:
-            return default
 
     def __str__(self) -> str:
         """String representation of the issue"""

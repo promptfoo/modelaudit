@@ -246,8 +246,8 @@ class TestDetectJITScriptRisks:
         """Test handling of non-existent files."""
         findings = detect_jit_script_risks("/non/existent/file.pt")
         assert len(findings) == 1
-        assert findings[0].get("type") == "error"
-        assert "not found" in findings[0].get("message")
+        assert findings[0].type == "error"
+        assert "not found" in findings[0].message
 
     def test_file_too_large(self, tmp_path):
         """Test handling of files that are too large."""
@@ -257,8 +257,8 @@ class TestDetectJITScriptRisks:
         # Test with very small max_size
         findings = detect_jit_script_risks(str(large_file), max_size=50)
         assert len(findings) == 1
-        assert findings[0].get("type") == "error"
-        assert "too large" in findings[0].get("message")
+        assert findings[0].type == "error"
+        assert "too large" in findings[0].message
 
     def test_model_type_detection_from_extension(self, tmp_path):
         """Test that model type is detected from file extension."""
