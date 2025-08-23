@@ -8,31 +8,32 @@ ModelAudit includes enhanced support for scanning large ML models (up to 1 TB+) 
 
 ModelAudit automatically detects file sizes and chooses the optimal scanning strategy:
 
-### 1. Normal Scanning (<100 GB)
+### 1. Normal Scanning (≤10 GB)
 
-- **Small files (<10MB)**: Normal in-memory scanning
-- **Medium files (10MB-100MB)**: Chunked reading
-- **Large files (100MB-1GB)**: Streaming analysis
-- **Performance**: Full file loaded into memory, complete analysis of all content, fastest performance for smaller models
+- **Small to medium files**: Standard in-memory or chunked scanning
+- **Performance**: Complete analysis of all content, fastest performance
+- **Memory Usage**: Optimized for available system memory
 
-### 2. Chunked Scanning (100 GB - 1 TB)
+### 2. Chunked Scanning (10 GB - 500 GB)
 
-- **Very large files (1GB-50GB)**: Optimized scanning with the large file handler
-- **Process**: File read in 50 GB chunks with progress reporting for each chunk
-- **Benefits**: Memory-efficient processing, complete coverage of file content
+- **Large files**: File read in configurable chunks (default 10GB) with progress reporting
+- **Process**: Sequential chunk processing with memory-efficient handling
+- **Benefits**: Complete coverage while managing memory usage
+- **Special Support**: Enhanced pickle file scanning with chunk-aware analysis
 
-### 3. Streaming Scanning (1 TB - 5 TB)
+### 3. Large File Optimization (500 GB - 1 TB)
 
-- **Extreme files (50GB-200GB)**: Memory-mapped I/O scanning
-- **Process**: Analyzes file header (first 100 GB), samples middle and end sections
-- **Features**: Reports partial scan completion, suitable for very large models
-- **Memory Usage**: Efficient access without loading entire file into memory
+- **Very large files**: Automatic fallback to complete scanning with optimized I/O
+- **Process**: Full file analysis with enhanced progress reporting and timeout scaling
+- **Memory Management**: Efficient buffer usage to prevent memory exhaustion
 
-### 4. Advanced Distributed Scanning (>5 TB)
+### 4. Extreme File Handling (>1 TB)
 
-- **Massive files (>200GB)**: Distributed/signature-based scanning
-- **Process**: Enhanced header analysis (first 100 GB), heuristic-based detection with large sampling
-- **Benefits**: Minimal memory usage with advanced techniques, supports extremely large models up to 10 TB+
+- **Massive files**: Complete security scanning with extended timeouts
+- **Process**: Full file analysis ensuring no security shortcuts are taken
+- **Benefits**: Maintains complete security coverage regardless of file size
+
+**Note**: All scanning strategies perform complete security analysis - no sampling or partial scanning is used that could miss security issues.
 
 ## Sharded Model Support
 
@@ -52,28 +53,28 @@ When a sharded model is detected:
 3. **Result Combination**: Results are combined into a single report
 4. **Configuration Analysis**: Configuration files are analyzed for metadata
 
-## Memory-Mapped I/O
+## Memory Management
 
-For files between 50GB-200GB, ModelAudit uses memory-mapped I/O:
+ModelAudit uses efficient memory management strategies for large files:
 
-- **Efficient Access**: Efficient access without loading entire file into memory
-- **Sliding Windows**: Scans data in sliding windows (up to 500MB)
-- **Complete Coverage**: Overlapping windows ensure no patterns are missed
-- **Memory Footprint**: Minimal memory footprint even for huge files
+- **Chunked Reading**: Files are processed in manageable chunks to control memory usage
+- **Buffer Management**: Configurable buffer sizes optimize I/O performance
+- **Progress Tracking**: Real-time progress reporting for long-running scans
+- **Memory Footprint**: Minimal memory footprint through streaming and chunked processing
 
 ## Progressive Timeout Scaling
 
 Timeouts automatically scale with file size:
 
-- **Standard files**: 30 minutes (increased from previous 5 minutes)
-- **Extreme files (>50GB)**: 60 minutes
+- **Standard files**: 60 minutes (increased from previous 5 minutes)
+- **Extreme files (>50GB)**: 120 minutes
 - **Massive files (>200GB)**: 2 hours
 - **Per-shard timeout**: 10 minutes
 
 ### Previous vs Current Timeout Settings
 
 - **Previous**: 300 seconds (5 minutes)
-- **Current**: 1800 seconds (30 minutes)
+- **Current**: 3600 seconds (60 minutes)
 - **Rationale**: Large models (1-8 GB) require more time for thorough scanning
 
 ## File Size Limits
@@ -130,40 +131,43 @@ modelaudit llama-405b/pytorch_model-00001-of-00100.bin
 modelaudit massive_model.bin
 
 # Output:
-# Using extreme large file handler for massive_model.bin
-# File size: 400GB - using memory-mapped I/O
-# Memory-mapped scan: 10GB/400GB (2.5%)...
+# Using large file handler for massive_model.bin
+# File size: 400GB - using chunked processing
+# Processing: 10GB/400GB (2.5%)...
 ```
 
-### Force Large File Handling
+### Control Large File Handling
 
 ```bash
-# Use --large-models flag to optimize for large files
-modelaudit --large-models model.bin
+# Large file support is enabled by default, disable if needed
+modelaudit scan model.bin --no-large-model-support
+
+# Or explicitly enable (default behavior)
+modelaudit scan model.bin --large-model-support
 ```
 
 ## Performance Considerations
 
 ### Memory Usage
 
-ModelAudit automatically optimizes memory usage based on file size:
+ModelAudit optimizes memory usage based on file size and scanning strategy:
 
-- **Small files (<10 MB)**: typically ~2x file size
-- **Medium files (10-100 MB)**: typically ~50 MB constant
-- **Large files (>100 MB)**: typically ~20 MB constant
-- **Very large files (>1 GB)**: typically ~10 MB constant
-- **Memory-mapped I/O**: keeps memory usage under 1GB even for TB-sized files
-- **Chunked reading**: uses configurable buffer sizes (default 10MB)
-- **Parallel shard scanning**: uses ~500MB per worker
+- **Chunked reading**: Uses configurable buffer sizes (default 10GB for large files)
+- **Streaming analysis**: Minimal memory footprint for cloud storage scanning
+- **Parallel shard scanning**: Memory usage scales with number of workers
+- **Buffer management**: Automatically adjusts based on available system memory
+
+_Note: Specific memory usage patterns depend on file format, content complexity, and system configuration._
 
 ### Scan Times
 
-Expected scanning times vary by model size:
+Expected scanning times are approximate and vary based on file format, content, and system performance:
 
-- **Small files**: 1-5 seconds
-- **Medium files**: 5-30 seconds
-- **Large files**: 30-120 seconds
-- **Very large files**: 60-300 seconds
+- **Small files**: Usually under 30 seconds
+- **Large files**: Several minutes depending on size and complexity
+- **Very large files**: May take 30+ minutes with extended timeouts
+
+_Note: Scanning times depend heavily on storage speed, CPU performance, file format complexity, and security content found._
 
 ### Network Considerations
 
