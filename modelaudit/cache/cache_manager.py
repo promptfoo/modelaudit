@@ -1,10 +1,10 @@
 """Cache manager for integrating with ModelAudit scanners."""
 
+import logging
 import os
 import time
-import logging
-from typing import Dict, Any, Optional
 from pathlib import Path
+from typing import Any, Optional
 
 from .scan_results_cache import ScanResultsCache
 
@@ -29,7 +29,7 @@ class CacheManager:
         self.enabled = enabled
         self.cache = ScanResultsCache(cache_dir) if enabled else None
 
-    def get_cached_result(self, file_path: str) -> Optional[Dict[str, Any]]:
+    def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
         """
         Get cached scan result if available.
 
@@ -44,7 +44,7 @@ class CacheManager:
 
         return self.cache.get_cached_result(file_path)
 
-    def store_result(self, file_path: str, scan_result: Dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
+    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
         """
         Store scan result in cache.
 
@@ -58,7 +58,7 @@ class CacheManager:
 
         self.cache.store_result(file_path, scan_result, scan_duration_ms)
 
-    def cached_scan(self, file_path: str, scanner_func, *args, **kwargs) -> Dict[str, Any]:
+    def cached_scan(self, file_path: str, scanner_func, *args, **kwargs) -> dict[str, Any]:
         """
         Perform a cache-aware scan operation.
 
@@ -103,13 +103,13 @@ class CacheManager:
             # Store result in cache
             self.store_result(file_path, scan_result, int(scan_duration))
 
-            return scan_result
+            return scan_result  # type: ignore[no-any-return]
 
         except Exception as e:
             logger.error(f"Scan failed for {file_path}: {e}")
             raise
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
         if not self.enabled or not self.cache:
             return {"enabled": False, "total_entries": 0, "hit_rate": 0.0}

@@ -1,13 +1,12 @@
 """Tests for cache CLI commands."""
 
-import pytest
 import tempfile
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 from click.testing import CliRunner
 
-from modelaudit.cli import cli
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cli import cli
 
 
 class TestCacheCLI:
@@ -19,13 +18,14 @@ class TestCacheCLI:
 
     def test_cache_stats_empty(self):
         """Test cache stats with empty cache."""
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "stats"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = CliRunner()
+            result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
 
-        assert result.exit_code == 0
-        assert "Cache Statistics" in result.output
-        assert "Total entries: 0" in result.output
-        assert "Hit rate: 0.0%" in result.output
+            assert result.exit_code == 0
+            assert "Cache Statistics" in result.output
+            assert "Total entries: 0" in result.output
+            assert "Hit rate: 0.0%" in result.output
 
     def test_cache_clear_dry_run(self):
         """Test cache clear dry run."""

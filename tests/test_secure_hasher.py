@@ -1,15 +1,15 @@
 """Tests for secure file hashing functionality."""
 
-import os
-import tempfile
+import builtins
+import contextlib
+
 import pytest
-from pathlib import Path
 
 from modelaudit.utils.secure_hasher import (
     SecureFileHasher,
+    benchmark_hashing_performance,
     hash_file_secure,
     verify_file_hash,
-    benchmark_hashing_performance,
 )
 
 
@@ -265,10 +265,8 @@ class TestErrorHandling:
 
         finally:
             # Restore permissions for cleanup
-            try:
+            with contextlib.suppress(builtins.BaseException):
                 test_file.chmod(0o644)
-            except:
-                pass
 
 
 # Integration test with actual pickle file

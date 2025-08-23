@@ -1,13 +1,13 @@
 """File-based scan results cache implementation."""
 
-import json
 import hashlib
-import time
-import os
+import json
 import logging
+import os
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
-from dataclasses import dataclass, asdict
+from typing import Any, Optional
 
 from ..utils.secure_hasher import SecureFileHasher
 
@@ -19,10 +19,10 @@ class CacheEntry:
     """Data class for cache entries."""
 
     cache_key: str
-    file_info: Dict[str, Any]
-    version_info: Dict[str, Any]
-    scan_result: Dict[str, Any]
-    cache_metadata: Dict[str, Any]
+    file_info: dict[str, Any]
+    version_info: dict[str, Any]
+    scan_result: dict[str, Any]
+    cache_metadata: dict[str, Any]
 
 
 class ScanResultsCache:
@@ -51,7 +51,7 @@ class ScanResultsCache:
 
         self._ensure_metadata_exists()
 
-    def get_cached_result(self, file_path: str) -> Optional[Dict[str, Any]]:
+    def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
         """
         Get cached scan result if available and valid.
 
@@ -75,7 +75,7 @@ class ScanResultsCache:
                 return None
 
             # Load cache entry
-            with open(cache_file_path, "r", encoding="utf-8") as f:
+            with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
             # Validate entry is still valid
@@ -95,14 +95,14 @@ class ScanResultsCache:
 
             self._record_cache_hit()
             logger.info(f"Cache HIT for {os.path.basename(file_path)}")
-            return cache_entry["scan_result"]
+            return cache_entry["scan_result"]  # type: ignore[no-any-return]
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
             return None
 
-    def store_result(self, file_path: str, scan_result: Dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
+    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
         """
         Store scan result in cache.
 
@@ -197,7 +197,7 @@ class ScanResultsCache:
         # This prevents too many files in a single directory
         return self.cache_dir / cache_key[:2] / cache_key[2:4] / f"{cache_key}.json"
 
-    def _get_version_info(self) -> Dict[str, Any]:
+    def _get_version_info(self) -> dict[str, Any]:
         """Get current version information for cache invalidation."""
         try:
             # Try to import ModelAudit version
@@ -215,14 +215,14 @@ class ScanResultsCache:
             logger.debug(f"Failed to get version info: {e}")
             return {"modelaudit_version": "unknown", "scanner_versions": {}, "config_hash": "unknown"}
 
-    def _get_scanner_versions(self) -> Dict[str, str]:
+    def _get_scanner_versions(self) -> dict[str, str]:
         """Get version fingerprint for all scanners."""
         try:
             # Try to import scanner registry
             from modelaudit.scanners import SCANNER_REGISTRY
 
             versions = {}
-            for name, info in SCANNER_REGISTRY.items():
+            for name, info in SCANNER_REGISTRY.items():  # type: ignore[attr-defined]
                 # Get scanner class version if available
                 versions[name] = getattr(info, "version", "1.0")
 
@@ -240,7 +240,7 @@ class ScanResultsCache:
         config_str = json.dumps(config_data, sort_keys=True)
         return hashlib.blake2b(config_str.encode(), digest_size=8).hexdigest()
 
-    def _is_cache_entry_valid(self, cache_entry: Dict[str, Any], file_path: str) -> bool:
+    def _is_cache_entry_valid(self, cache_entry: dict[str, Any], file_path: str) -> bool:
         """
         Validate that cache entry is still valid.
 
@@ -269,10 +269,7 @@ class ScanResultsCache:
             scanned_at = cache_entry["cache_metadata"]["scanned_at"]
             age_days = (time.time() - scanned_at) / (24 * 60 * 60)
 
-            if age_days > 30:
-                return False
-
-            return True
+            return not age_days > 30
 
         except Exception:
             return False
@@ -317,7 +314,7 @@ class ScanResultsCache:
                 continue
 
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
+                with open(cache_file, encoding="utf-8") as f:
                     cache_entry = json.load(f)
 
                 last_access = cache_entry["cache_metadata"]["last_access"]
@@ -340,7 +337,7 @@ class ScanResultsCache:
 
     def _cleanup_empty_directories(self):
         """Remove empty cache subdirectories."""
-        for root, dirs, files in os.walk(self.cache_dir, topdown=False):
+        for root, dirs, _files in os.walk(self.cache_dir, topdown=False):
             for dirname in dirs:
                 dir_path = Path(root) / dirname
                 try:
@@ -349,7 +346,7 @@ class ScanResultsCache:
                 except OSError:
                     pass  # Directory not empty or other error
 
-    def get_cache_stats(self) -> Dict[str, Any]:
+    def get_cache_stats(self) -> dict[str, Any]:
         """
         Get cache statistics.
 
@@ -426,11 +423,11 @@ class ScanResultsCache:
         with open(self.metadata_file, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
-    def _load_cache_metadata(self) -> Dict[str, Any]:
+    def _load_cache_metadata(self) -> dict[str, Any]:
         """Load cache metadata from file."""
         try:
-            with open(self.metadata_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(self.metadata_file, encoding="utf-8") as f:
+                return json.load(f)  # type: ignore[no-any-return]
         except Exception:
             # Return default metadata if file can't be loaded
             return {"statistics": {"cache_hits": 0, "cache_misses": 0, "avg_scan_time_ms": 0.0}}

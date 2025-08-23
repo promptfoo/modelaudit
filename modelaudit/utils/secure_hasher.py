@@ -1,12 +1,11 @@
 """Secure file hashing for ModelAudit cache system."""
 
 import hashlib
+import logging
 import mmap
 import os
 import time
-import logging
-from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -74,17 +73,16 @@ class SecureFileHasher:
 
         try:
             if file_size < 100 * 1024 * 1024:  # < 100MB - use memory mapping
-                with open(file_path, "rb") as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        hasher.update(mm)
+                with open(file_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    hasher.update(mm)
             else:
                 # Stream large files in chunks
                 with open(file_path, "rb") as f:
                     while chunk := f.read(self.chunk_size):
                         hasher.update(chunk)
 
-        except (OSError, IOError) as e:
-            raise OSError(f"Failed to hash file {file_path}: {e}")
+        except OSError as e:
+            raise OSError(f"Failed to hash file {file_path}: {e}") from e
 
         hash_time = time.time() - start_time
         hash_hex = hasher.hexdigest()
@@ -126,8 +124,8 @@ class SecureFileHasher:
                     data = f.read(length)
                     hasher.update(data)
 
-        except (OSError, IOError) as e:
-            raise OSError(f"Failed to hash file {file_path}: {e}")
+        except OSError as e:
+            raise OSError(f"Failed to hash file {file_path}: {e}") from e
 
         # Include metadata for additional security
         stat = os.stat(file_path)
