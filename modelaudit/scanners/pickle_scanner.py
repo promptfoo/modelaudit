@@ -2532,7 +2532,7 @@ class PickleScanner(BaseScanner):
             ):
                 torch_references += 1
 
-            # Pattern 1: Suspicious torch imports (NOT legitimate ones like FloatStorage, LongStorage, _rebuild_tensor_v2)
+            # Pattern 1: Suspicious torch imports (NOT legitimate ones like FloatStorage, etc.)
             if (
                 opcode.name in ["GLOBAL", "STACK_GLOBAL"]
                 and arg
@@ -2544,7 +2544,7 @@ class PickleScanner(BaseScanner):
                     "_rebuild_tensor_v2", "_rebuild_tensor", "_rebuild_parameter", "_rebuild_sparse_tensor",
                     "_rebuild_nested_tensor", "strided", "contiguous", "storage", "tensor"
                 ]
-                
+
                 if not any(legitimate in str(arg).lower() for legitimate in legitimate_torch_ops):
                     # Look for dangerous opcodes within next 15 positions
                     for j in range(i + 1, min(i + 16, len(opcodes))):
@@ -2554,7 +2554,7 @@ class PickleScanner(BaseScanner):
                                 {
                                     "pattern_type": "torch_import_with_execution",
                                     "description": (
-                                        f"Suspicious PyTorch import ({arg}) followed by code execution opcode ({next_opcode.name})"
+                                        f"Suspicious PyTorch import followed by {next_opcode.name} opcode"
                                     ),
                                     "opcodes": [opcode.name, next_opcode.name],
                                     "exploitation_method": "weights_only=True bypass via PyTorch internal access",
