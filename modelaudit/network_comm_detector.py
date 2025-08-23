@@ -541,43 +541,86 @@ class NetworkCommDetector:
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
         is_ml_model = context and any(
-            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]
+            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx", ".safetensors"]
         )
 
-        for port in self.SUSPICIOUS_PORTS:
-            if is_ml_model:
-                for pattern in self.EXPLICIT_PORT_PATTERNS[port]:
-                    if pattern.search(data):
-                        port_name = self._get_port_name(port)
-                        self.findings.append(
-                            {
-                                "type": "suspicious_port",
-                                "severity": "HIGH",
-                                "confidence": 0.9,
-                                "message": f"Explicit network connection to port {port} ({port_name})",
-                                "port": port,
-                                "service": port_name,
-                                "context": context,
-                            }
-                        )
-                        break
-            else:
-                for pattern_bytes in self.PORT_PATTERNS[port]:
-                    if pattern_bytes in data:
-                        port_name = self._get_port_name(port)
+        # For ML models, we need to be much more conservative to avoid false positives
+        # Binary model weights can contain random byte sequences that match port patterns
+        if is_ml_model:
+            # Only scan for very explicit network patterns in ML models
+            # Skip port scanning for pure binary model files to avoid false positives
+            self._scan_explicit_network_patterns_in_ml_models(data, context)
+            return
 
+        # For non-ML files, use the original port detection logic
+        for port in self.SUSPICIOUS_PORTS:
+            for pattern_bytes in self.PORT_PATTERNS[port]:
+                if pattern_bytes in data:
+                    port_name = self._get_port_name(port)
+
+                    self.findings.append(
+                        {
+                            "type": "suspicious_port",
+                            "severity": "MEDIUM",
+                            "confidence": 0.6,
+                            "message": f"Suspicious port detected: {port} ({port_name})",
+                            "port": port,
+                            "service": port_name,
+                            "context": context,
+                        }
+                    )
+                    break
+
+    def _scan_explicit_network_patterns_in_ml_models(self, data: bytes, context: str) -> None:
+        """Scan for very explicit network patterns in ML models with high confidence."""
+        # Only look for very explicit network communication patterns that are unlikely
+        # to occur in legitimate model weights. These patterns require clear context.
+        
+        explicit_network_patterns = [
+            # Very explicit URL patterns that are unlikely in model weights
+            (rb'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*', "url"),
+            # Explicit socket connection patterns with clear text context
+            (rb'socket\.connect\s*\(\s*["\']?[a-zA-Z0-9.-]+["\']?\s*,\s*\d+', "socket_connection"),
+            # Clear HTTP request patterns
+            (rb'(GET|POST|PUT|DELETE)\s+\/[^\s]*\s+HTTP\/1\.[01]', "http_request"),
+            # Explicit network library imports in clear text
+            (rb'import\s+(socket|urllib|requests|httplib)', "network_import"),
+        ]
+        
+        for pattern, pattern_type in explicit_network_patterns:
+            import re
+            regex = re.compile(pattern, re.IGNORECASE)
+            matches = regex.finditer(data)
+            
+            for match in matches:
+                # Get context around the match to validate it's not in binary weights
+                start_pos = max(0, match.start() - 100)
+                end_pos = min(len(data), match.end() + 100)
+                context_data = data[start_pos:end_pos]
+                
+                # Check if this looks like legitimate text (not binary weights)
+                try:
+                    context_str = context_data.decode('utf-8', errors='strict')
+                    # If we can decode it as UTF-8, it's likely text-based and suspicious
+                    printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
+                    
+                    if printable_ratio > 0.7:  # High ratio of printable characters
+                        matched_text = match.group().decode('utf-8', errors='ignore')
                         self.findings.append(
                             {
-                                "type": "suspicious_port",
-                                "severity": "MEDIUM",
-                                "confidence": 0.6,
-                                "message": f"Suspicious port detected: {port} ({port_name})",
-                                "port": port,
-                                "service": port_name,
+                                "type": "explicit_network_pattern",
+                                "severity": "CRITICAL",
+                                "confidence": 0.95,
+                                "message": f"Explicit network pattern in ML model: {matched_text[:100]}",
+                                "pattern_type": pattern_type,
+                                "matched_text": matched_text[:200],
                                 "context": context,
                             }
                         )
-                        break
+                except UnicodeDecodeError:
+                    # If it can't be decoded as UTF-8, it's likely binary data
+                    # Skip to avoid false positives in model weights
+                    continue
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""

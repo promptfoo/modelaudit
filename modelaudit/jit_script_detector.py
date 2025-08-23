@@ -491,6 +491,208 @@ class JITScriptDetector:
 
         return findings
 
+    def scan_advanced_torchscript_vulnerabilities(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+        """Advanced TorchScript vulnerability scanning for sophisticated attacks"""
+        findings = []
+        
+        try:
+            text_data = data.decode("utf-8", errors="ignore")
+        except Exception:
+            text_data = str(data)
+        
+        # 1. TorchScript serialization injection attacks
+        serialization_injection_patterns = [
+            (r"torch\.jit\.save.*exec\s*\(", "TorchScript save with exec injection"),
+            (r"torch\.jit\.load.*eval\s*\(", "TorchScript load with eval injection"),
+            (r"torch\.save.*__reduce__", "PyTorch save with reduce injection"),
+            (r"torch\.load.*weights_only\s*=\s*False", "Unsafe torch.load without weights_only protection"),
+            (r"pickle\.loads.*torch", "Unsafe pickle deserialization with torch"),
+        ]
+        
+        for pattern, description in serialization_injection_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE)
+            if matches:
+                findings.append({
+                    "type": "torchscript_serialization_injection",
+                    "severity": "CRITICAL",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript serialization vulnerability: {description}",
+                    "context": context,
+                    "recommendation": "Use safe serialization methods and validate all model sources"
+                })
+        
+        # 2. TorchScript module manipulation attacks  
+        module_manipulation_patterns = [
+            (r"torch\.jit\.script\s*\(\s*lambda", "Lambda script compilation"),
+            (r"torch\.jit\.trace.*exec", "Trace with exec injection"),
+            (r"torch\.nn\.Module.*__getattr__.*exec", "Module attribute injection"),
+            (r"torch\.jit\.CompilationUnit.*exec", "Compilation unit injection"),
+            (r"torch\.jit\.script_method.*eval", "Script method with eval"),
+            (r"torch\.jit\.unused.*__import__", "Unused decorator bypass"),
+        ]
+        
+        for pattern, description in module_manipulation_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
+            if matches:
+                findings.append({
+                    "type": "torchscript_module_manipulation",
+                    "severity": "HIGH", 
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript module manipulation: {description}",
+                    "context": context,
+                    "recommendation": "Review model architecture for unauthorized module modifications"
+                })
+        
+        # 3. TorchScript graph manipulation
+        graph_manipulation_patterns = [
+            (r"torch\.jit\.freeze.*add_module", "Graph freeze with module injection"),
+            (r"torch\.jit\.optimize_for_inference.*exec", "Inference optimization with exec"),
+            (r"torch\.fx\.symbolic_trace.*eval", "FX tracing with eval injection"),
+            (r"torch\.fx\.replace_pattern.*__import__", "FX pattern replacement with import"),
+            (r"torch\.jit\.fuse.*system", "JIT fusion with system call"),
+        ]
+        
+        for pattern, description in graph_manipulation_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
+            if matches:
+                findings.append({
+                    "type": "torchscript_graph_manipulation",
+                    "severity": "HIGH",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript graph manipulation: {description}",
+                    "context": context,
+                    "recommendation": "Validate model graph integrity and compilation process"
+                })
+        
+        # 4. TorchScript bytecode injection
+        bytecode_injection_patterns = [
+            (r"torch\.jit\.get_jit_operator.*exec", "JIT operator with exec"),
+            (r"torch\.ops\.aten\..*exec", "ATEN operator with exec"),
+            (r"torch\.ops\.torchscript\..*eval", "TorchScript op with eval"),
+            (r"torch\.jit\.ScriptFunction.*compile", "Script function with compile"),
+            (r"torch\.jit\.mobile\..*exec", "Mobile JIT with exec"),
+        ]
+        
+        for pattern, description in bytecode_injection_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE)
+            if matches:
+                findings.append({
+                    "type": "torchscript_bytecode_injection",
+                    "severity": "CRITICAL",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript bytecode injection: {description}",
+                    "context": context,
+                    "recommendation": "This indicates potential code injection at the bytecode level"
+                })
+        
+        # 5. TorchScript CUDA/backend exploitation
+        backend_exploitation_patterns = [
+            (r"torch\.cuda\..*exec", "CUDA operations with exec"),
+            (r"torch\.backends\..*eval", "Backend configuration with eval"),
+            (r"torch\.distributed\..*system", "Distributed operations with system calls"),
+            (r"torch\.multiprocessing\..*exec", "Multiprocessing with exec"),
+            (r"torch\.profiler\..*eval", "Profiler with eval injection"),
+        ]
+        
+        for pattern, description in backend_exploitation_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE)
+            if matches:
+                findings.append({
+                    "type": "torchscript_backend_exploitation",
+                    "severity": "HIGH",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript backend exploitation: {description}",
+                    "context": context,
+                    "recommendation": "Review backend operations for security vulnerabilities"
+                })
+        
+        # 6. TorchScript hook and callback injection
+        hook_injection_patterns = [
+            (r"torch\.nn\.utils\.hooks\..*exec", "Hook with exec injection"),
+            (r"register_.*_hook.*eval", "Hook registration with eval"),
+            (r"register_forward_hook.*__import__", "Forward hook with import"),
+            (r"register_backward_hook.*system", "Backward hook with system call"),
+            (r"register_module_.*_hook.*exec", "Module hook with exec"),
+        ]
+        
+        for pattern, description in hook_injection_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
+            if matches:
+                findings.append({
+                    "type": "torchscript_hook_injection",
+                    "severity": "CRITICAL",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"TorchScript hook injection: {description}",
+                    "context": context,
+                    "recommendation": "Hooks can execute arbitrary code - review all hook registrations"
+                })
+        
+        # 7. Check for obfuscated TorchScript code
+        obfuscation_patterns = [
+            (r"\\x[0-9a-fA-F]{2}.*torch", "Hex-encoded TorchScript references"),
+            (r"base64.*decode.*torch", "Base64-encoded TorchScript code"),
+            (r"chr\(.*\).*torch", "Character-encoded TorchScript strings"),
+            (r"eval\(.*compile.*torch", "Double-encoded TorchScript execution"),
+        ]
+        
+        for pattern, description in obfuscation_patterns:
+            matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
+            if matches:
+                findings.append({
+                    "type": "torchscript_obfuscation",
+                    "severity": "WARNING",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"Obfuscated TorchScript code: {description}",
+                    "context": context,
+                    "recommendation": "Obfuscated code may hide malicious functionality"
+                })
+        
+        # 8. TorchScript version-specific vulnerability patterns
+        version_vulnerabilities = [
+            (r"torch\.jit\.load.*weights_only\s*=\s*True", "CVE-2025-32434: weights_only=True bypass pattern"),
+            (r"torch\.load.*map_location.*exec", "Map location with code execution"),
+            (r"torch\.serialization\..*exec", "Serialization with exec pattern"),
+            (r"torch\._C\..*eval", "Internal C++ interface with eval"),
+        ]
+        
+        for pattern, description in version_vulnerabilities:
+            matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
+            if matches:
+                findings.append({
+                    "type": "torchscript_version_vulnerability",
+                    "severity": "CRITICAL",
+                    "pattern": pattern,
+                    "description": description,
+                    "matches": len(matches),
+                    "framework": "TorchScript",
+                    "message": f"Version-specific vulnerability: {description}",
+                    "context": context,
+                    "recommendation": "Update PyTorch version and review loading patterns"
+                })
+        
+        return findings
+
     def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list[dict[str, Any]]:
         """Main entry point to scan a model for JIT/Script code execution risks.
 
@@ -516,6 +718,8 @@ class JITScriptDetector:
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
+            # Advanced TorchScript vulnerability scanning
+            findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
             findings.extend(self.scan_tensorflow(data, context))
@@ -527,6 +731,7 @@ class JITScriptDetector:
         if model_type == "unknown" or not findings:
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
+            findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
 
