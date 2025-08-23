@@ -9,6 +9,8 @@ from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
 from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
+    CVE_BINARY_PATTERNS,
+    CVE_COMBINED_PATTERNS,
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
@@ -18,6 +20,7 @@ from modelaudit.utils.code_validation import (
     validate_python_syntax,
 )
 
+from ..cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..explanations import (
     get_import_explanation,
     get_opcode_explanation,
@@ -1121,7 +1124,7 @@ class PickleScanner(BaseScanner):
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
         """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
-        # Early detection of dangerous patterns
+        # Early detection of dangerous patterns (existing + CVE-specific)
         dangerous_patterns = [
             b"posix",  # Common in malicious pickles (posix.system)
             b"subprocess",
@@ -1149,6 +1152,9 @@ class PickleScanner(BaseScanner):
             b"getstatusoutput",  # commands.getstatusoutput
             b"system",  # Catches both os.system and from os import system
         ]
+        
+        # Add CVE-specific binary patterns
+        dangerous_patterns.extend(CVE_BINARY_PATTERNS)
 
         # Limit how much we scan for performance
         max_scan_size = min(8192, len(data))
@@ -1189,6 +1195,52 @@ class PickleScanner(BaseScanner):
                         f"The file contains the dangerous pattern '{pattern_str}' "
                         f"which could indicate malicious code execution during unpickling."
                     ),
+                )
+        
+        # Perform CVE-specific pattern analysis on the data
+        self._analyze_cve_patterns(data, result, context_path)
+
+    def _analyze_cve_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
+        """Analyze data for specific CVE patterns and add CVE attribution."""
+        # Convert bytes to string for pattern analysis
+        try:
+            content_str = data.decode('utf-8', errors='ignore')
+        except UnicodeDecodeError:
+            content_str = ""
+        
+        # Use CVE pattern analysis
+        cve_attributions = analyze_cve_patterns(content_str, data)
+        
+        if cve_attributions:
+            # Enhance scan result with CVE information
+            enhance_scan_result_with_cve(result, [content_str], data)
+            
+            # Add specific CVE detection checks
+            for attr in cve_attributions:
+                severity = IssueSeverity.CRITICAL if attr.severity == "CRITICAL" else IssueSeverity.WARNING
+                
+                # Check if this is a high-confidence detection
+                confidence_desc = "high" if attr.confidence > 0.8 else "medium" if attr.confidence > 0.6 else "low"
+                
+                result.add_check(
+                    name=f"CVE Pattern Detection: {attr.cve_id}",
+                    passed=False,
+                    message=f"Detected patterns associated with {attr.cve_id} ({confidence_desc} confidence)",
+                    severity=severity,
+                    location=context_path,
+                    details={
+                        "cve_id": attr.cve_id,
+                        "description": attr.description,
+                        "cvss_score": attr.cvss,
+                        "cwe": attr.cwe,
+                        "affected_versions": attr.affected_versions,
+                        "confidence": attr.confidence,
+                        "patterns_matched": attr.patterns_matched,
+                        "remediation": attr.remediation,
+                    },
+                    why=f"This pickle file contains patterns consistent with {attr.cve_id}, "
+                        f"a {attr.severity.lower()} vulnerability ({attr.cwe}) affecting {attr.affected_versions}. "
+                        f"This could indicate potential exploitation attempts. {attr.remediation}"
                 )
 
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
