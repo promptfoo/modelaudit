@@ -2546,18 +2546,44 @@ class PickleScanner(BaseScanner):
                         # Only flag clearly suspicious torch operations
                         is_suspicious = (
                             # Suspicious torch modules/functions
-                            any(suspicious in str(arg).lower() for suspicious in [
-                                "eval", "exec", "system", "import", "builtin", "compile",
-                                "subprocess", "os.", "sys.", "__import__", "getattr"
-                            ]) or
+                            any(
+                                suspicious in str(arg).lower()
+                                for suspicious in [
+                                    "eval",
+                                    "exec",
+                                    "system",
+                                    "import",
+                                    "builtin",
+                                    "compile",
+                                    "subprocess",
+                                    "os.",
+                                    "sys.",
+                                    "__import__",
+                                    "getattr",
+                                ]
+                            )
+                            or
                             # Non-standard torch operations that could be malicious
-                            ("torch" in str(arg).lower() and 
-                             not any(standard in str(arg).lower() for standard in [
-                                 "storage", "_rebuild", "tensor", "parameter", "module", 
-                                 "nn.", "functional", "utils", "cuda", "device"
-                             ]))
+                            (
+                                "torch" in str(arg).lower()
+                                and not any(
+                                    standard in str(arg).lower()
+                                    for standard in [
+                                        "storage",
+                                        "_rebuild",
+                                        "tensor",
+                                        "parameter",
+                                        "module",
+                                        "nn.",
+                                        "functional",
+                                        "utils",
+                                        "cuda",
+                                        "device",
+                                    ]
+                                )
+                            )
                         )
-                        
+
                         if is_suspicious:
                             patterns.append(
                                 {
