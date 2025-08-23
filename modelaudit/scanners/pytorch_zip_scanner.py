@@ -623,17 +623,17 @@ class PyTorchZipScanner(BaseScanner):
             # Look for GLOBAL opcodes that reference torch.__version__
             for i, (opcode, arg, _pos) in enumerate(opcodes):
                 if opcode.name == "GLOBAL" and arg and "torch" in arg and ("version" in arg or "__version__" in arg):
-                        # Found a reference to torch version - try to get the value
-                        # Look for subsequent opcodes that might contain the version string
-                        for j in range(i + 1, min(i + 10, len(opcodes))):
-                            next_opcode, next_arg, next_pos = opcodes[j]
-                            if (
-                                next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
-                                and next_arg
-                                and isinstance(next_arg, str)
-                                and self._looks_like_version(next_arg)
-                            ):
-                                    return next_arg
+                    # Found a reference to torch version - try to get the value
+                    # Look for subsequent opcodes that might contain the version string
+                    for j in range(i + 1, min(i + 10, len(opcodes))):
+                        next_opcode, next_arg, next_pos = opcodes[j]
+                        if (
+                            next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                            and next_arg
+                            and isinstance(next_arg, str)
+                            and self._looks_like_version(next_arg)
+                        ):
+                            return next_arg
 
             # Look for any version-like strings in the pickle
             for opcode, arg, _pos in opcodes:
@@ -643,7 +643,7 @@ class PyTorchZipScanner(BaseScanner):
                     and isinstance(arg, str)
                     and self._looks_like_pytorch_version(arg)
                 ):
-                        return arg
+                    return arg
 
         except Exception:
             pass
@@ -681,8 +681,7 @@ class PyTorchZipScanner(BaseScanner):
                     name="CVE-2025-32434 PyTorch Version Check",
                     passed=False,
                     message=(
-                        f"Model uses vulnerable PyTorch version {framework_version} "
-                        "susceptible to CVE-2025-32434 RCE"
+                        f"Model uses vulnerable PyTorch version {framework_version} susceptible to CVE-2025-32434 RCE"
                     ),
                     severity=IssueSeverity.CRITICAL,
                     location=path,

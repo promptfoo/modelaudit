@@ -646,8 +646,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     name="Protobuf Field Size Check",
                                     passed=False,
                                     message=(
-                        f"Abnormally large protobuf field '{field_desc.name}' with {field_size} elements"
-                    ),
+                                        f"Abnormally large protobuf field '{field_desc.name}' "
+                                        f"with {field_size} elements"
+                                    ),
                                     severity=IssueSeverity.WARNING,
                                     location=self.current_file_path,
                                     details={
@@ -788,8 +789,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         name="Protobuf Node Name Length Check",
                         passed=False,
                         message=(
-                            f"Abnormally long node name (length: {len(node.name)}) "
-                            "may indicate buffer overflow attempt"
+                            f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
                         ),
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (node: {node.name[:100]}...)",
