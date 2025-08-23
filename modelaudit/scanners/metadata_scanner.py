@@ -95,33 +95,98 @@ class MetadataScanner(BaseScanner):
         url_pattern = r'https?://[^\s<>"\']+[^\s<>"\',.]'
         urls = re.findall(url_pattern, content)
 
-        suspicious_domains = [
+        # High-risk domains that are almost always suspicious
+        high_risk_domains = [
             "bit.ly",
             "tinyurl.com",
             "t.co",
             "goo.gl",
             "ow.ly",
-            "github.io",
-            "gitlab.io",
             "ngrok.io",
             "localtunnel.me",
         ]
 
+        # Medium-risk domains that could be legitimate but worth flagging
+        medium_risk_domains = [
+            "github.io",
+            "gitlab.io",
+        ]
+
         for url in urls:
-            for domain in suspicious_domains:
-                if domain in url.lower():
+            url_lower = url.lower()
+            for domain in high_risk_domains:
+                if domain in url_lower:
                     issues.append(
                         Issue(
                             message=f"Suspicious URL found in text metadata: {url}",
                             severity=IssueSeverity.WARNING,
                             location=file_path,
-                            details={"url": url, "suspicious_domain": domain},
+                            details={"url": url, "suspicious_domain": domain, "risk_level": "high"},
                             why="URL shorteners and tunnel services can hide malicious endpoints",
                             type="suspicious_url",
                         )
                     )
+                    break  # Avoid duplicate issues for the same URL
+
+            # For medium-risk domains, be more selective
+            for domain in medium_risk_domains:
+                if domain in url_lower:
+                    # Check if this looks like a legitimate project page
+                    if not self._looks_like_legitimate_project_url(url):
+                        issues.append(
+                            Issue(
+                                message=f"Potentially suspicious hosting service in text metadata: {url}",
+                                severity=IssueSeverity.INFO,  # Lower severity for medium risk
+                                location=file_path,
+                                details={"url": url, "suspicious_domain": domain, "risk_level": "medium"},
+                                why="Third-party hosting services should be verified for legitimacy",
+                                type="suspicious_url",
+                            )
+                        )
+                    break  # Avoid duplicate issues for the same URL
 
         return issues
+
+    def _looks_like_legitimate_project_url(self, url: str) -> bool:
+        """Check if a URL looks like a legitimate project page rather than suspicious content."""
+        url_lower = url.lower()
+
+        # Look for patterns that suggest legitimate project pages
+        legitimate_patterns = [
+            # Common project/documentation patterns
+            r"github\.io/[\w\-]+/?$",  # Simple username.github.io
+            r"[\w\-]+\.github\.io/?$",  # Project pages
+            r"gitlab\.io/[\w\-]+/?$",   # Simple username.gitlab.io
+            r"[\w\-]+\.gitlab\.io/?$",  # Project pages
+            # Documentation and common project files
+            r"/docs?/?$",
+            r"/readme\.md$",
+            r"/index\.html?$",
+        ]
+
+        import re
+        return any(re.search(pattern, url_lower) for pattern in legitimate_patterns)
+
+    def _calculate_entropy(self, text: str) -> float:
+        """Calculate the Shannon entropy of a text string."""
+        import math
+        from collections import Counter
+
+        if not text:
+            return 0.0
+
+        # Count character frequencies
+        char_counts = Counter(text)
+        text_len = len(text)
+
+        # Calculate entropy
+        entropy = 0.0
+        for count in char_counts.values():
+            probability = count / text_len
+            if probability > 0:
+                entropy -= probability * math.log2(probability)
+
+        return entropy
 
     def _check_exposed_secrets_in_text(self, content: str, file_path: str) -> list[Issue]:
         """Check for exposed secrets in text content."""
@@ -142,10 +207,30 @@ class MetadataScanner(BaseScanner):
             for match in matches:
                 # Skip obvious examples or placeholders
                 matched_text = match.group(0)
-                if not any(
+
+                # Extract the actual secret part for entropy analysis
+                secret_part = matched_text
+                if "=" in matched_text:
+                    # For token assignments like "api_key=abc123", extract just the value
+                    secret_part = matched_text.split("=", 1)[1].strip(' "\'')
+                elif " " in matched_text and "Bearer" in matched_text:
+                    # For Bearer tokens, extract just the token part
+                    secret_part = matched_text.split(" ", 1)[1].strip()
+
+                # Check for obvious placeholders
+                is_placeholder = any(
                     placeholder in matched_text.lower()
-                    for placeholder in ["example", "placeholder", "your_", "xxx", "****", "token_here"]
-                ):
+                    for placeholder in ["example", "placeholder", "your_", "xxx", "****", "token_here", "sample"]
+                )
+
+                # Calculate entropy to reduce false positives
+                entropy = self._calculate_entropy(secret_part)
+
+                # Only flag as suspicious if it has sufficient entropy (randomness)
+                # Typical thresholds: low entropy (~2.0) for structured text, high entropy (~4.5+) for random tokens
+                min_entropy = 3.5  # Balanced threshold to catch real secrets but avoid common words
+
+                if not is_placeholder and entropy >= min_entropy and len(secret_part) >= 10:
                     issues.append(
                         Issue(
                             message=f"Potential exposed secret in text metadata: {description}",
@@ -154,6 +239,8 @@ class MetadataScanner(BaseScanner):
                             details={
                                 "pattern_description": description,
                                 "match_preview": matched_text[:20] + "..." if len(matched_text) > 20 else matched_text,
+                                "entropy": round(entropy, 2),
+                                "length": len(secret_part),
                             },
                             why="Exposed secrets in documentation can lead to unauthorized access",
                             type="exposed_secret",

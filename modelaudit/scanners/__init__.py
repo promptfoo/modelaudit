@@ -456,6 +456,20 @@ class ScannerRegistry:
 
                 return None
 
+    def has_scanner_class(self, class_name: str) -> bool:
+        """Check if a scanner class is available without loading it.
+
+        Args:
+            class_name: Name of the scanner class to check for
+
+        Returns:
+            True if the scanner is registered and can potentially be loaded
+        """
+        return any(
+            scanner_info.get("class") == class_name
+            for scanner_info in self._scanners.values()
+        )
+
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
         scanner_classes = []

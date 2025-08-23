@@ -506,10 +506,8 @@ def scan_model_directory_or_file(
 
     validate_scan_config(config)
 
-    # Check if metadata scanner is available once (optimization)
-    metadata_scanner_available = any(
-        scanner_class.__name__ == "MetadataScanner" for scanner_class in _registry.get_scanner_classes()
-    )
+    # Check if metadata scanner is available once (optimization - avoids loading all scanners)
+    metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
 
     try:
         # Handle streaming paths

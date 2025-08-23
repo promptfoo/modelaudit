@@ -125,9 +125,8 @@ class TestModelDownload:
         cache_dir = tmp_path / "custom_cache"
         download_model("hf://test/model", cache_dir=cache_dir)
 
-        # Verify cache directory was used
+        # Verify cache directory was used (we now use local_dir instead of cache_dir for safety)
         call_args = mock_snapshot_download.call_args
-        assert call_args[1]["cache_dir"] == str(cache_dir / "huggingface" / "test" / "model")
         assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
 
     @patch("huggingface_hub.snapshot_download")
@@ -149,20 +148,17 @@ class TestModelDownload:
         with pytest.raises(ValueError):
             download_model("https://github.com/user/repo")
 
-    @patch("builtins.__import__")
-    def test_missing_huggingface_hub_dependency(self, mock_import):
+    def test_missing_huggingface_hub_dependency(self):
         """Test error when huggingface-hub is not installed."""
-
-        # Mock the import to raise ImportError
-        def side_effect(name, *args, **kwargs):
-            if name == "huggingface_hub":
-                raise ImportError("No module named 'huggingface_hub'")
-            return __import__(name, *args, **kwargs)
-
-        mock_import.side_effect = side_effect
-
-        with pytest.raises(ImportError, match="huggingface-hub package is required"):
-            download_model("https://huggingface.co/test/model")
+        real_import = __import__
+        with patch("builtins.__import__") as mock_import:
+            def side_effect(name, *args, **kwargs):
+                if name == "huggingface_hub":
+                    raise ImportError("No module named 'huggingface_hub'")
+                return real_import(name, *args, **kwargs)
+            mock_import.side_effect = side_effect
+            with pytest.raises(ImportError, match="huggingface-hub package is required"):
+                download_model("https://huggingface.co/test/model")
 
 
 class TestModelSizeAndDiskSpace:
@@ -228,18 +224,19 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_insufficient_disk_space(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
     ):
-        """Test download fails gracefully when disk space is insufficient."""
+        """Test download fails gracefully when disk space is insufficient (with custom cache)."""
         # Mock model size
         mock_get_model_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
 
         # Mock disk space check to fail
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
-        # Test download failure
+        # Test download failure with custom cache directory (this enables disk space checking)
+        cache_dir = tmp_path / "custom_cache"
         with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
-            download_model("https://huggingface.co/test/model")
+            download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify snapshot_download was not called
         mock_snapshot_download.assert_not_called()
@@ -248,9 +245,9 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_disk_space_check(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
     ):
-        """Test successful download with disk space check."""
+        """Test successful download with disk space check when using custom cache."""
         # Mock model size
         mock_get_model_size.return_value = 1024 * 1024 * 1024  # 1 GB
 
@@ -258,11 +255,12 @@ class TestModelSizeAndDiskSpace:
         mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
 
         # Mock snapshot download
-        mock_path = "/tmp/test_model"
+        mock_path = str(tmp_path / "test_model")
         mock_snapshot_download.return_value = mock_path
 
-        # Test download
-        result = download_model("https://huggingface.co/test/model")
+        # Test download with custom cache directory (this enables disk space checking)
+        cache_dir = tmp_path / "custom_cache"
+        result = download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify disk space was checked
         mock_check_disk_space.assert_called_once()
@@ -419,16 +417,14 @@ class TestHuggingFaceFileURLs:
         with pytest.raises(ValueError):
             download_file_from_hf("https://github.com/user/repo/blob/main/file.bin")
 
-    @patch("builtins.__import__")
-    def test_download_file_missing_dependency(self, mock_import):
+    def test_download_file_missing_dependency(self):
         """Test error when huggingface-hub is not installed."""
-
-        def side_effect(name, *args, **kwargs):
-            if name == "huggingface_hub":
-                raise ImportError("No module named 'huggingface_hub'")
-            return __import__(name, *args, **kwargs)
-
-        mock_import.side_effect = side_effect
-
-        with pytest.raises(ImportError, match="huggingface-hub package is required"):
-            download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")
+        real_import = __import__
+        with patch("builtins.__import__") as mock_import:
+            def side_effect(name, *args, **kwargs):
+                if name == "huggingface_hub":
+                    raise ImportError("No module named 'huggingface_hub'")
+                return real_import(name, *args, **kwargs)
+            mock_import.side_effect = side_effect
+            with pytest.raises(ImportError, match="huggingface-hub package is required"):
+                download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")
