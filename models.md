@@ -13,9 +13,10 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 143 models cataloged
-- Safe Models: 47 legitimate models (baseline testing)
-- Malicious Models: 96 models with attack vectors
+- Total Models: 133 models cataloged
+- Safe Models: 45 legitimate models (baseline testing)
+- Malicious Models: 88 models with attack vectors
+- Archived Models: 10 models no longer available
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
 - Attack Types: 7+ distinct exploitation methods
 
@@ -25,53 +26,51 @@ These models should scan clean and serve as negative controls for false positive
 
 | #   | Model Name                                                        | Type            | Source       | Status | Scan Results                                                                                               |
 | --- | ----------------------------------------------------------------- | --------------- | ------------ | ------ | ---------------------------------------------------------------------------------------------------------- |
-| 1   | `vikhyatk/moondream-2`                                            | Computer Vision | Hugging Face | Failed | Repository not found                                                                                       |
-| 2   | `openai/clip-vit-base-patch32`                                    | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`                                                            |
-| 3   | `google/vit-base-patch16-224`                                     | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`                                                             |
-| 4   | `facebook/detr-resnet-50`                                         | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`                                                                 |
-| 5   | `microsoft/beit-base-patch16-224`                                 | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`                                                         |
-| 6   | `ultralytics/yolov5n`                                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`                                                                     |
-| 7   | `pytorch/vision:v0.13.0-mobilenet_v2`                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`                                                                    |
-| 8   | `scikit-learn/logistic-regression`                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt`                                                        |
-| 9   | `scikit-learn/decision-tree`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 10  | `scikit-learn/svm`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 11  | `scikit-learn/random-forest`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 12  | `scikit-learn/gradient-boosting`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 13  | `scikit-learn/k-means`                                            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 14  | `scikit-learn/linear-regression`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 15  | `scikit-learn/ridge`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 16  | `scikit-learn/lasso`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 17  | `scikit-learn/pca`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 18  | `scikit-learn/agglomerative-clustering`                           | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
-| 19  | `sentence-transformers/all-MiniLM-L6-v2`                          | Text Embeddings | Hugging Face | Clean  | Safetensors format - no pickle execution risk                                                              |
-| 20  | `timm/resnet50.a1_in1k`                                           | Computer Vision | Hugging Face | Clean  | Timm model with safetensors - validates timm coverage                                                      |
-| 21  | `facebook/dinov2-base`                                            | Computer Vision | Hugging Face | Clean  | Vision backbone with safetensors - large file handling                                                     |
-| 22  | `microsoft/resnet-50`                                             | Computer Vision | Hugging Face | Clean  | Classic ResNet with safetensors - ResNet repo validation                                                   |
-| 23  | `google-bert/bert-base-uncased`                                   | NLP             | Hugging Face | Clean  | Base BERT with safetensors and ONNX - core NLP baseline                                                    |
-| 24  | `distilbert/distilbert-base-uncased`                              | NLP             | Hugging Face | Clean  | DistilBERT with safetensors - minimal transformer control                                                  |
-| 25  | `FacebookAI/roberta-base`                                         | NLP             | Hugging Face | Clean  | RoBERTa with safetensors - confirms RoBERTa configs clean                                                  |
-| 26  | `google-t5/t5-small`                                              | NLP             | Hugging Face | Clean  | T5 with safetensors - encoder-decoder validation                                                           |
-| 27  | `facebook/wav2vec2-base-960h`                                     | Audio ASR       | Hugging Face | Clean  | Wav2Vec2 with safetensors - audio feature extractors                                                       |
-| 28  | `openai/whisper-tiny`                                             | Audio ASR       | Hugging Face | Clean  | Whisper with safetensors - small ASR baseline                                                              |
-| 29  | `Xenova/clip-vit-base-patch16`                                    | ONNX            | Hugging Face | Clean  | CLIP vision-text ONNX - transformer ONNX validation                                                        |
-| 30  | `Xenova/clip-vit-large-patch14`                                   | ONNX            | Hugging Face | Clean  | Large CLIP ONNX - bigger graph handling                                                                    |
-| 31  | `onnx-community/mobilenet_v2_1.0_224`                             | ONNX            | Hugging Face | Clean  | MobileNetV2 ONNX - mobile CNN baseline                                                                     |
-| 32  | `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k`           | ONNX            | Hugging Face | Clean  | MobileNetV4 ONNX - modern opsets validation                                                                |
-| 33  | `Kalray/resnet50`                                                 | ONNX            | Hugging Face | Clean  | ResNet50 ONNX with INT8 - quantized ONNX validation                                                        |
-| 34  | `Kalray/deeplabv3plus-resnet50`                                   | ONNX            | Hugging Face | Clean  | Segmentation ONNX - segmentation graph coverage                                                            |
-| 35  | `Qualcomm/MobileNet-v2`                                           | ONNX            | Hugging Face | Clean  | Vendor ONNX reference - vendor-packaged graphs                                                             |
-| 36  | `webnn/yolov8m`                                                   | ONNX            | Hugging Face | Clean  | YOLOv8 ONNX - confirms YOLO-in-ONNX doesn't FP like .pt                                                    |
-| 37  | `OpenVINO/bert-base-uncased-sst2-unstructured80-int8-ov`          | OpenVINO        | Hugging Face | Clean  | OpenVINO IR (XML+BIN) - mixed asset repo validation                                                        |
-| 38  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
-| 39  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
-| 40  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
-| 41  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
-| 42  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
-| 43  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
-| 44  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
-| 45  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
-| 46  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
-| 47  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
+| 1   | `openai/clip-vit-base-patch32`                                    | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`                                                            |
+| 2   | `google/vit-base-patch16-224`                                     | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`                                                             |
+| 3   | `facebook/detr-resnet-50`                                         | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`                                                                 |
+| 4   | `microsoft/beit-base-patch16-224`                                 | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`                                                         |
+| 5   | `ultralytics/yolov5n`                                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`                                                                     |
+| 6   | `pytorch/vision:v0.13.0-mobilenet_v2`                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`                                                                    |
+| 7   | `scikit-learn/logistic-regression`                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt`                                                        |
+| 8   | `scikit-learn/decision-tree`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 9   | `scikit-learn/svm`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 10  | `scikit-learn/random-forest`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 11  | `scikit-learn/gradient-boosting`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 12  | `scikit-learn/k-means`                                            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 13  | `scikit-learn/linear-regression`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 14  | `scikit-learn/ridge`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 15  | `scikit-learn/lasso`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 16  | `scikit-learn/pca`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 17  | `scikit-learn/agglomerative-clustering`                           | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 18  | `sentence-transformers/all-MiniLM-L6-v2`                          | Text Embeddings | Hugging Face | Clean  | Safetensors format - no pickle execution risk                                                              |
+| 19  | `timm/resnet50.a1_in1k`                                           | Computer Vision | Hugging Face | Clean  | Timm model with safetensors - validates timm coverage                                                      |
+| 20  | `facebook/dinov2-base`                                            | Computer Vision | Hugging Face | Clean  | Vision backbone with safetensors - large file handling                                                     |
+| 21  | `microsoft/resnet-50`                                             | Computer Vision | Hugging Face | Clean  | Classic ResNet with safetensors - ResNet repo validation                                                   |
+| 22  | `google-bert/bert-base-uncased`                                   | NLP             | Hugging Face | Clean  | Base BERT with safetensors and ONNX - core NLP baseline                                                    |
+| 23  | `distilbert/distilbert-base-uncased`                              | NLP             | Hugging Face | Clean  | DistilBERT with safetensors - minimal transformer control                                                  |
+| 24  | `FacebookAI/roberta-base`                                         | NLP             | Hugging Face | Clean  | RoBERTa with safetensors - confirms RoBERTa configs clean                                                  |
+| 25  | `google-t5/t5-small`                                              | NLP             | Hugging Face | Clean  | T5 with safetensors - encoder-decoder validation                                                           |
+| 26  | `facebook/wav2vec2-base-960h`                                     | Audio ASR       | Hugging Face | Clean  | Wav2Vec2 with safetensors - audio feature extractors                                                       |
+| 27  | `openai/whisper-tiny`                                             | Audio ASR       | Hugging Face | Clean  | Whisper with safetensors - small ASR baseline                                                              |
+| 28  | `Xenova/clip-vit-base-patch16`                                    | ONNX            | Hugging Face | Clean  | CLIP vision-text ONNX - transformer ONNX validation                                                        |
+| 29  | `Xenova/clip-vit-large-patch14`                                   | ONNX            | Hugging Face | Clean  | Large CLIP ONNX - bigger graph handling                                                                    |
+| 30  | `onnx-community/mobilenet_v2_1.0_224`                             | ONNX            | Hugging Face | Clean  | MobileNetV2 ONNX - mobile CNN baseline                                                                     |
+| 31  | `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k`           | ONNX            | Hugging Face | Clean  | MobileNetV4 ONNX - modern opsets validation                                                                |
+| 32  | `Kalray/resnet50`                                                 | ONNX            | Hugging Face | Clean  | ResNet50 ONNX with INT8 - quantized ONNX validation                                                        |
+| 33  | `Kalray/deeplabv3plus-resnet50`                                   | ONNX            | Hugging Face | Clean  | Segmentation ONNX - segmentation graph coverage                                                            |
+| 34  | `webnn/yolov8m`                                                   | ONNX            | Hugging Face | Clean  | YOLOv8 ONNX - confirms YOLO-in-ONNX doesn't FP like .pt                                                    |
+| 35  | `OpenVINO/bert-base-uncased-sst2-unstructured80-int8-ov`          | OpenVINO        | Hugging Face | Clean  | OpenVINO IR (XML+BIN) - mixed asset repo validation                                                        |
+| 36  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
+| 37  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
+| 38  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
+| 39  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
+| 40  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
+| 41  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
+| 42  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
+| 43  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
+| 44  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
+| 45  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
 
 ## Malicious Models (Threat Detection Testing)
 
@@ -83,21 +82,21 @@ Classic pickle deserialization attacks in PyTorch model files.
 
 | #   | Model Name                              | Attack Vector | Source       | Primary Artifact                               | Detection Notes                                                                                                                    |
 | --- | --------------------------------------- | ------------- | ------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| 19  | `drhyrum/bert-tiny-torch-picklebomb`    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Explicit picklebomb demo                                                                                        |
-| 20  | `Frase/tiny-bert-model-unsafe`          | Pickle RCE    | Hugging Face | `archive/data.pkl`                             | Contains webbrowser.open and torch rebuild helpers                                                                                 |
-| 21  | `kojino/bert-tiny-torch-picklebomb`     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Fork of picklebomb PoC                                                                                                             |
-| 22  | `drhyrum/bert-tiny-torch-vuln`          | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged unsafe in HF UI                                                                                                            |
-| 23  | `ykilcher/totally-harmless-model`       | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Contains `__builtin__.eval` imports                                                                                                |
-| 24  | `hf-internal-testing/unsafe-model`      | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Known-bad control model                                                                                         |
-| 25  | `matanby/unsafe-diffusion`              | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Dummy model demonstrating unsafe pickle loading                                                                                    |
-| 26  | `MustEr/bert_locked`                    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Labeled "Security Research - Do NOT download"                                                                                      |
-| 27  | `MustEr/gpt2-elite`                     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged with suspicious imports, real-world example                                                                                |
-| 28  | `TencentAIGC/poisoned-model`            | Pickle RCE    | Hugging Face | `poisoned_model.pth`                           | Explicit `posix.system` import detection                                                                                           |
-| 29  | `DSfsdasgaa/shell`                      | Pickle RCE    | Hugging Face | `kcp.pth`, `ws.pth`                            | `.pth` files with `posix.system`, includes ELF                                                                                     |
-| 30  | `nono31/malicious-models-repo`          | Multi-format  | Hugging Face | Multiple files                                 | Multiple unsafe files: PyTorch, GGUF, TensorFlow                                                                                   |
-| 31  | `YuhengSSS/VSSD`                        | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth`            | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage.                                                   |
-| 32  | `XavierJiezou/ktda-models`              | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`                          | "Detected Pickle imports (11)." Useful for PyTorch load path test.                                                                 |
-| 33  | `trackinglaboratory/CAMELTrack`         | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`                        | Marked **Unsafe**. Exercises compressed pickle handling.                                                                           |
+| 46  | `drhyrum/bert-tiny-torch-picklebomb`    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Explicit picklebomb demo                                                                                        |
+| 47  | `Frase/tiny-bert-model-unsafe`          | Pickle RCE    | Hugging Face | `archive/data.pkl`                             | Contains webbrowser.open and torch rebuild helpers                                                                                 |
+| 48  | `kojino/bert-tiny-torch-picklebomb`     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Fork of picklebomb PoC                                                                                                             |
+| 49  | `drhyrum/bert-tiny-torch-vuln`          | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged unsafe in HF UI                                                                                                            |
+| 50  | `ykilcher/totally-harmless-model`       | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Contains `__builtin__.eval` imports                                                                                                |
+| 51  | `hf-internal-testing/unsafe-model`      | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Recommended test - Known-bad control model                                                                                         |
+| 52  | `matanby/unsafe-diffusion`              | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Dummy model demonstrating unsafe pickle loading                                                                                    |
+| 53  | `MustEr/bert_locked`                    | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Labeled "Security Research - Do NOT download"                                                                                      |
+| 54  | `MustEr/gpt2-elite`                     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged with suspicious imports, real-world example                                                                                |
+| 55  | `TencentAIGC/poisoned-model`            | Pickle RCE    | Hugging Face | `poisoned_model.pth`                           | Explicit `posix.system` import detection                                                                                           |
+| 56  | `DSfsdasgaa/shell`                      | Pickle RCE    | Hugging Face | `kcp.pth`, `ws.pth`                            | `.pth` files with `posix.system`, includes ELF                                                                                     |
+| 57  | `nono31/malicious-models-repo`          | Multi-format  | Hugging Face | Multiple files                                 | Multiple unsafe files: PyTorch, GGUF, TensorFlow                                                                                   |
+| 58  | `YuhengSSS/VSSD`                        | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth`            | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage.                                                   |
+| 59  | `XavierJiezou/ktda-models`              | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`                          | "Detected Pickle imports (11)." Useful for PyTorch load path test.                                                                 |
+| 60  | `trackinglaboratory/CAMELTrack`         | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`                        | Marked **Unsafe**. Exercises compressed pickle handling.                                                                           |
 | 101 | `LiheYoung/Depth-Anything`              | Pickle RCE    | HF Space     | `checkpoints_semseg/ade20k_vitl_mIoU_59.4.pth` | File Security Scans mark file **Unsafe**. "Detected Pickle imports (11)" listed.                                                   |
 | 102 | `rodrigomiranda98/tweet-eval-emotion`   | Raw pickle    | Hugging Face | `model.pkl`                                    | File page shows **Unsafe** status for the pickle file. Good for generic pickle‑load path tests.                                    |
 | 103 | `cesaenv/rottenTomatoes`                | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (97)" including FastAI, spaCy, and torch rebuild opcodes. Stresses large import surfaces. |
@@ -125,7 +124,6 @@ YOLO and PyTorch model files with embedded malicious pickle payloads.
 | 40  | `StableDiffusionVN/yolo`                | YOLO pickle   | Hugging Face | `yolo-human-parse-v2.pt`    | YOLO .pt flagged unsafe                                                                                |
 | 41  | `Zhao-Xuanxiang/yolov7-seg`             | YOLO pickle   | Hugging Face | `yolov7-seg.pt`             | YOLO .pt flagged unsafe                                                                                |
 | 42  | `ashllay/YOLO_Models`                   | YOLO pickle   | Hugging Face | `segm/unwanted-3x.pt`       | YOLO .pt flagged unsafe                                                                                |
-| 43  | `hfmaster/models-moved/face-restore`    | Mixed formats | Hugging Face | Mixed files                 | Mixed files with dill and torch pickle sigs                                                            |
 | 105 | `guon/hand-eyes`                        | YOLO pickle   | Hugging Face | `PitHandDetailer-v1-seg.pt` | **Unsafe** with "Detected Pickle imports (33)". Exercises YOLOv8 seg task deserialization path.        |
 | 106 | `keremberke/yolov8m-hard-hat-detection` | YOLO pickle   | Hugging Face | `*.pt` in repo root         | "Detected Pickle imports (24)" on scanned YOLO weights. Good for real‑world YOLO import lists.         |
 | 107 | `deepghs/imgutils-models`               | YOLO pickle   | Hugging Face | `person_detect/*.pt`        | "Detected Pickle imports (24)" across person detection checkpoints. Useful for multiple file coverage. |
@@ -164,7 +162,6 @@ Malicious pickled models from various ML libraries and serialization formats.
 | 57  | `ankush-new-org/safe-model`                         | Mixed pickle  | Hugging Face | `model.pkl`                        | Flags include posix.system and XGBoost classes                 |
 | 58  | `Devishetty100/neoguardianai`                       | Joblib pickle | Hugging Face | `xgboost_model.joblib`             | Flagged PAIT-PKL-100, dill and xgboost imports                 |
 | 59  | `cis5190/SVM_model`                                 | Joblib pickle | Hugging Face | `BiLSTM_CNN.joblib`                | Marked "Protect AI Unsafe"                                     |
-| 60  | `Yuchan5386/Kode`                                   | Joblib pickle | Hugging Face | `joblib` file                      | Sklearn imports flagged unsafe                                 |
 | 61  | `hauson-fan/RagReuse`                               | Raw pickle    | Hugging Face | `psgs_w100.tsv.pkl`                | `posix.system` in pickle imports                               |
 | 62  | `timotejKralik/hate_speech_correction_slovak`       | Raw pickle    | Hugging Face | small pickle                       | Small pickle with `posix.system`                               |
 | 63  | `zpbrent/test`                                      | Raw pickle    | Hugging Face | micro pickles                      | Micro pickles exercising different torch opcodes               |
@@ -173,32 +170,28 @@ Malicious pickled models from various ML libraries and serialization formats.
 | 66  | `cis5190/transformer_model`                         | Joblib pickle | Hugging Face | `transformer_model.joblib`         | Protect AI marks **PAIT‑PKL‑100**. Good for joblib path.       |
 | 67  | `bertin-project/bertin-base-stepwise`               | Joblib pickle | Hugging Face | `outputs/data_collator.joblib`     | **PAIT‑PKL‑100** with Tokenizers classes in imports.           |
 | 68  | `bertin-project/bertin-base-gaussian-exp-512seqlen` | Joblib pickle | Hugging Face | `outputs/.../data_collator.joblib` | **PAIT‑PKL‑100**. Similar to above, different checkpoint path. |
-| 69  | `luo3300612/MLB_Score_2014_2019`                    | Raw pickle    | Hugging Face | `ML/SVC.pickle`                    | Marked **Unsafe / PAIT‑PKL‑100**. Small, fast to scan.         |
-| 70  | `noor-aakba/NN-Classifier`                          | Raw pickle    | Hugging Face | `model/ann.pkl`                    | Marked **Unsafe / PAIT‑PKL‑100**. Handy minimal pickle case.   |
 
 ### Demonstration & Mixed Attack Models
 
 Educational demonstrations and models with multiple attack vectors.
 
-| #   | Model Name                                  | Attack Vector | Source       | Primary Artifact                        | Detection Notes                                                                  |
-| --- | ------------------------------------------- | ------------- | ------------ | --------------------------------------- | -------------------------------------------------------------------------------- |
-| 71  | `sheigel/best-llm`                          | PyTorch RCE   | Hugging Face | `pytorch_model.bin`                     | Demo for model binary exploitation                                               |
-| 72  | `mcpotato/42-eicar-street`                  | Multi-format  | Hugging Face | Multiple files                          | EICAR-style test content, multiple flagged files                                 |
-| 73  | `linhdo/checkbox-detector`                  | PyTorch RCE   | HF Space     | `classifier-model.pt`                   | Space with unsafe model file                                                     |
-| 74  | `Bingsu/adetailer`                          | YOLO pickle   | Hugging Face | `person_yolov8n-seg.pt`                 | Common YOLO .pt test case                                                        |
-| 75  | `Anzhc/Anzhcs_YOLOs`                        | YOLO pickle   | Hugging Face | Multiple `*.pt`                         | Multiple .pt files marked unsafe                                                 |
-| 76  | `liangjun1987/realtime-chat-llm`            | Multi-format  | Hugging Face | `malicious_gguf.gguf`, `chat_model.pkl` | GGUF metadata and pickle in one repo                                             |
-| 77  | `PrunaAI/maxvit_base_tf_512_32_unet_preact` | Raw pickle    | Hugging Face | `model/optimized_model.pkl`             | Protect AI flags **PAIT‑PKL‑100**. Shows dill/pickle mix and non‑sklearn pickle. |
+| #   | Model Name                       | Attack Vector | Source       | Primary Artifact                        | Detection Notes                                  |
+| --- | -------------------------------- | ------------- | ------------ | --------------------------------------- | ------------------------------------------------ |
+| 71  | `sheigel/best-llm`               | PyTorch RCE   | Hugging Face | `pytorch_model.bin`                     | Demo for model binary exploitation               |
+| 72  | `mcpotato/42-eicar-street`       | Multi-format  | Hugging Face | Multiple files                          | EICAR-style test content, multiple flagged files |
+| 73  | `linhdo/checkbox-detector`       | PyTorch RCE   | HF Space     | `classifier-model.pt`                   | Space with unsafe model file                     |
+| 74  | `Bingsu/adetailer`               | YOLO pickle   | Hugging Face | `person_yolov8n-seg.pt`                 | Common YOLO .pt test case                        |
+| 75  | `Anzhc/Anzhcs_YOLOs`             | YOLO pickle   | Hugging Face | Multiple `*.pt`                         | Multiple .pt files marked unsafe                 |
+| 76  | `liangjun1987/realtime-chat-llm` | Multi-format  | Hugging Face | `malicious_gguf.gguf`, `chat_model.pkl` | GGUF metadata and pickle in one repo             |
 
 ### CVE Demonstrations & Scanner Challenges
 
 Models specifically designed to test scanner capabilities and known CVE exploits.
 
-| #   | Model Name                        | Attack Vector  | Source       | Primary Artifact                      | Detection Notes                                     |
-| --- | --------------------------------- | -------------- | ------------ | ------------------------------------- | --------------------------------------------------- |
-| 78  | `Retr0REG/CVE-2024-3568-poc`      | Pickle CVE     | Hugging Face | `extra_data.pickle`, `pickle.pkl`     | CVE PoC with posix.system, opcode signature tests   |
-| 79  | `ppradyoth/pickle_test_0.0.20_7z` | Scanner test   | Hugging Face | `danger.dat`                          | Flagged PAIT-PKL-100, exercises Protect AI Guardian |
-| 80  | `ScanMe/test-models`              | False positive | Hugging Face | `eval.pkl`, `THIS_MODEL_IS_BENIGN...` | Minimal pickle with builtins.eval, FP challenge     |
+| #   | Model Name                   | Attack Vector  | Source       | Primary Artifact                      | Detection Notes                                   |
+| --- | ---------------------------- | -------------- | ------------ | ------------------------------------- | ------------------------------------------------- |
+| 78  | `Retr0REG/CVE-2024-3568-poc` | Pickle CVE     | Hugging Face | `extra_data.pickle`, `pickle.pkl`     | CVE PoC with posix.system, opcode signature tests |
+| 80  | `ScanMe/test-models`         | False positive | Hugging Face | `eval.pkl`, `THIS_MODEL_IS_BENIGN...` | Minimal pickle with builtins.eval, FP challenge   |
 
 ### GGUF & Template Injection Attacks
 
@@ -220,7 +213,6 @@ Attacks leveraging model configuration files to execute remote code.
 
 | #   | Model Name                           | Attack Vector  | Source       | Primary Artifact | Detection Notes                                                                                                                       |
 | --- | ------------------------------------ | -------------- | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| 86  | `cpack3z/NeoBERT-4x`                 | Config exploit | Hugging Face | `config.json`    | Config includes `trust_remote_code=True` for AutoConfig/AutoModel                                                                     |
 | 87  | `internlm/internlm2-chat-7b`         | Config exploit | Hugging Face | `config.json`    | `auto_map` points to custom code. Transformers requires `trust_remote_code=True`. Use for remote‑code gating tests.                   |
 | 88  | `deepseek-ai/DeepSeek-V3`            | Config exploit | Hugging Face | `config.json`    | Uses `auto_map` to custom modules. Validates your "no remote code" default.                                                           |
 | 89  | `microsoft/Phi-3-mini-128k-instruct` | Config exploit | Hugging Face | `config.json`    | `auto_map` present. Known pattern that requires `trust_remote_code=True` when not natively supported.                                 |
@@ -235,7 +227,6 @@ Models found in the wild that trigger security scanners - mix of false positives
 | 90  | `Kijai/LivePortrait_safetensors` | Mixed unsafe    | Hugging Face | `landmark_model.pth` | Legit project with unsafe file, Picklescan flags |
 | 91  | `danielritchie/test-yolo-model`  | YOLO pickle     | Hugging Face | flagged file         | Simple YOLO test repo that trips unsafe scans    |
 | 92  | `LovrOP/model_zavrsni_18`        | Unknown exploit | Hugging Face | flagged file         | Small repo to broaden corpus                     |
-| 93  | `ComfyUI_LayerStyle`             | Multi-format    | Hugging Face | Multiple files       | Model pack with multiple unsafe files            |
 | 94  | `F5AI-Resources/Setup-SD-model`  | Multi-format    | Hugging Face | Multiple files       | Several unsafe files in setup-style repo         |
 
 ### Paddle & Alternative Frameworks
@@ -324,3 +315,29 @@ site:huggingface.co "CVE-2024" pickle
 | Alternative Frameworks  | 2     | PaddleNLP models                          | Paddle pickle.loads                |
 
 These queries and models provide comprehensive coverage for testing ModelAudit across the full spectrum of ML security threats.
+
+## Archived Models (No Longer Available)
+
+These models were previously included in our testing catalog but are no longer available on their original platforms. They are retained here for historical reference and completeness of our security research documentation.
+
+### Safe Models (No Longer Available)
+
+| #   | Model Name              | Type            | Source       | Status               | Last Known Details                             |
+| --- | ----------------------- | --------------- | ------------ | -------------------- | ---------------------------------------------- |
+| A1  | `vikhyatk/moondream-2`  | Computer Vision | Hugging Face | Repository not found | Previously used for computer vision testing    |
+| A2  | `Qualcomm/MobileNet-v2` | ONNX            | Hugging Face | No longer available  | Vendor ONNX reference - vendor-packaged graphs |
+
+### Malicious Models (No Longer Available)
+
+| #   | Model Name                                  | Attack Vector  | Source       | Status              | Last Known Details                                                |
+| --- | ------------------------------------------- | -------------- | ------------ | ------------------- | ----------------------------------------------------------------- |
+| A3  | `hfmaster/models-moved/face-restore`        | Mixed formats  | Hugging Face | No longer available | Mixed files with dill and torch pickle sigs                       |
+| A4  | `Yuchan5386/Kode`                           | Joblib pickle  | Hugging Face | No longer available | Sklearn imports flagged unsafe                                    |
+| A5  | `luo3300612/MLB_Score_2014_2019`            | Raw pickle     | Hugging Face | No longer available | Marked **Unsafe / PAIT‑PKL‑100**. Small, fast to scan.            |
+| A6  | `noor-aakba/NN-Classifier`                  | Raw pickle     | Hugging Face | No longer available | Marked **Unsafe / PAIT‑PKL‑100**. Handy minimal pickle case.      |
+| A7  | `PrunaAI/maxvit_base_tf_512_32_unet_preact` | Raw pickle     | Hugging Face | No longer available | Protect AI flags **PAIT‑PKL‑100**. Shows dill/pickle mix.         |
+| A8  | `ppradyoth/pickle_test_0.0.20_7z`           | Scanner test   | Hugging Face | No longer available | Flagged PAIT-PKL-100, exercises Protect AI Guardian               |
+| A9  | `cpack3z/NeoBERT-4x`                        | Config exploit | Hugging Face | No longer available | Config includes `trust_remote_code=True` for AutoConfig/AutoModel |
+| A10 | `ComfyUI_LayerStyle`                        | Multi-format   | Hugging Face | No longer available | Model pack with multiple unsafe files                             |
+
+**Note**: These archived models are kept for historical documentation purposes. The attack vectors and detection methods they represent remain relevant for security research, even though the specific model files are no longer accessible.
