@@ -25,9 +25,6 @@ DANGEROUS_TF_OPERATIONS = {
     "SaveV2": IssueSeverity.CRITICAL,  # SaveV2 operations
     "ExecuteOp": IssueSeverity.CRITICAL,  # Execute arbitrary operations
     "SystemConfig": IssueSeverity.CRITICAL,  # System configuration access
-    "DecodeRaw": IssueSeverity.CRITICAL,  # Raw data decoding - potential exploitation
-    "DecodeJpeg": IssueSeverity.CRITICAL,  # JPEG decoding - potential exploitation
-    "DecodePng": IssueSeverity.CRITICAL,  # PNG decoding - potential exploitation
 }
 
 # Try to import TensorFlow, but handle the case where it's not installed
@@ -145,7 +142,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
-                for op_info in self._scan_tf_operations(content):
+                for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(
                         name="TensorFlow Operation Security Check",
                         passed=False,
@@ -266,17 +263,16 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    def _scan_tf_operations(self, model_pb: bytes) -> list[dict[str, Any]]:
-        """Scan TensorFlow graph for dangerous operations"""
+    def _scan_tf_operations(self, saved_model: Any) -> list[dict[str, Any]]:
+        """Scan TensorFlow graph for dangerous operations (generic pass)"""
         dangerous_ops: list[dict[str, Any]] = []
-
         try:
-            saved_model = SavedModelType()
-            saved_model.ParseFromString(model_pb)
-
             for meta_graph in saved_model.meta_graphs:
                 graph_def = meta_graph.graph_def
                 for node in graph_def.node:
+                    # Skip PyFunc/PyCall here; they are handled by _check_python_op
+                    if node.op in ("PyFunc", "PyCall"):
+                        continue
                     if node.op in DANGEROUS_TF_OPERATIONS:
                         dangerous_ops.append(
                             {
@@ -285,9 +281,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "severity": DANGEROUS_TF_OPERATIONS[node.op],
                             }
                         )
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.warning(f"Failed to parse TensorFlow graph: {e}")
-
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Failed to iterate TensorFlow graph: {e}")
         return dangerous_ops
 
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:

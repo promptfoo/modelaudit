@@ -165,25 +165,43 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_detect_readfile_operation():
+def test_detect_readfile_operation(tmp_path):
+    # Synthesize a SavedModel containing a ReadFile node
+    model_path = _create_test_savedmodel_with_op(tmp_path, "ReadFile", "readfile_test")
     scanner = TensorFlowSavedModelScanner()
-    result = scanner.scan("tests/assets/tensorflow/malicious_readfile/saved_model.pb")
+    result = scanner.scan(model_path)
 
-    assert result.issues
-    readfile_issues = [i for i in result.issues if "ReadFile" in i.message]
-    assert readfile_issues
-    assert readfile_issues[0].severity == IssueSeverity.CRITICAL
+    readfile_issues = [i for i in result.issues if i.message and "ReadFile" in i.message]
+    assert readfile_issues, "Expected detection for ReadFile operation"
+    assert any(i.severity == IssueSeverity.CRITICAL for i in readfile_issues)
+    # Ensure an explanation is provided for developer guidance
+    assert any(i.why for i in readfile_issues), "Missing explanation for ReadFile detection"
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_detect_pyfunc_operation():
+def test_detect_pyfunc_operation(tmp_path):
+    model_path = _create_test_savedmodel_with_op(tmp_path, "PyFunc", "pyfunc_test")
     scanner = TensorFlowSavedModelScanner()
-    result = scanner.scan("tests/assets/tensorflow/malicious_pyfunc/saved_model.pb")
+    result = scanner.scan(model_path)
 
-    assert result.issues
-    pyfunc_issues = [i for i in result.issues if "PyFunc" in i.message]
-    assert pyfunc_issues
-    assert pyfunc_issues[0].severity == IssueSeverity.CRITICAL
+    pyfunc_issues = [i for i in result.issues if i.message and "PyFunc" in i.message]
+    assert pyfunc_issues, "Expected detection for PyFunc operation"
+    assert any(i.severity == IssueSeverity.CRITICAL for i in pyfunc_issues)
+    assert any(i.why for i in pyfunc_issues), "Missing explanation for PyFunc detection"
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+def test_detect_writefile_operation(tmp_path):
+    # Synthesize a SavedModel containing a WriteFile node
+    model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
+    scanner = TensorFlowSavedModelScanner()
+    result = scanner.scan(model_path)
+
+    writefile_issues = [i for i in result.issues if i.message and "WriteFile" in i.message]
+    assert writefile_issues, "Expected detection for WriteFile operation"
+    assert any(i.severity == IssueSeverity.CRITICAL for i in writefile_issues)
+    # Ensure an explanation is provided for developer guidance
+    assert any(i.why for i in writefile_issues), "Missing explanation for WriteFile detection"
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
