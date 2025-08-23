@@ -601,7 +601,7 @@ class SafeTensorsScanner(BaseScanner):
             if not obj:
                 return current_depth
             return max(self._calculate_json_depth(v, current_depth + 1) for v in obj.values())
-        
+
         if isinstance(obj, list):
             if not obj:
                 return current_depth
