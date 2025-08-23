@@ -13,8 +13,8 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 114 models cataloged
-- Safe Models: 18 legitimate models (baseline testing)
+- Total Models: 143 models cataloged
+- Safe Models: 47 legitimate models (baseline testing)
 - Malicious Models: 96 models with attack vectors
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
 - Attack Types: 7+ distinct exploitation methods
@@ -23,26 +23,55 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 These models should scan clean and serve as negative controls for false positive detection.
 
-| #   | Model Name                              | Type            | Source       | Status | Scan Results                                        |
-| --- | --------------------------------------- | --------------- | ------------ | ------ | --------------------------------------------------- |
-| 1   | `vikhyatk/moondream-2`                  | Computer Vision | Hugging Face | Failed | Repository not found                                |
-| 2   | `openai/clip-vit-base-patch32`          | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`     |
-| 3   | `google/vit-base-patch16-224`           | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`      |
-| 4   | `facebook/detr-resnet-50`               | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`          |
-| 5   | `microsoft/beit-base-patch16-224`       | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`  |
-| 6   | `ultralytics/yolov5n`                   | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`              |
-| 7   | `pytorch/vision:v0.13.0-mobilenet_v2`   | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`             |
-| 8   | `scikit-learn/logistic-regression`      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt` |
-| 9   | `scikit-learn/decision-tree`            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 10  | `scikit-learn/svm`                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 11  | `scikit-learn/random-forest`            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 12  | `scikit-learn/gradient-boosting`        | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 13  | `scikit-learn/k-means`                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 14  | `scikit-learn/linear-regression`        | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 15  | `scikit-learn/ridge`                    | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 16  | `scikit-learn/lasso`                    | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 17  | `scikit-learn/pca`                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
-| 18  | `scikit-learn/agglomerative-clustering` | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                 |
+| #   | Model Name                                                        | Type            | Source       | Status | Scan Results                                                                                               |
+| --- | ----------------------------------------------------------------- | --------------- | ------------ | ------ | ---------------------------------------------------------------------------------------------------------- |
+| 1   | `vikhyatk/moondream-2`                                            | Computer Vision | Hugging Face | Failed | Repository not found                                                                                       |
+| 2   | `openai/clip-vit-base-patch32`                                    | Computer Vision | Hugging Face | Clean  | `scan_results/openai-clip-vit-base-patch32.txt`                                                            |
+| 3   | `google/vit-base-patch16-224`                                     | Computer Vision | Hugging Face | Clean  | `scan_results/google-vit-base-patch16-224.txt`                                                             |
+| 4   | `facebook/detr-resnet-50`                                         | Computer Vision | Hugging Face | Clean  | `scan_results/facebook-detr-resnet-50.txt`                                                                 |
+| 5   | `microsoft/beit-base-patch16-224`                                 | Computer Vision | Hugging Face | Clean  | `scan_results/microsoft-beit-base-patch16-224.txt`                                                         |
+| 6   | `ultralytics/yolov5n`                                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/ultralytics-yolov5n.txt`                                                                     |
+| 7   | `pytorch/vision:v0.13.0-mobilenet_v2`                             | Computer Vision | PyTorch Hub  | Clean  | `scan_results/pytorch-mobilenet_v2.txt`                                                                    |
+| 8   | `scikit-learn/logistic-regression`                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-logistic_regression.txt`                                                        |
+| 9   | `scikit-learn/decision-tree`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 10  | `scikit-learn/svm`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 11  | `scikit-learn/random-forest`                                      | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 12  | `scikit-learn/gradient-boosting`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 13  | `scikit-learn/k-means`                                            | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 14  | `scikit-learn/linear-regression`                                  | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 15  | `scikit-learn/ridge`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 16  | `scikit-learn/lasso`                                              | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 17  | `scikit-learn/pca`                                                | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 18  | `scikit-learn/agglomerative-clustering`                           | ML Algorithm    | Local        | Clean  | `scan_results/scikit-learn-all.txt`                                                                        |
+| 19  | `sentence-transformers/all-MiniLM-L6-v2`                          | Text Embeddings | Hugging Face | Clean  | Safetensors format - no pickle execution risk                                                              |
+| 20  | `timm/resnet50.a1_in1k`                                           | Computer Vision | Hugging Face | Clean  | Timm model with safetensors - validates timm coverage                                                      |
+| 21  | `facebook/dinov2-base`                                            | Computer Vision | Hugging Face | Clean  | Vision backbone with safetensors - large file handling                                                     |
+| 22  | `microsoft/resnet-50`                                             | Computer Vision | Hugging Face | Clean  | Classic ResNet with safetensors - ResNet repo validation                                                   |
+| 23  | `google-bert/bert-base-uncased`                                   | NLP             | Hugging Face | Clean  | Base BERT with safetensors and ONNX - core NLP baseline                                                    |
+| 24  | `distilbert/distilbert-base-uncased`                              | NLP             | Hugging Face | Clean  | DistilBERT with safetensors - minimal transformer control                                                  |
+| 25  | `FacebookAI/roberta-base`                                         | NLP             | Hugging Face | Clean  | RoBERTa with safetensors - confirms RoBERTa configs clean                                                  |
+| 26  | `google-t5/t5-small`                                              | NLP             | Hugging Face | Clean  | T5 with safetensors - encoder-decoder validation                                                           |
+| 27  | `facebook/wav2vec2-base-960h`                                     | Audio ASR       | Hugging Face | Clean  | Wav2Vec2 with safetensors - audio feature extractors                                                       |
+| 28  | `openai/whisper-tiny`                                             | Audio ASR       | Hugging Face | Clean  | Whisper with safetensors - small ASR baseline                                                              |
+| 29  | `Xenova/clip-vit-base-patch16`                                    | ONNX            | Hugging Face | Clean  | CLIP vision-text ONNX - transformer ONNX validation                                                        |
+| 30  | `Xenova/clip-vit-large-patch14`                                   | ONNX            | Hugging Face | Clean  | Large CLIP ONNX - bigger graph handling                                                                    |
+| 31  | `onnx-community/mobilenet_v2_1.0_224`                             | ONNX            | Hugging Face | Clean  | MobileNetV2 ONNX - mobile CNN baseline                                                                     |
+| 32  | `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k`           | ONNX            | Hugging Face | Clean  | MobileNetV4 ONNX - modern opsets validation                                                                |
+| 33  | `Kalray/resnet50`                                                 | ONNX            | Hugging Face | Clean  | ResNet50 ONNX with INT8 - quantized ONNX validation                                                        |
+| 34  | `Kalray/deeplabv3plus-resnet50`                                   | ONNX            | Hugging Face | Clean  | Segmentation ONNX - segmentation graph coverage                                                            |
+| 35  | `Qualcomm/MobileNet-v2`                                           | ONNX            | Hugging Face | Clean  | Vendor ONNX reference - vendor-packaged graphs                                                             |
+| 36  | `webnn/yolov8m`                                                   | ONNX            | Hugging Face | Clean  | YOLOv8 ONNX - confirms YOLO-in-ONNX doesn't FP like .pt                                                    |
+| 37  | `OpenVINO/bert-base-uncased-sst2-unstructured80-int8-ov`          | OpenVINO        | Hugging Face | Clean  | OpenVINO IR (XML+BIN) - mixed asset repo validation                                                        |
+| 38  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
+| 39  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
+| 40  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
+| 41  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
+| 42  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
+| 43  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
+| 44  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
+| 45  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
+| 46  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
+| 47  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
 
 ## Malicious Models (Threat Detection Testing)
 
