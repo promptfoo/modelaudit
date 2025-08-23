@@ -93,6 +93,37 @@ jobs:
         run: |
           rye run ruff format --check modelaudit/ tests/
 
+      - name: Check for circular imports
+        run: |
+          python -c "
+          import sys
+          import warnings
+          
+          print('🔍 Checking for circular imports...')
+          
+          # Test basic imports
+          try:
+              import modelaudit
+              from modelaudit.scanners.base import BaseScanner, ScanResult
+              from modelaudit.core import scan_file
+              from modelaudit.utils.result_conversion import scan_result_from_dict
+              print('✅ All imports successful')
+          except Exception as e:
+              print(f'❌ Import failed: {e}')
+              sys.exit(1)
+          
+          # Check that base doesn't import core
+          base_module = sys.modules['modelaudit.scanners.base']
+          if hasattr(base_module, '__file__'):
+              with open(base_module.__file__, 'r') as f:
+                  content = f.read()
+                  if 'from ..core import' in content or 'from modelaudit.core import' in content:
+                      print('❌ Circular import detected: base.py imports from core.py')
+                      sys.exit(1)
+          
+          print('✅ No circular imports detected')
+          "
+
   type-check:
     name: Type Check
     needs: changes
