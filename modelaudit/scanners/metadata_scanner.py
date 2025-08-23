@@ -24,9 +24,13 @@ class MetadataScanner(BaseScanner):
 
         # Handle README/model card files (including extensionless README files)
         return path.name.lower() in [
-            "readme", "readme.md", "readme.txt",
-            "model_card.md", "model_card.txt",
-            "model-index.yml", "model-index.yaml"
+            "readme",
+            "readme.md",
+            "readme.txt",
+            "model_card.md",
+            "model_card.txt",
+            "model-index.yml",
+            "model-index.yaml",
         ]
 
     def scan(self, file_path: str, timeout: int = 300) -> ScanResult:

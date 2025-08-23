@@ -508,8 +508,7 @@ def scan_model_directory_or_file(
 
     # Check if metadata scanner is available once (optimization)
     metadata_scanner_available = any(
-        scanner_class.__name__ == "MetadataScanner"
-        for scanner_class in _registry.get_scanner_classes()
+        scanner_class.__name__ == "MetadataScanner" for scanner_class in _registry.get_scanner_classes()
     )
 
     try:
