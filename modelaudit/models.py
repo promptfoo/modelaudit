@@ -33,7 +33,6 @@ class DetectorFinding(BaseModel):
         return self.model_dump(exclude_none=True)
 
 
-
 class JITScriptFinding(DetectorFinding):
     """Pydantic model for JIT/Script detector findings"""
 
@@ -222,6 +221,7 @@ class CopyrightNoticeModel(BaseModel):
             return v
         # Basic validation for year patterns
         import re
+
         if not re.match(r"^\d{4}(-\d{4})?$", v):
             raise ValueError("Year must be in format YYYY or YYYY-YYYY")
         return v
@@ -316,7 +316,7 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
             text=text,
             confidence=confidence,
             source=source,
-            commercial_allowed=None
+            commercial_allowed=None,
         )
         self.license_info.append(license_info)
 
@@ -324,9 +324,7 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
         self, holder: str, years: Optional[str] = None, notice_text: Optional[str] = None, confidence: float = 0.0
     ) -> None:
         """Add copyright notice with validation"""
-        copyright_notice = CopyrightNoticeModel(
-            holder=holder, year=years, text=notice_text, confidence=confidence
-        )
+        copyright_notice = CopyrightNoticeModel(holder=holder, year=years, text=notice_text, confidence=confidence)
         self.copyright_notices.append(copyright_notice)
 
     def set_file_hashes(self, hashes: dict[str, str]) -> None:

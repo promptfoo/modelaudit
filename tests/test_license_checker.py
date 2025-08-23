@@ -537,8 +537,7 @@ test,data
         # The license detection should find the CC BY-NC (non-commercial) license
         # Check if it's detected as incompatible licenses (which is correct for non-commercial)
         assert any(
-            "Incompatible licenses" in issue.message or "Non-commercial" in issue.message
-            for issue in license_issues
+            "Incompatible licenses" in issue.message or "Non-commercial" in issue.message for issue in license_issues
         ), f"Expected license incompatibility detection in messages: {[issue.message for issue in license_issues]}"
 
     def test_ml_model_directory_no_false_positives(self, tmp_path):

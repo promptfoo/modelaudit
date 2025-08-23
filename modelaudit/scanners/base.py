@@ -115,7 +115,6 @@ class Issue(BaseModel):
         """Convert the issue to a dictionary for serialization (backward compatibility)"""
         return self.model_dump(exclude_none=True, mode="json")
 
-
     def __str__(self) -> str:
         """String representation of the issue"""
         severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)

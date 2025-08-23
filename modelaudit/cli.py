@@ -1409,9 +1409,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
-    visible_issues = [
-        issue for issue in issues if verbose or _get_issue_attr(issue, "severity") != "debug"
-    ]
+    visible_issues = [issue for issue in issues if verbose or _get_issue_attr(issue, "severity") != "debug"]
 
     # Count issues by severity
     severity_counts = {
@@ -1466,9 +1464,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append("")
 
         # Display critical issues first
-        critical_issues = [
-            issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"
-        ]
+        critical_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"]
         if critical_issues:
             output_lines.append(
                 style_text("  🚨 Critical Issues", fg="red", bold=True),
@@ -1479,9 +1475,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display warnings
-        warning_issues = [
-            issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"
-        ]
+        warning_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"]
         if warning_issues:
             if critical_issues:
                 output_lines.append("")
@@ -1504,9 +1498,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display debug issues if verbose
         if verbose:
-            debug_issues = [
-                issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "debug"
-            ]
+            debug_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "debug"]
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
                     output_lines.append("")
