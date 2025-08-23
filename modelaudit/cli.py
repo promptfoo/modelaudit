@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import click
 from yaspin import yaspin
@@ -17,6 +17,7 @@ from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
 from .models import ModelAuditResultModel
+from .scanners.base import IssueSeverity
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_model, is_huggingface_url
@@ -48,6 +49,40 @@ def style_text(text: str, **kwargs) -> str:
     return text
 
 
+def expand_paths(paths: tuple[str, ...]) -> list[str]:
+    """Expand and validate input paths with type safety."""
+    expanded: list[str] = []
+    for path_str in paths:
+        # Handle glob patterns and resolve paths
+        path = Path(path_str)
+        if "*" in path_str or "?" in path_str:
+            # Handle glob patterns
+            import glob
+
+            matches = glob.glob(path_str, recursive=True)
+            expanded.extend(matches)
+        else:
+            expanded.append(str(path.resolve()) if path.exists() else path_str)
+    return expanded
+
+
+def create_progress_callback_wrapper(progress_callback: Optional[Any], spinner: Optional[Any]) -> Optional[Any]:
+    """Create a type-safe progress callback wrapper."""
+    if not progress_callback:
+        return None
+
+    def wrapped_callback(message: str, percentage: float) -> None:
+        """Wrapped progress callback with type safety."""
+        try:
+            progress_callback(message, percentage)
+            if spinner and hasattr(spinner, "text"):
+                spinner.text = message
+        except Exception as e:
+            logger.warning(f"Progress callback error: {e}")
+
+    return wrapped_callback
+
+
 def is_mlflow_uri(path: str) -> bool:
     """Check if a path is an MLflow model URI."""
     return path.startswith("models:/")
@@ -56,12 +91,12 @@ def is_mlflow_uri(path: str) -> bool:
 class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
-    def get_command(self, ctx, cmd_name):
+    def get_command(self, ctx, cmd_name) -> Optional[click.Command]:
         """Get command by name, return None if not found"""
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
 
-    def resolve_command(self, ctx, args):
+    def resolve_command(self, ctx, args) -> tuple[str, click.Command, list[str]]:
         """Resolve command, using 'scan' as default when paths are provided"""
         # If we have args and the first arg is not a known command, use 'scan' as default
         if args and args[0] not in self.list_commands(ctx):
@@ -70,7 +105,7 @@ class DefaultCommandGroup(click.Group):
 
         return super().resolve_command(ctx, args)
 
-    def format_help(self, ctx, formatter):
+    def format_help(self, ctx, formatter) -> None:
         """Show help with both commands but emphasize scan as primary"""
         formatter.write_text("ModelAudit - Security scanner for ML model files")
         formatter.write_paragraph()
@@ -111,7 +146,7 @@ def cli() -> None:
 
 
 @cli.group()
-def auth():
+def auth() -> None:
     """Manage authentication"""
     pass
 
@@ -124,7 +159,7 @@ def auth():
     help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
-def login(org_id, host, api_key):
+def login(org_id: Optional[str], host: Optional[str], api_key: Optional[str]) -> None:
     """Login"""
     try:
         token = None
@@ -165,7 +200,7 @@ def login(org_id, host, api_key):
 
 
 @auth.command()
-def logout():
+def logout() -> None:
     """Logout"""
     email = get_user_email()
     api_key = cloud_config.get_api_key()
@@ -182,7 +217,7 @@ def logout():
 
 
 @auth.command()
-def whoami():
+def whoami() -> None:
     """Show current user information"""
     try:
         email = get_user_email()
@@ -211,7 +246,7 @@ def whoami():
 
 
 @cli.command("delegate-info", hidden=True)
-def delegate_info():
+def delegate_info() -> None:
     """Internal command to show delegation status"""
 
     from .auth.config import config
@@ -424,17 +459,23 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
-    # Expand DVC pointer files before scanning
-    expanded_paths = []
-    for p in paths:
+    # Expand and validate paths with type safety
+    expanded_paths: list[str] = expand_paths(paths)
+
+    # Process DVC pointer files
+    dvc_expanded_paths: list[str] = []
+    for p in expanded_paths:
         if os.path.isfile(p) and p.endswith(".dvc"):
             targets = resolve_dvc_file(p)
             if targets:
-                expanded_paths.extend(targets)
+                dvc_expanded_paths.extend(targets)
             else:
-                expanded_paths.append(p)
+                dvc_expanded_paths.append(p)
         else:
-            expanded_paths.append(p)
+            dvc_expanded_paths.append(p)
+
+    # Use the DVC-expanded paths as the final list
+    expanded_paths = dvc_expanded_paths
 
     # Print a nice header if not in JSON mode and not writing to a file
     if format == "text" and not output:
@@ -1008,13 +1049,15 @@ def scan_command(
                     if result_issues:
                         # Filter out DEBUG severity issues when not in verbose mode
                         # scan_results is ModelAuditResultModel
-                        visible_issues = [issue for issue in result_issues if verbose or issue.severity != "debug"]
+                        visible_issues = [
+                            issue for issue in result_issues if verbose or issue.severity != IssueSeverity.DEBUG
+                        ]
                         issue_count = len(visible_issues)
 
                         if issue_count > 0:
                             # Determine severity for coloring
                             # scan_results is ModelAuditResultModel
-                            has_critical = any(issue.severity == "critical" for issue in visible_issues)
+                            has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 if has_critical:
@@ -1098,11 +1141,11 @@ def scan_command(
                     if not any(issue.message == "Scan interrupted by user" for issue in audit_result.issues):
                         import time
 
-                        from .models import IssueModel
+                        from .scanners.base import Issue
 
-                        interruption_issue = IssueModel(
+                        interruption_issue = Issue(
                             message="Scan interrupted by user",
-                            severity="info",
+                            severity=IssueSeverity.INFO,
                             location=None,
                             details={"interrupted": True},
                             timestamp=time.time(),
@@ -1156,8 +1199,8 @@ def scan_command(
     if format == "json":
         # Filter out DEBUG issues and checks unless verbose mode is enabled
         if not verbose:
-            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != "debug"]
-            audit_result.checks = [check for check in audit_result.checks if check.severity != "debug"]
+            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
+            audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
 
         # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
@@ -1177,8 +1220,8 @@ def scan_command(
         if verbose:
             visible_issues = audit_result.issues  # In verbose mode, show all issues including debug
             if visible_issues:
-                critical_count = len([i for i in visible_issues if i.severity == "critical"])
-                warning_count = len([i for i in visible_issues if i.severity == "warning"])
+                critical_count = len([i for i in visible_issues if i.severity == IssueSeverity.CRITICAL])
+                warning_count = len([i for i in visible_issues if i.severity == IssueSeverity.WARNING])
                 if critical_count > 0:
                     click.echo(f"Found {critical_count} critical issue(s), {warning_count} warning(s)")
                 elif warning_count > 0:
@@ -1366,9 +1409,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
-    visible_issues = [
-        issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
-    ]
+    visible_issues = [issue for issue in issues if verbose or _get_issue_attr(issue, "severity") != "debug"]
 
     # Count issues by severity
     severity_counts = {
@@ -1379,10 +1420,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     }
 
     for issue in issues:
-        if isinstance(issue, dict):
-            severity = issue.get("severity", "warning")
-            if severity in severity_counts:
-                severity_counts[severity] += 1
+        severity = _get_issue_attr(issue, "severity", "warning")
+        if severity in severity_counts:
+            severity_counts[severity] += 1
 
     # Display issue summary
     output_lines.append("")
@@ -1424,9 +1464,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append("")
 
         # Display critical issues first
-        critical_issues = [
-            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"
-        ]
+        critical_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"]
         if critical_issues:
             output_lines.append(
                 style_text("  🚨 Critical Issues", fg="red", bold=True),
@@ -1437,9 +1475,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display warnings
-        warning_issues = [
-            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"
-        ]
+        warning_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"]
         if warning_issues:
             if critical_issues:
                 output_lines.append("")
@@ -1450,7 +1486,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display info issues
-        info_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "info"]
+        info_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "info"]
         if info_issues:
             if critical_issues or warning_issues:
                 output_lines.append("")
@@ -1462,9 +1498,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display debug issues if verbose
         if verbose:
-            debug_issues = [
-                issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"
-            ]
+            debug_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "debug"]
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
                     output_lines.append("")
@@ -1502,11 +1536,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         )
     # Determine overall status
     elif visible_issues:
-        if any(isinstance(issue, dict) and issue.get("severity") == "critical" for issue in visible_issues):
+        if any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues):
             status_icon = "❌"
             status_msg = "CRITICAL SECURITY ISSUES FOUND"
             status_color = "red"
-        elif any(isinstance(issue, dict) and issue.get("severity") == "warning" for issue in visible_issues):
+        elif any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues):
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
@@ -1538,14 +1572,23 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     return "\n".join(output_lines)
 
 
+def _get_issue_attr(issue: Union[dict[str, Any], Any], attr: str, default: Any = None) -> Any:
+    """Safely get an attribute from an issue whether it's a dict or Pydantic object."""
+    if isinstance(issue, dict):
+        return issue.get(attr, default)
+    else:
+        # Assume it's a Pydantic object
+        return getattr(issue, attr, default)
+
+
 def _format_issue(
-    issue: dict[str, Any],
+    issue: Union[dict[str, Any], Any],
     output_lines: list[str],
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
-    message = issue.get("message", "Unknown issue")
-    location = issue.get("location", "")
+    message = _get_issue_attr(issue, "message", "Unknown issue")
+    location = _get_issue_attr(issue, "location", "")
 
     # Icon based on severity
     icons = {
@@ -1566,7 +1609,7 @@ def _format_issue(
         output_lines.append(f"{icon} {style_text(message, fg='bright_white')}")
 
     # Add "Why" explanation if available
-    why = issue.get("why")
+    why = _get_issue_attr(issue, "why")
     if why:
         why_label = style_text("Why:", fg="magenta", bold=True)
         # Wrap long explanations
@@ -1581,7 +1624,7 @@ def _format_issue(
         output_lines.append(f"       {why_label} {wrapped_why}")
 
     # Add details if available
-    details = issue.get("details", {})
+    details = _get_issue_attr(issue, "details", {})
     if details:
         for key, value in details.items():
             if value:  # Only show non-empty values
@@ -1596,7 +1639,7 @@ def _format_issue(
     is_flag=True,
     help="Show detailed information about failed scanners",
 )
-def doctor(show_failed: bool):
+def doctor(show_failed: bool) -> None:
     """Diagnose scanner compatibility and system status"""
     import sys
 

@@ -191,13 +191,13 @@ class TestTimeoutConfiguration:
         """Test that zero or negative timeout values are rejected"""
         from modelaudit.core import validate_scan_config
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="Input should be greater than 0"):
             validate_scan_config({"timeout": 0})
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="Input should be greater than 0"):
             validate_scan_config({"timeout": -1})
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="unable to parse string as an integer"):
             validate_scan_config({"timeout": "invalid"})
 
 

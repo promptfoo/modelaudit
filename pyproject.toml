@@ -164,9 +164,10 @@ extend-select = [
     "RUF",  # Ruff-specific rules
 ]
 
-# Ignore rules that conflict with the formatter
+# Ignore rules that conflict with the formatter or Python 3.9 compatibility
 ignore = [
     "COM812",  # Trailing comma (conflicts with formatter)
+    "UP045",   # Use `X | None` for type annotations (not supported in Python 3.9)
 ]
 
 [tool.ruff.lint.per-file-ignores]

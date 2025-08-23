@@ -5,23 +5,26 @@ import time
 
 import pytest
 
+# Ensure models are rebuilt for forward references
 from modelaudit.models import (
-    CheckModel,
-    IssueModel,
     ModelAuditResultModel,
     create_audit_result_model,
+    rebuild_models,
 )
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
+
+rebuild_models()
 
 
 class TestPydanticModels:
     """Test Pydantic model functionality for current JSON format."""
 
     def test_issue_model_creation(self):
-        """Test IssueModel creation and serialization."""
+        """Test Issue creation and serialization."""
         timestamp = time.time()
-        issue = IssueModel(
+        issue = Issue(
             message="Test issue",
-            severity="warning",
+            severity=IssueSeverity.WARNING,
             location="/path/to/file.pkl",
             details={"key": "value"},
             timestamp=timestamp,
@@ -29,7 +32,7 @@ class TestPydanticModels:
         )
 
         assert issue.message == "Test issue"
-        assert issue.severity == "warning"
+        assert issue.severity == IssueSeverity.WARNING
         assert issue.location == "/path/to/file.pkl"
         assert issue.details == {"key": "value"}
         assert issue.timestamp == timestamp
@@ -37,16 +40,16 @@ class TestPydanticModels:
 
         # Test serialization
         issue_dict = issue.model_dump()
-        assert issue_dict["severity"] == "warning"
+        assert issue_dict["severity"] == "warning"  # Enum serializes to its value
 
     def test_check_model_creation(self):
-        """Test CheckModel creation and serialization."""
+        """Test Check creation and serialization."""
         timestamp = time.time()
-        check = CheckModel(
+        check = Check(
             name="Test Check",
-            status="failed",
+            status=CheckStatus.FAILED,
             message="Check failed",
-            severity="critical",
+            severity=IssueSeverity.CRITICAL,
             location="/path/to/file.pkl",
             details={"error": "details"},
             timestamp=timestamp,
@@ -54,9 +57,9 @@ class TestPydanticModels:
         )
 
         assert check.name == "Test Check"
-        assert check.status == "failed"
+        assert check.status == CheckStatus.FAILED
         assert check.message == "Check failed"
-        assert check.severity == "critical"
+        assert check.severity == IssueSeverity.CRITICAL
         assert check.location == "/path/to/file.pkl"
         assert check.details == {"error": "details"}
         assert check.timestamp == timestamp
@@ -139,8 +142,8 @@ class TestPydanticModels:
         # Create a realistic model
         model = ModelAuditResultModel(
             bytes_scanned=100,
-            issues=[IssueModel(message="Test issue", severity="warning", timestamp=time.time())],
-            checks=[CheckModel(name="Test Check", status="passed", message="Check passed", timestamp=time.time())],
+            issues=[Issue(message="Test issue", severity=IssueSeverity.WARNING, timestamp=time.time())],
+            checks=[Check(name="Test Check", status=CheckStatus.PASSED, message="Check passed", timestamp=time.time())],
             files_scanned=1,
             assets=[{"path": "test.pkl", "type": "pickle"}],
             has_errors=False,
@@ -184,7 +187,7 @@ class TestPydanticModels:
 
     def test_pydantic_v2_features(self):
         """Test Pydantic v2 specific features."""
-        check = CheckModel(name="Test Check", status="passed", message="Test message", timestamp=time.time())
+        check = Check(name="Test Check", status=CheckStatus.PASSED, message="Test message", timestamp=time.time())
 
         # Test model_dump() method (v2 syntax)
         data = check.model_dump()
@@ -211,7 +214,7 @@ class TestPydanticModels:
 
         # Test that invalid data is caught
         with pytest.raises(ValidationError):
-            CheckModel(
+            Check(
                 name="Test",
                 status="invalid_status",  # Should be passed/failed/skipped
                 message="Test",
