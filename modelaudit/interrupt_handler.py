@@ -30,8 +30,9 @@ import logging
 import os
 import signal
 import threading
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger("modelaudit.interrupt")
 
@@ -49,8 +50,8 @@ class InterruptHandler:
     def __init__(self) -> None:
         """Initialize the interrupt handler."""
         self._interrupted = threading.Event()
-        self._original_sigint_handler: Optional[Callable[[int, Any], None]] = None
-        self._original_sigterm_handler: Optional[Callable[[int, Any], None]] = None
+        self._original_sigint_handler: Any = None
+        self._original_sigterm_handler: Any = None
         self._lock = threading.Lock()
         self._active = False
 
@@ -96,7 +97,7 @@ class InterruptHandler:
             raise KeyboardInterrupt("Scan interrupted by user")
 
     @contextmanager
-    def install_handlers(self):
+    def install_handlers(self) -> Generator[None, None, None]:
         """Context manager to install and uninstall signal handlers.
 
         This ensures signal handlers are properly restored even if an
@@ -111,35 +112,37 @@ class InterruptHandler:
             yield
             return
 
+        # Not active, need to acquire lock and install handlers
         with self._lock:
-            # Double-check inside lock (in case state changed)
+            # Double-check inside lock (in case state changed while acquiring lock)
             if self._active:
-                yield
-                return
-
-            try:
-                # Store original handlers
-                self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
-
-                # SIGTERM might not be available on Windows
+                # Another thread activated it while we were waiting for the lock
+                yield  # type: ignore[unreachable]
+            else:
+                # We need to install handlers
                 try:
-                    self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
-                except (AttributeError, ValueError):
-                    # SIGTERM not available on this platform
-                    self._original_sigterm_handler = None
+                    # Store original handlers
+                    self._original_sigint_handler = signal.signal(signal.SIGINT, self._signal_handler)
 
-                self._active = True
-                logger.debug("Interrupt handlers installed")
-                yield
-            finally:
-                # Restore original handlers
-                if self._original_sigint_handler is not None:
-                    signal.signal(signal.SIGINT, self._original_sigint_handler)
-                if self._original_sigterm_handler is not None:
-                    with contextlib.suppress(AttributeError, ValueError):
-                        signal.signal(signal.SIGTERM, self._original_sigterm_handler)
-                self._active = False
-                logger.debug("Interrupt handlers restored")
+                    # SIGTERM might not be available on Windows
+                    try:
+                        self._original_sigterm_handler = signal.signal(signal.SIGTERM, self._signal_handler)
+                    except (AttributeError, ValueError):
+                        # SIGTERM not available on this platform
+                        self._original_sigterm_handler = None
+
+                    self._active = True
+                    logger.debug("Interrupt handlers installed")
+                    yield
+                finally:
+                    # Restore original handlers
+                    if self._original_sigint_handler is not None:
+                        signal.signal(signal.SIGINT, self._original_sigint_handler)
+                    if self._original_sigterm_handler is not None:
+                        with contextlib.suppress(AttributeError, ValueError):
+                            signal.signal(signal.SIGTERM, self._original_sigterm_handler)
+                    self._active = False
+                    logger.debug("Interrupt handlers restored")
 
 
 # Global interrupt handler instance
@@ -194,7 +197,7 @@ def reset_interrupt() -> None:
 
 
 @contextmanager
-def interruptible_scan():
+def interruptible_scan() -> Generator["InterruptHandler", None, None]:
     """Context manager for interruptible scanning operations.
 
     This installs signal handlers for SIGINT and SIGTERM, allowing the

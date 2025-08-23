@@ -353,7 +353,8 @@ jobs:
   # Summary job to ensure all required checks pass
   ci-success:
     name: CI Success
-    needs: [quick-feedback, lint, type-check, test, test-numpy-compatibility, build]
+    needs:
+      [quick-feedback, lint, type-check, test, test-numpy-compatibility, build]
     if: always()
     runs-on: ubuntu-latest
     steps:

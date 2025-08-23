@@ -6,7 +6,7 @@ import json
 import os
 import re
 import struct
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
@@ -350,7 +350,7 @@ class SafeTensorsScanner(BaseScanner):
         return result
 
     @staticmethod
-    def _expected_size(dtype: str | None, shape: list[int]) -> int | None:
+    def _expected_size(dtype: Optional[str], shape: list[int]) -> Optional[int]:
         """Return expected tensor byte size from dtype and shape."""
         if dtype not in _DTYPE_SIZES:
             return None

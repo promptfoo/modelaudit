@@ -141,6 +141,7 @@ def stream_analyze_file(
                                 "file_size": file_size,
                                 "analysis_complete": was_complete,
                             },
+                            type="streaming_security_check",
                             why=(
                                 f"The file header contains the dangerous pattern "
                                 f"'{pattern.decode('utf-8', errors='ignore')}' which could "
@@ -161,6 +162,7 @@ def stream_analyze_file(
                                 "protocol_version": protocol_version,
                                 "detection_method": "streaming_protocol_check",
                             },
+                            type="streaming_pickle_protocol_check",
                             why=(
                                 f"This pickle file uses protocol {protocol_version} which "
                                 "supports more complex operations that could be exploited."
