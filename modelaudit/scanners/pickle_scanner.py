@@ -32,17 +32,17 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 def _compute_pickle_length(path: str) -> int:
     """
     Compute the exact length of pickle data by finding the STOP opcode position.
-    
+
     Args:
         path: Path to the file containing pickle data
-        
+
     Returns:
         The byte position where pickle data ends, or a fallback estimate
     """
     try:
         with open(path, "rb") as f:
-            for opcode, arg, pos in pickletools.genops(f):
-                if opcode.name == "STOP":
+            for opcode, _arg, pos in pickletools.genops(f):
+                if opcode.name == "STOP" and pos is not None:
                     return pos + 1  # Include the STOP opcode itself
         # If no STOP found, fallback to file size (malformed pickle)
         return os.path.getsize(path)

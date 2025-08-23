@@ -228,7 +228,9 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
         assert len(result.issues) > 0, "Expected issues to be detected for memo-based attack"
         subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
-        assert len(subprocess_issues) > 0, f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
+        assert len(subprocess_issues) > 0, (
+            f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
+        )
 
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
