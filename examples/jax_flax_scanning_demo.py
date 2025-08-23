@@ -19,6 +19,7 @@ import msgpack
 
 try:
     import numpy as np
+
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
@@ -56,28 +57,20 @@ def create_sample_flax_checkpoint(path: str):
                         "layer_norm": {
                             "scale": np.ones(768).astype(np.float32).tobytes(),
                             "bias": np.zeros(768).astype(np.float32).tobytes(),
-                        }
+                        },
                     }
-                }
+                },
             }
         },
-        "opt_state": {
-            "step": 10000,
-            "learning_rate": 1e-4,
-            "adam": {
-                "beta1": 0.9,
-                "beta2": 0.999,
-                "eps": 1e-8
-            }
-        },
+        "opt_state": {"step": 10000, "learning_rate": 1e-4, "adam": {"beta1": 0.9, "beta2": 0.999, "eps": 1e-8}},
         "metadata": {
             "model_type": "transformer",
             "layers": 12,
             "hidden_size": 768,
             "vocab_size": 50257,
             "jax_version": "0.4.23",
-            "flax_version": "0.7.5"
-        }
+            "flax_version": "0.7.5",
+        },
     }
 
     with open(path, "wb") as f:
@@ -97,13 +90,13 @@ def create_suspicious_jax_checkpoint(path: str):
         # Invalid tensor shapes
         "tensor_info": {
             "shape": [-1, 100, -50],  # Negative dimensions
-            "dtype": "malicious_dtype"
+            "dtype": "malicious_dtype",
         },
         # Orbax-specific threats
         "__orbax_metadata__": {
             "restore_fn": "eval(user_input)",
-            "custom_serializer": "subprocess.run(['rm', '-rf', '/'])"
-        }
+            "custom_serializer": "subprocess.run(['rm', '-rf', '/'])",
+        },
     }
 
     with open(path, "wb") as f:
@@ -119,10 +112,7 @@ def create_orbax_checkpoint_directory(dir_path: str):
         "version": "0.1.0",
         "type": "orbax_checkpoint",
         "format": "flax",
-        "save_args": {
-            "step": 5000,
-            "timestamp": "2024-01-15T10:30:00Z"
-        }
+        "save_args": {"step": 5000, "timestamp": "2024-01-15T10:30:00Z"},
     }
 
     with open(os.path.join(dir_path, "orbax_checkpoint_metadata.json"), "w") as f:
@@ -135,20 +125,12 @@ def create_orbax_checkpoint_directory(dir_path: str):
                 "dense_layers": {
                     "layer_0": np.random.randn(128, 64).astype(np.float32),
                     "layer_1": np.random.randn(64, 32).astype(np.float32),
-                    "output": np.random.randn(32, 10).astype(np.float32)
+                    "output": np.random.randn(32, 10).astype(np.float32),
                 }
             }
         }
     else:
-        params_data = {
-            "model": {
-                "dense_layers": {
-                    "layer_0": [1.0] * 100,
-                    "layer_1": [0.5] * 50,
-                    "output": [0.1] * 10
-                }
-            }
-        }
+        params_data = {"model": {"dense_layers": {"layer_0": [1.0] * 100, "layer_1": [0.5] * 50, "output": [0.1] * 10}}}
 
     with open(os.path.join(dir_path, "checkpoint"), "wb") as f:
         pickle.dump(params_data, f)
@@ -156,9 +138,9 @@ def create_orbax_checkpoint_directory(dir_path: str):
 
 def demo_flax_msgpack_scanning():
     """Demonstrate Flax msgpack scanning capabilities."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🔬 FLAX MSGPACK SCANNER DEMO")
-    print("="*60)
+    print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Test 1: Legitimate Flax checkpoint
@@ -211,9 +193,9 @@ def demo_flax_msgpack_scanning():
 
 def demo_jax_checkpoint_scanning():
     """Demonstrate JAX checkpoint scanning capabilities."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🔬 JAX CHECKPOINT SCANNER DEMO")
-    print("="*60)
+    print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Test 1: Orbax checkpoint directory
@@ -232,11 +214,7 @@ def demo_jax_checkpoint_scanning():
 
         # Test 2: Directory detection
         print("\n📁 Test 2: Testing checkpoint directory detection")
-        test_dirs = [
-            ("orbax_checkpoint", True),
-            ("regular_directory", False),
-            ("pytorch_checkpoint", False)
-        ]
+        test_dirs = [("orbax_checkpoint", True), ("regular_directory", False), ("pytorch_checkpoint", False)]
 
         for dir_name, should_handle in test_dirs:
             test_dir = os.path.join(tmp_dir, dir_name)
@@ -257,26 +235,24 @@ def demo_jax_checkpoint_scanning():
 
 def demo_security_threat_detection():
     """Demonstrate security threat detection in JAX/Flax models."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🛡️  SECURITY THREAT DETECTION DEMO")
-    print("="*60)
+    print("=" * 60)
 
     threats = [
         {
             "name": "JAX Host Callback Exploit",
             "data": {
                 "params": {"weights": b"\x00" * 100},
-                "malicious_code": "jax.experimental.host_callback.call(os.system, 'rm -rf /')"
-            }
+                "malicious_code": "jax.experimental.host_callback.call(os.system, 'rm -rf /')",
+            },
         },
         {
             "name": "Orbax Restore Function Injection",
             "data": {
-                "__orbax_metadata__": {
-                    "restore_fn": "eval(user_controlled_input)"
-                },
-                "params": {"layer": b"\x00" * 50}
-            }
+                "__orbax_metadata__": {"restore_fn": "eval(user_controlled_input)"},
+                "params": {"layer": b"\x00" * 50},
+            },
         },
         {
             "name": "Invalid Tensor Dimensions",
@@ -284,18 +260,18 @@ def demo_security_threat_detection():
                 "params": {"tensor": b"\x00" * 100},
                 "shape_info": {
                     "shape": [-1, -100, 1000000000],  # Negative and extremely large dims
-                    "dtype": "float32"
-                }
-            }
+                    "dtype": "float32",
+                },
+            },
         },
         {
             "name": "Fake JAX Array Metadata",
             "data": {
                 "__jax_array__": "malicious_array_impl",
                 "__tree_flatten__": "custom_flatten_function",
-                "params": {"data": b"\x00" * 100}
-            }
-        }
+                "params": {"data": b"\x00" * 100},
+            },
+        },
     ]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -336,9 +312,9 @@ def main():
         demo_jax_checkpoint_scanning()
         demo_security_threat_detection()
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("✅ Demo completed successfully!")
-        print("="*60)
+        print("=" * 60)
         print("\nKey features demonstrated:")
         print("• Support for .msgpack, .flax, .orbax, .jax file extensions")
         print("• Orbax checkpoint directory scanning")
