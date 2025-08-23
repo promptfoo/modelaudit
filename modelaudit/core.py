@@ -506,7 +506,7 @@ def scan_model_directory_or_file(
 
     validate_scan_config(config)
 
-    # Check if metadata scanner is available once (optimization - avoids loading all scanners)
+    # Check if metadata scanner is available once (optimization - avoids loading scanner)
     metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
 
     try:

@@ -367,7 +367,7 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.metadata_scanner",
                 "class": "MetadataScanner",
                 "description": "Scans model metadata files for security issues",
-                "extensions": [".json", ".md", ".yml", ".yaml"],
+                "extensions": [".json", ".md", ".markdown", ".rst", ".yml", ".yaml"],
                 "priority": 1,  # High priority for security-focused metadata scanning
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,

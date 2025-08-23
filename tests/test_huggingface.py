@@ -321,6 +321,7 @@ class TestHuggingFaceFileURLs:
             "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
             "https://huggingface.co/facebook/bart-large/resolve/main/config.json",
             "https://hf.co/microsoft/DialoGPT/resolve/main/model.safetensors",
+            "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",  # Percent-encoded revision
         ]
         for url in valid_urls:
             assert is_huggingface_file_url(url), f"Failed to detect valid file URL: {url}"
@@ -350,6 +351,10 @@ class TestHuggingFaceFileURLs:
             (
                 "https://hf.co/facebook/bart-large/resolve/main/subfolder/model.safetensors",
                 ("facebook/bart-large", "main", "subfolder/model.safetensors"),
+            ),
+            (
+                "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",
+                ("user/repo", "refs/pr/1", "file.bin"),  # Percent-decoded revision
             ),
         ]
         for url, expected in test_cases:

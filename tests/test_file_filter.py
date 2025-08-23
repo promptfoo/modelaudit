@@ -110,7 +110,7 @@ class TestFileFilter:
         """Test that the function handles full paths correctly."""
         # Should extract filename and check extension
         # Note: README.md is now scanned by MetadataScanner, so not skipped
-        assert not should_skip_file("/path/to/README.md")
+        assert not should_skip_file("/path/to/README.md", metadata_scanner_available=True)
         assert should_skip_file("./relative/path/script.py")
         assert not should_skip_file("/models/checkpoint.pkl")
         assert not should_skip_file("data/model.h5")
@@ -118,7 +118,7 @@ class TestFileFilter:
     def test_case_sensitivity(self):
         """Test that extension checking is case-insensitive."""
         # Note: README.MD is now scanned by MetadataScanner, so not skipped
-        assert not should_skip_file("README.MD")
+        assert not should_skip_file("README.MD", metadata_scanner_available=True)
         assert should_skip_file("script.PY")
         assert should_skip_file("IMAGE.JPG")
 

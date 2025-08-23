@@ -84,6 +84,6 @@ def test_cli_skip_message_in_verbose():
         # The model.pkl should be mentioned in the output
         assert "model.pkl" in result.output or "pickle" in result.output.lower()
 
-        # With skip files enabled, should only scan 1 file
-        if "--format" not in result.output:  # text format
-            assert "Files: 2" in result.output
+        # With skip files enabled, should only scan 2 files (model.pkl + README.md)
+        # We didn't pass --format json, so output should be text
+        assert "Files: 2" in result.output

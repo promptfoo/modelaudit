@@ -106,7 +106,7 @@ ModelAudit supports multiple input sources:
 
 - Local files and directories
 - HuggingFace models: `hf://username/model` or `https://huggingface.co/username/model`
-- HuggingFace direct files: `https://huggingface.co/username/model/resolve/main/pytorch_model.bin`
+- HuggingFace direct files: `https://huggingface.co/username/model/resolve/<revision>/<path>` or `https://hf.co/username/model/resolve/<revision>/<path>`
 - Cloud storage: S3 (`s3://bucket/path`), GCS (`gs://bucket/path`)
 - MLflow models: `models://model-name/version`
 - JFrog Artifactory URLs

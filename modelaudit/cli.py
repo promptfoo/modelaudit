@@ -609,19 +609,25 @@ def scan_command(
                         click.echo(f"Downloading file from {path}...")
 
                     try:
-                        # Convert cache_dir string to Path if provided
+                        # Determine cache directory behavior for single-file downloads
                         hf_cache_dir = None
+                        tmp_dl_dir = None
                         if cache and cache_dir:
-                            hf_cache_dir = Path(cache_dir)
+                            hf_cache_dir = Path(cache_dir) / "huggingface"
                         elif cache:
-                            # Use default cache directory
-                            hf_cache_dir = Path.home() / ".modelaudit" / "cache"
+                            # Use tool-scoped cache directory, not the global HF cache
+                            hf_cache_dir = Path.home() / ".modelaudit" / "cache" / "huggingface"
+                        else:
+                            # No cache: use an ephemeral directory we control (safe to delete later)
+                            import tempfile
+                            tmp_dl_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                            hf_cache_dir = tmp_dl_dir
 
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
-                        # Only track for cleanup if not using cache
-                        temp_dir = str(download_path.parent) if not cache else None
+                        # Only track for cleanup if we created an ephemeral cache above
+                        temp_dir = str(hf_cache_dir) if not cache else None
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))

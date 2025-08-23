@@ -21,12 +21,12 @@ def is_huggingface_url(url: str) -> bool:
 
 def is_huggingface_file_url(url: str) -> bool:
     """Check if a URL is a direct HuggingFace file URL."""
-    # More robust pattern that handles percent-encoded characters
-    patterns = [
-        r"^https?://huggingface\.co/[^/]+/[^/]+/resolve/[^/]+/.+",
-        r"^https?://hf\.co/[^/]+/[^/]+/resolve/[^/]+/.+",
-    ]
-    return any(re.match(pattern, url) for pattern in patterns)
+    try:
+        # Reuse the stricter URL structure validation
+        parse_huggingface_file_url(url)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:

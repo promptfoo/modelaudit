@@ -24,8 +24,11 @@ class MetadataScanner(BaseScanner):
         return filename_lower in [
             "readme",
             "readme.md",
+            "readme.rst",
             "readme.txt",
             "model_card.md",
+            "modelcard.md",
+            "model_card",
             "model_card.txt",
             "model-index.yml",
             "model-index.yaml",
@@ -56,6 +59,7 @@ class MetadataScanner(BaseScanner):
         result = ScanResult("metadata")
         result.issues = issues
         result.bytes_scanned = path.stat().st_size if path.exists() else 0
+        result.finish(success=True)
         return result
 
     def _scan_text_metadata(self, file_path: str) -> list[Issue]:
@@ -95,77 +99,39 @@ class MetadataScanner(BaseScanner):
         url_pattern = r'https?://[^\s<>"\']+[^\s<>"\',.]'
         urls = re.findall(url_pattern, content)
 
-        # High-risk domains that are almost always suspicious
-        high_risk_domains = [
+        suspicious_domains = [
             "bit.ly",
             "tinyurl.com",
             "t.co",
             "goo.gl",
             "ow.ly",
+            "is.gd",
+            "rb.gy",
+            "tiny.one",
             "ngrok.io",
             "localtunnel.me",
         ]
 
-        # Medium-risk domains that could be legitimate but worth flagging
-        medium_risk_domains = [
-            "github.io",
-            "gitlab.io",
-        ]
-
+        seen = set()
         for url in urls:
-            url_lower = url.lower()
-            for domain in high_risk_domains:
-                if domain in url_lower:
+            if url in seen:
+                continue
+            for domain in suspicious_domains:
+                if domain in url.lower():
+                    seen.add(url)
                     issues.append(
                         Issue(
                             message=f"Suspicious URL found in text metadata: {url}",
                             severity=IssueSeverity.WARNING,
                             location=file_path,
-                            details={"url": url, "suspicious_domain": domain, "risk_level": "high"},
+                            details={"url": url, "suspicious_domain": domain},
                             why="URL shorteners and tunnel services can hide malicious endpoints",
                             type="suspicious_url",
                         )
                     )
                     break  # Avoid duplicate issues for the same URL
 
-            # For medium-risk domains, be more selective
-            for domain in medium_risk_domains:
-                if domain in url_lower:
-                    # Check if this looks like a legitimate project page
-                    if not self._looks_like_legitimate_project_url(url):
-                        issues.append(
-                            Issue(
-                                message=f"Potentially suspicious hosting service in text metadata: {url}",
-                                severity=IssueSeverity.INFO,  # Lower severity for medium risk
-                                location=file_path,
-                                details={"url": url, "suspicious_domain": domain, "risk_level": "medium"},
-                                why="Third-party hosting services should be verified for legitimacy",
-                                type="suspicious_url",
-                            )
-                        )
-                    break  # Avoid duplicate issues for the same URL
-
         return issues
-
-    def _looks_like_legitimate_project_url(self, url: str) -> bool:
-        """Check if a URL looks like a legitimate project page rather than suspicious content."""
-        url_lower = url.lower()
-
-        # Look for patterns that suggest legitimate project pages
-        legitimate_patterns = [
-            # Common project/documentation patterns
-            r"github\.io/[\w\-]+/?$",  # Simple username.github.io
-            r"[\w\-]+\.github\.io/?$",  # Project pages
-            r"gitlab\.io/[\w\-]+/?$",   # Simple username.gitlab.io
-            r"[\w\-]+\.gitlab\.io/?$",  # Project pages
-            # Documentation and common project files
-            r"/docs?/?$",
-            r"/readme\.md$",
-            r"/index\.html?$",
-        ]
-
-        import re
-        return any(re.search(pattern, url_lower) for pattern in legitimate_patterns)
 
     def _calculate_entropy(self, text: str) -> float:
         """Calculate the Shannon entropy of a text string."""
