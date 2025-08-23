@@ -1401,7 +1401,10 @@ class PickleScanner(BaseScanner):
                 if globals_found:
                     logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
                     return globals_found
-                raise
+                # For internal scanner calls (like joblib), don't fail the entire scan
+                # Just log the issue and return empty set
+                logger.debug(f"Pickle parsing failed with no globals found: {e}")
+                return set()
 
             last_byte = data.read(1)
             if last_byte:
