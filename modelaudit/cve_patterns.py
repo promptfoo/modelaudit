@@ -76,7 +76,10 @@ class CVEAttribution:
 
 def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEAttribution]:
     """
-    Analyze content for CVE-specific patterns and return attribution information.
+    Analyze content for CVE-specific patterns using multi-line aware detection.
+    
+    Simple, effective approach that detects CVE patterns across multiple lines
+    instead of requiring everything on a single line.
 
     Args:
         content: String content to analyze
@@ -87,7 +90,26 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     """
     attributions = []
 
-    # Check CVE-2020-13092 patterns
+    # Check CVE-2020-13092 patterns  
+    cve_2020_matches = _check_cve_2020_13092_multiline(content, binary_content)
+    if cve_2020_matches:
+        attributions.append(_create_cve_2020_13092_attribution(cve_2020_matches))
+
+    # Check CVE-2024-34997 patterns
+    cve_2024_matches = _check_cve_2024_34997_multiline(content, binary_content)
+    if cve_2024_matches:
+        attributions.append(_create_cve_2024_34997_attribution(cve_2024_matches))
+
+    return attributions
+
+
+def _analyze_cve_patterns_basic(content: str, binary_content: bytes = b"") -> list[CVEAttribution]:
+    """
+    Basic CVE analysis fallback (original implementation).
+    """
+    attributions = []
+
+    # Check CVE-2020-13092 patterns  
     cve_2020_matches = _check_cve_2020_13092(content, binary_content)
     if cve_2020_matches:
         attributions.append(_create_cve_2020_13092_attribution(cve_2020_matches))
@@ -100,79 +122,115 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     return attributions
 
 
-def _check_cve_2020_13092(content: str, binary_content: bytes) -> list[str]:
-    """Check for CVE-2020-13092 specific patterns - requires multiple indicators."""
+def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2020-13092 using multi-line aware detection.
+    
+    CVE-2020-13092: sklearn <= 0.23.0 joblib.load deserialization vulnerability
+    Real malicious code spreads indicators across multiple lines.
+    """
     matches = []
-
-    # Check string patterns (these are already sophisticated combinations)
-    for pattern in CVE_2020_13092_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
-            matches.append(pattern)
-
-    # For binary patterns, require multiple dangerous indicators
-    cve_2020_binary_indicators = [
-        b"joblib.load",
-        b"sklearn",
-        b"__reduce__",
-        b"os.system",
-        b"subprocess",
-        b"Pipeline",
-    ]
-
-    found_indicators = []
-    for binary_pattern in cve_2020_binary_indicators:
-        if binary_pattern in binary_content:
-            found_indicators.append(binary_pattern.decode("utf-8", errors="ignore"))
-
-    # Only flag as CVE-2020-13092 if we have multiple indicators including dangerous ones
-    dangerous_indicators = ["os.system", "subprocess", "__reduce__", "joblib.load"]
-    has_sklearn = "sklearn" in found_indicators
-    has_dangerous = any(indicator in found_indicators for indicator in dangerous_indicators)
-
-    # Require both sklearn-related content AND dangerous operations
-    if has_sklearn and has_dangerous and len(found_indicators) >= 3:
-        matches.extend(found_indicators)
-
+    content_lower = content.lower()
+    
+    # Skip documentation/comments that mention CVE patterns
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2020", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        # This looks like documentation, not executable code
+        return []
+    
+    # Required indicators for CVE-2020-13092
+    sklearn_indicators = ["sklearn", "joblib"]
+    dangerous_operations = ["os.system", "subprocess", "__reduce__", "eval", "exec"]
+    loading_operations = ["joblib.load", "joblib.dump", "pickle.load"]
+    
+    # Check if we have sklearn/joblib context
+    has_sklearn = any(indicator in content_lower for indicator in sklearn_indicators)
+    
+    # Check if we have dangerous operations
+    has_dangerous = any(op in content_lower for op in dangerous_operations)
+    
+    # Check if we have loading operations (vulnerability trigger)
+    has_loading = any(op in content_lower for op in loading_operations)
+    
+    # Also check binary content for additional evidence
+    binary_indicators = []
+    for indicator in [b"sklearn", b"joblib", b"os.system", b"__reduce__", b"subprocess"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+    
+    # CVE-2020-13092 detection logic:
+    # Need sklearn/joblib context AND dangerous operations
+    if has_sklearn and has_dangerous:
+        matches.append("sklearn/joblib context with dangerous operations")
+        
+        # Higher confidence if loading operations present
+        if has_loading:
+            matches.append("loading operations present")
+            
+        # Higher confidence with binary evidence
+        if binary_indicators:
+            matches.extend(binary_indicators)
+            
+        # Check for specific dangerous combinations
+        if "__reduce__" in content_lower and "os.system" in content_lower:
+            matches.append("__reduce__ with os.system (high risk)")
+            
     return matches
 
 
-def _check_cve_2024_34997(content: str, binary_content: bytes) -> list[str]:
-    """Check for CVE-2024-34997 specific patterns - requires multiple indicators."""
+def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2024-34997 using multi-line aware detection.
+    
+    CVE-2024-34997: joblib v1.4.2 NumpyArrayWrapper deserialization vulnerability
+    Real malicious code spreads indicators across multiple lines.
+    """
     matches = []
-
-    # Check string patterns (these are already sophisticated combinations)
-    for pattern in CVE_2024_34997_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
-            matches.append(pattern)
-
-    # For binary patterns, require multiple dangerous indicators
-    cve_2024_binary_indicators = [
-        b"NumpyArrayWrapper",
-        b"read_array",
-        b"numpy_pickle",
-        b"pickle.load",
-        b"joblib.cache",
-        b"__reduce__",
-        b"os.system",
-        b"subprocess",
-    ]
-
-    found_indicators = []
-    for binary_pattern in cve_2024_binary_indicators:
-        if binary_pattern in binary_content:
-            found_indicators.append(binary_pattern.decode("utf-8", errors="ignore"))
-
-    # Only flag as CVE-2024-34997 if we have NumpyArrayWrapper AND dangerous operations
-    numpy_indicators = ["NumpyArrayWrapper", "read_array", "numpy_pickle"]
-    dangerous_indicators = ["pickle.load", "__reduce__", "os.system", "subprocess"]
-
-    has_numpy = any(indicator in found_indicators for indicator in numpy_indicators)
-    has_dangerous = any(indicator in found_indicators for indicator in dangerous_indicators)
-
-    # Require both numpy-related content AND dangerous operations
-    if has_numpy and has_dangerous and len(found_indicators) >= 2:
-        matches.extend(found_indicators)
-
+    content_lower = content.lower()
+    
+    # Skip documentation/comments that mention CVE patterns
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        # This looks like documentation, not executable code
+        return []
+    
+    # Required indicators for CVE-2024-34997
+    numpy_indicators = ["numpyarraywrapper", "read_array", "numpy_pickle"]
+    dangerous_operations = ["pickle.load", "os.system", "subprocess", "__reduce__", "eval", "exec"]
+    joblib_context = ["joblib", "joblib.cache"]
+    
+    # Check if we have numpy wrapper context
+    has_numpy = any(indicator in content_lower for indicator in numpy_indicators)
+    
+    # Check if we have dangerous operations
+    has_dangerous = any(op in content_lower for op in dangerous_operations)
+    
+    # Check if we have joblib context
+    has_joblib = any(context in content_lower for context in joblib_context)
+    
+    # Also check binary content for additional evidence
+    binary_indicators = []
+    for indicator in [b"NumpyArrayWrapper", b"read_array", b"pickle.load", b"joblib", b"os.system"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+    
+    # CVE-2024-34997 detection logic:
+    # Need numpy wrapper context AND dangerous operations
+    if has_numpy and has_dangerous:
+        matches.append("NumpyArrayWrapper context with dangerous operations")
+        
+        # Higher confidence with joblib context
+        if has_joblib:
+            matches.append("joblib context present")
+            
+        # Higher confidence with binary evidence
+        if binary_indicators:
+            matches.extend(binary_indicators)
+            
+        # Check for specific dangerous combinations
+        if "pickle.load" in content_lower and "numpyarraywrapper" in content_lower:
+            matches.append("NumpyArrayWrapper with pickle.load (high risk)")
+            
     return matches
 
 
@@ -345,6 +403,44 @@ def enhance_scan_result_with_cve(scan_result, detected_patterns: list[str], bina
         highest_cvss = max(attr.cvss for attr in cve_attributions)
         highest_cve = next(attr for attr in cve_attributions if attr.cvss == highest_cvss)
         scan_result.metadata["primary_cve"] = highest_cve.cve_id
+
+
+# Helper functions for enhanced CVE analysis integration
+
+def _get_cve_description(cve_id: str) -> str:
+    """Get CVE description."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return str(info.get("description", "Unknown CVE"))
+
+
+def _get_cve_severity(cve_id: str) -> str:
+    """Get CVE severity."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return str(info.get("severity", "UNKNOWN"))
+
+
+def _get_cve_cvss(cve_id: str) -> float:
+    """Get CVE CVSS score."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return float(info.get("cvss", 0.0))
+
+
+def _get_cve_cwe(cve_id: str) -> str:
+    """Get CVE CWE classification."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return str(info.get("cwe", "CWE-UNKNOWN"))
+
+
+def _get_cve_affected_versions(cve_id: str) -> str:
+    """Get CVE affected versions."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return str(info.get("affected_versions", "Unknown versions"))
+
+
+def _get_cve_remediation(cve_id: str) -> str:
+    """Get CVE remediation guidance."""
+    info = CVE_COMBINED_PATTERNS.get(cve_id, {})
+    return str(info.get("remediation", "No remediation guidance available"))
 
 
 def format_cve_report(attributions: list[CVEAttribution]) -> str:
