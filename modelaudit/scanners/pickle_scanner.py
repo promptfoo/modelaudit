@@ -1129,8 +1129,10 @@ class PickleScanner(BaseScanner):
                             "pickle_parse_error": str(e),
                             "early_detection_successful": early_detection_successful,
                         },
-                        why=("This binary file does not contain valid pickle data structure. "
-                             "Binary content was analyzed for security patterns instead."),
+                        why=(
+                            "This binary file does not contain valid pickle data structure. "
+                            "Binary content was analyzed for security patterns instead."
+                        ),
                     )
 
                     # If early detection was successful, also perform comprehensive binary scan
@@ -1181,8 +1183,10 @@ class PickleScanner(BaseScanner):
                             "early_detection_successful": early_detection_successful,
                             "truncation_reason": "format_complexity",
                         },
-                        why=("This pickle file contains complex structures that could not be fully parsed. "
-                             "Early security pattern analysis was performed."),
+                        why=(
+                            "This pickle file contains complex structures that could not be fully parsed. "
+                            "Early security pattern analysis was performed."
+                        ),
                     )
 
                     # Always update metadata for complex pickle files
