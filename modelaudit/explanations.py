@@ -8,7 +8,7 @@ for common security issues found in ML model files.
 from typing import Optional
 
 # Common explanations for dangerous imports and modules
-DANGEROUS_IMPORTS = {
+DANGEROUS_IMPORTS: dict[str, str] = {
     "os": (
         "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system "
         "commands, file system manipulation, and environment variable access. Malicious models can use this to "
@@ -18,6 +18,18 @@ DANGEROUS_IMPORTS = {
         "The 'posix' module provides direct access to POSIX system calls on Unix-like systems. Like the 'os' module, "
         "it can execute arbitrary system commands and manipulate the file system. The 'posix.system' function is "
         "equivalent to 'os.system' and poses the same security risks."
+    ),
+    "nt": (
+        "The 'nt' module is a Windows-specific alias for 'os', exposing the same system command and file operations. "
+        "Attackers can invoke functions like 'nt.system' to execute arbitrary commands."
+    ),
+    "ntpath": (
+        "The 'ntpath' module provides Windows path manipulation utilities. These can be abused to access or modify "
+        "restricted system paths, facilitating privilege escalation or data exfiltration."
+    ),
+    "posixpath": (
+        "The 'posixpath' module provides POSIX path manipulation utilities. Attackers can leverage it to traverse or "
+        "access restricted paths on Unix-like systems."
     ),
     "sys": (
         "The 'sys' module provides access to interpreter internals and system-specific parameters. It can be used to "
@@ -458,3 +470,90 @@ def _enhance_explanation_with_context(message: str, base_explanation: str, conte
 
     # Return None if no context-specific enhancement applies
     return None
+
+
+# CVE-2025-32434 Specific Explanations
+def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2025-32434 vulnerability types"""
+
+    explanations = {
+        "pytorch_version": (
+            "CVE-2025-32434 affects PyTorch versions ≤2.5.1 and allows remote code execution "
+            "when loading models with torch.load(weights_only=True). The 'weights_only=True' "
+            "parameter was commonly believed to provide security protection, but this "
+            "vulnerability demonstrates that malicious pickle files can still execute "
+            "arbitrary code regardless of this setting. Upgrade to PyTorch 2.6.0+ immediately."
+        ),
+        "weights_only_false_security": (
+            "This model contains dangerous pickle opcodes that can execute arbitrary code "
+            "even when loaded with torch.load(weights_only=True). This is the core of "
+            "CVE-2025-32434 - the 'weights_only=True' parameter does NOT provide security "
+            "protection against sophisticated attacks. The parameter is a feature flag, not "
+            "a security boundary. Never rely on it for security with untrusted models."
+        ),
+        "dangerous_opcodes": (
+            "The detected opcodes (REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL, BUILD) are "
+            "fundamental pickle operations that enable arbitrary code execution. These "
+            "opcodes can invoke __reduce__ methods, instantiate arbitrary classes, and "
+            "import dangerous modules. CVE-2025-32434 exploits the fact that torch.load() "
+            "processes these opcodes even with weights_only=True, allowing malicious models "
+            "to execute code during the loading process."
+        ),
+        "opcode_sequences": (
+            "Specific opcode sequences have been identified that indicate CVE-2025-32434 "
+            "exploitation attempts. These include PyTorch imports followed by execution "
+            "opcodes, chained REDUCE operations for complex payloads, and eval/exec "
+            "patterns with embedded string data. These sequences represent sophisticated "
+            "attacks designed to bypass the weights_only=True assumption."
+        ),
+        "torchscript_vulnerabilities": (
+            "TorchScript models can contain embedded code that executes during compilation "
+            "or loading. CVE-2025-32434 can be combined with TorchScript injection to "
+            "create multi-stage attacks. Dangerous patterns include serialization injection, "
+            "module manipulation, hook injection, and bytecode-level code execution. "
+            "These attacks can persist even after model loading completes."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2025-32434, a critical PyTorch vulnerability. "
+        "Review the CVE documentation and update to PyTorch 2.6.0+ immediately.",
+    )
+
+
+def get_pytorch_security_explanation(issue_type: str) -> str:
+    """Get PyTorch-specific security explanations"""
+
+    explanations = {
+        "pickle_serialization": (
+            "PyTorch models use Python's pickle format for serialization, which is inherently "
+            "unsafe. Pickle can execute arbitrary code during deserialization through __reduce__ "
+            "methods, class instantiation, and module imports. This is not a bug but a "
+            "fundamental design characteristic. Use SafeTensors format for better security."
+        ),
+        "model_source_validation": (
+            "Model files should only be loaded from trusted, verified sources. Implement "
+            "cryptographic signature verification, hash validation, and supply chain security "
+            "practices. Never load models from untrusted URLs, user uploads, or unverified "
+            "repositories without thorough security scanning."
+        ),
+        "safe_loading_practices": (
+            "Safe model loading requires: (1) PyTorch 2.6.0+, (2) weights_only=True as basic "
+            "precaution, (3) model source validation, (4) hash verification, (5) security "
+            "scanning with tools like ModelAudit, and (6) sandboxed loading for untrusted "
+            "models. Consider migrating to SafeTensors format for inherent safety."
+        ),
+        "torchscript_security": (
+            "TorchScript models contain compiled code that can include dangerous operations. "
+            "Validate all script modules for unsafe operations, avoid dynamic code generation, "
+            "and review hook functions for malicious behavior. TorchScript can bypass some "
+            "Python-level security controls, making validation critical."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "This is a PyTorch-specific security concern. Review PyTorch security best practices "
+        "and ensure you're following safe model loading procedures.",
+    )

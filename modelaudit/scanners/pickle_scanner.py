@@ -9,6 +9,7 @@ from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
 from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
+    CVE_BINARY_PATTERNS,
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
@@ -18,6 +19,7 @@ from modelaudit.utils.code_validation import (
     validate_python_syntax,
 )
 
+from ..cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..explanations import (
     get_import_explanation,
     get_opcode_explanation,
@@ -1121,7 +1123,7 @@ class PickleScanner(BaseScanner):
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
         """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
-        # Early detection of dangerous patterns
+        # Early detection of dangerous patterns (existing + CVE-specific)
         dangerous_patterns = [
             b"posix",  # Common in malicious pickles (posix.system)
             b"subprocess",
@@ -1150,11 +1152,50 @@ class PickleScanner(BaseScanner):
             b"system",  # Catches both os.system and from os import system
         ]
 
+        # Add CVE-specific binary patterns
+        dangerous_patterns.extend(CVE_BINARY_PATTERNS)
+
+        # CVE-2025-32434 specific patterns - PyTorch weights_only=True bypass techniques
+        cve_2025_32434_patterns = [
+            # Patterns that specifically exploit the weights_only=True assumption
+            b"torch.load",  # Direct torch.load references in payload
+            b"weights_only",  # References to the weights_only parameter
+            b"torch._C",  # Internal PyTorch C++ interface access
+            b"torch.jit._script",  # TorchScript exploitation paths
+            b"torch.jit.trace",  # JIT tracing exploitation
+            b"torch.serialization",  # PyTorch serialization internals
+            b"torch._utils",  # Internal PyTorch utilities
+            b"torch.nn.Module",  # Neural network module manipulation
+            b"torch._six",  # PyTorch compatibility utilities
+            b"torch.cuda._lazy_call",  # CUDA lazy execution exploitation
+            b"torch.autograd.Function",  # Autograd function injection
+            b"F.apply",  # Function application bypass
+            # Base64/hex encoded PyTorch payloads
+            b"dG9yY2g",  # base64 "torch"
+            b"746f726368",  # hex "torch"
+            b"UHlUb3JjaA",  # base64 "PyTorch"
+            b"507954617268",  # hex "PyTorch"
+            # Obfuscated torch references
+            b"__torch__",  # Torch module references
+            b"_torch_",  # Alternative torch references
+            # Lambda exploitation in PyTorch context
+            b"lambda",  # Lambda functions for code injection
+            b"functools.partial",  # Partial function application
+            # PyTorch-specific dangerous operations
+            b"torch.save",  # Model saving manipulation
+            b"torch.hub",  # PyTorch Hub exploitation
+            b"torchvision.transforms",  # Transform pipeline injection
+            b"torch.utils.data",  # Data pipeline manipulation
+        ]
+
+        # Combine all patterns
+        all_dangerous_patterns = dangerous_patterns + cve_2025_32434_patterns
+
         # Limit how much we scan for performance
         max_scan_size = min(8192, len(data))
         scan_data = data[:max_scan_size]
 
-        for pattern in dangerous_patterns:
+        for pattern in all_dangerous_patterns:
             # Check for interrupts during pattern scanning
             self.check_interrupted()
             # Use find() instead of 'in' operator to be more explicit
@@ -1169,6 +1210,18 @@ class PickleScanner(BaseScanner):
                 # Use semantic analysis to check if this is actually dangerous
                 # For now, just check if it's in documentation or comments
                 is_safe = "documentation" in context.lower() or "#" in context
+
+                # Additional PyTorch-specific safety checks
+                if pattern == b"torch._utils":
+                    # torch._utils is safe when used with legitimate tensor rebuilding functions
+                    legitimate_pytorch_functions = [
+                        b"_rebuild_tensor_v2",
+                        b"_rebuild_parameter",
+                        b"_rebuild_tensor",
+                        b"_rebuild_sparse_tensor",
+                        b"_rebuild_nested_tensor",
+                    ]
+                    is_safe = is_safe or any(func in context.encode() for func in legitimate_pytorch_functions)
 
                 # Skip if semantic analysis says it's safe (e.g., in documentation)
                 if is_safe:
@@ -1189,6 +1242,52 @@ class PickleScanner(BaseScanner):
                         f"The file contains the dangerous pattern '{pattern_str}' "
                         f"which could indicate malicious code execution during unpickling."
                     ),
+                )
+
+        # Perform CVE-specific pattern analysis on the data
+        self._analyze_cve_patterns(data, result, context_path)
+
+    def _analyze_cve_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
+        """Analyze data for specific CVE patterns and add CVE attribution."""
+        # Convert bytes to string for pattern analysis
+        try:
+            content_str = data.decode("utf-8", errors="ignore")
+        except UnicodeDecodeError:
+            content_str = ""
+
+        # Use CVE pattern analysis
+        cve_attributions = analyze_cve_patterns(content_str, data)
+
+        if cve_attributions:
+            # Enhance scan result with CVE information
+            enhance_scan_result_with_cve(result, [content_str], data)
+
+            # Add specific CVE detection checks
+            for attr in cve_attributions:
+                severity = IssueSeverity.CRITICAL if attr.severity == "CRITICAL" else IssueSeverity.WARNING
+
+                # Check if this is a high-confidence detection
+                confidence_desc = "high" if attr.confidence > 0.8 else "medium" if attr.confidence > 0.6 else "low"
+
+                result.add_check(
+                    name=f"CVE Pattern Detection: {attr.cve_id}",
+                    passed=False,
+                    message=f"Detected patterns associated with {attr.cve_id} ({confidence_desc} confidence)",
+                    severity=severity,
+                    location=context_path,
+                    details={
+                        "cve_id": attr.cve_id,
+                        "description": attr.description,
+                        "cvss_score": attr.cvss,
+                        "cwe": attr.cwe,
+                        "affected_versions": attr.affected_versions,
+                        "confidence": attr.confidence,
+                        "patterns_matched": attr.patterns_matched,
+                        "remediation": attr.remediation,
+                    },
+                    why=f"This pickle file contains patterns consistent with {attr.cve_id}, "
+                    f"a {attr.severity.lower()} vulnerability ({attr.cwe}) affecting {attr.affected_versions}. "
+                    f"This could indicate potential exploitation attempts. {attr.remediation}",
                 )
 
     def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
@@ -1473,6 +1572,25 @@ class PickleScanner(BaseScanner):
 
             # SMART DETECTION: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
+
+            # CVE-2025-32434 specific opcode sequence analysis
+            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes)
+            for cve_pattern in cve_patterns:
+                result.add_check(
+                    name="CVE-2025-32434 Opcode Sequence Detection",
+                    passed=False,
+                    message=f"Detected CVE-2025-32434 exploitation pattern: {cve_pattern['description']}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (pos {cve_pattern['position']})",
+                    details={
+                        "cve_id": "CVE-2025-32434",
+                        "pattern_type": cve_pattern["pattern_type"],
+                        "description": cve_pattern["description"],
+                        "opcodes_involved": cve_pattern["opcodes"],
+                        "exploitation_method": cve_pattern["exploitation_method"],
+                        "position": cve_pattern["position"],
+                    },
+                )
 
             # ML-context-aware stack depth validation
             ml_confidence = ml_context.get("overall_confidence", 0)
@@ -2540,6 +2658,207 @@ class PickleScanner(BaseScanner):
             )
 
         return result
+
+    def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple]) -> list[dict]:
+        """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques"""
+        patterns = []
+
+        # Count dangerous opcodes and torch references for overall analysis
+        dangerous_opcodes_count = 0
+        torch_references = 0
+        dangerous_opcodes_found = []
+
+        for i, (opcode, arg, pos) in enumerate(opcodes):
+            # Count dangerous opcodes
+            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL"]:
+                dangerous_opcodes_count += 1
+                dangerous_opcodes_found.append((opcode.name, pos))
+
+            # Count torch references
+            if (
+                opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                and arg
+                and any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"])
+            ):
+                torch_references += 1
+
+            # Pattern 1: Clearly malicious torch operations (not legitimate storage/rebuild operations)
+            if (
+                opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                and arg
+                and any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"])
+            ):
+                # Look for dangerous opcodes within next 30 positions
+                # Note: We check ALL torch operations since even legitimate ones can be part of attacks
+                for j in range(i + 1, min(i + 31, len(opcodes))):
+                    next_opcode, next_arg, next_pos = opcodes[j]
+                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                        # Only flag clearly suspicious torch operations
+                        is_suspicious = (
+                            # Suspicious torch modules/functions
+                            any(
+                                suspicious in str(arg).lower()
+                                for suspicious in [
+                                    "eval",
+                                    "exec",
+                                    "system",
+                                    "import",
+                                    "builtin",
+                                    "compile",
+                                    "subprocess",
+                                    "os.",
+                                    "sys.",
+                                    "__import__",
+                                    "getattr",
+                                ]
+                            )
+                            or
+                            # Non-standard torch operations that could be malicious
+                            (
+                                "torch" in str(arg).lower()
+                                and not any(
+                                    standard in str(arg).lower()
+                                    for standard in [
+                                        "storage",
+                                        "_rebuild",
+                                        "tensor",
+                                        "parameter",
+                                        "module",
+                                        "nn.",
+                                        "functional",
+                                        "utils",
+                                        "cuda",
+                                        "device",
+                                    ]
+                                )
+                            )
+                        )
+
+                        if is_suspicious:
+                            patterns.append(
+                                {
+                                    "pattern_type": "torch_import_with_execution",
+                                    "description": (
+                                        f"Suspicious PyTorch operation ({arg}) followed by {next_opcode.name} opcode"
+                                    ),
+                                    "opcodes": [opcode.name, next_opcode.name],
+                                    "exploitation_method": "weights_only=True bypass via PyTorch operation",
+                                    "position": pos,
+                                }
+                            )
+                            break
+
+            # Pattern 2: Multiple REDUCE opcodes in sequence (common in CVE-2025-32434 exploits)
+            if opcode.name == "REDUCE" and i < len(opcodes) - 2:
+                reduce_sequence = [opcode.name]
+                reduce_positions = [pos]
+
+                # Look for subsequent REDUCE opcodes
+                for j in range(i + 1, min(i + 6, len(opcodes))):
+                    next_opcode, next_arg, next_pos = opcodes[j]
+                    if next_opcode.name == "REDUCE":
+                        reduce_sequence.append(next_opcode.name)
+                        reduce_positions.append(next_pos)
+                    elif next_opcode.name in ["MARK", "TUPLE", "LIST"]:
+                        # Skip structure opcodes
+                        continue
+                    else:
+                        break
+
+                # If we found 3+ REDUCE opcodes in close proximity
+                if len(reduce_sequence) >= 3:
+                    patterns.append(
+                        {
+                            "pattern_type": "chained_reduce_execution",
+                            "description": f"Chain of {len(reduce_sequence)} REDUCE opcodes indicating complex exploit",
+                            "opcodes": reduce_sequence,
+                            "exploitation_method": "Chained __reduce__ method exploitation",
+                            "position": pos,
+                        }
+                    )
+
+            # Pattern 3: GLOBAL builtins.eval/exec followed by data loading
+            if (
+                opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                and arg
+                and any(dangerous in str(arg).lower() for dangerous in ["eval", "exec", "compile", "__import__"])
+            ):
+                # Look for data loading opcodes that could contain payload
+                for j in range(i + 1, min(i + 8, len(opcodes))):
+                    next_opcode, next_arg, next_pos = opcodes[j]
+                    if next_opcode.name in ["UNICODE", "STRING", "BINUNICODE", "SHORT_BINSTRING"]:
+                        patterns.append(
+                            {
+                                "pattern_type": "eval_exec_with_payload",
+                                "description": f"Code execution function ({arg}) with string payload",
+                                "opcodes": [opcode.name, next_opcode.name],
+                                "exploitation_method": "Direct code execution via eval/exec",
+                                "position": pos,
+                            }
+                        )
+                        break
+
+            # Pattern 4: BUILD opcode with suspicious GLOBAL preceding it (setstate exploitation)
+            if opcode.name == "BUILD" and i > 0:
+                # Look backwards for GLOBAL opcodes
+                for j in range(max(0, i - 5), i):
+                    prev_opcode, prev_arg, prev_pos = opcodes[j]
+                    if (
+                        prev_opcode.name in ["GLOBAL", "STACK_GLOBAL"]
+                        and prev_arg
+                        and any(
+                            suspicious in str(prev_arg).lower()
+                            for suspicious in ["os", "subprocess", "eval", "exec", "torch"]
+                        )
+                    ):
+                        patterns.append(
+                            {
+                                "pattern_type": "setstate_exploitation",
+                                "description": f"BUILD opcode with suspicious import ({prev_arg})",
+                                "opcodes": [prev_opcode.name, opcode.name],
+                                "exploitation_method": "__setstate__ method exploitation",
+                                "position": pos,
+                            }
+                        )
+                        break
+
+            # Pattern 5: Lambda exploitation sequences (GLOBAL lambda followed by REDUCE)
+            if opcode.name in ["UNICODE", "STRING", "BINUNICODE"] and arg and "lambda" in str(arg).lower():
+                # Look for REDUCE opcodes following lambda
+                for j in range(i + 1, min(i + 8, len(opcodes))):
+                    next_opcode, next_arg, next_pos = opcodes[j]
+                    if next_opcode.name == "REDUCE":
+                        patterns.append(
+                            {
+                                "pattern_type": "lambda_exploitation",
+                                "description": "Lambda function with REDUCE opcode execution",
+                                "opcodes": [opcode.name, next_opcode.name],
+                                "exploitation_method": "Lambda function code injection",
+                                "position": pos,
+                            }
+                        )
+                        break
+
+        # Pattern 6: Overall suspicious density check (CVE-2025-32434 indicator)
+        # Very high concentration of dangerous opcodes in a PyTorch model is suspicious
+        # Normal PyTorch models have some REDUCE opcodes for tensor reconstruction, but not excessive amounts
+        if dangerous_opcodes_count > 80 and torch_references > 0:
+            patterns.append(
+                {
+                    "pattern_type": "high_risk_opcode_density",
+                    "description": (
+                        f"High concentration of dangerous opcodes ({dangerous_opcodes_count}) "
+                        "in PyTorch model indicates potential CVE-2025-32434 exploitation"
+                    ),
+                    "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
+                    "exploitation_method": "weights_only=True bypass via opcode density attack",
+                    "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
+                    "dangerous_count": dangerous_opcodes_count,
+                    "torch_references": torch_references,
+                }
+            )
+
+        return patterns
 
     def check_for_jit_script_code(
         self,
