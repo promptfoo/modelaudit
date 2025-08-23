@@ -310,7 +310,13 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
                 parsed_url = None
 
         license_info = LicenseInfoModel(
-            spdx_id=spdx_id, name=name, url=parsed_url, text=text, confidence=confidence, source=source, commercial_allowed=None
+            spdx_id=spdx_id,
+            name=name,
+            url=parsed_url,
+            text=text,
+            confidence=confidence,
+            source=source,
+            commercial_allowed=None
         )
         self.license_info.append(license_info)
 

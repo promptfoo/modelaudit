@@ -562,7 +562,8 @@ test,data
         license_issues = [
             issue
             for issue in results.get("issues", [])
-            if getattr(issue, "type", None) == "license_warning" and "unspecified licenses" in getattr(issue, "message", "")
+            if getattr(issue, "type", None) == "license_warning"
+            and "unspecified licenses" in getattr(issue, "message", "")
         ]
 
         assert len(license_issues) == 0
