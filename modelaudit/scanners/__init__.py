@@ -363,6 +363,15 @@ class ScannerRegistry:
                 "dependencies": ["jinja2", "gguf"],  # gguf optional for GGUF support
                 "numpy_sensitive": False,
             },
+            "metadata": {
+                "module": "modelaudit.scanners.metadata_scanner",
+                "class": "MetadataScanner",
+                "description": "Scans model metadata files for security issues",
+                "extensions": [".json", ".md", ".markdown", ".rst", ".yml", ".yaml"],
+                "priority": 1,  # High priority for security-focused metadata scanning
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -446,6 +455,17 @@ class ScannerRegistry:
                     logger.debug(error_msg)  # Debug level for other issues
 
                 return None
+
+    def has_scanner_class(self, class_name: str) -> bool:
+        """Check if a scanner class is available without loading it.
+
+        Args:
+            class_name: Name of the scanner class to check for
+
+        Returns:
+            True if the scanner is registered and can potentially be loaded
+        """
+        return any(scanner_info.get("class") == class_name for scanner_info in self._scanners.values())
 
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
@@ -590,6 +610,7 @@ def __getattr__(name: str) -> Any:
         "PaddleScanner": "paddle",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
+        "MetadataScanner": "metadata",
         "ZipScanner": "zip",
     }
 

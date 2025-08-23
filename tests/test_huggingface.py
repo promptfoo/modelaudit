@@ -7,10 +7,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.utils.huggingface import (
+    download_file_from_hf,
     download_model,
     get_model_info,
     get_model_size,
+    is_huggingface_file_url,
     is_huggingface_url,
+    parse_huggingface_file_url,
     parse_huggingface_url,
 )
 
@@ -122,9 +125,8 @@ class TestModelDownload:
         cache_dir = tmp_path / "custom_cache"
         download_model("hf://test/model", cache_dir=cache_dir)
 
-        # Verify cache directory was used
+        # Verify cache directory was used (we now use local_dir instead of cache_dir for safety)
         call_args = mock_snapshot_download.call_args
-        assert call_args[1]["cache_dir"] == str(cache_dir / "huggingface" / "test" / "model")
         assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
 
     @patch("huggingface_hub.snapshot_download")
@@ -146,20 +148,19 @@ class TestModelDownload:
         with pytest.raises(ValueError):
             download_model("https://github.com/user/repo")
 
-    @patch("builtins.__import__")
-    def test_missing_huggingface_hub_dependency(self, mock_import):
+    def test_missing_huggingface_hub_dependency(self):
         """Test error when huggingface-hub is not installed."""
+        real_import = __import__
+        with patch("builtins.__import__") as mock_import:
 
-        # Mock the import to raise ImportError
-        def side_effect(name, *args, **kwargs):
-            if name == "huggingface_hub":
-                raise ImportError("No module named 'huggingface_hub'")
-            return __import__(name, *args, **kwargs)
+            def side_effect(name, *args, **kwargs):
+                if name == "huggingface_hub":
+                    raise ImportError("No module named 'huggingface_hub'")
+                return real_import(name, *args, **kwargs)
 
-        mock_import.side_effect = side_effect
-
-        with pytest.raises(ImportError, match="huggingface-hub package is required"):
-            download_model("https://huggingface.co/test/model")
+            mock_import.side_effect = side_effect
+            with pytest.raises(ImportError, match="huggingface-hub package is required"):
+                download_model("https://huggingface.co/test/model")
 
 
 class TestModelSizeAndDiskSpace:
@@ -225,18 +226,19 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_insufficient_disk_space(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
     ):
-        """Test download fails gracefully when disk space is insufficient."""
+        """Test download fails gracefully when disk space is insufficient (with custom cache)."""
         # Mock model size
         mock_get_model_size.return_value = 10 * 1024 * 1024 * 1024  # 10 GB
 
         # Mock disk space check to fail
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
-        # Test download failure
+        # Test download failure with custom cache directory (this enables disk space checking)
+        cache_dir = tmp_path / "custom_cache"
         with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
-            download_model("https://huggingface.co/test/model")
+            download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify snapshot_download was not called
         mock_snapshot_download.assert_not_called()
@@ -245,9 +247,9 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_disk_space_check(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
     ):
-        """Test successful download with disk space check."""
+        """Test successful download with disk space check when using custom cache."""
         # Mock model size
         mock_get_model_size.return_value = 1024 * 1024 * 1024  # 1 GB
 
@@ -255,11 +257,12 @@ class TestModelSizeAndDiskSpace:
         mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
 
         # Mock snapshot download
-        mock_path = "/tmp/test_model"
+        mock_path = str(tmp_path / "test_model")
         mock_snapshot_download.return_value = mock_path
 
-        # Test download
-        result = download_model("https://huggingface.co/test/model")
+        # Test download with custom cache directory (this enables disk space checking)
+        cache_dir = tmp_path / "custom_cache"
+        result = download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify disk space was checked
         mock_check_disk_space.assert_called_once()
@@ -309,3 +312,128 @@ class TestGetModelInfo:
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == ""
+
+
+class TestHuggingFaceFileURLs:
+    """Test HuggingFace direct file URL handling."""
+
+    def test_valid_file_urls(self):
+        """Test that valid HuggingFace file URLs are detected."""
+        valid_urls = [
+            "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
+            "https://huggingface.co/facebook/bart-large/resolve/main/config.json",
+            "https://hf.co/microsoft/DialoGPT/resolve/main/model.safetensors",
+            "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",  # Percent-encoded revision
+        ]
+        for url in valid_urls:
+            assert is_huggingface_file_url(url), f"Failed to detect valid file URL: {url}"
+
+    def test_invalid_file_urls(self):
+        """Test that invalid URLs are not detected as HuggingFace file URLs."""
+        invalid_urls = [
+            "https://huggingface.co/bert-base-uncased",  # Model URL, not file URL
+            "https://github.com/user/repo/blob/main/file.bin",  # GitHub, not HuggingFace
+            "https://huggingface.co/model/tree/main",  # Tree view, not resolve
+            "/path/to/local/file.bin",  # Local path
+        ]
+        for url in invalid_urls:
+            assert not is_huggingface_file_url(url), f"Incorrectly detected invalid file URL: {url}"
+
+    def test_parse_file_urls(self):
+        """Test parsing HuggingFace file URLs."""
+        test_cases = [
+            (
+                "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
+                ("bert-base/uncased", "main", "pytorch_model.bin"),
+            ),
+            (
+                "https://huggingface.co/microsoft/DialoGPT/resolve/v1.0/config.json",
+                ("microsoft/DialoGPT", "v1.0", "config.json"),
+            ),
+            (
+                "https://hf.co/facebook/bart-large/resolve/main/subfolder/model.safetensors",
+                ("facebook/bart-large", "main", "subfolder/model.safetensors"),
+            ),
+            (
+                "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",
+                ("user/repo", "refs/pr/1", "file.bin"),  # Percent-decoded revision
+            ),
+        ]
+        for url, expected in test_cases:
+            repo_id, branch, filename = parse_huggingface_file_url(url)
+            assert (repo_id, branch, filename) == expected, f"Failed to parse file URL: {url}"
+
+    def test_parse_invalid_file_urls(self):
+        """Test that invalid file URLs raise ValueError."""
+        invalid_urls = [
+            "https://github.com/user/repo/blob/main/file.bin",
+            "https://huggingface.co/model",  # Missing resolve path
+            "https://huggingface.co/model/tree/main/file.bin",  # Wrong path structure
+        ]
+        for url in invalid_urls:
+            with pytest.raises(ValueError):
+                parse_huggingface_file_url(url)
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_success(self, mock_hf_hub_download):
+        """Test successful file download from HuggingFace."""
+        mock_path = "/tmp/downloaded_file.bin"
+        mock_hf_hub_download.return_value = mock_path
+
+        url = "https://huggingface.co/test/model/resolve/main/pytorch_model.bin"
+        result = download_file_from_hf(url)
+
+        # Verify the download was called correctly
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            revision="main",
+            cache_dir=None,
+        )
+        assert result == Path(mock_path)
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_cache_dir(self, mock_hf_hub_download, tmp_path):
+        """Test file download with custom cache directory."""
+        mock_path = str(tmp_path / "downloaded_file.bin")
+        mock_hf_hub_download.return_value = mock_path
+
+        cache_dir = tmp_path / "custom_cache"
+        url = "https://huggingface.co/test/model/resolve/main/config.json"
+        download_file_from_hf(url, cache_dir=cache_dir)
+
+        # Verify cache directory was used
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="config.json",
+            revision="main",
+            cache_dir=str(cache_dir),
+        )
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_failure(self, mock_hf_hub_download):
+        """Test that file download failures are handled properly."""
+        mock_hf_hub_download.side_effect = Exception("Download failed")
+
+        url = "https://huggingface.co/test/model/resolve/main/file.bin"
+        with pytest.raises(Exception, match="Failed to download file from"):
+            download_file_from_hf(url)
+
+    def test_download_file_invalid_url(self):
+        """Test that invalid file URLs raise appropriate errors."""
+        with pytest.raises(ValueError):
+            download_file_from_hf("https://github.com/user/repo/blob/main/file.bin")
+
+    def test_download_file_missing_dependency(self):
+        """Test error when huggingface-hub is not installed."""
+        real_import = __import__
+        with patch("builtins.__import__") as mock_import:
+
+            def side_effect(name, *args, **kwargs):
+                if name == "huggingface_hub":
+                    raise ImportError("No module named 'huggingface_hub'")
+                return real_import(name, *args, **kwargs)
+
+            mock_import.side_effect = side_effect
+            with pytest.raises(ImportError, match="huggingface-hub package is required"):
+                download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")
