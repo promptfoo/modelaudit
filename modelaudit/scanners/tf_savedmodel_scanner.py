@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Optional
 
 from modelaudit.explanations import get_tf_op_explanation
-from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+from modelaudit.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
 from modelaudit.utils.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -14,17 +14,11 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
+# Derive from centralized list; keep severities unified here
+# Exclude Python ops (handled elsewhere) and pure decode ops from the generic pass
+_EXCLUDE_FROM_GENERIC = {"DecodeRaw", "DecodeJpeg", "DecodePng"}
 DANGEROUS_TF_OPERATIONS = {
-    "ReadFile": IssueSeverity.CRITICAL,  # File system read access
-    "WriteFile": IssueSeverity.CRITICAL,  # File system write access
-    "PyFunc": IssueSeverity.CRITICAL,  # Python function execution
-    "PyCall": IssueSeverity.CRITICAL,  # Python code execution
-    "ShellExecute": IssueSeverity.CRITICAL,  # Shell command execution
-    "MergeV2Checkpoints": IssueSeverity.CRITICAL,  # Checkpoint manipulation
-    "Save": IssueSeverity.CRITICAL,  # Save operations
-    "SaveV2": IssueSeverity.CRITICAL,  # SaveV2 operations
-    "ExecuteOp": IssueSeverity.CRITICAL,  # Execute arbitrary operations
-    "SystemConfig": IssueSeverity.CRITICAL,  # System configuration access
+    op: IssueSeverity.CRITICAL for op in TENSORFLOW_DANGEROUS_OPS if op not in _EXCLUDE_FROM_GENERIC
 }
 
 # Python operations that require special handling
@@ -155,6 +149,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         details={
                             "op_type": op_info["operation"],
                             "node_name": op_info["node_name"],
+                            "meta_graph": op_info.get("meta_graph", "unknown"),
                         },
                         why=get_tf_op_explanation(op_info["operation"]),
                     )
@@ -282,6 +277,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "operation": node.op,
                                 "node_name": node.name,
                                 "severity": DANGEROUS_TF_OPERATIONS[node.op],
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
                             }
                         )
         except Exception as e:  # pragma: no cover
@@ -307,7 +305,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     # Special handling for PyFunc/PyCall - try to extract and validate Python code
                     if node.op in PYTHON_OPS:
                         self._check_python_op(node, result, meta_graph)
-                    else:
+                    elif node.op not in DANGEROUS_TF_OPERATIONS:
                         result.add_check(
                             name="TensorFlow Operation Security Check",
                             passed=False,
@@ -323,6 +321,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                             why=get_tf_op_explanation(node.op),
                         )
+                    # else: already reported by generic dangerous-op pass
 
                 # Check for StatefulPartitionedCall which can contain custom functions
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:

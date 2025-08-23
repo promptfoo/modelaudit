@@ -380,7 +380,7 @@ SUSPICIOUS_OPS = {
     "ShellExecute",  # Execute shell commands
     "ExecuteOp",  # Execute arbitrary operations
     "SystemConfig",  # System configuration access
-    # Data decoding - MEDIUM RISK (documented but not actively scanned as CRITICAL)
+    # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw",  # Raw data decoding
     "DecodeJpeg",  # JPEG decoding (image processing)
     "DecodePng",  # PNG decoding (image processing)
@@ -402,7 +402,7 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "ShellExecute": "Can execute shell commands",
     "ExecuteOp": "Can execute arbitrary operations",
     "SystemConfig": "Can access system configuration",
-    # Data decoding - MEDIUM RISK (documented but not actively scanned as CRITICAL)
+    # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw": "Can decode raw image data, potential injection of malicious content",
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
