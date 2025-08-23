@@ -6,9 +6,10 @@ which replaces binary classification with graduated CRITICAL/HIGH/MEDIUM/LOW sys
 """
 
 import pytest
-from modelaudit.scanners.base import IssueSeverity, get_severity_score, SEVERITY_SCORES
-from modelaudit.suspicious_symbols import PICKLE_SEVERITY_MAP, TENSORFLOW_SEVERITY_MAP
+
+from modelaudit.scanners.base import SEVERITY_SCORES, IssueSeverity, get_severity_score
 from modelaudit.scanners.pickle_scanner import _get_graduated_severity
+from modelaudit.suspicious_symbols import PICKLE_SEVERITY_MAP, TENSORFLOW_SEVERITY_MAP
 
 
 class TestSeverityEnhancements:
@@ -16,15 +17,15 @@ class TestSeverityEnhancements:
 
     def test_severity_enum_has_graduated_levels(self):
         """Test that IssueSeverity enum has all graduated levels"""
-        assert hasattr(IssueSeverity, 'CRITICAL')
-        assert hasattr(IssueSeverity, 'HIGH') 
-        assert hasattr(IssueSeverity, 'MEDIUM')
-        assert hasattr(IssueSeverity, 'LOW')
-        
+        assert hasattr(IssueSeverity, "CRITICAL")
+        assert hasattr(IssueSeverity, "HIGH")
+        assert hasattr(IssueSeverity, "MEDIUM")
+        assert hasattr(IssueSeverity, "LOW")
+
         # Ensure backward compatibility
-        assert hasattr(IssueSeverity, 'WARNING')
-        assert hasattr(IssueSeverity, 'INFO')
-        assert hasattr(IssueSeverity, 'DEBUG')
+        assert hasattr(IssueSeverity, "WARNING")
+        assert hasattr(IssueSeverity, "INFO")
+        assert hasattr(IssueSeverity, "DEBUG")
 
     def test_severity_values_correct(self):
         """Test that severity values are correctly defined"""
@@ -56,7 +57,7 @@ class TestSeverityEnhancements:
             get_severity_score(IssueSeverity.INFO),
             get_severity_score(IssueSeverity.DEBUG),
         ]
-        
+
         assert scores == sorted(scores, reverse=True), "Severity scores should be in descending order"
 
 
@@ -73,7 +74,7 @@ class TestPickleSeverityClassification:
             ("builtins", "exec"),
             ("__builtin__", "eval"),
         ]
-        
+
         for module, function in critical_cases:
             severity = _get_graduated_severity(module, function)
             assert severity == IssueSeverity.CRITICAL, f"{module}.{function} should be CRITICAL"
@@ -87,7 +88,7 @@ class TestPickleSeverityClassification:
             ("requests", None),
             ("urllib", None),
         ]
-        
+
         for module, function in high_cases:
             severity = _get_graduated_severity(module, function)
             assert severity == IssueSeverity.HIGH, f"{module}.{function} should be HIGH"
@@ -100,7 +101,7 @@ class TestPickleSeverityClassification:
             ("operator", "attrgetter"),
             ("importlib", None),
         ]
-        
+
         for module, function in medium_cases:
             severity = _get_graduated_severity(module, function)
             assert severity == IssueSeverity.MEDIUM, f"{module}.{function} should be MEDIUM"
@@ -112,7 +113,7 @@ class TestPickleSeverityClassification:
             ("logging", None),
             ("inspect", None),
         ]
-        
+
         for module, function in low_cases:
             severity = _get_graduated_severity(module, function)
             assert severity == IssueSeverity.LOW, f"{module}.{function} should be LOW"
@@ -150,15 +151,15 @@ class TestTensorFlowSeverityClassification:
         """Test that dangerous TF operations are classified as CRITICAL"""
         critical_ops = TENSORFLOW_SEVERITY_MAP["CRITICAL"]
         expected_critical = ["PyFunc", "PyCall", "ShellExecute"]
-        
+
         for op in expected_critical:
             assert op in critical_ops, f"TF operation {op} should be CRITICAL"
 
     def test_tensorflow_high_operations(self):
         """Test that file system TF operations are classified as HIGH"""
-        high_ops = TENSORFLOW_SEVERITY_MAP["HIGH"] 
+        high_ops = TENSORFLOW_SEVERITY_MAP["HIGH"]
         expected_high = ["ReadFile", "WriteFile", "MergeV2Checkpoints"]
-        
+
         for op in expected_high:
             assert op in high_ops, f"TF operation {op} should be HIGH"
 
@@ -166,7 +167,7 @@ class TestTensorFlowSeverityClassification:
         """Test that save operations are classified as MEDIUM"""
         medium_ops = TENSORFLOW_SEVERITY_MAP["MEDIUM"]
         expected_medium = ["Save", "SaveV2"]
-        
+
         for op in expected_medium:
             assert op in medium_ops, f"TF operation {op} should be MEDIUM"
 
@@ -180,7 +181,7 @@ class TestSeverityMappingConsistency:
         assert "HIGH" in PICKLE_SEVERITY_MAP
         assert "MEDIUM" in PICKLE_SEVERITY_MAP
         assert "LOW" in PICKLE_SEVERITY_MAP
-        
+
         # Ensure each level has at least one module
         for level in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
             assert len(PICKLE_SEVERITY_MAP[level]) > 0, f"{level} severity should have modules"
@@ -188,8 +189,8 @@ class TestSeverityMappingConsistency:
     def test_no_module_duplicates_across_severities(self):
         """Test that modules don't appear in multiple severity levels"""
         all_modules = set()
-        for level, modules in PICKLE_SEVERITY_MAP.items():
-            for module in modules.keys():
+        for _level, modules in PICKLE_SEVERITY_MAP.items():
+            for module in modules:
                 assert module not in all_modules, f"Module {module} appears in multiple severity levels"
                 all_modules.add(module)
 
@@ -221,14 +222,14 @@ class TestBackwardCompatibility:
         """Test that SEVERITY_SCORES includes all severity levels"""
         all_severities = [
             IssueSeverity.CRITICAL,
-            IssueSeverity.HIGH, 
+            IssueSeverity.HIGH,
             IssueSeverity.MEDIUM,
             IssueSeverity.LOW,
             IssueSeverity.WARNING,
             IssueSeverity.INFO,
             IssueSeverity.DEBUG,
         ]
-        
+
         for severity in all_severities:
             assert severity in SEVERITY_SCORES, f"Missing severity {severity} in SEVERITY_SCORES"
 
@@ -249,10 +250,10 @@ class TestSeverityClassificationIntegration:
         """Test that severity classification handles edge cases"""
         # Test empty/None inputs
         assert _get_graduated_severity("") == IssueSeverity.MEDIUM
-        
+
         # Test case sensitivity (should be case sensitive)
         assert _get_graduated_severity("OS") == IssueSeverity.MEDIUM  # Not same as "os"
-        
+
         # Test function-specific matching
         assert _get_graduated_severity("builtins", "eval") == IssueSeverity.CRITICAL
         assert _get_graduated_severity("builtins", "safe_func") == IssueSeverity.MEDIUM  # Default for unknown func
@@ -269,3 +270,4 @@ class TestSeverityClassificationIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+

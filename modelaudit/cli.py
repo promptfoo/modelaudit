@@ -1665,7 +1665,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             )
         if severity_counts["info"] > 0:
             summary_parts.append(
-                "  " + style_text(f"ℹ️ {severity_counts['info']} Info", fg="cyan"),
+                "  " + style_text(f"[i] {severity_counts['info']} Info", fg="cyan"),
             )
         if verbose and severity_counts["debug"] > 0:
             summary_parts.append(
@@ -1843,16 +1843,16 @@ def format_severity_display(severity: str) -> str:
         "high": {"symbol": "🟠", "color": "bright_red", "name": "HIGH"},
         "medium": {"symbol": "🟡", "color": "yellow", "name": "MEDIUM"},
         "low": {"symbol": "🔵", "color": "blue", "name": "LOW"},
-        "info": {"symbol": "ℹ️", "color": "cyan", "name": "INFO"},
+        "info": {"symbol": "[i]", "color": "cyan", "name": "INFO"},
         "debug": {"symbol": "🐛", "color": "white", "name": "DEBUG"},
         # Backward compatibility
         "warning": {"symbol": "⚠️", "color": "yellow", "name": "WARNING"},
     }
-    
+
     config = severity_config.get(severity, {"symbol": "❓", "color": "white", "name": severity.upper()})
-    
+
     if should_use_color():
-        return style_text(f"{config['symbol']} {config['name']}", fg=config['color'])
+        return style_text(f"{config['symbol']} {config['name']}", fg=config["color"])
     return f"{config['symbol']} {config['name']}"
 
 
@@ -1869,10 +1869,10 @@ def _format_issue(
     icons = {
         "critical": "    └─ 🔴",
         "high": "    └─ 🟠",
-        "medium": "    └─ 🟡", 
+        "medium": "    └─ 🟡",
         "low": "    └─ 🔵",
         "warning": "    └─ ⚠️ ",  # Backward compatibility
-        "info": "    └─ ℹ️ ",
+        "info": "    └─ [i] ",
         "debug": "    └─ 🐛",
     }
 

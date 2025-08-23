@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
+from typing import IO, Any, BinaryIO, ClassVar, Dict, List, Optional, Union, cast
 
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
@@ -25,21 +25,20 @@ from ..explanations import (
     get_opcode_explanation,
     get_pattern_explanation,
 )
-from ..suspicious_symbols import DANGEROUS_OPCODES
+from ..suspicious_symbols import DANGEROUS_OPCODES, PICKLE_SEVERITY_MAP
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
-from ..suspicious_symbols import PICKLE_SEVERITY_MAP
 
 
 def _get_graduated_severity(module: str, function: Optional[str] = None) -> IssueSeverity:
     """Get graduated severity level for a module/function based on security impact"""
     for severity_level, modules in PICKLE_SEVERITY_MAP.items():
-        if module in modules:
-            module_spec = modules[module]
-            if module_spec == "*":  # All functions in module
+        modules_dict = cast(Dict[str, Union[str, List[str]]], modules)  # Type hint for mypy
+        if module in modules_dict:
+            module_spec = modules_dict[module] 
+            # Check if all functions match or specific function matches
+            if module_spec == "*" or (isinstance(module_spec, list) and function and function in module_spec):
                 return getattr(IssueSeverity, severity_level)
-            elif isinstance(module_spec, list) and function in module_spec:
-                return getattr(IssueSeverity, severity_level)
-    
+
     # Default to MEDIUM for unknown suspicious modules (conservative approach)
     return IssueSeverity.MEDIUM
 
