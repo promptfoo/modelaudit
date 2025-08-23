@@ -92,6 +92,7 @@ npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, 
 - Executable files in archives
 - Blacklisted model names
 - Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
+- Model metadata security issues (exposed secrets, suspicious URLs, dangerous code references)
 
 ## Exit Codes
 
@@ -105,6 +106,7 @@ ModelAudit supports multiple input sources:
 
 - Local files and directories
 - HuggingFace models: `hf://username/model` or `https://huggingface.co/username/model`
+- HuggingFace direct files: `https://huggingface.co/username/model/resolve/main/pytorch_model.bin`
 - Cloud storage: S3 (`s3://bucket/path`), GCS (`gs://bucket/path`)
 - MLflow models: `models://model-name/version`
 - JFrog Artifactory URLs

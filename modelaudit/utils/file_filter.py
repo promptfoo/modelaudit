@@ -98,6 +98,7 @@ def should_skip_file(
     skip_extensions: Optional[set[str]] = None,
     skip_filenames: Optional[set[str]] = None,
     skip_hidden: bool = True,
+    metadata_scanner_available: bool = True,
 ) -> bool:
     """
     Check if a file should be skipped based on its extension or name.
@@ -107,6 +108,7 @@ def should_skip_file(
         skip_extensions: Set of extensions to skip (defaults to DEFAULT_SKIP_EXTENSIONS)
         skip_filenames: Set of filenames to skip (defaults to DEFAULT_SKIP_FILENAMES)
         skip_hidden: Whether to skip hidden files (starting with .)
+        metadata_scanner_available: Whether metadata scanner is available to handle metadata files
 
     Returns:
         True if the file should be skipped
@@ -119,6 +121,14 @@ def should_skip_file(
     filename = os.path.basename(path)
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
+
+    # Special handling for metadata files that scanners can handle
+    metadata_extensions = {".md", ".yml", ".yaml"}
+    metadata_filenames = {"README", "readme"}
+
+    # If metadata scanner is available, don't skip metadata files
+    if metadata_scanner_available and (ext in metadata_extensions or filename.lower() in metadata_filenames):
+        return False
 
     # Skip based on extension
     if ext in skip_extensions:

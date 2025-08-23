@@ -19,6 +19,42 @@ def is_huggingface_url(url: str) -> bool:
     return any(re.match(pattern, url) for pattern in patterns)
 
 
+def is_huggingface_file_url(url: str) -> bool:
+    """Check if a URL is a direct HuggingFace file URL."""
+    patterns = [
+        r"^https?://huggingface\.co/[\w\-\.]+/[\w\-\.]+/resolve/[\w\-\.]+/.+",
+        r"^https?://hf\.co/[\w\-\.]+/[\w\-\.]+/resolve/[\w\-\.]+/.+",
+    ]
+    return any(re.match(pattern, url) for pattern in patterns)
+
+
+def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
+    """Parse a HuggingFace file URL to extract repo_id and filename.
+
+    Args:
+        url: HuggingFace file URL like https://huggingface.co/user/repo/resolve/main/file.bin
+
+    Returns:
+        Tuple of (repo_id, branch, filename)
+
+    Raises:
+        ValueError: If URL format is invalid
+    """
+    parsed = urlparse(url)
+    if parsed.netloc not in ["huggingface.co", "hf.co"]:
+        raise ValueError(f"Not a HuggingFace URL: {url}")
+
+    path_parts = parsed.path.strip("/").split("/")
+    if len(path_parts) < 5 or path_parts[2] != "resolve":
+        raise ValueError(f"Invalid HuggingFace file URL format: {url}")
+
+    repo_id = f"{path_parts[0]}/{path_parts[1]}"
+    branch = path_parts[3]
+    filename = "/".join(path_parts[4:])
+
+    return repo_id, branch, filename
+
+
 def parse_huggingface_url(url: str) -> tuple[str, str]:
     """Parse a HuggingFace URL to extract repo_id.
 
@@ -280,3 +316,40 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
 
             shutil.rmtree(download_path)
         raise Exception(f"Failed to download model from {url}: {e!s}") from e
+
+
+def download_file_from_hf(url: str, cache_dir: Optional[Path] = None) -> Path:
+    """Download a single file from HuggingFace using direct file URL.
+
+    Args:
+        url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
+        cache_dir: Optional cache directory for downloads
+
+    Returns:
+        Path to the downloaded file
+
+    Raises:
+        ValueError: If URL is invalid
+        Exception: If download fails
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    repo_id, branch, filename = parse_huggingface_file_url(url)
+
+    try:
+        # Use hf_hub_download for single file downloads
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=branch,
+            cache_dir=str(cache_dir) if cache_dir else None,
+        )
+        return Path(local_path)
+    except Exception as e:
+        raise Exception(f"Failed to download file from {url}: {e!s}") from e

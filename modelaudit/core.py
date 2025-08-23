@@ -631,7 +631,11 @@ def scan_model_directory_or_file(
 
                     # Skip non-model files early if filtering is enabled
                     skip_file_types = config.get("skip_file_types", True)
-                    if skip_file_types and should_skip_file(file_path):
+                    # Check if metadata scanner is available to handle metadata files
+                    metadata_scanner_available = _registry.get_scanner_class("metadata") is not None
+                    if skip_file_types and should_skip_file(
+                        file_path, metadata_scanner_available=metadata_scanner_available
+                    ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
                             try:

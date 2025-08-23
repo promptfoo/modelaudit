@@ -363,6 +363,15 @@ class ScannerRegistry:
                 "dependencies": ["jinja2", "gguf"],  # gguf optional for GGUF support
                 "numpy_sensitive": False,
             },
+            "metadata": {
+                "module": "modelaudit.scanners.metadata_scanner",
+                "class": "MetadataScanner",
+                "description": "Scans model metadata files for security issues",
+                "extensions": [".json", ".md", ".yml", ".yaml"],
+                "priority": 1,  # High priority for security-focused metadata scanning
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -590,6 +599,7 @@ def __getattr__(name: str) -> Any:
         "PaddleScanner": "paddle",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
+        "MetadataScanner": "metadata",
         "ZipScanner": "zip",
     }
 
