@@ -1,8 +1,8 @@
 include LICENSE
 include README.md
-exclude tests*
-exclude docs*
-exclude scripts*
+prune tests
+prune docs
+prune scripts
 exclude Dockerfile*
 exclude docker-compose.yml
 exclude setup-poetry.sh
@@ -18,5 +18,5 @@ exclude plan.md
 exclude final_scan_results.json
 exclude package.json
 exclude package-lock.json
-exclude node_modules*
-exclude scan_results*
+prune node_modules
+prune scan_results

@@ -1,5 +1,7 @@
 # Comprehensive ModelAudit vs modelscan Evidence List
 
+**Test Context**: modelscan commit 8b8ed4b (observed August 23, 2025). Results reflect this snapshot in time.
+
 ## 🚨 Critical Evidence: modelscan Complete Blind Spots
 
 ### 1. ONNX Models - 100% Missed
@@ -13,25 +15,25 @@ modelscan -p .
 # Result: "No issues found! 🎉" + "Total skipped: 29 files"
 
 # ONNX files completely ignored:
-./onnx/text_model_fp16.onnx (6.4MB)
-./onnx/text_model.onnx (12.7MB)
-./onnx/vision_model.onnx (6.6MB)
-./onnx/model.onnx (19.3MB)
-./onnx/text_model_quantized.onnx (3.2MB)
-./onnx/vision_model_fp16.onnx (3.3MB)
-./onnx/vision_model_quantized.onnx (1.7MB)
-./onnx/model_fp16.onnx (9.7MB)
-./onnx/model_quantized.onnx (4.9MB)
+./onnx/text_model_fp16.onnx (6.4 MB)
+./onnx/text_model.onnx (12.7 MB)
+./onnx/vision_model.onnx (6.6 MB)
+./onnx/model.onnx (19.3 MB)
+./onnx/text_model_quantized.onnx (3.2 MB)
+./onnx/vision_model_fp16.onnx (3.3 MB)
+./onnx/vision_model_quantized.onnx (1.7 MB)
+./onnx/model_fp16.onnx (9.7 MB)
+./onnx/model_quantized.onnx (4.9 MB)
 ```
 
-**Impact**: CRITICAL - 67.8MB of model files with zero security analysis
+**Impact**: CRITICAL — 67.8 MB of model files with zero security analysis
 
 ### 2. GGUF Models - 100% Missed
 
 **Evidence**: modelscan has no GGUF scanner in settings.py
 
 ```python
-# modelscan supported extensions (from settings.py):
+# modelscan supported extensions (from settings.py, commit 8b8ed4b, observed Aug 23, 2025):
 "supported_extensions": [
     ".pkl", ".pickle", ".joblib", ".dill", ".dat", ".data",  # Pickle
     ".bin", ".pt", ".pth", ".ckpt",                          # PyTorch
@@ -154,14 +156,14 @@ modelaudit hf://chandar-lab/NeoBERT
 
 After comprehensive testing of cached models, **no instances were found where modelscan detected security issues that ModelAudit missed**.
 
-### Additional Evidence - modelscan Misses Known CVEs
+### Additional Evidence — modelscan Misses Known CVEs
 
 | Test Case                               | ModelAudit Result      | modelscan Result                     | Evidence                            |
 | --------------------------------------- | ---------------------- | ------------------------------------ | ----------------------------------- |
 | `Retr0REG/CVE-2024-3568-poc/pickle.pkl` | 5+ CRITICAL detections | ❌ "No issues found! 🎉"             | **CVE PoC completely missed**       |
 | `ankush-new-org/safe-model/model.pkl`   | 3+ CRITICAL detections | 1 CRITICAL (basic posix.system only) | **Missing eval, builtins patterns** |
 
-### Theoretical modelscan Advantages (Unverified):
+### Theoretical modelscan Advantages (Unverified)
 
 1. **Performance**: Possibly faster due to simpler scanning (untested)
 2. **Resource Usage**: Lower memory usage due to limited scope (untested)
@@ -175,4 +177,4 @@ After comprehensive testing of cached models, **no instances were found where mo
 - **Modern Attack Vectors**: Exclusively detected by ModelAudit
 - **CVE-Specific Detection**: Superior (catches CVEs modelscan misses)
 
-**Conclusion**: ModelAudit provides superior security detection across all tested categories with no identified areas where modelscan has detection advantages.
+**Conclusion**: As of 2025-08-23 and the versions tested, ModelAudit outperformed modelscan across our scenarios; no cases were found where modelscan detected issues that ModelAudit missed.

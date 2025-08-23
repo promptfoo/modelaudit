@@ -9,8 +9,9 @@ import sys
 import subprocess
 import json
 import time
+import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # Model categories to test systematically
 TEST_MODELS = {
@@ -88,19 +89,20 @@ def run_modelaudit(model_name: str, timeout: int = 300) -> Dict:
     
     try:
         cmd = [
-            "python", "-m", "modelaudit", 
+            sys.executable, "-m", "modelaudit", 
             f"hf://{model_name}",
             "--format", "json",
             "--timeout", str(timeout),
             "--no-large-model-support"
         ]
         
+        ma_cwd = os.getenv("MODELAUDIT_CWD", os.getcwd())
         result = subprocess.run(
             cmd, 
             capture_output=True, 
             text=True, 
             timeout=timeout,
-            cwd="/Users/mdangelo/projects/ma4"
+            cwd=ma_cwd
         )
         
         if result.returncode == 0:
@@ -146,8 +148,11 @@ def run_modelscan(cache_path: str) -> Dict:
         return {"status": "no_cache", "details": "Model not cached"}
     
     try:
+        ms_bin = shutil.which("modelscan")
+        if not ms_bin:
+            return {"status": "error", "details": "modelscan binary not found in PATH"}
         result = subprocess.run(
-            ["modelscan", "-p", cache_path],
+            [ms_bin, "-p", cache_path],
             capture_output=True,
             text=True,
             timeout=120
@@ -206,7 +211,8 @@ def test_category(category: str, models: List[str]) -> Dict:
         ma_result = run_modelaudit(model, timeout=180)
         
         # Determine cache path for modelscan
-        cache_path = f"/Users/mdangelo/.modelaudit/cache/huggingface/{model}"
+        cache_root = os.getenv("MODELAUDIT_CACHE_ROOT", str(Path.home() / ".modelaudit" / "cache" / "huggingface"))
+        cache_path = str(Path(cache_root) / model)
         
         # Test with modelscan (on cached files)
         ms_result = run_modelscan(cache_path)
@@ -306,14 +312,26 @@ def main():
             return
     else:
         # Test all categories (this will take a long time!)
-        print("⚠️  This will test ALL models - estimated time: 2-3 hours")
+        total_categories = len(TEST_MODELS)
+        total_models = sum(len(models) for models in TEST_MODELS.values())
+        est_time_per_model_min = 2  # Adjust as appropriate for your environment
+        est_total_time_min = total_models * est_time_per_model_min
+        est_total_time_hr = est_total_time_min / 60
+        print(f"⚠️  This will test ALL models: {total_models} models in {total_categories} categories.")
+        print(f"Estimated time: ~{est_total_time_min:.0f} minutes (~{est_total_time_hr:.1f} hours)")
         response = input("Continue? (y/N): ")
         if response.lower() != 'y':
             return
-            
+        
         results = {}
-        for category, models in TEST_MODELS.items():
+        partial_file = "comprehensive_comparison_report_partial.json"
+        for idx, (category, models) in enumerate(TEST_MODELS.items(), 1):
+            print(f"\n[{idx}/{total_categories}] Testing category: {category} ({len(models)} models)")
             results[category] = test_category(category, models)
+            # Save intermediate results
+            with open(partial_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"Progress: {idx}/{total_categories} categories complete. Partial results saved to {partial_file}.")
     
     # Generate and save report
     report = generate_report(results)
@@ -321,6 +339,11 @@ def main():
     output_file = "comprehensive_comparison_report.md"
     with open(output_file, 'w') as f:
         f.write(report)
+    
+    # Clean up partial file if it exists
+    partial_file = "comprehensive_comparison_report_partial.json"
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
     
     print(f"\n🎉 Report saved to: {output_file}")
 

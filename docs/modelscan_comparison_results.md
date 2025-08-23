@@ -1,5 +1,7 @@
 # ModelScan vs ModelAudit: Comparative Analysis Results
 
+**Test Context**: modelscan submodule commit 8b8ed4b; runs performed on August 23, 2025 against the documented corpus.
+
 ## Test Results Summary
 
 Based on our analysis of both tools and testing on the `nono31/malicious-models-repo`, here are the key findings:
@@ -8,7 +10,7 @@ Based on our analysis of both tools and testing on the `nono31/malicious-models-
 
 ### ModelScan Results
 
-```
+```text
 Total Issues: 3
 Total Issues By Severity:
     - CRITICAL: 3
@@ -23,7 +25,7 @@ Total Skipped: 119 files
 
 ### ModelAudit Results (based on console output)
 
-```
+```text
 CRITICAL Issues Found:
 1. Dangerous pattern 'eval' found in raw file content
 2. Dangerous pattern 'exec' found in raw file content
@@ -160,7 +162,7 @@ custom_op_domain = "evil.domain.com"
 
 ### ModelScan Results
 
-```
+```text
 No issues found! 🎉
 
 Total Skipped: 29 files

@@ -4,6 +4,12 @@
 
 This document catalogs models used for testing the ModelAudit security scanner across various ML frameworks and potential threat vectors.
 
+> **Safety Notice**
+>
+> - Do not import or execute model artifacts listed here. Use an isolated scanning environment.
+> - Comply with the respective platform's terms and local laws.
+> - Some entries are benign and included to exercise parsers; inclusion does not imply maliciousness.
+
 ### Testing Objectives
 
 1. Verify legitimate models scan clean without false positives
@@ -13,7 +19,7 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 136 models cataloged (10 archived models moved to bottom for historical reference)
+- Total Models: 136 models cataloged (as of 2025-08-23; 10 archived models moved to bottom for historical reference)
 - Safe Models: 45 legitimate models (baseline testing)
 - Malicious Models: 91 models with attack vectors
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
@@ -321,6 +327,8 @@ The following models are recommended for demonstrating ModelAudit's superior det
 
 ### Models that Demonstrate ModelAudit's Advantages
 
+**Test context**: modelscan submodule commit 8b8ed4b (as of August 23, 2025). Results reflect this commit and our standard test corpus.
+
 | Category                    | Model                                   | ModelAudit Detection           | modelscan Result          | Impact       |
 | --------------------------- | --------------------------------------- | ------------------------------ | ------------------------- | ------------ |
 | **GGUF Template Injection** | `microsoft/Phi-3-mini-4k-instruct-gguf` | ✅ Chat template analysis      | ❌ No GGUF scanner        | **CRITICAL** |
@@ -353,10 +361,10 @@ modelscan -p ~/.modelaudit/cache/huggingface/nono31/malicious-models-repo
 
 ### Key Findings Summary
 
-1. **ONNX Models**: modelscan provides **0% coverage** - completely skips all ONNX files
-2. **GGUF Models**: modelscan has **no scanner** for GGUF format or template injection
-3. **Configuration Files**: modelscan **doesn't analyze** config.json, tokenizer_config.json
-4. **Advanced Frameworks**: Missing support for TensorRT, OpenVINO, PaddlePaddle, CoreML, TFLite
+1. **ONNX Models**: in our tests (commit 8b8ed4b), modelscan skipped ONNX files (0% coverage on the listed corpus)
+2. **GGUF Models**: as of commit 8b8ed4b, modelscan had no GGUF scanner or template injection checks
+3. **Configuration Files**: as tested, modelscan did not analyze config.json/tokenizer_config.json
+4. **Advanced Frameworks**: missing scanners observed for TensorRT, OpenVINO, PaddlePaddle, CoreML, TFLite in our tests
 
 ### Recommended Test Sequence for Demos
 
@@ -365,7 +373,7 @@ modelscan -p ~/.modelaudit/cache/huggingface/nono31/malicious-models-repo
 3. **Config Exploits**: `chandar-lab/NeoBERT` - Shows missing configuration analysis
 4. **Advanced Detection**: `nono31/malicious-models-repo` - Shows ModelAudit's deeper analysis
 
-These comparisons demonstrate that ModelAudit detects **critical security vulnerabilities that modelscan completely misses**, representing significant gaps in production ML security coverage.
+In these tests, ModelAudit detected issues that modelscan (commit 8b8ed4b) missed, indicating material gaps in coverage on the evaluated corpus and date.
 
 ## Archived Models (No Longer Available)
 

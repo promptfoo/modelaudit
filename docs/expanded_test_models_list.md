@@ -1,17 +1,17 @@
 # Expanded Test Models List for ModelAudit vs modelscan Comparison
 
-## 🏆 Tier 1: Guaranteed ModelAudit Wins (Always Demo These)
+## 🏆 Tier 1: Consistent Results Observed in Our Tests (as of 2025-08-23)
 
 ### ONNX Complete Blind Spot (CRITICAL Impact)
 
-| Model                                                   | Files                  | modelscan Result | ModelAudit Advantage         |
-| ------------------------------------------------------- | ---------------------- | ---------------- | ---------------------------- |
-| `Xenova/clip-vit-base-patch16`                          | 9 .onnx files (67.8MB) | ❌ Skips all     | ✅ Full graph analysis       |
-| `Xenova/clip-vit-large-patch14`                         | Multiple .onnx files   | ❌ Skips all     | ✅ Custom operator detection |
-| `onnx-community/mobilenet_v2_1.0_224`                   | MobileNet ONNX         | ❌ Skips all     | ✅ Architecture analysis     |
-| `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k` | Modern ONNX            | ❌ Skips all     | ✅ Modern opset validation   |
-| `Kalray/resnet50`                                       | Quantized ONNX         | ❌ Skips all     | ✅ Quantization analysis     |
-| `webnn/yolov8m`                                         | YOLO in ONNX           | ❌ Skips all     | ✅ YOLO-ONNX validation      |
+| Model                                                   | Files                   | modelscan Result | ModelAudit Advantage         |
+| ------------------------------------------------------- | ----------------------- | ---------------- | ---------------------------- |
+| `Xenova/clip-vit-base-patch16`                          | 9 .onnx files (67.8 MB) | ❌ Skips all     | ✅ Full graph analysis       |
+| `Xenova/clip-vit-large-patch14`                         | Multiple .onnx files    | ❌ Skips all     | ✅ Custom operator detection |
+| `onnx-community/mobilenet_v2_1.0_224`                   | MobileNet ONNX          | ❌ Skips all     | ✅ Architecture analysis     |
+| `onnx-community/mobilenetv4_conv_small.e2400_r224_in1k` | Modern ONNX             | ❌ Skips all     | ✅ Modern opset validation   |
+| `Kalray/resnet50`                                       | Quantized ONNX          | ❌ Skips all     | ✅ Quantization analysis     |
+| `webnn/yolov8m`                                         | YOLO in ONNX            | ❌ Skips all     | ✅ YOLO-ONNX validation      |
 
 ### GGUF Complete Blind Spot (CRITICAL Impact)
 
@@ -117,13 +117,13 @@ echo "6. Framework Coverage"
 
 ## 📊 Expected Results Summary
 
-### Guaranteed Outcomes:
+### Expected Outcomes (in our environment as of 2025-08-23):
 
 - **ONNX Models**: modelscan skips 100%, ModelAudit analyzes 100%
 - **GGUF Models**: modelscan has no scanner, ModelAudit detects template injection
 - **Config Exploits**: modelscan has no analysis, ModelAudit detects RCE patterns
 - **Known CVEs**: modelscan misses CVE PoCs, ModelAudit detects them
-- **Framework Coverage**: 70% gap in format support
+- **Framework Coverage**: ~70% gap in format support across formats tested
 
 ### Competitive Positioning:
 

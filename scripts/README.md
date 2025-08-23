@@ -19,9 +19,16 @@ A comprehensive testing script that compares ModelAudit vs modelscan across vari
 # Test a specific category
 python scripts/comprehensive_modelscan_test.py ONNX_BLIND_SPOTS
 
-# Test all categories (takes 2-3 hours)
+# Test all categories (shows detailed time estimates)
 python scripts/comprehensive_modelscan_test.py
 ```
+
+**Features:**
+
+- Detailed time estimates based on model count (≈2 min per model)
+- Progress tracking with category/model counts
+- Intermediate results saved as JSON for recovery
+- Automatic cleanup of temporary files on completion
 
 **Requirements:**
 

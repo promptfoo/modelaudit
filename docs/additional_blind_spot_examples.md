@@ -1,14 +1,21 @@
-# Additional Blind Spot Examples: ModelAudit vs modelscan
+# Additional Blind Spot Examples: ModelAudit vs. modelscan
 
 ## 🚨 **12+ Critical Examples: ModelAudit Detects, modelscan Skips**
+
+Test environment (reproducibility):
+
+**Date**: 2025-08-23  
+**ModelAudit**: v0.2.3 (from pyproject.toml)  
+**modelscan**: commit 8b8ed4b  
+**Command flags**: see "Demo Commands" and comparison scripts
 
 Based on comprehensive testing of cached models, here are verified examples where **ModelAudit provides security analysis while modelscan completely skips the files**.
 
 ### **1. GGUF Models - 100% Blind Spot**
 
 - **`microsoft/Phi-3-mini-4k-instruct-gguf`**
-  - **ModelAudit**: ✅ Analyzes GGUF format, detects clean model
-  - **modelscan**: ❌ No GGUF scanner - complete skip
+  - **ModelAudit**: ✅ Analyzes GGUF format; no issues detected by current ruleset
+  - **modelscan**: ❌ No GGUF scanner — GGUF files not scanned
   - **Impact**: CRITICAL - No analysis of popular LLM format
 
 ### **2. ONNX Models with Custom Operators**
@@ -20,7 +27,7 @@ Based on comprehensive testing of cached models, here are verified examples wher
 
 ### **3. ONNX Vision Models**
 
-- **`Xenova/clip-vit-base-patch16` (9 ONNX files, 67.8MB)**
+- **`Xenova/clip-vit-base-patch16` (9 ONNX files, 67.8 MB)**
   - **ModelAudit**: ✅ Full graph analysis on all ONNX files
   - **modelscan**: ❌ Skips all 9 ONNX files with "No issues found!"
   - **Impact**: CRITICAL - Large vision models completely unanalyzed
@@ -88,11 +95,11 @@ Based on comprehensive testing of cached models, here are verified examples wher
   - **modelscan**: ❌ Skips ONNX and CoreML variants
   - **Impact**: HIGH - Production deployment formats missed
 
-## **📊 Quantified Impact**
+## **📊 Quantified Impact (as of 2025-08-23; ModelAudit v0.2.3, modelscan commit 8b8ed4b)**
 
 - **Total Formats Tested**: 12 examples across 6+ different ML frameworks
-- **ModelAudit Coverage**: 12/12 examples analyzed (100%)
-- **modelscan Coverage**: ~3/12 examples analyzed (25% - PyTorch only)
+- **ModelAudit Coverage**: 12/12 examples analyzed (100%) in our test environment
+- **modelscan Coverage**: ~3/12 examples analyzed (25% — PyTorch only) in our test environment
 - **Coverage Gap**: **75% of tested model formats completely unsupported**
 
 ## **🎯 Key Evidence Points**
@@ -113,7 +120,7 @@ modelaudit hf://microsoft/Phi-3-mini-4k-instruct-gguf
 # 2. ONNX - ModelAudit analyzes, modelscan skips
 modelaudit hf://Xenova/clip-vit-base-patch16
 modelscan -p ~/.modelaudit/cache/huggingface/Xenova/clip-vit-base-patch16
-# Result: modelscan skips all 9 ONNX files (67.8MB)
+# Result: modelscan skips all 9 ONNX files (67.8 MB)
 
 # 3. Multi-format - ModelAudit comprehensive, modelscan partial
 modelaudit hf://sentence-transformers/all-MiniLM-L6-v2
@@ -123,4 +130,4 @@ modelscan -p ~/.modelaudit/cache/huggingface/sentence-transformers/all-MiniLM-L6
 
 ## **Conclusion**
 
-This demonstrates **ModelAudit's overwhelming superiority** in production ML security where models are deployed across multiple formats and frameworks. The **75% coverage gap** represents critical security vulnerabilities that could allow malicious models to pass completely undetected in environments using modelscan.
+In our tests (as of 2025-08-23), ModelAudit analyzed all demonstrated formats while modelscan analyzed a subset. The observed ~75% coverage gap across the examples indicates potential risk if unsupported formats are used without compensating controls.
