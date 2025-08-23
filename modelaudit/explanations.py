@@ -8,7 +8,7 @@ for common security issues found in ML model files.
 from typing import Optional
 
 # Common explanations for dangerous imports and modules
-DANGEROUS_IMPORTS = {
+DANGEROUS_IMPORTS: dict[str, str] = {
     "os": (
         "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system "
         "commands, file system manipulation, and environment variable access. Malicious models can use this to "
@@ -21,15 +21,15 @@ DANGEROUS_IMPORTS = {
     ),
     "nt": (
         "The 'nt' module is a Windows-specific alias for 'os', exposing the same system command and file operations. "
-        "Attackers can invoke functions like 'nt.system' to execute arbitrary commands.",
+        "Attackers can invoke functions like 'nt.system' to execute arbitrary commands."
     ),
     "ntpath": (
         "The 'ntpath' module provides Windows path manipulation utilities. These can be abused to access or modify "
-        "restricted system paths, facilitating privilege escalation or data exfiltration.",
+        "restricted system paths, facilitating privilege escalation or data exfiltration."
     ),
     "posixpath": (
         "The 'posixpath' module provides POSIX path manipulation utilities. Attackers can leverage it to traverse or "
-        "access restricted paths on Unix-like systems.",
+        "access restricted paths on Unix-like systems."
     ),
     "sys": (
         "The 'sys' module provides access to interpreter internals and system-specific parameters. It can be used to "
