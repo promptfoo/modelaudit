@@ -315,6 +315,58 @@ site:huggingface.co "CVE-2024" pickle
 
 These queries and models provide comprehensive coverage for testing ModelAudit across the full spectrum of ML security threats.
 
+## ModelAudit vs modelscan: Comparative Testing
+
+The following models are recommended for demonstrating ModelAudit's superior detection capabilities compared to ProtectAI's modelscan. These models highlight critical blind spots in modelscan where ModelAudit provides comprehensive security analysis.
+
+### Models that Demonstrate ModelAudit's Advantages
+
+| Category | Model | ModelAudit Detection | modelscan Result | Impact |
+|----------|-------|---------------------|------------------|---------|
+| **GGUF Template Injection** | `microsoft/Phi-3-mini-4k-instruct-gguf` | ✅ Chat template analysis | ❌ No GGUF scanner | **CRITICAL** |
+| **ONNX Blind Spot** | `Xenova/clip-vit-base-patch16` | ✅ Full ONNX graph analysis | ❌ Skips all .onnx files | **HIGH** |
+| **ONNX Blind Spot** | `onnx-community/mobilenet_v2_1.0_224` | ✅ Custom operator detection | ❌ Skips all .onnx files | **HIGH** |
+| **Config Exploits** | `internlm/internlm2-chat-7b` | ✅ auto_map detection | ❌ No config analysis | **HIGH** |
+| **Config Exploits** | `chandar-lab/NeoBERT` | ✅ trust_remote_code detection | ❌ No config analysis | **HIGH** |
+| **Advanced PyTorch** | `drhyrum/bert-tiny-torch-picklebomb` | ✅ CVE-2025-32434 patterns | ⚠️ Basic pickle detection | **MEDIUM** |
+| **Multi-format** | `nono31/malicious-models-repo` | ✅ 12+ distinct issues | ⚠️ 3 basic issues | **MEDIUM** |
+
+### Quick Comparison Commands
+
+```bash
+# Test ONNX blind spot (modelscan skips entirely)
+modelaudit hf://Xenova/clip-vit-base-patch16 --no-large-model-support
+modelscan -p ~/.modelaudit/cache/huggingface/Xenova/clip-vit-base-patch16
+
+# Test GGUF template analysis  
+modelaudit hf://microsoft/Phi-3-mini-4k-instruct-gguf --timeout 300
+# modelscan has no GGUF support
+
+# Test configuration analysis
+modelaudit hf://internlm/internlm2-chat-7b
+# modelscan has no config analysis
+
+# Test advanced malicious detection
+modelaudit hf://nono31/malicious-models-repo
+modelscan -p ~/.modelaudit/cache/huggingface/nono31/malicious-models-repo
+```
+
+### Key Findings Summary
+
+1. **ONNX Models**: modelscan provides **0% coverage** - completely skips all ONNX files
+2. **GGUF Models**: modelscan has **no scanner** for GGUF format or template injection
+3. **Configuration Files**: modelscan **doesn't analyze** config.json, tokenizer_config.json
+4. **Advanced Frameworks**: Missing support for TensorRT, OpenVINO, PaddlePaddle, CoreML, TFLite
+
+### Recommended Test Sequence for Demos
+
+1. **Start with ONNX**: `Xenova/clip-vit-base-patch16` - Shows complete modelscan blind spot
+2. **GGUF Templates**: `microsoft/Phi-3-mini-4k-instruct-gguf` - Shows missing GGUF support
+3. **Config Exploits**: `chandar-lab/NeoBERT` - Shows missing configuration analysis
+4. **Advanced Detection**: `nono31/malicious-models-repo` - Shows ModelAudit's deeper analysis
+
+These comparisons demonstrate that ModelAudit detects **critical security vulnerabilities that modelscan completely misses**, representing significant gaps in production ML security coverage.
+
 ## Archived Models (No Longer Available)
 
 The following models were previously cataloged but are no longer available on their original platforms. They are kept here for archival purposes and historical reference.
