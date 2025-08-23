@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import Any, BinaryIO, ClassVar, Optional, Union
+from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
 
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
@@ -1191,6 +1191,76 @@ class PickleScanner(BaseScanner):
                     ),
                 )
 
+    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+        """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
+        globals_found: set[tuple[str, str]] = set()
+        memo: dict[Union[int, str], str] = {}
+
+        last_byte = b"dummy"
+        while last_byte != b"":
+            try:
+                ops: list[tuple[Any, Any, Union[int, None]]] = list(pickletools.genops(data))
+            except Exception as e:
+                if globals_found:
+                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
+                    return globals_found
+                raise
+
+            last_byte = data.read(1)
+            if last_byte:
+                data.seek(-1, 1)
+
+            for n, (opcode, arg, _pos) in enumerate(ops):
+                op_name = opcode.name
+                if op_name == "MEMOIZE" and n > 0:
+                    memo[len(memo)] = ops[n - 1][1]
+                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
+                    memo[arg] = ops[n - 1][1]
+                elif op_name in {"GLOBAL", "INST"}:
+                    parts = str(arg).split(" ", 1)
+                    if len(parts) == 2:
+                        globals_found.add((parts[0], parts[1]))
+                    elif parts:
+                        globals_found.add((parts[0], ""))
+                elif op_name == "STACK_GLOBAL":
+                    values = self._extract_stack_global_values(ops, n, memo)
+                    if len(values) == 2:
+                        globals_found.add((values[1], values[0]))
+                    else:
+                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}, found {len(values)} values")
+                        globals_found.add(("unknown", "unknown"))
+
+            if not multiple_pickles:
+                break
+
+        return globals_found
+
+    def _extract_stack_global_values(
+        self, ops: list[tuple[Any, Any, Union[int, None]]], position: int, memo: dict[Union[int, str], str]
+    ) -> list[str]:
+        """Extract values for STACK_GLOBAL opcode by walking backwards through stack."""
+        values: list[str] = []
+
+        for offset in range(1, min(position + 1, 10)):
+            prev_op = ops[position - offset]
+            op_name = prev_op[0].name
+            op_value = prev_op[1]
+
+            if op_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
+                continue
+            if op_name in {"GET", "BINGET", "LONG_BINGET"}:
+                values.append(memo.get(op_value, "unknown"))
+            elif op_name in {"SHORT_BINUNICODE", "UNICODE", "BINUNICODE", "BINUNICODE8"}:
+                values.append(str(op_value))
+            else:
+                logger.debug(f"Non-string opcode {op_name} in STACK_GLOBAL analysis")
+                values.append("unknown")
+
+            if len(values) == 2:
+                break
+
+        return values
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
@@ -1207,6 +1277,9 @@ class PickleScanner(BaseScanner):
         file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
 
         file_obj.seek(current_pos)  # Reset position
+        # Extract global references across all pickle streams
+        advanced_globals = self._extract_globals_advanced(file_obj)
+        file_obj.seek(current_pos)  # Reset again after extraction
 
         # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
         # This was missing and allowed malicious PyTorch models to pass undetected
@@ -1498,6 +1571,32 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+
+            # Analyze globals extracted from all pickle streams
+            for mod, func in advanced_globals:
+                if _is_actually_dangerous_global(mod, func, ml_context):
+                    suspicious_count += 1
+                    severity = _get_context_aware_severity(
+                        IssueSeverity.CRITICAL,
+                        ml_context,
+                    )
+                    result.add_check(
+                        name="Advanced Global Reference Check",
+                        passed=False,
+                        message=f"Suspicious reference {mod}.{func}",
+                        severity=severity,
+                        location=self.current_file_path,
+                        details={
+                            "module": mod,
+                            "function": func,
+                            "opcode": "STACK_GLOBAL",
+                            "ml_context_confidence": ml_context.get(
+                                "overall_confidence",
+                                0,
+                            ),
+                        },
+                        why=get_import_explanation(mod),
+                    )
 
             # Record successful ML context validation if content appears safe
             if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5:

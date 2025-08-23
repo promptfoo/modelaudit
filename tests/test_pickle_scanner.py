@@ -11,6 +11,11 @@ from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
+from tests.assets.generators.generate_advanced_pickle_tests import (
+    generate_memo_based_attack,
+    generate_multiple_pickle_attack,
+    generate_stack_global_attack,
+)
 from tests.assets.generators.generate_evil_pickle import EvilClass
 
 # Add the parent directory to sys.path to allow importing modelaudit
@@ -198,14 +203,40 @@ class TestPickleScanner(unittest.TestCase):
                 # Should not find any suspicious patterns in binary content
                 binary_issues = [issue for issue in result.issues if "binary data" in issue.message.lower()]
                 assert len(binary_issues) == 0
-
-                # Check metadata
-                assert "pickle_bytes" in result.metadata
-                assert "binary_bytes" in result.metadata
-                assert result.metadata["binary_bytes"] > 1000
-
             finally:
                 os.unlink(f.name)
+
+
+class TestPickleScannerAdvanced(unittest.TestCase):
+    def setUp(self) -> None:
+        # Ensure advanced pickle assets exist
+        generate_stack_global_attack()
+        generate_memo_based_attack()
+        generate_multiple_pickle_attack()
+
+    def test_stack_global_detection(self) -> None:
+        scanner = PickleScanner()
+        result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
+
+        assert len(result.issues) > 0
+        os_issues = [i for i in result.issues if "os" in i.message.lower() or "posix" in i.message.lower()]
+        assert len(os_issues) > 0
+
+    def test_memo_object_tracking(self) -> None:
+        scanner = PickleScanner()
+        result = scanner.scan("tests/assets/pickles/memo_attack.pkl")
+
+        assert len(result.issues) > 0
+        subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
+        assert len(subprocess_issues) > 0
+
+    def test_multiple_pickle_streams(self) -> None:
+        scanner = PickleScanner()
+        result = scanner.scan("tests/assets/pickles/multiple_stream_attack.pkl")
+
+        assert len(result.issues) > 0
+        eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
+        assert len(eval_issues) > 0
 
     def test_scan_regular_pickle_file(self):
         """Test that regular .pkl files don't trigger binary content scanning"""

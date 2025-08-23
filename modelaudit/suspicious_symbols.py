@@ -132,6 +132,21 @@ SUSPICIOUS_GLOBALS = {
     "dill._dill": "*",
 }
 
+# Add sophisticated pickle patterns that target advanced exploitation techniques
+ADVANCED_PICKLE_PATTERNS = {
+    "nt": "*",  # Windows os module alias
+    "posix": "*",  # Unix os module alias (ensure coverage)
+    "operator": ["attrgetter"],  # Attribute access bypass
+    "pty": "*",  # Pseudo-terminal spawning
+    "bdb": "*",  # Python debugger access
+    "asyncio": "*",  # Asynchronous execution framework
+    "_pickle": "*",  # Low-level pickle module
+    "types": ["CodeType", "FunctionType"],  # Code object construction
+}
+
+# Merge advanced patterns into main suspicious globals set
+SUSPICIOUS_GLOBALS.update(ADVANCED_PICKLE_PATTERNS)
+
 # Builtin functions that enable dynamic code execution or module loading
 DANGEROUS_BUILTINS = [
     "eval",
