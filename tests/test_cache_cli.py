@@ -39,30 +39,28 @@ class TestCacheCLI:
         """Test cache clear with actual data."""
         # Reset global cache manager to ensure isolation
         reset_cache_manager()
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create test cache entry
-            with tempfile.NamedTemporaryFile(suffix=".pkl") as tmp_file:
-                tmp_file.write(b"test content")
-                tmp_file.flush()
 
-                cache_manager = get_cache_manager(cache_dir=temp_dir, enabled=True)
-                test_result = {"test": "result", "findings": []}
-                cache_manager.store_result(tmp_file.name, test_result, 100)
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.NamedTemporaryFile(suffix=".pkl") as tmp_file:
+            tmp_file.write(b"test content")
+            tmp_file.flush()
 
-                # Check stats show entry
-                runner = CliRunner()
-                result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
-                assert "Total entries: 1" in result.output
+            cache_manager = get_cache_manager(cache_dir=temp_dir, enabled=True)
+            test_result = {"test": "result", "findings": []}
+            cache_manager.store_result(tmp_file.name, test_result, 100)
 
-                # Clear cache
-                result = runner.invoke(cli, ["cache", "clear", "--cache-dir", temp_dir])
-                assert result.exit_code == 0
-                assert "Cleared 1 cache entries" in result.output
+            # Check stats show entry
+            runner = CliRunner()
+            result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
+            assert "Total entries: 1" in result.output
 
-                # Verify cleared
-                result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
-                assert "Total entries: 0" in result.output
+            # Clear cache
+            result = runner.invoke(cli, ["cache", "clear", "--cache-dir", temp_dir])
+            assert result.exit_code == 0
+            assert "Cleared 1 cache entries" in result.output
+
+            # Verify cleared
+            result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
+            assert "Total entries: 0" in result.output
 
     def test_cache_cleanup_dry_run(self):
         """Test cache cleanup dry run."""
