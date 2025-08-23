@@ -150,3 +150,7 @@ TODO.md
 # Temporary analysis artifacts should never be committed
 _temp_files/
 
+# External repository directories (for research/comparison)
+modelscan/
+picklescan/
+

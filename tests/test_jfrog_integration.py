@@ -47,6 +47,8 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_mkdtemp, moc
         timeout=200,
         max_file_size=1000,
         max_total_size=2000,
+        cache_enabled=True,
+        cache_dir=None,
     )
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
     assert results == expected_results

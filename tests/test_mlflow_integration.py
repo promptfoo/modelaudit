@@ -60,6 +60,8 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
         blacklist_patterns=["malicious"],
         max_file_size=1000000,
         max_total_size=5000000,
+        cache_enabled=True,
+        cache_dir=None,
     )
 
     # Verify cleanup

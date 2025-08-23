@@ -66,13 +66,22 @@ def scan_mlflow_model(
         local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)
         # mlflow may return a file within tmp_dir; ensure directory path
         download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        # Ensure cache configuration is passed through from kwargs
+        # Remove cache config from kwargs to avoid conflicts
+        scan_kwargs = kwargs.copy()
+        cache_config = {
+            "cache_enabled": scan_kwargs.pop("cache_enabled", True),
+            "cache_dir": scan_kwargs.pop("cache_dir", None),
+        }
+
         return scan_model_directory_or_file(
             download_path,
             timeout=timeout,
             blacklist_patterns=blacklist_patterns,
             max_file_size=max_file_size,
             max_total_size=max_total_size,
-            **kwargs,
+            **cache_config,
+            **scan_kwargs,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
