@@ -105,6 +105,14 @@ SUSPICIOUS_GLOBALS = {
         "open",
         "input",
         "__import__",
+        # Add all dangerous builtins
+        "globals",  # Access to global namespace
+        "locals",  # Access to local namespace
+        "setattr",  # Can set arbitrary attributes
+        "getattr",  # Can access arbitrary attributes
+        "delattr",  # Can delete attributes
+        "vars",  # Access to object's namespace
+        "dir",  # Can enumerate available attributes
     ],  # Dynamic code evaluation and file access
     # Python 2 style builtins - CRITICAL RISK
     "__builtin__": [
