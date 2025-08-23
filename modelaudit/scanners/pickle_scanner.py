@@ -10,7 +10,6 @@ from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     CVE_BINARY_PATTERNS,
-    CVE_COMBINED_PATTERNS,
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
@@ -1152,7 +1151,7 @@ class PickleScanner(BaseScanner):
             b"getstatusoutput",  # commands.getstatusoutput
             b"system",  # Catches both os.system and from os import system
         ]
-        
+
         # Add CVE-specific binary patterns
         dangerous_patterns.extend(CVE_BINARY_PATTERNS)
 
@@ -1196,7 +1195,7 @@ class PickleScanner(BaseScanner):
                         f"which could indicate malicious code execution during unpickling."
                     ),
                 )
-        
+
         # Perform CVE-specific pattern analysis on the data
         self._analyze_cve_patterns(data, result, context_path)
 
@@ -1204,24 +1203,24 @@ class PickleScanner(BaseScanner):
         """Analyze data for specific CVE patterns and add CVE attribution."""
         # Convert bytes to string for pattern analysis
         try:
-            content_str = data.decode('utf-8', errors='ignore')
+            content_str = data.decode("utf-8", errors="ignore")
         except UnicodeDecodeError:
             content_str = ""
-        
+
         # Use CVE pattern analysis
         cve_attributions = analyze_cve_patterns(content_str, data)
-        
+
         if cve_attributions:
             # Enhance scan result with CVE information
             enhance_scan_result_with_cve(result, [content_str], data)
-            
+
             # Add specific CVE detection checks
             for attr in cve_attributions:
                 severity = IssueSeverity.CRITICAL if attr.severity == "CRITICAL" else IssueSeverity.WARNING
-                
+
                 # Check if this is a high-confidence detection
                 confidence_desc = "high" if attr.confidence > 0.8 else "medium" if attr.confidence > 0.6 else "low"
-                
+
                 result.add_check(
                     name=f"CVE Pattern Detection: {attr.cve_id}",
                     passed=False,
@@ -1239,8 +1238,8 @@ class PickleScanner(BaseScanner):
                         "remediation": attr.remediation,
                     },
                     why=f"This pickle file contains patterns consistent with {attr.cve_id}, "
-                        f"a {attr.severity.lower()} vulnerability ({attr.cwe}) affecting {attr.affected_versions}. "
-                        f"This could indicate potential exploitation attempts. {attr.remediation}"
+                    f"a {attr.severity.lower()} vulnerability ({attr.cwe}) affecting {attr.affected_versions}. "
+                    f"This could indicate potential exploitation attempts. {attr.remediation}",
                 )
 
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
