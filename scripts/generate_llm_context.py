@@ -50,8 +50,8 @@ def generate_context_file(
 ):
     """Generate the LLM context file with README and source code."""
 
-    # Get project root
-    project_root = Path(__file__).parent
+    # Get project root (parent of scripts directory)
+    project_root = Path(__file__).parent.parent
 
     # Files/patterns to exclude
     excluded_patterns = [
