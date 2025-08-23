@@ -21,7 +21,7 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner
 
 # Skip all tests if py7zr is not available for asset generation
-pytest_plugins = []
+pytest_plugins: list[str] = []
 
 
 class TestSevenZipScanner:
