@@ -82,6 +82,65 @@ OS_MODULE_ALIASES: dict[str, dict[str, Any]] = {
 }
 
 # =============================================================================
+# GRADUATED SEVERITY MAPPINGS
+# =============================================================================
+
+# Graduated severity mapping for pickle globals
+PICKLE_SEVERITY_MAP = {
+    "CRITICAL": {
+        # Direct code execution - immediate RCE risk
+        "builtins": ["eval", "exec", "compile", "__import__"],
+        "__builtin__": ["eval", "exec", "compile", "__import__"],
+        "runpy": "*",
+        "os": "*",
+        "subprocess": "*",
+        "sys": "*",
+        "nt": "*",     # Windows os alias
+        "posix": "*",  # Unix os alias
+        "socket": "*",
+        "pty": "*",
+        "_pickle": "*",
+    },
+    "HIGH": {
+        # File system and network access
+        "webbrowser": "*",
+        "shutil": ["rmtree", "copy", "move"],
+        "tempfile": "*",
+        "pickle": ["loads", "load"],
+        "requests": "*",
+        "urllib": "*",
+        "httplib": "*",
+        "http": "*",
+        "aiohttp": "*",
+        "ntpath": "*",
+        "posixpath": "*",
+    },
+    "MEDIUM": {
+        # Encoding and potential obfuscation
+        "base64": ["b64decode", "decode"],
+        "codecs": ["decode", "encode"],
+        "operator": ["attrgetter"],
+        "importlib": "*",
+        "types": "*",
+        "collections": ["defaultdict"],
+    },
+    "LOW": {
+        # Informational findings
+        "warnings": "*",
+        "logging": "*",
+        "inspect": "*",
+    }
+}
+
+# TensorFlow operation severity mapping
+TENSORFLOW_SEVERITY_MAP = {
+    "CRITICAL": ["PyFunc", "PyCall", "ShellExecute"],
+    "HIGH": ["ReadFile", "WriteFile", "MergeV2Checkpoints"],
+    "MEDIUM": ["Save", "SaveV2"],
+    "LOW": []
+}
+
+# =============================================================================
 # PICKLE SECURITY PATTERNS
 # =============================================================================
 

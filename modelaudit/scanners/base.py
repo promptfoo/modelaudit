@@ -34,12 +34,32 @@ logger = logging.getLogger("modelaudit.scanners")
 
 
 class IssueSeverity(Enum):
-    """Enum for issue severity levels"""
+    """Graduated severity levels matching industry standards"""
 
-    DEBUG = "debug"  # Debug information
-    INFO = "info"  # Informational, not a security concern
-    WARNING = "warning"  # Potential issue, needs review
-    CRITICAL = "critical"  # Definite security concern
+    CRITICAL = "critical"  # RCE, data exfiltration, system compromise
+    HIGH = "high"         # File system access, network operations
+    MEDIUM = "medium"     # Suspicious patterns, potential issues
+    LOW = "low"          # Informational findings, best practices
+    DEBUG = "debug"      # Debug information (keep existing)
+    INFO = "info"        # Informational (keep existing)
+    WARNING = "warning"  # Backward compatibility - maps to MEDIUM
+
+
+# Add severity scoring for risk calculations
+SEVERITY_SCORES = {
+    IssueSeverity.CRITICAL: 10.0,
+    IssueSeverity.HIGH: 7.5,
+    IssueSeverity.MEDIUM: 5.0,
+    IssueSeverity.LOW: 2.5,
+    IssueSeverity.INFO: 1.0,
+    IssueSeverity.DEBUG: 0.0,
+    IssueSeverity.WARNING: 5.0,  # Map WARNING to MEDIUM score for backward compatibility
+}
+
+
+def get_severity_score(severity: IssueSeverity) -> float:
+    """Get numeric score for severity level"""
+    return SEVERITY_SCORES.get(severity, 0.0)
 
 
 class CheckStatus(Enum):

@@ -1597,10 +1597,13 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Filter out DEBUG severity issues when not in verbose mode
     visible_issues = [issue for issue in issues if verbose or _get_issue_attr(issue, "severity") != "debug"]
 
-    # Count issues by severity
+    # Count issues by severity - graduated system
     severity_counts = {
         "critical": 0,
-        "warning": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "warning": 0,  # Backward compatibility
         "info": 0,
         "debug": 0,
     }
@@ -1616,17 +1619,42 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines.append("" + "─" * 60)
 
     if visible_issues:
-        # Show issue counts with icons
+        # Show issue counts with graduated severity system
         summary_parts = []
         if severity_counts["critical"] > 0:
             summary_parts.append(
                 "  "
                 + style_text(
-                    f"🚨 {severity_counts['critical']} Critical",
+                    f"🔴 {severity_counts['critical']} Critical",
                     fg="red",
                     bold=True,
                 ),
             )
+        if severity_counts["high"] > 0:
+            summary_parts.append(
+                "  "
+                + style_text(
+                    f"🟠 {severity_counts['high']} High",
+                    fg="bright_red",
+                ),
+            )
+        if severity_counts["medium"] > 0:
+            summary_parts.append(
+                "  "
+                + style_text(
+                    f"🟡 {severity_counts['medium']} Medium",
+                    fg="yellow",
+                ),
+            )
+        if severity_counts["low"] > 0:
+            summary_parts.append(
+                "  "
+                + style_text(
+                    f"🔵 {severity_counts['low']} Low",
+                    fg="blue",
+                ),
+            )
+        # Backward compatibility
         if severity_counts["warning"] > 0:
             summary_parts.append(
                 "  "
@@ -1637,44 +1665,84 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             )
         if severity_counts["info"] > 0:
             summary_parts.append(
-                "  " + style_text(f"[i] {severity_counts['info']} Info", fg="blue"),
+                "  " + style_text(f"ℹ️ {severity_counts['info']} Info", fg="cyan"),
             )
         if verbose and severity_counts["debug"] > 0:
             summary_parts.append(
-                "  " + style_text(f"🐛 {severity_counts['debug']} Debug", fg="cyan"),
+                "  " + style_text(f"🐛 {severity_counts['debug']} Debug", fg="white"),
             )
 
         output_lines.extend(summary_parts)
 
-        # Group issues by severity for better organization
+        # Group issues by severity for better organization (graduated system)
         output_lines.append("")
+
+        any_previous_section = False
 
         # Display critical issues first
         critical_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"]
         if critical_issues:
             output_lines.append(
-                style_text("  🚨 Critical Issues", fg="red", bold=True),
+                style_text("  🔴 Critical Issues", fg="red", bold=True),
             )
             output_lines.append("  " + "─" * 40)
             for issue in critical_issues:
                 _format_issue(issue, output_lines, "critical")
                 output_lines.append("")
+            any_previous_section = True
 
-        # Display warnings
+        # Display high severity issues
+        high_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "high"]
+        if high_issues:
+            if any_previous_section:
+                output_lines.append("")
+            output_lines.append(style_text("  🟠 High Severity Issues", fg="bright_red", bold=True))
+            output_lines.append("  " + "─" * 40)
+            for issue in high_issues:
+                _format_issue(issue, output_lines, "high")
+                output_lines.append("")
+            any_previous_section = True
+
+        # Display medium severity issues
+        medium_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "medium"]
+        if medium_issues:
+            if any_previous_section:
+                output_lines.append("")
+            output_lines.append(style_text("  🟡 Medium Severity Issues", fg="yellow", bold=True))
+            output_lines.append("  " + "─" * 40)
+            for issue in medium_issues:
+                _format_issue(issue, output_lines, "medium")
+                output_lines.append("")
+            any_previous_section = True
+
+        # Display low severity issues
+        low_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "low"]
+        if low_issues:
+            if any_previous_section:
+                output_lines.append("")
+            output_lines.append(style_text("  🔵 Low Severity Issues", fg="blue", bold=True))
+            output_lines.append("  " + "─" * 40)
+            for issue in low_issues:
+                _format_issue(issue, output_lines, "low")
+                output_lines.append("")
+            any_previous_section = True
+
+        # Display warnings (backward compatibility)
         warning_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"]
         if warning_issues:
-            if critical_issues:
+            if any_previous_section:
                 output_lines.append("")
             output_lines.append(style_text("  ⚠️  Warnings", fg="yellow", bold=True))
             output_lines.append("  " + "─" * 40)
             for issue in warning_issues:
                 _format_issue(issue, output_lines, "warning")
                 output_lines.append("")
+            any_previous_section = True
 
         # Display info issues
         info_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "info"]
         if info_issues:
-            if critical_issues or warning_issues:
+            if any_previous_section:
                 output_lines.append("")
             output_lines.append(style_text("  [i] Information", fg="blue", bold=True))
             output_lines.append("  " + "─" * 40)
@@ -1767,6 +1835,27 @@ def _get_issue_attr(issue: Union[dict[str, Any], Any], attr: str, default: Any =
         return getattr(issue, attr, default)
 
 
+def format_severity_display(severity: str) -> str:
+    """Format severity with color coding and symbols for graduated system"""
+    # Map for graduated severity system
+    severity_config = {
+        "critical": {"symbol": "🔴", "color": "red", "name": "CRITICAL"},
+        "high": {"symbol": "🟠", "color": "bright_red", "name": "HIGH"},
+        "medium": {"symbol": "🟡", "color": "yellow", "name": "MEDIUM"},
+        "low": {"symbol": "🔵", "color": "blue", "name": "LOW"},
+        "info": {"symbol": "ℹ️", "color": "cyan", "name": "INFO"},
+        "debug": {"symbol": "🐛", "color": "white", "name": "DEBUG"},
+        # Backward compatibility
+        "warning": {"symbol": "⚠️", "color": "yellow", "name": "WARNING"},
+    }
+    
+    config = severity_config.get(severity, {"symbol": "❓", "color": "white", "name": severity.upper()})
+    
+    if should_use_color():
+        return style_text(f"{config['symbol']} {config['name']}", fg=config['color'])
+    return f"{config['symbol']} {config['name']}"
+
+
 def _format_issue(
     issue: Union[dict[str, Any], Any],
     output_lines: list[str],
@@ -1776,11 +1865,14 @@ def _format_issue(
     message = _get_issue_attr(issue, "message", "Unknown issue")
     location = _get_issue_attr(issue, "location", "")
 
-    # Icon based on severity
+    # Icon based on graduated severity system
     icons = {
-        "critical": "    └─ 🚨",
-        "warning": "    └─ ⚠️ ",
-        "info": "    └─ [i] ",
+        "critical": "    └─ 🔴",
+        "high": "    └─ 🟠",
+        "medium": "    └─ 🟡", 
+        "low": "    └─ 🔵",
+        "warning": "    └─ ⚠️ ",  # Backward compatibility
+        "info": "    └─ ℹ️ ",
         "debug": "    └─ 🐛",
     }
 
