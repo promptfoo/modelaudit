@@ -43,19 +43,40 @@ class SecureFileHasher:
             OSError: If file cannot be read
             ValueError: If file is empty or invalid
         """
+        return self.hash_file_with_stat(file_path, None)
+
+    def hash_file_with_stat(self, file_path: str, file_stat: Optional[os.stat_result]) -> str:
+        """
+        Hash a file using the most appropriate strategy based on size, with optional stat reuse.
+
+        Args:
+            file_path: Path to file to hash
+            file_stat: Optional pre-computed os.stat_result to avoid redundant calls
+
+        Returns:
+            Hash string with prefix indicating method used
+
+        Raises:
+            OSError: If file cannot be read
+            ValueError: If file is empty or invalid
+        """
         if not os.path.isfile(file_path):
             raise ValueError(f"File does not exist: {file_path}")
 
-        file_size = os.path.getsize(file_path)
+        # Get file stat once if not provided
+        if file_stat is None:
+            file_stat = os.stat(file_path)
+
+        file_size = file_stat.st_size
 
         if file_size == 0:
             raise ValueError(f"File is empty: {file_path}")
 
         if file_size <= self.full_hash_threshold:
-            return self._secure_full_hash(file_path)
+            return self._secure_full_hash_with_stat(file_path, file_stat)
         else:
             logger.info(f"Large file ({file_size / 1024**3:.1f}GB), using enhanced fingerprint for {file_path}")
-            return self._secure_enhanced_fingerprint(file_path, file_size)
+            return self._secure_enhanced_fingerprint_with_stat(file_path, file_stat)
 
     def _secure_full_hash(self, file_path: str) -> str:
         """
@@ -67,9 +88,23 @@ class SecureFileHasher:
         Returns:
             Hash string with 'secure:' prefix
         """
+        file_stat = os.stat(file_path)
+        return self._secure_full_hash_with_stat(file_path, file_stat)
+
+    def _secure_full_hash_with_stat(self, file_path: str, file_stat: os.stat_result) -> str:
+        """
+        Compute cryptographically secure full file hash using Blake2b with stat reuse.
+
+        Args:
+            file_path: Path to file to hash
+            file_stat: Pre-computed os.stat_result
+
+        Returns:
+            Hash string with 'secure:' prefix
+        """
         start_time = time.time()
         hasher = hashlib.blake2b(digest_size=32)  # 256-bit output
-        file_size = os.path.getsize(file_path)
+        file_size = file_stat.st_size
 
         try:
             if file_size < 100 * 1024 * 1024:  # < 100MB - use memory mapping
@@ -117,8 +152,26 @@ class SecureFileHasher:
         Returns:
             Hash string with 'fingerprint:' prefix
         """
+        file_stat = os.stat(file_path)
+        return self._secure_enhanced_fingerprint_with_stat(file_path, file_stat)
+
+    def _secure_enhanced_fingerprint_with_stat(self, file_path: str, file_stat: os.stat_result) -> str:
+        """
+        Compute security-conscious fingerprint for very large files with stat reuse.
+
+        Hashes significant portions distributed throughout the file
+        to make tampering detectable while being faster than full hash.
+
+        Args:
+            file_path: Path to file to hash
+            file_stat: Pre-computed os.stat_result
+
+        Returns:
+            Hash string with 'fingerprint:' prefix
+        """
         start_time = time.time()
         hasher = hashlib.blake2b(digest_size=32)
+        file_size = file_stat.st_size
 
         # Define portions to hash - strategically distributed
         portions_to_hash = [
@@ -139,11 +192,10 @@ class SecureFileHasher:
         except OSError as e:
             raise OSError(f"Failed to hash file {file_path}: {e}") from e
 
-        # Include metadata for additional security
-        stat = os.stat(file_path)
+        # Include metadata for additional security - reuse stat
         hasher.update(str(file_size).encode())
-        hasher.update(str(int(stat.st_mtime)).encode())
-        hasher.update(str(stat.st_ino).encode())  # inode for uniqueness
+        hasher.update(str(int(file_stat.st_mtime)).encode())
+        hasher.update(str(file_stat.st_ino).encode())  # inode for uniqueness
 
         hash_time = time.time() - start_time
         hash_hex = hasher.hexdigest()

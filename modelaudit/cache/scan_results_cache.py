@@ -53,7 +53,7 @@ class ScanResultsCache:
 
     def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
         """
-        Get cached scan result if available and valid.
+        Get cached scan result if available and valid with optimized file system calls.
 
         Args:
             file_path: Path to file to check cache for
@@ -62,8 +62,11 @@ class ScanResultsCache:
             Cached scan result dictionary if found and valid, None otherwise
         """
         try:
-            # Generate cache key
-            cache_key = self._generate_cache_key(file_path)
+            # Get file stats ONCE and reuse for both cache key generation and validation
+            file_stat = os.stat(file_path)
+
+            # Generate cache key with stat reuse
+            cache_key = self._generate_cache_key(file_path, file_stat=file_stat)
             if not cache_key:
                 return None
 
@@ -78,8 +81,8 @@ class ScanResultsCache:
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
-            # Validate entry is still valid
-            if not self._is_cache_entry_valid(cache_entry, file_path):
+            # Validate entry is still valid (pass stat to avoid another os.stat call)
+            if not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat):
                 # Remove invalid entry
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
@@ -104,7 +107,7 @@ class ScanResultsCache:
 
     def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
         """
-        Store scan result in cache.
+        Store scan result in cache with optimized file system calls.
 
         Args:
             file_path: Path to file that was scanned
@@ -112,13 +115,16 @@ class ScanResultsCache:
             scan_duration_ms: Optional scan duration in milliseconds
         """
         try:
-            # Generate cache key and file info
-            cache_key = self._generate_cache_key(file_path)
+            # Get file stats ONCE and reuse
+            file_stat = os.stat(file_path)
+
+            # Pass file_stat to avoid redundant calls
+            cache_key = self._generate_cache_key(file_path, file_stat=file_stat)
             if not cache_key:
                 return
 
-            file_hash = self.hasher.hash_file(file_path)
-            file_stat = os.stat(file_path)
+            # Use optimized hash method with stat reuse
+            file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
 
             cache_entry = CacheEntry(
                 cache_key=cache_key,
@@ -151,19 +157,20 @@ class ScanResultsCache:
         except Exception as e:
             logger.warning(f"Failed to cache result for {file_path}: {e}")
 
-    def _generate_cache_key(self, file_path: str) -> Optional[str]:
+    def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result] = None) -> Optional[str]:
         """
         Generate cache key from file hash and version info.
 
         Args:
             file_path: Path to file
+            file_stat: Optional pre-computed os.stat_result to avoid redundant calls
 
         Returns:
             Cache key string or None if generation failed
         """
         try:
-            # Get file hash
-            file_hash = self.hasher.hash_file(file_path)
+            # Get file hash (with optional stat reuse)
+            file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
 
             # Get version information
             version_info = self._get_version_info()
@@ -251,18 +258,34 @@ class ScanResultsCache:
         Returns:
             True if entry is valid, False otherwise
         """
+        current_stat = os.stat(file_path)
+        return self._is_cache_entry_valid_with_stat(cache_entry, file_path, current_stat)
+
+    def _is_cache_entry_valid_with_stat(
+        self, cache_entry: dict[str, Any], file_path: str, file_stat: os.stat_result
+    ) -> bool:
+        """
+        Validate that cache entry is still valid with stat reuse.
+
+        Args:
+            cache_entry: Cache entry dictionary
+            file_path: Current file path
+            file_stat: Pre-computed os.stat_result
+
+        Returns:
+            True if entry is valid, False otherwise
+        """
         try:
             # Check file hasn't changed
-            current_stat = os.stat(file_path)
             cached_mtime = cache_entry["file_info"]["mtime"]
             cached_size = cache_entry["file_info"]["size"]
 
             # Check modification time (allow 1 second tolerance)
-            if abs(current_stat.st_mtime - cached_mtime) > 1.0:
+            if abs(file_stat.st_mtime - cached_mtime) > 1.0:
                 return False
 
             # Check file size
-            if current_stat.st_size != cached_size:
+            if file_stat.st_size != cached_size:
                 return False
 
             # Check entry isn't too old (30 days default)
