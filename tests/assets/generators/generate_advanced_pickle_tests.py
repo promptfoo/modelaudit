@@ -7,7 +7,7 @@ def generate_stack_global_attack() -> None:
 
     class StackGlobalAttack:
         def __reduce__(self):
-            return (__import__("os").system, ("echo pwned",))
+            return (__import__("os").system, ("echo STACK_GLOBAL_PAYLOAD",))
 
     with open("tests/assets/pickles/stack_global_attack.pkl", "wb") as f:
         pickle.dump(StackGlobalAttack(), f)
@@ -19,7 +19,7 @@ def generate_memo_based_attack() -> None:
     class MemoAttack:
         def __reduce__(self):
             dangerous_module = __import__("subprocess")
-            return (dangerous_module.call, (["echo", "memo_attack"],))
+            return (dangerous_module.call, (["echo", "MEMO_ATTACK_PAYLOAD"],))
 
     with open("tests/assets/pickles/memo_attack.pkl", "wb") as f:
         pickle.dump(MemoAttack(), f)
@@ -35,7 +35,7 @@ def generate_multiple_pickle_attack() -> None:
 
     class HiddenAttack:
         def __reduce__(self):
-            return (eval, ("__import__('os').system('hidden_attack')",))
+            return (eval, ("__import__('os').system('HIDDEN_ATTACK_PAYLOAD')",))
 
     pickle.dump(HiddenAttack(), buffer)
 

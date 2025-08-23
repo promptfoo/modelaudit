@@ -5,8 +5,8 @@ from pathlib import Path
 
 class EvilClass:
     def __reduce__(self):
-        # This is a malicious example for testing
-        return (os.system, ('echo "This is potentially malicious"',))
+        # This is a malicious example for testing - uses safe placeholder command
+        return (os.system, ('echo "MALICIOUS_PAYLOAD_PLACEHOLDER"',))
 
 
 evil_obj = EvilClass()
