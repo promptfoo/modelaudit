@@ -1,5 +1,6 @@
 """Cache manager for integrating with ModelAudit scanners."""
 
+import os
 import time
 import logging
 from typing import Dict, Any, Optional
@@ -88,7 +89,10 @@ class CacheManager:
             
             return cached_result
         
-        # Cache miss - perform actual scan
+        # Cache miss - validate file exists before scanning
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
         logger.info(f"Cache MISS for {Path(file_path).name} - scanning...")
         scan_start = time.time()
         

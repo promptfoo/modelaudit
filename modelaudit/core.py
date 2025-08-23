@@ -42,6 +42,61 @@ logger = logging.getLogger("modelaudit.core")
 _OPEN_PATCH_LOCK = Lock()
 
 
+def _scan_result_from_dict(result_dict: dict) -> ScanResult:
+    """
+    Convert a dictionary representation back to a ScanResult object.
+    
+    This is used when retrieving cached scan results that were stored as dictionaries.
+    
+    Args:
+        result_dict: Dictionary representation of a ScanResult
+        
+    Returns:
+        Reconstructed ScanResult object
+    """
+    # Create new ScanResult with the same scanner name
+    scanner_name = result_dict.get('scanner', 'cached')
+    result = ScanResult(scanner_name=scanner_name)
+    
+    # Restore basic properties
+    result.success = result_dict.get('success', True)
+    result.bytes_scanned = result_dict.get('bytes_scanned', 0)
+    result.start_time = result_dict.get('start_time', time.time())
+    result.end_time = result_dict.get('end_time', time.time())
+    result.metadata.update(result_dict.get('metadata', {}))
+    
+    # Restore issues from cached data
+    for issue_dict in result_dict.get('issues', []):
+        result.add_issue(
+            message=issue_dict.get('message', ''),
+            severity=IssueSeverity(issue_dict.get('severity', 'warning')),
+            location=issue_dict.get('location'),
+            details=issue_dict.get('details', {}),
+            why=issue_dict.get('why')
+        )
+    
+    # Restore checks from cached data
+    for check_dict in result_dict.get('checks', []):
+        from modelaudit.scanners.base import Check, CheckStatus
+        try:
+            check = Check(
+                name=check_dict.get('name', ''),
+                status=CheckStatus(check_dict.get('status', 'passed')),
+                message=check_dict.get('message', ''),
+                severity=IssueSeverity(check_dict['severity']) if check_dict.get('severity') else None,
+                location=check_dict.get('location'),
+                details=check_dict.get('details', {}),
+                why=check_dict.get('why'),
+                timestamp=check_dict.get('timestamp', time.time())
+            )
+            result.checks.append(check)
+        except Exception as e:
+            # If we can't reconstruct a check, log and continue
+            logger.debug(f"Could not reconstruct check from cache: {e}")
+    
+    return result
+
+
 def _add_asset_to_results(
     results: ModelAuditResultModel,
     file_path: str,
@@ -1111,6 +1166,51 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     if config is None:
         config = {}
     validate_scan_config(config)
+    
+    # Check cache configuration
+    cache_enabled = config.get('cache_enabled', True)
+    cache_dir = config.get('cache_dir')
+    
+    # If caching is disabled, proceed with direct scan
+    if not cache_enabled:
+        return _scan_file_internal(path, config)
+    
+    # Use cache manager for cache-enabled scans
+    try:
+        from .cache import get_cache_manager
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+        
+        # Create a wrapper function for the cache manager
+        def cached_scan_wrapper(file_path: str) -> dict:
+            result = _scan_file_internal(file_path, config)
+            return result.to_dict()
+        
+        # Get cached result or perform scan
+        result_dict = cache_manager.cached_scan(path, cached_scan_wrapper)
+        
+        # Convert back to ScanResult
+        return _scan_result_from_dict(result_dict)
+        
+    except Exception as e:
+        # If cache system fails, fall back to direct scanning
+        logger.warning(f"Cache system error for {path}: {e}. Falling back to direct scan.")
+        return _scan_file_internal(path, config)
+
+
+def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+    """
+    Internal implementation of file scanning (cache-agnostic).
+    
+    Args:
+        path: Path to the file to scan
+        config: Optional scanner configuration
+
+    Returns:
+        ScanResult object with the scan results
+    """
+    if config is None:
+        config = {}
+    validate_scan_config(config)
 
     # Skip HuggingFace cache files to reduce noise
     if _is_huggingface_cache_file(path):
@@ -1242,7 +1342,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
-                result = scanner.scan(path)
+                result = scanner.scan_with_cache(path)
         except TimeoutError as e:
             # Handle timeout gracefully
             result = ScanResult(scanner_name=preferred_scanner.name)
@@ -1270,7 +1370,7 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
-                    result = scanner.scan(path)
+                    result = scanner.scan_with_cache(path)
             except TimeoutError as e:
                 # Handle timeout gracefully
                 result = ScanResult(scanner_name=scanner_class.name)

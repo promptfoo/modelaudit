@@ -65,13 +65,22 @@ def scan_jfrog_artifact(
             timeout=timeout,
         )
 
+        # Ensure cache configuration is passed through from kwargs
+        # Remove cache config from kwargs to avoid conflicts
+        scan_kwargs = kwargs.copy()
+        cache_config = {
+            'cache_enabled': scan_kwargs.pop('cache_enabled', True),
+            'cache_dir': scan_kwargs.pop('cache_dir', None),
+        }
+        
         return scan_model_directory_or_file(
             str(download_path),
             blacklist_patterns=blacklist_patterns,
             timeout=timeout,
             max_file_size=max_file_size,
             max_total_size=max_total_size,
-            **kwargs,
+            **cache_config,
+            **scan_kwargs,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

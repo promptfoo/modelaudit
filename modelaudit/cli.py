@@ -1146,6 +1146,8 @@ def scan_command(
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
                         "progress_update_interval": progress_interval,
+                        "cache_enabled": cache,
+                        "cache_dir": cache_dir,
                     }
 
                     scan_results: ModelAuditResultModel = scan_model_directory_or_file(

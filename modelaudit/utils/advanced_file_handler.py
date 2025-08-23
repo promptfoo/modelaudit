@@ -504,5 +504,55 @@ def scan_advanced_large_file(
     Returns:
         ScanResult with findings
     """
+    # Check if caching is enabled in scanner config
+    config = getattr(scanner, 'config', {})
+    cache_enabled = config.get('cache_enabled', True)
+    cache_dir = config.get('cache_dir')
+    
+    # If caching is disabled, proceed with direct scan
+    if not cache_enabled:
+        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+    
+    # Use cache manager for advanced large file scans
+    try:
+        from ..cache import get_cache_manager
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+        
+        # Create wrapper function for cache manager
+        def cached_advanced_scan_wrapper(fpath: str) -> dict:
+            result = _scan_advanced_large_file_internal(fpath, scanner, progress_callback, timeout)
+            return result.to_dict()
+        
+        # Get cached result or perform scan
+        result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan_wrapper)
+        
+        # Convert back to ScanResult
+        from ..core import _scan_result_from_dict
+        return _scan_result_from_dict(result_dict)
+        
+    except Exception as e:
+        # If cache system fails, fall back to direct scanning
+        logger.warning(f"Advanced file cache error for {file_path}: {e}. Falling back to direct scan.")
+        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+
+def _scan_advanced_large_file_internal(
+    file_path: str,
+    scanner: Any,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+    timeout: int = 7200,
+) -> ScanResult:
+    """
+    Internal implementation of advanced large file scanning (cache-agnostic).
+    
+    Args:
+        file_path: Path to scan
+        scanner: Scanner instance
+        progress_callback: Progress callback
+        timeout: Maximum scan time
+
+    Returns:
+        ScanResult with findings
+    """
     handler = AdvancedFileHandler(file_path, scanner, progress_callback, timeout)
     return handler.scan()
