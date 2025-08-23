@@ -19,9 +19,9 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 136 active models + 10 archived models = 146 total cataloged
+- Total Models: 134 active models + 10 archived models = 144 total cataloged
 - Safe Models: 45 legitimate models (baseline testing)
-- Malicious Models: 91 models with attack vectors
+- Malicious Models: 89 models with attack vectors
 - Archived Models: 10 models no longer available (moved to bottom for historical reference)
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
 - Attack Types: 7+ distinct exploitation methods
@@ -99,14 +99,13 @@ Classic pickle deserialization attacks in PyTorch model files.
 | 54  | `MustEr/gpt2-elite`                     | Pickle RCE    | Hugging Face | `pytorch_model.bin`                            | Flagged with suspicious imports, real-world example                                                                                |
 | 55  | `TencentAIGC/poisoned-model`            | Pickle RCE    | Hugging Face | `poisoned_model.pth`                           | Explicit `posix.system` import detection                                                                                           |
 | 56  | `DSfsdasgaa/shell`                      | Pickle RCE    | Hugging Face | `kcp.pth`, `ws.pth`                            | `.pth` files with `posix.system`, includes ELF                                                                                     |
-| 57  | `nono31/malicious-models-repo`          | Multi-format  | Hugging Face | Multiple files                                 | Multiple unsafe files: PyTorch, GGUF, TensorFlow                                                                                   |
-| 58  | `YuhengSSS/VSSD`                        | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth`            | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage.                                                   |
-| 59  | `XavierJiezou/ktda-models`              | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`                          | "Detected Pickle imports (11)." Useful for PyTorch load path test.                                                                 |
-| 60  | `trackinglaboratory/CAMELTrack`         | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`                        | Marked **Unsafe**. Exercises compressed pickle handling.                                                                           |
-| 101 | `LiheYoung/Depth-Anything`              | Pickle RCE    | HF Space     | `checkpoints_semseg/ade20k_vitl_mIoU_59.4.pth` | File Security Scans mark file **Unsafe**. "Detected Pickle imports (11)" listed.                                                   |
-| 102 | `rodrigomiranda98/tweet-eval-emotion`   | Raw pickle    | Hugging Face | `model.pkl`                                    | File page shows **Unsafe** status for the pickle file. Good for generic pickle‑load path tests.                                    |
-| 103 | `cesaenv/rottenTomatoes`                | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (97)" including FastAI, spaCy, and torch rebuild opcodes. Stresses large import surfaces. |
-| 104 | `luisvarona/intel-image-classification` | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (94)". Useful FastAI‑style pickle corpus.                                                 |
+| 57  | `YuhengSSS/VSSD`                        | Pickle RCE    | Hugging Face | `mask_rcnn_vssd_fpn_coco_micro.pth`            | "Detected Pickle imports (11)" in File Security Scans. Good for opcode coverage.                                                   |
+| 58  | `XavierJiezou/ktda-models`              | Pickle RCE    | Hugging Face | `checkpoints/fcn.pth`                          | "Detected Pickle imports (11)." Useful for PyTorch load path test.                                                                 |
+| 59  | `trackinglaboratory/CAMELTrack`         | Pickle RCE    | Hugging Face | `states/mot17-val.pklz`                        | Marked **Unsafe**. Exercises compressed pickle handling.                                                                           |
+| 60  | `LiheYoung/Depth-Anything`              | Pickle RCE    | HF Space     | `checkpoints_semseg/ade20k_vitl_mIoU_59.4.pth` | File Security Scans mark file **Unsafe**. "Detected Pickle imports (11)" listed.                                                   |
+| 61  | `rodrigomiranda98/tweet-eval-emotion`   | Raw pickle    | Hugging Face | `model.pkl`                                    | File page shows **Unsafe** status for the pickle file. Good for generic pickle‑load path tests.                                    |
+| 62  | `cesaenv/rottenTomatoes`                | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (97)" including FastAI, spaCy, and torch rebuild opcodes. Stresses large import surfaces. |
+| 63  | `luisvarona/intel-image-classification` | Raw pickle    | Hugging Face | `model.pkl`                                    | **Unsafe** with "Detected Pickle imports (94)". Useful FastAI‑style pickle corpus.                                                 |
 
 ### Alternative Execution Vectors
 
@@ -114,9 +113,9 @@ Different methods of achieving code execution beyond standard pickle.
 
 | #   | Model Name           | Attack Vector  | Source       | Primary Artifact    | Detection Notes                 |
 | --- | -------------------- | -------------- | ------------ | ------------------- | ------------------------------- |
-| 34  | `mkiani/gpt2-exec`   | `exec()` call  | Hugging Face | `pytorch_model.bin` | Code injected using exec        |
-| 35  | `mkiani/gpt2-runpy`  | `runpy` module | Hugging Face | `pytorch_model.bin` | Code injected using runpy       |
-| 36  | `mkiani/gpt2-system` | System calls   | Hugging Face | `pytorch_model.bin` | Code injected using system call |
+| 64  | `mkiani/gpt2-exec`   | `exec()` call  | Hugging Face | `pytorch_model.bin` | Code injected using exec        |
+| 65  | `mkiani/gpt2-runpy`  | `runpy` module | Hugging Face | `pytorch_model.bin` | Code injected using runpy       |
+| 66  | `mkiani/gpt2-system` | System calls   | Hugging Face | `pytorch_model.bin` | Code injected using system call |
 
 ### YOLO Model Exploits (.pt/.pth files)
 
@@ -124,16 +123,16 @@ YOLO and PyTorch model files with embedded malicious pickle payloads.
 
 | #   | Model Name                              | Attack Vector | Source       | Primary Artifact            | Detection Notes                                                                                        |
 | --- | --------------------------------------- | ------------- | ------------ | --------------------------- | ------------------------------------------------------------------------------------------------------ |
-| 37  | `echo840/MonkeyOCR`                     | YOLO pickle   | Hugging Face | `Structure/layout_zh.pt`    | Flagged "Detected Pickle imports (33)"                                                                 |
-| 38  | `Uminosachi/FastSAM`                    | YOLO pickle   | Hugging Face | `FastSAM-s.pt`              | YOLO .pt with pickle imports                                                                           |
-| 39  | `jags/yolov8_model_segmentation-set`    | YOLO pickle   | Hugging Face | `face_yolov8n-seg2_60.pt`   | YOLOv8 .pt flagged unsafe                                                                              |
-| 40  | `StableDiffusionVN/yolo`                | YOLO pickle   | Hugging Face | `yolo-human-parse-v2.pt`    | YOLO .pt flagged unsafe                                                                                |
-| 41  | `Zhao-Xuanxiang/yolov7-seg`             | YOLO pickle   | Hugging Face | `yolov7-seg.pt`             | YOLO .pt flagged unsafe                                                                                |
-| 42  | `ashllay/YOLO_Models`                   | YOLO pickle   | Hugging Face | `segm/unwanted-3x.pt`       | YOLO .pt flagged unsafe                                                                                |
-| 105 | `guon/hand-eyes`                        | YOLO pickle   | Hugging Face | `PitHandDetailer-v1-seg.pt` | **Unsafe** with "Detected Pickle imports (33)". Exercises YOLOv8 seg task deserialization path.        |
-| 106 | `keremberke/yolov8m-hard-hat-detection` | YOLO pickle   | Hugging Face | `*.pt` in repo root         | "Detected Pickle imports (24)" on scanned YOLO weights. Good for real‑world YOLO import lists.         |
-| 107 | `deepghs/imgutils-models`               | YOLO pickle   | Hugging Face | `person_detect/*.pt`        | "Detected Pickle imports (24)" across person detection checkpoints. Useful for multiple file coverage. |
-| 108 | `JCTN/adetailer`                        | YOLO pickle   | Hugging Face | `*.pt` in repo              | "Detected Pickle imports (33)". Alternative ADetailer variants beyond `Bingsu/adetailer`.              |
+| 67  | `echo840/MonkeyOCR`                     | YOLO pickle   | Hugging Face | `Structure/layout_zh.pt`    | Flagged "Detected Pickle imports (33)"                                                                 |
+| 68  | `Uminosachi/FastSAM`                    | YOLO pickle   | Hugging Face | `FastSAM-s.pt`              | YOLO .pt with pickle imports                                                                           |
+| 69  | `jags/yolov8_model_segmentation-set`    | YOLO pickle   | Hugging Face | `face_yolov8n-seg2_60.pt`   | YOLOv8 .pt flagged unsafe                                                                              |
+| 70  | `StableDiffusionVN/yolo`                | YOLO pickle   | Hugging Face | `yolo-human-parse-v2.pt`    | YOLO .pt flagged unsafe                                                                                |
+| 71  | `Zhao-Xuanxiang/yolov7-seg`             | YOLO pickle   | Hugging Face | `yolov7-seg.pt`             | YOLO .pt flagged unsafe                                                                                |
+| 72  | `ashllay/YOLO_Models`                   | YOLO pickle   | Hugging Face | `segm/unwanted-3x.pt`       | YOLO .pt flagged unsafe                                                                                |
+| 73  | `guon/hand-eyes`                        | YOLO pickle   | Hugging Face | `PitHandDetailer-v1-seg.pt` | **Unsafe** with "Detected Pickle imports (33)". Exercises YOLOv8 seg task deserialization path.        |
+| 74  | `keremberke/yolov8m-hard-hat-detection` | YOLO pickle   | Hugging Face | `*.pt` in repo root         | "Detected Pickle imports (24)" on scanned YOLO weights. Good for real‑world YOLO import lists.         |
+| 75  | `deepghs/imgutils-models`               | YOLO pickle   | Hugging Face | `person_detect/*.pt`        | "Detected Pickle imports (24)" across person detection checkpoints. Useful for multiple file coverage. |
+| 76  | `JCTN/adetailer`                        | YOLO pickle   | Hugging Face | `*.pt` in repo              | "Detected Pickle imports (33)". Alternative ADetailer variants beyond `Bingsu/adetailer`.              |
 
 ### Keras & TensorFlow Exploits
 
@@ -141,19 +140,19 @@ Malicious Keras models with Lambda layer exploits and TensorFlow SavedModel atta
 
 | #   | Model Name                                | Attack Vector | Source       | Primary Artifact                                   | Detection Notes                                                                                                             |
 | --- | ----------------------------------------- | ------------- | ------------ | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| 41  | `mkiani/unsafe-keras`                     | Keras Lambda  | Hugging Face | `unsafe_model.keras`                               | Recommended test - HF marks unsafe                                                                                          |
-| 42  | `mkiani/unsafe-saved-model`               | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Unsafe SavedModel example                                                                                                   |
-| 43  | `mkiani/keras-unsafe-models`              | Keras Lambda  | Hugging Face | `unsafe_model.h5`                                  | Keras H5 unsafe format                                                                                                      |
-| 44  | `Juna190825/github_jeffprosise_model`     | Keras Lambda  | Hugging Face | `*.keras`                                          | Keras serialization flagged unsafe by HF                                                                                    |
-| 45  | `warmiros/unsafe_models`                  | Keras Lambda  | Hugging Face | `unsafe.h5`, `unsafe.keras`                        | Tiny PoCs for fast tests                                                                                                    |
-| 46  | `Sag1012/machine-translation`             | Keras Lambda  | Hugging Face | `BiLSTM/my_model (1).keras`                        | Flagged with PAIT-KERAS-301                                                                                                 |
-| 47  | `ScanMe/test-models`                      | Keras Lambda  | Hugging Face | `eval_lambda.keras`, `eval_lambda.h5`              | Keras Lambda serialization PoCs                                                                                             |
-| 48  | `JackVines/ds_saliency_inference`         | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Use to validate SavedModel handling and scanner verdicts.               |
-| 49  | `alexanderkroner/MSI-Net`                 | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Good real‑world SavedModel test.                                        |
-| 50  | `dini15/Skin_Type`                        | Keras         | Hugging Face | `model_aug.keras`                                  | `.keras` file flagged **Unsafe** in File Security Scans. Useful for Lambda‑layer serialization checks.                      |
-| 51  | `m7142yosuke/english2kana`                | Keras         | Hugging Face | `english2kana-v1.keras`                            | `.keras` file flagged **Unsafe**. Simple repro for Keras payload detection.                                                 |
-| 52  | `ckavili/totally_harmless_no_scan_needed` | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Marked **Unsafe**. Model card even jokes "totally harmless," making it a nice red‑team control.                             |
-| 109 | `Anggads01/trashnet-classifier`           | Keras         | Hugging Face | `best_model.keras` or `DenseNet121_02_model.keras` | File Security Scans show **Unsafe** with `PAIT-KERAS-301` on multiple `.keras` files. Good for Lambda serialization checks. |
+| 77  | `mkiani/unsafe-keras`                     | Keras Lambda  | Hugging Face | `unsafe_model.keras`                               | Recommended test - HF marks unsafe                                                                                          |
+| 78  | `mkiani/unsafe-saved-model`               | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Unsafe SavedModel example                                                                                                   |
+| 79  | `mkiani/keras-unsafe-models`              | Keras Lambda  | Hugging Face | `unsafe_model.h5`                                  | Keras H5 unsafe format                                                                                                      |
+| 80  | `Juna190825/github_jeffprosise_model`     | Keras Lambda  | Hugging Face | `*.keras`                                          | Keras serialization flagged unsafe by HF                                                                                    |
+| 81  | `warmiros/unsafe_models`                  | Keras Lambda  | Hugging Face | `unsafe.h5`, `unsafe.keras`                        | Tiny PoCs for fast tests                                                                                                    |
+| 82  | `Sag1012/machine-translation`             | Keras Lambda  | Hugging Face | `BiLSTM/my_model (1).keras`                        | Flagged with PAIT-KERAS-301                                                                                                 |
+| 83  | `ScanMe/test-models`                      | Keras Lambda  | Hugging Face | `eval_lambda.keras`, `eval_lambda.h5`              | Keras Lambda serialization PoCs                                                                                             |
+| 84  | `JackVines/ds_saliency_inference`         | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Use to validate SavedModel handling and scanner verdicts.               |
+| 85  | `alexanderkroner/MSI-Net`                 | TF SavedModel | Hugging Face | `saved_model.pb`                                   | File Security Scans mark the SavedModel **Unsafe**. Good real‑world SavedModel test.                                        |
+| 86  | `dini15/Skin_Type`                        | Keras         | Hugging Face | `model_aug.keras`                                  | `.keras` file flagged **Unsafe** in File Security Scans. Useful for Lambda‑layer serialization checks.                      |
+| 87  | `m7142yosuke/english2kana`                | Keras         | Hugging Face | `english2kana-v1.keras`                            | `.keras` file flagged **Unsafe**. Simple repro for Keras payload detection.                                                 |
+| 88  | `ckavili/totally_harmless_no_scan_needed` | TF SavedModel | Hugging Face | `saved_model.pb`                                   | Marked **Unsafe**. Model card even jokes "totally harmless," making it a nice red‑team control.                             |
+| 89  | `Anggads01/trashnet-classifier`           | Keras         | Hugging Face | `best_model.keras` or `DenseNet121_02_model.keras` | File Security Scans show **Unsafe** with `PAIT-KERAS-301` on multiple `.keras` files. Good for Lambda serialization checks. |
 
 ### Sklearn/Joblib/Pickle Exploits
 
@@ -197,7 +196,6 @@ Models specifically designed to test scanner capabilities and known CVE exploits
 | #   | Model Name                   | Attack Vector  | Source       | Primary Artifact                      | Detection Notes                                   |
 | --- | ---------------------------- | -------------- | ------------ | ------------------------------------- | ------------------------------------------------- |
 | 78  | `Retr0REG/CVE-2024-3568-poc` | Pickle CVE     | Hugging Face | `extra_data.pickle`, `pickle.pkl`     | CVE PoC with posix.system, opcode signature tests |
-| 80  | `ScanMe/test-models`         | False positive | Hugging Face | `eval.pkl`, `THIS_MODEL_IS_BENIGN...` | Minimal pickle with builtins.eval, FP challenge   |
 
 ### GGUF & Template Injection Attacks
 
