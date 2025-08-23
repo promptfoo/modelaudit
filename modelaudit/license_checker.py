@@ -1,33 +1,14 @@
 import json
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
 
-
-@dataclass
-class LicenseInfo:
-    """Information about a detected license."""
-
-    spdx_id: Optional[str] = None
-    name: Optional[str] = None
-    commercial_allowed: Optional[bool] = None
-    source: str = "unknown"  # Where the license was detected from
-    confidence: float = 0.0  # Confidence score (0.0 to 1.0)
-    text: Optional[str] = None
-
-
-@dataclass
-class CopyrightInfo:
-    """Information about detected copyright notices."""
-
-    holder: str
-    year: Optional[str] = None
-    text: str = ""
-
+# Import Pydantic models instead of using dataclasses
+from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
+from modelaudit.models import LicenseInfoModel as LicenseInfo
 
 # Common license patterns with SPDX IDs and commercial use status
 LICENSE_PATTERNS = {

@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import click
 from yaspin import yaspin
@@ -1410,7 +1410,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
     visible_issues = [
-        issue for issue in issues if verbose or not isinstance(issue, dict) or issue.get("severity") != "debug"
+        issue for issue in issues if verbose or _get_issue_attr(issue, "severity") != "debug"
     ]
 
     # Count issues by severity
@@ -1422,10 +1422,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     }
 
     for issue in issues:
-        if isinstance(issue, dict):
-            severity = issue.get("severity", "warning")
-            if severity in severity_counts:
-                severity_counts[severity] += 1
+        severity = _get_issue_attr(issue, "severity", "warning")
+        if severity in severity_counts:
+            severity_counts[severity] += 1
 
     # Display issue summary
     output_lines.append("")
@@ -1468,7 +1467,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display critical issues first
         critical_issues = [
-            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "critical"
+            issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "critical"
         ]
         if critical_issues:
             output_lines.append(
@@ -1481,7 +1480,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
         # Display warnings
         warning_issues = [
-            issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "warning"
+            issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "warning"
         ]
         if warning_issues:
             if critical_issues:
@@ -1493,7 +1492,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append("")
 
         # Display info issues
-        info_issues = [issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "info"]
+        info_issues = [issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "info"]
         if info_issues:
             if critical_issues or warning_issues:
                 output_lines.append("")
@@ -1506,7 +1505,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         # Display debug issues if verbose
         if verbose:
             debug_issues = [
-                issue for issue in visible_issues if isinstance(issue, dict) and issue.get("severity") == "debug"
+                issue for issue in visible_issues if _get_issue_attr(issue, "severity") == "debug"
             ]
             if debug_issues:
                 if critical_issues or warning_issues or info_issues:
@@ -1545,11 +1544,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         )
     # Determine overall status
     elif visible_issues:
-        if any(isinstance(issue, dict) and issue.get("severity") == "critical" for issue in visible_issues):
+        if any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues):
             status_icon = "❌"
             status_msg = "CRITICAL SECURITY ISSUES FOUND"
             status_color = "red"
-        elif any(isinstance(issue, dict) and issue.get("severity") == "warning" for issue in visible_issues):
+        elif any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues):
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
@@ -1581,14 +1580,23 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     return "\n".join(output_lines)
 
 
+def _get_issue_attr(issue: Union[dict[str, Any], Any], attr: str, default: Any = None) -> Any:
+    """Safely get an attribute from an issue whether it's a dict or Pydantic object."""
+    if isinstance(issue, dict):
+        return issue.get(attr, default)
+    else:
+        # Assume it's a Pydantic object
+        return getattr(issue, attr, default)
+
+
 def _format_issue(
-    issue: dict[str, Any],
+    issue: Union[dict[str, Any], Any],
     output_lines: list[str],
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
-    message = issue.get("message", "Unknown issue")
-    location = issue.get("location", "")
+    message = _get_issue_attr(issue, "message", "Unknown issue")
+    location = _get_issue_attr(issue, "location", "")
 
     # Icon based on severity
     icons = {
@@ -1609,7 +1617,7 @@ def _format_issue(
         output_lines.append(f"{icon} {style_text(message, fg='bright_white')}")
 
     # Add "Why" explanation if available
-    why = issue.get("why")
+    why = _get_issue_attr(issue, "why")
     if why:
         why_label = style_text("Why:", fg="magenta", bold=True)
         # Wrap long explanations
@@ -1624,7 +1632,7 @@ def _format_issue(
         output_lines.append(f"       {why_label} {wrapped_why}")
 
     # Add details if available
-    details = issue.get("details", {})
+    details = _get_issue_attr(issue, "details", {})
     if details:
         for key, value in details.items():
             if value:  # Only show non-empty values

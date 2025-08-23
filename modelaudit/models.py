@@ -7,7 +7,7 @@ JSON structure that ModelAudit currently outputs for backward compatibility.
 import time
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 if TYPE_CHECKING:
     from .scanners.base import Check, Issue
@@ -190,6 +190,18 @@ class LicenseInfoModel(BaseModel):
     text: Optional[str] = Field(None, description="License text content")
     confidence: float = Field(0.0, description="Confidence in license detection", ge=0.0, le=1.0)
     source: Optional[str] = Field(None, description="Source of license detection (file, header, etc.)")
+    commercial_allowed: Optional[bool] = Field(None, description="Whether commercial use is allowed")
+
+    @field_validator("spdx_id")
+    @classmethod
+    def validate_spdx_id(cls, v: Optional[str]) -> Optional[str]:
+        """Validate SPDX ID format"""
+        if v is None:
+            return v
+        # Basic validation for common SPDX ID patterns
+        if not v.replace("-", "").replace(".", "").replace("+", "").isalnum():
+            raise ValueError("SPDX ID must contain only alphanumeric characters, hyphens, dots, and plus signs")
+        return v
 
 
 class CopyrightNoticeModel(BaseModel):
@@ -198,9 +210,21 @@ class CopyrightNoticeModel(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
     holder: str = Field(..., description="Copyright holder name")
-    years: Optional[str] = Field(None, description="Copyright years (e.g., '2020-2023')")
-    notice_text: Optional[str] = Field(None, description="Full copyright notice text")
+    year: Optional[str] = Field(None, description="Copyright year(s)")
+    text: Optional[str] = Field(None, description="Full copyright notice text")
     confidence: float = Field(0.0, description="Confidence in copyright detection", ge=0.0, le=1.0)
+
+    @field_validator("year")
+    @classmethod
+    def validate_year(cls, v: Optional[str]) -> Optional[str]:
+        """Validate copyright year format (e.g., '2020', '2020-2023')"""
+        if v is None:
+            return v
+        # Basic validation for year patterns
+        import re
+        if not re.match(r"^\d{4}(-\d{4})?$", v):
+            raise ValueError("Year must be in format YYYY or YYYY-YYYY")
+        return v
 
 
 class FileHashesModel(BaseModel):
