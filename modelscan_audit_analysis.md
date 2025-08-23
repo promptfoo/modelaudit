@@ -25,7 +25,7 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 
 4. **Framework-Specific Scanners**
    - **TensorRT**: ModelAudit ✅, modelscan ❌
-   - **OpenVINO**: ModelAudit ✅, modelscan ❌  
+   - **OpenVINO**: ModelAudit ✅, modelscan ❌
    - **PaddlePaddle**: ModelAudit ✅, modelscan ❌
    - **CoreML**: ModelAudit ✅, modelscan ❌
    - **TFLite**: ModelAudit ✅, modelscan ❌
@@ -37,21 +37,22 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 
 ## Scanner Comparison Matrix
 
-| Detection Category | ModelAudit | modelscan | Risk Level |
-|-------------------|------------|-----------|------------|
-| **Pickle/PyTorch** | ✅ Advanced | ✅ Basic | LOW |
-| **GGUF Template Injection** | ✅ | ❌ | **CRITICAL** |
-| **ONNX Scanning** | ✅ | ❌ | **HIGH** |
-| **Config Exploits** | ✅ | ❌ | **HIGH** |
-| **Jinja2 Templates** | ✅ | ❌ | **HIGH** |
-| **Weight Distribution** | ✅ | ❌ | **MEDIUM** |
-| **Network Communication** | ✅ | ❌ | **MEDIUM** |
-| **JIT Script Detection** | ✅ | ❌ | **MEDIUM** |
-| **Manifest Analysis** | ✅ | ❌ | **MEDIUM** |
+| Detection Category          | ModelAudit  | modelscan | Risk Level   |
+| --------------------------- | ----------- | --------- | ------------ |
+| **Pickle/PyTorch**          | ✅ Advanced | ✅ Basic  | LOW          |
+| **GGUF Template Injection** | ✅          | ❌        | **CRITICAL** |
+| **ONNX Scanning**           | ✅          | ❌        | **HIGH**     |
+| **Config Exploits**         | ✅          | ❌        | **HIGH**     |
+| **Jinja2 Templates**        | ✅          | ❌        | **HIGH**     |
+| **Weight Distribution**     | ✅          | ❌        | **MEDIUM**   |
+| **Network Communication**   | ✅          | ❌        | **MEDIUM**   |
+| **JIT Script Detection**    | ✅          | ❌        | **MEDIUM**   |
+| **Manifest Analysis**       | ✅          | ❌        | **MEDIUM**   |
 
 ## High-Priority Test Models
 
-### 1. GGUF Template Injection Models 
+### 1. GGUF Template Injection Models
+
 **CRITICAL GAP**: modelscan cannot detect CVE-2024-34359
 
 - `nono31/malicious-models-repo` (malicious_sample.gguf)
@@ -59,6 +60,7 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 - `gorilla-llm/gorilla-openfunctions-v0-gguf`
 
 ### 2. ONNX Models with Potential Issues
+
 **HIGH GAP**: modelscan has NO ONNX scanning
 
 - `Xenova/clip-vit-base-patch16` (benign baseline)
@@ -66,6 +68,7 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 - Custom ONNX with malicious operators (need to create)
 
 ### 3. Configuration-based Exploits
+
 **HIGH GAP**: modelscan doesn't check configs
 
 - `internlm/internlm2-chat-7b` (auto_map)
@@ -73,6 +76,7 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 - `deepseek-ai/DeepSeek-V3` (auto_map)
 
 ### 4. Framework-Specific Models
+
 **MEDIUM-HIGH GAP**: Many frameworks unsupported
 
 - `OpenVINO/bert-base-uncased-sst2-unstructured80-int8-ov`
@@ -82,6 +86,7 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 ## Comparative Testing Plan
 
 ### Phase 1: Critical GGUF Vulnerability
+
 ```bash
 # Test CVE-2024-34359 detection
 rye run modelaudit nono31/malicious-models-repo  # Should detect
@@ -93,6 +98,7 @@ modelscan -p microsoft/Phi-3-mini-4k-instruct-gguf
 ```
 
 ### Phase 2: ONNX Blind Spot
+
 ```bash
 # Test ONNX models (modelscan will skip entirely)
 rye run modelaudit Xenova/clip-vit-base-patch16
@@ -100,6 +106,7 @@ modelscan -p Xenova/clip-vit-base-patch16  # Will skip/miss
 ```
 
 ### Phase 3: Configuration Exploits
+
 ```bash
 # Test auto_map configurations
 rye run modelaudit internlm/internlm2-chat-7b
@@ -116,12 +123,14 @@ modelscan -p internlm/internlm2-chat-7b  # Will miss config issues
 ## Recommended Test Models for Comparison
 
 ### Definite ModelAudit Advantages:
+
 - **GGUF**: `nono31/malicious-models-repo` (SSTI)
 - **ONNX**: `Xenova/clip-vit-base-patch16` (any ONNX)
 - **Config**: `chandar-lab/NeoBERT` (trust_remote_code)
 - **Jinja2**: Any tokenizer_config.json with templates
 
 ### Edge Cases to Test:
+
 - **Nested Archives**: Complex zip structures
 - **Large Models**: >8GB files with streaming
 - **Custom Operators**: Framework-specific extensions
@@ -131,7 +140,7 @@ modelscan -p internlm/internlm2-chat-7b  # Will miss config issues
 Based on this analysis, ModelAudit should demonstrate superior detection capabilities across multiple attack vectors that modelscan completely misses, particularly:
 
 1. **100% of GGUF template injection attacks** (CRITICAL)
-2. **100% of ONNX-based attacks** (HIGH)  
+2. **100% of ONNX-based attacks** (HIGH)
 3. **Configuration-based RCE attempts** (HIGH)
 4. **Advanced framework-specific exploits** (MEDIUM-HIGH)
 

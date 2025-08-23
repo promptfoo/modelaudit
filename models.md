@@ -321,15 +321,15 @@ The following models are recommended for demonstrating ModelAudit's superior det
 
 ### Models that Demonstrate ModelAudit's Advantages
 
-| Category | Model | ModelAudit Detection | modelscan Result | Impact |
-|----------|-------|---------------------|------------------|---------|
-| **GGUF Template Injection** | `microsoft/Phi-3-mini-4k-instruct-gguf` | ✅ Chat template analysis | ❌ No GGUF scanner | **CRITICAL** |
-| **ONNX Blind Spot** | `Xenova/clip-vit-base-patch16` | ✅ Full ONNX graph analysis | ❌ Skips all .onnx files | **HIGH** |
-| **ONNX Blind Spot** | `onnx-community/mobilenet_v2_1.0_224` | ✅ Custom operator detection | ❌ Skips all .onnx files | **HIGH** |
-| **Config Exploits** | `internlm/internlm2-chat-7b` | ✅ auto_map detection | ❌ No config analysis | **HIGH** |
-| **Config Exploits** | `chandar-lab/NeoBERT` | ✅ trust_remote_code detection | ❌ No config analysis | **HIGH** |
-| **Advanced PyTorch** | `drhyrum/bert-tiny-torch-picklebomb` | ✅ CVE-2025-32434 patterns | ⚠️ Basic pickle detection | **MEDIUM** |
-| **Multi-format** | `nono31/malicious-models-repo` | ✅ 12+ distinct issues | ⚠️ 3 basic issues | **MEDIUM** |
+| Category                    | Model                                   | ModelAudit Detection           | modelscan Result          | Impact       |
+| --------------------------- | --------------------------------------- | ------------------------------ | ------------------------- | ------------ |
+| **GGUF Template Injection** | `microsoft/Phi-3-mini-4k-instruct-gguf` | ✅ Chat template analysis      | ❌ No GGUF scanner        | **CRITICAL** |
+| **ONNX Blind Spot**         | `Xenova/clip-vit-base-patch16`          | ✅ Full ONNX graph analysis    | ❌ Skips all .onnx files  | **HIGH**     |
+| **ONNX Blind Spot**         | `onnx-community/mobilenet_v2_1.0_224`   | ✅ Custom operator detection   | ❌ Skips all .onnx files  | **HIGH**     |
+| **Config Exploits**         | `internlm/internlm2-chat-7b`            | ✅ auto_map detection          | ❌ No config analysis     | **HIGH**     |
+| **Config Exploits**         | `chandar-lab/NeoBERT`                   | ✅ trust_remote_code detection | ❌ No config analysis     | **HIGH**     |
+| **Advanced PyTorch**        | `drhyrum/bert-tiny-torch-picklebomb`    | ✅ CVE-2025-32434 patterns     | ⚠️ Basic pickle detection | **MEDIUM**   |
+| **Multi-format**            | `nono31/malicious-models-repo`          | ✅ 12+ distinct issues         | ⚠️ 3 basic issues         | **MEDIUM**   |
 
 ### Quick Comparison Commands
 
@@ -338,7 +338,7 @@ The following models are recommended for demonstrating ModelAudit's superior det
 modelaudit hf://Xenova/clip-vit-base-patch16 --no-large-model-support
 modelscan -p ~/.modelaudit/cache/huggingface/Xenova/clip-vit-base-patch16
 
-# Test GGUF template analysis  
+# Test GGUF template analysis
 modelaudit hf://microsoft/Phi-3-mini-4k-instruct-gguf --timeout 300
 # modelscan has no GGUF support
 
