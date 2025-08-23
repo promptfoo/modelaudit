@@ -1,33 +1,14 @@
 import json
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
 
-
-@dataclass
-class LicenseInfo:
-    """Information about a detected license."""
-
-    spdx_id: Optional[str] = None
-    name: Optional[str] = None
-    commercial_allowed: Optional[bool] = None
-    source: str = "unknown"  # Where the license was detected from
-    confidence: float = 0.0  # Confidence score (0.0 to 1.0)
-    text: Optional[str] = None
-
-
-@dataclass
-class CopyrightInfo:
-    """Information about detected copyright notices."""
-
-    holder: str
-    year: Optional[str] = None
-    text: str = ""
-
+# Import Pydantic models instead of using dataclasses
+from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
+from modelaudit.models import LicenseInfoModel as LicenseInfo
 
 # Common license patterns with SPDX IDs and commercial use status
 LICENSE_PATTERNS = {
@@ -243,6 +224,8 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
                 commercial_allowed=info["commercial_allowed"] if isinstance(info["commercial_allowed"], bool) else None,
                 source="file_header",
                 confidence=0.8,  # High confidence for explicit patterns
+                url=None,
+                text=None,
             )
             licenses.append(license_info)
 
@@ -286,6 +269,7 @@ def extract_copyright_notices(
                     holder=holder,
                     year=year,
                     text=f"Copyright {year} {holder}",
+                    confidence=0.8,
                 )
                 copyrights.append(copyright_info)
 

@@ -21,11 +21,11 @@ def create_mock_scan_result(**kwargs):
     if "issues" in kwargs:
         import time
 
-        from modelaudit.models import IssueModel
+        from modelaudit.scanners.base import Issue
 
         issues = []
         for issue_dict in kwargs["issues"]:
-            issue = IssueModel(
+            issue = Issue(
                 message=issue_dict.get("message", "Test issue"),
                 severity=issue_dict.get("severity", "warning"),
                 location=issue_dict.get("location"),
