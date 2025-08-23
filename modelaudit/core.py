@@ -24,6 +24,7 @@ from modelaudit.utils.advanced_file_handler import (
     should_use_advanced_handler,
 )
 from modelaudit.utils.assets import asset_from_scan_result
+from modelaudit.utils.cache_decorator import cached_scan
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_file_format_from_magic,
@@ -1102,6 +1103,7 @@ def _is_huggingface_cache_file(path: str) -> bool:
     return bool("/refs/" in path and filename in ["main", "HEAD"])
 
 
+@cached_scan()
 def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
@@ -1117,37 +1119,8 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         config = {}
     validate_scan_config(config)
 
-    # Check cache configuration
-    cache_enabled = config.get("cache_enabled", True)
-    cache_dir = config.get("cache_dir")
-
-    # If caching is disabled, proceed with direct scan
-    if not cache_enabled:
-        return _scan_file_internal(path, config)
-
-    # Use cache manager for cache-enabled scans
-    try:
-        from .cache import get_cache_manager
-
-        cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-        # Create a wrapper function for the cache manager
-        def cached_scan_wrapper(file_path: str) -> dict:
-            result = _scan_file_internal(file_path, config)
-            return result.to_dict()
-
-        # Get cached result or perform scan
-        result_dict = cache_manager.cached_scan(path, cached_scan_wrapper)
-
-        # Convert back to ScanResult
-        from .utils.result_conversion import scan_result_from_dict
-
-        return scan_result_from_dict(result_dict)
-
-    except Exception as e:
-        # If cache system fails, fall back to direct scanning
-        logger.warning(f"Cache system error for {path}: {e}. Falling back to direct scan.")
-        return _scan_file_internal(path, config)
+    # Delegate to internal implementation - cache decorator handles caching
+    return _scan_file_internal(path, config)
 
 
 def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
