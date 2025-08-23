@@ -126,7 +126,9 @@ class DefaultCommandGroup(click.Group):
         formatter.write_paragraph()
         formatter.write_text("Other commands:")
         with formatter.indentation():
-            formatter.write_text("modelaudit doctor  # Diagnose scanner compatibility")
+            formatter.write_text("modelaudit doctor       # Diagnose scanner compatibility")
+            formatter.write_text("modelaudit cache clear  # Clear scan results cache")
+            formatter.write_text("modelaudit cache stats  # Show cache statistics")
 
         formatter.write_paragraph()
         formatter.write_text("For detailed help on scanning:")
@@ -242,6 +244,133 @@ def whoami() -> None:
     except Exception as error:
         error_message = str(error)
         click.echo(f"Failed to get user info: {error_message}", err=True)
+        sys.exit(1)
+
+
+@cli.group()
+def cache() -> None:
+    """Manage scan results cache"""
+    pass
+
+
+@cache.command()
+@click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
+@click.option("--dry-run", is_flag=True, help="Show what would be cleared without actually clearing")
+def clear(cache_dir: Optional[str], dry_run: bool) -> None:
+    """Clear the entire scan results cache"""
+    from .cache import get_cache_manager
+
+    try:
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+
+        if dry_run:
+            stats = cache_manager.get_stats()
+            total_entries = stats.get("total_entries", 0)
+            total_size_mb = stats.get("total_size_mb", 0.0)
+
+            click.echo(f"Would clear {total_entries} cache entries ({total_size_mb:.1f}MB)")
+            return
+
+        # Get stats before clearing for reporting
+        stats = cache_manager.get_stats()
+        total_entries = stats.get("total_entries", 0)
+        total_size_mb = stats.get("total_size_mb", 0.0)
+
+        # Clear the cache
+        try:
+            cache_manager.clear()
+            success_msg = f"Cleared {total_entries} cache entries ({total_size_mb:.1f}MB)"
+            click.echo(style_text(success_msg, fg="green"))
+        except PermissionError as e:
+            error_msg = f"Permission denied while clearing cache: {e}"
+            click.echo(style_text(error_msg, fg="red"), err=True)
+            click.echo("Try running with elevated permissions or check cache directory permissions.", err=True)
+            sys.exit(1)
+        except OSError as e:
+            error_msg = f"File system error while clearing cache: {e}"
+            click.echo(style_text(error_msg, fg="red"), err=True)
+            sys.exit(1)
+
+    except Exception as e:
+        error_msg = f"Failed to clear cache: {e}"
+        click.echo(style_text(error_msg, fg="red"), err=True)
+        sys.exit(1)
+
+
+@cache.command()
+@click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
+@click.option("--max-age", type=int, default=30, help="Maximum age of entries to keep in days [default: 30]")
+@click.option("--dry-run", is_flag=True, help="Show what would be cleaned without actually cleaning")
+def cleanup(cache_dir: Optional[str], max_age: int, dry_run: bool) -> None:
+    """Clean up old cache entries"""
+    from .cache import get_cache_manager
+
+    try:
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+
+        if dry_run:
+            # For dry run, we'd need to implement a preview method
+            # For now, just show current stats
+            stats = cache_manager.get_stats()
+            total_entries = stats.get("total_entries", 0)
+            total_size_mb = stats.get("total_size_mb", 0.0)
+
+            click.echo(f"Would cleanup cache entries older than {max_age} days")
+            click.echo(f"Current cache: {total_entries} entries ({total_size_mb:.1f}MB)")
+            return
+
+        # Clean up old entries
+        removed_count = cache_manager.cleanup(max_age)
+
+        if removed_count > 0:
+            success_msg = f"Removed {removed_count} old cache entries (>{max_age} days old)"
+            click.echo(style_text(success_msg, fg="green"))
+        else:
+            click.echo("No old cache entries found to remove")
+
+    except Exception as e:
+        error_msg = f"Failed to cleanup cache: {e}"
+        click.echo(style_text(error_msg, fg="red"), err=True)
+        sys.exit(1)
+
+
+@cache.command()
+@click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
+def stats(cache_dir: Optional[str]) -> None:
+    """Show cache statistics"""
+    from .cache import get_cache_manager
+
+    try:
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+        stats = cache_manager.get_stats()
+
+        click.echo("Cache Statistics")
+        click.echo("=" * 20)
+
+        enabled = stats.get("enabled", False)
+        if not enabled:
+            click.echo(style_text("Cache is disabled", fg="yellow"))
+            return
+
+        total_entries = stats.get("total_entries", 0)
+        total_size_mb = stats.get("total_size_mb", 0.0)
+        cache_hits = stats.get("cache_hits", 0)
+        cache_misses = stats.get("cache_misses", 0)
+        hit_rate = stats.get("hit_rate", 0.0)
+
+        click.echo(f"Total entries: {total_entries}")
+        click.echo(f"Total size: {total_size_mb:.1f}MB")
+        click.echo(f"Cache hits: {cache_hits}")
+        click.echo(f"Cache misses: {cache_misses}")
+        click.echo(f"Hit rate: {hit_rate:.1%}")
+
+        if total_entries > 0:
+            avg_size_kb = (total_size_mb * 1024) / total_entries
+            click.echo(f"Average entry size: {avg_size_kb:.1f}KB")
+
+    except Exception as e:
+        error_msg = f"Failed to get cache stats: {e}"
+        click.echo(style_text(error_msg, fg="red"), err=True)
         sys.exit(1)
 
 
@@ -1077,6 +1206,8 @@ def scan_command(
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
                         "progress_update_interval": progress_interval,
+                        "cache_enabled": cache,
+                        "cache_dir": cache_dir,
                     }
 
                     scan_results: ModelAuditResultModel = scan_model_directory_or_file(
