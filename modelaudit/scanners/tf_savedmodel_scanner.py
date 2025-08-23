@@ -27,6 +27,9 @@ DANGEROUS_TF_OPERATIONS = {
     "SystemConfig": IssueSeverity.CRITICAL,  # System configuration access
 }
 
+# Python operations that require special handling
+PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
+
 # Try to import TensorFlow, but handle the case where it's not installed
 try:
     import tensorflow as tf  # noqa: F401
@@ -270,8 +273,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
             for meta_graph in saved_model.meta_graphs:
                 graph_def = meta_graph.graph_def
                 for node in graph_def.node:
-                    # Skip PyFunc/PyCall here; they are handled by _check_python_op
-                    if node.op in ("PyFunc", "PyCall"):
+                    # Skip Python ops here; they are handled by _check_python_op
+                    if node.op in PYTHON_OPS:
                         continue
                     if node.op in DANGEROUS_TF_OPERATIONS:
                         dangerous_ops.append(
@@ -301,26 +304,25 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if node.op in self.suspicious_ops:
                     suspicious_op_found = True
 
-                    if node.op in DANGEROUS_TF_OPERATIONS:
-                        if node.op in ["PyFunc", "PyCall"]:
-                            self._check_python_op(node, result, meta_graph)
-                        continue
-
-                    result.add_check(
-                        name="TensorFlow Operation Security Check",
-                        passed=False,
-                        message=f"Suspicious TensorFlow operation: {node.op}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (node: {node.name})",
-                        details={
-                            "op_type": node.op,
-                            "node_name": node.name,
-                            "meta_graph": (
-                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                            ),
-                        },
-                        why=get_tf_op_explanation(node.op),
-                    )
+                    # Special handling for PyFunc/PyCall - try to extract and validate Python code
+                    if node.op in PYTHON_OPS:
+                        self._check_python_op(node, result, meta_graph)
+                    else:
+                        result.add_check(
+                            name="TensorFlow Operation Security Check",
+                            passed=False,
+                            message=f"Suspicious TensorFlow operation: {node.op}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "op_type": node.op,
+                                "node_name": node.name,
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            },
+                            why=get_tf_op_explanation(node.op),
+                        )
 
                 # Check for StatefulPartitionedCall which can contain custom functions
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
