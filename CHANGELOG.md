@@ -133,7 +133,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **fix**: resolve PyTorch scanner pickle path context (#257)
 - **fix**: improve detection of evasive malicious models and optimize large file handling (#256)
 - **fix**: eliminate false positives and false negatives in model scanning (#253)
 - **fix**: improve PyTorch ZIP scanner detection for .bin files (#248)
@@ -282,7 +281,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat**: add PR title validation - Development workflow improvements (#35)
 - **feat**: add manifest parser error handling - Better diagnostics for corrupted model metadata (#30)
 - **feat**: change output label of ERROR severity to CRITICAL (#25)
-- **ci**: add automated dependency updates - Dependabot integration for security patches (#4)
 
 ### Changed
 
