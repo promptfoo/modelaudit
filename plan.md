@@ -5,6 +5,7 @@
 Based on comprehensive audit, **39 scanning entry points** identified across the codebase that need cache integration for maximum performance benefit.
 
 ### **📊 Audit Summary**
+
 - **39 scanning entry points** identified across the codebase
 - **4 critical integration layers** for maximum cache coverage
 - **3 specialized handlers** for large files that need priority caching
@@ -17,6 +18,7 @@ Based on comprehensive audit, **39 scanning entry points** identified across the
 ### **Layer 1: Core Scanning Orchestration (HIGHEST PRIORITY)**
 
 **Primary Target: `core.py:scan_file()` - Line 1100**
+
 - **Impact**: 🔴 **CRITICAL** - This is the main entry point for ALL file scanning
 - **Current Flow**: File → Format Detection → Scanner Selection → Scan Execution
 - **Cache Integration Point**: Wrap the entire `scan_file()` function with `CacheManager.cached_scan()`
@@ -31,19 +33,19 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 # AFTER (with cache integration)
 def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
     from .cache import get_cache_manager
-    
+
     # Get cache configuration
     cache_enabled = config.get('cache_enabled', True) if config else True
     cache_dir = config.get('cache_dir') if config else None
-    
+
     if not cache_enabled:
         # Direct scan without cache
         return _scan_file_internal(path, config)
-    
+
     # Use cache manager
     cache_manager = get_cache_manager(cache_dir, enabled=True)
     result_dict = cache_manager.cached_scan(path, _scan_file_internal, config)
-    
+
     # Convert dict back to ScanResult if needed
     return _result_from_dict(result_dict) if isinstance(result_dict, dict) else result_dict
 
@@ -55,6 +57,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> d
 ### **Layer 2: Large File Handlers (HIGH PRIORITY)**
 
 **Targets**:
+
 1. **`utils/large_file_handler.py:scan_large_file()` - Line 211**
 2. **`utils/advanced_file_handler.py:scan_advanced_large_file()` - Line 489**
 
@@ -64,16 +67,16 @@ These handlers are **extremely expensive** for large models (>10GB) and would be
 # Integration Example for large_file_handler.py
 def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
     from ..cache import get_cache_manager
-    
+
     # Check if caching is enabled in scanner config
     config = getattr(scanner, 'config', {})
     cache_enabled = config.get('cache_enabled', True)
-    
+
     if cache_enabled:
         cache_manager = get_cache_manager()
         return cache_manager.cached_scan(
-            file_path, 
-            _scan_large_file_internal, 
+            file_path,
+            _scan_large_file_internal,
             scanner, progress_callback, timeout
         )
     else:
@@ -83,11 +86,12 @@ def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Ca
 ### **Layer 3: Individual Scanner Methods (MEDIUM PRIORITY)**
 
 **27 Scanner Classes** - Each has a `scan()` method:
+
 - `PickleScanner.scan()` - Most critical (pickle files are dangerous)
 - `SafeTensorsScanner.scan()` - Very common format
 - `PyTorchZipScanner.scan()` - Complex analysis
 - `KerasH5Scanner.scan()` - HDF5 parsing expensive
-- `ONNXScanner.scan()` - Protobuf parsing 
+- `ONNXScanner.scan()` - Protobuf parsing
 - ... 22 more scanners
 
 **Implementation Strategy**: Modify `BaseScanner` to provide optional caching:
@@ -97,18 +101,18 @@ def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Ca
 def scan_with_cache(self, path: str) -> ScanResult:
     """Scan with optional caching support."""
     cache_enabled = self.config.get('cache_enabled', True)
-    
+
     if not cache_enabled:
         return self.scan(path)
-    
+
     from ..cache import get_cache_manager
     cache_manager = get_cache_manager()
-    
+
     # Create cache-aware scan function
     def cached_scan_func(file_path: str) -> dict:
         result = self.scan(file_path)
         return result.to_dict()
-    
+
     result_dict = cache_manager.cached_scan(path, cached_scan_func)
     return self._result_from_dict(result_dict)
 
@@ -118,11 +122,13 @@ def scan_with_cache(self, path: str) -> ScanResult:
 ### **Layer 4: Integration Functions (MEDIUM PRIORITY)**
 
 **Network-Intensive Operations**:
+
 1. **`jfrog_integration.py:scan_jfrog_artifact()`** - Downloads + Scans
-2. **`mlflow_integration.py:scan_mlflow_model()`** - Model Registry + Scans  
+2. **`mlflow_integration.py:scan_mlflow_model()`** - Model Registry + Scans
 3. **HuggingFace Integration** - Downloads from HF Hub + Scans
 
 These need **multi-level caching**:
+
 - Download cache (already exists)
 - Scan result cache (new)
 
@@ -131,21 +137,25 @@ These need **multi-level caching**:
 ## 🚀 **Implementation Priority & Timeline**
 
 ### **Phase 1: Core Integration (Week 1) - CRITICAL**
+
 1. ✅ Integrate `core.py:scan_file()` with cache manager
 2. ✅ Update CLI to pass cache configuration down
 3. ✅ Test with real models to verify performance gains
 
 ### **Phase 2: Large File Optimization (Week 1) - HIGH**
+
 1. ✅ Integrate large file handlers with caching
 2. ✅ Test with >1GB models to measure impact
 3. ✅ Ensure cache keys work with memory-mapped scanning
 
 ### **Phase 3: Scanner-Level Caching (Week 2) - MEDIUM**
+
 1. ✅ Add optional caching to `BaseScanner`
 2. ✅ Update high-value scanners (Pickle, SafeTensors, PyTorch)
 3. ✅ Benchmark individual scanner cache hits
 
 ### **Phase 4: Integration Enhancements (Week 2) - MEDIUM**
+
 1. ✅ Multi-level caching for network operations
 2. ✅ Cache invalidation on model updates
 3. ✅ Advanced cache statistics and monitoring
@@ -155,12 +165,14 @@ These need **multi-level caching**:
 ## 🔧 **Technical Implementation Details**
 
 ### **Cache Key Strategy**
+
 ```python
 # Cache keys should include:
 cache_key = f"{file_hash}_{scanner_name}_{modelaudit_version}_{scanner_config_hash}"
 ```
 
-### **Configuration Integration** 
+### **Configuration Integration**
+
 ```python
 # Update CLI to pass cache config
 @cli.command("scan")
@@ -175,6 +187,7 @@ def scan_command(..., cache: bool, cache_dir: str):
 ```
 
 ### **Performance Expectations**
+
 - **4-20x speedup** on cache hits (based on our BERT testing)
 - **Minimal overhead** on cache misses (~50ms for hashing)
 - **Tiny disk footprint** (~2KB per cached scan)
@@ -184,11 +197,13 @@ def scan_command(..., cache: bool, cache_dir: str):
 ## 📋 **All Scanning Entry Points Identified**
 
 ### **Core Orchestration**
+
 1. `core.py:scan_file()` - Line 1100 - **PRIMARY TARGET**
 2. `core.py:scan_model_directory_or_file()` - Line 455 - Main CLI entry
 3. `interrupt_handler.py:scan_file()` - Calls core.scan_file()
 
 ### **Large File Handlers**
+
 4. `utils/large_file_handler.py:scan_large_file()` - Line 211
 5. `utils/large_file_handler.py:LargeFileHandler.scan()` - Line 82
 6. `utils/advanced_file_handler.py:scan_advanced_large_file()` - Line 489
@@ -197,6 +212,7 @@ def scan_command(..., cache: bool, cache_dir: str):
 9. `utils/advanced_file_handler.py:ShardScanner.scan_shards()` - Line 241
 
 ### **Individual Scanners (27 total)**
+
 10. `scanners/pickle_scanner.py:PickleScanner.scan()` - Line 817
 11. `scanners/safetensors_scanner.py:SafeTensorsScanner.scan()` - Line 55
 12. `scanners/pytorch_zip_scanner.py:PyTorchZipScanner.scan()` - Line 56
@@ -225,11 +241,13 @@ def scan_command(..., cache: bool, cache_dir: str):
 35. `scanners/base.py:BaseScanner.scan_with_progress()` - Line 986
 
 ### **Integration Functions**
+
 36. `jfrog_integration.py:scan_jfrog_artifact()` - Line 18
 37. `mlflow_integration.py:scan_mlflow_model()` - Line 13
 38. `cli.py:scan_command()` - Line 511 - Main CLI entry
 
 ### **Utility Scanners**
+
 39. `license_checker.py:scan_for_license_headers()` - Line 188
 
 ---
@@ -238,13 +256,14 @@ def scan_command(..., cache: bool, cache_dir: str):
 
 Based on real BERT model testing:
 
-| Model Type | Size | Current Scan | Cached Scan | Speedup | Time Saved |
-|------------|------|--------------|-------------|---------|------------|
-| BERT-base | 420 MB | 3.64s | 0.53s | **6.8x** | 3.1s |
-| RoBERTa-large | 1.3 GB | 12.68s | 2.69s | **4.7x** | 10.0s |
-| Expected Large Models | 10+ GB | 60-300s | 5-15s | **12-20x** | 45-285s |
+| Model Type            | Size   | Current Scan | Cached Scan | Speedup    | Time Saved |
+| --------------------- | ------ | ------------ | ----------- | ---------- | ---------- |
+| BERT-base             | 420 MB | 3.64s        | 0.53s       | **6.8x**   | 3.1s       |
+| RoBERTa-large         | 1.3 GB | 12.68s       | 2.69s       | **4.7x**   | 10.0s      |
+| Expected Large Models | 10+ GB | 60-300s      | 5-15s       | **12-20x** | 45-285s    |
 
 **Key Benefits:**
+
 - 🚀 **4-20x speedup** on repeated scans
 - 💾 **Minimal cache footprint** (~2KB per scan)
 - 🔐 **No security compromise** - full scanning maintained
@@ -255,6 +274,7 @@ Based on real BERT model testing:
 ## 🎯 **Success Criteria**
 
 ### **Phase 1 Success Metrics**
+
 - ✅ All scans through `core.py:scan_file()` use cache when enabled
 - ✅ 4-10x speedup on cache hits with real models
 - ✅ Cache can be disabled via `--no-cache` CLI flag
@@ -262,6 +282,7 @@ Based on real BERT model testing:
 - ✅ Backward compatibility - no breaking changes
 
 ### **Overall Success Metrics**
+
 - ✅ **Every file scan** across ModelAudit benefits from caching
 - ✅ Significant performance improvements for development workflows
 - ✅ Minimal overhead for first-time scans

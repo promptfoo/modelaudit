@@ -1,6 +1,6 @@
 artifact_location: file:///Users/mdangelo/projects/ma3/mlruns/0
 creation_time: 1755961022643
-experiment_id: '0'
+experiment_id: "0"
 last_update_time: 1755961022643
 lifecycle_stage: active
 name: Default
