@@ -1,15 +1,28 @@
+import logging
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 
 from modelaudit.explanations import get_tf_op_explanation
-from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+from modelaudit.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
 from modelaudit.utils.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger(__name__)
+
+# Derive from centralized list; keep severities unified here
+# Exclude Python ops (handled elsewhere) and pure decode ops from the generic pass
+_EXCLUDE_FROM_GENERIC = {"DecodeRaw", "DecodeJpeg", "DecodePng"}
+DANGEROUS_TF_OPERATIONS = {
+    op: IssueSeverity.CRITICAL for op in TENSORFLOW_DANGEROUS_OPS if op not in _EXCLUDE_FROM_GENERIC
+}
+
+# Python operations that require special handling
+PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
 # Try to import TensorFlow, but handle the case where it's not installed
 try:
@@ -126,6 +139,20 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
+                for op_info in self._scan_tf_operations(saved_model):
+                    result.add_check(
+                        name="TensorFlow Operation Security Check",
+                        passed=False,
+                        message=f"Dangerous TensorFlow operation: {op_info['operation']}",
+                        severity=op_info["severity"],
+                        location=f"{self.current_file_path} (node: {op_info['node_name']})",
+                        details={
+                            "op_type": op_info["operation"],
+                            "node_name": op_info["node_name"],
+                            "meta_graph": op_info.get("meta_graph", "unknown"),
+                        },
+                        why=get_tf_op_explanation(op_info["operation"]),
+                    )
 
                 self._analyze_saved_model(saved_model, result)
 
@@ -234,6 +261,31 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _scan_tf_operations(self, saved_model: Any) -> list[dict[str, Any]]:
+        """Scan TensorFlow graph for dangerous operations (generic pass)"""
+        dangerous_ops: list[dict[str, Any]] = []
+        try:
+            for meta_graph in saved_model.meta_graphs:
+                graph_def = meta_graph.graph_def
+                for node in graph_def.node:
+                    # Skip Python ops here; they are handled by _check_python_op
+                    if node.op in PYTHON_OPS:
+                        continue
+                    if node.op in DANGEROUS_TF_OPERATIONS:
+                        dangerous_ops.append(
+                            {
+                                "operation": node.op,
+                                "node_name": node.name,
+                                "severity": DANGEROUS_TF_OPERATIONS[node.op],
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            }
+                        )
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Failed to iterate TensorFlow graph: {e}")
+        return dangerous_ops
+
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
         suspicious_op_found = False
@@ -245,19 +297,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Scan all nodes in the graph for suspicious operations
             for node in graph_def.node:
                 # Count all operation types
-                if node.op in op_counts:
-                    op_counts[node.op] += 1
-                else:
-                    op_counts[node.op] = 1
+                op_counts[node.op] = op_counts.get(node.op, 0) + 1
 
-                # Check if the operation is suspicious
                 if node.op in self.suspicious_ops:
                     suspicious_op_found = True
 
                     # Special handling for PyFunc/PyCall - try to extract and validate Python code
-                    if node.op in ["PyFunc", "PyCall"]:
+                    if node.op in PYTHON_OPS:
                         self._check_python_op(node, result, meta_graph)
-                    else:
+                    elif node.op not in DANGEROUS_TF_OPERATIONS:
                         result.add_check(
                             name="TensorFlow Operation Security Check",
                             passed=False,
@@ -273,6 +321,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                             why=get_tf_op_explanation(node.op),
                         )
+                    # else: already reported by generic dangerous-op pass
 
                 # Check for StatefulPartitionedCall which can contain custom functions
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:

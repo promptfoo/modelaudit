@@ -205,6 +205,14 @@ TF_OP_EXPLANATIONS = {
         "The PyFunc operation executes arbitrary Python code in the TensorFlow graph, which attackers can "
         "abuse to run system commands or other malicious code."
     ),
+    "PyFuncStateless": (
+        "The PyFuncStateless operation executes arbitrary Python code without maintaining state between calls, "
+        "which attackers can abuse to run system commands or other malicious code."
+    ),
+    "EagerPyFunc": (
+        "The EagerPyFunc operation executes arbitrary Python code in eager execution mode, which attackers can "
+        "abuse to run system commands or other malicious code during model loading or inference."
+    ),
     "PyCall": (
         "The PyCall operation invokes Python callbacks during graph execution, creating dangerous security risks "
         "by allowing arbitrary code execution that could compromise the system."
