@@ -2532,32 +2532,41 @@ class PickleScanner(BaseScanner):
             ):
                 torch_references += 1
 
-            # Pattern 1: Suspicious torch imports (NOT legitimate ones like FloatStorage, etc.)
+            # Pattern 1: Clearly malicious torch operations (not legitimate storage/rebuild operations)
             if (
                 opcode.name in ["GLOBAL", "STACK_GLOBAL"]
                 and arg
                 and any(torch_pattern in str(arg).lower() for torch_pattern in ["torch", "pytorch", "_c", "jit"])
             ):
-                # Skip legitimate PyTorch operations
-                legitimate_torch_ops = [
-                    "floatstorage", "longstorage", "intstorage", "doublestorage", "shortstorage", "charstorage",
-                    "_rebuild_tensor_v2", "_rebuild_tensor", "_rebuild_parameter", "_rebuild_sparse_tensor",
-                    "_rebuild_nested_tensor", "strided", "contiguous", "storage", "tensor"
-                ]
-
-                if not any(legitimate in str(arg).lower() for legitimate in legitimate_torch_ops):
-                    # Look for dangerous opcodes within next 15 positions
-                    for j in range(i + 1, min(i + 16, len(opcodes))):
-                        next_opcode, next_arg, next_pos = opcodes[j]
-                        if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                # Look for dangerous opcodes within next 30 positions
+                # Note: We check ALL torch operations since even legitimate ones can be part of attacks
+                for j in range(i + 1, min(i + 31, len(opcodes))):
+                    next_opcode, next_arg, next_pos = opcodes[j]
+                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                        # Only flag clearly suspicious torch operations
+                        is_suspicious = (
+                            # Suspicious torch modules/functions
+                            any(suspicious in str(arg).lower() for suspicious in [
+                                "eval", "exec", "system", "import", "builtin", "compile",
+                                "subprocess", "os.", "sys.", "__import__", "getattr"
+                            ]) or
+                            # Non-standard torch operations that could be malicious
+                            ("torch" in str(arg).lower() and 
+                             not any(standard in str(arg).lower() for standard in [
+                                 "storage", "_rebuild", "tensor", "parameter", "module", 
+                                 "nn.", "functional", "utils", "cuda", "device"
+                             ]))
+                        )
+                        
+                        if is_suspicious:
                             patterns.append(
                                 {
                                     "pattern_type": "torch_import_with_execution",
                                     "description": (
-                                        f"Suspicious PyTorch import followed by {next_opcode.name} opcode"
+                                        f"Suspicious PyTorch operation ({arg}) followed by {next_opcode.name} opcode"
                                     ),
                                     "opcodes": [opcode.name, next_opcode.name],
-                                    "exploitation_method": "weights_only=True bypass via PyTorch internal access",
+                                    "exploitation_method": "weights_only=True bypass via PyTorch operation",
                                     "position": pos,
                                 }
                             )
