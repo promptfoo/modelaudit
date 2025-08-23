@@ -218,25 +218,25 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         scanner = PickleScanner()
         result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
 
-        assert len(result.issues) > 0
+        assert len(result.issues) > 0, "Expected issues to be detected for STACK_GLOBAL attack"
         os_issues = [i for i in result.issues if "os" in i.message.lower() or "posix" in i.message.lower()]
-        assert len(os_issues) > 0
+        assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
         result = scanner.scan("tests/assets/pickles/memo_attack.pkl")
 
-        assert len(result.issues) > 0
+        assert len(result.issues) > 0, "Expected issues to be detected for memo-based attack"
         subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
-        assert len(subprocess_issues) > 0
+        assert len(subprocess_issues) > 0, f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
 
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
         result = scanner.scan("tests/assets/pickles/multiple_stream_attack.pkl")
 
-        assert len(result.issues) > 0
+        assert len(result.issues) > 0, "Expected issues to be detected for multiple pickle streams"
         eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
-        assert len(eval_issues) > 0
+        assert len(eval_issues) > 0, f"Expected eval issues, but found: {[i.message for i in result.issues]}"
 
     def test_scan_regular_pickle_file(self):
         """Test that regular .pkl files don't trigger binary content scanning"""

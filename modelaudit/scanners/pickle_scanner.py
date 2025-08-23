@@ -28,6 +28,30 @@ from ..explanations import (
 from ..suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
+
+def _compute_pickle_length(path: str) -> int:
+    """
+    Compute the exact length of pickle data by finding the STOP opcode position.
+    
+    Args:
+        path: Path to the file containing pickle data
+        
+    Returns:
+        The byte position where pickle data ends, or a fallback estimate
+    """
+    try:
+        with open(path, "rb") as f:
+            for opcode, arg, pos in pickletools.genops(f):
+                if opcode.name == "STOP":
+                    return pos + 1  # Include the STOP opcode itself
+        # If no STOP found, fallback to file size (malformed pickle)
+        return os.path.getsize(path)
+    except Exception:
+        # Fallback to conservative estimate on any error
+        file_size = os.path.getsize(path)
+        return min(file_size // 2, 64)
+
+
 # ============================================================================
 # SMART DETECTION SYSTEM - ML Context Awareness
 # ============================================================================
@@ -990,9 +1014,9 @@ class PickleScanner(BaseScanner):
                         "recursion_limited": True,
                         "file_size": file_size,
                         "security_issues_found": True,
-                        # Add expected metadata fields for test compatibility
-                        "pickle_bytes": min(file_size // 2, 64),  # Rough estimate - assume small pickle header
-                        "binary_bytes": max(file_size - min(file_size // 2, 64), 0),
+                        # Add precise metadata fields using pickletools for accuracy
+                        "pickle_bytes": _compute_pickle_length(path),
+                        "binary_bytes": max(file_size - _compute_pickle_length(path), 0),
                     }
                 )
                 # Add a note about the recursion limit but don't treat it as the main issue
