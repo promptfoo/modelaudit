@@ -597,17 +597,15 @@ class SafeTensorsScanner(BaseScanner):
 
     def _calculate_json_depth(self, obj: Any, current_depth: int = 0) -> int:
         """Calculate maximum depth of JSON object"""
-        if not isinstance(obj, (dict, list)):
-            return current_depth
-
         if isinstance(obj, dict):
             if not obj:
                 return current_depth
             return max(self._calculate_json_depth(v, current_depth + 1) for v in obj.values())
-
+        
         if isinstance(obj, list):
             if not obj:
                 return current_depth
             return max(self._calculate_json_depth(v, current_depth + 1) for v in obj)
 
+        # For primitive types (str, int, float, bool, None)
         return current_depth
