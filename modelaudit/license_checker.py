@@ -224,6 +224,8 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
                 commercial_allowed=info["commercial_allowed"] if isinstance(info["commercial_allowed"], bool) else None,
                 source="file_header",
                 confidence=0.8,  # High confidence for explicit patterns
+                url=None,
+                text=None,
             )
             licenses.append(license_info)
 
@@ -267,6 +269,7 @@ def extract_copyright_notices(
                     holder=holder,
                     year=year,
                     text=f"Copyright {year} {holder}",
+                    confidence=0.8,
                 )
                 copyrights.append(copyright_info)
 
