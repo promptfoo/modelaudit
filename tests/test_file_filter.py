@@ -11,7 +11,7 @@ class TestFileFilter:
     def test_skip_common_extensions(self):
         """Test that common non-model extensions are skipped."""
         skip_files = [
-            "README.md",
+            # Note: README.md is now scanned by MetadataScanner for security
             "test.txt",
             "script.py",
             "style.css",
@@ -62,7 +62,8 @@ class TestFileFilter:
 
     def test_skip_specific_filenames(self):
         """Test that specific filenames are skipped."""
-        skip_names = ["README", "Makefile", "requirements.txt", "package.json"]
+        # Note: README is now scanned by MetadataScanner for security
+        skip_names = ["Makefile", "requirements.txt", "package.json"]
 
         for name in skip_names:
             assert should_skip_file(name), f"Should skip {name}"
@@ -108,14 +109,16 @@ class TestFileFilter:
     def test_path_handling(self):
         """Test that the function handles full paths correctly."""
         # Should extract filename and check extension
-        assert should_skip_file("/path/to/README.md")
+        # Note: README.md is now scanned by MetadataScanner, so not skipped
+        assert not should_skip_file("/path/to/README.md")
         assert should_skip_file("./relative/path/script.py")
         assert not should_skip_file("/models/checkpoint.pkl")
         assert not should_skip_file("data/model.h5")
 
     def test_case_sensitivity(self):
         """Test that extension checking is case-insensitive."""
-        assert should_skip_file("README.MD")
+        # Note: README.MD is now scanned by MetadataScanner, so not skipped
+        assert not should_skip_file("README.MD")
         assert should_skip_file("script.PY")
         assert should_skip_file("IMAGE.JPG")
 

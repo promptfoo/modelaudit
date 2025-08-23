@@ -1,6 +1,5 @@
 """Tests for metadata scanner."""
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -11,19 +10,11 @@ from modelaudit.scanners.metadata_scanner import MetadataScanner
 class TestMetadataScanner:
     """Test metadata scanner functionality."""
 
-    def test_can_handle_json_configs(self):
-        """Test that scanner handles JSON configuration files."""
-        scanner = MetadataScanner()
-
-        # config.json is handled by ManifestScanner, not MetadataScanner
-        assert not scanner.can_handle("config.json")
-        assert scanner.can_handle("tokenizer_config.json")
-        assert scanner.can_handle("generation_config.json")
-
     def test_can_handle_text_metadata(self):
-        """Test that scanner handles text metadata files."""
+        """Test that scanner handles text metadata files only."""
         scanner = MetadataScanner()
 
+        # Should handle README and documentation files
         assert scanner.can_handle("README")
         assert scanner.can_handle("readme")
         assert scanner.can_handle("README.md")
@@ -33,6 +24,11 @@ class TestMetadataScanner:
         assert scanner.can_handle("model-index.yml")
         assert scanner.can_handle("model-index.yaml")
 
+        # Should NOT handle config files (handled by ManifestScanner)
+        assert not scanner.can_handle("config.json")
+        assert not scanner.can_handle("tokenizer_config.json")
+        assert not scanner.can_handle("generation_config.json")
+
     def test_cannot_handle_other_files(self):
         """Test that scanner rejects non-metadata files."""
         scanner = MetadataScanner()
@@ -40,207 +36,93 @@ class TestMetadataScanner:
         assert not scanner.can_handle("model.pkl")
         assert not scanner.can_handle("pytorch_model.bin")
         assert not scanner.can_handle("data.txt")
+        assert not scanner.can_handle("random.json")
 
-    def test_scan_valid_json_config(self):
-        """Test scanning valid JSON configuration."""
+    def test_scan_valid_readme(self):
+        """Test scanning valid README file."""
         scanner = MetadataScanner()
-        config = {"model_type": "bert", "hidden_size": 768, "num_layers": 12}
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            tokenizer_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(tokenizer_path, "w") as f:
-                json.dump(config, f)
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write("# My Model\\n\\nThis is a clean README with no security issues.\\n")
 
-            result = scanner.scan(str(tokenizer_path))
+            result = scanner.scan(str(readme_path))
 
         assert result.scanner_name == "metadata"
-        assert len(result.issues) == 0  # Clean config should have no issues
+        assert len(result.issues) == 0  # Clean README should have no issues
 
-    def test_scan_suspicious_url_in_config(self):
-        """Test detection of suspicious URLs in configuration."""
+    def test_scan_suspicious_urls_in_readme(self):
+        """Test detection of suspicious URLs in README."""
         scanner = MetadataScanner()
-        config = {"model_url": "https://bit.ly/suspicious-model", "download_url": "https://ngrok.io/malicious-endpoint"}
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write(
+                    "# Model Info\\n\\n- Download: https://bit.ly/suspicious-model\\n- Endpoint: https://ngrok.io/malicious-endpoint\\n"
+                )
 
-            result = scanner.scan(str(config_path))
+            result = scanner.scan(str(readme_path))
 
         assert len(result.issues) == 2
         assert all(issue.severity == IssueSeverity.WARNING for issue in result.issues)
         assert any("bit.ly" in issue.message for issue in result.issues)
         assert any("ngrok.io" in issue.message for issue in result.issues)
 
-    def test_scan_exposed_secrets_in_config(self):
-        """Test detection of exposed secrets in configuration."""
+    def test_scan_exposed_secrets_in_readme(self):
+        """Test detection of exposed secrets in README."""
         scanner = MetadataScanner()
-        config = {
-            "api_key": "sk-1234567890abcdef",
-            "auth_token": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "secret": "not_a_placeholder_value_123",
-        }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write(
+                    "# Model Setup\\n\\n"
+                    + "API Key: sk-1234567890abcdef1234567890abcdef12345678\\n"
+                    + "Token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n"
+                )
 
-            result = scanner.scan(str(config_path))
-
-        assert len(result.issues) >= 1  # Should detect at least one real secret
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any("api_key" in issue.message for issue in result.issues)
-
-    def test_scan_ignores_placeholder_secrets(self):
-        """Test that obvious placeholders are not flagged as secrets."""
-        scanner = MetadataScanner()
-        config = {"api_key": "your_api_key_here", "token": "placeholder_token", "secret": "XXXXXXXXXX"}
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
-
-            result = scanner.scan(str(config_path))
-
-        # Should not flag placeholders
-        assert len(result.issues) == 0
-
-    def test_scan_auto_map_entries(self):
-        """Test detection of dangerous auto_map entries."""
-        scanner = MetadataScanner()
-        config = {"auto_map": {"AutoModel": "custom_model.py", "AutoTokenizer": "os.system('rm -rf /')"}}
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
-
-            result = scanner.scan(str(config_path))
-
-        assert len(result.issues) >= 1  # Should detect at least one dangerous reference
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any("os" in issue.message for issue in result.issues)
-
-    def test_scan_custom_code_references(self):
-        """Test detection of custom code references."""
-        scanner = MetadataScanner()
-        config = {"custom_objects": "import os; os.system('malicious')", "lambda_layer": "lambda x: eval(x)"}
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
-
-            result = scanner.scan(str(config_path))
-
-        assert len(result.issues) >= 2  # Should detect multiple dangerous patterns
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
-
-    def test_scan_text_metadata_with_urls(self):
-        """Test scanning text metadata files for suspicious URLs."""
-        scanner = MetadataScanner()
-        content = """# Model Card
-
-This model is available at: https://bit.ly/suspicious-link
-
-For more info: https://ngrok.io/tunnel
-"""
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(content)
-            f.flush()
-
-            result = scanner.scan(f.name)
-
-        assert len(result.issues) >= 2  # Should detect multiple suspicious URLs
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
-
-        # Cleanup
-        Path(f.name).unlink()
-
-    def test_scan_text_metadata_with_secrets(self):
-        """Test scanning text metadata for exposed secrets."""
-        scanner = MetadataScanner()
-        content = """# Setup Instructions
-
-Set your API key: sk-1234567890abcdef1234567890abcdef12345678
-
-GitHub token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-"""
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(content)
-            f.flush()
-
-            result = scanner.scan(f.name)
+            result = scanner.scan(str(readme_path))
 
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
 
-        # Cleanup
-        Path(f.name).unlink()
-
-    def test_scan_invalid_json(self):
-        """Test handling of invalid JSON files."""
+    def test_scan_ignores_placeholder_secrets(self):
+        """Test that obvious placeholders are not flagged as secrets."""
         scanner = MetadataScanner()
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                f.write('{"invalid": json}')  # Invalid JSON
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write("# Setup\\n\\nAPI Key: your_api_key_here\\nToken: placeholder_token\\nSecret: XXXXXXXXXX\\n")
 
-            result = scanner.scan(str(config_path))
+            result = scanner.scan(str(readme_path))
 
-        assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.WARNING
-        assert "Invalid JSON" in result.issues[0].message
+        # Should not flag placeholders
+        assert len(result.issues) == 0
 
     def test_scan_nonexistent_file(self):
         """Test handling of nonexistent files."""
         scanner = MetadataScanner()
 
-        result = scanner.scan("/nonexistent/tokenizer_config.json")
+        result = scanner.scan("/nonexistent/README.md")
 
         assert len(result.issues) == 1
         assert result.issues[0].severity == IssueSeverity.WARNING
         assert "Error reading" in result.issues[0].message
 
-    def test_scan_nested_config_structure(self):
-        """Test scanning nested configuration structures."""
-        scanner = MetadataScanner()
-        config = {
-            "model": {"endpoints": {"inference": "https://tinyurl.com/malicious"}},
-            "auth": {"credentials": {"api_key": "real_key_12345"}},
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
-
-            result = scanner.scan(str(config_path))
-
-        assert len(result.issues) >= 2  # Should detect multiple issues
-        # Should detect both suspicious URL and potential secret
-        severities = {issue.severity for issue in result.issues}
-        assert IssueSeverity.WARNING in severities
-        assert IssueSeverity.CRITICAL in severities
-
     def test_bytes_scanned_reported(self):
         """Test that bytes scanned is properly reported."""
         scanner = MetadataScanner()
-        config = {"model_type": "test"}
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "tokenizer_config.json"
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write("# Test README\\n")
 
-            expected_size = config_path.stat().st_size
-            result = scanner.scan(str(config_path))
+            expected_size = readme_path.stat().st_size
+            result = scanner.scan(str(readme_path))
 
         assert result.bytes_scanned > 0
         assert result.bytes_scanned == expected_size
