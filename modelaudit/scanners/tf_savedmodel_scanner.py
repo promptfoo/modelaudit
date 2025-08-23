@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Optional
@@ -10,6 +11,19 @@ from modelaudit.utils.code_validation import (
 )
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger(__name__)
+
+DANGEROUS_TF_OPERATIONS = {
+    "ReadFile": IssueSeverity.CRITICAL,  # File system read access
+    "WriteFile": IssueSeverity.CRITICAL,  # File system write access
+    "PyFunc": IssueSeverity.CRITICAL,  # Python function execution
+    "PyCall": IssueSeverity.CRITICAL,  # Python code execution
+    "ShellExecute": IssueSeverity.CRITICAL,  # Shell command execution
+    "MergeV2Checkpoints": IssueSeverity.CRITICAL,  # Checkpoint manipulation
+    "Save": IssueSeverity.WARNING,  # Save operations
+    "SaveV2": IssueSeverity.WARNING,  # SaveV2 operations
+}
 
 # Try to import TensorFlow, but handle the case where it's not installed
 try:
@@ -126,6 +140,19 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
+                for op_info in self._scan_tf_operations(content):
+                    result.add_check(
+                        name="TensorFlow Operation Security Check",
+                        passed=False,
+                        message=f"Dangerous TensorFlow operation: {op_info['operation']}",
+                        severity=op_info["severity"],
+                        location=f"{self.current_file_path} (node: {op_info['node_name']})",
+                        details={
+                            "op_type": op_info["operation"],
+                            "node_name": op_info["node_name"],
+                        },
+                        why=get_tf_op_explanation(op_info["operation"]),
+                    )
 
                 self._analyze_saved_model(saved_model, result)
 
@@ -234,6 +261,30 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _scan_tf_operations(self, model_pb: bytes) -> list[dict[str, Any]]:
+        """Scan TensorFlow graph for dangerous operations"""
+        dangerous_ops: list[dict[str, Any]] = []
+
+        try:
+            saved_model = SavedModelType()
+            saved_model.ParseFromString(model_pb)
+
+            for meta_graph in saved_model.meta_graphs:
+                graph_def = meta_graph.graph_def
+                for node in graph_def.node:
+                    if node.op in DANGEROUS_TF_OPERATIONS:
+                        dangerous_ops.append(
+                            {
+                                "operation": node.op,
+                                "node_name": node.name,
+                                "severity": DANGEROUS_TF_OPERATIONS[node.op],
+                            }
+                        )
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.warning(f"Failed to parse TensorFlow graph: {e}")
+
+        return dangerous_ops
+
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
         suspicious_op_found = False
@@ -245,34 +296,31 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Scan all nodes in the graph for suspicious operations
             for node in graph_def.node:
                 # Count all operation types
-                if node.op in op_counts:
-                    op_counts[node.op] += 1
-                else:
-                    op_counts[node.op] = 1
+                op_counts[node.op] = op_counts.get(node.op, 0) + 1
 
-                # Check if the operation is suspicious
                 if node.op in self.suspicious_ops:
                     suspicious_op_found = True
 
-                    # Special handling for PyFunc/PyCall - try to extract and validate Python code
-                    if node.op in ["PyFunc", "PyCall"]:
-                        self._check_python_op(node, result, meta_graph)
-                    else:
-                        result.add_check(
-                            name="TensorFlow Operation Security Check",
-                            passed=False,
-                            message=f"Suspicious TensorFlow operation: {node.op}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (node: {node.name})",
-                            details={
-                                "op_type": node.op,
-                                "node_name": node.name,
-                                "meta_graph": (
-                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                                ),
-                            },
-                            why=get_tf_op_explanation(node.op),
-                        )
+                    if node.op in DANGEROUS_TF_OPERATIONS:
+                        if node.op in ["PyFunc", "PyCall"]:
+                            self._check_python_op(node, result, meta_graph)
+                        continue
+
+                    result.add_check(
+                        name="TensorFlow Operation Security Check",
+                        passed=False,
+                        message=f"Suspicious TensorFlow operation: {node.op}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (node: {node.name})",
+                        details={
+                            "op_type": node.op,
+                            "node_name": node.name,
+                            "meta_graph": (
+                                meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                            ),
+                        },
+                        why=get_tf_op_explanation(node.op),
+                    )
 
                 # Check for StatefulPartitionedCall which can contain custom functions
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:

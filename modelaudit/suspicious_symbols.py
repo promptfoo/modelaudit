@@ -253,6 +253,22 @@ SUSPICIOUS_OPS = {
     "DecodePng",  # PNG decoding (image processing)
 }
 
+TENSORFLOW_DANGEROUS_OPS = {
+    # File system operations - HIGH RISK
+    "ReadFile": "Can read arbitrary files from the system",
+    "WriteFile": "Can write arbitrary files to the system",
+    "MergeV2Checkpoints": "Can manipulate checkpoint files",
+    "Save": "Can save data to arbitrary locations",
+    "SaveV2": "Can save data to arbitrary locations",
+    # Code execution - CRITICAL RISK
+    "PyFunc": "Can execute arbitrary Python functions",
+    "PyCall": "Can call arbitrary Python code",
+    # System operations - CRITICAL RISK
+    "ShellExecute": "Can execute shell commands",
+    "ExecuteOp": "Can execute arbitrary operations",
+    "SystemConfig": "Can access system configuration",
+}
+
 # Suspicious Keras layer types
 # Layer types that can contain arbitrary code or complex functionality
 SUSPICIOUS_LAYER_TYPES = {

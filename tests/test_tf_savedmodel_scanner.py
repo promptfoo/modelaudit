@@ -165,6 +165,28 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+def test_detect_readfile_operation():
+    scanner = TensorFlowSavedModelScanner()
+    result = scanner.scan("tests/assets/tensorflow/malicious_readfile/saved_model.pb")
+
+    assert result.issues
+    readfile_issues = [i for i in result.issues if "ReadFile" in i.message]
+    assert readfile_issues
+    assert readfile_issues[0].severity == IssueSeverity.CRITICAL
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+def test_detect_pyfunc_operation():
+    scanner = TensorFlowSavedModelScanner()
+    result = scanner.scan("tests/assets/tensorflow/malicious_pyfunc/saved_model.pb")
+
+    assert result.issues
+    pyfunc_issues = [i for i in result.issues if "PyFunc" in i.message]
+    assert pyfunc_issues
+    assert pyfunc_issues[0].severity == IssueSeverity.CRITICAL
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
 def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
