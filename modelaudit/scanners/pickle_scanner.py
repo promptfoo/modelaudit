@@ -1111,10 +1111,10 @@ class PickleScanner(BaseScanner):
 
             # Handle different types of parsing errors more gracefully
             error_message = str(e).lower()
-            if ("opcode" in error_message or "unknown" in error_message):
+            if "opcode" in error_message or "unknown" in error_message:
                 # This could be a complex pickle file, corrupted data, or binary file
                 file_ext = os.path.splitext(path)[1].lower()
-                
+
                 if is_bin_file:
                     # Binary file that's not a pickle - handle gracefully
                     logger.debug(f"Binary file {path} does not contain valid pickle data: {e}")
@@ -1125,20 +1125,23 @@ class PickleScanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=path,
                         details={
-                            "file_type": "binary", 
+                            "file_type": "binary",
                             "pickle_parse_error": str(e),
-                            "early_detection_successful": early_detection_successful
+                            "early_detection_successful": early_detection_successful,
                         },
-                        why="This binary file does not contain valid pickle data structure. Binary content was analyzed for security patterns instead."
+                        why=("This binary file does not contain valid pickle data structure. "
+                             "Binary content was analyzed for security patterns instead."),
                     )
-                    
+
                     # If early detection was successful, also perform comprehensive binary scan
                     if early_detection_successful:
-                        result.metadata.update({
-                            "file_type": "binary",
-                            "pickle_parsing_failed": True,
-                        })
-                        
+                        result.metadata.update(
+                            {
+                                "file_type": "binary",
+                                "pickle_parsing_failed": True,
+                            }
+                        )
+
                         # Perform comprehensive binary scan of the entire file
                         try:
                             with open(path, "rb") as f:
@@ -1159,38 +1162,41 @@ class PickleScanner(BaseScanner):
                         except Exception as binary_scan_error:
                             logger.warning(f"Binary scan failed for {path}: {binary_scan_error}")
                             result.metadata["binary_scan_failed"] = str(binary_scan_error)
-                        
+
                         result.finish(success=True)
                         return result
-                        
-                elif file_ext in ['.pkl', '.pickle', '.joblib', '.dill']:
+
+                elif file_ext in [".pkl", ".pickle", ".joblib", ".dill"]:
                     # Pickle-like file with parsing issues - handle as format complexity
                     logger.debug(f"Pickle file {path} truncated due to format complexity: {e}")
                     result.add_check(
                         name="Pickle Format Complexity",
                         passed=True,  # Not a failure, just complex format
-                        message="Scan truncated due to format complexity", 
+                        message="Scan truncated due to format complexity",
                         severity=IssueSeverity.INFO,
                         location=path,
                         details={
                             "file_type": "pickle_complex",
                             "parse_error": str(e),
                             "early_detection_successful": early_detection_successful,
-                            "truncation_reason": "format_complexity"
+                            "truncation_reason": "format_complexity",
                         },
-                        why="This pickle file contains complex structures that could not be fully parsed. Early security pattern analysis was performed."
+                        why=("This pickle file contains complex structures that could not be fully parsed. "
+                             "Early security pattern analysis was performed."),
                     )
-                    
+
                     # Always update metadata for complex pickle files
-                    result.metadata.update({
-                        "file_type": "pickle_complex",
-                        "parsing_truncated": True,
-                        "truncation_reason": "format_complexity"
-                    })
-                    
+                    result.metadata.update(
+                        {
+                            "file_type": "pickle_complex",
+                            "parsing_truncated": True,
+                            "truncation_reason": "format_complexity",
+                        }
+                    )
+
                     result.finish(success=True)
                     return result
-            
+
             # Handle as critical error for truly suspicious cases
             result.add_check(
                 name="Pickle File Open",
@@ -1236,7 +1242,7 @@ class PickleScanner(BaseScanner):
             b"getstatusoutput",  # commands.getstatusoutput
             b"system",  # Catches both os.system and from os import system
         ]
-        
+
         # Add all binary code patterns to ensure consistency with binary scanning
         dangerous_patterns.extend(BINARY_CODE_PATTERNS)
 
