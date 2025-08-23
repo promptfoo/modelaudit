@@ -372,6 +372,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "sevenzip": {
+                "module": "modelaudit.scanners.sevenzip_scanner",
+                "class": "SevenZipScanner",
+                "description": "Scans 7-Zip archive files",
+                "extensions": [".7z"],
+                "priority": 97,  # Before generic zip scanner
+                "dependencies": ["py7zr"],
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",

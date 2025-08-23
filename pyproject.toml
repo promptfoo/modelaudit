@@ -59,6 +59,7 @@ tensorrt = ["tensorrt>=8.6.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
+sevenzip = ["py7zr>=0.20.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
     "numpy>=1.19.0,<2.0",
