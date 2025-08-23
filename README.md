@@ -153,7 +153,7 @@ ModelAudit provides additional flags for specialized workflows:
 
 - `--strict-license` – fail when incompatible or deprecated licenses are detected
 - `--max-file-size BYTES` / `--max-total-size BYTES` – limit scanning of very large files
-- `--max-download-size SIZE` – cap remote downloads (e.g., `500MB`, `2GB`)
+- `--max-download-size SIZE` – cap remote downloads (e.g., `500 MB`, `2 GB`)
 - `--preview` – show size and metadata before downloading remote models
 - `--cache/--no-cache` and `--cache-dir PATH` – control caching of cloud downloads
 - `--no-skip-files` and `--selective/--all-files` – control which files are scanned in directories
@@ -164,10 +164,10 @@ ModelAudit provides additional flags for specialized workflows:
 
 ModelAudit automatically optimizes scanning strategies for different model sizes:
 
-- **<100GB**: Full in-memory analysis for comprehensive scanning
-- **100GB-1TB**: Chunked processing with 50GB chunks for memory efficiency
-- **1TB-5TB**: Streaming analysis with intelligent sampling
-- **>5TB**: Advanced distributed scanning techniques
+- **<100 GB**: Full in-memory analysis for comprehensive scanning
+- **100 GB-1 TB**: Chunked processing with 50 GB chunks for memory efficiency
+- **1 TB-5 TB**: Streaming analysis with intelligent sampling
+- **>5 TB**: Advanced distributed scanning techniques
 
 Large models are supported with automatic timeout increases and memory-optimized processing.
 
