@@ -11,29 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **feat**: add Jinja2 template injection scanner (#323)
 - **feat**: comprehensive deep Pydantic integration with advanced type safety (#322)
-- **feat**: add Pydantic models for JSON export with type safety (#315)
-- **feat**: add support for multi-part archive suffixes (#307)
 - **feat**: optimize CI for faster feedback (#320)
-- **test**: speed up tests and CI runtime (#316)
-- **test**: cover Windows path extraction scenarios (#313)
 - **docs**: add comprehensive CI optimization guide (#319)
 - **docs**: add Non-Interactive Commands guidance to AGENTS.md (#318)
+- **feat**: skip SafeTensors in WeightDistributionScanner for performance (#317)
+- **test**: speed up tests and CI runtime (#316)
+- **feat**: add Pydantic models for JSON export with type safety (#315)
+- **test**: cover Windows path extraction scenarios (#313)
+- **feat**: add support for multi-part archive suffixes (#307)
 - **docs**: add comprehensive publishing instructions (#302)
 
 ### Changed
 
-- **perf**: skip SafeTensors in WeightDistributionScanner for performance (#317)
+- **chore**: make ctrl+c immediately terminate if pressed twice (#314)
 
 ### Fixed
 
-- **fix**: make ctrl+c immediately terminate if pressed twice (#314)
-- **fix**: recurse cloud object size calculations (#309)
-- **fix**: avoid duplicated sharded file paths (#305)
-- **fix**: handle missing author in HuggingFace model info (#308)
-- **fix**: handle PyTorch Hub URLs with multi-part extensions (#306)
+- **fix**: default bytes_scanned in streaming operations (#312)
 - **fix**: validate directory file list before filtering (#311)
 - **fix**: tighten ONNX preview signature validation (#310)
-- **fix**: default bytes_scanned in streaming operations (#312)
+- **fix**: recurse cloud object size calculations (#309)
+- **fix**: handle missing author in HuggingFace model info (#308)
+- **fix**: handle PyTorch Hub URLs with multi-part extensions (#306)
+- **fix**: avoid duplicated sharded file paths (#305)
 - **fix**: handle None values in Keras H5 scanner to prevent TypeError (#303)
 
 ## [0.2.3] - 2025-08-21
@@ -133,7 +133,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **fix**: resolve PyTorch scanner pickle path context (#257)
 - **fix**: improve detection of evasive malicious models and optimize large file handling (#256)
 - **fix**: eliminate false positives and false negatives in model scanning (#253)
 - **fix**: improve PyTorch ZIP scanner detection for .bin files (#248)
@@ -281,7 +280,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat**: add multi-format .bin file support - Enhanced detection for various binary model formats (#57)
 - **feat**: add manifest parser error handling - Better diagnostics for corrupted model metadata (#30)
 - **feat**: add PR title validation - Development workflow improvements (#35)
-- **ci**: add automated dependency updates - Dependabot integration for security patches (#4)
 - **feat**: change output label of ERROR severity to CRITICAL (#25)
 
 ### Changed
