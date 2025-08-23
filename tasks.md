@@ -60,6 +60,7 @@ Add detection for dangerous TensorFlow operations (ReadFile, WriteFile, PyFunc, 
    ```
 
 2. **Update suspicious_symbols.py**:
+
    ```python
    # Add to SUSPICIOUS_OPS section
    TENSORFLOW_DANGEROUS_OPS = {
@@ -254,6 +255,7 @@ Implement advanced pickle opcode analysis including STACK_GLOBAL parsing and mem
    ```
 
 2. **Update suspicious_symbols.py**:
+
    ```python
    # Add sophisticated pickle patterns
    ADVANCED_PICKLE_PATTERNS = {
@@ -479,6 +481,7 @@ Replace binary "suspicious/not suspicious" classification with ModelScan's gradu
    ```
 
 3. **Update CLI Output** (`modelaudit/cli.py`):
+
    ```python
    def format_severity_output(severity: IssueSeverity) -> str:
        """Format severity with color coding"""
@@ -721,6 +724,7 @@ Implement external TOML configuration files for security rules, allowing enterpr
    ```
 
 4. **CLI Integration** (`modelaudit/cli.py`):
+
    ```python
    @click.option(
        "--config",
@@ -803,6 +807,7 @@ Enable scanning of files containing multiple pickle objects, which attackers use
 ### Implementation Details
 
 1. **Enhance Pickle Scanner** (extend Task 2 implementation):
+
    ```python
    def _scan_multiple_pickle_streams(self, file_path: str) -> List[ScanResult]:
        """Scan file for multiple pickle streams"""
@@ -932,6 +937,7 @@ Detect Windows (`nt`) and Unix (`posix`) OS module aliases that attackers use to
 ### Implementation Details
 
 1. **Update Suspicious Symbols**:
+
    ```python
    # Add to SUSPICIOUS_GLOBALS
    OS_MODULE_ALIASES = {
@@ -1091,6 +1097,7 @@ Implement ModelScan's approach to graceful degradation where missing dependencie
    ```
 
 2. **CLI Diagnostics Command** (`modelaudit/cli.py`):
+
    ```python
    @cli.command("doctor")
    def doctor():
@@ -1278,6 +1285,7 @@ Implement PickleScan's three-tier safety classification (Innocuous, Suspicious, 
    ```
 
 3. **Enhanced Classification Logic** (`modelaudit/scanners/pickle_scanner.py`):
+
    ```python
    def _classify_global_safety(self, module: str, name: str) -> Tuple[SafetyLevel, IssueSeverity]:
        """Classify global import using PickleScan's safety logic"""
