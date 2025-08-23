@@ -55,15 +55,56 @@ class PyTorchZipScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
+        # Initial validation and setup
+        result = self._initialize_scan(path)
+        if result.success is False:  # Early return for validation failures
+            return result
+
+        try:
+            # Store the file path for use in issue locations
+            self.current_file_path = path
+
+            with zipfile.ZipFile(path, "r") as zip_file:
+                # Validate ZIP entries and check for path traversal
+                safe_entries = self._validate_zip_entries(zip_file, result, path)
+
+                # Discover pickle files in the archive
+                pickle_files = self._discover_pickle_files(zip_file, safe_entries, result)
+
+                # Extract version info and check for CVE vulnerabilities
+                self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
+
+                # Scan all discovered pickle files
+                bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
+
+                # Check for JIT/Script code execution risks
+                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
+
+                # Detect suspicious non-pickle files
+                self._detect_suspicious_files(safe_entries, result, path)
+
+                # Validate PyTorch model structure
+                self._validate_pytorch_structure(pickle_files, result)
+
+                # Check for blacklisted patterns across all files
+                self._check_blacklist_patterns(zip_file, safe_entries, result)
+
+                result.bytes_scanned = bytes_scanned
+
+        except zipfile.BadZipFile:
+            return self._handle_bad_zip_error(path)
+        except Exception as e:
+            return self._handle_scan_error(path, e)
+
+        result.finish(success=True)
+        return result
+
+    def _initialize_scan(self, path: str) -> ScanResult:
+        """Initialize scan with basic validation and setup"""
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
-
-        # Handle large files with streaming
-        # size_check = self._check_size_limit(path)
-        # if size_check:
-        #     return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -72,6 +113,7 @@ class PyTorchZipScanner(BaseScanner):
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
 
+        # Validate ZIP format
         header = self._read_header(path)
         if not header.startswith(b"PK"):
             result.add_check(
@@ -92,463 +134,468 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-        try:
-            # Store the file path for use in issue locations
-            self.current_file_path = path
+        return result
 
-            with zipfile.ZipFile(path, "r") as z:
-                safe_entries: list[str] = []
-                path_traversal_found = False
-                for name in z.namelist():
-                    temp_base = os.path.join(tempfile.gettempdir(), "extract")
-                    _, is_safe = sanitize_archive_path(name, temp_base)
-                    if not is_safe:
-                        result.add_check(
-                            name="Path Traversal Protection",
-                            passed=False,
-                            message=f"Archive entry {name} attempted path traversal outside the archive",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}:{name}",
-                            details={"entry": name},
-                        )
-                        path_traversal_found = True
-                        continue
-                    safe_entries.append(name)
+    def _validate_zip_entries(self, zip_file: zipfile.ZipFile, result: ScanResult, path: str) -> list[str]:
+        """Validate ZIP entries and check for path traversal attacks"""
+        safe_entries: list[str] = []
+        path_traversal_found = False
 
-                if not path_traversal_found and z.namelist():
-                    result.add_check(
-                        name="Path Traversal Protection",
-                        passed=True,
-                        message="All archive entries have safe paths",
-                        location=path,
-                        details={"entries_checked": len(z.namelist())},
-                    )
-                # Find pickle files - PyTorch models often use various names
-                # Common patterns: data.pkl, archive/data.pkl, *.pkl, or any file with pickle magic bytes
-                pickle_files = []
-                for name in safe_entries:
-                    # Check common pickle file patterns
-                    if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
+        for name in zip_file.namelist():
+            temp_base = os.path.join(tempfile.gettempdir(), "extract")
+            _, is_safe = sanitize_archive_path(name, temp_base)
+            if not is_safe:
+                result.add_check(
+                    name="Path Traversal Protection",
+                    passed=False,
+                    message=f"Archive entry {name} attempted path traversal outside the archive",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path}:{name}",
+                    details={"entry": name},
+                )
+                path_traversal_found = True
+                continue
+            safe_entries.append(name)
+
+        if not path_traversal_found and zip_file.namelist():
+            result.add_check(
+                name="Path Traversal Protection",
+                passed=True,
+                message="All archive entries have safe paths",
+                location=path,
+                details={"entries_checked": len(zip_file.namelist())},
+            )
+
+        return safe_entries
+
+    def _discover_pickle_files(
+        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult
+    ) -> list[str]:
+        """Discover pickle files in the ZIP archive"""
+        pickle_files = []
+
+        # First pass: Look for common pickle file patterns
+        for name in safe_entries:
+            if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
+                pickle_files.append(name)
+
+        # Second pass: If no obvious pickle files found, check for pickle magic bytes
+        if not pickle_files:
+            for name in safe_entries:
+                try:
+                    data_start = zip_file.read(name)[:4]
+                    pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+                    if any(data_start.startswith(m) for m in pickle_magics):
                         pickle_files.append(name)
+                except Exception:
+                    pass
 
-                # If no obvious pickle files found, check all files for pickle magic bytes
-                if not pickle_files:
-                    for name in safe_entries:
-                        try:
-                            # Read first few bytes to check for pickle magic
-                            data_start = z.read(name)[:4]
-                            pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
-                            if any(data_start.startswith(m) for m in pickle_magics):
-                                pickle_files.append(name)
-                        except Exception:
-                            pass
+        result.metadata["pickle_files"] = pickle_files
+        return pickle_files
 
-                result.metadata["pickle_files"] = pickle_files
+    def _check_pytorch_vulnerabilities(
+        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
+    ) -> None:
+        """Extract PyTorch version info and check for CVE vulnerabilities"""
+        pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries)
+        result.metadata.update(pytorch_version_info)
+        self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
 
-                # Extract PyTorch version information for CVE-2025-32434 detection
-                pytorch_version_info = self._extract_pytorch_version_info(z, safe_entries)
-                result.metadata.update(pytorch_version_info)
+    def _scan_pickle_files(
+        self, zip_file: zipfile.ZipFile, pickle_files: list[str], result: ScanResult, path: str
+    ) -> int:
+        """Scan all discovered pickle files for malicious content"""
+        bytes_scanned = 0
 
-                # Check for CVE-2025-32434 vulnerability based on version
-                self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
+        for name in pickle_files:
+            info = zip_file.getinfo(name)
+            file_size = info.file_size
 
-                # Track number of bytes scanned
-                bytes_scanned = 0
+            # Set the current file path on the pickle scanner for proper error reporting
+            self.pickle_scanner.current_file_path = f"{path}:{name}"
 
-                # Scan each pickle file using streaming to handle large files
-                for name in pickle_files:
-                    # Get file info without loading it
-                    info = z.getinfo(name)
-                    file_size = info.file_size
+            # Choose scanning approach based on file size
+            if file_size < 10 * 1024 * 1024 * 1024:  # < 10GB
+                data = zip_file.read(name)
+                bytes_scanned += len(data)
 
-                    # Set the current file path on the pickle scanner for proper error reporting
-                    self.pickle_scanner.current_file_path = f"{path}:{name}"
+                with io.BytesIO(data) as file_like:
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
+            else:
+                # For large pickle files, use streaming extraction
+                with zip_file.open(name, "r") as zf:
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(
+                        cast(io.BufferedIOBase, zf),  # type: ignore[arg-type]
+                        file_size,
+                    )
+                bytes_scanned += file_size
 
-                    # For small pickle files (< 10GB), read normally
-                    if file_size < 10 * 1024 * 1024 * 1024:
-                        data = z.read(name)
-                        bytes_scanned += len(data)
+            # Update issue metadata and locations
+            for issue in sub_result.issues:
+                if issue.details:
+                    issue.details["pickle_filename"] = name
+                else:
+                    issue.details = {"pickle_filename": name}
 
-                        with io.BytesIO(data) as file_like:
-                            sub_result = self.pickle_scanner._scan_pickle_bytes(
-                                file_like,
-                                len(data),
-                            )
-                    else:
-                        # For large pickle files, use streaming extraction
-                        with z.open(name, "r") as zf:
-                            # Scan the pickle file in a memory-efficient way
-                            # The pickle scanner will handle the streaming internally
-                            # Type cast to satisfy mypy - z.open returns IO[bytes] which is compatible with BinaryIO
-                            sub_result = self.pickle_scanner._scan_pickle_bytes(
-                                cast(io.BufferedIOBase, zf),  # type: ignore[arg-type]
-                                file_size,
-                            )
-                        bytes_scanned += file_size
+                # Update location to include the main file path
+                if not issue.location:
+                    issue.location = f"{path}:{name}"
+                elif "pos" in issue.location:
+                    issue.location = f"{path}:{name} {issue.location}"
 
-                    # Include the pickle filename in each issue
-                    for issue in sub_result.issues:
-                        if issue.details:
-                            issue.details["pickle_filename"] = name
-                        else:
-                            issue.details = {"pickle_filename": name}
+            # Add CVE-2025-32434 specific warnings
+            self._add_weights_only_safety_warnings(sub_result, result, path, name)
+            result.merge(sub_result)
 
-                        # Update location to include the main file path
-                        if not issue.location:
-                            issue.location = f"{path}:{name}"
-                        elif "pos" in issue.location:
-                            # If it's a position from the pickle scanner,
-                            # prepend the file path
-                            issue.location = f"{path}:{name} {issue.location}"
+        return bytes_scanned
 
-                    # Add CVE-2025-32434 specific warnings for PyTorch models with dangerous opcodes
-                    self._add_weights_only_safety_warnings(sub_result, result, path, name)
+    def _scan_for_jit_patterns(
+        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
+    ) -> int:
+        """Check for JIT/Script code execution risks"""
+        bytes_scanned = 0
+        jit_patterns_found = False
 
-                    # Merge results
-                    result.merge(sub_result)
+        for name in safe_entries:
+            if jit_patterns_found:
+                break  # Already found patterns, no need to continue
 
-                # Check for JIT/Script code execution risks
-                # Stream through entries to check for TorchScript patterns without loading all into memory
-                jit_patterns_found = False
-                for name in safe_entries:
-                    if jit_patterns_found:
-                        break  # Already found patterns, no need to continue
+            try:
+                info = zip_file.getinfo(name)
+                # Only check first 100GB of each file for JIT patterns
+                check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
 
-                    try:
-                        info = z.getinfo(name)
-                        # Only check first 100GB of each file for JIT patterns
-                        check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
+                with zip_file.open(name, "r") as zf:
+                    chunk = zf.read(check_size)
+                    bytes_scanned += len(chunk)
 
-                        with z.open(name, "r") as zf:
-                            chunk = zf.read(check_size)
-                            bytes_scanned += len(chunk)
-
-                            # Check this chunk for JIT/Script patterns
-                            self.check_for_jit_script_code(
-                                chunk,
-                                result,
-                                model_type="pytorch",
-                                context=f"{path}:{name}",
-                            )
-
-                            # Check if we found any JIT issues
-                            if any("JIT" in issue.message or "TorchScript" in issue.message for issue in result.issues):
-                                jit_patterns_found = True
-
-                    except Exception:
-                        # Skip files that can't be read
-                        pass
-
-                # Network communication check is already done per-file in the loop above
-
-                # Check for other suspicious files
-                python_files_found = False
-                executable_files_found = False
-                for name in safe_entries:
-                    # Check for Python code files
-                    if name.endswith(".py"):
-                        result.add_check(
-                            name="Python Code File Detection",
-                            passed=False,
-                            message=f"Python code file found in PyTorch model: {name}",
-                            severity=IssueSeverity.INFO,
-                            location=f"{path}:{name}",
-                            details={"file": name},
-                        )
-                        python_files_found = True
-                    # Check for shell scripts or other executable files
-                    elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
-                        result.add_check(
-                            name="Executable File Detection",
-                            passed=False,
-                            message=f"Executable file found in PyTorch model: {name}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}:{name}",
-                            details={"file": name},
-                        )
-                        executable_files_found = True
-
-                if not python_files_found and safe_entries:
-                    result.add_check(
-                        name="Python Code File Detection",
-                        passed=True,
-                        message="No Python code files found in model",
-                        location=path,
+                    # Check this chunk for JIT/Script patterns
+                    self.check_for_jit_script_code(
+                        chunk,
+                        result,
+                        model_type="pytorch",
+                        context=f"{path}:{name}",
                     )
 
-                if not executable_files_found and safe_entries:
-                    result.add_check(
-                        name="Executable File Detection",
-                        passed=True,
-                        message="No executable files found in model",
-                        location=path,
+                    # Check this chunk for network communication patterns
+                    self.check_for_network_communication(
+                        chunk,
+                        result,
+                        context=f"{path}:{name}",
                     )
 
-                # Check for missing data.pkl (common in PyTorch models)
-                if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_files]:
+                    # Check if we found any JIT issues
+                    if any("JIT" in issue.message or "TorchScript" in issue.message for issue in result.issues):
+                        jit_patterns_found = True
+
+            except Exception:
+                # Skip files that can't be read
+                pass
+
+        return bytes_scanned
+
+    def _detect_suspicious_files(self, safe_entries: list[str], result: ScanResult, path: str) -> None:
+        """Detect suspicious non-pickle files in the archive"""
+        python_files_found = False
+        executable_files_found = False
+
+        for name in safe_entries:
+            # Check for Python code files
+            if name.endswith(".py"):
+                result.add_check(
+                    name="Python Code File Detection",
+                    passed=False,
+                    message=f"Python code file found in PyTorch model: {name}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{path}:{name}",
+                    details={"file": name},
+                )
+                python_files_found = True
+            # Check for shell scripts or other executable files
+            elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
+                result.add_check(
+                    name="Executable File Detection",
+                    passed=False,
+                    message=f"Executable file found in PyTorch model: {name}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path}:{name}",
+                    details={"file": name},
+                )
+                executable_files_found = True
+
+        # Add positive checks if no suspicious files found
+        if not python_files_found and safe_entries:
+            result.add_check(
+                name="Python Code File Detection",
+                passed=True,
+                message="No Python code files found in model",
+                location=path,
+            )
+
+        if not executable_files_found and safe_entries:
+            result.add_check(
+                name="Executable File Detection",
+                passed=True,
+                message="No executable files found in model",
+                location=path,
+            )
+
+    def _validate_pytorch_structure(self, pickle_files: list[str], result: ScanResult) -> None:
+        """Validate that the PyTorch model has expected structure"""
+        if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_files]:
+            result.add_check(
+                name="PyTorch Structure Validation",
+                passed=False,
+                message="PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models.",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"missing_file": "data.pkl"},
+            )
+        else:
+            result.add_check(
+                name="PyTorch Structure Validation",
+                passed=True,
+                message="PyTorch model has expected structure with data.pkl",
+                location=self.current_file_path,
+                details={"pickle_files": pickle_files},
+            )
+
+    def _check_blacklist_patterns(self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult) -> None:
+        """Check for blacklisted patterns in all files"""
+        blacklist_patterns = None
+        if (
+            hasattr(self, "config")
+            and self.config
+            and "blacklist_patterns" in self.config
+            and self.config["blacklist_patterns"] is not None
+        ):
+            blacklist_patterns = self.config["blacklist_patterns"]
+
+        if blacklist_patterns:
+            self._scan_blacklist_patterns(zip_file, safe_entries, blacklist_patterns, result)
+        else:
+            # No blacklist patterns configured
+            if safe_entries:
+                result.add_check(
+                    name="Blacklist Pattern Check",
+                    passed=True,
+                    message="No blacklist patterns configured for scanning",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"reason": "no_blacklist_configured", "entries_available": len(safe_entries)},
+                )
+
+    def _scan_blacklist_patterns(
+        self, zip_file: zipfile.ZipFile, safe_entries: list[str], blacklist_patterns: list[str], result: ScanResult
+    ) -> None:
+        """Scan files for blacklisted patterns"""
+        max_blacklist_scan_size = self.config.get("max_blacklist_scan_size", 100 * 1024 * 1024)  # 100MB default
+
+        for name in safe_entries:
+            try:
+                info = zip_file.getinfo(name)
+
+                # Skip files that are too large
+                if info.file_size > max_blacklist_scan_size:
                     result.add_check(
-                        name="PyTorch Structure Validation",
-                        passed=False,
-                        message="PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models.",
+                        name="Blacklist Pattern Check",
+                        passed=True,
+                        message=(
+                            f"File {name} too large for blacklist scanning "
+                            f"(size: {info.file_size}, limit: {max_blacklist_scan_size})"
+                        ),
                         severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"missing_file": "data.pkl"},
+                        location=f"{self.current_file_path} ({name})",
+                        details={
+                            "file_size": info.file_size,
+                            "scan_limit": max_blacklist_scan_size,
+                            "zip_entry": name,
+                            "reason": "size_limit_exceeded",
+                        },
                     )
+                    continue
+
+                # Choose scanning method based on file size
+                if info.file_size > 10 * 1024 * 1024:  # 10MB threshold for streaming
+                    self._scan_large_file_for_patterns(zip_file, name, blacklist_patterns, result)
                 else:
+                    self._scan_small_file_for_patterns(zip_file, name, blacklist_patterns, result)
+
+            except (zipfile.BadZipFile, MemoryError, Exception) as e:
+                self._handle_blacklist_scan_error(name, e, result)
+
+    def _scan_large_file_for_patterns(
+        self, zip_file: zipfile.ZipFile, name: str, blacklist_patterns: list[str], result: ScanResult
+    ) -> None:
+        """Stream large files and check patterns in chunks"""
+        found_patterns = []
+        with zip_file.open(name, "r") as zf:
+            chunk_size = 1024 * 1024  # 1MB chunks
+            overlap_buffer = b""
+            max_pattern_len = max(len(p.encode("utf-8")) for p in blacklist_patterns) if blacklist_patterns else 0
+
+            while True:
+                chunk = zf.read(chunk_size)
+                if not chunk:
+                    break
+
+                # Combine with overlap buffer to catch patterns across chunk boundaries
+                search_data = overlap_buffer + chunk
+
+                # Check for patterns in this chunk
+                if name.endswith(".pkl"):
+                    # Binary search for pickled files
+                    for pattern in blacklist_patterns:
+                        pattern_bytes = pattern.encode("utf-8")
+                        if pattern_bytes in search_data and pattern not in found_patterns:
+                            found_patterns.append(pattern)
+                else:
+                    # Text search for other files
+                    try:
+                        text_data = search_data.decode("utf-8", errors="ignore")
+                        for pattern in blacklist_patterns:
+                            if pattern in text_data and pattern not in found_patterns:
+                                found_patterns.append(pattern)
+                    except UnicodeDecodeError:
+                        # Fall back to binary search if text decode fails
+                        for pattern in blacklist_patterns:
+                            pattern_bytes = pattern.encode("utf-8")
+                            if pattern_bytes in search_data and pattern not in found_patterns:
+                                found_patterns.append(pattern)
+
+                # Keep overlap buffer for pattern matching across chunks
+                overlap_buffer = search_data[-max_pattern_len:] if len(search_data) >= max_pattern_len else search_data
+
+        # Report found patterns
+        for pattern in found_patterns:
+            result.add_check(
+                name="Blacklist Pattern Check",
+                passed=False,
+                message=f"Blacklisted pattern '{pattern}' found in file {name}",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} ({name})",
+                details={
+                    "pattern": pattern,
+                    "file": name,
+                    "file_type": "pickle" if name.endswith(".pkl") else "text",
+                    "scan_method": "streaming",
+                },
+            )
+
+    def _scan_small_file_for_patterns(
+        self, zip_file: zipfile.ZipFile, name: str, blacklist_patterns: list[str], result: ScanResult
+    ) -> None:
+        """Scan small files for blacklisted patterns"""
+        file_data = zip_file.read(name)
+
+        # For pickled files, check for patterns in the binary data
+        if name.endswith(".pkl"):
+            for pattern in blacklist_patterns:
+                pattern_bytes = pattern.encode("utf-8")
+                if pattern_bytes in file_data:
                     result.add_check(
-                        name="PyTorch Structure Validation",
-                        passed=True,
-                        message="PyTorch model has expected structure with data.pkl",
-                        location=self.current_file_path,
-                        details={"pickle_files": pickle_files},
+                        name="Blacklist Pattern Check",
+                        passed=False,
+                        message=f"Blacklisted pattern '{pattern}' found in pickled file {name}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} ({name})",
+                        details={
+                            "pattern": pattern,
+                            "file": name,
+                            "file_type": "pickle",
+                            "scan_method": "direct",
+                        },
                     )
-
-                # Check for blacklist patterns in all files
-                blacklist_patterns = None
-                if (
-                    hasattr(self, "config")
-                    and self.config
-                    and "blacklist_patterns" in self.config
-                    and self.config["blacklist_patterns"] is not None
-                ):
-                    blacklist_patterns = self.config["blacklist_patterns"]
-
-                if blacklist_patterns:
-                    # Configure size limits for blacklist scanning to prevent memory issues
-                    max_blacklist_scan_size = self.config.get(
-                        "max_blacklist_scan_size",
-                        100 * 1024 * 1024,  # 100MB default
-                    )
-
-                    for name in safe_entries:
-                        try:
-                            # Check file size before attempting to read
-                            info = z.getinfo(name)
-                            if info.file_size > max_blacklist_scan_size:
-                                result.add_check(
-                                    name="Blacklist Pattern Check",
-                                    passed=True,
-                                    message=(
-                                        f"File {name} too large for blacklist scanning "
-                                        f"(size: {info.file_size}, limit: {max_blacklist_scan_size})"
-                                    ),
-                                    severity=IssueSeverity.INFO,
-                                    location=f"{self.current_file_path} ({name})",
-                                    details={
-                                        "file_size": info.file_size,
-                                        "scan_limit": max_blacklist_scan_size,
-                                        "zip_entry": name,
-                                        "reason": "size_limit_exceeded",
-                                    },
-                                )
-                                continue
-
-                            # Use streaming read for large files to avoid memory issues
-                            if info.file_size > 10 * 1024 * 1024:  # 10MB threshold for streaming
-                                # Stream the file and check patterns in chunks
-                                found_patterns = []
-                                with z.open(name, "r") as zf:
-                                    chunk_size = 1024 * 1024  # 1MB chunks
-                                    overlap_buffer = b""
-                                    max_pattern_len = (
-                                        max(len(p.encode("utf-8")) for p in blacklist_patterns)
-                                        if blacklist_patterns
-                                        else 0
-                                    )
-
-                                    while True:
-                                        chunk = zf.read(chunk_size)
-                                        if not chunk:
-                                            break
-
-                                        # Combine with overlap buffer to catch patterns across chunk boundaries
-                                        search_data = overlap_buffer + chunk
-
-                                        # Check for patterns in this chunk
-                                        if name.endswith(".pkl"):
-                                            # Binary search for pickled files
-                                            for pattern in blacklist_patterns:
-                                                pattern_bytes = pattern.encode("utf-8")
-                                                if pattern_bytes in search_data and pattern not in found_patterns:
-                                                    found_patterns.append(pattern)
-                                        else:
-                                            # Text search for other files
-                                            try:
-                                                text_data = search_data.decode("utf-8", errors="ignore")
-                                                for pattern in blacklist_patterns:
-                                                    if pattern in text_data and pattern not in found_patterns:
-                                                        found_patterns.append(pattern)
-                                            except UnicodeDecodeError:
-                                                # Fall back to binary search if text decode fails
-                                                for pattern in blacklist_patterns:
-                                                    pattern_bytes = pattern.encode("utf-8")
-                                                    if pattern_bytes in search_data and pattern not in found_patterns:
-                                                        found_patterns.append(pattern)
-
-                                        # Keep overlap buffer for pattern matching across chunks
-                                        overlap_buffer = (
-                                            search_data[-max_pattern_len:]
-                                            if len(search_data) >= max_pattern_len
-                                            else search_data
-                                        )
-
-                                # Report found patterns
-                                for pattern in found_patterns:
-                                    result.add_check(
-                                        name="Blacklist Pattern Check",
-                                        passed=False,
-                                        message=f"Blacklisted pattern '{pattern}' found in file {name}",
-                                        severity=IssueSeverity.CRITICAL,
-                                        location=f"{self.current_file_path} ({name})",
-                                        details={
-                                            "pattern": pattern,
-                                            "file": name,
-                                            "file_type": "pickle" if name.endswith(".pkl") else "text",
-                                            "scan_method": "streaming",
-                                        },
-                                    )
-                            else:
-                                # Small file - read normally
-                                file_data = z.read(name)
-
-                                # For pickled files, check for patterns in the binary data
-                                if name.endswith(".pkl"):
-                                    for pattern in blacklist_patterns:
-                                        # Convert pattern to bytes for binary search
-                                        pattern_bytes = pattern.encode("utf-8")
-                                        if pattern_bytes in file_data:
-                                            result.add_check(
-                                                name="Blacklist Pattern Check",
-                                                passed=False,
-                                                message=f"Blacklisted pattern '{pattern}' found in pickled file {name}",
-                                                severity=IssueSeverity.CRITICAL,
-                                                location=f"{self.current_file_path} ({name})",
-                                                details={
-                                                    "pattern": pattern,
-                                                    "file": name,
-                                                    "file_type": "pickle",
-                                                    "scan_method": "direct",
-                                                },
-                                            )
-                                else:
-                                    # For text files, decode and search as text
-                                    try:
-                                        content = file_data.decode("utf-8")
-                                        for pattern in blacklist_patterns:
-                                            if pattern in content:
-                                                result.add_check(
-                                                    name="Blacklist Pattern Check",
-                                                    passed=False,
-                                                    message=f"Blacklisted pattern '{pattern}' found in file {name}",
-                                                    severity=IssueSeverity.CRITICAL,
-                                                    location=f"{self.current_file_path} ({name})",
-                                                    details={
-                                                        "pattern": pattern,
-                                                        "file": name,
-                                                        "file_type": "text",
-                                                        "scan_method": "direct",
-                                                    },
-                                                )
-                                    except UnicodeDecodeError:
-                                        # Fall back to binary search for files that can't be decoded as text
-                                        for pattern in blacklist_patterns:
-                                            pattern_bytes = pattern.encode("utf-8")
-                                            if pattern_bytes in file_data:
-                                                result.add_check(
-                                                    name="Blacklist Pattern Check",
-                                                    passed=False,
-                                                    message=(
-                                                        f"Blacklisted pattern '{pattern}' found in binary file {name}"
-                                                    ),
-                                                    severity=IssueSeverity.CRITICAL,
-                                                    location=f"{self.current_file_path} ({name})",
-                                                    details={
-                                                        "pattern": pattern,
-                                                        "file": name,
-                                                        "file_type": "binary",
-                                                        "scan_method": "direct",
-                                                    },
-                                                )
-                        except zipfile.BadZipFile as e:
-                            result.add_check(
-                                name="ZIP Entry Read",
-                                passed=False,
-                                message=f"Bad ZIP file structure reading {name}: {e!s}",
-                                severity=IssueSeverity.WARNING,
-                                location=f"{self.current_file_path} ({name})",
-                                details={
-                                    "zip_entry": name,
-                                    "exception": str(e),
-                                    "exception_type": "BadZipFile",
-                                    "scan_phase": "blacklist_check",
-                                },
-                            )
-                        except MemoryError as e:
-                            result.add_check(
-                                name="ZIP Entry Read",
-                                passed=False,
-                                message=f"Memory limit exceeded reading {name}: {e!s}",
-                                severity=IssueSeverity.WARNING,
-                                location=f"{self.current_file_path} ({name})",
-                                details={
-                                    "zip_entry": name,
-                                    "exception": str(e),
-                                    "exception_type": "MemoryError",
-                                    "scan_phase": "blacklist_check",
-                                },
-                            )
-                        except Exception as e:
-                            result.add_check(
-                                name="ZIP Entry Read",
-                                passed=False,
-                                message=f"Error reading file {name}: {e!s}",
-                                severity=IssueSeverity.DEBUG,
-                                location=f"{self.current_file_path} ({name})",
-                                details={
-                                    "zip_entry": name,
-                                    "exception": str(e),
-                                    "exception_type": type(e).__name__,
-                                    "scan_phase": "blacklist_check",
-                                },
-                            )
-                else:
-                    # No blacklist patterns configured - add a pass check to indicate this was intentionally skipped
-                    if safe_entries:  # Only add this check if there are entries to potentially scan
+        else:
+            # For text files, decode and search as text
+            try:
+                content = file_data.decode("utf-8")
+                for pattern in blacklist_patterns:
+                    if pattern in content:
                         result.add_check(
                             name="Blacklist Pattern Check",
-                            passed=True,
-                            message="No blacklist patterns configured for scanning",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={"reason": "no_blacklist_configured", "entries_available": len(safe_entries)},
+                            passed=False,
+                            message=f"Blacklisted pattern '{pattern}' found in file {name}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} ({name})",
+                            details={
+                                "pattern": pattern,
+                                "file": name,
+                                "file_type": "text",
+                                "scan_method": "direct",
+                            },
+                        )
+            except UnicodeDecodeError:
+                # Fall back to binary search for files that can't be decoded as text
+                for pattern in blacklist_patterns:
+                    pattern_bytes = pattern.encode("utf-8")
+                    if pattern_bytes in file_data:
+                        result.add_check(
+                            name="Blacklist Pattern Check",
+                            passed=False,
+                            message=f"Blacklisted pattern '{pattern}' found in binary file {name}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} ({name})",
+                            details={
+                                "pattern": pattern,
+                                "file": name,
+                                "file_type": "binary",
+                                "scan_method": "direct",
+                            },
                         )
 
-                result.bytes_scanned = bytes_scanned
+    def _handle_blacklist_scan_error(self, name: str, error: Exception, result: ScanResult) -> None:
+        """Handle errors during blacklist pattern scanning"""
+        if isinstance(error, zipfile.BadZipFile):
+            severity = IssueSeverity.WARNING
+            error_type = "BadZipFile"
+        elif isinstance(error, MemoryError):
+            severity = IssueSeverity.WARNING
+            error_type = "MemoryError"
+        else:
+            severity = IssueSeverity.DEBUG
+            error_type = type(error).__name__
 
-        except zipfile.BadZipFile:
-            result.add_check(
-                name="PyTorch ZIP Format Validation",
-                passed=False,
-                message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"path": path},
-            )
-            result.finish(success=False)
-            return result
-        except Exception as e:
-            result.add_check(
-                name="PyTorch ZIP Scan",
-                passed=False,
-                message=f"Error scanning PyTorch zip file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-            result.finish(success=False)
-            return result
+        result.add_check(
+            name="ZIP Entry Read",
+            passed=False,
+            message=f"Error reading file {name}: {error!s}",
+            severity=severity,
+            location=f"{self.current_file_path} ({name})",
+            details={
+                "zip_entry": name,
+                "exception": str(error),
+                "exception_type": error_type,
+                "scan_phase": "blacklist_check",
+            },
+        )
 
-        result.finish(success=True)
+    def _handle_bad_zip_error(self, path: str) -> ScanResult:
+        """Handle BadZipFile errors"""
+        result = self._create_result()
+        result.add_check(
+            name="PyTorch ZIP Format Validation",
+            passed=False,
+            message=f"Not a valid zip file: {path}",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details={"path": path},
+        )
+        result.finish(success=False)
+        return result
+
+    def _handle_scan_error(self, path: str, error: Exception) -> ScanResult:
+        """Handle general scan errors"""
+        result = self._create_result()
+        result.add_check(
+            name="PyTorch ZIP Scan",
+            passed=False,
+            message=f"Error scanning PyTorch zip file: {error!s}",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details={"exception": str(error), "exception_type": type(error).__name__},
+        )
+        result.finish(success=False)
         return result
 
     def _extract_pytorch_version_info(self, zipfile_obj, safe_entries: list[str]) -> dict[str, Any]:
