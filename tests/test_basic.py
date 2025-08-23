@@ -78,7 +78,7 @@ def test_max_file_size(tmp_path):
     test_file.write_bytes(b"x" * 1000)  # 1000 bytes
 
     # Scan with max_file_size smaller than the file
-    results = scan_model_directory_or_file(str(test_file), max_file_size=500)
+    results = scan_model_directory_or_file(str(test_file), max_file_size=500, cache_enabled=False)
 
     assert results.success is True
     assert results.files_scanned == 1
@@ -88,7 +88,7 @@ def test_max_file_size(tmp_path):
     assert len(large_file_issues) == 1
 
     # Scan with max_file_size larger than the file
-    results = scan_model_directory_or_file(str(test_file), max_file_size=2000)
+    results = scan_model_directory_or_file(str(test_file), max_file_size=2000, cache_enabled=False)
 
     assert results.success is True
     assert results.files_scanned == 1

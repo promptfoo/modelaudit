@@ -105,6 +105,14 @@ SUSPICIOUS_GLOBALS = {
         "open",
         "input",
         "__import__",
+        # Add all dangerous builtins
+        "globals",  # Access to global namespace
+        "locals",  # Access to local namespace
+        "setattr",  # Can set arbitrary attributes
+        "getattr",  # Can access arbitrary attributes
+        "delattr",  # Can delete attributes
+        "vars",  # Access to object's namespace
+        "dir",  # Can enumerate available attributes
     ],  # Dynamic code evaluation and file access
     # Python 2 style builtins - CRITICAL RISK
     "__builtin__": [
@@ -154,6 +162,20 @@ SUSPICIOUS_GLOBALS = {
     # References to the private dill._dill module are also suspicious
     "dill._dill": "*",
 }
+
+# Advanced pickle patterns targeting sophisticated exploitation techniques
+# These patterns represent high-risk modules/functions used in advanced attacks
+ADVANCED_PICKLE_PATTERNS = {
+    "operator": ["attrgetter"],  # CRITICAL: Can bypass attribute access restrictions to reach dangerous methods
+    "pty": "*",  # CRITICAL: Pseudo-terminal spawning enables shell access
+    "bdb": "*",  # HIGH: Python debugger can inspect/modify runtime state
+    "asyncio": "*",  # MEDIUM: Async execution can obfuscate malicious operations
+    "_pickle": "*",  # HIGH: Low-level pickle operations bypass safety checks
+    "types": ["CodeType", "FunctionType"],  # CRITICAL: Direct code object construction enables arbitrary code execution
+}
+
+# Merge advanced patterns into main suspicious globals set
+SUSPICIOUS_GLOBALS.update(ADVANCED_PICKLE_PATTERNS)
 
 # Include OS module aliases in suspicious globals
 SUSPICIOUS_GLOBALS.update({alias: data["functions"] for alias, data in OS_MODULE_ALIASES.items()})

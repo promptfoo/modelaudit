@@ -2,7 +2,7 @@
 
 ## Overview
 
-ModelAudit now includes enhanced support for scanning large ML models (up to 1TB+) with optimized strategies based on file size.
+ModelAudit now includes enhanced support for scanning large ML models (up to 1 TB) with optimized strategies based on file size.
 
 ## Default Configuration Changes
 
@@ -10,7 +10,7 @@ ModelAudit now includes enhanced support for scanning large ML models (up to 1TB
 
 - **Previous**: 300 seconds (5 minutes)
 - **New**: 1800 seconds (30 minutes)
-- **Rationale**: Large models (1-8GB) require more time for thorough scanning
+- **Rationale**: Large models (1-8 GB) require more time for thorough scanning
 
 ### File Size Limits
 
@@ -23,32 +23,32 @@ ModelAudit now includes enhanced support for scanning large ML models (up to 1TB
 
 ModelAudit automatically selects the appropriate scanning strategy based on file size:
 
-### 1. Normal Scanning (<100GB)
+### 1. Normal Scanning (<100 GB)
 
 - Full file loaded into memory
 - Complete analysis of all content
 - Fastest performance for smaller models
 
-### 2. Chunked Scanning (100GB - 1TB)
+### 2. Chunked Scanning (100 GB - 1 TB)
 
-- File read in 50GB chunks
+- File read in 50 GB chunks
 - Progress reporting for each chunk
 - Memory-efficient processing
 - Complete coverage of file content
 
-### 3. Streaming Scanning (1TB - 5TB)
+### 3. Streaming Scanning (1 TB - 5 TB)
 
-- Analyzes file header (first 100GB)
+- Analyzes file header (first 100 GB)
 - Samples middle and end sections
 - Reports partial scan completion
 - Suitable for very large models
 
-### 4. Optimized Scanning (>5TB)
+### 4. Optimized Scanning (>5 TB)
 
-- Enhanced header analysis (first 100GB)
+- Enhanced header analysis (first 100 GB)
 - Heuristic-based detection with large sampling
 - Minimal memory usage with advanced techniques
-- Supports extremely large models up to 10TB+
+- Supports extremely large models up to 10 TB+
 
 ## CLI Usage
 
@@ -128,10 +128,10 @@ modelaudit scan hf://bert-large-uncased --timeout 1800
 
 ### Memory Usage
 
-- Small files (<10MB): ~2x file size
-- Medium files (10-100MB): ~50MB constant
-- Large files (>100MB): ~20MB constant
-- Very large files (>1GB): ~10MB constant
+- Small files (<10 MB): typically ~2x file size
+- Medium files (10-100 MB): typically ~50 MB constant
+- Large files (>100 MB): typically ~20 MB constant
+- Very large files (>1 GB): typically ~10 MB constant
 
 ### Scan Times
 
@@ -152,7 +152,7 @@ When scanning remote models:
 
 ### Partial Scanning
 
-For files over 100MB, ModelAudit uses sampling strategies that may not detect:
+For files over 100 MB, ModelAudit uses sampling strategies that may not detect:
 
 - Issues in unsampled sections
 - Patterns distributed throughout the file
@@ -175,7 +175,7 @@ scan:
   timeout: 1800 # 30 minutes
   max_file_size: 0 # Unlimited
   large_model_support: true
-  chunk_size: 53687091200 # 50GB chunks
+  chunk_size: 53687091200 # bytes (50 GB chunks)
 
 # Progress reporting
 output:
@@ -204,9 +204,9 @@ modelaudit scan model.bin --timeout 0
 
 ```bash
 # Limit file size to prevent OOM
-modelaudit scan model.bin --max-file-size 1073741824  # 1GB
+modelaudit scan model.bin --max-file-size 1073741824  # 1 GB
 
-# Use streaming for all files >10MB
+# Use streaming for all files > 10 MB
 modelaudit scan model.bin --stream
 ```
 

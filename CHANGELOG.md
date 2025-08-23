@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **test**: speed up tests and CI runtime (#316)
 - **test**: cover Windows path extraction scenarios (#313)
 - **feat**: detect dangerous TensorFlow operations
+- **feat**: enhance pickle scanner with STACK_GLOBAL and memo tracking
 - **feat**: detect Windows and Unix OS module aliases to prevent system command execution via `nt` and `posix`
 
 ### Changed
