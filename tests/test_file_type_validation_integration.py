@@ -248,9 +248,7 @@ class TestFileTypeValidationIntegration:
 
             # Check for validation issues
             validation_issues = [
-                issue
-                for issue in results["issues"]
-                if "file type validation failed" in issue.get("message", "").lower()
+                issue for issue in results["issues"] if "file type validation failed" in issue.message.lower()
             ]
 
             assert len(validation_issues) == 0, (
@@ -450,7 +448,7 @@ class TestFileTypeValidationIntegration:
         validation_warnings = [
             issue
             for issue in results["issues"]
-            if "file type validation failed" in issue.get("message", "").lower() and issue.get("severity") == "warning"
+            if "file type validation failed" in issue.message.lower() and str(issue.severity).endswith("WARNING")
         ]
 
         assert len(validation_warnings) > 0, "Should generate file type validation warnings"

@@ -1,0 +1,9 @@
+{
+  "tokenizer_class": "GPT2Tokenizer",
+  "model_max_length": 1024,
+  "chat_template": "{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] }}\\n{% endif %}{% for message in messages[1:] %}{{ message['role'].title() }}: {{ message['content'] }}\\n{% endfor %}Assistant:",
+  "bos_token": "<|startoftext|>",
+  "eos_token": "<|endoftext|>",
+  "pad_token": "<|endoftext|>",
+  "add_prefix_space": false
+}

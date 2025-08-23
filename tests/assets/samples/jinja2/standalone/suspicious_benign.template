@@ -1,0 +1,7 @@
+{% for message in messages %}
+  {% if message.class == "important" %}
+    IMPORTANT: {{ message.content }}
+  {% else %}
+    {{ message.content }}
+  {% endif %}
+{% endfor %}
