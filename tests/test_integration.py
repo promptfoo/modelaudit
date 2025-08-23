@@ -166,8 +166,10 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     results2 = scan_model_directory_or_file(str(path2))
 
     # Filter debug issues from individual results to match CLI behavior (CLI filters debug by default)
-    results1_issues = [issue for issue in results1.issues if getattr(issue, "severity", None) != "debug"]
-    results2_issues = [issue for issue in results2.issues if getattr(issue, "severity", None) != "debug"]
+    from modelaudit.scanners.base import IssueSeverity
+
+    results1_issues = [issue for issue in results1.issues if getattr(issue, "severity", None) != IssueSeverity.DEBUG]
+    results2_issues = [issue for issue in results2.issues if getattr(issue, "severity", None) != IssueSeverity.DEBUG]
 
     # Scan both files using CLI
     runner = CliRunner()

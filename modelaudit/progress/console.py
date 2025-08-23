@@ -56,7 +56,7 @@ class ConsoleProgressReporter(ProgressReporter):
         self._item_pbar: Optional[tqdm] = None
         self._current_phase = ProgressPhase.INITIALIZING
 
-    def _create_byte_progress_bar(self, stats: ProgressStats) -> Optional["tqdm"]:
+    def _create_byte_progress_bar(self, stats: ProgressStats) -> "Optional[tqdm]":
         """Create byte-level progress bar."""
         if not self.use_tqdm or not self.show_bytes or stats.total_bytes <= 0:
             return None
@@ -72,7 +72,7 @@ class ConsoleProgressReporter(ProgressReporter):
             leave=True,
         )
 
-    def _create_item_progress_bar(self, stats: ProgressStats) -> Optional["tqdm"]:
+    def _create_item_progress_bar(self, stats: ProgressStats) -> "Optional[tqdm]":
         """Create item-level progress bar."""
         if not self.use_tqdm or not self.show_items or stats.total_items <= 0:
             return None

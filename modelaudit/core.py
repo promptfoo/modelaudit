@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional
+from typing import IO, Any, Callable, Optional, Union
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -15,7 +15,7 @@ from modelaudit.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
 )
-from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
@@ -68,7 +68,8 @@ def _add_scan_result_to_model(
 ) -> None:
     """Helper function to add scan result data to Pydantic model."""
 
-    from .models import CheckModel, FileMetadataModel, IssueModel
+    from .models import FileMetadataModel
+    from .scanners.base import Check, Issue
 
     # Update byte counts
     results.bytes_scanned += file_result.bytes_scanned
@@ -88,13 +89,13 @@ def _add_scan_result_to_model(
     for issue in file_result.issues:
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
-            results.issues.append(IssueModel(**issue_dict))
+            results.issues.append(Issue(**issue_dict))
 
     # Convert and add checks
     for check in file_result.checks:
         check_dict = check.to_dict() if hasattr(check, "to_dict") else check
         if isinstance(check_dict, dict):
-            results.checks.append(CheckModel(**check_dict))
+            results.checks.append(Check(**check_dict))
 
     # Add file metadata if available
     if hasattr(file_result, "metadata") and file_result.metadata:
@@ -118,11 +119,19 @@ def _add_issue_to_model(
     """Helper function to add an issue directly to the Pydantic model."""
     import time
 
-    from .models import IssueModel
+    from .scanners.base import Issue, IssueSeverity
 
-    issue = IssueModel(
+    # Convert string severity to enum
+    severity_enum = {
+        "debug": IssueSeverity.DEBUG,
+        "info": IssueSeverity.INFO,
+        "warning": IssueSeverity.WARNING,
+        "critical": IssueSeverity.CRITICAL,
+    }.get(severity.lower(), IssueSeverity.WARNING)
+
+    issue = Issue(
         message=message,
-        severity=severity,
+        severity=severity_enum,
         location=location,
         details=details or {},
         timestamp=time.time(),
@@ -424,29 +433,23 @@ def _consolidate_checks(results: ModelAuditResultModel) -> None:
         )
 
     # Update results with consolidated checks and counts - convert to Pydantic models
-    from .models import CheckModel
+    from .models import Check
 
-    results.checks = [CheckModel(**check) if isinstance(check, dict) else check for check in consolidated_checks]
+    results.checks = [Check(**check) if isinstance(check, dict) else check for check in consolidated_checks]
     _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
-def validate_scan_config(config: dict[str, Any]) -> None:
-    """Validate configuration parameters for scanning."""
-    timeout = config.get("timeout")
-    if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
-        raise ValueError("timeout must be a positive integer")
+def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
+    """Validate configuration parameters for scanning using Pydantic model."""
+    try:
+        return ScanConfigModel.from_dict(config)
+    except Exception as e:
+        raise ValueError(f"Invalid scan configuration: {e}") from e
 
-    max_file_size = config.get("max_file_size")
-    if max_file_size is not None and (not isinstance(max_file_size, int) or max_file_size < 0):
-        raise ValueError("max_file_size must be a non-negative integer")
 
-    max_total_size = config.get("max_total_size")
-    if max_total_size is not None and (not isinstance(max_total_size, int) or max_total_size < 0):
-        raise ValueError("max_total_size must be a non-negative integer")
-
-    chunk_size = config.get("chunk_size")
-    if chunk_size is not None and (not isinstance(chunk_size, int) or chunk_size <= 0):
-        raise ValueError("chunk_size must be a positive integer")
+def create_scan_config(**kwargs: Any) -> ScanConfigModel:
+    """Create a validated scan configuration from keyword arguments."""
+    return ScanConfigModel(**kwargs)
 
 
 def scan_model_directory_or_file(
@@ -726,7 +729,7 @@ def scan_model_directory_or_file(
                             results.scanner_names.append(scanner_name)
 
                         # Add issues for each file path that shares this content using Pydantic models
-                        from .models import IssueModel
+                        from .scanners.base import Issue
 
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
@@ -745,11 +748,11 @@ def scan_model_directory_or_file(
                                 if "timestamp" not in issue_dict:
                                     issue_dict["timestamp"] = time.time()
 
-                                results.issues.append(IssueModel(**issue_dict))
+                                results.issues.append(Issue(**issue_dict))
 
                         # Add checks for each file path that shares this content using Pydantic models
                         if hasattr(file_result, "checks"):
-                            from .models import CheckModel
+                            from .models import Check
 
                             for check in file_result.checks:
                                 check_dict = check.to_dict() if hasattr(check, "to_dict") else check
@@ -768,7 +771,7 @@ def scan_model_directory_or_file(
                                     if "timestamp" not in check_dict:
                                         check_dict["timestamp"] = time.time()
 
-                                    results.checks.append(CheckModel(**check_dict))
+                                    results.checks.append(Check(**check_dict))
 
                         # Add assets for all file paths that share this content
                         for file_path in file_paths:
@@ -998,7 +1001,7 @@ def scan_model_directory_or_file(
         any(
             any(indicator in issue.message for indicator in operational_error_indicators)
             for issue in results.issues
-            if issue.severity in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         )
         or not scan_metadata["success"]
     )
@@ -1041,10 +1044,12 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
+        from modelaudit.scanners.base import IssueSeverity
+
         security_issues = [
             issue
             for issue in issues
-            if hasattr(issue, "severity") and issue.severity in ["warning", "error", "critical"]
+            if hasattr(issue, "severity") and issue.severity in [IssueSeverity.WARNING, IssueSeverity.CRITICAL]
         ]
         if security_issues:
             return 1
@@ -1307,17 +1312,18 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
 def merge_scan_result(
     results: ModelAuditResultModel,
-    scan_result: ScanResult,
+    scan_result: Union[ScanResult, dict[str, Any]],
 ) -> None:
     """
     Merge a ScanResult object into the ModelAuditResultModel.
 
     Args:
         results: The existing ModelAuditResultModel
-        scan_result: The ScanResult object to merge
+        scan_result: The ScanResult object or dict to merge
     """
-    # Convert scan_result to dict if it's a ScanResult object
-    scan_dict = scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
-
-    # Use the existing aggregate_scan_result method instead of manual merging
-    results.aggregate_scan_result(scan_dict)
+    # Use the new direct aggregation method for better performance and type safety
+    if isinstance(scan_result, ScanResult):
+        results.aggregate_scan_result_direct(scan_result)
+    else:
+        # Fallback to dict-based aggregation for backward compatibility
+        results.aggregate_scan_result(scan_result)

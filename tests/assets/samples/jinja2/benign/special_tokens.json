@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "RobertaTokenizer",
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'user' %}{{ '<|user|>' + message['content'] + '<|end|>' }}{% elif message['role'] == 'assistant' %}{{ '<|assistant|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}",
+  "model_max_length": 1024
+}

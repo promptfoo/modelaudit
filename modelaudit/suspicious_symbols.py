@@ -32,6 +32,7 @@ Security Pattern Categories:
     - SUSPICIOUS_LAYER_TYPES: Risky Keras layer types
     - SUSPICIOUS_CONFIG_PROPERTIES: Dangerous configuration keys
     - SUSPICIOUS_CONFIG_PATTERNS: Manifest file security patterns
+    - JINJA2_SSTI_PATTERNS: Jinja2 Server-Side Template Injection patterns
 
 Maintenance Guidelines:
     When adding new patterns:
@@ -339,6 +340,135 @@ SUSPICIOUS_CONFIG_PATTERNS = {
 }
 
 # =============================================================================
+# JINJA2 TEMPLATE INJECTION PATTERNS
+# =============================================================================
+
+# Jinja2 Server-Side Template Injection (SSTI) patterns
+# These patterns detect potential template injection vulnerabilities in ML model templates
+# Primarily targeting CVE-2024-34359 and similar SSTI attack vectors in ML contexts
+JINJA2_SSTI_PATTERNS = {
+    # Critical risk patterns - immediate code execution
+    # These patterns indicate direct attempts to execute arbitrary code
+    "critical_injection": [
+        # Direct function calls for code execution
+        r"__import__\s*\(",  # __import__('os').system('cmd')
+        r"eval\s*\(",  # eval('malicious_code')
+        r"exec\s*\(",  # exec('malicious_code')
+        r"compile\s*\(",  # compile('code', '<string>', 'exec')
+        # System command execution
+        r"os\.system\s*\(",  # os.system('cmd')
+        r"os\.popen\s*\(",  # os.popen('cmd')
+        r"subprocess\.",  # subprocess.call, subprocess.Popen, etc.
+        r"commands\.",  # commands.getoutput (Python 2)
+        # Process spawning
+        r"os\.spawn[a-z]*\s*\(",  # os.spawnv, os.spawnl, etc.
+        r"pty\.spawn\s*\(",  # pty.spawn('/bin/sh')
+        # File system manipulation
+        r"shutil\.rmtree\s*\(",  # shutil.rmtree('/path')
+        r"os\.remove\s*\(",  # os.remove('file')
+        r"os\.unlink\s*\(",  # os.unlink('file')
+        # Network operations
+        r"socket\.socket\s*\(",  # socket.socket()
+        r"urllib\.request\.",  # urllib.request.urlopen
+        r"requests\.",  # requests.get, requests.post
+        # Dynamic module loading
+        r"importlib\.",  # importlib.import_module
+        r"runpy\.",  # runpy.run_module, runpy.run_path
+    ],
+    # Object traversal patterns - Python object hierarchy exploitation
+    # These patterns navigate Python's object model to reach dangerous functions
+    "object_traversal": [
+        # Basic object traversal
+        r"__class__\.__mro__",  # Access method resolution order
+        r"__class__\.__base__",  # Access base class
+        r"__class__\.__bases__",  # Access base classes tuple
+        r"__subclasses__\(\)",  # Get all subclasses
+        # Advanced traversal patterns
+        r"__class__\.__mro__\[\d+\]",  # Index into MRO (e.g., __mro__[1])
+        r"__class__\.__base__\.__subclasses__\(\)",  # Chain: base -> subclasses
+        r"__mro__\[1\]\.__subclasses__\(\)",  # Common pattern: object class
+        # Subclass iteration and filtering
+        r"__subclasses__\(\)\[\d+\]",  # Direct subclass access by index
+        r"for .+ in .*__subclasses__",  # Iterate through subclasses
+        r"if .+ in .*__name__",  # Filter classes by name
+    ],
+    # Global scope access patterns - accessing dangerous global functions
+    # These patterns access global namespaces to reach restricted functions
+    "global_access": [
+        # Direct global access
+        r"__globals__\[",  # Access globals dictionary
+        r"__builtins__\[",  # Access builtins dictionary
+        r"__init__\.__globals__",  # Access through __init__ method
+        # Framework-specific global access
+        r"self\.__init__\.__globals__",  # Self reference to globals
+        r"\.environment\.globals",  # Jinja2 environment globals
+        r"cycler\.__init__\.__globals__",  # Via cycler object
+        r"joiner\.__init__\.__globals__",  # Via joiner object
+        r"namespace\.__init__\.__globals__",  # Via namespace object
+        # Request/application context access (web frameworks)
+        r"request\.application\.__globals__",  # Flask request object
+        r"config\.__class__\.__init__\.__globals__",  # Config object globals
+        # Module globals access
+        r"\._module\.__builtins__",  # Module builtins
+        r"sys\.modules\[",  # Access loaded modules
+    ],
+    # WAF bypass and obfuscation patterns
+    # These patterns detect attempts to evade basic security filters
+    "obfuscation": [
+        # Character encoding bypasses
+        r"\\x[0-9a-fA-F]{2}",  # Hex encoding: \x5f for _
+        r"chr\(\d+\)",  # Character construction: chr(95) for _
+        r"['\"]\.join\(",  # String joining: ''.join([chr(x) for x in ...])
+        # Attribute access bypasses
+        r"\|attr\(",  # Jinja2 filter: |attr('__class__')
+        r"\[['\"]\w+['\"]\]",  # Bracket notation: ['__class__']
+        r"getattr\s*\(",  # getattr(obj, '__class__')
+        # String construction bypasses
+        r"format\s*\(",  # String formatting
+        r"{}".format(r"|format\("),  # Template string formatting
+        r"f['\"].*\{",  # f-string formatting
+        # Base64 and other encoding
+        r"base64\.",  # Base64 encoding/decoding
+        r"codecs\.",  # Codec operations
+        r"binascii\.",  # Binary/ASCII conversions
+    ],
+    # Template control flow exploitation
+    # These patterns detect malicious use of Jinja2 control structures
+    "control_flow": [
+        # Loops for class discovery
+        r"{% for .+ in .*__subclasses__",  # Loop through subclasses
+        r"{% for .+ in .*__mro__",  # Loop through MRO
+        r"{% for .+ in .*__dict__",  # Loop through object dict
+        # Conditionals for class filtering
+        r"{% if .+ in .*__name__",  # Filter by class name
+        r"{% if .*warning.* in",  # Common: look for 'warnings' class
+        r"{% if .*popen.* in",  # Look for popen functionality
+        # Variable assignment for payload staging
+        r"{% set .+ = .*__",  # Set variable to dangerous object
+        r"{% set .+ = .*\.__class__",  # Set variable to class
+        # Macro definition for code reuse
+        r"{% macro .+ %}",  # Define reusable code block
+    ],
+    # Environment and configuration access
+    # These patterns detect attempts to access system information
+    "environment_access": [
+        # Environment variables
+        r"os\.environ",  # Access environment variables
+        r"sys\.argv",  # Command line arguments
+        r"sys\.path",  # Python path
+        # System information
+        r"platform\.",  # Platform information
+        r"sys\.version",  # Python version
+        r"os\.getcwd",  # Current working directory
+        r"os\.listdir",  # Directory listing
+        # Configuration access
+        r"config\.items\(\)",  # Framework configuration
+        r"app\.config",  # Application config
+        r"settings\.",  # Settings access
+    ],
+}
+
+# =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
@@ -395,6 +525,11 @@ def get_all_suspicious_patterns() -> dict[str, Any]:
             "patterns": SUSPICIOUS_METADATA_PATTERNS,
             "description": "Regex patterns for suspicious metadata values in model files",
             "risk_level": "MEDIUM",
+        },
+        "jinja2_ssti": {
+            "patterns": JINJA2_SSTI_PATTERNS,
+            "description": "Jinja2 Server-Side Template Injection patterns",
+            "risk_level": "CRITICAL",
         },
     }
 

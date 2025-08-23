@@ -354,6 +354,15 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "jinja2_template": {
+                "module": "modelaudit.scanners.jinja2_template_scanner",
+                "class": "Jinja2TemplateScanner",
+                "description": "Scans for Jinja2 template injection vulnerabilities in ML models",
+                "extensions": [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"],
+                "priority": 14,  # High priority for security scanner, before safetensors
+                "dependencies": ["jinja2", "gguf"],  # gguf optional for GGUF support
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -580,6 +589,7 @@ def __getattr__(name: str) -> Any:
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
         "TarScanner": "tar",
+        "Jinja2TemplateScanner": "jinja2_template",
         "ZipScanner": "zip",
     }
 

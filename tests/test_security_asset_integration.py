@@ -15,6 +15,7 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import IssueSeverity
 
 
 class TestSecurityAssetIntegration:
@@ -148,7 +149,7 @@ class TestSecurityAssetIntegration:
             security_issues = [
                 issue
                 for issue in results.issues
-                if getattr(issue, "severity", None) in ["critical", "error", "warning"]
+                if getattr(issue, "severity", None) in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             ]
             assert len(security_issues) > 0, f"No security issues found in {malicious_file.name}"
 
