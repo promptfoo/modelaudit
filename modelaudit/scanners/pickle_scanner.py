@@ -2206,14 +2206,28 @@ class PickleScanner(BaseScanner):
                         func = recent_strings[1]  # Second string pushed (function)
                         if self._is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+
+                            # Use PickleScan safety classification for appropriate severity
+                            safety_level, safety_severity = classify_global_safety(mod, func)
+
+                            # Map string severity to IssueSeverity enum
+                            severity_mapping = {
+                                "critical": IssueSeverity.CRITICAL,
+                                "warning": IssueSeverity.WARNING,
+                                "info": IssueSeverity.INFO,
+                                "debug": IssueSeverity.DEBUG,
+                            }
+                            base_severity = severity_mapping.get(safety_severity, IssueSeverity.WARNING)
+
+                            # Apply ML context awareness to the safety-classified severity
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_severity,
                                 ml_context,
                             )
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
                                 passed=False,
-                                message=f"Suspicious module reference found: {mod}.{func}",
+                                message=f"Suspicious reference {mod}.{func} (safety: {safety_level})",
                                 severity=severity,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 details={
@@ -2221,6 +2235,7 @@ class PickleScanner(BaseScanner):
                                     "function": func,
                                     "position": pos,
                                     "opcode": opcode.name,
+                                    "safety_level": safety_level,
                                     "ml_context_confidence": ml_context.get(
                                         "overall_confidence",
                                         0,
