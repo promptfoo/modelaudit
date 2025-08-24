@@ -15,7 +15,7 @@ class PyTorchZipScanner(BaseScanner):
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
     supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".bin"]
-    
+
     # CVE-2025-32434 constants
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
@@ -111,7 +111,7 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Scan Timeout",
                 passed=False,
-                message=f"Scan timed out: {str(e)}",
+                message=f"Scan timed out: {e!s}",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"timeout_seconds": self.timeout},
@@ -341,7 +341,9 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif name.endswith((".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")):
+            elif name.endswith(
+                (".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")
+            ):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
@@ -809,7 +811,7 @@ class PyTorchZipScanner(BaseScanner):
 
             # Parse version string
             vstr = version.strip()
-            is_prerelease = bool(re.search(r'(dev|rc|alpha|beta)', vstr, re.IGNORECASE))
+            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
             version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 # If we can't parse it, assume vulnerable for safety
