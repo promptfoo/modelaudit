@@ -93,10 +93,6 @@ jobs:
         run: |
           rye run ruff format --check modelaudit/ tests/
 
-      - name: Check for circular imports
-        run: |
-          rye run python scripts/check_circular_imports.py
-
   type-check:
     name: Type Check
     needs: changes
@@ -131,6 +127,10 @@ jobs:
       - name: Type checking
         run: |
           rye run mypy modelaudit/ tests/
+
+      - name: Check for circular imports
+        run: |
+          rye run python scripts/check_circular_imports.py
 
   # Fast feedback job for immediate results
   quick-feedback:
