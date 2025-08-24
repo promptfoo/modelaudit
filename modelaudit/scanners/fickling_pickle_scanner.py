@@ -517,8 +517,10 @@ class FicklingPickleScanner(BaseScanner):
                         is_suspicious = any(suspicious_key in str(key).lower() for suspicious_key in suspicious_keys)
                         if is_suspicious:
                             logger.info(
-                                f"Found suspicious key '{key}' at {current_path}, value type: {type(value)}, length: {len(value) if isinstance(value, str) else 'N/A'}"
-                            )  # Debug
+                                f"Found suspicious key '{key}' at {current_path}, "
+                                f"value type: {type(value)}, "
+                                f"length: {len(value) if isinstance(value, str) else 'N/A'}"
+                            )
 
                         if is_suspicious and isinstance(value, str) and len(value) > 100:
                             logger.info(f"Checking base64 payload for key '{key}' at {current_path}")  # Debug
@@ -731,23 +733,24 @@ class FicklingPickleScanner(BaseScanner):
     def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
         """
         Legacy compatibility method for scanning pickle bytes from a file-like object.
-        
+
         This method provides backward compatibility for code that expects the old
         PickleScanner interface, particularly the JoblibScanner.
         """
         result = ScanResult(scanner_name=self.name)
-        
+
         try:
             # Read all data from the file-like object
             file_like.seek(0)
             data = file_like.read()
-            
+
             # Create a temporary file to use with fickling
             import tempfile
+
             with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp_file:
                 tmp_file.write(data)
                 tmp_file.flush()
-                
+
                 try:
                     # Use the regular scan method on the temporary file
                     scan_result = self.scan(tmp_file.name)
@@ -756,21 +759,20 @@ class FicklingPickleScanner(BaseScanner):
                     result.metadata = scan_result.metadata.copy()
                     result.metadata["file_path"] = f"<bytes:{len(data)}>"
                     result.bytes_scanned = len(data)
-                    
+
                 finally:
                     # Clean up temporary file
+                    import contextlib
                     import os
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(tmp_file.name)
-                    except OSError:
-                        pass
-                        
+
         except Exception as e:
             result.add_issue(
                 message=f"Error scanning pickle bytes: {e}",
                 severity=IssueSeverity.CRITICAL,
             )
-            
+
         return result
 
     def _analyze_additional_stream(self, stream_data: bytes, stream_number: int, result: ScanResult) -> None:
