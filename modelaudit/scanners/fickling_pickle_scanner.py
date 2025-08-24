@@ -85,19 +85,52 @@ class FicklingPickleScanner(BaseScanner):
                 result.finish(success=False)
                 return result
 
-            # Run fickling's comprehensive analysis
-            analysis_results = check_safety(pickled)
+            # Use fickling's module-level safety check (correct API)
+            import fickling as fickling_module
+            fickling_is_safe = fickling_module.is_likely_safe(file_path)
+            
+            # Get additional fickling information
+            unsafe_imports = list(pickled.unsafe_imports())
+            non_standard_imports = list(pickled.non_standard_imports())
 
             # Add basic metadata
             result.metadata.update(
                 {
-                    "fickling_severity": analysis_results.severity.name,
-                    "fickling_safe": bool(analysis_results),
+                    "fickling_safe": fickling_is_safe,
+                    "unsafe_imports": len(unsafe_imports),
+                    "non_standard_imports": len(non_standard_imports),
                     "scan_time_seconds": time.time() - start_time,
                     "file_size": self._get_file_size(file_path),
-                    "opcodes_analyzed": len(list(pickled)) if hasattr(pickled, "__iter__") else 0,
+                    "opcodes_analyzed": len(list(pickled.opcodes)) if hasattr(pickled, "opcodes") else 0,
                 }
             )
+            
+            # CRITICAL: Add supplementary security analysis for patterns fickling misses
+            self._analyze_dangerous_globals(pickled, result)
+            
+            # Process fickling's native detections
+            if not fickling_is_safe:
+                result.add_issue(
+                    message="Fickling detected potentially unsafe pickle operations",
+                    severity=IssueSeverity.HIGH,
+                    details={"fickling_analysis": "unsafe"},
+                )
+                
+            # Process unsafe imports detected by fickling
+            for unsafe_import in unsafe_imports:
+                result.add_issue(
+                    message=f"Unsafe import detected: {unsafe_import}",
+                    severity=IssueSeverity.CRITICAL,
+                    details={"import": str(unsafe_import)},
+                )
+                
+            # Process non-standard imports
+            for non_std_import in non_standard_imports:
+                result.add_issue(
+                    message=f"Non-standard import detected: {non_std_import}",
+                    severity=IssueSeverity.WARNING,
+                    details={"import": str(non_std_import)},
+                )
 
             # For .bin files, add binary content metadata and scan trailing content
             if file_path.lower().endswith(".bin"):
@@ -126,9 +159,6 @@ class FicklingPickleScanner(BaseScanner):
 
             # Check for multiple pickle streams in the file
             self._scan_for_multiple_streams(file_path, result)
-
-            # Convert fickling results to ModelAudit issues
-            self._convert_fickling_results(analysis_results, result)
 
         except UnsafeFileError as e:
             # Fickling detected unsafe content
@@ -729,6 +759,60 @@ class FicklingPickleScanner(BaseScanner):
 
         except Exception as e:
             logger.warning(f"Error during multiple stream scan: {e}")
+            
+    def _analyze_dangerous_globals(self, pickled, result: ScanResult) -> None:
+        """
+        Analyze pickle for dangerous GLOBAL opcodes that fickling might miss.
+        
+        This is critical for detecting patterns like __builtin__.eval that fickling
+        considers safe but our security model considers dangerous.
+        """
+        try:
+            from ..suspicious_symbols import SUSPICIOUS_GLOBALS
+            
+            # Analyze each opcode in the pickle
+            for opcode in pickled.opcodes:
+                if hasattr(opcode, 'name') and opcode.name == 'GLOBAL':
+                    # Extract the module and function from GLOBAL opcode
+                    if hasattr(opcode, 'arg') and opcode.arg:
+                        global_ref = str(opcode.arg)
+                        
+                        # Parse "module function" format
+                        if ' ' in global_ref:
+                            module_name, func_name = global_ref.split(' ', 1)
+                            
+                            # Check against our suspicious globals database
+                            if self._is_dangerous_global_reference(module_name, func_name):
+                                result.add_issue(
+                                    message=f"Dangerous global reference: {module_name}.{func_name}",
+                                    severity=IssueSeverity.CRITICAL,
+                                    details={
+                                        "module": module_name,
+                                        "function": func_name,
+                                        "global_reference": global_ref,
+                                        "opcode": "GLOBAL",
+                                        "recommendation": f"The global reference {module_name}.{func_name} can execute arbitrary code during pickle loading"
+                                    }
+                                )
+                                
+        except Exception as e:
+            logger.warning(f"Error during dangerous globals analysis: {e}")
+            
+    def _is_dangerous_global_reference(self, module_name: str, func_name: str) -> bool:
+        """Check if a module.function combination is dangerous according to our security model."""
+        from ..suspicious_symbols import SUSPICIOUS_GLOBALS
+        
+        if module_name not in SUSPICIOUS_GLOBALS:
+            return False
+            
+        suspicious_funcs = SUSPICIOUS_GLOBALS[module_name]
+        if suspicious_funcs == "*":
+            return True
+            
+        if isinstance(suspicious_funcs, list):
+            return func_name in suspicious_funcs
+            
+        return False
 
     def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
         """
