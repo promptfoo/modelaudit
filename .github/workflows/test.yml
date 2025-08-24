@@ -141,13 +141,10 @@ jobs:
           base_path = find_module_path('modelaudit.scanners.base')
           core_path = find_module_path('modelaudit.core')
 
-          # base -> core
+          # Only check the problematic direction: base -> core
+          # (core -> base is legitimate and expected)
           if module_imports_target(base_path, {'modelaudit.core'}):
-              print('❌ Circular risk: scanners/base.py imports core.py')
-              sys.exit(1)
-          # core -> base (defensive)
-          if module_imports_target(core_path, {'modelaudit.scanners.base'}):
-              print('❌ Circular risk: core.py imports scanners/base.py')
+              print('❌ Circular import detected: scanners/base.py imports from core.py')
               sys.exit(1)
 
           print('✅ No circular imports detected')
