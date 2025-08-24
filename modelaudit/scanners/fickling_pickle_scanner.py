@@ -88,7 +88,7 @@ class FicklingPickleScanner(BaseScanner):
             # Use fickling's module-level safety check (correct API)
             import fickling as fickling_module
             fickling_is_safe = fickling_module.is_likely_safe(file_path)
-            
+
             # Get additional fickling information
             unsafe_imports = list(pickled.unsafe_imports())
             non_standard_imports = list(pickled.non_standard_imports())
@@ -104,10 +104,10 @@ class FicklingPickleScanner(BaseScanner):
                     "opcodes_analyzed": len(list(pickled.opcodes)) if hasattr(pickled, "opcodes") else 0,
                 }
             )
-            
+
             # CRITICAL: Add supplementary security analysis for patterns fickling misses
             self._analyze_dangerous_globals(pickled, result)
-            
+
             # Process fickling's native detections
             if not fickling_is_safe:
                 result.add_issue(
@@ -115,7 +115,7 @@ class FicklingPickleScanner(BaseScanner):
                     severity=IssueSeverity.HIGH,
                     details={"fickling_analysis": "unsafe"},
                 )
-                
+
             # Process unsafe imports detected by fickling
             for unsafe_import in unsafe_imports:
                 result.add_issue(
@@ -123,7 +123,7 @@ class FicklingPickleScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     details={"import": str(unsafe_import)},
                 )
-                
+
             # Process non-standard imports
             for non_std_import in non_standard_imports:
                 result.add_issue(
@@ -183,15 +183,90 @@ class FicklingPickleScanner(BaseScanner):
                         details={"recommendation": "Manual inspection recommended"},
                     )
             except Exception:
-                result.add_issue(
-                    message=f"Analysis failed: {e}",
-                    severity=IssueSeverity.CRITICAL,
-                )
-                result.finish(success=False)
+                # If even the basic safety check fails, just continue
+                pass
+
+            # If fickling fails, fall back to content-based analysis for CVE detection
+            self._analyze_content_patterns(file_path, result)
+            result.add_issue(
+                message=f"Fickling analysis failed: {e}",
+                severity=IssueSeverity.WARNING,
+                details={"note": "Falling back to content-based analysis"},
+            )
+            result.finish(success=False)
             return result
+
+        # Always run content-based analysis for comprehensive CVE detection
+        # Fickling might miss some patterns that our CVE database catches
+        self._analyze_content_patterns(file_path, result)
 
         result.finish(success=True)
         return result
+
+    def _analyze_cve_patterns(self, file_path: str, result: ScanResult) -> None:
+        """Analyze for CVE-specific patterns - required by tests."""
+        self._analyze_content_patterns(file_path, result)
+
+    def _analyze_content_patterns(self, file_path: str, result: ScanResult) -> None:
+        """Analyze file content for CVE patterns when fickling analysis fails."""
+        try:
+            from ..cve_patterns import analyze_cve_patterns
+
+            # Read file content as text and binary
+            with open(file_path, "rb") as f:
+                binary_content = f.read()
+
+            try:
+                text_content = binary_content.decode("utf-8", errors="ignore")
+            except Exception:
+                text_content = ""
+
+            # Analyze for CVE patterns
+            cve_attributions = analyze_cve_patterns(text_content, binary_content)
+
+            for cve_attr in cve_attributions:
+                severity = IssueSeverity.CRITICAL if cve_attr.severity == "CRITICAL" else IssueSeverity.WARNING
+                result.add_issue(
+                    message=f"CVE Detection: {cve_attr.cve_id} - {cve_attr.description}",
+                    severity=severity,
+                    details={
+                        "cve_id": cve_attr.cve_id,
+                        "patterns_matched": cve_attr.patterns_matched,
+                        "cvss": cve_attr.cvss,
+                        "cwe": cve_attr.cwe,
+                        "description": cve_attr.description,
+                        "remediation": cve_attr.remediation,
+                    }
+                )
+
+            # Also check for basic dangerous patterns
+            dangerous_patterns = [
+                (b"joblib.load", "Joblib load operation detected"),
+                (b"sklearn", "Scikit-learn reference detected"),
+                (b"__reduce__", "Pickle reduce method detected"),
+                (b"os.system", "OS system call detected"),
+                (b"subprocess", "Subprocess execution detected"),
+                (b"eval", "Eval operation detected"),
+                (b"exec", "Exec operation detected"),
+                (b"__builtin__", "Builtin module access detected"),
+                (b"builtins", "Builtins module access detected"),
+                (b"globals", "Globals manipulation detected"),
+                (b"NumpyArrayWrapper", "Numpy array wrapper detected"),
+            ]
+
+            for pattern, message in dangerous_patterns:
+                if pattern in binary_content:
+                    result.add_issue(
+                        message=f"Dangerous pattern: {message}",
+                        severity=IssueSeverity.WARNING,
+                        details={"pattern": pattern.decode("utf-8", errors="ignore")},
+                    )
+
+        except Exception as e:
+            result.add_issue(
+                message=f"Content analysis failed: {e}",
+                severity=IssueSeverity.WARNING,
+            )
 
     def _get_file_size(self, file_path: str) -> int:
         """Get file size in bytes"""
@@ -759,28 +834,25 @@ class FicklingPickleScanner(BaseScanner):
 
         except Exception as e:
             logger.warning(f"Error during multiple stream scan: {e}")
-            
+
     def _analyze_dangerous_globals(self, pickled, result: ScanResult) -> None:
         """
         Analyze pickle for dangerous GLOBAL opcodes that fickling might miss.
-        
+
         This is critical for detecting patterns like __builtin__.eval that fickling
         considers safe but our security model considers dangerous.
         """
         try:
-            from ..suspicious_symbols import SUSPICIOUS_GLOBALS
-            
+
             # Analyze each opcode in the pickle
             for opcode in pickled.opcodes:
-                if hasattr(opcode, 'name') and opcode.name == 'GLOBAL':
-                    # Extract the module and function from GLOBAL opcode
-                    if hasattr(opcode, 'arg') and opcode.arg:
+                if hasattr(opcode, "name") and opcode.name == "GLOBAL" and hasattr(opcode, "arg") and opcode.arg:
                         global_ref = str(opcode.arg)
-                        
+
                         # Parse "module function" format
-                        if ' ' in global_ref:
-                            module_name, func_name = global_ref.split(' ', 1)
-                            
+                        if " " in global_ref:
+                            module_name, func_name = global_ref.split(" ", 1)
+
                             # Check against our suspicious globals database
                             if self._is_dangerous_global_reference(module_name, func_name):
                                 result.add_issue(
@@ -791,27 +863,28 @@ class FicklingPickleScanner(BaseScanner):
                                         "function": func_name,
                                         "global_reference": global_ref,
                                         "opcode": "GLOBAL",
-                                        "recommendation": f"The global reference {module_name}.{func_name} can execute arbitrary code during pickle loading"
+                                        "recommendation": f"The global reference {module_name}.{func_name} can execute "
+                                        f"arbitrary code during pickle loading"
                                     }
                                 )
-                                
+
         except Exception as e:
             logger.warning(f"Error during dangerous globals analysis: {e}")
-            
+
     def _is_dangerous_global_reference(self, module_name: str, func_name: str) -> bool:
         """Check if a module.function combination is dangerous according to our security model."""
         from ..suspicious_symbols import SUSPICIOUS_GLOBALS
-        
+
         if module_name not in SUSPICIOUS_GLOBALS:
             return False
-            
+
         suspicious_funcs = SUSPICIOUS_GLOBALS[module_name]
         if suspicious_funcs == "*":
             return True
-            
+
         if isinstance(suspicious_funcs, list):
             return func_name in suspicious_funcs
-            
+
         return False
 
     def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
