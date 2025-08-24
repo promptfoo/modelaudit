@@ -175,6 +175,8 @@ ignore = [
 "__init__.py" = ["F401"]
 "tests/**/*.py" = ["S101", "F841"]
 "tests/assets/generators/*.py" = ["W291", "W293", "E501", "SIM115"]  # Security test generators contain intentionally malicious code
+"modelscan/**/*.py" = ["E", "W", "F", "I", "Q", "COM", "UP", "B", "C4", "SIM", "RUF"]  # External modelscan repository - ignore all rules
+"scripts/*.py" = ["E", "W", "F", "I", "Q", "COM", "UP", "B", "C4", "SIM", "RUF"]  # Utility scripts - ignore lint rules
 
 [tool.ruff.lint.flake8-quotes]
 # Standardize on double quotes for consistency with docstrings
