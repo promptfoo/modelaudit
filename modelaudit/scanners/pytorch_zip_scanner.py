@@ -15,6 +15,11 @@ class PyTorchZipScanner(BaseScanner):
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
     supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".bin"]
+    
+    # CVE-2025-32434 constants
+    CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
+    CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
+    CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
@@ -56,6 +61,13 @@ class PyTorchZipScanner(BaseScanner):
 
     def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
+        # Override timeout if provided
+        if timeout is not None:
+            self.timeout = timeout
+
+        # Start timeout tracking
+        self._start_scan_timer()
+
         # Initial validation and setup
         result = self._initialize_scan(path)
         if result.success is False:  # Early return for validation failures
@@ -68,6 +80,7 @@ class PyTorchZipScanner(BaseScanner):
             with zipfile.ZipFile(path, "r") as zip_file:
                 # Validate ZIP entries and check for path traversal
                 safe_entries = self._validate_zip_entries(zip_file, result, path)
+                self._check_timeout()  # Check timeout after entry validation
 
                 # Discover pickle files in the archive
                 pickle_files = self._discover_pickle_files(zip_file, safe_entries, result)
@@ -77,6 +90,7 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Scan all discovered pickle files
                 bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
+                self._check_timeout()  # Check timeout after pickle scanning
 
                 # Check for JIT/Script code execution risks
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
@@ -92,6 +106,18 @@ class PyTorchZipScanner(BaseScanner):
 
                 result.bytes_scanned += bytes_scanned
 
+        except TimeoutError as e:
+            # Handle timeout gracefully
+            result.add_check(
+                name="Scan Timeout",
+                passed=False,
+                message=f"Scan timed out: {str(e)}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout_seconds": self.timeout},
+            )
+            result.finish(success=True)  # Partial results are still valid
+            return result
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
         except Exception as e:
@@ -187,7 +213,9 @@ class PyTorchZipScanner(BaseScanner):
                         data_start = zef.read(8)  # header only
                     # Include protocol 1 and check for protocol 0 ASCII pickles
                     pickle_magics = [b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
-                    ascii_pickle_opcodes = [b"(", b"p"]  # Protocol 0 ASCII opcodes
+                    # Common Protocol 0 ASCII opcodes: MARK '(', PUT 'p', GLOBAL 'c',
+                    # LIST 'l', DICT 'd', INT 'I'/'i', STRING 'S', UNICODE 'V', etc.
+                    ascii_pickle_opcodes = [b"(", b"p", b"c", b"l", b"d", b"I", b"i", b"S", b"V", b"q", b"t", b"u"]
                     if any(data_start.startswith(m) for m in pickle_magics) or any(
                         data_start.startswith(op) for op in ascii_pickle_opcodes
                     ):
@@ -224,7 +252,6 @@ class PyTorchZipScanner(BaseScanner):
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
             if file_size <= max_in_mem:
                 data = zip_file.read(name)
-                bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
                     sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
             else:
@@ -233,7 +260,6 @@ class PyTorchZipScanner(BaseScanner):
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         spool.write(chunk)
                     size_on_disk = spool.tell()
-                    bytes_scanned += size_on_disk
                     spool.seek(0)
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
                         spool,  # type: ignore[arg-type]
@@ -315,7 +341,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
+            elif name.endswith((".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
@@ -366,13 +392,8 @@ class PyTorchZipScanner(BaseScanner):
     def _check_blacklist_patterns(self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult) -> None:
         """Check for blacklisted patterns in all files"""
         blacklist_patterns = None
-        if (
-            hasattr(self, "config")
-            and self.config
-            and "blacklist_patterns" in self.config
-            and self.config["blacklist_patterns"] is not None
-        ):
-            blacklist_patterns = self.config["blacklist_patterns"]
+        if not blacklist_patterns:
+            blacklist_patterns = self.config.get("blacklist_patterns") if self.config else None
 
         if blacklist_patterns:
             self._scan_blacklist_patterns(zip_file, safe_entries, blacklist_patterns, result)
@@ -601,7 +622,7 @@ class PyTorchZipScanner(BaseScanner):
         result.finish(success=False)
         return result
 
-    def _extract_pytorch_version_info(self, zipfile_obj, safe_entries: list[str]) -> dict[str, Any]:
+    def _extract_pytorch_version_info(self, zipfile_obj: zipfile.ZipFile, safe_entries: list[str]) -> dict[str, Any]:
         """Extract PyTorch version information from model archive for CVE-2025-32434 detection"""
         version_info: dict[str, Any] = {
             "pytorch_archive_version": None,
@@ -625,7 +646,11 @@ class PyTorchZipScanner(BaseScanner):
             for name in safe_entries:
                 if name.endswith(".pkl"):
                     try:
-                        pickle_data = zipfile_obj.read(name)
+                        # Cap read for version probing to 1MB; adjust via config if needed
+                        with zipfile_obj.open(name, "r") as zf:
+                            cfg = self.config or {}
+                            probe_bytes = cfg.get("version_probe_bytes", 1024 * 1024)  # 1MB default
+                            pickle_data = zf.read(probe_bytes)
                         # Look for torch version patterns in pickle data
                         framework_version = self._extract_framework_version_from_pickle(pickle_data)
                         if framework_version:
@@ -736,11 +761,11 @@ class PyTorchZipScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
-                        "cve_id": "CVE-2025-32434",
+                        "cve_id": self.CVE_2025_32434_ID,
                         "pytorch_version": framework_version,
                         "version_source": version_source,
                         "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
-                        "fixed_in": "PyTorch 2.6.0",
+                        "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                         "recommendation": (
                             "Update to PyTorch 2.6.0 or later, "
                             "avoid torch.load(weights_only=True) with untrusted models"
@@ -768,7 +793,7 @@ class PyTorchZipScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "cve_id": "CVE-2025-32434",
+                    "cve_id": self.CVE_2025_32434_ID,
                     "version_detection": "failed",
                     "recommendation": (
                         "Verify PyTorch version manually - "
@@ -783,7 +808,9 @@ class PyTorchZipScanner(BaseScanner):
             import re
 
             # Parse version string
-            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version.strip())
+            vstr = version.strip()
+            is_prerelease = bool(re.search(r'(dev|rc|alpha|beta)', vstr, re.IGNORECASE))
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 # If we can't parse it, assume vulnerable for safety
                 return True
@@ -798,10 +825,14 @@ class PyTorchZipScanner(BaseScanner):
                     return True  # 2.0.x through 2.4.x are vulnerable
                 elif minor == 5:
                     return patch <= 1  # 2.5.0 and 2.5.1 are vulnerable
+                elif minor >= 6:
+                    # For 2.6.0+, treat pre-releases conservatively as vulnerable
+                    return is_prerelease
                 else:
-                    return False  # 2.6.0+ are fixed
+                    return False  # 2.6.0+ stable releases are fixed
             else:
-                return False  # 3.x+ would not be vulnerable (future versions)
+                # For 3.x+, treat pre-releases conservatively as vulnerable
+                return is_prerelease
 
         except Exception:
             # If version parsing fails, assume vulnerable for safety
@@ -865,7 +896,7 @@ class PyTorchZipScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=f"{model_path}:{pickle_name}",
                 details={
-                    "cve_id": "CVE-2025-32434",
+                    "cve_id": self.CVE_2025_32434_ID,
                     "dangerous_opcodes": list(set(dangerous_opcodes_found)),
                     "code_execution_risks": list(set(code_execution_risks)),
                     "weights_only_false_security": True,
@@ -878,7 +909,7 @@ class PyTorchZipScanner(BaseScanner):
                         "safer serialization formats like SafeTensors. Always validate model sources."
                     ),
                     "affected_pytorch_versions": "All versions ≤2.5.1",
-                    "fixed_in": "PyTorch 2.6.0",
+                    "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                 },
             )
         else:
@@ -893,7 +924,7 @@ class PyTorchZipScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=f"{model_path}:{pickle_name}",
                 details={
-                    "cve_id": "CVE-2025-32434",
+                    "cve_id": self.CVE_2025_32434_ID,
                     "dangerous_opcodes_found": False,
                     "weights_only_security_note": (
                         "Even when no dangerous opcodes are detected, weights_only=True in torch.load() "
