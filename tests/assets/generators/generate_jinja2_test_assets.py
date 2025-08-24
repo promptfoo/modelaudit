@@ -8,7 +8,7 @@ This script creates various test files including:
 - Benign ML templates for false positive testing
 - Mock GGUF files (without actual GGUF binary format)
 """
-# ruff: noqa: E501  # Long lines are intentional for template strings
+# Long lines are intentional for template strings
 
 import json
 from pathlib import Path
