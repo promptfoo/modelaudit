@@ -17,6 +17,7 @@ from .core import determine_exit_code, scan_model_directory_or_file
 from .interrupt_handler import interruptible_scan
 from .jfrog_integration import scan_jfrog_artifact
 from .models import ModelAuditResultModel
+from .sarif_formatter import format_sarif_output
 from .scanners.base import IssueSeverity
 from .utils import resolve_dvc_file
 from .utils.cloud_storage import download_from_cloud, is_cloud_url
@@ -400,9 +401,9 @@ def delegate_info() -> None:
 @click.option(
     "--format",
     "-f",
-    type=click.Choice(["text", "json"]),
+    type=click.Choice(["text", "json", "sarif"]),
     default="text",
-    help="Output format [default: text]",
+    help="Output format (text, json, or sarif) [default: text]",
 )
 @click.option(
     "--output",
@@ -573,7 +574,7 @@ def scan_command(
 
     \b
     Advanced options:
-        --format, -f       Output format (text or json)
+        --format, -f       Output format (text, json, or sarif)
         --output, -o       Write results to a file instead of stdout
         --sbom             Write CycloneDX SBOM to file
         --timeout, -t      Set scan timeout in seconds
@@ -606,7 +607,7 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
-    # Print a nice header if not in JSON mode and not writing to a file
+    # Print a nice header if not in structured format mode and not writing to a file
     if format == "text" and not output:
         # Add delegation indicator if running via promptfoo
         delegation_note = ""
@@ -1386,6 +1387,9 @@ def scan_command(
 
         # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
+    elif format == "sarif":
+        # SARIF format for integration with security tools
+        output_text = format_sarif_output(audit_result, expanded_paths, verbose)
     else:
         # Text format - convert to dict for backward compatibility with format_text_output
         output_text = format_text_output(audit_result.model_dump(), verbose)
@@ -1413,7 +1417,7 @@ def scan_command(
             else:
                 click.echo("No security issues found")
     else:
-        # Add a separator line between debug output and scan results
+        # Add a separator line between debug output and scan results (only for text format)
         if format == "text":
             click.echo("\n" + "─" * 80)
         click.echo(output_text)
