@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **feat**: add SARIF output format support for integration with security tools and CI/CD pipelines
 - **feat**: add Jinja2 template injection scanner (#323)
 - **feat**: comprehensive deep Pydantic integration with advanced type safety (#322)
 - **feat**: optimize CI for faster feedback (#320)
