@@ -171,7 +171,10 @@ def update_models_md(file_path: str, dry_run: bool = False) -> Dict[str, int]:
 
 
 def main():
-    models_md_path = "/Users/mdangelo/projects/ma4/models.md"
+    # Get the project root (parent of scripts directory)
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
+    models_md_path = project_root / "docs" / "models.md"
     
     if not os.path.exists(models_md_path):
         print(f"Error: {models_md_path} not found")
