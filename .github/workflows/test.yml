@@ -131,6 +131,9 @@ jobs:
       - name: Check for circular imports
         run: |
           set -euo pipefail
+          ls -la scripts/check_circular_imports.py
+          echo "Current directory: $(pwd)"
+          echo "Python version: $(python --version)"
           rye run python scripts/check_circular_imports.py
 
   # Fast feedback job for immediate results
