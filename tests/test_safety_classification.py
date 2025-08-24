@@ -202,20 +202,24 @@ class TestSafetyClassification:
         # Dangerous builtins should not be in the safe lists
         builtin_modules = ["builtins", "__builtin__", "__builtins__"]
         dangerous_builtins = ["eval", "exec", "compile", "__import__"]
-        
+
         for module in builtin_modules:
             if module in SAFE_GLOBALS:
                 safe_funcs = SAFE_GLOBALS[module]
                 for dangerous_func in dangerous_builtins:
-                    assert dangerous_func not in safe_funcs, f"Dangerous builtin {module}.{dangerous_func} should not be in SAFE_GLOBALS"
-        
+                    assert dangerous_func not in safe_funcs, (
+                        f"Dangerous builtin {module}.{dangerous_func} should not be in SAFE_GLOBALS"
+                    )
+
         # But safe builtins should be allowed
         safe_builtins = ["len", "str", "int", "float"]
         for module in builtin_modules:
             if module in SAFE_GLOBALS:
                 safe_funcs = SAFE_GLOBALS[module]
                 for safe_func in safe_builtins:
-                    assert safe_func in safe_funcs, f"Safe builtin {module}.{safe_func} should be in SAFE_GLOBALS"
+                    assert safe_func in safe_funcs, (
+                        f"Safe builtin {module}.{safe_func} should be in SAFE_GLOBALS"
+                    )
 
     def test_pickle_modules_unsafe(self):
         """Test that pickle-related modules are not marked as safe."""
