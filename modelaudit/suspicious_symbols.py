@@ -134,6 +134,18 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
         "device",
         "memory_format",
         "layout",
+        # Storage classes - safe for model serialization
+        "FloatStorage",
+        "DoubleStorage",
+        "HalfStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ShortStorage",
+        "IntStorage",
+        "LongStorage",
+        "BoolStorage",
+        "Storage",
+        "UntypedStorage",
     ],
     "torch.nn": "*",  # Neural network modules
     "torch.nn.functional": "*",  # Functional neural network operations

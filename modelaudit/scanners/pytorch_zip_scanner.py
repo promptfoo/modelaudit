@@ -854,30 +854,37 @@ class PyTorchZipScanner(BaseScanner):
             issue_msg = issue.message.lower()
             issue_details = issue.details or {}
 
-            # Look for specific dangerous opcodes
-            if "reduce" in issue_msg or "REDUCE" in str(issue_details):
+            # Get safety level from the issue details if available
+            safety_level = issue_details.get("safety_level", "unknown")
+
+            # Only flag opcodes as dangerous if they are classified as "dangerous" by the safety system
+            # This prevents false positives from legitimate PyTorch operations
+            is_dangerous = safety_level == "dangerous"
+
+            # Look for specific dangerous opcodes - only flag if actually dangerous
+            if ("reduce" in issue_msg or "REDUCE" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("REDUCE")
                 code_execution_risks.append("__reduce__ method exploitation")
-            if "inst" in issue_msg or "INST" in str(issue_details):
+            if ("inst" in issue_msg or "INST" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("INST")
                 code_execution_risks.append("Class instantiation code execution")
-            if "obj" in issue_msg or "OBJ" in str(issue_details):
+            if ("obj" in issue_msg or "OBJ" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("OBJ")
                 code_execution_risks.append("Object creation code execution")
-            if "newobj" in issue_msg or "NEWOBJ" in str(issue_details):
+            if ("newobj" in issue_msg or "NEWOBJ" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("NEWOBJ")
                 code_execution_risks.append("New-style object creation")
-            if "stack_global" in issue_msg or "STACK_GLOBAL" in str(issue_details):
+            if ("stack_global" in issue_msg or "STACK_GLOBAL" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("STACK_GLOBAL")
                 code_execution_risks.append("Dynamic import and attribute access")
-            if "global" in issue_msg or "GLOBAL" in str(issue_details):
+            if ("global" in issue_msg or "GLOBAL" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("GLOBAL")
                 code_execution_risks.append("Module import and attribute access")
-            if "build" in issue_msg or "BUILD" in str(issue_details):
+            if ("build" in issue_msg or "BUILD" in str(issue_details)) and is_dangerous:
                 dangerous_opcodes_found.append("BUILD")
                 code_execution_risks.append("__setstate__ method exploitation")
 
-            # Look for any code execution patterns
+            # Look for any code execution patterns - these are always dangerous
             if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
                 code_execution_risks.append("Direct code execution patterns")
 
