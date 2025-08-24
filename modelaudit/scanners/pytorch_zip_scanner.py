@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional, cast
+from typing import Any, ClassVar, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -19,7 +19,8 @@ class PyTorchZipScanner(BaseScanner):
     def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
-        self.pickle_scanner = PickleScanner(config)
+        self.pickle_scanner: PickleScanner = PickleScanner(config)
+        self.current_file_path = ""  # Will be set when scanning files
 
     @staticmethod
     def _read_header(path: str, length: int = 4) -> bytes:
@@ -53,7 +54,7 @@ class PyTorchZipScanner(BaseScanner):
         # For .pt and .pth, always try to handle
         return True
 
-    def scan(self, path: str) -> ScanResult:
+    def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
         # Initial validation and setup
         result = self._initialize_scan(path)
@@ -89,7 +90,7 @@ class PyTorchZipScanner(BaseScanner):
                 # Check for blacklisted patterns across all files
                 self._check_blacklist_patterns(zip_file, safe_entries, result)
 
-                result.bytes_scanned = bytes_scanned
+                result.bytes_scanned += bytes_scanned
 
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
@@ -117,7 +118,7 @@ class PyTorchZipScanner(BaseScanner):
         header = self._read_header(path)
         if not header.startswith(b"PK"):
             result.add_check(
-                name="ZIP Format Validation",
+                name="PyTorch ZIP Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
                 severity=IssueSeverity.CRITICAL,
@@ -128,7 +129,7 @@ class PyTorchZipScanner(BaseScanner):
             return result
         else:
             result.add_check(
-                name="ZIP Format Validation",
+                name="PyTorch ZIP Format Validation",
                 passed=True,
                 message="Valid ZIP format detected",
                 location=path,
@@ -140,9 +141,8 @@ class PyTorchZipScanner(BaseScanner):
         """Validate ZIP entries and check for path traversal attacks"""
         safe_entries: list[str] = []
         path_traversal_found = False
-
+        temp_base = os.path.join(tempfile.gettempdir(), "extract")
         for name in zip_file.namelist():
-            temp_base = os.path.join(tempfile.gettempdir(), "extract")
             _, is_safe = sanitize_archive_path(name, temp_base)
             if not is_safe:
                 result.add_check(
@@ -183,9 +183,14 @@ class PyTorchZipScanner(BaseScanner):
         if not pickle_files:
             for name in safe_entries:
                 try:
-                    data_start = zip_file.read(name)[:4]
-                    pickle_magics = [b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
-                    if any(data_start.startswith(m) for m in pickle_magics):
+                    with zip_file.open(name, "r") as zef:
+                        data_start = zef.read(8)  # header only
+                    # Include protocol 1 and check for protocol 0 ASCII pickles
+                    pickle_magics = [b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
+                    ascii_pickle_opcodes = [b"(", b"p"]  # Protocol 0 ASCII opcodes
+                    if any(data_start.startswith(m) for m in pickle_magics) or any(
+                        data_start.startswith(op) for op in ascii_pickle_opcodes
+                    ):
                         pickle_files.append(name)
                 except Exception:
                     pass
@@ -214,21 +219,26 @@ class PyTorchZipScanner(BaseScanner):
             # Set the current file path on the pickle scanner for proper error reporting
             self.pickle_scanner.current_file_path = f"{path}:{name}"
 
-            # Choose scanning approach based on file size
-            if file_size < 10 * 1024 * 1024 * 1024:  # < 10GB
+            # Choose scanning approach based on file size with spooling for seekability
+            cfg = self.config or {}
+            max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
+            if file_size <= max_in_mem:
                 data = zip_file.read(name)
                 bytes_scanned += len(data)
-
                 with io.BytesIO(data) as file_like:
                     sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
             else:
-                # For large pickle files, use streaming extraction
-                with zip_file.open(name, "r") as zf:
+                # Stream to a spooled temp file to avoid OOM and provide seek()
+                with zip_file.open(name, "r") as zf, tempfile.SpooledTemporaryFile(max_size=max_in_mem) as spool:
+                    for chunk in iter(lambda: zf.read(1024 * 1024), b""):
+                        spool.write(chunk)
+                    size_on_disk = spool.tell()
+                    bytes_scanned += size_on_disk
+                    spool.seek(0)
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        cast(io.BufferedIOBase, zf),  # type: ignore[arg-type]
-                        file_size,
+                        spool,  # type: ignore[arg-type]
+                        size_on_disk,
                     )
-                bytes_scanned += file_size
 
             # Update issue metadata and locations
             for issue in sub_result.issues:
@@ -261,32 +271,25 @@ class PyTorchZipScanner(BaseScanner):
                 break  # Already found patterns, no need to continue
 
             try:
-                info = zip_file.getinfo(name)
-                # Only check first 100GB of each file for JIT patterns
-                check_size = min(info.file_size, 100 * 1024 * 1024 * 1024)
-
                 with zip_file.open(name, "r") as zf:
-                    chunk = zf.read(check_size)
-                    bytes_scanned += len(chunk)
-
-                    # Check this chunk for JIT/Script patterns
-                    self.check_for_jit_script_code(
-                        chunk,
-                        result,
-                        model_type="pytorch",
-                        context=f"{path}:{name}",
-                    )
-
-                    # Check this chunk for network communication patterns
-                    self.check_for_network_communication(
-                        chunk,
-                        result,
-                        context=f"{path}:{name}",
-                    )
-
-                    # Check if we found any JIT issues
-                    if any("JIT" in issue.message or "TorchScript" in issue.message for issue in result.issues):
-                        jit_patterns_found = True
+                    # 1MB streaming chunks
+                    for chunk in iter(lambda: zf.read(1024 * 1024), b""):
+                        bytes_scanned += len(chunk)
+                        # Dispatch to base scanner helpers
+                        jit_count = self.check_for_jit_script_code(
+                            chunk,
+                            result,
+                            model_type="pytorch",
+                            context=f"{path}:{name}",
+                        )
+                        self.check_for_network_communication(
+                            chunk,
+                            result,
+                            context=f"{path}:{name}",
+                        )
+                        if jit_count:
+                            jit_patterns_found = True
+                            break
 
             except Exception:
                 # Skip files that can't be read
@@ -306,7 +309,7 @@ class PyTorchZipScanner(BaseScanner):
                     name="Python Code File Detection",
                     passed=False,
                     message=f"Python code file found in PyTorch model: {name}",
-                    severity=IssueSeverity.INFO,
+                    severity=IssueSeverity.WARNING,
                     location=f"{path}:{name}",
                     details={"file": name},
                 )
@@ -421,7 +424,7 @@ class PyTorchZipScanner(BaseScanner):
                 else:
                     self._scan_small_file_for_patterns(zip_file, name, blacklist_patterns, result)
 
-            except (zipfile.BadZipFile, MemoryError, Exception) as e:
+            except Exception as e:
                 self._handle_blacklist_scan_error(name, e, result)
 
     def _scan_large_file_for_patterns(
@@ -611,7 +614,7 @@ class PyTorchZipScanner(BaseScanner):
             if "version" in safe_entries:
                 version_data = zipfile_obj.read("version").decode("utf-8", errors="ignore").strip()
                 version_info["pytorch_archive_version"] = version_data
-                version_info["pytorch_version_source"] = "archive/version"
+                version_info["pytorch_version_source"] = "version"
             elif "archive/version" in safe_entries:
                 version_data = zipfile_obj.read("archive/version").decode("utf-8", errors="ignore").strip()
                 version_info["pytorch_archive_version"] = version_data
