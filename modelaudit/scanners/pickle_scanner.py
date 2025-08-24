@@ -10,6 +10,7 @@ from .fickling_pickle_scanner import FicklingPickleScanner
 # Legacy alias - maintains backward compatibility
 PickleScanner = FicklingPickleScanner
 
+
 # Legacy function compatibility
 def is_suspicious_global(module_name: str, func_name: str) -> bool:
     """
@@ -30,6 +31,7 @@ def is_suspicious_global(module_name: str, func_name: str) -> bool:
 
     return False
 
+
 # Legacy constants for backward compatibility
 ML_SAFE_GLOBALS = {
     "joblib": ["dump", "load", "Memory"],
@@ -37,8 +39,9 @@ ML_SAFE_GLOBALS = {
     "pickle": ["dump", "load", "dumps", "loads"],
     "numpy": ["array", "load", "save", "ndarray", "dtype", "_reconstruct"],
     "torch": ["save", "load", "tensor"],
-    "sklearn": ["Pipeline", "BaseEstimator"]
+    "sklearn": ["Pipeline", "BaseEstimator"],
 }
+
 
 # ML context detection function (from fickling_pickle_scanner)
 def _detect_ml_context(data):
@@ -47,6 +50,7 @@ def _detect_ml_context(data):
     """
     scanner = FicklingPickleScanner()
     return scanner._detect_ml_context(data)
+
 
 def _is_legitimate_serialization_file(file_path: str) -> bool:
     """
@@ -85,6 +89,7 @@ def _is_legitimate_serialization_file(file_path: str) -> bool:
 
     return False
 
+
 def _is_actually_dangerous_global(module_name: str, func_name: str) -> bool:
     """
     Determine if a global is actually dangerous in the current context.
@@ -100,12 +105,13 @@ def _is_actually_dangerous_global(module_name: str, func_name: str) -> bool:
     # Allow some ML-related patterns that might be flagged but are generally safe
     ml_safe_patterns = [
         ("numpy", "_reconstruct"),  # NumPy array reconstruction
-        ("numpy", "dtype"),         # Data type definitions
-        ("torch", "load"),          # PyTorch model loading
-        ("sklearn", "Pipeline"),    # Sklearn pipelines
+        ("numpy", "dtype"),  # Data type definitions
+        ("torch", "load"),  # PyTorch model loading
+        ("sklearn", "Pipeline"),  # Sklearn pipelines
     ]
 
     return (module_name, func_name) not in ml_safe_patterns
+
 
 def _should_ignore_opcode_sequence(opcodes: list) -> bool:
     """
@@ -119,14 +125,7 @@ def _should_ignore_opcode_sequence(opcodes: list) -> bool:
 
     # Simple heuristic: if the sequence only contains "safe" operations
     # like GLOBAL references to known ML modules, we can ignore it
-    safe_patterns = [
-        "numpy",
-        "torch",
-        "sklearn",
-        "pandas",
-        "collections",
-        "OrderedDict"
-    ]
+    safe_patterns = ["numpy", "torch", "sklearn", "pandas", "collections", "OrderedDict"]
 
     # Convert opcodes to string representation for pattern matching
     opcodes_str = str(opcodes).lower()
@@ -140,6 +139,7 @@ def _should_ignore_opcode_sequence(opcodes: list) -> bool:
 
     return False
 
+
 # Export for backwards compatibility
 __all__ = [
     "ML_SAFE_GLOBALS",
@@ -149,5 +149,5 @@ __all__ = [
     "_is_legitimate_serialization_file",
     "_should_ignore_opcode_sequence",
     "is_suspicious_global",
-    "pickletools"  # Re-export standard library module
+    "pickletools",  # Re-export standard library module
 ]

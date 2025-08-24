@@ -764,6 +764,7 @@ class FicklingPickleScanner(BaseScanner):
                     # Clean up temporary file
                     import contextlib
                     import os
+
                     with contextlib.suppress(OSError):
                         os.unlink(tmp_file.name)
 
