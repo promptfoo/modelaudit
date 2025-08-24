@@ -128,9 +128,10 @@ jobs:
         run: |
           rye run mypy modelaudit/ tests/
 
-      # - name: Check for circular imports
-      #   run: |
-      #     rye run python scripts/check_circular_imports.py
+      - name: Check for circular imports
+        run: |
+          set -euo pipefail
+          rye run python scripts/check_circular_imports.py
 
   # Fast feedback job for immediate results
   quick-feedback:
