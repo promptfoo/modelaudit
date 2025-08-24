@@ -95,34 +95,63 @@ jobs:
 
       - name: Check for circular imports
         run: |
-          python -c "
+          set -euo pipefail
+          rye run python - <<'PY'
+          import ast
           import sys
-          import warnings
-          
+          import importlib.util
+          from pathlib import Path
+
           print('🔍 Checking for circular imports...')
-          
-          # Test basic imports
+
+          # Basic imports
           try:
-              import modelaudit
-              from modelaudit.scanners.base import BaseScanner, ScanResult
-              from modelaudit.core import scan_file
-              from modelaudit.utils.result_conversion import scan_result_from_dict
+              import modelaudit  # noqa: F401
+              from modelaudit.scanners.base import BaseScanner, ScanResult  # noqa: F401
+              from modelaudit.core import scan_file  # noqa: F401
+              from modelaudit.utils.result_conversion import scan_result_from_dict  # noqa: F401
               print('✅ All imports successful')
           except Exception as e:
               print(f'❌ Import failed: {e}')
               sys.exit(1)
-          
-          # Check that base doesn't import core
-          base_module = sys.modules['modelaudit.scanners.base']
-          if hasattr(base_module, '__file__'):
-              with open(base_module.__file__, 'r') as f:
-                  content = f.read()
-                  if 'from ..core import' in content or 'from modelaudit.core import' in content:
-                      print('❌ Circular import detected: base.py imports from core.py')
-                      sys.exit(1)
-          
+
+          def find_module_path(name: str) -> Path | None:
+              spec = importlib.util.find_spec(name)
+              return Path(spec.origin) if spec and spec.origin else None
+
+          def module_imports_target(path: Path | None, targets: set[str]) -> bool:
+              if not path or not path.exists():
+                  return False
+              tree = ast.parse(path.read_text(encoding='utf-8'))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      for alias in node.names:
+                          if alias.name in targets:
+                              return True
+                  elif isinstance(node, ast.ImportFrom):
+                      # Absolute imports
+                      if node.module and node.module in targets:
+                          return True
+                      # Relative imports (e.g., from ..core import ...)
+                      # Normalize relative by best-effort suffix match
+                      if node.module and any(node.module.endswith(t.split('.', 1)[-1]) for t in targets):
+                          return True
+              return False
+
+          base_path = find_module_path('modelaudit.scanners.base')
+          core_path = find_module_path('modelaudit.core')
+
+          # base -> core
+          if module_imports_target(base_path, {'modelaudit.core'}):
+              print('❌ Circular risk: scanners/base.py imports core.py')
+              sys.exit(1)
+          # core -> base (defensive)
+          if module_imports_target(core_path, {'modelaudit.scanners.base'}):
+              print('❌ Circular risk: core.py imports scanners/base.py')
+              sys.exit(1)
+
           print('✅ No circular imports detected')
-          "
+          PY
 
   type-check:
     name: Type Check
