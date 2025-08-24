@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, cast
+from typing import IO, Any, Callable, Dict, List, Optional, Tuple, cast
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -42,18 +42,18 @@ _OPEN_PATCH_LOCK = Lock()
 
 
 def _add_asset_to_results(
-    results: dict[str, Any],
+    results: Dict[str, Any],
     file_path: str,
     file_result: ScanResult,
 ) -> None:
     """Helper function to add an asset entry to the results."""
-    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list = cast(List[Dict[str, Any]], results["assets"])
     assets_list.append(asset_from_scan_result(file_path, file_result))
 
 
-def _add_error_asset_to_results(results: dict[str, Any], file_path: str) -> None:
+def _add_error_asset_to_results(results: Dict[str, Any], file_path: str) -> None:
     """Helper function to add an error asset entry to the results."""
-    assets_list = cast(list[dict[str, Any]], results["assets"])
+    assets_list = cast(List[Dict[str, Any]], results["assets"])
     assets_list.append({"path": file_path, "type": "error"})
 
 
@@ -76,7 +76,7 @@ def _calculate_file_hash(file_path: str) -> str:
             return f"fallback_{file_path}"
 
 
-def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
+def _group_files_by_content(file_paths: List[str]) -> Dict[str, List[str]]:
     """Group files by their content hash to avoid scanning duplicates.
 
     Args:
@@ -85,7 +85,7 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     Returns:
         Dictionary mapping content hash to list of file paths with that content
     """
-    content_groups: dict[str, list[str]] = defaultdict(list)
+    content_groups: Dict[str, List[str]] = defaultdict(list)
 
     for file_path in file_paths:
         content_hash = _calculate_file_hash(file_path)
@@ -129,7 +129,7 @@ def _extract_primary_asset_from_location(location: str) -> str:
     return primary_asset.strip() if primary_asset.strip() else "unknown"
 
 
-def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def _group_checks_by_asset(checks_list: List[Any]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
     """Group checks by (check_name, primary_asset_path).
 
     Args:
@@ -138,7 +138,7 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
     Returns:
         Dictionary mapping (check_name, asset_path) to list of checks
     """
-    check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    check_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
 
     for i, check in enumerate(checks_list):
         # Type guard: ensure check is a dictionary
@@ -157,7 +157,7 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
 
 
 def _create_consolidated_message(
-    check_name: str, group_checks: list[dict[str, Any]], consolidated_status: str, failed_count: int
+    check_name: str, group_checks: List[Dict[str, Any]], consolidated_status: str, failed_count: int
 ) -> str:
     """Create appropriate consolidated message based on check results.
 
@@ -192,7 +192,7 @@ def _create_consolidated_message(
             return f"{check_name} found {failed_count} issues"
 
 
-def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[str, Any]:
+def _collect_consolidated_details(group_checks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Collect and consolidate details from failed checks.
 
     Args:
@@ -201,8 +201,8 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     Returns:
         Consolidated details dictionary
     """
-    consolidated_details: dict[str, Any] = {"component_count": len(group_checks)}
-    failed_details: list[Any] = []
+    consolidated_details: Dict[str, Any] = {"component_count": len(group_checks)}
+    failed_details: List[Any] = []
 
     for check in group_checks:
         if check.get("status") == "failed" and check.get("details"):
@@ -214,7 +214,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+def _extract_failure_context(group_checks: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     """Extract severity and explanation from failed checks.
 
     Args:
@@ -240,7 +240,7 @@ def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Option
     return consolidated_severity, consolidated_why
 
 
-def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
+def _get_consolidated_timestamp(group_checks: List[Dict[str, Any]]) -> float:
     """Get the most recent timestamp from a group of checks.
 
     Args:
@@ -254,7 +254,7 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
 
 
 def _update_result_counts(
-    results: dict[str, Any], consolidated_checks: list[dict[str, Any]], original_count: int
+    results: Dict[str, Any], consolidated_checks: List[Dict[str, Any]], original_count: int
 ) -> None:
     """Update result dictionary with consolidated check counts.
 
@@ -286,7 +286,7 @@ def _update_result_counts(
         logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
 
 
-def _consolidate_checks(results: dict[str, Any]) -> None:
+def _consolidate_checks(results: Dict[str, Any]) -> None:
     """Consolidate duplicate checks by name and asset for cleaner reporting.
 
     Groups checks by (check_name, primary_asset_path) and consolidates them into
@@ -299,7 +299,7 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
     Raises:
         Exception: Logs errors but doesn't fail the scan if consolidation fails
     """
-    checks_list = cast(list[Any], results.get("checks", []))
+    checks_list = cast(List[Any], results.get("checks", []))
     if not checks_list:
         logger.debug("No checks to consolidate")
         return
@@ -310,7 +310,7 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
     check_groups = _group_checks_by_asset(checks_list)
 
     # Consolidate checks within each group
-    consolidated_checks: list[dict[str, Any]] = []
+    consolidated_checks: List[Dict[str, Any]] = []
 
     for (check_name, primary_asset), group_checks in check_groups.items():
         if len(group_checks) == 1:
@@ -353,7 +353,7 @@ def _consolidate_checks(results: dict[str, Any]) -> None:
     _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
-def validate_scan_config(config: dict[str, Any]) -> None:
+def validate_scan_config(config: Dict[str, Any]) -> None:
     """Validate configuration parameters for scanning."""
     timeout = config.get("timeout")
     if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
@@ -374,7 +374,7 @@ def validate_scan_config(config: dict[str, Any]) -> None:
 
 def scan_model_directory_or_file(
     path: str,
-    blacklist_patterns: Optional[list[str]] = None,
+    blacklist_patterns: Optional[List[str]] = None,
     timeout: int = 3600,  # 1 hour for large models (up to 8GB+)
     max_file_size: int = 0,  # 0 means unlimited - support any size
     max_total_size: int = 0,  # 0 means unlimited
@@ -382,7 +382,7 @@ def scan_model_directory_or_file(
     progress_callback: Optional[Callable[[str, float], None]] = None,
     skip_file_types: bool = True,
     **kwargs,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     """
     Scan a model file or directory for malicious content.
 
@@ -405,7 +405,7 @@ def scan_model_directory_or_file(
     start_time = time.time()
 
     # Initialize results with proper type hints
-    results: dict[str, Any] = {
+    results: Dict[str, Any] = {
         "start_time": start_time,
         "path": path,
         "bytes_scanned": 0,
@@ -450,18 +450,18 @@ def scan_model_directory_or_file(
                     results["bytes_scanned"] = scan_result.metadata.get("file_size", 0)
 
                     # Add scanner info
-                    scanners_list = cast(list[str], results["scanners"])
+                    scanners_list = cast(List[str], results["scanners"])
                     if scan_result.scanner_name and scan_result.scanner_name not in scanners_list:
                         scanners_list.append(scan_result.scanner_name)
 
                     # Add issues
-                    issues_list = cast(list[dict[str, Any]], results["issues"])
+                    issues_list = cast(List[Dict[str, Any]], results["issues"])
                     for issue in scan_result.issues:
                         issues_list.append(issue.to_dict())
 
                     # Add checks if available
                     if hasattr(scan_result, "checks"):
-                        checks_list = cast(list[dict[str, Any]], results["checks"])
+                        checks_list = cast(List[Dict[str, Any]], results["checks"])
                         for check in scan_result.checks:
                             checks_list.append(check.to_dict())
 
@@ -469,7 +469,7 @@ def scan_model_directory_or_file(
                     _add_asset_to_results(results, stream_url, scan_result)
 
                     # Add metadata
-                    file_meta = cast(dict[str, Any], results["file_metadata"])
+                    file_meta = cast(Dict[str, Any], results["file_metadata"])
                     file_meta[stream_url] = scan_result.metadata
 
                     if not was_complete:
@@ -525,7 +525,7 @@ def scan_model_directory_or_file(
             scanned_paths: set[str] = set()
 
             # First pass: collect all file paths that need scanning
-            files_to_scan: list[str] = []
+            files_to_scan: List[str] = []
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -541,7 +541,7 @@ def scan_model_directory_or_file(
                         try:
                             link_target = os.readlink(file_path)
                         except OSError as e:
-                            issues_list = cast(list[dict[str, Any]], results["issues"])
+                            issues_list = cast(List[Dict[str, Any]], results["issues"])
                             issues_list.append(
                                 {
                                     "message": "Broken symlink encountered",
@@ -569,7 +569,7 @@ def scan_model_directory_or_file(
                                     break
 
                     if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list = cast(List[Dict[str, Any]], results["issues"])
                         issues_list.append(
                             {
                                 "message": "Path traversal outside scanned directory",
@@ -585,7 +585,7 @@ def scan_model_directory_or_file(
                     if skip_file_types and should_skip_file(file_path):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
-                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            file_meta = cast(Dict[str, Any], results["file_metadata"])
                             try:
                                 license_metadata = collect_license_metadata(str(resolved_file))
                                 file_meta[str(resolved_file)] = license_metadata
@@ -670,11 +670,11 @@ def scan_model_directory_or_file(
                         content_processed += 1
 
                         scanner_name = file_result.scanner_name
-                        scanners_list = cast(list[str], results["scanners"])
+                        scanners_list = cast(List[str], results["scanners"])
                         if scanner_name and scanner_name not in scanners_list:
                             scanners_list.append(scanner_name)
 
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list = cast(List[Dict[str, Any]], results["issues"])
 
                         # Add issues for each file path that shares this content
                         for issue in file_result.issues:
@@ -692,7 +692,7 @@ def scan_model_directory_or_file(
 
                         # Add checks for each file path that shares this content
                         if hasattr(file_result, "checks"):
-                            checks_list = cast(list[dict[str, Any]], results["checks"])
+                            checks_list = cast(List[Dict[str, Any]], results["checks"])
                             for check in file_result.checks:
                                 check_dict = check.to_dict()
                                 # Update location to include all file paths with this content
@@ -711,7 +711,7 @@ def scan_model_directory_or_file(
                             _add_asset_to_results(results, file_path, file_result)
 
                             # Add metadata for all file paths
-                            file_meta = cast(dict[str, Any], results["file_metadata"])
+                            file_meta = cast(Dict[str, Any], results["file_metadata"])
                             license_metadata = collect_license_metadata(file_path)
                             combined_metadata = {**file_result.metadata, **license_metadata}
                             # Add information about content deduplication
@@ -736,7 +736,7 @@ def scan_model_directory_or_file(
                     except Exception as e:
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         results["success"] = False
-                        issues_list = cast(list[dict[str, Any]], results["issues"])
+                        issues_list = cast(List[Dict[str, Any]], results["issues"])
 
                         # Add error for all files that share this content
                         for file_path in file_paths:
@@ -762,7 +762,7 @@ def scan_model_directory_or_file(
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.info("Scan terminated early due to total size limit")
-                issues_list = cast(list[dict[str, Any]], results["issues"])
+                issues_list = cast(List[Dict[str, Any]], results["issues"])
                 issues_list.append(
                     {
                         "message": "Scan terminated early due to total size limit",
@@ -828,23 +828,23 @@ def scan_model_directory_or_file(
                 results["bytes_scanned"] = cast(int, results["bytes_scanned"]) + file_result.bytes_scanned
 
                 scanner_name = file_result.scanner_name
-                scanners_list = cast(list[str], results["scanners"])
+                scanners_list = cast(List[str], results["scanners"])
                 if scanner_name and scanner_name not in scanners_list:
                     scanners_list.append(scanner_name)
 
-                issues_list = cast(list[dict[str, Any]], results["issues"])
+                issues_list = cast(List[Dict[str, Any]], results["issues"])
                 for issue in file_result.issues:
                     issues_list.append(issue.to_dict())
 
                 # Add checks if available
                 if hasattr(file_result, "checks"):
-                    checks_list = cast(list[dict[str, Any]], results["checks"])
+                    checks_list = cast(List[Dict[str, Any]], results["checks"])
                     for check in file_result.checks:
                         checks_list.append(check.to_dict())
 
                 _add_asset_to_results(results, target, file_result)
 
-                file_meta = cast(dict[str, Any], results["file_metadata"])
+                file_meta = cast(Dict[str, Any], results["file_metadata"])
                 license_metadata = collect_license_metadata(target)
                 combined_metadata = {**file_result.metadata, **license_metadata}
                 file_meta[target] = combined_metadata
@@ -873,7 +873,7 @@ def scan_model_directory_or_file(
             "severity": IssueSeverity.INFO.value,
             "details": {"interrupted": True},
         }
-        issues_list = cast(list[dict[str, Any]], results["issues"])
+        issues_list = cast(List[Dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
     except Exception as e:
         logger.exception(f"Error during scan: {e!s}")
@@ -883,7 +883,7 @@ def scan_model_directory_or_file(
             "severity": IssueSeverity.CRITICAL.value,
             "details": {"exception_type": type(e).__name__},
         }
-        issues_list = cast(list[dict[str, Any]], results["issues"])
+        issues_list = cast(List[Dict[str, Any]], results["issues"])
         issues_list.append(issue_dict)
         _add_error_asset_to_results(results, path)
 
@@ -903,7 +903,7 @@ def scan_model_directory_or_file(
     # Add license warnings if any
     try:
         license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
-        issues_list = cast(list[dict[str, Any]], results["issues"])
+        issues_list = cast(List[Dict[str, Any]], results["issues"])
         for warning in license_warnings:
             # Convert license warnings to issues
             issue_dict = {
@@ -949,7 +949,7 @@ def scan_model_directory_or_file(
         "Too many open files",
     ]
 
-    issues_list = cast(list[dict[str, Any]], results["issues"])
+    issues_list = cast(List[Dict[str, Any]], results["issues"])
     results["has_errors"] = (
         any(
             any(indicator in issue.get("message", "") for indicator in operational_error_indicators)
@@ -963,7 +963,7 @@ def scan_model_directory_or_file(
     return results
 
 
-def determine_exit_code(results: dict[str, Any]) -> int:
+def determine_exit_code(results: Dict[str, Any]) -> int:
     """
     Determine the appropriate exit code based on scan results.
 
@@ -1043,7 +1043,7 @@ def _is_huggingface_cache_file(path: str) -> bool:
     return bool("/refs/" in path and filename in ["main", "HEAD"])
 
 
-def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+def scan_file(path: str, config: Optional[Dict[str, Any]] = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -1257,9 +1257,9 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
 
 
 def merge_scan_result(
-    results: dict[str, Any],
+    results: Dict[str, Any],
     scan_result: ScanResult,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     """
     Merge a ScanResult object into the results dictionary.
 
@@ -1274,7 +1274,7 @@ def merge_scan_result(
     scan_dict = scan_result.to_dict() if isinstance(scan_result, ScanResult) else scan_result
 
     # Merge issues
-    issues_list = cast(list[dict[str, Any]], results["issues"])
+    issues_list = cast(List[Dict[str, Any]], results["issues"])
     for issue in scan_dict.get("issues", []):
         issues_list.append(issue)
 

@@ -11,7 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import re
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 # Dangerous TorchScript operations that can execute arbitrary code
 DANGEROUS_TORCH_OPS = [
@@ -126,7 +126,7 @@ CODE_EXECUTION_PATTERNS = [
 class JITScriptDetector:
     """Detects dangerous JIT/Script code execution patterns in ML models."""
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initialize the JIT/Script detector.
 
         Args:
@@ -150,7 +150,7 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_torchscript(self, data: bytes, context: str = "") -> List[Dict[str, Any]]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:

@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -131,10 +131,10 @@ UNLICENSED_INDICATORS = [
 # SPDX license metadata
 SPDX_LICENSE_PATH = Path(__file__).with_name("spdx_licenses.json")
 SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
-_SPDX_LICENSES: Optional[dict[str, Any]] = None
+_SPDX_LICENSES: Optional[Dict[str, Any]] = None
 
 
-def load_spdx_license_data(download: bool = False) -> dict[str, Any]:
+def load_spdx_license_data(download: bool = False) -> Dict[str, Any]:
     """Load SPDX license metadata from bundled JSON or download if requested."""
     global _SPDX_LICENSES
     if _SPDX_LICENSES is not None and not download:
@@ -204,7 +204,7 @@ MODEL_EXTENSIONS = {
 }
 
 
-def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[LicenseInfo]:
+def scan_for_license_headers(file_path: str, max_lines: int = 50) -> List[LicenseInfo]:
     """
     Scan a file's header for license information.
 
@@ -215,7 +215,7 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
     Returns:
         List of detected license information
     """
-    licenses: list[LicenseInfo] = []
+    licenses: List[LicenseInfo] = []
 
     try:
         with open(file_path, encoding="utf-8", errors="ignore") as f:
@@ -252,7 +252,7 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
 def extract_copyright_notices(
     file_path: str,
     max_lines: int = 50,
-) -> list[CopyrightInfo]:
+) -> List[CopyrightInfo]:
     """
     Extract copyright notices from a file.
 
@@ -263,7 +263,7 @@ def extract_copyright_notices(
     Returns:
         List of copyright information found
     """
-    copyrights: list[CopyrightInfo] = []
+    copyrights: List[CopyrightInfo] = []
 
     try:
         with open(file_path, encoding="utf-8", errors="ignore") as f:
@@ -292,7 +292,7 @@ def extract_copyright_notices(
     return copyrights
 
 
-def find_license_files(directory: str) -> list[str]:
+def find_license_files(directory: str) -> List[str]:
     """
     Find license files in a directory.
 
@@ -302,7 +302,7 @@ def find_license_files(directory: str) -> list[str]:
     Returns:
         List of paths to license files
     """
-    license_files: list[str] = []
+    license_files: List[str] = []
 
     if not os.path.isdir(directory):
         return license_files
@@ -319,7 +319,7 @@ def find_license_files(directory: str) -> list[str]:
     return license_files
 
 
-def detect_unlicensed_datasets(file_paths: list[str]) -> list[str]:
+def detect_unlicensed_datasets(file_paths: List[str]) -> List[str]:
     """
     Detect dataset files that may lack proper licensing.
 
@@ -392,7 +392,7 @@ def _is_ml_config_file(filename: str) -> bool:
     return filename in ml_config_patterns
 
 
-def _is_ml_model_directory(file_paths: list[str]) -> bool:
+def _is_ml_model_directory(file_paths: List[str]) -> bool:
     """
     Determine if the file paths represent an ML model directory.
 
@@ -436,7 +436,7 @@ def _is_ml_model_directory(file_paths: list[str]) -> bool:
     return has_ml_files or (has_weight_files and has_config_files)
 
 
-def detect_agpl_components(scan_results: dict[str, Any]) -> list[str]:
+def detect_agpl_components(scan_results: Dict[str, Any]) -> List[str]:
     """
     Detect components that use AGPL licensing.
 
@@ -463,18 +463,18 @@ def detect_agpl_components(scan_results: dict[str, Any]) -> list[str]:
     return agpl_files
 
 
-def _get_spdx_info(spdx_id: str) -> Optional[dict[str, Any]]:
+def _get_spdx_info(spdx_id: str) -> Optional[Dict[str, Any]]:
     """Return SPDX metadata for a license ID if available."""
     licenses = load_spdx_license_data()
     return licenses.get(spdx_id)
 
 
-def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False) -> list[dict[str, Any]]:
+def check_spdx_license_issues(scan_results: Dict[str, Any], strict: bool = False) -> List[Dict[str, Any]]:
     """Check for deprecated or incompatible licenses using SPDX data."""
-    warnings: list[dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
     file_metadata = scan_results.get("file_metadata", {})
-    deprecated_files: list[str] = []
-    incompatible_files: list[str] = []
+    deprecated_files: List[str] = []
+    incompatible_files: List[str] = []
 
     for file_path, metadata in file_metadata.items():
         for license_info in metadata.get("license_info", []):
@@ -526,7 +526,7 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
     return warnings
 
 
-def check_commercial_use_warnings(scan_results: dict[str, Any], *, strict: bool = False) -> list[dict[str, Any]]:
+def check_commercial_use_warnings(scan_results: Dict[str, Any], *, strict: bool = False) -> List[Dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 
@@ -659,7 +659,7 @@ def check_commercial_use_warnings(scan_results: dict[str, Any], *, strict: bool 
     return warnings
 
 
-def collect_license_metadata(file_path: str) -> dict[str, Any]:
+def collect_license_metadata(file_path: str) -> Dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
