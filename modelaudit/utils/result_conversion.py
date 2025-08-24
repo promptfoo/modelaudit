@@ -30,8 +30,14 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     result.success = result_dict.get("success", True)
     result.bytes_scanned = result_dict.get("bytes_scanned", 0)
     result.start_time = result_dict.get("start_time", time.time())
-    # Preserve None if end_time missing; duration property handles it.
-    result.end_time = result_dict.get("end_time")
+    # For end_time: preserve None only if it was explicitly stored as None
+    # If missing entirely (common with current to_dict), set to start_time + duration
+    if "end_time" in result_dict:
+        result.end_time = result_dict["end_time"]
+    elif "duration" in result_dict:
+        result.end_time = result.start_time + result_dict["duration"]
+    else:
+        result.end_time = time.time()
     result.metadata.update(result_dict.get("metadata", {}))
 
     # Helpers to normalize incoming cached values
