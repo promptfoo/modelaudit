@@ -3160,3 +3160,10 @@ class PickleScanner(BaseScanner):
                 why="JIT/Script detection encountered an unexpected error",
             )
             return 0
+
+
+# Module-level wrappers for testing compatibility
+def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
+    """Module-level wrapper for dangerous global detection."""
+    scanner = PickleScanner()
+    return scanner._is_actually_dangerous_global(mod, func, ml_context)

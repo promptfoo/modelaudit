@@ -103,14 +103,37 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "numpy.fft": "*",  # Fast Fourier Transform
     "numpy.polynomial": "*",  # Polynomial operations
     "numpy.testing": "*",  # Testing utilities
-
     # PyTorch framework - comprehensive safe operations
     "torch": [
-        "FloatTensor", "DoubleTensor", "HalfTensor", "ByteTensor", "CharTensor",
-        "ShortTensor", "IntTensor", "LongTensor", "BoolTensor",
-        "Tensor", "tensor", "from_numpy", "zeros", "ones", "empty", "randn", "rand",
-        "arange", "linspace", "eye", "stack", "cat", "split", "chunk",
-        "Size", "dtype", "device", "memory_format", "layout",
+        "FloatTensor",
+        "DoubleTensor",
+        "HalfTensor",
+        "ByteTensor",
+        "CharTensor",
+        "ShortTensor",
+        "IntTensor",
+        "LongTensor",
+        "BoolTensor",
+        "Tensor",
+        "tensor",
+        "from_numpy",
+        "zeros",
+        "ones",
+        "empty",
+        "randn",
+        "rand",
+        "arange",
+        "linspace",
+        "eye",
+        "stack",
+        "cat",
+        "split",
+        "chunk",
+        "Size",
+        "dtype",
+        "device",
+        "memory_format",
+        "layout",
     ],
     "torch.nn": "*",  # Neural network modules
     "torch.nn.functional": "*",  # Functional neural network operations
@@ -127,13 +150,11 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "torchvision": "*",  # Computer vision utilities
     "torchvision.transforms": "*",  # Image transformations
     "torchvision.models": "*",  # Pre-trained models
-
     # TensorFlow ecosystem - safe operations
     "tensorflow": "*",  # Core TensorFlow operations (specific ops checked elsewhere)
     "tensorflow.keras": "*",  # Keras high-level API
     "tensorflow.python": "*",  # TensorFlow Python API
     "tf": "*",  # Common TensorFlow alias
-
     # Scikit-learn - ML algorithms and utilities
     "sklearn": "*",  # Core scikit-learn functionality
     "sklearn.base": "*",  # Base classes and utilities
@@ -153,7 +174,6 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "sklearn.tree": "*",  # Decision trees
     "sklearn.utils": "*",  # Utility functions
     "sklearn.pipeline": "*",  # ML pipelines
-
     # Standard library - safe operations only
     "collections": ["OrderedDict", "namedtuple", "defaultdict", "deque", "Counter"],
     "functools": ["partial", "reduce", "wraps", "lru_cache"],
@@ -177,10 +197,139 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "decimal": "*",  # Decimal arithmetic
     "fractions": "*",  # Rational number arithmetic
     "statistics": "*",  # Statistical functions
+    # Safe builtin functions - common safe Python builtins
+    "__builtin__": [
+        "len",
+        "str",
+        "int",
+        "float",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "print",
+        "abs",
+        "min",
+        "max",
+        "sum",
+        "sorted",
+        "reversed",
+        "bool",
+        "type",
+        "isinstance",
+        "hasattr",
+        "getattr",
+        "dir",
+        "vars",
+        "id",
+        "ord",
+        "chr",
+        "hex",
+        "oct",
+        "bin",
+        "round",
+        "divmod",
+        "pow",
+        "repr",
+        "hash",
+        "iter",
+        "next",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "range",
+        "slice",
+    ],
+    "__builtins__": [
+        "len",
+        "str",
+        "int",
+        "float",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "print",
+        "abs",
+        "min",
+        "max",
+        "sum",
+        "sorted",
+        "reversed",
+        "bool",
+        "type",
+        "isinstance",
+        "hasattr",
+        "getattr",
+        "dir",
+        "vars",
+        "id",
+        "ord",
+        "chr",
+        "hex",
+        "oct",
+        "bin",
+        "round",
+        "divmod",
+        "pow",
+        "repr",
+        "hash",
+        "iter",
+        "next",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "range",
+        "slice",
+    ],
+    "builtins": [
+        "len",
+        "str",
+        "int",
+        "float",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "print",
+        "abs",
+        "min",
+        "max",
+        "sum",
+        "sorted",
+        "reversed",
+        "bool",
+        "type",
+        "isinstance",
+        "hasattr",
+        "getattr",
+        "dir",
+        "vars",
+        "id",
+        "ord",
+        "chr",
+        "hex",
+        "oct",
+        "bin",
+        "round",
+        "divmod",
+        "pow",
+        "repr",
+        "hash",
+        "iter",
+        "next",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "range",
+        "slice",
+    ],
     "enum": "*",  # Enumeration support
     "dataclasses": "*",  # Dataclass support
     "typing": "*",  # Type hints
-
     # ML-specific libraries - safe operations
     "scipy": "*",  # Scientific computing
     "scipy.sparse": "*",  # Sparse matrix operations
@@ -197,25 +346,21 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "PIL": "*",  # Python Imaging Library
     "cv2": "*",  # OpenCV computer vision
     "skimage": "*",  # Image processing
-
     # Model serialization libraries - framework-specific safe operations
     "joblib": ["load", "dump"],  # Scikit-learn model persistence (limited to core functions)
     "pickle": [],  # Empty list = no safe operations (all pickle operations are suspicious)
     "dill": [],  # Empty list = no safe operations (all dill operations are suspicious)
     "_pickle": [],  # Empty list = no safe operations (low-level pickle is suspicious)
-
     # Hugging Face ecosystem - transformer models
     "transformers": "*",  # Hugging Face transformers
     "datasets": "*",  # Hugging Face datasets
     "tokenizers": "*",  # Fast tokenizers
-
     # Other ML frameworks
     "xgboost": "*",  # Gradient boosting framework
     "lightgbm": "*",  # Light gradient boosting
     "catboost": "*",  # CatBoost gradient boosting
     "onnx": "*",  # Open Neural Network Exchange
     "onnxruntime": "*",  # ONNX runtime
-
     # Specialized ML libraries
     "gym": "*",  # OpenAI Gym for RL
     "stable_baselines3": "*",  # RL algorithms
@@ -224,7 +369,6 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "ray": "*",  # Distributed computing
     "mlflow": "*",  # ML experiment tracking
     "wandb": "*",  # Weights & Biases tracking
-
     # Data format libraries - safe operations
     "h5py": "*",  # HDF5 file format
     "zarr": "*",  # Chunked, compressed arrays
@@ -232,7 +376,6 @@ SAFE_GLOBALS: dict[str, Union[str, list[str]]] = {
     "pyarrow": "*",  # Apache Arrow
     "faiss": "*",  # Facebook AI Similarity Search
     "annoy": "*",  # Approximate Nearest Neighbors
-
     # Linear algebra backends
     "mkl": "*",  # Intel Math Kernel Library
     "openblas": "*",  # OpenBLAS library
@@ -807,8 +950,9 @@ def classify_global_safety(module: str, name: str) -> tuple[str, str]:
     """
     # Check if it's definitely dangerous first
     dangerous_filter = SUSPICIOUS_GLOBALS.get(module)
-    if (dangerous_filter is not None and
-        (dangerous_filter == "*" or (isinstance(dangerous_filter, list) and name in dangerous_filter))):
+    if dangerous_filter is not None and (
+        dangerous_filter == "*" or (isinstance(dangerous_filter, list) and name in dangerous_filter)
+    ):
         return "dangerous", "critical"
 
     # Check OS module aliases for dangerous operations
@@ -834,22 +978,91 @@ def classify_global_safety(module: str, name: str) -> tuple[str, str]:
         elif safe_filter == "*":
             # Wildcard safe module - be conservative for core ML libraries only
             core_ml_modules = {
-                "numpy", "numpy.core", "numpy.core.multiarray", "numpy.core.numeric",
-                "numpy.core.umath", "numpy.linalg", "numpy.random", "numpy.lib",
-                "numpy.lib.format", "numpy.ma", "numpy.fft", "numpy.polynomial",
-                "numpy.testing", "torch.nn", "torch.nn.functional", "torch.nn.modules",
-                "torch.optim", "torch.utils", "torch.utils.data", "torch._utils",
-                "torch.jit", "torch.autograd", "torch.cuda", "torch.distributed",
-                "torchvision", "torchvision.transforms", "torchvision.models",
-                "tensorflow", "tensorflow.keras", "tensorflow.python", "tf",
-                "sklearn", "sklearn.base", "sklearn.cluster", "sklearn.decomposition",
-                "sklearn.ensemble", "sklearn.feature_extraction", "sklearn.feature_selection",
-                "sklearn.linear_model", "sklearn.metrics", "sklearn.model_selection",
-                "sklearn.naive_bayes", "sklearn.neighbors", "sklearn.neural_network",
-                "sklearn.preprocessing", "sklearn.svm", "sklearn.tree", "sklearn.utils",
-                "sklearn.pipeline", "scipy", "scipy.sparse", "scipy.linalg", "scipy.optimize",
-                "scipy.stats", "scipy.signal", "scipy.ndimage", "pandas", "matplotlib",
-                "matplotlib.pyplot"
+                "numpy",
+                "numpy.core",
+                "numpy.core.multiarray",
+                "numpy.core.numeric",
+                "numpy.core.umath",
+                "numpy.linalg",
+                "numpy.random",
+                "numpy.lib",
+                "numpy.lib.format",
+                "numpy.ma",
+                "numpy.fft",
+                "numpy.polynomial",
+                "numpy.testing",
+                "torch.nn",
+                "torch.nn.functional",
+                "torch.nn.modules",
+                "torch.optim",
+                "torch.utils",
+                "torch.utils.data",
+                "torch._utils",
+                "torch.jit",
+                "torch.autograd",
+                "torch.cuda",
+                "torch.distributed",
+                "torchvision",
+                "torchvision.transforms",
+                "torchvision.models",
+                "tensorflow",
+                "tensorflow.keras",
+                "tensorflow.python",
+                "tf",
+                "sklearn",
+                "sklearn.base",
+                "sklearn.cluster",
+                "sklearn.decomposition",
+                "sklearn.ensemble",
+                "sklearn.feature_extraction",
+                "sklearn.feature_selection",
+                "sklearn.linear_model",
+                "sklearn.metrics",
+                "sklearn.model_selection",
+                "sklearn.naive_bayes",
+                "sklearn.neighbors",
+                "sklearn.neural_network",
+                "sklearn.preprocessing",
+                "sklearn.svm",
+                "sklearn.tree",
+                "sklearn.utils",
+                "sklearn.pipeline",
+                "scipy",
+                "scipy.sparse",
+                "scipy.linalg",
+                "scipy.optimize",
+                "scipy.stats",
+                "scipy.signal",
+                "scipy.ndimage",
+                "pandas",
+                "matplotlib",
+                "matplotlib.pyplot",
+                # Standard library modules that are safe with wildcard
+                "collections",
+                "functools",
+                "itertools",
+                "operator",
+                "copy",
+                "math",
+                "random",
+                "re",
+                "string",
+                "datetime",
+                "time",
+                "json",
+                "uuid",
+                "hashlib",
+                "hmac",
+                "base64",
+                "binascii",
+                "struct",
+                "array",
+                "decimal",
+                "fractions",
+                "statistics",
+                "enum",
+                "dataclasses",
+                "typing",
             }
 
             if module in core_ml_modules:
