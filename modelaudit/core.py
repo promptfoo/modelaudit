@@ -42,62 +42,6 @@ logger = logging.getLogger("modelaudit.core")
 _OPEN_PATCH_LOCK = Lock()
 
 
-def _scan_result_from_dict(result_dict: dict) -> ScanResult:
-    """
-    Convert a dictionary representation back to a ScanResult object.
-
-    This is used when retrieving cached scan results that were stored as dictionaries.
-
-    Args:
-        result_dict: Dictionary representation of a ScanResult
-
-    Returns:
-        Reconstructed ScanResult object
-    """
-    # Create new ScanResult with the same scanner name
-    scanner_name = result_dict.get("scanner", "cached")
-    result = ScanResult(scanner_name=scanner_name)
-
-    # Restore basic properties
-    result.success = result_dict.get("success", True)
-    result.bytes_scanned = result_dict.get("bytes_scanned", 0)
-    result.start_time = result_dict.get("start_time", time.time())
-    result.end_time = result_dict.get("end_time", time.time())
-    result.metadata.update(result_dict.get("metadata", {}))
-
-    # Restore issues from cached data
-    for issue_dict in result_dict.get("issues", []):
-        result.add_issue(
-            message=issue_dict.get("message", ""),
-            severity=IssueSeverity(issue_dict.get("severity", "warning")),
-            location=issue_dict.get("location"),
-            details=issue_dict.get("details", {}),
-            why=issue_dict.get("why"),
-        )
-
-    # Restore checks from cached data
-    for check_dict in result_dict.get("checks", []):
-        from modelaudit.scanners.base import Check, CheckStatus
-
-        try:
-            check = Check(
-                name=check_dict.get("name", ""),
-                status=CheckStatus(check_dict.get("status", "passed")),
-                message=check_dict.get("message", ""),
-                severity=IssueSeverity(check_dict.get("severity")) if check_dict.get("severity") else None,
-                location=check_dict.get("location"),
-                details=check_dict.get("details", {}),
-                why=check_dict.get("why"),
-                timestamp=check_dict.get("timestamp", time.time()),
-            )
-            result.checks.append(check)
-        except Exception as e:
-            # If we can't reconstruct a check, log and continue
-            logger.debug(f"Could not reconstruct check from cache: {e}")
-
-    return result
-
-
 def _add_asset_to_results(
     results: ModelAuditResultModel,
     file_path: str,
@@ -1196,7 +1140,9 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         result_dict = cache_manager.cached_scan(path, cached_scan_wrapper)
 
         # Convert back to ScanResult
-        return _scan_result_from_dict(result_dict)
+        from .utils.result_conversion import scan_result_from_dict
+
+        return scan_result_from_dict(result_dict)
 
     except Exception as e:
         # If cache system fails, fall back to direct scanning

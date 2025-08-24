@@ -402,9 +402,9 @@ class BaseScanner(ABC):
             result_dict = cache_manager.cached_scan(path, cached_scanner_wrapper)
 
             # Convert back to ScanResult
-            from ..core import _scan_result_from_dict
+            from ..utils.result_conversion import scan_result_from_dict
 
-            return _scan_result_from_dict(result_dict)
+            return scan_result_from_dict(result_dict)
 
         except Exception as e:
             # If cache system fails, fall back to direct scanning

@@ -128,6 +128,11 @@ jobs:
         run: |
           rye run mypy modelaudit/ tests/
 
+      - name: Check for circular imports
+        run: |
+          set -euo pipefail
+          python scripts/minimal_circular_check.py
+
   # Fast feedback job for immediate results
   quick-feedback:
     name: Quick Feedback (Python 3.12)
