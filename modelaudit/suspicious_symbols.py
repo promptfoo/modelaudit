@@ -130,6 +130,7 @@ SUSPICIOUS_GLOBALS = {
     "__builtins__": [
         "eval",
         "exec",
+        "execfile",  # Python 2 compatibility
         "compile",
         "open",
         "input",
