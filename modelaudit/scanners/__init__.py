@@ -95,12 +95,12 @@ class ScannerRegistry:
         # Order matters - more specific scanners should come before generic ones
         self._scanners = {
             "pickle": {
-                "module": "modelaudit.scanners.pickle_scanner",
-                "class": "PickleScanner",
-                "description": "Scans pickle files for malicious code",
-                "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
+                "module": "modelaudit.scanners.fickling_pickle_scanner",
+                "class": "FicklingPickleScanner",
+                "description": "Scans pickle files using fickling's comprehensive security analysis",
+                "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt", ".joblib", ".bin", ".p", ".data"],
                 "priority": 1,
-                "dependencies": [],  # No heavy dependencies
+                "dependencies": ["fickling"],  # fickling is now core dependency
                 "numpy_sensitive": False,
             },
             "pytorch_binary": {
@@ -586,7 +586,8 @@ def __getattr__(name: str) -> Any:
     """Lazy loading for scanner classes"""
     # Map class names to scanner IDs
     class_to_id = {
-        "PickleScanner": "pickle",
+        "FicklingPickleScanner": "pickle",
+        "PickleScanner": "pickle",  # Legacy alias
         "PyTorchBinaryScanner": "pytorch_binary",
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",

@@ -81,6 +81,8 @@ docker==7.1.0
     # via mlflow
 fastapi==0.115.14
     # via mlflow-skinny
+fickling==0.1.4
+    # via modelaudit
 filelock==3.18.0
     # via huggingface-hub
     # via torch
@@ -292,6 +294,7 @@ pyasn1-modules==0.4.2
 pydantic==2.11.7
     # via fastapi
     # via mlflow-skinny
+    # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
 pygments==2.19.2
@@ -363,6 +366,8 @@ sqlparse==0.5.3
     # via mlflow-skinny
 starlette==0.46.2
     # via fastapi
+stdlib-list==0.11.1
+    # via fickling
 sympy==1.14.0
     # via coremltools
     # via torch
