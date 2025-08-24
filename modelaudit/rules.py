@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from re import Pattern
-from typing import ClassVar, Optional
+from typing import ClassVar, List, Optional
 
 
 class Severity(str, Enum):
@@ -27,7 +27,7 @@ class Rule:
     name: str
     default_severity: Severity
     description: str
-    message_patterns: list[Pattern[str]]
+    message_patterns: List[Pattern[str]]
 
     def matches_message(self, message: str) -> bool:
         """Check if this rule matches a given message."""
@@ -882,7 +882,7 @@ class RuleRegistry:
         cls._initialized = True
 
     @classmethod
-    def _add_rule(cls, code: str, name: str, severity: Severity, description: str, patterns: list[str]):
+    def _add_rule(cls, code: str, name: str, severity: Severity, description: str, patterns: List[str]):
         """Add a rule to the registry."""
         compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
         cls._rules[code] = Rule(code, name, severity, description, compiled_patterns)
