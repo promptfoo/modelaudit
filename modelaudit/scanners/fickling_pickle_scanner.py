@@ -23,7 +23,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 class FicklingPickleScanner(BaseScanner):
     """Scanner for Python Pickle files using fickling's advanced analysis"""
 
-    name = "fickling_pickle"
+    name = "pickle"  # Legacy name for backward compatibility
     description = "Scans Python pickle files using fickling's comprehensive security analysis"
     supported_extensions: ClassVar[list[str]] = [
         ".pkl",

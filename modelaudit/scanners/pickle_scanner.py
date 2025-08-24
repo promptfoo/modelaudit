@@ -2,6 +2,7 @@
 # This module provides backward compatibility for code importing PickleScanner
 # from the old pickle_scanner module name
 
+import pickletools  # Standard library module
 from .fickling_pickle_scanner import FicklingPickleScanner
 from ..suspicious_symbols import SUSPICIOUS_GLOBALS
 
@@ -149,5 +150,6 @@ __all__ = [
     "_detect_ml_context",
     "_is_legitimate_serialization_file",
     "_is_actually_dangerous_global",
-    "_should_ignore_opcode_sequence"
+    "_should_ignore_opcode_sequence",
+    "pickletools"  # Re-export standard library module
 ]
