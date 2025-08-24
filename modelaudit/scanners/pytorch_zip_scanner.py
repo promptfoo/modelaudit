@@ -181,7 +181,7 @@ class PyTorchZipScanner(BaseScanner):
                             # The pickle scanner will handle the streaming internally
                             # Type cast to satisfy mypy - z.open returns IO[bytes] which is compatible with BinaryIO
                             sub_result = self.pickle_scanner._scan_pickle_bytes(
-                                cast(io.BufferedIOBase, zf),  # type: ignore[arg-type]
+                                cast(io.BufferedIOBase, zf),
                                 file_size,
                             )
                         bytes_scanned += file_size

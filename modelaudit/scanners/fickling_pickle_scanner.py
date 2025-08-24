@@ -346,8 +346,7 @@ class FicklingPickleScanner(BaseScanner):
             if pattern in trailing_bytes:
                 result.add_issue(
                     message=(
-                        f"Suspicious code pattern detected in binary data: "
-                        f"{pattern.decode('utf-8', errors='ignore')}"
+                        f"Suspicious code pattern detected in binary data: {pattern.decode('utf-8', errors='ignore')}"
                     ),
                     severity=IssueSeverity.WARNING,
                     details={
@@ -477,9 +476,7 @@ class FicklingPickleScanner(BaseScanner):
     def _scan_for_embedded_payloads(self, pickled, result: ScanResult) -> None:
         """Scan for embedded base64-encoded Python payloads (V4 attack detection)"""
         try:
-            import base64
             import pickle as std_pickle
-            import re
 
             logger.info("Starting embedded payload scan")  # Debug log
 
@@ -502,36 +499,45 @@ class FicklingPickleScanner(BaseScanner):
                     logger.info(f"Scanning dict at {path} with {len(obj)} keys: {list(obj.keys())[:5]}")  # Debug
                     for key, value in obj.items():
                         current_path = f"{path}.{key}" if path != "root" else key
-                        
+
                         # Check for suspicious key names that might indicate embedded payloads
                         suspicious_keys = [
-                            'serialized_tensor_data', 'tensor_data', 'encoded_data', 
-                            'payload', 'data', 'config_loader', 'initialization_script',
-                            'metadata_processor', 'pipeline_executor', 'optimizer_code'
+                            "serialized_tensor_data",
+                            "tensor_data",
+                            "encoded_data",
+                            "payload",
+                            "data",
+                            "config_loader",
+                            "initialization_script",
+                            "metadata_processor",
+                            "pipeline_executor",
+                            "optimizer_code",
                         ]
-                        
+
                         is_suspicious = any(suspicious_key in str(key).lower() for suspicious_key in suspicious_keys)
                         if is_suspicious:
-                            logger.info(f"Found suspicious key '{key}' at {current_path}, value type: {type(value)}, length: {len(value) if isinstance(value, str) else 'N/A'}")  # Debug
-                        
+                            logger.info(
+                                f"Found suspicious key '{key}' at {current_path}, value type: {type(value)}, length: {len(value) if isinstance(value, str) else 'N/A'}"
+                            )  # Debug
+
                         if is_suspicious and isinstance(value, str) and len(value) > 100:
                             logger.info(f"Checking base64 payload for key '{key}' at {current_path}")  # Debug
                             # Try to decode as base64 and check for Python code
                             if self._check_base64_python_payload(value, current_path, result):
                                 continue
-                        
+
                         scan_for_embedded_code(value, current_path)
-                
+
                 elif isinstance(obj, list):
                     for i, item in enumerate(obj):
                         current_path = f"{path}[{i}]" if path != "root" else f"[{i}]"
                         scan_for_embedded_code(item, current_path)
-                
+
                 elif isinstance(obj, str) and len(obj) > 200:
                     # Check long strings that might be base64-encoded payloads
                     self._check_base64_python_payload(obj, path, result)
-                
-                elif hasattr(obj, '__dict__'):
+
+                elif hasattr(obj, "__dict__"):
                     # Scan object attributes
                     for attr_name, attr_value in obj.__dict__.items():
                         current_path = f"{path}.{attr_name}" if path != "root" else attr_name
@@ -547,82 +553,82 @@ class FicklingPickleScanner(BaseScanner):
         try:
             import base64
             import re
-            
+
             logger.info(f"Checking base64 payload at {location}, length: {len(data_string)}")  # Debug
-            
+
             # Skip if string is too short or contains non-base64 characters
             if len(data_string) < 50:
                 logger.info(f"String too short: {len(data_string)} < 50")  # Debug
                 return False
-            
+
             # Try to decode as base64
             try:
                 decoded_bytes = base64.b64decode(data_string, validate=True)
-                decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
+                decoded_text = decoded_bytes.decode("utf-8", errors="ignore")
                 logger.info(f"Successfully decoded base64, decoded length: {len(decoded_text)}")  # Debug
             except Exception as e:
                 logger.info(f"Failed to decode base64: {e}")  # Debug
                 return False
-            
+
             # Check if decoded content looks like Python code
             python_indicators = [
-                r'import\s+\w+',                     # import statements
-                r'from\s+\w+\s+import',              # from X import Y
-                r'def\s+\w+\s*\(',                   # function definitions
-                r'class\s+\w+',                      # class definitions
-                r'exec\s*\(',                        # exec calls
-                r'eval\s*\(',                        # eval calls
-                r'urllib\.request',                  # network requests
-                r'subprocess',                       # system calls
-                r'os\.system',                       # OS system calls
-                r'threading\.Thread',                # threading
-                r'\.read_text\(\)',                  # file reading
-                r'\.write_text\(',                   # file writing
-                r'Path\.home\(\)',                   # home directory access
-                r'json\.loads',                      # JSON parsing
-                r'\.encode\(\)',                     # encoding operations
-                r'\.decode\(\)',                     # decoding operations
+                r"import\s+\w+",  # import statements
+                r"from\s+\w+\s+import",  # from X import Y
+                r"def\s+\w+\s*\(",  # function definitions
+                r"class\s+\w+",  # class definitions
+                r"exec\s*\(",  # exec calls
+                r"eval\s*\(",  # eval calls
+                r"urllib\.request",  # network requests
+                r"subprocess",  # system calls
+                r"os\.system",  # OS system calls
+                r"threading\.Thread",  # threading
+                r"\.read_text\(\)",  # file reading
+                r"\.write_text\(",  # file writing
+                r"Path\.home\(\)",  # home directory access
+                r"json\.loads",  # JSON parsing
+                r"\.encode\(\)",  # encoding operations
+                r"\.decode\(\)",  # decoding operations
             ]
-            
+
             python_matches = 0
             matched_patterns = []
-            
+
             for pattern in python_indicators:
                 if re.search(pattern, decoded_text, re.IGNORECASE):
                     python_matches += 1
                     matched_patterns.append(pattern)
-            
+
             logger.info(f"Found {python_matches} Python patterns: {matched_patterns}")  # Debug
             logger.info(f"First 200 chars of decoded: {decoded_text[:200]}")  # Debug
-            
+
             # If we found multiple Python patterns, it's likely embedded code
             if python_matches >= 3:
                 # Check for specific malicious patterns
                 malicious_patterns = [
-                    (r'\.ssh[/\\]', "SSH key access"),
-                    (r'\.aws[/\\]', "AWS credentials access"),
-                    (r'\.docker[/\\]', "Docker config access"),
-                    (r'\.kube[/\\]', "Kubernetes config access"),
-                    (r'credentials', "Credential harvesting"),
-                    (r'urllib\.request\.urlopen', "Network exfiltration"),
-                    (r'threading\.Thread.*daemon.*True', "Persistent backdoor"),
-                    (r'exec\s*\(.*\[.*\]', "Dynamic code execution"),
-                    (r'system.*\(.*\)', "System command execution"),
+                    (r"\.ssh[/\\]", "SSH key access"),
+                    (r"\.aws[/\\]", "AWS credentials access"),
+                    (r"\.docker[/\\]", "Docker config access"),
+                    (r"\.kube[/\\]", "Kubernetes config access"),
+                    (r"credentials", "Credential harvesting"),
+                    (r"urllib\.request\.urlopen", "Network exfiltration"),
+                    (r"threading\.Thread.*daemon.*True", "Persistent backdoor"),
+                    (r"exec\s*\(.*\[.*\]", "Dynamic code execution"),
+                    (r"system.*\(.*\)", "System command execution"),
                 ]
-                
+
                 threat_indicators = []
                 for pattern, description in malicious_patterns:
                     if re.search(pattern, decoded_text, re.IGNORECASE):
                         threat_indicators.append(description)
-                
+
                 logger.info(f"Found threat indicators: {threat_indicators}")  # Debug
-                
-                severity = IssueSeverity.CRITICAL if threat_indicators else IssueSeverity.HIGH
-                
+
+                severity = IssueSeverity.CRITICAL if threat_indicators else IssueSeverity.WARNING
+
                 issue_message = f"Embedded Base64 Python payload detected at '{location}'"
                 if threat_indicators:
                     issue_message += f" (Threats: {', '.join(threat_indicators)})"
-                
+
                 logger.info(f"Adding issue: {issue_message}")  # Debug
                 result.add_issue(
                     message=issue_message,
@@ -630,19 +636,21 @@ class FicklingPickleScanner(BaseScanner):
                     details={
                         "location": location,
                         "encoding": "base64",
-                        "python_indicators": len(python_matches),
+                        "python_indicators": python_matches,
                         "matched_patterns": matched_patterns[:5],  # Limit for readability
                         "threat_indicators": threat_indicators,
                         "payload_length": len(decoded_text),
-                        "recommendation": "Base64-encoded Python payloads can execute arbitrary code during model loading"
-                    }
+                        "recommendation": (
+                            "Base64-encoded Python payloads can execute arbitrary code during model loading"
+                        ),
+                    },
                 )
                 logger.info(f"Issue added, current issue count: {len(result.issues)}")  # Debug
                 return True
-            
+
         except Exception as e:
             logger.debug(f"Error checking base64 payload at {location}: {e}")
-        
+
         return False
 
     def _scan_for_multiple_streams(self, file_path: str, result: ScanResult) -> None:
@@ -683,7 +691,7 @@ class FicklingPickleScanner(BaseScanner):
                     # If this is not the first stream, analyze it for threats
                     if stream_count > 1:
                         # Extract just this stream's data
-                        stream_data = file_data[current_pos:current_pos + stop_pos + 1]
+                        stream_data = file_data[current_pos : current_pos + stop_pos + 1]
 
                         # Create a temporary file to analyze this stream with fickling
                         self._analyze_additional_stream(stream_data, stream_count, result)
@@ -692,8 +700,12 @@ class FicklingPickleScanner(BaseScanner):
                     current_pos += stop_pos + 1
 
                     # Skip any padding bytes
-                    while (current_pos < len(file_data) and
-                           file_data[current_pos:current_pos+1] in [b"", b"\x00", b"\n", b"\r"]):
+                    while current_pos < len(file_data) and file_data[current_pos : current_pos + 1] in [
+                        b"",
+                        b"\x00",
+                        b"\n",
+                        b"\r",
+                    ]:
                         current_pos += 1
 
                 except Exception as e:
@@ -707,14 +719,59 @@ class FicklingPickleScanner(BaseScanner):
                     details={
                         "stream_count": stream_count,
                         "recommendation": "Multiple pickle streams can hide malicious code in subsequent streams",
-                        "security_risk": "HIGH - Additional streams may contain hidden payloads"
-                    }
+                        "security_risk": "HIGH - Additional streams may contain hidden payloads",
+                    },
                 )
                 result.metadata["multiple_streams"] = True
                 result.metadata["stream_count"] = stream_count
 
         except Exception as e:
             logger.warning(f"Error during multiple stream scan: {e}")
+
+    def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
+        """
+        Legacy compatibility method for scanning pickle bytes from a file-like object.
+        
+        This method provides backward compatibility for code that expects the old
+        PickleScanner interface, particularly the JoblibScanner.
+        """
+        result = ScanResult(scanner_name=self.name)
+        
+        try:
+            # Read all data from the file-like object
+            file_like.seek(0)
+            data = file_like.read()
+            
+            # Create a temporary file to use with fickling
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp_file:
+                tmp_file.write(data)
+                tmp_file.flush()
+                
+                try:
+                    # Use the regular scan method on the temporary file
+                    scan_result = self.scan(tmp_file.name)
+                    # Copy results but reset the file path metadata
+                    result.issues = scan_result.issues
+                    result.metadata = scan_result.metadata.copy()
+                    result.metadata["file_path"] = f"<bytes:{len(data)}>"
+                    result.bytes_scanned = len(data)
+                    
+                finally:
+                    # Clean up temporary file
+                    import os
+                    try:
+                        os.unlink(tmp_file.name)
+                    except OSError:
+                        pass
+                        
+        except Exception as e:
+            result.add_issue(
+                message=f"Error scanning pickle bytes: {e}",
+                severity=IssueSeverity.CRITICAL,
+            )
+            
+        return result
 
     def _analyze_additional_stream(self, stream_data: bytes, stream_number: int, result: ScanResult) -> None:
         """Analyze an additional pickle stream for security threats"""
