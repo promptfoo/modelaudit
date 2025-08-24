@@ -137,7 +137,7 @@ class FicklingPickleScanner(BaseScanner):
             if fickling_result.severity == Severity.LIKELY_SAFE:
                 continue
 
-            # Create issue directly via add_issue method  
+            # Create issue directly via add_issue method
             message = f"{self._generate_issue_title(fickling_result)}: {fickling_result!s}"
             details = {
                 "fickling_analysis": fickling_result.analysis_name,
@@ -150,11 +150,7 @@ class FicklingPickleScanner(BaseScanner):
             self._add_explanations(details, fickling_result)
 
             # Add issue using the method's expected parameters
-            result.add_issue(
-                message=message,
-                severity=severity,
-                details=details
-            )
+            result.add_issue(message=message, severity=severity, details=details)
 
     def _map_fickling_severity(self, fickling_severity: Severity) -> IssueSeverity:
         """Map fickling severity levels to ModelAudit severity levels"""
