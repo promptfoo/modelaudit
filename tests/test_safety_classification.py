@@ -217,9 +217,7 @@ class TestSafetyClassification:
             if module in SAFE_GLOBALS:
                 safe_funcs = SAFE_GLOBALS[module]
                 for safe_func in safe_builtins:
-                    assert safe_func in safe_funcs, (
-                        f"Safe builtin {module}.{safe_func} should be in SAFE_GLOBALS"
-                    )
+                    assert safe_func in safe_funcs, f"Safe builtin {module}.{safe_func} should be in SAFE_GLOBALS"
 
     def test_pickle_modules_unsafe(self):
         """Test that pickle-related modules are not marked as safe."""
