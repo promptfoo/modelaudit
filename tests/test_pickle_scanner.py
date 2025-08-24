@@ -48,10 +48,7 @@ class TestPickleScanner(unittest.TestCase):
         # Check that issues were found
         assert result.has_errors
 
-        # Print the found issues for debugging
-        print(f"Found {len(result.issues)} issues:")
-        for issue in result.issues:
-            print(f"  - {issue.severity.name}: {issue.message}")
+        # Check that the scan found issues
 
         # Check that specific issues were detected (updated for fickling)
         has_dangerous_import_detection = False

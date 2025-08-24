@@ -16,6 +16,7 @@ from fickling.exception import UnsafeFileError
 from fickling.fickle import Pickled
 
 from ..explanations import get_import_explanation, get_opcode_explanation
+from ..suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
@@ -34,6 +35,7 @@ class FicklingPickleScanner(BaseScanner):
         ".pt",  # PyTorch tensors
         ".p",  # Short pickle extension
         ".data",  # Some models use .data
+        ".ckpt",  # Checkpoints
     ]
 
     @classmethod
@@ -49,41 +51,81 @@ class FicklingPickleScanner(BaseScanner):
 
         # Check if file exists
         if not os.path.exists(file_path):
-            result.success = False
             result.add_issue(
                 message=f"File not found: {file_path}",
                 severity=IssueSeverity.CRITICAL,
             )
+            result.finish(success=False)
             return result
 
         try:
             # Load pickle file with fickling
             with open(file_path, "rb") as f:
                 pickled = Pickled.load(f)
+                pickle_bytes = f.tell()
+                trailing_bytes = f.read()
 
             # Check for timeout
             if timeout and (time.time() - start_time) > timeout:
                 result.metadata["timeout_seconds"] = timeout
-                result.success = False
                 result.add_issue(
                     message="Scan timed out",
                     severity=IssueSeverity.CRITICAL,
                 )
+                result.finish(success=False)
+                return result
+
+            # Check timeout after load
+            if timeout and (time.time() - start_time) > timeout:
+                result.metadata["timeout_seconds"] = timeout
+                result.add_issue(
+                    message="Scan timed out during analysis",
+                    severity=IssueSeverity.CRITICAL,
+                )
+                result.finish(success=False)
                 return result
 
             # Run fickling's comprehensive analysis
             analysis_results = check_safety(pickled)
 
-            # Add metadata first
+            # Add basic metadata
             result.metadata.update(
                 {
                     "fickling_severity": analysis_results.severity.name,
                     "fickling_safe": bool(analysis_results),
                     "scan_time_seconds": time.time() - start_time,
                     "file_size": self._get_file_size(file_path),
-                    "opcodes_analyzed": len(list(pickled)),
+                    "opcodes_analyzed": len(list(pickled)) if hasattr(pickled, "__iter__") else 0,
                 }
             )
+
+            # For .bin files, add binary content metadata and scan trailing content
+            if file_path.lower().endswith(".bin"):
+                result.metadata["pickle_bytes"] = pickle_bytes
+                result.metadata["binary_bytes"] = len(trailing_bytes)
+
+                # Skip binary scan for high-confidence ML models
+                ml_context = self._detect_ml_context(pickled)
+                result.metadata["ml_context"] = ml_context
+
+                pytorch_confidence = ml_context.get("frameworks", {}).get("pytorch", 0)
+                overall_confidence = ml_context.get("overall_confidence", 0)
+
+                if pytorch_confidence > 0.7 and overall_confidence > 0.7:
+                    result.metadata["binary_scan_skipped"] = True
+                    result.metadata["skip_reason"] = "High-confidence PyTorch model detected"
+                else:
+                    # Scan trailing binary content
+                    self._scan_trailing_binary(trailing_bytes, result)
+
+            # Check for nested pickles (all file types)
+            self._scan_for_nested_pickles(pickled, result)
+
+            # Check for embedded base64 payloads (V4 attack detection)
+            self._scan_for_embedded_payloads(pickled, result)
+
+            # Check for multiple pickle streams in the file
+            self._scan_for_multiple_streams(file_path, result)
 
             # Convert fickling results to ModelAudit issues
             self._convert_fickling_results(analysis_results, result)
@@ -111,12 +153,14 @@ class FicklingPickleScanner(BaseScanner):
                         details={"recommendation": "Manual inspection recommended"},
                     )
             except Exception:
-                result.success = False
                 result.add_issue(
                     message=f"Analysis failed: {e}",
                     severity=IssueSeverity.CRITICAL,
                 )
+                result.finish(success=False)
+            return result
 
+        result.finish(success=True)
         return result
 
     def _get_file_size(self, file_path: str) -> int:
@@ -235,3 +279,484 @@ class FicklingPickleScanner(BaseScanner):
                 explanation = get_opcode_explanation(var_value.upper())
                 if explanation:
                     details["opcode_explanation"] = explanation
+
+    def _detect_ml_context(self, pickled) -> dict:
+        """Detect ML framework context for smart binary scanning"""
+        try:
+            # Simple heuristic: look for common PyTorch patterns
+            pytorch_indicators = 0
+            total_checks = 4
+
+            # Convert to string for analysis
+            pickle_str = str(pickled)
+
+            # Check for OrderedDict (common in PyTorch)
+            if "OrderedDict" in pickle_str:
+                pytorch_indicators += 1
+
+            # Check for common PyTorch state_dict patterns
+            pytorch_patterns = ["features.", "classifier.", "._metadata", "._modules"]
+            for pattern in pytorch_patterns:
+                if pattern in pickle_str:
+                    pytorch_indicators += 1
+                    break
+
+            # Check for tensor-like keys
+            if any(x in pickle_str for x in [".weight", ".bias"]):
+                pytorch_indicators += 1
+
+            # Check for version metadata
+            if "version" in pickle_str.lower():
+                pytorch_indicators += 1
+
+            pytorch_confidence = pytorch_indicators / total_checks
+
+            return {
+                "frameworks": {"pytorch": pytorch_confidence},
+                "overall_confidence": pytorch_confidence,
+                "indicators": pytorch_indicators,
+            }
+        except Exception:
+            return {"frameworks": {}, "overall_confidence": 0.0}
+
+    def _scan_trailing_binary(self, trailing_bytes: bytes, result: ScanResult) -> None:
+        """Scan trailing binary content for suspicious patterns"""
+        if not trailing_bytes:
+            return
+
+        # Check for executable signatures using centralized patterns
+        for sig, desc in EXECUTABLE_SIGNATURES.items():
+            if sig in trailing_bytes:
+                # Special handling for PE files - require DOS stub
+                if sig == b"MZ" and b"This program cannot be run in DOS mode" not in trailing_bytes:
+                    continue  # Skip MZ without DOS stub
+
+                result.add_issue(
+                    message=f"Executable signature detected in binary data: {desc}",
+                    severity=IssueSeverity.CRITICAL,
+                    details={
+                        "signature": sig.hex(),
+                        "description": desc,
+                        "recommendation": "Binary data should not contain executable code",
+                    },
+                )
+
+        # Check for suspicious code patterns using centralized patterns
+        for pattern in BINARY_CODE_PATTERNS:
+            if pattern in trailing_bytes:
+                result.add_issue(
+                    message=(
+                        f"Suspicious code pattern detected in binary data: "
+                        f"{pattern.decode('utf-8', errors='ignore')}"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    details={
+                        "pattern": pattern.decode("utf-8", errors="ignore"),
+                        "recommendation": "Review binary content for embedded code",
+                    },
+                )
+
+    def _contains_pickle_magic(self, data: bytes) -> bool:
+        """Check if data contains pickle magic bytes indicating nested pickle"""
+        # Pickle protocol magic bytes
+        pickle_magics = [b"\x80\x03", b"\x80\x04", b"\x80\x05"]  # Protocols 3, 4, 5
+        return any(magic in data for magic in pickle_magics)
+
+    def _candidate_base64_strings(self, data: bytes) -> list[str]:
+        """Extract potential base64 encoded strings from binary data"""
+        import re
+
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            # Look for base64-like strings (at least 20 chars, valid base64 chars)
+            pattern = r"[A-Za-z0-9+/]{20,}={0,2}"
+            return re.findall(pattern, text)
+        except Exception:
+            return []
+
+    def _scan_for_nested_pickles(self, pickled, result: ScanResult) -> None:
+        """Scan pickle content for nested pickle payloads"""
+        try:
+            import base64
+            import pickle as std_pickle
+
+            # Get the actual Python object using standard pickle
+            # We need to reconstruct it from the fickling object
+            if hasattr(pickled, "dumps"):
+                try:
+                    # Get the pickle bytes and reload with standard pickle
+                    pickle_data = pickled.dumps()
+                    actual_object = std_pickle.loads(pickle_data)
+                    # Successfully loaded the actual Python object
+                except Exception as e:
+                    logger.warning(f"Failed to load pickled object for nested scanning: {e}")
+                    return
+            else:
+                actual_object = pickled
+
+            # Look for raw pickle bytes in the data
+            if hasattr(actual_object, "__dict__"):
+                for key, value in actual_object.__dict__.items():
+                    if isinstance(value, bytes) and self._contains_pickle_magic(value):
+                        result.add_issue(
+                            message=f"Nested pickle payload detected in attribute '{key}'",
+                            severity=IssueSeverity.CRITICAL,
+                            details={"attribute": key, "recommendation": "Nested pickles can hide malicious code"},
+                        )
+
+            # Look for dictionary or list content for nested/encoded payloads
+            def scan_container(container, path=""):
+                if isinstance(container, dict):
+                    for key, value in container.items():
+                        current_path = f"{path}.{key}" if path else str(key)
+                        if isinstance(value, str):
+                            try:
+                                decoded = base64.b64decode(value)
+                                if self._contains_pickle_magic(decoded):
+                                    result.add_issue(
+                                        message=f"Encoded pickle payload detected at '{current_path}'",
+                                        severity=IssueSeverity.CRITICAL,
+                                        details={
+                                            "location": current_path,
+                                            "encoding": "base64",
+                                            "recommendation": "Encoded payloads may contain hidden code",
+                                        },
+                                    )
+                            except Exception:
+                                pass
+                        elif isinstance(value, bytes):
+                            # Check for raw pickle bytes
+                            if self._contains_pickle_magic(value):
+                                result.add_issue(
+                                    message=f"Nested pickle payload detected at '{current_path}'",
+                                    severity=IssueSeverity.CRITICAL,
+                                    details={
+                                        "location": current_path,
+                                        "recommendation": "Nested pickles can hide malicious code",
+                                    },
+                                )
+                        elif isinstance(value, (dict, list)):
+                            scan_container(value, current_path)
+                elif isinstance(container, list):
+                    for i, item in enumerate(container):
+                        current_path = f"{path}[{i}]" if path else f"[{i}]"
+                        if isinstance(item, str):
+                            try:
+                                decoded = base64.b64decode(item)
+                                if self._contains_pickle_magic(decoded):
+                                    result.add_issue(
+                                        message=f"Encoded pickle payload detected at '{current_path}'",
+                                        severity=IssueSeverity.CRITICAL,
+                                        details={
+                                            "location": current_path,
+                                            "encoding": "base64",
+                                            "recommendation": "Encoded payloads may contain hidden code",
+                                        },
+                                    )
+                            except Exception:
+                                pass
+                        elif isinstance(item, bytes):
+                            # Check for raw pickle bytes
+                            if self._contains_pickle_magic(item):
+                                result.add_issue(
+                                    message=f"Nested pickle payload detected at '{current_path}'",
+                                    severity=IssueSeverity.CRITICAL,
+                                    details={
+                                        "location": current_path,
+                                        "recommendation": "Nested pickles can hide malicious code",
+                                    },
+                                )
+                        elif isinstance(item, (dict, list)):
+                            scan_container(item, current_path)
+
+            scan_container(actual_object)
+
+        except Exception as e:
+            logger.warning(f"Error during nested pickle scan: {e}")
+
+    def _scan_for_embedded_payloads(self, pickled, result: ScanResult) -> None:
+        """Scan for embedded base64-encoded Python payloads (V4 attack detection)"""
+        try:
+            import base64
+            import pickle as std_pickle
+            import re
+
+            logger.info("Starting embedded payload scan")  # Debug log
+
+            # Get the actual Python object
+            try:
+                if hasattr(pickled, "dumps"):
+                    pickle_data = pickled.dumps()
+                    actual_object = std_pickle.loads(pickle_data)
+                    logger.info(f"Loaded actual object type: {type(actual_object)}")  # Debug log
+                else:
+                    actual_object = pickled
+                    logger.info(f"Using pickled object directly: {type(actual_object)}")  # Debug log
+            except Exception as e:
+                logger.warning(f"Failed to load object for embedded payload scan: {e}")
+                return
+
+            def scan_for_embedded_code(obj, path="root"):
+                """Recursively scan object for embedded base64 Python code"""
+                if isinstance(obj, dict):
+                    logger.info(f"Scanning dict at {path} with {len(obj)} keys: {list(obj.keys())[:5]}")  # Debug
+                    for key, value in obj.items():
+                        current_path = f"{path}.{key}" if path != "root" else key
+                        
+                        # Check for suspicious key names that might indicate embedded payloads
+                        suspicious_keys = [
+                            'serialized_tensor_data', 'tensor_data', 'encoded_data', 
+                            'payload', 'data', 'config_loader', 'initialization_script',
+                            'metadata_processor', 'pipeline_executor', 'optimizer_code'
+                        ]
+                        
+                        is_suspicious = any(suspicious_key in str(key).lower() for suspicious_key in suspicious_keys)
+                        if is_suspicious:
+                            logger.info(f"Found suspicious key '{key}' at {current_path}, value type: {type(value)}, length: {len(value) if isinstance(value, str) else 'N/A'}")  # Debug
+                        
+                        if is_suspicious and isinstance(value, str) and len(value) > 100:
+                            logger.info(f"Checking base64 payload for key '{key}' at {current_path}")  # Debug
+                            # Try to decode as base64 and check for Python code
+                            if self._check_base64_python_payload(value, current_path, result):
+                                continue
+                        
+                        scan_for_embedded_code(value, current_path)
+                
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        current_path = f"{path}[{i}]" if path != "root" else f"[{i}]"
+                        scan_for_embedded_code(item, current_path)
+                
+                elif isinstance(obj, str) and len(obj) > 200:
+                    # Check long strings that might be base64-encoded payloads
+                    self._check_base64_python_payload(obj, path, result)
+                
+                elif hasattr(obj, '__dict__'):
+                    # Scan object attributes
+                    for attr_name, attr_value in obj.__dict__.items():
+                        current_path = f"{path}.{attr_name}" if path != "root" else attr_name
+                        scan_for_embedded_code(attr_value, current_path)
+
+            scan_for_embedded_code(actual_object)
+
+        except Exception as e:
+            logger.warning(f"Error during embedded payload scan: {e}")
+
+    def _check_base64_python_payload(self, data_string: str, location: str, result: ScanResult) -> bool:
+        """Check if a string contains base64-encoded Python code"""
+        try:
+            import base64
+            import re
+            
+            logger.info(f"Checking base64 payload at {location}, length: {len(data_string)}")  # Debug
+            
+            # Skip if string is too short or contains non-base64 characters
+            if len(data_string) < 50:
+                logger.info(f"String too short: {len(data_string)} < 50")  # Debug
+                return False
+            
+            # Try to decode as base64
+            try:
+                decoded_bytes = base64.b64decode(data_string, validate=True)
+                decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
+                logger.info(f"Successfully decoded base64, decoded length: {len(decoded_text)}")  # Debug
+            except Exception as e:
+                logger.info(f"Failed to decode base64: {e}")  # Debug
+                return False
+            
+            # Check if decoded content looks like Python code
+            python_indicators = [
+                r'import\s+\w+',                     # import statements
+                r'from\s+\w+\s+import',              # from X import Y
+                r'def\s+\w+\s*\(',                   # function definitions
+                r'class\s+\w+',                      # class definitions
+                r'exec\s*\(',                        # exec calls
+                r'eval\s*\(',                        # eval calls
+                r'urllib\.request',                  # network requests
+                r'subprocess',                       # system calls
+                r'os\.system',                       # OS system calls
+                r'threading\.Thread',                # threading
+                r'\.read_text\(\)',                  # file reading
+                r'\.write_text\(',                   # file writing
+                r'Path\.home\(\)',                   # home directory access
+                r'json\.loads',                      # JSON parsing
+                r'\.encode\(\)',                     # encoding operations
+                r'\.decode\(\)',                     # decoding operations
+            ]
+            
+            python_matches = 0
+            matched_patterns = []
+            
+            for pattern in python_indicators:
+                if re.search(pattern, decoded_text, re.IGNORECASE):
+                    python_matches += 1
+                    matched_patterns.append(pattern)
+            
+            logger.info(f"Found {python_matches} Python patterns: {matched_patterns}")  # Debug
+            logger.info(f"First 200 chars of decoded: {decoded_text[:200]}")  # Debug
+            
+            # If we found multiple Python patterns, it's likely embedded code
+            if python_matches >= 3:
+                # Check for specific malicious patterns
+                malicious_patterns = [
+                    (r'\.ssh[/\\]', "SSH key access"),
+                    (r'\.aws[/\\]', "AWS credentials access"),
+                    (r'\.docker[/\\]', "Docker config access"),
+                    (r'\.kube[/\\]', "Kubernetes config access"),
+                    (r'credentials', "Credential harvesting"),
+                    (r'urllib\.request\.urlopen', "Network exfiltration"),
+                    (r'threading\.Thread.*daemon.*True', "Persistent backdoor"),
+                    (r'exec\s*\(.*\[.*\]', "Dynamic code execution"),
+                    (r'system.*\(.*\)', "System command execution"),
+                ]
+                
+                threat_indicators = []
+                for pattern, description in malicious_patterns:
+                    if re.search(pattern, decoded_text, re.IGNORECASE):
+                        threat_indicators.append(description)
+                
+                logger.info(f"Found threat indicators: {threat_indicators}")  # Debug
+                
+                severity = IssueSeverity.CRITICAL if threat_indicators else IssueSeverity.HIGH
+                
+                issue_message = f"Embedded Base64 Python payload detected at '{location}'"
+                if threat_indicators:
+                    issue_message += f" (Threats: {', '.join(threat_indicators)})"
+                
+                logger.info(f"Adding issue: {issue_message}")  # Debug
+                result.add_issue(
+                    message=issue_message,
+                    severity=severity,
+                    details={
+                        "location": location,
+                        "encoding": "base64",
+                        "python_indicators": len(python_matches),
+                        "matched_patterns": matched_patterns[:5],  # Limit for readability
+                        "threat_indicators": threat_indicators,
+                        "payload_length": len(decoded_text),
+                        "recommendation": "Base64-encoded Python payloads can execute arbitrary code during model loading"
+                    }
+                )
+                logger.info(f"Issue added, current issue count: {len(result.issues)}")  # Debug
+                return True
+            
+        except Exception as e:
+            logger.debug(f"Error checking base64 payload at {location}: {e}")
+        
+        return False
+
+    def _scan_for_multiple_streams(self, file_path: str, result: ScanResult) -> None:
+        """Scan for multiple pickle streams in a single file"""
+        try:
+            import io
+            import pickletools
+
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+
+            stream_count = 0
+            current_pos = 0
+
+            while current_pos < len(file_data):
+                try:
+                    # Create stream from current position
+                    stream = io.BytesIO(file_data[current_pos:])
+
+                    # Try to parse pickle stream
+                    opcodes = list(pickletools.genops(stream))
+                    if not opcodes:
+                        break
+
+                    stream_count += 1
+
+                    # Find STOP opcode position
+                    stop_pos = None
+                    for opcode, _arg, pos in opcodes:
+                        if opcode.name == "STOP":
+                            stop_pos = pos
+                            break
+
+                    if stop_pos is None:
+                        # No STOP found, malformed stream
+                        break
+
+                    # If this is not the first stream, analyze it for threats
+                    if stream_count > 1:
+                        # Extract just this stream's data
+                        stream_data = file_data[current_pos:current_pos + stop_pos + 1]
+
+                        # Create a temporary file to analyze this stream with fickling
+                        self._analyze_additional_stream(stream_data, stream_count, result)
+
+                    # Move to next potential stream
+                    current_pos += stop_pos + 1
+
+                    # Skip any padding bytes
+                    while (current_pos < len(file_data) and
+                           file_data[current_pos:current_pos+1] in [b"", b"\x00", b"\n", b"\r"]):
+                        current_pos += 1
+
+                except Exception as e:
+                    logger.debug(f"Error parsing stream at position {current_pos}: {e}")
+                    break
+
+            if stream_count > 1:
+                result.add_issue(
+                    message=f"Multiple pickle streams detected: {stream_count} streams found",
+                    severity=IssueSeverity.CRITICAL,
+                    details={
+                        "stream_count": stream_count,
+                        "recommendation": "Multiple pickle streams can hide malicious code in subsequent streams",
+                        "security_risk": "HIGH - Additional streams may contain hidden payloads"
+                    }
+                )
+                result.metadata["multiple_streams"] = True
+                result.metadata["stream_count"] = stream_count
+
+        except Exception as e:
+            logger.warning(f"Error during multiple stream scan: {e}")
+
+    def _analyze_additional_stream(self, stream_data: bytes, stream_number: int, result: ScanResult) -> None:
+        """Analyze an additional pickle stream for security threats"""
+        try:
+            import os
+            import tempfile
+
+            # Create temporary file with just this stream
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+                temp_file.write(stream_data)
+                temp_file.flush()
+
+                try:
+                    # Load and analyze this stream with fickling
+                    with open(temp_file.name, "rb") as f:
+                        additional_pickled = Pickled.load(f)
+                        additional_results = check_safety(additional_pickled)
+
+                    # Convert results with stream context
+                    for fickling_result in additional_results.results:
+                        if fickling_result.severity != Severity.LIKELY_SAFE:
+                            severity = self._map_fickling_severity(fickling_result.severity)
+                            message = (
+                                f"Stream {stream_number} - {self._generate_issue_title(fickling_result)}: "
+                                f"{fickling_result!s}"
+                            )
+
+                            details = {
+                                "stream_number": stream_number,
+                                "fickling_analysis": fickling_result.analysis_name,
+                                "fickling_severity": fickling_result.severity.name,
+                                "trigger": fickling_result.trigger,
+                                "recommendation": f"Stream {stream_number} contains malicious code",
+                            }
+
+                            # Add explanations
+                            self._add_explanations(details, fickling_result)
+
+                            result.add_issue(message=message, severity=severity, details=details)
+
+                finally:
+                    os.unlink(temp_file.name)
+
+        except Exception as e:
+            logger.warning(f"Error analyzing additional stream {stream_number}: {e}")
