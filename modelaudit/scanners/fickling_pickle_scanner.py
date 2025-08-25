@@ -201,6 +201,9 @@ class FicklingPickleScanner(BaseScanner):
         # Fickling might miss some patterns that our CVE database catches
         self._analyze_content_patterns(file_path, result)
 
+        # Add basic security checks
+        self._add_security_checks(pickled, result, file_path, fickling_is_safe)
+
         # Set bytes scanned for size limit enforcement
         result.bytes_scanned = self._get_file_size(file_path)
 
@@ -249,12 +252,19 @@ class FicklingPickleScanner(BaseScanner):
                 (b"sklearn", "Scikit-learn reference detected"),
                 (b"__reduce__", "Pickle reduce method detected"),
                 (b"os.system", "OS system call detected"),
+                (b"os", "OS module access detected"),
+                (b"posix", "POSIX system access detected"),
+                (b"system", "System call detected"),
                 (b"subprocess", "Subprocess execution detected"),
                 (b"eval", "Eval operation detected"),
                 (b"exec", "Exec operation detected"),
+                (b"compile", "Compile operation detected"),
                 (b"__builtin__", "Builtin module access detected"),
+                (b"__builtins__", "__builtins__ module access detected"),
                 (b"builtins", "Builtins module access detected"),
                 (b"globals", "Globals manipulation detected"),
+                (b"locals", "Locals manipulation detected"),
+                (b"dill", "dill library reference detected"),
                 (b"NumpyArrayWrapper", "Numpy array wrapper detected"),
             ]
 
@@ -889,6 +899,85 @@ class FicklingPickleScanner(BaseScanner):
             return func_name in suspicious_funcs
 
         return False
+
+    def _add_security_checks(self, pickled, result: ScanResult, file_path: str, fickling_is_safe: bool) -> None:
+        """Add Check objects for security validation reporting."""
+
+        # Basic pickle safety check
+        result.add_check(
+            name="Pickle Safety Analysis",
+            passed=fickling_is_safe,
+            message="Fickling safety analysis passed" if fickling_is_safe else "Fickling detected unsafe operations",
+            severity=IssueSeverity.CRITICAL if not fickling_is_safe else None,
+            location=file_path,
+            details={"fickling_safe": fickling_is_safe},
+        )
+
+        # Dangerous imports check
+        try:
+            unsafe_imports = list(pickled.unsafe_imports())
+            has_dangerous_imports = len(unsafe_imports) > 0
+
+            result.add_check(
+                name="Dangerous Imports Detection",
+                passed=not has_dangerous_imports,
+                message=f"Found {len(unsafe_imports)} dangerous imports"
+                if has_dangerous_imports
+                else "No dangerous imports detected",
+                severity=IssueSeverity.CRITICAL if has_dangerous_imports else None,
+                location=file_path,
+                details={"unsafe_imports_count": len(unsafe_imports)},
+            )
+        except Exception:
+            # If we can't analyze imports, add a neutral check
+            result.add_check(
+                name="Dangerous Imports Detection",
+                passed=True,
+                message="Import analysis completed",
+                location=file_path,
+            )
+
+        # Dangerous opcodes check
+        dangerous_opcodes = self._check_for_dangerous_opcodes(pickled, file_path)
+        has_dangerous_opcodes = len(dangerous_opcodes) > 0
+
+        result.add_check(
+            name="Dangerous Opcodes Detection",
+            passed=not has_dangerous_opcodes,
+            message=f"Found {len(dangerous_opcodes)} dangerous opcodes"
+            if has_dangerous_opcodes
+            else "No dangerous opcodes detected",
+            severity=IssueSeverity.WARNING if has_dangerous_opcodes else None,
+            location=file_path,
+            details={"dangerous_opcodes": dangerous_opcodes},
+        )
+
+    def _check_for_dangerous_opcodes(self, pickled, file_path: str) -> list[str]:
+        """Check for dangerous pickle opcodes and return list of found opcodes."""
+        dangerous_opcodes = []
+
+        try:
+            for opcode in pickled.opcodes:
+                if hasattr(opcode, "name"):
+                    opcode_name = opcode.name
+                    # Check for dangerous opcodes
+                    if opcode_name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL", "BUILD"]:
+                        if opcode_name not in dangerous_opcodes:
+                            dangerous_opcodes.append(opcode_name)
+
+                    # Check for GLOBAL opcodes with dangerous references
+                    elif opcode_name == "GLOBAL" and hasattr(opcode, "arg") and opcode.arg:
+                        global_ref = str(opcode.arg)
+                        if " " in global_ref:
+                            module_name, func_name = global_ref.split(" ", 1)
+                            if self._is_dangerous_global_reference(module_name, func_name):
+                                dangerous_ref = f"GLOBAL({module_name}.{func_name})"
+                                if dangerous_ref not in dangerous_opcodes:
+                                    dangerous_opcodes.append(dangerous_ref)
+        except Exception:
+            pass
+
+        return dangerous_opcodes
 
     def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
         """
