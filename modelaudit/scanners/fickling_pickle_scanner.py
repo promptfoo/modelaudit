@@ -10,7 +10,6 @@ import os
 import time
 from typing import ClassVar, Optional
 
-import fickling
 from fickling.analysis import AnalysisResults, Severity, check_safety
 from fickling.exception import UnsafeFileError
 from fickling.fickle import Pickled
@@ -42,7 +41,7 @@ class FicklingPickleScanner(BaseScanner):
     def can_handle(cls, file_path: str) -> bool:
         """Check if this scanner can handle the given file"""
         import os
-        
+
         if not os.path.isfile(file_path):
             return False
         ext = os.path.splitext(file_path)[1].lower()
@@ -52,6 +51,7 @@ class FicklingPickleScanner(BaseScanner):
         if ext == ".bin":
             try:
                 from modelaudit.utils.filetype import detect_file_format
+
                 if detect_file_format(file_path) == "zip":
                     return False
             except Exception:
@@ -93,6 +93,7 @@ class FicklingPickleScanner(BaseScanner):
 
             # Quick signal for mismatch metadata
             import fickling
+
             fickling_is_safe = fickling.is_likely_safe(file_path)
 
             # Additional fickling info
@@ -504,9 +505,8 @@ class FicklingPickleScanner(BaseScanner):
         """Scan for nested pickle payloads in strings/bytes within the pickle."""
         try:
             import base64
-            import pickle as std_pickle
 
-            # Get raw pickle bytes 
+            # Get raw pickle bytes
             raw = pickled.dumps() if hasattr(pickled, "dumps") else bytes(getattr(pickled, "data", b""))
             if not raw:
                 return
@@ -534,7 +534,7 @@ class FicklingPickleScanner(BaseScanner):
                 except Exception:
                     continue
 
-            # Look for raw pickle bytes embedded within strings in the pickle data 
+            # Look for raw pickle bytes embedded within strings in the pickle data
             # (not the main pickle stream itself)
             self._scan_for_embedded_pickle_strings(raw, result)
 
@@ -548,7 +548,7 @@ class FicklingPickleScanner(BaseScanner):
         """Count the number of separate pickle streams in the data"""
         count = 0
         pos = 0
-        
+
         while pos < len(data):
             # Look for pickle magic bytes
             if any(data[pos:].startswith(magic) for magic in [b"\x80\x03", b"\x80\x04", b"\x80\x05"]):
@@ -560,7 +560,7 @@ class FicklingPickleScanner(BaseScanner):
                 pos = stop_pos + 1
             else:
                 pos += 1
-                
+
         return count
 
     def _scan_for_embedded_pickle_strings(self, raw: bytes, result: ScanResult) -> None:
@@ -568,7 +568,7 @@ class FicklingPickleScanner(BaseScanner):
         try:
             # Look for pickle magic patterns that aren't at the start of the file
             # (which would be the main pickle stream)
-            for i, magic in enumerate([b"\x80\x03", b"\x80\x04", b"\x80\x05"]):
+            for magic in [b"\x80\x03", b"\x80\x04", b"\x80\x05"]:
                 positions = []
                 start = 0
                 while True:
@@ -577,7 +577,7 @@ class FicklingPickleScanner(BaseScanner):
                         break
                     positions.append(pos)
                     start = pos + 1
-                
+
                 # If we find pickle magic at positions other than the start (position 0),
                 # it could be nested pickles
                 nested_positions = [pos for pos in positions if pos > 0]
@@ -588,13 +588,10 @@ class FicklingPickleScanner(BaseScanner):
                             result.add_issue(
                                 message="Nested pickle payload detected in serialized data",
                                 severity=IssueSeverity.CRITICAL,
-                                details={
-                                    "position": pos,
-                                    "recommendation": "Nested pickles can hide malicious code"
-                                },
+                                details={"position": pos, "recommendation": "Nested pickles can hide malicious code"},
                             )
                             return  # Only report once to avoid spam
-                            
+
         except Exception:
             pass  # Ignore errors in this heuristic check
 
@@ -602,12 +599,12 @@ class FicklingPickleScanner(BaseScanner):
         """Scan serialized bytes for embedded base64-encoded Python payloads (no deserialization)."""
         try:
             logger.debug("Starting embedded payload scan")  # Changed to debug
-            
+
             # Get raw pickle bytes without deserializing
             raw = pickled.dumps() if hasattr(pickled, "dumps") else bytes(getattr(pickled, "data", b""))
             if not raw:
                 return
-                
+
             # Scan for base64-encoded Python payloads in raw bytes
             for token in self._candidate_base64_strings(raw):
                 # token is a string; pass it directly

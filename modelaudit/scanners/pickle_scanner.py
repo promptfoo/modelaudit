@@ -3,6 +3,7 @@
 # from the old pickle_scanner module name
 
 import pickletools  # Standard library module
+from typing import Optional
 
 from ..suspicious_symbols import SUSPICIOUS_GLOBALS
 from .fickling_pickle_scanner import FicklingPickleScanner
@@ -10,13 +11,14 @@ from .fickling_pickle_scanner import FicklingPickleScanner
 
 class PickleScanner(FicklingPickleScanner):
     """Legacy PickleScanner with additional backward compatibility."""
-    
-    def scan(self, file_path: str, timeout: int | None = None):
+
+    def scan(self, file_path: str, timeout: Optional[float] = None):
         """Scan with enhanced error handling for truncation metadata."""
         from .base import ScanResult
+
         result = ScanResult(scanner_name=self.__class__.__name__)
         result.metadata["file_path"] = file_path
-        
+
         # Perform legacy pickletools validation that can be mocked
         try:
             self._validate_pickle_with_pickletools(file_path)
@@ -24,28 +26,28 @@ class PickleScanner(FicklingPickleScanner):
         except ValueError as e:
             if "opcode" in str(e).lower():
                 result.metadata["truncated"] = True
-                result.metadata["truncation_reason"] = "post_stop_data_or_format_issue" 
+                result.metadata["truncation_reason"] = "post_stop_data_or_format_issue"
                 result.metadata["exception_type"] = type(e).__name__
                 result.metadata["exception_message"] = str(e)
                 result.metadata["validated_format"] = True
                 result.finish(success=True)
                 return result
-            
-        # If validation passed, proceed with normal scanning  
+
+        # If validation passed, proceed with normal scanning
         try:
             return super().scan(file_path, timeout)
         except Exception:
             # If scanning failed but validation passed, return the basic result
             result.finish(success=True)
             return result
-    
+
     def _validate_pickle_with_pickletools(self, file_path: str):
         """Validate pickle format using pickletools (can be mocked for testing)."""
         import io
-        
+
         with open(file_path, "rb") as f:
             file_data = f.read()
-        
+
         # This call can be mocked in tests
         stream = io.BytesIO(file_data)
         list(pickletools.genops(stream))
@@ -125,9 +127,9 @@ def _is_legitimate_serialization_file(file_path: str) -> bool:
                 return False
 
             # For .joblib files, check for joblib-specific patterns
-            if file_path.lower().endswith('.joblib'):
+            if file_path.lower().endswith(".joblib"):
                 # Joblib files should contain references to joblib or sklearn patterns
-                joblib_patterns = [b'joblib', b'sklearn', b'numpy', b'__reduce_ex__']
+                joblib_patterns = [b"joblib", b"sklearn", b"numpy", b"__reduce_ex__"]
                 if not any(pattern in first_bytes for pattern in joblib_patterns):
                     return False
 
