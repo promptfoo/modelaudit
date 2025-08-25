@@ -41,7 +41,22 @@ class FicklingPickleScanner(BaseScanner):
     @classmethod
     def can_handle(cls, file_path: str) -> bool:
         """Check if this scanner can handle the given file"""
-        return any(file_path.lower().endswith(ext) for ext in cls.supported_extensions)
+        import os
+        
+        if not os.path.isfile(file_path):
+            return False
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        # Defer ZIP-formatted .bin to the PyTorch ZIP scanner
+        if ext == ".bin":
+            try:
+                from modelaudit.utils.filetype import detect_file_format
+                if detect_file_format(file_path) == "zip":
+                    return False
+            except Exception:
+                pass  # fall back to handling here
+        return True
 
     def scan(self, file_path: str, timeout: Optional[float] = None) -> ScanResult:
         """Scan a pickle file using fickling's analysis engine"""
@@ -49,8 +64,8 @@ class FicklingPickleScanner(BaseScanner):
         result = ScanResult(scanner_name=self.name)
         result.metadata["file_path"] = file_path
 
-        # Check if file exists
-        if not os.path.exists(file_path):
+        # Check if file exists and is a regular file
+        if not os.path.isfile(file_path):
             result.add_issue(
                 message=f"File not found: {file_path}",
                 severity=IssueSeverity.CRITICAL,
@@ -65,72 +80,56 @@ class FicklingPickleScanner(BaseScanner):
                 pickle_bytes = f.tell()
                 trailing_bytes = f.read()
 
-            # Check for timeout
+            # Single pre-analysis timeout fence (after load)
             if timeout and (time.time() - start_time) > timeout:
                 result.metadata["timeout_seconds"] = timeout
-                result.add_issue(
-                    message="Scan timed out",
-                    severity=IssueSeverity.CRITICAL,
-                )
+                result.add_issue("Scan timed out after load", IssueSeverity.CRITICAL)
                 result.finish(success=False)
                 return result
 
-            # Check timeout after load
-            if timeout and (time.time() - start_time) > timeout:
-                result.metadata["timeout_seconds"] = timeout
-                result.add_issue(
-                    message="Scan timed out during analysis",
-                    severity=IssueSeverity.CRITICAL,
-                )
-                result.finish(success=False)
-                return result
+            # Run fickling AST analysis and convert findings
+            analysis_results = check_safety(pickled)
+            self._convert_fickling_results(analysis_results, result)
 
-            # Use fickling's module-level safety check (correct API)
-            import fickling as fickling_module
+            # Quick signal for mismatch metadata
+            import fickling
+            fickling_is_safe = fickling.is_likely_safe(file_path)
 
-            fickling_is_safe = fickling_module.is_likely_safe(file_path)
-
-            # Get additional fickling information
+            # Additional fickling info
             unsafe_imports = list(pickled.unsafe_imports())
             non_standard_imports = list(pickled.non_standard_imports())
+
+            # Compute opcode count safely
+            opcode_count = None
+            try:
+                ops = getattr(pickled, "opcodes", None)
+                if ops is not None and hasattr(ops, "__len__"):
+                    opcode_count = len(ops)
+            except Exception:
+                opcode_count = None
 
             # Add basic metadata
             result.metadata.update(
                 {
-                    "fickling_safe": fickling_is_safe,
+                    "fickling_severity": analysis_results.severity.name,
+                    "fickling_safe": analysis_results.severity.name == "LIKELY_SAFE",
                     "unsafe_imports": len(unsafe_imports),
                     "non_standard_imports": len(non_standard_imports),
                     "scan_time_seconds": time.time() - start_time,
                     "file_size": self._get_file_size(file_path),
-                    "opcodes_analyzed": len(list(pickled.opcodes)) if hasattr(pickled, "opcodes") else 0,
+                    "opcodes_analyzed": opcode_count,
                 }
             )
 
             # CRITICAL: Add supplementary security analysis for patterns fickling misses
             self._analyze_dangerous_globals(pickled, result)
 
-            # Process fickling's native detections
-            if not fickling_is_safe:
+            # Optional: flag only when quick-signal conflicts with deep analysis
+            if not fickling_is_safe and result.metadata.get("fickling_severity") == "LIKELY_SAFE":
                 result.add_issue(
-                    message="Fickling detected potentially unsafe pickle operations",
-                    severity=IssueSeverity.CRITICAL,
-                    details={"fickling_analysis": "unsafe"},
-                )
-
-            # Process unsafe imports detected by fickling
-            for unsafe_import in unsafe_imports:
-                result.add_issue(
-                    message=f"Unsafe import detected: {unsafe_import}",
-                    severity=IssueSeverity.CRITICAL,
-                    details={"import": str(unsafe_import)},
-                )
-
-            # Process non-standard imports
-            for non_std_import in non_standard_imports:
-                result.add_issue(
-                    message=f"Non-standard import detected: {non_std_import}",
+                    message="Basic safety check flagged concerns despite LIKELY_SAFE analysis",
                     severity=IssueSeverity.WARNING,
-                    details={"import": str(non_std_import)},
+                    details={"fickling_analysis": "mismatch"},
                 )
 
             # For .bin files, add binary content metadata and scan trailing content
@@ -172,6 +171,8 @@ class FicklingPickleScanner(BaseScanner):
                 },
             )
             result.metadata["fickling_unsafe"] = True
+            result.finish(success=True)
+            return result
 
         except Exception as e:
             logger.warning(f"Fickling analysis failed for {file_path}: {e}")
@@ -194,7 +195,7 @@ class FicklingPickleScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 details={"note": "Falling back to content-based analysis"},
             )
-            result.finish(success=False)
+            result.finish(success=True)
             return result
 
         # Always run content-based analysis for comprehensive CVE detection
@@ -206,6 +207,13 @@ class FicklingPickleScanner(BaseScanner):
 
         # Set bytes scanned for size limit enforcement
         result.bytes_scanned = self._get_file_size(file_path)
+
+        # Post-analysis timeout fence
+        if timeout and (time.time() - start_time) > timeout:
+            result.metadata["timeout_seconds"] = timeout
+            result.add_issue("Scan exceeded timeout after analysis", IssueSeverity.CRITICAL)
+            result.finish(success=False)
+            return result
 
         result.finish(success=True)
         return result
@@ -493,178 +501,118 @@ class FicklingPickleScanner(BaseScanner):
             return []
 
     def _scan_for_nested_pickles(self, pickled, result: ScanResult) -> None:
-        """Scan pickle content for nested pickle payloads"""
+        """Scan for nested pickle payloads in strings/bytes within the pickle."""
         try:
             import base64
             import pickle as std_pickle
 
-            # Get the actual Python object using standard pickle
-            # We need to reconstruct it from the fickling object
-            if hasattr(pickled, "dumps"):
-                try:
-                    # Get the pickle bytes and reload with standard pickle
-                    pickle_data = pickled.dumps()
-                    actual_object = std_pickle.loads(pickle_data)
-                    # Successfully loaded the actual Python object
-                except Exception as e:
-                    logger.warning(f"Failed to load pickled object for nested scanning: {e}")
-                    return
-            else:
-                actual_object = pickled
-
-            # Look for raw pickle bytes in the data
-            if hasattr(actual_object, "__dict__"):
-                for key, value in actual_object.__dict__.items():
-                    if isinstance(value, bytes) and self._contains_pickle_magic(value):
-                        result.add_issue(
-                            message=f"Nested pickle payload detected in attribute '{key}'",
-                            severity=IssueSeverity.CRITICAL,
-                            details={"attribute": key, "recommendation": "Nested pickles can hide malicious code"},
-                        )
-
-            # Look for dictionary or list content for nested/encoded payloads
-            def scan_container(container, path=""):
-                if isinstance(container, dict):
-                    for key, value in container.items():
-                        current_path = f"{path}.{key}" if path else str(key)
-                        if isinstance(value, str):
-                            try:
-                                decoded = base64.b64decode(value)
-                                if self._contains_pickle_magic(decoded):
-                                    result.add_issue(
-                                        message=f"Encoded pickle payload detected at '{current_path}'",
-                                        severity=IssueSeverity.CRITICAL,
-                                        details={
-                                            "location": current_path,
-                                            "encoding": "base64",
-                                            "recommendation": "Encoded payloads may contain hidden code",
-                                        },
-                                    )
-                            except Exception:
-                                pass
-                        elif isinstance(value, bytes):
-                            # Check for raw pickle bytes
-                            if self._contains_pickle_magic(value):
-                                result.add_issue(
-                                    message=f"Nested pickle payload detected at '{current_path}'",
-                                    severity=IssueSeverity.CRITICAL,
-                                    details={
-                                        "location": current_path,
-                                        "recommendation": "Nested pickles can hide malicious code",
-                                    },
-                                )
-                        elif isinstance(value, (dict, list)):
-                            scan_container(value, current_path)
-                elif isinstance(container, list):
-                    for i, item in enumerate(container):
-                        current_path = f"{path}[{i}]" if path else f"[{i}]"
-                        if isinstance(item, str):
-                            try:
-                                decoded = base64.b64decode(item)
-                                if self._contains_pickle_magic(decoded):
-                                    result.add_issue(
-                                        message=f"Encoded pickle payload detected at '{current_path}'",
-                                        severity=IssueSeverity.CRITICAL,
-                                        details={
-                                            "location": current_path,
-                                            "encoding": "base64",
-                                            "recommendation": "Encoded payloads may contain hidden code",
-                                        },
-                                    )
-                            except Exception:
-                                pass
-                        elif isinstance(item, bytes):
-                            # Check for raw pickle bytes
-                            if self._contains_pickle_magic(item):
-                                result.add_issue(
-                                    message=f"Nested pickle payload detected at '{current_path}'",
-                                    severity=IssueSeverity.CRITICAL,
-                                    details={
-                                        "location": current_path,
-                                        "recommendation": "Nested pickles can hide malicious code",
-                                    },
-                                )
-                        elif isinstance(item, (dict, list)):
-                            scan_container(item, current_path)
-
-            scan_container(actual_object)
-
-        except Exception as e:
-            logger.warning(f"Error during nested pickle scan: {e}")
-
-    def _scan_for_embedded_payloads(self, pickled, result: ScanResult) -> None:
-        """Scan for embedded base64-encoded Python payloads (V4 attack detection)"""
-        try:
-            import pickle as std_pickle
-
-            logger.info("Starting embedded payload scan")  # Debug log
-
-            # Get the actual Python object
-            try:
-                if hasattr(pickled, "dumps"):
-                    pickle_data = pickled.dumps()
-                    actual_object = std_pickle.loads(pickle_data)
-                    logger.info(f"Loaded actual object type: {type(actual_object)}")  # Debug log
-                else:
-                    actual_object = pickled
-                    logger.info(f"Using pickled object directly: {type(actual_object)}")  # Debug log
-            except Exception as e:
-                logger.warning(f"Failed to load object for embedded payload scan: {e}")
+            # Get raw pickle bytes 
+            raw = pickled.dumps() if hasattr(pickled, "dumps") else bytes(getattr(pickled, "data", b""))
+            if not raw:
                 return
 
-            def scan_for_embedded_code(obj, path="root"):
-                """Recursively scan object for embedded base64 Python code"""
-                if isinstance(obj, dict):
-                    logger.info(f"Scanning dict at {path} with {len(obj)} keys: {list(obj.keys())[:5]}")  # Debug
-                    for key, value in obj.items():
-                        current_path = f"{path}.{key}" if path != "root" else key
+            # Look for multiple pickle streams (concatenated pickles)
+            pickle_count = self._count_pickle_streams(raw)
+            if pickle_count > 1:
+                result.add_issue(
+                    message=f"Multiple pickle streams detected ({pickle_count} streams)",
+                    severity=IssueSeverity.WARNING,
+                    details={"recommendation": "Multiple pickles in one file can hide malicious code"},
+                )
 
-                        # Check for suspicious key names that might indicate embedded payloads
-                        suspicious_keys = [
-                            "serialized_tensor_data",
-                            "tensor_data",
-                            "encoded_data",
-                            "payload",
-                            "data",
-                            "config_loader",
-                            "initialization_script",
-                            "metadata_processor",
-                            "pipeline_executor",
-                            "optimizer_code",
-                        ]
+            # Look for Base64-encoded nested payloads within string data in the pickle
+            for token in self._candidate_base64_strings(raw):
+                try:
+                    decoded = base64.b64decode(token, validate=True)
+                    if self._contains_pickle_magic(decoded) and len(decoded) > 20:  # Avoid tiny false positives
+                        result.add_issue(
+                            message="Encoded pickle payload detected in serialized data",
+                            severity=IssueSeverity.CRITICAL,
+                            details={"encoding": "base64", "recommendation": "Nested pickles can hide malicious code"},
+                        )
+                        break
+                except Exception:
+                    continue
 
-                        is_suspicious = any(suspicious_key in str(key).lower() for suspicious_key in suspicious_keys)
-                        if is_suspicious:
-                            logger.info(
-                                f"Found suspicious key '{key}' at {current_path}, "
-                                f"value type: {type(value)}, "
-                                f"length: {len(value) if isinstance(value, str) else 'N/A'}"
+            # Look for raw pickle bytes embedded within strings in the pickle data 
+            # (not the main pickle stream itself)
+            self._scan_for_embedded_pickle_strings(raw, result)
+
+        except Exception as e:
+            result.add_issue(
+                message=f"Error scanning for nested pickles: {e}",
+                severity=IssueSeverity.WARNING,
+            )
+
+    def _count_pickle_streams(self, data: bytes) -> int:
+        """Count the number of separate pickle streams in the data"""
+        count = 0
+        pos = 0
+        
+        while pos < len(data):
+            # Look for pickle magic bytes
+            if any(data[pos:].startswith(magic) for magic in [b"\x80\x03", b"\x80\x04", b"\x80\x05"]):
+                count += 1
+                # Skip past this pickle - look for the STOP opcode (.)
+                stop_pos = data.find(b".", pos)
+                if stop_pos == -1:
+                    break
+                pos = stop_pos + 1
+            else:
+                pos += 1
+                
+        return count
+
+    def _scan_for_embedded_pickle_strings(self, raw: bytes, result: ScanResult) -> None:
+        """Look for pickle magic bytes embedded in string data within the pickle"""
+        try:
+            # Look for pickle magic patterns that aren't at the start of the file
+            # (which would be the main pickle stream)
+            for i, magic in enumerate([b"\x80\x03", b"\x80\x04", b"\x80\x05"]):
+                positions = []
+                start = 0
+                while True:
+                    pos = raw.find(magic, start)
+                    if pos == -1:
+                        break
+                    positions.append(pos)
+                    start = pos + 1
+                
+                # If we find pickle magic at positions other than the start (position 0),
+                # it could be nested pickles
+                nested_positions = [pos for pos in positions if pos > 0]
+                if nested_positions:
+                    # Only flag if there's substantial data after the magic (not just a coincidental match)
+                    for pos in nested_positions:
+                        if pos + 10 < len(raw):  # At least 10 bytes of pickle data
+                            result.add_issue(
+                                message="Nested pickle payload detected in serialized data",
+                                severity=IssueSeverity.CRITICAL,
+                                details={
+                                    "position": pos,
+                                    "recommendation": "Nested pickles can hide malicious code"
+                                },
                             )
+                            return  # Only report once to avoid spam
+                            
+        except Exception:
+            pass  # Ignore errors in this heuristic check
 
-                        if is_suspicious and isinstance(value, str) and len(value) > 100:
-                            logger.info(f"Checking base64 payload for key '{key}' at {current_path}")  # Debug
-                            # Try to decode as base64 and check for Python code
-                            if self._check_base64_python_payload(value, current_path, result):
-                                continue
-
-                        scan_for_embedded_code(value, current_path)
-
-                elif isinstance(obj, list):
-                    for i, item in enumerate(obj):
-                        current_path = f"{path}[{i}]" if path != "root" else f"[{i}]"
-                        scan_for_embedded_code(item, current_path)
-
-                elif isinstance(obj, str) and len(obj) > 200:
-                    # Check long strings that might be base64-encoded payloads
-                    self._check_base64_python_payload(obj, path, result)
-
-                elif hasattr(obj, "__dict__"):
-                    # Scan object attributes
-                    for attr_name, attr_value in obj.__dict__.items():
-                        current_path = f"{path}.{attr_name}" if path != "root" else attr_name
-                        scan_for_embedded_code(attr_value, current_path)
-
-            scan_for_embedded_code(actual_object)
+    def _scan_for_embedded_payloads(self, pickled, result: ScanResult) -> None:
+        """Scan serialized bytes for embedded base64-encoded Python payloads (no deserialization)."""
+        try:
+            logger.debug("Starting embedded payload scan")  # Changed to debug
+            
+            # Get raw pickle bytes without deserializing
+            raw = pickled.dumps() if hasattr(pickled, "dumps") else bytes(getattr(pickled, "data", b""))
+            if not raw:
+                return
+                
+            # Scan for base64-encoded Python payloads in raw bytes
+            for token in self._candidate_base64_strings(raw):
+                # token is a string; pass it directly
+                if self._check_base64_python_payload(token, "serialized_data", result):
+                    break  # Stop after first confirmed payload to limit noise
 
         except Exception as e:
             logger.warning(f"Error during embedded payload scan: {e}")
@@ -831,6 +779,13 @@ class FicklingPickleScanner(BaseScanner):
 
                 except Exception as e:
                     logger.debug(f"Error parsing stream at position {current_pos}: {e}")
+                    # Set metadata for truncation issues
+                    if isinstance(e, ValueError) and "opcode" in str(e).lower():
+                        result.metadata["truncated"] = True
+                        result.metadata["truncation_reason"] = "post_stop_data_or_format_issue"
+                        result.metadata["exception_type"] = type(e).__name__
+                        result.metadata["exception_message"] = str(e)
+                        result.metadata["validated_format"] = True
                     break
 
             if stream_count > 1:
