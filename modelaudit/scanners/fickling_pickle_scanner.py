@@ -201,6 +201,9 @@ class FicklingPickleScanner(BaseScanner):
         # Fickling might miss some patterns that our CVE database catches
         self._analyze_content_patterns(file_path, result)
 
+        # Set bytes scanned for size limit enforcement
+        result.bytes_scanned = self._get_file_size(file_path)
+
         result.finish(success=True)
         return result
 

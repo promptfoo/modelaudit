@@ -262,7 +262,7 @@ class PyTorchZipScanner(BaseScanner):
                     size_on_disk = spool.tell()
                     spool.seek(0)
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        spool,  # type: ignore[arg-type]
+                        spool,
                         size_on_disk,
                     )
 
