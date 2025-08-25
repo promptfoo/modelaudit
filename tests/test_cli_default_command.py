@@ -98,7 +98,7 @@ class TestDefaultCommandGroup:
         # Test doctor command
         result = runner.invoke(cli, ["doctor"])
         assert result.exit_code == 0
-        assert "ModelAudit System Diagnostics" in result.output
+        assert "ModelAudit Scanner Diagnostic Report" in result.output
 
     def test_invalid_command_shows_error(self):
         """Test that invalid commands are treated as paths and scanned."""
