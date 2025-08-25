@@ -432,7 +432,7 @@ class ScannerRegistry:
                     error_msg = f"Scanner {scanner_id} import failed: {e}"
 
                 self._failed_scanners[scanner_id] = error_msg
-                
+
                 # For expected dependency issues, use info level
                 if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
                     logger.info(error_msg)
@@ -538,15 +538,45 @@ class ScannerRegistry:
         return self._failed_scanners.copy()
 
     def get_available_scanners_summary(self) -> dict[str, Any]:
-        """Get summary of scanner availability for diagnostics"""
-        loaded_scanners = [s for s in self._scanners.keys() if s not in self._failed_scanners]
-        
+        """Get comprehensive summary of scanner availability for diagnostics"""
+        # Force loading of all scanners to populate failed_scanners
+        loaded_scanners = []
+        dependency_errors = {}
+        numpy_errors = {}
+
+        for scanner_id in self._scanners:
+            scanner_class = self._load_scanner(scanner_id)
+            if scanner_class:
+                loaded_scanners.append(scanner_id)
+            elif scanner_id in self._failed_scanners:
+                error_msg = self._failed_scanners[scanner_id]
+                scanner_info = self._scanners[scanner_id]
+                dependencies = scanner_info.get("dependencies", [])
+
+                # Categorize errors for better reporting
+                if "NumPy compatibility" in error_msg or "numpy" in error_msg.lower():
+                    numpy_errors[scanner_id] = error_msg
+                elif dependencies and (
+                    "requires dependencies" in error_msg
+                    or (isinstance(error_msg, str) and "pip install modelaudit[" in error_msg)
+                ):
+                    dependency_errors[scanner_id] = {
+                        "error": error_msg,
+                        "dependencies": dependencies,
+                        "install_command": f"pip install modelaudit[{','.join(dependencies)}]",
+                    }
+
         return {
             "total_scanners": len(self._scanners),
             "loaded_scanners": len(loaded_scanners),
             "failed_scanners": len(self._failed_scanners),
-            "loaded_scanner_list": loaded_scanners,
-            "failed_scanner_details": self._failed_scanners.copy()
+            "loaded_scanner_list": sorted(loaded_scanners),
+            "failed_scanner_details": self._failed_scanners.copy(),
+            "dependency_errors": dependency_errors,
+            "numpy_errors": numpy_errors,
+            "success_rate": round((len(loaded_scanners) / len(self._scanners)) * 100, 1)
+            if len(self._scanners) > 0
+            else 0.0,
         }
 
     def get_numpy_status(self) -> tuple[bool, str]:
