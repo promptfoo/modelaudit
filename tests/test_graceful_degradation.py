@@ -60,6 +60,9 @@ class TestGracefulDegradation:
 
     def test_numpy_compatibility_issues_handled(self):
         """Test that NumPy compatibility issues are handled gracefully"""
+        # Use fresh registry to test error handling
+        fresh_registry = ScannerRegistry()
+        
         with patch("importlib.import_module") as mock_import:
             # Simulate NumPy compatibility error
             def mock_import_side_effect(module_name):
@@ -70,14 +73,14 @@ class TestGracefulDegradation:
             mock_import.side_effect = mock_import_side_effect
 
             # Try to load scanner - should fail gracefully
-            scanner_class = _registry.load_scanner_by_id("keras_h5")
+            scanner_class = fresh_registry.load_scanner_by_id("keras_h5")
             assert scanner_class is None
 
             # Should provide helpful error message
-            failed_scanners = _registry.get_failed_scanners()
-            if "keras_h5" in failed_scanners:  # May already be failed from actual loading
-                error_msg = failed_scanners["keras_h5"]
-                assert "numpy" in error_msg.lower() or "compatibility" in error_msg.lower()
+            failed_scanners = fresh_registry.get_failed_scanners()
+            assert "keras_h5" in failed_scanners
+            error_msg = failed_scanners["keras_h5"]
+            assert "numpy" in error_msg.lower() or "compatibility" in error_msg.lower()
 
     def test_core_functionality_works_with_failed_scanners(self):
         """Test that core functionality works even when some scanners fail"""
