@@ -87,6 +87,7 @@ class FicklingPickleScanner(BaseScanner):
 
             # Use fickling's module-level safety check (correct API)
             import fickling as fickling_module
+
             fickling_is_safe = fickling_module.is_likely_safe(file_path)
 
             # Get additional fickling information
@@ -112,7 +113,7 @@ class FicklingPickleScanner(BaseScanner):
             if not fickling_is_safe:
                 result.add_issue(
                     message="Fickling detected potentially unsafe pickle operations",
-                    severity=IssueSeverity.HIGH,
+                    severity=IssueSeverity.CRITICAL,
                     details={"fickling_analysis": "unsafe"},
                 )
 
@@ -236,7 +237,7 @@ class FicklingPickleScanner(BaseScanner):
                         "cwe": cve_attr.cwe,
                         "description": cve_attr.description,
                         "remediation": cve_attr.remediation,
-                    }
+                    },
                 )
 
             # Also check for basic dangerous patterns
@@ -843,30 +844,29 @@ class FicklingPickleScanner(BaseScanner):
         considers safe but our security model considers dangerous.
         """
         try:
-
             # Analyze each opcode in the pickle
             for opcode in pickled.opcodes:
                 if hasattr(opcode, "name") and opcode.name == "GLOBAL" and hasattr(opcode, "arg") and opcode.arg:
-                        global_ref = str(opcode.arg)
+                    global_ref = str(opcode.arg)
 
-                        # Parse "module function" format
-                        if " " in global_ref:
-                            module_name, func_name = global_ref.split(" ", 1)
+                    # Parse "module function" format
+                    if " " in global_ref:
+                        module_name, func_name = global_ref.split(" ", 1)
 
-                            # Check against our suspicious globals database
-                            if self._is_dangerous_global_reference(module_name, func_name):
-                                result.add_issue(
-                                    message=f"Dangerous global reference: {module_name}.{func_name}",
-                                    severity=IssueSeverity.CRITICAL,
-                                    details={
-                                        "module": module_name,
-                                        "function": func_name,
-                                        "global_reference": global_ref,
-                                        "opcode": "GLOBAL",
-                                        "recommendation": f"The global reference {module_name}.{func_name} can execute "
-                                        f"arbitrary code during pickle loading"
-                                    }
-                                )
+                        # Check against our suspicious globals database
+                        if self._is_dangerous_global_reference(module_name, func_name):
+                            result.add_issue(
+                                message=f"Dangerous global reference: {module_name}.{func_name}",
+                                severity=IssueSeverity.CRITICAL,
+                                details={
+                                    "module": module_name,
+                                    "function": func_name,
+                                    "global_reference": global_ref,
+                                    "opcode": "GLOBAL",
+                                    "recommendation": f"The global reference {module_name}.{func_name} can execute "
+                                    f"arbitrary code during pickle loading",
+                                },
+                            )
 
         except Exception as e:
             logger.warning(f"Error during dangerous globals analysis: {e}")
