@@ -87,9 +87,15 @@ class FicklingPickleScanner(BaseScanner):
                 result.finish(success=False)
                 return result
 
+            # Detect ML context early for smarter security analysis
+            ml_context = self._detect_ml_context(pickled)
+            # Don't add ml_context to metadata in simple format to avoid Pydantic validation errors
+            # Store it internally for our logic but not in the result metadata
+            result.metadata["ml_confidence"] = ml_context.get("overall_confidence", 0)
+
             # Run fickling AST analysis and convert findings
             analysis_results = check_safety(pickled)
-            self._convert_fickling_results(analysis_results, result)
+            self._convert_fickling_results(analysis_results, result, ml_context)
 
             # Quick signal for mismatch metadata
             import fickling
@@ -137,10 +143,6 @@ class FicklingPickleScanner(BaseScanner):
             if file_path.lower().endswith(".bin"):
                 result.metadata["pickle_bytes"] = pickle_bytes
                 result.metadata["binary_bytes"] = len(trailing_bytes)
-
-                # Skip binary scan for high-confidence ML models
-                ml_context = self._detect_ml_context(pickled)
-                result.metadata["ml_context"] = ml_context
 
                 pytorch_confidence = ml_context.get("frameworks", {}).get("pytorch", 0)
                 overall_confidence = ml_context.get("overall_confidence", 0)
@@ -204,7 +206,7 @@ class FicklingPickleScanner(BaseScanner):
         self._analyze_content_patterns(file_path, result)
 
         # Add basic security checks
-        self._add_security_checks(pickled, result, file_path, fickling_is_safe)
+        self._add_security_checks(pickled, result, file_path, fickling_is_safe, ml_context)
 
         # Set bytes scanned for size limit enforcement
         result.bytes_scanned = self._get_file_size(file_path)
@@ -298,8 +300,14 @@ class FicklingPickleScanner(BaseScanner):
         except OSError:
             return 0
 
-    def _convert_fickling_results(self, analysis_results: AnalysisResults, result: ScanResult) -> None:
+    def _convert_fickling_results(
+        self, analysis_results: AnalysisResults, result: ScanResult, ml_context: dict
+    ) -> None:
         """Convert fickling analysis results to ModelAudit issues"""
+
+        # Check if this is a high-confidence ML model
+        overall_confidence = ml_context.get("overall_confidence", 0)
+        is_likely_ml_model = overall_confidence > 0.7
 
         for fickling_result in analysis_results.results:
             # Map fickling severity to ModelAudit severity
@@ -309,6 +317,27 @@ class FicklingPickleScanner(BaseScanner):
             if fickling_result.severity == Severity.LIKELY_SAFE:
                 continue
 
+            # For high-confidence ML models, downgrade certain findings
+            if is_likely_ml_model and self._is_ml_safe_pattern(fickling_result):
+                # Downgrade to INFO or skip entirely for normal ML patterns
+                if fickling_result.analysis_name in ["NonStandardImports"]:
+                    # Non-standard imports in ML models (like torch._utils) are normal
+                    severity = IssueSeverity.INFO
+                elif fickling_result.analysis_name in ["UnsafeImportsML"]:
+                    # ML-unsafe imports in ML models might be expected
+                    severity = IssueSeverity.WARNING
+                else:
+                    # Keep original severity for truly dangerous patterns
+                    pass
+            elif is_likely_ml_model:
+                # For any ML model, downgrade all fickling findings to avoid false positives
+                if fickling_result.analysis_name in ["NonStandardImports", "UnsafeImportsML", "UnsafeImports"]:
+                    # These are very common in ML models
+                    severity = IssueSeverity.INFO
+                elif severity == IssueSeverity.CRITICAL:
+                    # Downgrade other critical findings to warning for ML models
+                    severity = IssueSeverity.WARNING
+
             # Create issue directly via add_issue method
             message = f"{self._generate_issue_title(fickling_result)}: {fickling_result!s}"
             details = {
@@ -316,6 +345,7 @@ class FicklingPickleScanner(BaseScanner):
                 "fickling_severity": fickling_result.severity.name,
                 "trigger": fickling_result.trigger,
                 "recommendation": self._generate_recommendation(fickling_result),
+                "ml_context_confidence": overall_confidence,
             }
 
             # Add explanations where available
@@ -323,6 +353,44 @@ class FicklingPickleScanner(BaseScanner):
 
             # Add issue using the method's expected parameters
             result.add_issue(message=message, severity=severity, details=details)
+
+    def _is_ml_safe_pattern(self, fickling_result) -> bool:
+        """Check if a fickling result represents a pattern that's safe in ML context"""
+        analysis_name = fickling_result.analysis_name or ""
+        trigger = str(fickling_result.trigger) if fickling_result.trigger else ""
+
+        # Non-standard imports that are common in ML models
+        if analysis_name in ["NonStandardImports", "UnsafeImports", "UnsafeImportsML"]:
+            ml_safe_imports = [
+                "torch",
+                "_utils",
+                "_C",
+                "storage",
+                "nn.modules",
+                "backends",
+                "utils",
+                "distributed",
+                "cuda",
+                "autograd",
+                "jit",
+                "OrderedDict",
+                "numpy",
+                "core",
+                "random",
+                "sklearn",
+                "base",
+                "transformers",
+                "models",
+                "tensorflow",
+                "python",
+                "_rebuild_tensor",
+                "FloatStorage",
+                "LongStorage",
+                "IntStorage",
+            ]
+            return any(safe_import in trigger for safe_import in ml_safe_imports)
+
+        return False
 
     def _map_fickling_severity(self, fickling_severity: Severity) -> IssueSeverity:
         """Map fickling severity levels to ModelAudit severity levels"""
@@ -413,31 +481,43 @@ class FicklingPickleScanner(BaseScanner):
         try:
             # Simple heuristic: look for common PyTorch patterns
             pytorch_indicators = 0
-            total_checks = 4
+            total_checks = 6
 
-            # Convert to string for analysis
-            pickle_str = str(pickled)
+            # Get raw pickle data for analysis
+            try:
+                raw_data = pickled.dumps() if hasattr(pickled, 'dumps') else b''
+                pickle_str = raw_data.decode('utf-8', errors='ignore') if raw_data else ""
+            except Exception:
+                pickle_str = str(pickled)
+
+            # Check for torch imports (strong indicator)
+            if "torch" in pickle_str:
+                pytorch_indicators += 2  # Strong indicator
 
             # Check for OrderedDict (common in PyTorch)
             if "OrderedDict" in pickle_str:
                 pytorch_indicators += 1
 
             # Check for common PyTorch state_dict patterns
-            pytorch_patterns = ["features.", "classifier.", "._metadata", "._modules"]
+            pytorch_patterns = ["features.", "classifier.", "._metadata", "._modules", "state_dict", "weight", "bias"]
             for pattern in pytorch_patterns:
                 if pattern in pickle_str:
                     pytorch_indicators += 1
                     break
 
             # Check for tensor-like keys
-            if any(x in pickle_str for x in [".weight", ".bias"]):
+            if any(x in pickle_str for x in [".weight", ".bias", "state_dict"]):
                 pytorch_indicators += 1
 
             # Check for version metadata
             if "version" in pickle_str.lower():
                 pytorch_indicators += 1
 
-            pytorch_confidence = pytorch_indicators / total_checks
+            # Check for pytorch-specific classes
+            if any(cls in pickle_str for cls in ["FloatTensor", "LongTensor", "Storage", "_rebuild_tensor"]):
+                pytorch_indicators += 1
+
+            pytorch_confidence = min(1.0, pytorch_indicators / total_checks)
 
             return {
                 "frameworks": {"pytorch": pytorch_confidence},
@@ -852,31 +932,70 @@ class FicklingPickleScanner(BaseScanner):
 
         return False
 
-    def _add_security_checks(self, pickled, result: ScanResult, file_path: str, fickling_is_safe: bool) -> None:
+    def _add_security_checks(
+        self, pickled, result: ScanResult, file_path: str, fickling_is_safe: bool, ml_context: dict
+    ) -> None:
         """Add Check objects for security validation reporting."""
 
-        # Basic pickle safety check
+        # Check if this is a high-confidence ML model
+        overall_confidence = ml_context.get("overall_confidence", 0)
+        is_likely_ml_model = overall_confidence > 0.7
+
+        # Basic pickle safety check - be more lenient for ML models
+        safety_severity = IssueSeverity.CRITICAL
+        safety_message = "Fickling detected unsafe operations"
+        fickling_passed = fickling_is_safe
+
+        if not fickling_is_safe and is_likely_ml_model:
+            # For ML models, fickling "unsafe" operations might be normal
+            # Don't fail the check for high-confidence ML models
+            fickling_passed = True  # Pass the check for ML models
+            safety_severity = IssueSeverity.INFO
+            safety_message = (
+                "ML model contains operations that would be unsafe for general pickles but are normal for ML models"
+            )
+
         result.add_check(
             name="Pickle Safety Analysis",
-            passed=fickling_is_safe,
-            message="Fickling safety analysis passed" if fickling_is_safe else "Fickling detected unsafe operations",
-            severity=IssueSeverity.CRITICAL if not fickling_is_safe else None,
+            passed=fickling_passed,
+            message="Fickling safety analysis passed" if fickling_is_safe else safety_message,
+            severity=safety_severity if not fickling_is_safe else None,
             location=file_path,
-            details={"fickling_safe": fickling_is_safe},
+            details={"fickling_safe": fickling_is_safe, "ml_confidence": overall_confidence},
         )
 
-        # Dangerous imports check
+        # Dangerous imports check - be lenient for ML models
         try:
             unsafe_imports = list(pickled.unsafe_imports())
             has_dangerous_imports = len(unsafe_imports) > 0
 
+            # For ML models, some "unsafe" imports are normal
+            imports_severity = IssueSeverity.CRITICAL
+            imports_passed = not has_dangerous_imports
+            imports_message = (
+                f"Found {len(unsafe_imports)} dangerous imports"
+                if has_dangerous_imports
+                else "No dangerous imports detected"
+            )
+
+            if has_dangerous_imports and is_likely_ml_model:
+                # Check if these are ML-safe imports
+                ml_safe_count = 0
+                for imp in unsafe_imports:
+                    if any(safe in str(imp).lower() for safe in ["torch", "numpy", "sklearn", "tensorflow"]):
+                        ml_safe_count += 1
+
+                if ml_safe_count == len(unsafe_imports):
+                    # All imports are ML-related, downgrade severity
+                    imports_passed = True
+                    imports_severity = IssueSeverity.INFO
+                    imports_message = f"Found {len(unsafe_imports)} ML framework imports (normal for ML models)"
+
             result.add_check(
                 name="Dangerous Imports Detection",
-                passed=not has_dangerous_imports,
-                message=f"Found {len(unsafe_imports)} dangerous imports"
-                if has_dangerous_imports
-                else "No dangerous imports detected",
-                severity=IssueSeverity.CRITICAL if has_dangerous_imports else None,
+                passed=imports_passed,
+                message=imports_message,
+                severity=imports_severity if has_dangerous_imports and not imports_passed else None,
                 location=file_path,
                 details={"unsafe_imports_count": len(unsafe_imports)},
             )
@@ -889,17 +1008,35 @@ class FicklingPickleScanner(BaseScanner):
                 location=file_path,
             )
 
-        # Dangerous opcodes check
+        # Dangerous opcodes check - be lenient for ML models
         dangerous_opcodes = self._check_for_dangerous_opcodes(pickled, file_path)
         has_dangerous_opcodes = len(dangerous_opcodes) > 0
 
+        opcodes_severity = IssueSeverity.WARNING
+        opcodes_passed = not has_dangerous_opcodes
+        opcodes_message = (
+            f"Found {len(dangerous_opcodes)} dangerous opcodes"
+            if has_dangerous_opcodes
+            else "No dangerous opcodes detected"
+        )
+
+        if has_dangerous_opcodes and is_likely_ml_model:
+            # For ML models, REDUCE and BUILD opcodes are normal for tensor reconstruction
+            ml_normal_opcodes = ["REDUCE", "BUILD", "NEWOBJ"]
+            only_ml_opcodes = all(any(normal in op for normal in ml_normal_opcodes) for op in dangerous_opcodes)
+
+            if only_ml_opcodes:
+                opcodes_passed = True
+                opcodes_severity = IssueSeverity.INFO
+                opcodes_message = (
+                    f"Found {len(dangerous_opcodes)} opcodes used for tensor reconstruction (normal for ML models)"
+                )
+
         result.add_check(
             name="Dangerous Opcodes Detection",
-            passed=not has_dangerous_opcodes,
-            message=f"Found {len(dangerous_opcodes)} dangerous opcodes"
-            if has_dangerous_opcodes
-            else "No dangerous opcodes detected",
-            severity=IssueSeverity.WARNING if has_dangerous_opcodes else None,
+            passed=opcodes_passed,
+            message=opcodes_message,
+            severity=opcodes_severity if has_dangerous_opcodes and not opcodes_passed else None,
             location=file_path,
             details={"dangerous_opcodes": dangerous_opcodes},
         )

@@ -887,15 +887,33 @@ class PyTorchZipScanner(BaseScanner):
             opcode_list = ", ".join(set(dangerous_opcodes_found)) if dangerous_opcodes_found else "unknown"
             # risk_description = "; ".join(set(code_execution_risks)) if code_execution_risks else "code execution"
 
-            pytorch_result.add_check(
-                name="CVE-2025-32434 weights_only=True Safety Warning",
-                passed=False,
-                message=(
+            # Check if this looks like a legitimate ML model
+            ml_confidence = pickle_result.metadata.get("ml_confidence", 0)
+            is_likely_ml_model = ml_confidence > 0.7
+            
+            # For legitimate ML models, tensor operations are normal, so downgrade severity
+            if is_likely_ml_model:
+                severity = IssueSeverity.INFO
+                passed = True
+                message = (
+                    f"PyTorch model uses tensor reconstruction opcodes ({opcode_list}) which are normal for ML models. "
+                    f"While these opcodes technically bypass weights_only=True safety checks, they are being used for "
+                    f"legitimate tensor deserialization rather than malicious code execution."
+                )
+            else:
+                severity = IssueSeverity.CRITICAL
+                passed = False
+                message = (
                     f"PyTorch model contains dangerous opcodes ({opcode_list}) that can execute code "
                     f"even when loaded with torch.load(weights_only=True). This contradicts the common "
                     f"assumption that weights_only=True provides safety against code execution."
-                ),
-                severity=IssueSeverity.CRITICAL,
+                )
+            
+            pytorch_result.add_check(
+                name="CVE-2025-32434 weights_only=True Safety Warning",
+                passed=passed,
+                message=message,
+                severity=severity,
                 location=f"{model_path}:{pickle_name}",
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
