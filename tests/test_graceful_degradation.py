@@ -62,7 +62,7 @@ class TestGracefulDegradation:
         """Test that NumPy compatibility issues are handled gracefully"""
         # Use fresh registry to test error handling
         fresh_registry = ScannerRegistry()
-        
+
         with patch("importlib.import_module") as mock_import:
             # Simulate NumPy compatibility error
             def mock_import_side_effect(module_name):
