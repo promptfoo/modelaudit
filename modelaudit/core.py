@@ -1398,7 +1398,7 @@ def merge_scan_result(
         for issue in scan_result.issues:
             record_issue_found(
                 issue.message,
-                issue.severity.name if hasattr(issue.severity, 'name') else str(issue.severity),
+                issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
                 scan_result.scanner_name,
             )
         # Use the new direct aggregation method for better performance and type safety

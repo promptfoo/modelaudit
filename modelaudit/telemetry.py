@@ -2,7 +2,7 @@
 Telemetry system for ModelAudit - tracks usage analytics and performance metrics.
 Follows privacy-first principles with comprehensive opt-out controls.
 """
-# ruff: noqa: UP007, UP045
+# ruff: noqa: UP007
 
 from __future__ import annotations
 
