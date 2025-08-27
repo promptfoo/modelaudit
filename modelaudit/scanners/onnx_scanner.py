@@ -14,10 +14,10 @@ try:
         TENSOR_TYPE_TO_NP_TYPE = mapping.TENSOR_TYPE_TO_NP_TYPE
     except (ImportError, AttributeError):
         # Fallback for newer ONNX versions - define basic mapping manually
-        TENSOR_TYPE_TO_NP_TYPE = dict({  # type: ignore[assignment]
+        TENSOR_TYPE_TO_NP_TYPE = {  # type: ignore[assignment]
             1: np.float32, 2: np.uint8, 3: np.int8, 6: np.int32, 7: np.int64,
             9: bool, 10: np.float16, 11: np.float64, 12: np.uint32, 13: np.uint64,
-        })
+        }
 
     HAS_ONNX = True
 except Exception:
