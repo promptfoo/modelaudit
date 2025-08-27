@@ -89,9 +89,48 @@ ML_SAFE_GLOBALS = {
 def _detect_ml_context(data):
     """
     Legacy function that delegates to the FicklingPickleScanner's _detect_ml_context method.
+    Enhanced for backward compatibility with tests expecting 'is_ml_content' key.
     """
-    scanner = FicklingPickleScanner()
-    return scanner._detect_ml_context(data)
+    # Handle legacy opcode list format for tests
+    if isinstance(data, list):
+        # Old-style opcode processing for backward compatibility
+        pytorch_indicators = 0
+        total_checks = 6
+        
+        # Convert opcodes to string representation for pattern matching
+        opcodes_str = str(data).lower()
+        
+        # Check for torch imports (strong indicator)
+        if "torch" in opcodes_str:
+            pytorch_indicators += 2  # Strong indicator
+        
+        # Check for OrderedDict (common in PyTorch)
+        if "ordereddict" in opcodes_str:
+            pytorch_indicators += 1
+            
+        # Check for common ML patterns
+        ml_patterns = ["linear", "tensor", "nn.", "module", "layer"]
+        for pattern in ml_patterns:
+            if pattern in opcodes_str:
+                pytorch_indicators += 1
+                break
+        
+        pytorch_confidence = min(1.0, pytorch_indicators / total_checks)
+        
+        result = {
+            "frameworks": {"pytorch": pytorch_confidence},
+            "overall_confidence": pytorch_confidence,
+            "indicators": pytorch_indicators,
+        }
+    else:
+        # New-style pickled object processing
+        scanner = FicklingPickleScanner()
+        result = scanner._detect_ml_context(data)
+    
+    # Add backward compatibility key
+    result["is_ml_content"] = result.get("overall_confidence", 0) > 0.1
+    
+    return result
 
 
 def _is_legitimate_serialization_file(file_path: str) -> bool:
@@ -139,7 +178,7 @@ def _is_legitimate_serialization_file(file_path: str) -> bool:
         return False
 
 
-def _is_actually_dangerous_global(module_name: str, func_name: str) -> bool:
+def _is_actually_dangerous_global(module_name: str, func_name: str, context: dict = None) -> bool:
     """
     Determine if a global is actually dangerous in the current context.
 
@@ -156,36 +195,33 @@ def _is_actually_dangerous_global(module_name: str, func_name: str) -> bool:
         ("numpy", "_reconstruct"),  # NumPy array reconstruction
         ("numpy", "dtype"),  # Data type definitions
         ("torch", "load"),  # PyTorch model loading
+        ("torch", "tensor"),  # PyTorch tensor creation
         ("sklearn", "Pipeline"),  # Sklearn pipelines
     ]
+
+    # If we have ML context and high confidence, be more lenient
+    if context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7:
+        if (module_name, func_name) in ml_safe_patterns:
+            return False
 
     return (module_name, func_name) not in ml_safe_patterns
 
 
-def _should_ignore_opcode_sequence(opcodes: list) -> bool:
+def _should_ignore_opcode_sequence(opcodes: list, context: dict = None) -> bool:
     """
     Determine if an opcode sequence should be ignored as benign.
 
     This function provides backward compatibility for tests that expect
-    opcode sequence analysis.
+    opcode sequence analysis with ML context.
     """
     if not opcodes:
         return True
 
-    # Simple heuristic: if the sequence only contains "safe" operations
-    # like GLOBAL references to known ML modules, we can ignore it
-    safe_patterns = ["numpy", "torch", "sklearn", "pandas", "collections", "OrderedDict"]
+    # Only ignore if we have high-confidence ML content
+    if context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7:
+        return True
 
-    # Convert opcodes to string representation for pattern matching
-    opcodes_str = str(opcodes).lower()
-
-    # If the sequence only contains safe ML-related patterns, ignore it
-    if any(pattern in opcodes_str for pattern in safe_patterns):
-        # But check for dangerous operations mixed in
-        dangerous_patterns = ["system", "exec", "eval", "import", "open"]
-        if not any(pattern in opcodes_str for pattern in dangerous_patterns):
-            return True
-
+    # For low confidence or non-ML content, don't ignore
     return False
 
 

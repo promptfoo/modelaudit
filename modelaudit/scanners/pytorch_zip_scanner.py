@@ -890,7 +890,7 @@ class PyTorchZipScanner(BaseScanner):
             # Check if this looks like a legitimate ML model
             ml_confidence = pickle_result.metadata.get("ml_confidence", 0)
             is_likely_ml_model = ml_confidence > 0.7
-            
+
             # For legitimate ML models, tensor operations are normal, so downgrade severity
             if is_likely_ml_model:
                 severity = IssueSeverity.INFO
@@ -908,7 +908,7 @@ class PyTorchZipScanner(BaseScanner):
                     f"even when loaded with torch.load(weights_only=True). This contradicts the common "
                     f"assumption that weights_only=True provides safety against code execution."
                 )
-            
+
             pytorch_result.add_check(
                 name="CVE-2025-32434 weights_only=True Safety Warning",
                 passed=passed,
