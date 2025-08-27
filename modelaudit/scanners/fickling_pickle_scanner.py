@@ -516,7 +516,7 @@ class FicklingPickleScanner(BaseScanner):
             # Check for pytorch-specific classes
             if any(cls in pickle_str for cls in ["FloatTensor", "LongTensor", "Storage", "_rebuild_tensor"]):
                 pytorch_indicators += 1
-            
+
             # Check for ML-related class names (for test compatibility)
             ml_class_patterns = ["MLModel", "Model", "PyTorchModel", "TorchModel"]
             if any(cls in pickle_str for cls in ml_class_patterns):

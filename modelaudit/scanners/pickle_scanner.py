@@ -96,27 +96,27 @@ def _detect_ml_context(data):
         # Old-style opcode processing for backward compatibility
         pytorch_indicators = 0
         total_checks = 6
-        
+
         # Convert opcodes to string representation for pattern matching
         opcodes_str = str(data).lower()
-        
+
         # Check for torch imports (strong indicator)
         if "torch" in opcodes_str:
             pytorch_indicators += 2  # Strong indicator
-        
+
         # Check for OrderedDict (common in PyTorch)
         if "ordereddict" in opcodes_str:
             pytorch_indicators += 1
-            
+
         # Check for common ML patterns
         ml_patterns = ["linear", "tensor", "nn.", "module", "layer"]
         for pattern in ml_patterns:
             if pattern in opcodes_str:
                 pytorch_indicators += 1
                 break
-        
+
         pytorch_confidence = min(1.0, pytorch_indicators / total_checks)
-        
+
         result = {
             "frameworks": {"pytorch": pytorch_confidence},
             "overall_confidence": pytorch_confidence,
@@ -126,10 +126,10 @@ def _detect_ml_context(data):
         # New-style pickled object processing
         scanner = FicklingPickleScanner()
         result = scanner._detect_ml_context(data)
-    
+
     # Add backward compatibility key
     result["is_ml_content"] = result.get("overall_confidence", 0) > 0.1
-    
+
     return result
 
 
@@ -178,7 +178,7 @@ def _is_legitimate_serialization_file(file_path: str) -> bool:
         return False
 
 
-def _is_actually_dangerous_global(module_name: str, func_name: str, context: dict = None) -> bool:
+def _is_actually_dangerous_global(module_name: str, func_name: str, context: Optional[dict] = None) -> bool:
     """
     Determine if a global is actually dangerous in the current context.
 
@@ -200,14 +200,14 @@ def _is_actually_dangerous_global(module_name: str, func_name: str, context: dic
     ]
 
     # If we have ML context and high confidence, be more lenient
-    if context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7:
-        if (module_name, func_name) in ml_safe_patterns:
-            return False
+    if (context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7
+        and (module_name, func_name) in ml_safe_patterns):
+        return False
 
     return (module_name, func_name) not in ml_safe_patterns
 
 
-def _should_ignore_opcode_sequence(opcodes: list, context: dict = None) -> bool:
+def _should_ignore_opcode_sequence(opcodes: list, context: Optional[dict] = None) -> bool:
     """
     Determine if an opcode sequence should be ignored as benign.
 
@@ -218,11 +218,7 @@ def _should_ignore_opcode_sequence(opcodes: list, context: dict = None) -> bool:
         return True
 
     # Only ignore if we have high-confidence ML content
-    if context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7:
-        return True
-
-    # For low confidence or non-ML content, don't ignore
-    return False
+    return bool(context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7)
 
 
 # Export for backwards compatibility
