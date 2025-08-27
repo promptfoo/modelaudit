@@ -31,9 +31,9 @@ class TestCLILicenseIntegration:
         """Test CLI scanning of MIT licensed model."""
         mit_dir = test_data_dir / "mit_model"
 
-        # Run CLI scan
+        # Run CLI scan with cache disabled to ensure fresh scan results
         result = subprocess.run(
-            [*cli_command, "scan", str(mit_dir), "--format", "json"],
+            [*cli_command, "scan", str(mit_dir), "--format", "json", "--no-cache"],
             capture_output=True,
             text=True,
         )

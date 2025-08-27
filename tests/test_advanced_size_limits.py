@@ -81,7 +81,8 @@ class TestAdvancedSizeLimits:
     def test_stat_error_sets_failure_and_end_time(self, mock_size):
         """Ensure stat errors mark result as failed and set end time."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            result = scan_file(f.name, {})
+            # Disable caching for error condition testing
+            result = scan_file(f.name, {"cache_enabled": False})
             assert any("Error checking file size" in issue.message for issue in result.issues)
             assert not result.success
             assert result.end_time is not None
