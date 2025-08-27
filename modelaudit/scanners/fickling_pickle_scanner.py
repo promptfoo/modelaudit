@@ -312,9 +312,15 @@ class FicklingPickleScanner(BaseScanner):
 
             for pattern, message in dangerous_patterns:
                 if pattern in binary_content:
+                    # Determine severity based on pattern criticality
+                    severity = IssueSeverity.CRITICAL
+                    if pattern in [b"joblib.load", b"sklearn", b"__reduce__", b"dill", b"NumpyArrayWrapper"]:
+                        # These patterns are more common in legitimate ML models
+                        severity = IssueSeverity.WARNING
+                    
                     result.add_issue(
                         message=f"Dangerous pattern: {message}",
-                        severity=IssueSeverity.WARNING,
+                        severity=severity,
                         details={"pattern": pattern.decode("utf-8", errors="ignore")},
                     )
 
