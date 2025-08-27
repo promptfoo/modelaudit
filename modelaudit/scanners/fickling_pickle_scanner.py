@@ -368,7 +368,12 @@ class FicklingPickleScanner(BaseScanner):
                     pass
             elif is_likely_ml_model:
                 # For any ML model, downgrade all fickling findings to avoid false positives
-                if fickling_result.analysis_name in ["NonStandardImports", "UnsafeImportsML", "UnsafeImports", "UnusedVariables"]:
+                if fickling_result.analysis_name in [
+                    "NonStandardImports",
+                    "UnsafeImportsML",
+                    "UnsafeImports",
+                    "UnusedVariables",
+                ]:
                     # These are very common in ML models
                     severity = IssueSeverity.INFO
                 elif severity == IssueSeverity.CRITICAL:
@@ -426,7 +431,7 @@ class FicklingPickleScanner(BaseScanner):
                 "IntStorage",
             ]
             return any(safe_import in trigger for safe_import in ml_safe_imports)
-        
+
         # Unused variables that are common in ML models
         if analysis_name in ["UnusedVariables"]:
             # PyTorch models commonly have unused variables like _var1, _var3 during tensor reconstruction
