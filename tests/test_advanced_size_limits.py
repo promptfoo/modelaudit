@@ -62,8 +62,8 @@ class TestAdvancedSizeLimits:
         mock_size.return_value = normal_large_size
 
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            # Config with a 1GB limit
-            config = {"max_file_size": 1024 * 1024 * 1024}  # 1GB limit
+            # Config with a 1GB limit and disabled cache to ensure proper size checking
+            config = {"max_file_size": 1024 * 1024 * 1024, "cache_enabled": False}  # 1GB limit
 
             with patch("modelaudit.core.os.path.getsize") as mock_core_size:
                 mock_core_size.return_value = normal_large_size
