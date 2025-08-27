@@ -7,7 +7,17 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 try:
     import numpy as np
     import onnx
-    from onnx import mapping
+
+    # Try to import mapping, but fall back if not available in newer versions
+    try:
+        from onnx import mapping
+        TENSOR_TYPE_TO_NP_TYPE = mapping.TENSOR_TYPE_TO_NP_TYPE
+    except (ImportError, AttributeError):
+        # Fallback for newer ONNX versions - define basic mapping manually
+        TENSOR_TYPE_TO_NP_TYPE = dict({  # type: ignore[assignment]
+            1: np.float32, 2: np.uint8, 3: np.int8, 6: np.int32, 7: np.int64,
+            9: bool, 10: np.float16, 11: np.float64, 12: np.uint32, 13: np.uint64,
+        })
 
     HAS_ONNX = True
 except Exception:
@@ -235,7 +245,7 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
-            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+            dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
@@ -282,7 +292,7 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
-                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+                    dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d

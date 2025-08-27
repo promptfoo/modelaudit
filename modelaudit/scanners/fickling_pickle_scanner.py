@@ -294,18 +294,16 @@ class FicklingPickleScanner(BaseScanner):
                 (b"sklearn", "Scikit-learn reference detected"),
                 (b"__reduce__", "Pickle reduce method detected"),
                 (b"os.system", "OS system call detected"),
-                (b"os", "OS module access detected"),
-                (b"posix", "POSIX system access detected"),
-                (b"system", "System call detected"),
+                (b"posix.system", "POSIX system call detected"),
                 (b"subprocess", "Subprocess execution detected"),
-                (b"eval", "Eval operation detected"),
-                (b"exec", "Exec operation detected"),
-                (b"compile", "Compile operation detected"),
+                (b"eval(", "Eval operation detected"),
+                (b"exec(", "Exec operation detected"),
+                (b"compile(", "Compile operation detected"),
                 (b"__builtin__", "Builtin module access detected"),
                 (b"__builtins__", "__builtins__ module access detected"),
                 (b"builtins", "Builtins module access detected"),
-                (b"globals", "Globals manipulation detected"),
-                (b"locals", "Locals manipulation detected"),
+                (b"globals(", "Globals manipulation detected"),
+                (b"locals(", "Locals manipulation detected"),
                 (b"dill", "dill library reference detected"),
                 (b"NumpyArrayWrapper", "Numpy array wrapper detected"),
             ]
@@ -317,7 +315,6 @@ class FicklingPickleScanner(BaseScanner):
                     if pattern in [b"joblib.load", b"sklearn", b"__reduce__", b"dill", b"NumpyArrayWrapper"]:
                         # These patterns are more common in legitimate ML models
                         severity = IssueSeverity.WARNING
-                    
                     result.add_issue(
                         message=f"Dangerous pattern: {message}",
                         severity=severity,
@@ -360,6 +357,9 @@ class FicklingPickleScanner(BaseScanner):
                 if fickling_result.analysis_name in ["NonStandardImports"]:
                     # Non-standard imports in ML models (like torch._utils) are normal
                     severity = IssueSeverity.INFO
+                elif fickling_result.analysis_name in ["UnusedVariables"]:
+                    # Unused variables in ML models (_var1, _var3) are normal tensor reconstruction
+                    severity = IssueSeverity.INFO
                 elif fickling_result.analysis_name in ["UnsafeImportsML"]:
                     # ML-unsafe imports in ML models might be expected
                     severity = IssueSeverity.WARNING
@@ -368,7 +368,7 @@ class FicklingPickleScanner(BaseScanner):
                     pass
             elif is_likely_ml_model:
                 # For any ML model, downgrade all fickling findings to avoid false positives
-                if fickling_result.analysis_name in ["NonStandardImports", "UnsafeImportsML", "UnsafeImports"]:
+                if fickling_result.analysis_name in ["NonStandardImports", "UnsafeImportsML", "UnsafeImports", "UnusedVariables"]:
                     # These are very common in ML models
                     severity = IssueSeverity.INFO
                 elif severity == IssueSeverity.CRITICAL:
@@ -426,6 +426,17 @@ class FicklingPickleScanner(BaseScanner):
                 "IntStorage",
             ]
             return any(safe_import in trigger for safe_import in ml_safe_imports)
+        
+        # Unused variables that are common in ML models
+        if analysis_name in ["UnusedVariables"]:
+            # PyTorch models commonly have unused variables like _var1, _var3 during tensor reconstruction
+            ml_safe_variable_patterns = [
+                "_var",
+                "_rebuild_tensor",
+                "Storage",
+                "tensor",
+            ]
+            return any(safe_var in trigger for safe_var in ml_safe_variable_patterns)
 
         return False
 

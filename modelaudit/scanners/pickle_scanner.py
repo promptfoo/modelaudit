@@ -48,6 +48,31 @@ class PickleScanner(FicklingPickleScanner):
 
                 result.finish(success=True)
                 return result
+        except RuntimeError as e:
+            # Handle non-benign errors (like in test_non_benign_errors_still_reported)
+            from .base import IssueSeverity
+
+            result.add_issue(
+                message=f"Pickle parsing error: {e!s}",
+                severity=IssueSeverity.WARNING,
+                details={"exception_type": type(e).__name__, "error_message": str(e)}
+            )
+
+            # Try to continue with fickling analysis even if pickletools failed
+            try:
+                fickling_result = super().scan(file_path, timeout)
+                # Merge issues from FicklingPickleScanner
+                for issue in fickling_result.issues:
+                    result.add_issue(issue.message, issue.severity, issue.location, issue.details)
+                # Copy over any additional metadata
+                for key, value in fickling_result.metadata.items():
+                    if key not in result.metadata:
+                        result.metadata[key] = value
+            except Exception:
+                pass
+
+            result.finish(success=True)
+            return result
 
         # If validation passed, proceed with normal scanning
         try:
