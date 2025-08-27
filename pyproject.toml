@@ -38,7 +38,6 @@ dependencies = [
     "platformdirs>=3.0.0",
     "pyyaml>=6.0,<7.0",
     "pydantic>=2.11.0,<3.0",
-    "fickling==0.1.4",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +50,7 @@ pytorch = ["torch>=2.6.0,<3.0"]
 yaml = ["pyyaml>=6.0,<7.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0,<2.0"]
+fickling = ["fickling==0.1.4"]
 dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
@@ -120,6 +120,7 @@ all = [
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
+    "fickling==0.1.4",
 ]
 
 [project.scripts]
