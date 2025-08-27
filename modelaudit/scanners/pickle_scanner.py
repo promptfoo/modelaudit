@@ -30,6 +30,22 @@ class PickleScanner(FicklingPickleScanner):
                 result.metadata["exception_type"] = type(e).__name__
                 result.metadata["exception_message"] = str(e)
                 result.metadata["validated_format"] = True
+
+                # Even for invalid pickle files, we should run content analysis
+                # to detect dangerous patterns (needed for tests and security)
+                try:
+                    fickling_result = super().scan(file_path, timeout)
+                    # Merge issues from FicklingPickleScanner with our truncation result
+                    for issue in fickling_result.issues:
+                        result.add_issue(issue.message, issue.severity, issue.location, issue.details)
+                    # Copy over any additional metadata
+                    for key, value in fickling_result.metadata.items():
+                        if key not in result.metadata:
+                            result.metadata[key] = value
+                except Exception:
+                    # If fickling scan also fails, that's fine, we still have truncation info
+                    pass
+
                 result.finish(success=True)
                 return result
 
@@ -200,8 +216,12 @@ def _is_actually_dangerous_global(module_name: str, func_name: str, context: Opt
     ]
 
     # If we have ML context and high confidence, be more lenient
-    if (context and context.get("is_ml_content") and context.get("overall_confidence", 0) > 0.7
-        and (module_name, func_name) in ml_safe_patterns):
+    if (
+        context
+        and context.get("is_ml_content")
+        and context.get("overall_confidence", 0) > 0.7
+        and (module_name, func_name) in ml_safe_patterns
+    ):
         return False
 
     return (module_name, func_name) not in ml_safe_patterns

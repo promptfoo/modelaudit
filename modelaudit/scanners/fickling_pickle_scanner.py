@@ -14,19 +14,22 @@ try:
     from fickling.analysis import AnalysisResults, Severity, check_safety
     from fickling.exception import UnsafeFileError
     from fickling.fickle import Pickled
+
     FICKLING_AVAILABLE = True
 except ImportError:
     # Graceful degradation when fickling is not available (e.g., in Docker builds)
     FICKLING_AVAILABLE = False
     # Create stub types for type compatibility
     from typing import Any
+
     AnalysisResults = Any
     Severity = Any
     UnsafeFileError = Exception
     Pickled = Any
-    
+
     def check_safety(*args, **kwargs):
         raise ImportError("Fickling is not available")
+
 
 from ..explanations import get_import_explanation, get_opcode_explanation
 from ..suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
@@ -85,8 +88,8 @@ class FicklingPickleScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 details={
                     "recommendation": "Install fickling for enhanced pickle security analysis",
-                    "fallback": "Using basic pickle validation only"
-                }
+                    "fallback": "Using basic pickle validation only",
+                },
             )
             result.metadata["fickling_available"] = False
             result.finish(success=True)
