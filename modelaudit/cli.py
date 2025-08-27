@@ -601,6 +601,7 @@ def scan_command(
     """
     # Record telemetry for scan command usage
     import time
+
     scan_start_time = time.time()
     scan_options = {
         "format": format,
