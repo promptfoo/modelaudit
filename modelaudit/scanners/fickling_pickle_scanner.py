@@ -18,23 +18,13 @@ try:
 except ImportError:
     # Graceful degradation when fickling is not available (e.g., in Docker builds)
     FICKLING_AVAILABLE = False
-    # Create stub classes/functions for type compatibility
-    class AnalysisResults:
-        def __init__(self):
-            self.severity = None
-            self.results = []
-
-    class Severity:
-        LIKELY_SAFE = "LIKELY_SAFE"
-
-    class UnsafeFileError(Exception):
-        pass
-
-    class Pickled:
-        @classmethod
-        def load(cls, f):
-            raise ImportError("Fickling is not available")
-
+    # Create stub types for type compatibility
+    from typing import Any
+    AnalysisResults = Any
+    Severity = Any
+    UnsafeFileError = Exception
+    Pickled = Any
+    
     def check_safety(*args, **kwargs):
         raise ImportError("Fickling is not available")
 
