@@ -322,9 +322,10 @@ class TestCompileEvalVariants:
 
         for pattern_name, dangerous_func in test_cases:
             # Create a proper pickle with the dangerous pattern
+            # Note: capture dangerous_func in default argument to avoid closure issue
             class DangerousPickle:
-                def __reduce__(self):
-                    return dangerous_func()
+                def __reduce__(self, func=dangerous_func):
+                    return func()
 
             with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
                 pickle.dump(DangerousPickle(), f)
@@ -338,9 +339,9 @@ class TestCompileEvalVariants:
 
                 # Check that pattern is mentioned (either in the function name or module reference)
                 pattern_found = any(
-                    pattern_name in issue.message.lower() or 
-                    f"builtins.{pattern_name}" in issue.message.lower() or
-                    (pattern_name == "__builtins__" and "builtins." in issue.message.lower())
+                    pattern_name in issue.message.lower()
+                    or f"builtins.{pattern_name}" in issue.message.lower()
+                    or (pattern_name == "__builtins__" and "builtins." in issue.message.lower())
                     for issue in result.issues
                 )
                 assert pattern_found, f"Should mention {pattern_name} in issues"

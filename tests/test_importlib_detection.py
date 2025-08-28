@@ -4,8 +4,8 @@ import pickle
 import tempfile
 from pathlib import Path
 
-from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
 def test_importlib_import_module_detection():
@@ -41,12 +41,14 @@ malicious.system('echo pwned')
 
 def test_importlib_pattern_in_raw_bytes():
     """Test that importlib pattern is detected as CRITICAL in pickle with direct module reference."""
+
     # Create a malicious pickle using __reduce__ that imports via importlib
     class MaliciousImportLib:
         def __reduce__(self):
             import importlib
+
             return (importlib.import_module, ("os",))
-    
+
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
         pickle.dump(MaliciousImportLib(), f)
         temp_path = f.name
