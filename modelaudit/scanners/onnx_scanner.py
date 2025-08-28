@@ -108,9 +108,11 @@ class OnnxScanner(BaseScanner):
                 context=path,
             )
 
-            # Create single aggregated checks for the file
-            self.summarize_jit_script_findings(jit_findings, result, context=path)
-            self.summarize_network_communication_findings(network_findings, result, context=path)
+            # Create single aggregated checks for the file (only if checks are enabled)
+            if self.config.get("check_jit_script", True):
+                self.summarize_jit_script_findings(jit_findings, result, context=path)
+            if self.config.get("check_network_comm", True):
+                self.summarize_network_communication_findings(network_findings, result, context=path)
 
         except Exception as e:
             # Log but don't fail the scan

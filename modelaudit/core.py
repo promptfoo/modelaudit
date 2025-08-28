@@ -364,7 +364,7 @@ def _update_result_counts(
 
     # Log consolidation summary
     reduction_count = original_count - total_checks
-    logger.info(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
+    logger.debug(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
 
     if skipped_checks > 0:
         logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
