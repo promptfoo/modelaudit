@@ -24,6 +24,7 @@ from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_file_from_hf, download_model, is_huggingface_file_url, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
+from .utils.smart_detection import generate_smart_defaults, apply_smart_overrides, parse_size_string
 
 logger = logging.getLogger("modelaudit")
 
@@ -392,18 +393,12 @@ def delegate_info() -> None:
 
 @cli.command("scan")
 @click.argument("paths", nargs=-1, type=str, required=True)
-@click.option(
-    "--blacklist",
-    "-b",
-    multiple=True,
-    help="Additional blacklist patterns to check against model names",
-)
+# Core output control (4 flags)
 @click.option(
     "--format",
     "-f",
     type=click.Choice(["text", "json", "sarif"]),
-    default="text",
-    help="Output format (text, json, or sarif) [default: text]",
+    help="Output format (text, json, or sarif) [default: auto-detected]",
 )
 @click.option(
     "--output",
@@ -411,178 +406,99 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Output file path (prints to stdout if not specified)",
 )
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option("--quiet", "-q", is_flag=True, help="Silence detection messages")
+# Security behavior (2 flags)
+@click.option(
+    "--blacklist",
+    "-b",
+    multiple=True,
+    help="Additional blacklist patterns to check against model names",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Strict mode: fail on warnings, scan all file types, strict license validation",
+)
+# Progress & reporting (2 flags)
+@click.option(
+    "--progress",
+    is_flag=True,
+    help="Force enable progress reporting (auto-detected by default)",
+)
 @click.option(
     "--sbom",
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
+# Override smart detection (2 flags)
 @click.option(
     "--timeout",
     "-t",
     type=int,
-    default=3600,
-    help="Scan timeout in seconds [default: 3600]",
-)
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
-@click.option(
-    "--max-file-size",
-    type=int,
-    default=0,
-    help="Maximum file size to scan in bytes [default: unlimited]",
+    help="Override auto-detected timeout in seconds",
 )
 @click.option(
-    "--max-total-size",
-    type=int,
-    default=0,
-    help="Maximum total bytes to scan before stopping [default: unlimited]",
-)
-@click.option(
-    "--registry-uri",
+    "--max-size",
     type=str,
-    help="MLflow registry URI (only used for MLflow model URIs)",
+    help="Override auto-detected size limits (e.g., 10GB, 500MB)",
 )
+# Preview/debugging (2 flags)
 @click.option(
-    "--jfrog-api-token",
-    type=str,
-    help="JFrog API token for authentication (can also use JFROG_API_TOKEN env var or .env file)",
-)
-@click.option(
-    "--jfrog-access-token",
-    type=str,
-    help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
-)
-@click.option(
-    "--max-download-size",
-    type=str,
-    help="Maximum download size for cloud storage (e.g., 500MB, 2GB)",
-)
-@click.option(
-    "--cache/--no-cache",
-    default=True,
-    help="Use cache for downloaded cloud storage files [default: cache]",
-)
-@click.option(
-    "--cache-dir",
-    type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
-    help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
-)
-@click.option(
-    "--no-skip-files/--skip-files",
-    default=False,
-    help="Whether to skip non-model file types during directory scans (default: skip)",
-)
-@click.option(
-    "--strict-license",
+    "--dry-run",
     is_flag=True,
-    help="Fail scan when incompatible or deprecated licenses are detected",
+    help="Preview what would be scanned/downloaded without actually doing it",
 )
 @click.option(
-    "--preview",
+    "--no-cache",
     is_flag=True,
-    help="Preview what would be downloaded without actually downloading",
-)
-@click.option(
-    "--selective/--all-files",
-    default=True,
-    help="Download only scannable files from directories [default: selective]",
-)
-@click.option(
-    "--stream",
-    is_flag=True,
-    help="Use streaming analysis for large cloud files (experimental)",
-)
-@click.option(
-    "--large-model-support/--no-large-model-support",
-    default=True,
-    help="Enable optimized scanning for large models (≈10GB+) [default: enabled]",
-)
-@click.option(
-    "--progress/--no-progress",
-    default=True,
-    help="Enable progress reporting for large model scans [default: enabled]",
-)
-@click.option(
-    "--progress-log",
-    type=click.Path(exists=False, file_okay=True, dir_okay=False),
-    help="Write progress information to log file",
-)
-@click.option(
-    "--progress-format",
-    type=click.Choice(["tqdm", "simple", "json"]),
-    default="tqdm",
-    help="Progress display format [default: tqdm]",
-)
-@click.option(
-    "--progress-interval",
-    type=float,
-    default=2.0,
-    help="Progress update interval in seconds [default: 2.0]",
+    help="Force disable caching (overrides smart detection)",
 )
 def scan_command(
     paths: tuple[str, ...],
-    blacklist: tuple[str, ...],
-    format: str,
+    format: Optional[str],
     output: Optional[str],
-    sbom: Optional[str],
-    timeout: int,
     verbose: bool,
-    max_file_size: int,
-    max_total_size: int,
-    registry_uri: Optional[str],
-    jfrog_api_token: Optional[str],
-    jfrog_access_token: Optional[str],
-    max_download_size: Optional[str],
-    cache: bool,
-    cache_dir: Optional[str],
-    no_skip_files: bool,
-    strict_license: bool,
-    preview: bool,
-    selective: bool,
-    stream: bool,
-    large_model_support: bool,
+    quiet: bool,
+    blacklist: tuple[str, ...],
+    strict: bool,
     progress: bool,
-    progress_log: Optional[str],
-    progress_format: str,
-    progress_interval: float,
+    sbom: Optional[str],
+    timeout: Optional[int],
+    max_size: Optional[str],
+    dry_run: bool,
+    no_cache: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
+    
+    Uses smart detection to automatically configure optimal settings based on input type.
 
     \b
-    Usage:
-        modelaudit scan /path/to/model1 /path/to/model2 ...
-        modelaudit scan https://huggingface.co/user/model
-        modelaudit scan https://pytorch.org/hub/pytorch_vision_resnet/
-        modelaudit scan hf://user/model
-        modelaudit scan s3://my-bucket/models/
-        modelaudit scan gs://my-bucket/model.pt
-        modelaudit scan models:/MyModel/1
-        modelaudit scan models:/MyModel/Production
-        modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+    Examples:
+        modelaudit scan model.pkl                    # Local file - fast scan
+        modelaudit scan s3://bucket/models/          # Cloud - auto caching + progress  
+        modelaudit scan hf://user/llama              # HuggingFace - selective download
+        modelaudit scan models:/model/v1             # MLflow - registry integration
+        
+        # Override smart detection when needed
+        modelaudit scan large-model.pt --max-size 20GB --timeout 7200
+        
+        # Strict mode for security-critical scans
+        modelaudit scan model.pkl --strict --format json --output report.json
+
+    \b 
+    Smart Detection:
+        • Input type (local/cloud/registry) → optimal download & caching
+        • File size (>1GB) → large model optimizations + progress bars
+        • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
+        • Cloud operations → automatic caching, size limits, timeouts
 
     \b
-    JFrog Authentication (choose one method):
-        --jfrog-api-token      API token (recommended)
-        --jfrog-access-token   Access token
-
-    You can also set environment variables or create a .env file:
-        JFROG_API_TOKEN, JFROG_ACCESS_TOKEN
-
-    You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
-
-        modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
-
-    \b
-    Advanced options:
-        --format, -f       Output format (text, json, or sarif)
-        --output, -o       Write results to a file instead of stdout
-        --sbom             Write CycloneDX SBOM to file
-        --timeout, -t      Set scan timeout in seconds
-        --verbose, -v      Show detailed information during scanning
-        --max-file-size    Maximum file size to scan in bytes
-        --max-total-size   Maximum total bytes to scan before stopping
-        --registry-uri     MLflow registry URI (for MLflow models only)
-
+    Authentication:
+        • JFrog: Set JFROG_API_TOKEN or JFROG_ACCESS_TOKEN environment variables
+        • MLflow: Set MLFLOW_TRACKING_URI environment variable
+        
     \b
     Exit codes:
         0 - Success, no security issues found
@@ -607,8 +523,63 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
+    # Generate smart defaults based on input analysis
+    smart_defaults = generate_smart_defaults(expanded_paths)
+    
+    # Prepare user overrides (only non-None values)
+    user_overrides = {}
+    if format is not None:
+        user_overrides['format'] = format
+    if timeout is not None:
+        user_overrides['timeout'] = timeout
+    if max_size is not None:
+        try:
+            user_overrides['max_file_size'] = parse_size_string(max_size)
+            user_overrides['max_total_size'] = parse_size_string(max_size)
+        except ValueError as e:
+            click.echo(f"Error parsing --max-size: {e}", err=True)
+            sys.exit(2)
+    
+    # Override smart detection with explicit user flags
+    if progress:
+        user_overrides['show_progress'] = True
+    if no_cache:
+        user_overrides['use_cache'] = False
+    if strict:
+        user_overrides['skip_non_model_files'] = False
+        user_overrides['strict_license'] = True
+    if quiet:
+        user_overrides['verbose'] = False
+        
+    # Apply smart defaults + user overrides
+    config = apply_smart_overrides(user_overrides, smart_defaults)
+    
+    # Extract final configuration values
+    final_timeout = config.get('timeout', 3600)
+    final_progress = config.get('show_progress', False) 
+    final_cache = config.get('use_cache', True)
+    final_cache_dir = config.get('cache_dir')
+    final_format = config.get('format', 'text')
+    final_large_model_support = config.get('large_model_support', True)
+    final_selective = config.get('selective_download', True) 
+    final_stream = config.get('stream_analysis', False)
+    final_max_file_size = config.get('max_file_size', 0)
+    final_max_total_size = config.get('max_total_size', 0)
+    final_skip_files = config.get('skip_non_model_files', True)
+    final_strict_license = config.get('strict_license', False)
+    
+    # Show smart detection info if not quiet
+    if not quiet and final_format == "text" and not output:
+        if verbose:
+            click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
+            for key, value in config.items():
+                if key != 'cache_dir':  # Skip showing long paths
+                    click.echo(f"   • {key}: {value}")
+        elif not config.get('colors', True):  # In CI mode
+            click.echo("Smart detection enabled")
+
     # Print a nice header if not in structured format mode and not writing to a file
-    if format == "text" and not output:
+    if final_format == "text" and not output:
         # Add delegation indicator if running via promptfoo
         delegation_note = ""
         if is_delegated_from_promptfoo():
