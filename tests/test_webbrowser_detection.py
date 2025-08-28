@@ -4,8 +4,8 @@ import pickle
 import tempfile
 from pathlib import Path
 
-from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
 def test_webbrowser_open_detection():
@@ -42,10 +42,12 @@ webbrowser.open("https://malicious.site/pwned")
 
 def test_webbrowser_pattern_in_raw_bytes():
     """Test that webbrowser pattern is detected as CRITICAL in pickle with direct module reference."""
+
     # Create a malicious pickle using __reduce__ that uses webbrowser
     class MaliciousWebbrowser:
         def __reduce__(self):
             import webbrowser
+
             return (webbrowser.open, ("https://malicious.site",))
 
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
