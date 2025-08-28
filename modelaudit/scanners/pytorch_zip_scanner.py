@@ -240,9 +240,18 @@ class PyTorchZipScanner(BaseScanner):
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
 
+        # Get the original ZIP file size for proper density calculations
+        # This is crucial for CVE-2025-32434 detection to avoid false positives
+        original_file_size = int(result.metadata.get("file_size") or 0)
+        if original_file_size <= 0:
+            try:
+                original_file_size = os.path.getsize(path)
+            except OSError:
+                original_file_size = 1  # Avoid divide-by-zero in density calculations
+
         for name in pickle_files:
             info = zip_file.getinfo(name)
-            file_size = info.file_size
+            pickle_data_size = info.file_size
 
             # Set the current file path on the pickle scanner for proper error reporting
             self.pickle_scanner.current_file_path = f"{path}:{name}"
@@ -250,20 +259,25 @@ class PyTorchZipScanner(BaseScanner):
             # Choose scanning approach based on file size with spooling for seekability
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
-            if file_size <= max_in_mem:
+            if pickle_data_size <= max_in_mem:
                 data = zip_file.read(name)
+                bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
+                    # IMPORTANT: Pass original ZIP file size, not pickle data size
+                    # This enables proper density-based CVE detection
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, original_file_size)
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
                 with zip_file.open(name, "r") as zf, tempfile.SpooledTemporaryFile(max_size=max_in_mem) as spool:
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         spool.write(chunk)
-                    size_on_disk = spool.tell()
+                        bytes_scanned += len(chunk)
                     spool.seek(0)
+                    # IMPORTANT: Pass original ZIP file size, not pickle data size
+                    # This enables proper density-based CVE detection
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
                         spool,  # type: ignore[arg-type]
-                        size_on_disk,
+                        original_file_size,
                     )
 
             # Update issue metadata and locations
