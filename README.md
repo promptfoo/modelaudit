@@ -151,19 +151,19 @@ ModelAudit automatically adapts to your input - **no configuration needed for mo
 
 ```bash
 # Local file - fast scan, no progress bars
-modelaudit model.pkl                    
+modelaudit model.pkl
 
 # Cloud directory - auto enables caching + progress bars
-modelaudit s3://my-bucket/models/       
+modelaudit s3://my-bucket/models/
 
-# HuggingFace model - selective download + caching  
+# HuggingFace model - selective download + caching
 modelaudit hf://microsoft/DialoGPT-medium
 
 # Large local file - enables progress + optimizations
-modelaudit 15GB-model.bin               
+modelaudit 15GB-model.bin
 
 # CI environment - auto detects and uses JSON output
-CI=true modelaudit model.pkl            
+CI=true modelaudit model.pkl
 ```
 
 **Override smart detection when needed:**
@@ -186,14 +186,16 @@ modelaudit s3://bucket/model.pt --dry-run
 ModelAudit uses **smart detection** to automatically configure optimal settings based on your input:
 
 **✨ Smart Detection Features:**
+
 - **Input type** (local/cloud/registry) → optimal download & caching strategies
-- **File size** (>1GB) → large model optimizations + progress bars  
+- **File size** (>1GB) → large model optimizations + progress bars
 - **Terminal type** (TTY/CI) → appropriate UI (progress vs quiet mode)
 - **Cloud operations** → automatic caching, size limits, timeouts
 
 **🎛️ Override Controls (12 focused flags):**
+
 - `--strict` – scan all file types, strict license validation, fail on warnings
-- `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`) 
+- `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`)
 - `--timeout SECONDS` – override auto-detected timeout
 - `--dry-run` – preview what would be scanned/downloaded
 - `--progress` – force enable progress reporting
@@ -204,7 +206,8 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - `--blacklist PATTERN` – additional security patterns
 
 **🔐 Authentication (via environment variables):**
-- Set `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory  
+
+- Set `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
 - Set `MLFLOW_TRACKING_URI` for MLflow registry access
 
 ### 🚀 Large Model Support (Up to 1 TB)
