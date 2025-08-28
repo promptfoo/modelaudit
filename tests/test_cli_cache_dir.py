@@ -66,7 +66,7 @@ class TestCacheDirOption:
         mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
         runner = CliRunner()
-        
+
         # With smart detection, HuggingFace URLs should enable caching automatically
         result = runner.invoke(cli, ["scan", "hf://test/model"])
 
