@@ -70,7 +70,7 @@ modelaudit/
 # 🔧 PRE-COMMIT WORKFLOW (development - fix issues):
 rye sync --features all-ci                      # Install CI dependencies
 rye run ruff format modelaudit/ tests/          # Format code and tests
-rye run ruff check --fix modelaudit/ tests/     # Lint and fix issues  
+rye run ruff check --fix modelaudit/ tests/     # Lint and fix issues
 rye run ruff check --fix --select I modelaudit/ tests/  # Fix import organization
 rye run mypy modelaudit/ tests/                 # Type check (both prod and tests)
 rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short  # Fast tests with fail-fast
@@ -78,14 +78,14 @@ rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not p
 # ✅ CI VERIFICATION COMMANDS (read-only checks, matches test.yml exactly):
 rye sync --features all-ci                      # Install CI dependencies
 rye run ruff check modelaudit/ tests/           # Lint check (must be clean)
-rye run ruff check --select I modelaudit/ tests/ # Import organization check  
+rye run ruff check --select I modelaudit/ tests/ # Import organization check
 rye run ruff format --check modelaudit/ tests/  # Format verification (must be formatted)
 rye run mypy modelaudit/ tests/                 # Type checking (must pass)
 rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short  # Fast tests
 
 # 🐌 SLOW TESTS (main branch only in CI):
 rye run pytest -n 1 --tb=short tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_stress_performance
-rye run pytest -n 1 --tb=short tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories  
+rye run pytest -n 1 --tb=short tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories
 rye run pytest -n 1 --tb=short tests/test_license_integration.py::TestLicenseIntegration::test_end_to_end_cli_integration
 ```
 
@@ -232,7 +232,7 @@ rye run pytest -n auto -m "not slow and not integration and not performance" --c
 
 # 🐌 SLOW/INTEGRATION TESTS (main branch CI only - specific tests):
 rye run pytest -n 1 --tb=short tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_stress_performance
-rye run pytest -n 1 --tb=short tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories  
+rye run pytest -n 1 --tb=short tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories
 rye run pytest -n 1 --tb=short tests/test_license_integration.py::TestLicenseIntegration::test_end_to_end_cli_integration
 
 # 🔧 DEVELOPMENT TESTING:
@@ -378,12 +378,12 @@ rye sync --features all-ci
 
 # Step 2: Fix all issues automatically (REQUIRED)
 rye run ruff format modelaudit/ tests/          # Auto-format code
-rye run ruff check --fix modelaudit/ tests/     # Auto-fix lint issues  
+rye run ruff check --fix modelaudit/ tests/     # Auto-fix lint issues
 rye run ruff check --fix --select I modelaudit/ tests/  # Auto-fix imports
 
 # Step 3: Verify compliance (MUST BE CLEAN)
 rye run ruff check modelaudit/ tests/           # MUST pass with no errors
-rye run ruff check --select I modelaudit/ tests/ # MUST pass with no errors  
+rye run ruff check --select I modelaudit/ tests/ # MUST pass with no errors
 rye run ruff format --check modelaudit/ tests/  # MUST pass with no errors
 rye run mypy modelaudit/ tests/                 # MUST pass with no errors
 
@@ -392,6 +392,7 @@ rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not p
 ```
 
 **⚠️ IF ANY COMMAND FAILS:**
+
 - Re-run the "fix" commands from Step 2
 - Check the error output and fix manually if needed
 - Re-run Step 3 until all checks pass
