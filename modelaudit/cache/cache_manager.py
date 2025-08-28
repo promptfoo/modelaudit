@@ -77,7 +77,7 @@ class CacheManager:
 
         if cached_result is not None:
             cache_lookup_time = (time.time() - start_time) * 1000
-            logger.info(f"Cache HIT for {Path(file_path).name} (lookup: {cache_lookup_time:.1f}ms)")
+            logger.debug(f"Cache hit for {Path(file_path).name} (lookup: {cache_lookup_time:.1f}ms)")
 
             # Add cache metadata to result
             if isinstance(cached_result, dict):
@@ -89,7 +89,7 @@ class CacheManager:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        logger.info(f"Cache MISS for {Path(file_path).name} - scanning...")
+        logger.debug(f"Cache miss for {Path(file_path).name}, proceeding with scan")
         scan_start = time.time()
 
         try:
@@ -135,14 +135,14 @@ class CacheManager:
     def disable(self) -> None:
         """Disable caching."""
         self.enabled = False
-        logger.info("Cache disabled")
+        logger.debug("Cache disabled")
 
     def enable(self, cache_dir: Optional[str] = None) -> None:
         """Enable caching."""
         self.enabled = True
         if not self.cache:
             self.cache = ScanResultsCache(cache_dir)
-        logger.info("Cache enabled")
+        logger.debug("Cache enabled")
 
 
 # Global cache manager instance

@@ -56,7 +56,7 @@ def scan_jfrog_artifact(
 
     tmp_dir = tempfile.mkdtemp(prefix="modelaudit_jfrog_")
     try:
-        logger.debug("Downloading JFrog artifact %s to %s", url, tmp_dir)
+        logger.debug(f"Downloading JFrog artifact {url} to {tmp_dir}")
         download_path = download_artifact(
             url,
             cache_dir=Path(tmp_dir),

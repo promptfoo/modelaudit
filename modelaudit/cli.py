@@ -1321,7 +1321,7 @@ def scan_command(
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
-                    logger.info("Scan interrupted by user")
+                    logger.debug("Scan interrupted by user")
                     # Add interruption issue if not already present
                     if not any(issue.message == "Scan interrupted by user" for issue in audit_result.issues):
                         import time
