@@ -1523,7 +1523,7 @@ class PickleScanner(BaseScanner):
             file_data,
             context=self.current_file_path,
         )
-        
+
         # Create single aggregated checks for the file
         self.summarize_jit_script_findings(jit_findings, result, context=self.current_file_path)
         self.summarize_network_communication_findings(network_findings, result, context=self.current_file_path)

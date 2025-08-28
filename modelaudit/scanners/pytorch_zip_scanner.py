@@ -301,7 +301,7 @@ class PyTorchZipScanner(BaseScanner):
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         bytes_scanned += len(chunk)
                         file_data += chunk
-                    
+
                     # Collect findings for this file without creating individual checks
                     if file_data:  # Only process if we have data
                         jit_findings = self.collect_jit_script_findings(
@@ -313,7 +313,7 @@ class PyTorchZipScanner(BaseScanner):
                             file_data,
                             context=f"{path}:{name}",
                         )
-                        
+
                         all_jit_findings.extend(jit_findings)
                         all_network_findings.extend(network_findings)
 

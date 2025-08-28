@@ -107,7 +107,7 @@ class OnnxScanner(BaseScanner):
                 model_data,
                 context=path,
             )
-            
+
             # Create single aggregated checks for the file
             self.summarize_jit_script_findings(jit_findings, result, context=path)
             self.summarize_network_communication_findings(network_findings, result, context=path)

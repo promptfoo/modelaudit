@@ -610,7 +610,7 @@ class BaseScanner(ABC):
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
-            
+
             # Convert findings to dict format for consistency
             standardized_findings = []
             for finding in findings:
@@ -622,7 +622,7 @@ class BaseScanner(ABC):
                     standardized_findings.append(
                         finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
                     )
-                    
+
             return standardized_findings
 
         except ImportError:
@@ -652,18 +652,16 @@ class BaseScanner(ABC):
                 "WARNING": IssueSeverity.WARNING,
                 "INFO": IssueSeverity.INFO,
             }
-            
+
             # Get highest severity across all findings
             max_severity = IssueSeverity.INFO
             for finding in findings:
-                finding_severity = severity_map.get(
-                    finding.get("severity", "WARNING"), IssueSeverity.WARNING
-                )
-                if finding_severity.value == "critical" and max_severity.value != "critical":
+                finding_severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                if (finding_severity.value == "critical" and max_severity.value != "critical") or (
+                    finding_severity.value == "warning" and max_severity.value == "info"
+                ):
                     max_severity = finding_severity
-                elif finding_severity.value == "warning" and max_severity.value == "info":
-                    max_severity = finding_severity
-            
+
             result.add_check(
                 name="JIT/Script Code Execution Detection",
                 passed=False,
@@ -827,18 +825,16 @@ class BaseScanner(ABC):
                 "MEDIUM": IssueSeverity.WARNING,
                 "LOW": IssueSeverity.INFO,
             }
-            
+
             # Get highest severity across all findings
             max_severity = IssueSeverity.INFO
             for finding in findings:
-                finding_severity = severity_map.get(
-                    finding.get("severity", "WARNING"), IssueSeverity.WARNING
-                )
-                if finding_severity.value == "critical" and max_severity.value != "critical":
+                finding_severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                if (finding_severity.value == "critical" and max_severity.value != "critical") or (
+                    finding_severity.value == "warning" and max_severity.value == "info"
+                ):
                     max_severity = finding_severity
-                elif finding_severity.value == "warning" and max_severity.value == "info":
-                    max_severity = finding_severity
-            
+
             result.add_check(
                 name="Network Communication Detection",
                 passed=False,
