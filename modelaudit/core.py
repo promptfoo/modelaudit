@@ -1241,7 +1241,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-            logger.warning(discrepancy_msg)
+            logger.debug(discrepancy_msg)
 
     # Prefer scanner based on header format using lazy loading
     preferred_scanner: Optional[type[BaseScanner]] = None
