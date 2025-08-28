@@ -42,12 +42,13 @@ class TestCacheDirOption:
     """Test the --cache-dir option functionality."""
 
     def test_cache_dir_option_exists(self):
-        """Test that --cache-dir option is available in CLI."""
+        """Test that cache directory is handled via smart detection."""
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", "--help"])
         assert result.exit_code == 0
-        assert "--cache-dir" in result.output
-        assert "Directory for caching downloaded files" in result.output
+        # --cache-dir is now handled by smart detection, not a CLI flag
+        assert "smart detection" in result.output.lower()
+        assert "--no-cache" in result.output
 
     @patch("modelaudit.cli.should_show_spinner", return_value=False)
     @patch("modelaudit.cli.download_model")
