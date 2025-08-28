@@ -841,13 +841,12 @@ class BaseScanner(ABC):
                 # Check multiple fields for pattern information
                 for field in ["pattern", "matched_text", "domain", "url", "message"]:
                     pattern = finding.get(field, "")
-                    if pattern and isinstance(pattern, str):
+                    if pattern and isinstance(pattern, str) and len(pattern) < 50:
                         # Add short, meaningful patterns (avoid very long strings)
-                        if len(pattern) < 50:
-                            unique_patterns.add(pattern)
-            
+                        unique_patterns.add(pattern)
+
             pattern_summary = ", ".join(sorted(unique_patterns)[:5]) if unique_patterns else "various patterns"
-            
+
             result.add_check(
                 name="Network Communication Detection",
                 passed=False,
