@@ -6,6 +6,7 @@ sophisticated pickle-based attacks.
 """
 
 import os
+import pickle
 import tempfile
 
 from modelaudit.scanners.base import IssueSeverity
@@ -311,28 +312,37 @@ class TestCompileEvalVariants:
         """Test that all new dangerous patterns are properly detected."""
         scanner = PickleScanner()
 
-        new_patterns = [
-            b"compile",
-            b"__builtins__",
-            b"globals",
-            b"locals",
+        # Test patterns using valid pickle files that contain dangerous functions
+        test_cases = [
+            ("compile", lambda: (compile, ("print('attack')", "<string>", "exec"))),
+            ("__builtins__", lambda: (eval, ("'dangerous'",))),  # eval is in builtins
+            ("globals", lambda: (globals, ())),
+            ("locals", lambda: (locals, ())),
         ]
 
-        for pattern in new_patterns:
-            # Create a simple file with the pattern
+        for pattern_name, dangerous_func in test_cases:
+            # Create a proper pickle with the dangerous pattern
+            class DangerousPickle:
+                def __reduce__(self):
+                    return dangerous_func()
+
             with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-                f.write(b"test content with " + pattern + b" in it")
+                pickle.dump(DangerousPickle(), f)
                 temp_path = f.name
 
             try:
                 result = scanner.scan(temp_path)
 
                 # Should detect the pattern
-                pattern_name = pattern.decode("utf-8")
                 assert len(result.issues) > 0, f"Should detect {pattern_name} pattern"
 
-                # Check that pattern is mentioned
-                pattern_found = any(pattern_name in issue.message.lower() for issue in result.issues)
+                # Check that pattern is mentioned (either in the function name or module reference)
+                pattern_found = any(
+                    pattern_name in issue.message.lower() or 
+                    f"builtins.{pattern_name}" in issue.message.lower() or
+                    (pattern_name == "__builtins__" and "builtins." in issue.message.lower())
+                    for issue in result.issues
+                )
                 assert pattern_found, f"Should mention {pattern_name} in issues"
 
             finally:
