@@ -51,7 +51,17 @@ class EnhancedPatternDetector:
         return {
             # System command execution
             "os_system": {
-                "patterns": [r"\bos\.system\b", r"\bsubprocess\.call\b", r"\bsubprocess\.run\b"],
+                "patterns": [
+                    r"\bos\.system\b",
+                    r"\bos\.popen\b",
+                    r"\bos\.spawn\w*\b",  # os.spawn, os.spawnl, os.spawnv, etc.
+                    r"\bsubprocess\.call\b",
+                    r"\bsubprocess\.run\b",
+                    r"\bsubprocess\.Popen\b",
+                    r"\bcommands\.getoutput\b",
+                    r"\bcommands\.getstatusoutput\b",
+                    r"\bposix\.system\b",
+                ],
                 "severity": "critical",
                 "description": "System command execution",
                 "category": "command_execution",
