@@ -584,6 +584,107 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for embedded secrets: {e}")
             return 0
 
+    def collect_jit_script_findings(
+        self,
+        data: bytes,
+        model_type: str = "unknown",
+        context: str = "",
+        enable_check: bool = True,
+    ) -> list[dict]:
+        """Collect JIT/script code findings without creating checks.
+
+        Args:
+            data: Binary model data to check
+            model_type: Type of model (pytorch, tensorflow, etc.)
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            List of findings
+        """
+        if not enable_check or not self.config.get("check_jit_script", True):
+            return []
+
+        try:
+            from modelaudit.jit_script_detector import JITScriptDetector
+
+            detector = JITScriptDetector(self.config.get("jit_script_config"))
+            findings = detector.scan_model(data, model_type, context)
+            
+            # Convert findings to dict format for consistency
+            standardized_findings = []
+            for finding in findings:
+                if hasattr(finding, "model_dump"):
+                    standardized_findings.append(finding.model_dump())
+                elif hasattr(finding, "get"):
+                    standardized_findings.append(dict(finding))
+                else:
+                    standardized_findings.append(
+                        finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+                    )
+                    
+            return standardized_findings
+
+        except ImportError:
+            logger.debug("JITScriptDetector not available, skipping JIT/Script check")
+            return []
+        except Exception as e:
+            logger.warning(f"Error checking for JIT/Script code: {e}")
+            return []
+
+    def summarize_jit_script_findings(
+        self,
+        findings: list[dict],
+        result: ScanResult,
+        context: str = "",
+    ) -> None:
+        """Create a single aggregated check from JIT/script findings.
+
+        Args:
+            findings: List of findings to summarize
+            result: ScanResult to add the summary check to
+            context: Context string for reporting
+        """
+        if findings:
+            # Map severity to IssueSeverity enum
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
+                "INFO": IssueSeverity.INFO,
+            }
+            
+            # Get highest severity across all findings
+            max_severity = IssueSeverity.INFO
+            for finding in findings:
+                finding_severity = severity_map.get(
+                    finding.get("severity", "WARNING"), IssueSeverity.WARNING
+                )
+                if finding_severity.value == "critical" and max_severity.value != "critical":
+                    max_severity = finding_severity
+                elif finding_severity.value == "warning" and max_severity.value == "info":
+                    max_severity = finding_severity
+            
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=False,
+                message=f"Found {len(findings)} JIT/Script code risks across file",
+                severity=max_severity,
+                location=context,
+                details={
+                    "findings_count": len(findings),
+                    "findings": findings[:10],  # Include up to 10 examples
+                    "total_findings": len(findings),
+                },
+                why="JIT/Script code patterns can execute arbitrary code during model loading",
+            )
+        else:
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=True,
+                message="No JIT/Script code execution risks detected",
+                location=context,
+            )
+
     def check_for_jit_script_code(
         self,
         data: bytes,
@@ -672,6 +773,92 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
+
+    def collect_network_communication_findings(
+        self,
+        data: bytes,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> list[dict]:
+        """Collect network communication findings without creating checks.
+
+        Args:
+            data: Binary model data to check
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            List of findings
+        """
+        if not enable_check or not self.config.get("check_network_comm", True):
+            return []
+
+        try:
+            from modelaudit.network_comm_detector import NetworkCommDetector
+
+            detector = NetworkCommDetector(self.config.get("network_comm_config"))
+            findings = detector.scan(data, context)
+            return findings
+
+        except ImportError:
+            logger.debug("NetworkCommDetector not available, skipping network comm check")
+            return []
+        except Exception as e:
+            logger.warning(f"Error checking for network communication: {e}")
+            return []
+
+    def summarize_network_communication_findings(
+        self,
+        findings: list[dict],
+        result: ScanResult,
+        context: str = "",
+    ) -> None:
+        """Create a single aggregated check from network communication findings.
+
+        Args:
+            findings: List of findings to summarize
+            result: ScanResult to add the summary check to
+            context: Context string for reporting
+        """
+        if findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "HIGH": IssueSeverity.CRITICAL,
+                "MEDIUM": IssueSeverity.WARNING,
+                "LOW": IssueSeverity.INFO,
+            }
+            
+            # Get highest severity across all findings
+            max_severity = IssueSeverity.INFO
+            for finding in findings:
+                finding_severity = severity_map.get(
+                    finding.get("severity", "WARNING"), IssueSeverity.WARNING
+                )
+                if finding_severity.value == "critical" and max_severity.value != "critical":
+                    max_severity = finding_severity
+                elif finding_severity.value == "warning" and max_severity.value == "info":
+                    max_severity = finding_severity
+            
+            result.add_check(
+                name="Network Communication Detection",
+                passed=False,
+                message=f"Found {len(findings)} network communication patterns across file",
+                severity=max_severity,
+                location=context,
+                details={
+                    "findings_count": len(findings),
+                    "findings": findings[:10],  # Include up to 10 examples
+                    "total_findings": len(findings),
+                },
+                why="Models should not contain network communication capabilities",
+            )
+        else:
+            result.add_check(
+                name="Network Communication Detection",
+                passed=True,
+                message="No network communication patterns detected",
+                location=context,
+            )
 
     def check_for_network_communication(
         self,

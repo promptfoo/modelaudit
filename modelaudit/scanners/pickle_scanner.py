@@ -1512,22 +1512,21 @@ class PickleScanner(BaseScanner):
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
 
-        # Check for JIT/Script code execution risks in the pickle data
-        # Pickle files can contain TorchScript or other JIT code
-        self.check_for_jit_script_code(
+        # Check for JIT/Script code execution risks and network communication patterns
+        # Collect findings without creating individual checks
+        jit_findings = self.collect_jit_script_findings(
             file_data,
-            result,
             model_type="pytorch",  # Most pickle files in ML are PyTorch
             context=self.current_file_path,
         )
-
-        # Check for network communication patterns
-        # Models should not contain network capabilities
-        self.check_for_network_communication(
+        network_findings = self.collect_network_communication_findings(
             file_data,
-            result,
             context=self.current_file_path,
         )
+        
+        # Create single aggregated checks for the file
+        self.summarize_jit_script_findings(jit_findings, result, context=self.current_file_path)
+        self.summarize_network_communication_findings(network_findings, result, context=self.current_file_path)
 
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:

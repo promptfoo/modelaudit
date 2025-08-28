@@ -288,38 +288,43 @@ class PyTorchZipScanner(BaseScanner):
     def _scan_for_jit_patterns(
         self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
     ) -> int:
-        """Check for JIT/Script code execution risks"""
+        """Check for JIT/Script code execution risks and network communication patterns"""
         bytes_scanned = 0
-        jit_patterns_found = False
+        all_jit_findings = []
+        all_network_findings = []
 
         for name in safe_entries:
-            if jit_patterns_found:
-                break  # Already found patterns, no need to continue
-
             try:
                 with zip_file.open(name, "r") as zf:
-                    # 1MB streaming chunks
+                    # Collect all data from this file for analysis
+                    file_data = b""
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         bytes_scanned += len(chunk)
-                        # Dispatch to base scanner helpers
-                        jit_count = self.check_for_jit_script_code(
-                            chunk,
-                            result,
+                        file_data += chunk
+                    
+                    # Collect findings for this file without creating individual checks
+                    if file_data:  # Only process if we have data
+                        jit_findings = self.collect_jit_script_findings(
+                            file_data,
                             model_type="pytorch",
                             context=f"{path}:{name}",
                         )
-                        self.check_for_network_communication(
-                            chunk,
-                            result,
+                        network_findings = self.collect_network_communication_findings(
+                            file_data,
                             context=f"{path}:{name}",
                         )
-                        if jit_count:
-                            jit_patterns_found = True
-                            break
+                        
+                        all_jit_findings.extend(jit_findings)
+                        all_network_findings.extend(network_findings)
 
             except Exception:
                 # Skip files that can't be read
                 pass
+
+        # Create single aggregated checks for the entire ZIP file
+        if safe_entries:  # Only create checks if we processed files
+            self.summarize_jit_script_findings(all_jit_findings, result, context=path)
+            self.summarize_network_communication_findings(all_network_findings, result, context=path)
 
         return bytes_scanned
 
