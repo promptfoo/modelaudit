@@ -962,11 +962,7 @@ def scan_model_directory_or_file(
     try:
         _consolidate_checks(results)
     except Exception as e:
-<<<<<<< HEAD
         logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
-=======
-        logger.warning(f"Error consolidating checks: {e!s}")
->>>>>>> main
 
     # Add license warnings if any
     try:
