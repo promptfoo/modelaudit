@@ -25,18 +25,18 @@ def resolve_dvc_file(file_path: str) -> list[str]:
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except Exception as exc:  # pragma: no cover - YAML errors are rare
-        logger.warning("Failed to parse DVC file %s: %s", file_path, exc)
+        logger.warning(f"Failed to parse DVC file {file_path}: {exc}")
         return []
 
     outs = data.get("outs", [])
     if not isinstance(outs, list):
-        logger.warning("DVC file %s has invalid 'outs' structure", file_path)
+        logger.warning(f"DVC file {file_path} has invalid 'outs' structure")
         return []
 
     # Limit number of outputs to prevent resource exhaustion
     MAX_OUTPUTS = 100
     if len(outs) > MAX_OUTPUTS:
-        logger.warning("DVC file %s has too many outputs (%d), limiting to %d", file_path, len(outs), MAX_OUTPUTS)
+        logger.warning(f"DVC file {file_path} has too many outputs ({len(outs)}), limiting to {MAX_OUTPUTS}")
         outs = outs[:MAX_OUTPUTS]
 
     resolved: list[str] = []
@@ -81,16 +81,16 @@ def resolve_dvc_file(file_path: str) -> list[str]:
                 current_check = current_check.parent
 
             if not is_safe:
-                logger.warning("DVC target path outside safe boundaries: %s -> %s", file_path, target)
+                logger.warning(f"DVC target path outside safe boundaries: {file_path} -> {target}")
                 continue
 
             if target.exists():
                 resolved.append(str(target))
             else:
-                logger.debug("DVC target missing: %s", target)
+                logger.debug(f"DVC target missing: {target}")
 
         except (OSError, ValueError) as e:
-            logger.warning("Error resolving DVC target path %s: %s", out_path, e)
+            logger.warning(f"Error resolving DVC target path {out_path}: {e}")
             continue
 
     return resolved
