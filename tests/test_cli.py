@@ -474,7 +474,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     # With smart detection and new output format, check for successful completion
     assert (
         "SCAN SUMMARY" in result.output
-        or "Files:" in result.output  
+        or "Files:" in result.output
         or "Duration:" in result.output
         or "Clean" in result.output
         or "Downloaded" in result.output
