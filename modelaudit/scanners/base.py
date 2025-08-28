@@ -846,7 +846,6 @@ class BaseScanner(ABC):
                         unique_patterns.add(pattern)
 
             pattern_summary = ", ".join(sorted(unique_patterns)[:5]) if unique_patterns else "various patterns"
-
             result.add_check(
                 name="Network Communication Detection",
                 passed=False,
