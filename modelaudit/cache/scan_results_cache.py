@@ -155,7 +155,7 @@ class ScanResultsCache:
             logger.debug(f"Cached scan result for {os.path.basename(file_path)}")
 
         except Exception as e:
-            logger.warning(f"Failed to cache result for {file_path}: {e}")
+            logger.debug(f"Failed to cache result for {file_path}: {e}")
 
     def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result] = None) -> Optional[str]:
         """
