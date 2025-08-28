@@ -681,6 +681,19 @@ class BaseScanner(ABC):
                 ):
                     max_severity = finding_severity
 
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
             result.add_check(
                 name="JIT/Script Code Execution Summary",
                 passed=False,
@@ -689,7 +702,7 @@ class BaseScanner(ABC):
                 location=context,
                 details={
                     "findings_count": len(findings),
-                    "findings": findings[:10],  # Include up to 10 examples
+                    "findings": sanitized_findings,  # Redacted examples
                     "total_findings": len(findings),
                     "aggregated": True,
                     "aggregation_type": "summary",
@@ -871,6 +884,19 @@ class BaseScanner(ABC):
                         # Add short, meaningful patterns (avoid very long strings)
                         unique_patterns.add(pattern)
 
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
             pattern_summary = ", ".join(sorted(unique_patterns)[:5]) if unique_patterns else "various patterns"
             result.add_check(
                 name="Network Communication Summary",
@@ -880,7 +906,7 @@ class BaseScanner(ABC):
                 location=context,
                 details={
                     "findings_count": len(findings),
-                    "findings": findings[:10],  # Include up to 10 examples
+                    "findings": sanitized_findings,  # Redacted examples
                     "total_findings": len(findings),
                     "patterns": sorted(unique_patterns)[:10],
                     "aggregated": True,
