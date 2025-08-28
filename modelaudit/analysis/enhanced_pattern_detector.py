@@ -93,8 +93,12 @@ class EnhancedPatternDetector:
                     r"\brequests\.get\b",
                     r"\bhttplib\b",
                     r"\bhttp\.client\b",
+                    r"\bwebbrowser\.open\b",
+                    r"\bwebbrowser\.open_new\b",
+                    r"\bwebbrowser\.open_new_tab\b",
+                    r"\bwebbrowser\b",  # General webbrowser module reference
                 ],
-                "severity": "warning",
+                "severity": "critical",  # Upgraded to critical for security
                 "description": "Network communication",
                 "category": "network_access",
             },

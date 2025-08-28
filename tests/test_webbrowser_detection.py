@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.base import IssueSeverity
 
 
 def test_webbrowser_open_detection():
@@ -26,7 +27,7 @@ webbrowser.open("https://malicious.site/pwned")
         result = scanner.scan(temp_path)
 
         # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
 
         # Should have at least one critical issue
         assert len(critical_issues) > 0, "No critical issues found for webbrowser"
@@ -40,10 +41,15 @@ webbrowser.open("https://malicious.site/pwned")
 
 
 def test_webbrowser_pattern_in_raw_bytes():
-    """Test that raw webbrowser pattern is detected as CRITICAL."""
+    """Test that webbrowser pattern is detected as CRITICAL in pickle with direct module reference."""
+    # Create a malicious pickle using __reduce__ that uses webbrowser
+    class MaliciousWebbrowser:
+        def __reduce__(self):
+            import webbrowser
+            return (webbrowser.open, ("https://malicious.site",))
+
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        # Write pickle with webbrowser.open reference
-        f.write(b"\x80\x02cwebbrowser\nopen\nq\x00X\x20\x00\x00\x00https://example.com\nq\x01K\x00\x88\x87q\x02Rq\x03.")
+        pickle.dump(MaliciousWebbrowser(), f)
         temp_path = f.name
 
     try:
@@ -51,10 +57,10 @@ def test_webbrowser_pattern_in_raw_bytes():
         result = scanner.scan(temp_path)
 
         # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
 
         # Should detect webbrowser as critical
-        assert len(critical_issues) > 0, "No critical issues found for raw webbrowser bytes"
+        assert len(critical_issues) > 0, "No critical issues found for webbrowser pickle"
 
         # Verify webbrowser is in the critical messages
         webbrowser_critical = any("webbrowser" in issue.message.lower() for issue in critical_issues)
@@ -107,7 +113,7 @@ def test_webbrowser_not_false_positive_in_comments():
         critical_webbrowser_issues = [
             issue
             for issue in result.issues
-            if str(issue.severity) == "IssueSeverity.CRITICAL" and "webbrowser" in issue.message.lower()
+            if issue.severity == IssueSeverity.CRITICAL and "webbrowser" in issue.message.lower()
         ]
 
         # Should not flag webbrowser in documentation as critical
