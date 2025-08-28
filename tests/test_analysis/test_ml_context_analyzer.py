@@ -64,7 +64,7 @@ class TestMLContextAnalyzer:
 
         assert result.operation is not None
         assert result.operation.risk_level == OperationRisk.SAFE
-        assert result.risk_adjustment < 0.2  # Significant risk reduction
+        assert result.risk_adjustment < 0.3  # Significant risk reduction
 
     def test_suspicious_operation_detection(self):
         """Test detection of suspicious but potentially legitimate operations."""

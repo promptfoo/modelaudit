@@ -64,8 +64,8 @@ class OpcodeSequenceAnalyzer:
             window_size: Number of recent opcodes to keep in analysis window
         """
         self.window_size = window_size
-        self.opcode_window = deque(maxlen=window_size)
-        self.stack_simulation = []
+        self.opcode_window: deque[str] = deque(maxlen=window_size)
+        self.stack_simulation: list[Any] = []
         self.patterns = self._initialize_attack_patterns()
         self.detected_patterns: list[SequenceAnalysisResult] = []
 
@@ -101,10 +101,10 @@ class OpcodeSequenceAnalyzer:
                 description="Dangerous object instantiation with constructor arguments",
                 severity="warning",
             ),
-            # Chained function calls
+            # Chained function calls (REDUCE followed by GLOBAL/REDUCE sequence)
             OpcodePattern(
                 name="chained_function_calls",
-                opcodes=["REDUCE", "REDUCE"],
+                opcodes=["REDUCE", "GLOBAL", "REDUCE"],
                 description="Chained function calls that could escalate privileges",
                 severity="warning",
             ),
@@ -265,7 +265,7 @@ class OpcodeSequenceAnalyzer:
             return {"patterns_detected": 0, "max_severity": "info", "summary": "No dangerous opcode sequences detected"}
 
         # Group by severity
-        severity_counts = {}
+        severity_counts: dict[str, int] = {}
         for result in self.detected_patterns:
             severity = result.severity
             severity_counts[severity] = severity_counts.get(severity, 0) + 1

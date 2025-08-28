@@ -49,13 +49,12 @@ class TestOpcodeSequenceAnalyzer:
         """Test detection of chained REDUCE operations."""
         analyzer = OpcodeSequenceAnalyzer()
 
-        # First REDUCE
+        # Create a chained function call scenario: REDUCE -> GLOBAL -> REDUCE
         analyzer.analyze_opcode("GLOBAL", ("subprocess", "Popen"), 100)
-        analyzer.analyze_opcode("REDUCE", None, 101)
-
-        # Second REDUCE (chaining)
-        analyzer.analyze_opcode("GLOBAL", ("os", "system"), 102)
-        results = analyzer.analyze_opcode("REDUCE", None, 103)
+        analyzer.analyze_opcode("BUILD_TUPLE", 1, 101)
+        analyzer.analyze_opcode("REDUCE", None, 102)  # First REDUCE
+        analyzer.analyze_opcode("GLOBAL", ("os", "system"), 103)  # Second function
+        results = analyzer.analyze_opcode("REDUCE", None, 104)  # Second REDUCE
 
         # Should detect chained function calls
         chained_results = [r for r in results if r.pattern_name == "chained_function_calls"]
@@ -245,8 +244,9 @@ def test_real_world_scenarios(test_case):
             f"Expected pattern '{expected_pattern}' not detected in {test_case['name']}"
         )
 
-    # Check severity
-    max_severity = max((r.severity for r in all_results), default="info")
+    # Check severity (proper severity ordering)
+    severity_order = {"info": 0, "warning": 1, "critical": 2}
+    max_severity = max((r.severity for r in all_results), key=lambda s: severity_order.get(s, 0), default="info")
     assert max_severity == test_case["expected_severity"], (
         f"Expected severity '{test_case['expected_severity']}' but got '{max_severity}'"
     )

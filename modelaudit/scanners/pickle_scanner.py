@@ -4,7 +4,7 @@ import struct
 import time
 from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
 
-from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector
+from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 from modelaudit.analysis.ml_context_analyzer import MLContextAnalyzer
 from modelaudit.analysis.opcode_sequence_analyzer import OpcodeSequenceAnalyzer
@@ -1291,7 +1291,7 @@ class PickleScanner(BaseScanner):
         # Process matches and create appropriate checks
         if pattern_matches:
             # Group matches by pattern type for better reporting
-            pattern_groups = {}
+            pattern_groups: dict[str, list[PatternMatch]] = {}
             for match in pattern_matches:
                 pattern_name = match.pattern_name
                 if pattern_name not in pattern_groups:
@@ -1299,7 +1299,7 @@ class PickleScanner(BaseScanner):
                 pattern_groups[pattern_name].append(match)
 
             # Create checks for each pattern group
-            for pattern_name, matches in pattern_groups.items():
+            for _pattern_name, matches in pattern_groups.items():
                 self._create_enhanced_pattern_check(matches, result, context_path)
 
         # Legacy pattern detection for backwards compatibility
@@ -1361,10 +1361,10 @@ class PickleScanner(BaseScanner):
         pattern_name = representative.pattern_name
         severity = representative.severity
 
-        # Calculate effective risk considering ML context
+        # Calculate effective risk considering ML context and confidence
         max_confidence = max(match.confidence for match in matches)
         min_ml_adjustment = min(match.ml_context_adjustment for match in matches)
-        effective_severity = self._calculate_effective_severity(severity, min_ml_adjustment)
+        effective_severity = self._calculate_effective_severity(severity, min_ml_adjustment, max_confidence)
 
         # Create detailed message
         if len(matches) == 1:
@@ -1380,7 +1380,14 @@ class PickleScanner(BaseScanner):
                 if ml_explanation:
                     message += f" (Risk reduced due to ML context: {ml_explanation})"
         else:
-            message = f"Detected {len(matches)} instances of {pattern_name} pattern"
+            # Get unique matched texts for better specificity
+            unique_matches = list(set(match.matched_text for match in matches))
+            if len(unique_matches) <= 3:
+                match_text = ", ".join(f"'{m}'" for m in unique_matches)
+                message = f"Detected {pattern_name} pattern: {match_text}"
+            else:
+                message = f"Detected {len(matches)} instances of {pattern_name} pattern"
+            
             ml_adjusted_count = sum(1 for m in matches if m.ml_context_adjustment < 0.9)
             if ml_adjusted_count > 0:
                 message += f" ({ml_adjusted_count} with reduced risk due to ML context)"
@@ -1417,17 +1424,23 @@ class PickleScanner(BaseScanner):
             why=self._generate_pattern_explanation(representative, min_ml_adjustment),
         )
 
-    def _calculate_effective_severity(self, base_severity: str, ml_adjustment: float) -> IssueSeverity:
-        """Calculate effective severity considering ML context adjustment."""
+    def _calculate_effective_severity(self, base_severity: str, ml_adjustment: float, confidence: float = 1.0) -> IssueSeverity:
+        """Calculate effective severity considering ML context adjustment and confidence."""
+        # If confidence is very low, reduce severity
+        if confidence < 0.3:  # Very low confidence
+            if base_severity == "critical":
+                return IssueSeverity.WARNING
+            elif base_severity == "warning":
+                return IssueSeverity.INFO
+        
         # If ML context reduces risk significantly, lower severity
         if ml_adjustment < 0.3:  # 70%+ risk reduction
             if base_severity == "critical":
                 return IssueSeverity.WARNING
             elif base_severity == "warning":
                 return IssueSeverity.INFO
-        elif ml_adjustment < 0.6:  # 40%+ risk reduction
-            if base_severity == "critical":
-                return IssueSeverity.WARNING
+        elif ml_adjustment < 0.6 and base_severity == "critical":  # 40%+ risk reduction
+            return IssueSeverity.WARNING
 
         # Map base severity to IssueSeverity enum
         severity_map = {
@@ -1445,10 +1458,16 @@ class PickleScanner(BaseScanner):
         )
 
         if match.deobfuscated_text:
-            base_explanation += " The pattern was detected after deobfuscating encoded content, which is often used to hide malicious intent."
+            base_explanation += (
+                " The pattern was detected after deobfuscating encoded content, "
+                "which is often used to hide malicious intent."
+            )
 
         if ml_adjustment < 0.7:
-            base_explanation += " However, this appears to be in the context of legitimate ML framework operations, which reduces the risk significantly."
+            base_explanation += (
+                " However, this appears to be in the context of legitimate ML framework operations, "
+                "which reduces the risk significantly."
+            )
 
         return base_explanation
 
@@ -1518,7 +1537,10 @@ class PickleScanner(BaseScanner):
                 "evidence": sequence_result.evidence,
                 "detection_method": "opcode_sequence_analysis",
             },
-            why=f"{sequence_result.description}. This sequence of opcodes can be used to execute arbitrary code during unpickling.",
+            why=(
+                f"{sequence_result.description}. This sequence of opcodes can be used to execute "
+                "arbitrary code during unpickling."
+            ),
         )
 
     def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:

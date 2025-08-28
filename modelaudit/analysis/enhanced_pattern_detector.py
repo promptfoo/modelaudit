@@ -65,8 +65,16 @@ class EnhancedPatternDetector:
             },
             # Dynamic imports
             "dynamic_import": {
-                "patterns": [r"\b__import__\s*\(", r"\bimportlib\.import_module\b"],
-                "severity": "warning",
+                "patterns": [
+                    r"\b__import__\s*\(",
+                    r"\bimportlib\.import_module\b",
+                    r"\bimportlib\.machinery\b", 
+                    r"\bimportlib\.util\b",
+                    r"\bfrom\s+importlib\b",
+                    r"\bimport\s+importlib\b",
+                    r"\bimportlib\b"  # importlib as string value (restored general pattern)
+                ],
+                "severity": "critical", 
                 "description": "Dynamic module import",
                 "category": "dynamic_import",
             },
@@ -110,13 +118,13 @@ class EnhancedPatternDetector:
             },
             {
                 "name": "hex_encoded",
-                "pattern": r"\\x[0-9a-fA-F]{2}",
+                "pattern": r"(?:\\x[0-9a-fA-F]{2})+",
                 "decoder": lambda x: bytes.fromhex(x.replace("\\x", "")).decode("utf-8", errors="ignore"),
                 "min_length": 8,
             },
             {
                 "name": "unicode_escape",
-                "pattern": r"\\u[0-9a-fA-F]{4}",
+                "pattern": r"(?:\\u[0-9a-fA-F]{4})+",
                 "decoder": lambda x: x.encode().decode("unicode_escape"),
                 "min_length": 6,
             },
@@ -271,9 +279,14 @@ class EnhancedPatternDetector:
         # Context analysis
         surrounding = self._extract_surrounding_context(content, match)
 
-        # Lower confidence if surrounded by comments
+        # Lower confidence if surrounded by comments or documentation
         if "#" in surrounding or "//" in surrounding:
             base_confidence -= 0.2
+            
+        # Lower confidence for documentation-like contexts
+        doc_indicators = ["documentation", "comment", "note", "description", "does not use", "safe"]
+        if any(indicator in surrounding.lower() for indicator in doc_indicators):
+            base_confidence -= 0.3
 
         # Higher confidence for dangerous argument patterns
         dangerous_args = ["shell=True", "/bin/sh", "cmd.exe", "/c ", ";", "&&", "||"]
@@ -353,8 +366,8 @@ class EnhancedPatternDetector:
         if not matches:
             return {"total_matches": 0, "severity_breakdown": {}, "category_breakdown": {}, "ml_adjusted_matches": 0}
 
-        severity_counts = {}
-        category_counts = {}
+        severity_counts: dict[str, int] = {}
+        category_counts: dict[str, int] = {}
         ml_adjusted_count = 0
 
         for match in matches:

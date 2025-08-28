@@ -66,8 +66,8 @@ class MLContextAnalyzer:
 
     def __init__(self):
         """Initialize ML context analyzer."""
-        self.ml_operations = self._initialize_ml_operations()
-        self.framework_patterns = self._initialize_framework_patterns()
+        self.ml_operations: list[MLOperation] = self._initialize_ml_operations()
+        self.framework_patterns: dict[MLFramework, list[str]] = self._initialize_framework_patterns()
 
     def _initialize_ml_operations(self) -> list[MLOperation]:
         """Initialize known legitimate ML operations."""
@@ -182,9 +182,9 @@ class MLContextAnalyzer:
             ],
             MLFramework.SKLEARN: [
                 r"\bsklearn\.",
-                r"\.fit\(\)",
-                r"\.predict\(\)",
-                r"\.transform\(\)",
+                r"\.fit\(",
+                r"\.predict\(",
+                r"\.transform\(",
                 r"joblib\.load",
                 r"pickle\.load",  # sklearn models are often pickled
             ],
@@ -236,7 +236,7 @@ class MLContextAnalyzer:
         self, function_call: str, stack_context: list[str], file_context: Optional[str] = None
     ) -> MLFramework:
         """Detect ML framework from context."""
-        framework_scores = dict.fromkeys(MLFramework, 0)
+        framework_scores: dict[MLFramework, float] = dict.fromkeys(MLFramework, 0.0)
 
         # Analyze function call
         for framework, patterns in self.framework_patterns.items():
@@ -276,14 +276,17 @@ class MLContextAnalyzer:
 
         # Pattern-based matching for broader operations
         for operation in self.ml_operations:
-            if operation.framework == framework:
-                # Match operation types
-                if (operation.operation_type == "model_loading" and any(
-                    keyword in function_call.lower() for keyword in ["load", "restore", "checkpoint"]
-                )) or (operation.operation_type == "tensor_ops" and any(
-                    keyword in function_call.lower() for keyword in ["tensor", "array", "constant"]
-                )):
-                    return operation
+            if operation.framework == framework and (
+                (
+                    operation.operation_type == "model_loading"
+                    and any(keyword in function_call.lower() for keyword in ["load", "restore", "checkpoint"])
+                )
+                or (
+                    operation.operation_type == "tensor_ops"
+                    and any(keyword in function_call.lower() for keyword in ["tensor", "array", "constant"])
+                )
+            ):
+                return operation
 
         return None
 
