@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **fix**: aggregate security checks per file instead of per chunk (#352)
 - **fix**: eliminate circular import between base.py and core.py (#342)
 - **fix**: default bytes_scanned in streaming operations (#312)
 - **fix**: validate directory file list before filtering (#311)
