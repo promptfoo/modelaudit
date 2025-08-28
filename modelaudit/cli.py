@@ -824,9 +824,8 @@ def scan_command(
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
 
                         # Download with caching support and progress bar
-                        download_path = download_model(
-                            path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output and should_show_spinner())
-                        )
+                        show_progress = format == "text" and not output and should_show_spinner()
+                        download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                         actual_path = str(download_path)
                         # Only track for cleanup if not using cache
                         temp_dir = str(download_path) if not cache else None

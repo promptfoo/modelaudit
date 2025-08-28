@@ -334,11 +334,11 @@ These queries and models provide comprehensive coverage for testing ModelAudit a
 
 ### Threshold Matrix
 
-| File Size     | Threshold (opcodes/MB) | Sensitivity | Example Models               |
-| ------------- | ---------------------- | ----------- | ---------------------------- |
-| < 10 MB       | 80                     | High        | Small custom models          |
-| 10 MB – 1 GB  | 200                    | Medium      | Standard models              |
-| > 1 GB        | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
+| File Size    | Threshold (opcodes/MB) | Sensitivity | Example Models               |
+| ------------ | ---------------------- | ----------- | ---------------------------- |
+| < 10 MB      | 80                     | High        | Small custom models          |
+| 10 MB – 1 GB | 200                    | Medium      | Standard models              |
+| > 1 GB       | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
 
 ### Before vs. After
 
