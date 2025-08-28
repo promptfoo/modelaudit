@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **feat**: improve CVE-2025-32434 detection with density-based analysis (#351)
 - **feat**: implement graceful degradation and enhanced error handling (#343)
-- **feat**: refactor PyTorch ZIP Scanner's massive 498-line scan() method (#346)
+- **feat**: improve PyTorch ZIP scanner maintainability by splitting scan() into smaller functions (#346)
 - **feat**: add SARIF output format support for integration with security tools and CI/CD pipelines (#349)
 - **feat**: optimize cache performance by reducing file system calls (#338)
 - **feat**: comprehensive task list update and critical CLI usability audit (#340)
