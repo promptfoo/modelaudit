@@ -108,13 +108,13 @@ def generate_smart_defaults(paths: list[str]) -> dict[str, Any]:
     is_ci = detect_ci_environment()
 
     # Generate defaults
+    use_cache = _should_use_cache(input_types)
     defaults = {
         # Progress settings
         "show_progress": _should_show_progress(input_types, max_file_size, tty_caps, is_ci),
         "large_model_support": max_file_size > (1024 * 1024 * 1024),  # >1GB
         # Caching settings
-        "use_cache": _should_use_cache(input_types),
-        "cache_dir": _get_default_cache_dir(),
+        "use_cache": use_cache,
         # Download settings
         "selective_download": _should_use_selective_download(input_types),
         "stream_analysis": max_file_size > (10 * 1024 * 1024 * 1024),  # >10GB
@@ -129,6 +129,10 @@ def generate_smart_defaults(paths: list[str]) -> dict[str, Any]:
         "colors": tty_caps["colors_supported"] and not is_ci,
         "verbose": False,  # Keep explicit control
     }
+
+    # Only set cache_dir if caching is enabled
+    if use_cache:
+        defaults["cache_dir"] = _get_default_cache_dir()
 
     return defaults
 
@@ -214,6 +218,10 @@ def apply_smart_overrides(user_args: dict[str, Any], smart_defaults: dict[str, A
     for key, value in user_args.items():
         if value is not None:
             config[key] = value
+
+    # If caching is disabled, remove cache_dir to ensure cleanup happens
+    if not config.get("use_cache", True):
+        config.pop("cache_dir", None)
 
     return config
 

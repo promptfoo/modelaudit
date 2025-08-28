@@ -527,7 +527,7 @@ def scan_command(
     smart_defaults = generate_smart_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
-    user_overrides = {}
+    user_overrides: dict[str, Any] = {}
     if format is not None:
         user_overrides["format"] = format
     if timeout is not None:
@@ -539,6 +539,7 @@ def scan_command(
         except ValueError as e:
             click.echo(f"Error parsing --max-size: {e}", err=True)
             import sys as sys_module
+
             sys_module.exit(2)
 
     # Override smart detection with explicit user flags
@@ -578,6 +579,7 @@ def scan_command(
     max_download_bytes = None
     if max_size is not None:
         import contextlib
+
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
@@ -1376,6 +1378,7 @@ def scan_command(
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(audit_result)
     import sys as sys_module
+
     sys_module.exit(exit_code)
 
 

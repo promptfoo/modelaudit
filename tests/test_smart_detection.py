@@ -3,8 +3,8 @@
 import tempfile
 
 from modelaudit.utils.smart_detection import (
-    detect_input_type,
     detect_file_size,
+    detect_input_type,
     generate_smart_defaults,
     parse_size_string,
 )
@@ -14,7 +14,7 @@ def test_detect_input_type_local():
     """Test detection of local file types."""
     with tempfile.NamedTemporaryFile() as tmp:
         assert detect_input_type(tmp.name) == "local_file"
-    
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         assert detect_input_type(tmp_dir) == "local_directory"
 
@@ -48,9 +48,9 @@ def test_generate_smart_defaults_local():
     with tempfile.NamedTemporaryFile() as tmp:
         tmp.write(b"x" * 1000)  # Small file
         tmp.flush()
-        
+
         defaults = generate_smart_defaults([tmp.name])
-        
+
         assert defaults["show_progress"] is False  # Small local file
         assert defaults["use_cache"] is False  # Local files don't need caching
         assert defaults["large_model_support"] is False  # Small file
@@ -62,7 +62,7 @@ def test_generate_smart_defaults_cloud():
     """Test smart defaults for cloud paths."""
     paths = ["s3://bucket/models/"]
     defaults = generate_smart_defaults(paths)
-    
+
     assert defaults["use_cache"] is True  # Cloud operations should cache
     assert defaults["selective_download"] is True  # Cloud directories
     assert "timeout" in defaults
@@ -76,14 +76,14 @@ def test_parse_size_string():
     assert parse_size_string("5MB") == 5 * 1024 * 1024
     assert parse_size_string("2GB") == 2 * 1024 * 1024 * 1024
     assert parse_size_string("1TB") == 1024 * 1024 * 1024 * 1024
-    
+
     # Test case insensitive
     assert parse_size_string("1gb") == 1024 * 1024 * 1024
-    
+
     # Test invalid format
     try:
         parse_size_string("invalid")
-        assert False, "Should have raised ValueError"
+        raise AssertionError("Should have raised ValueError")
     except ValueError:
         pass
 
@@ -92,7 +92,7 @@ def test_smart_defaults_huggingface():
     """Test smart defaults for HuggingFace models."""
     paths = ["hf://user/model"]
     defaults = generate_smart_defaults(paths)
-    
+
     assert defaults["use_cache"] is True  # Remote operations should cache
     assert defaults["selective_download"] is True  # HuggingFace models
     assert "timeout" in defaults

@@ -142,23 +142,70 @@ modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
 ### **Compliance & Audit Reporting**
 
 ```bash
-modelaudit model_package.zip --sbom compliance_report.json --strict-license --verbose
+modelaudit model_package.zip --sbom compliance_report.json --strict --verbose
+```
+
+### 🧠 Smart Detection Examples
+
+ModelAudit automatically adapts to your input - **no configuration needed for most cases:**
+
+```bash
+# Local file - fast scan, no progress bars
+modelaudit model.pkl                    
+
+# Cloud directory - auto enables caching + progress bars
+modelaudit s3://my-bucket/models/       
+
+# HuggingFace model - selective download + caching  
+modelaudit hf://microsoft/DialoGPT-medium
+
+# Large local file - enables progress + optimizations
+modelaudit 15GB-model.bin               
+
+# CI environment - auto detects and uses JSON output
+CI=true modelaudit model.pkl            
+```
+
+**Override smart detection when needed:**
+
+```bash
+# Force strict mode for security-critical scans
+modelaudit model.pkl --strict --format json --output report.json
+
+# Override size limits for huge models
+modelaudit huge-model.pt --max-size 50GB --timeout 7200
+
+# Preview mode without downloading
+modelaudit s3://bucket/model.pt --dry-run
 ```
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
-### ⚙️ Advanced CLI Options
+### ⚙️ Smart Detection & CLI Options
 
-ModelAudit provides additional flags for specialized workflows:
+ModelAudit uses **smart detection** to automatically configure optimal settings based on your input:
 
-- `--strict-license` – fail when incompatible or deprecated licenses are detected
-- `--max-file-size BYTES` / `--max-total-size BYTES` – limit scanning of very large files
-- `--max-download-size SIZE` – cap remote downloads (e.g., `500 MB`, `2 GB`)
-- `--preview` – show size and metadata before downloading remote models
-- `--cache/--no-cache` and `--cache-dir PATH` – control caching of cloud downloads
-- `--no-skip-files` and `--selective/--all-files` – control which files are scanned in directories
-- `--registry-uri URI` – scan models in an MLflow registry
-- `--jfrog-api-token` / `--jfrog-access-token` – authenticate with JFrog Artifactory
+**✨ Smart Detection Features:**
+- **Input type** (local/cloud/registry) → optimal download & caching strategies
+- **File size** (>1GB) → large model optimizations + progress bars  
+- **Terminal type** (TTY/CI) → appropriate UI (progress vs quiet mode)
+- **Cloud operations** → automatic caching, size limits, timeouts
+
+**🎛️ Override Controls (12 focused flags):**
+- `--strict` – scan all file types, strict license validation, fail on warnings
+- `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`) 
+- `--timeout SECONDS` – override auto-detected timeout
+- `--dry-run` – preview what would be scanned/downloaded
+- `--progress` – force enable progress reporting
+- `--no-cache` – disable caching (overrides smart detection)
+- `--format json` / `--output file.json` – structured output for CI/CD
+- `--sbom file.json` – generate software bill of materials
+- `--verbose` / `--quiet` – control output detail level
+- `--blacklist PATTERN` – additional security patterns
+
+**🔐 Authentication (via environment variables):**
+- Set `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory  
+- Set `MLFLOW_TRACKING_URI` for MLflow registry access
 
 ### 🚀 Large Model Support (Up to 1 TB)
 
