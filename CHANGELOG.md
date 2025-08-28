@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2025-08-28
+
 ### Added
 
 - **feat**: improve CVE-2025-32434 detection with density-based analysis (#351)
