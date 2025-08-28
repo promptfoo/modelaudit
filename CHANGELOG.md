@@ -290,7 +290,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: change weight distribution warnings to info level (#69)
 - **fix**: correct duration calculation (#68)
 
-## [0.1.1] - 2025-06-XX
+## [0.1.1] - 2025-06-16
 
 ### Added
 
@@ -313,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: switch config keys to info and reduce false positives (#8)
 - **fix**: reduce false positives for ML model configurations (#3)
 
-## [0.1.0] - 2025-06-XX
+## [0.1.0] - 2025-03-08
 
 ### Added
 
