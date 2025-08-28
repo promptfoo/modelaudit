@@ -403,9 +403,15 @@ def _consolidate_checks(results: ModelAuditResultModel) -> None:
             continue
 
         # Multiple checks - consolidate them
-        passed_count = sum(1 for c in group_checks if c.get("status") == "passed")
-        failed_count = len(group_checks) - passed_count
-        consolidated_status = "failed" if failed_count > 0 else "passed"
+        statuses = [c.get("status") for c in group_checks]
+        failed_count = sum(s == "failed" for s in statuses)
+        passed_count = sum(s == "passed" for s in statuses)
+        if failed_count:
+            consolidated_status = "failed"
+        elif passed_count:
+            consolidated_status = "passed"
+        else:
+            consolidated_status = "skipped"
 
         # Build consolidated check
         consolidated_check = {
@@ -544,6 +550,10 @@ def scan_model_directory_or_file(
                 raise ValueError(f"No scanner available for {stream_url}")
 
             # Return early for streaming - finalize the model
+            try:
+                _consolidate_checks(results)
+            except Exception as e:
+                logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
             results.finalize_statistics()
             return results
 
@@ -952,7 +962,7 @@ def scan_model_directory_or_file(
     try:
         _consolidate_checks(results)
     except Exception as e:
-        logger.warning(f"Error consolidating checks: {e!s}")
+        logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
 
     # Add license warnings if any
     try:
