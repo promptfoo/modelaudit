@@ -107,10 +107,10 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
     def test_no_cleanup_with_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
-        """Test that temporary directories are not cleaned up when using --cache-dir."""
+        """Test that temporary directories are not cleaned up when using smart detection caching."""
         # Setup mocks
         mock_is_hf_url.return_value = True
-        cache_dir = tmp_path / "persistent_cache"
+        cache_dir = tmp_path / "smart_cache"
         download_path = cache_dir / "model"
         download_path.mkdir(parents=True)
         mock_download_model.return_value = download_path
@@ -118,9 +118,10 @@ class TestCacheDirOption:
 
         runner = CliRunner()
 
-        result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
+        # With smart detection, HuggingFace URLs enable caching by default (no cleanup)
+        result = runner.invoke(cli, ["scan", "hf://test/model"])
 
-        # Verify cleanup was NOT called since we used a cache directory
+        # Verify cleanup was NOT called since smart detection enables caching
         mock_rmtree.assert_not_called()
         assert result.exit_code == 0
 
