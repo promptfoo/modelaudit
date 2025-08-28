@@ -70,14 +70,14 @@ These models should scan clean and serve as negative controls for false positive
 | 36  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
 | 37  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
 | 38  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
-| 39  | `meta-llama/Llama-3.2-1B`                                         | PyTorch ZIP     | Hugging Face | Clean  | Llama-3.2-1B PyTorch model - tests improved CVE-2025-32434 density-based detection (2.3GB, 294 opcodes) |
+| 39  | `meta-llama/Llama-3.2-1B`                                         | PyTorch ZIP     | Hugging Face | Clean  | Llama-3.2-1B PyTorch model - tests improved CVE-2025-32434 density-based detection (2.3GB, 294 opcodes)    |
 | 40  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
-| 40  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
-| 41  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
-| 42  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
-| 43  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
-| 44  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
-| 45  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
+| 41  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
+| 42  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
+| 43  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
+| 44  | `EfficientNetV2-B1 classification`                                | TensorFlow      | TF Hub       | Clean  | Standard TF2 SavedModel - tfhub.dev/google/imagenet/efficientnet_v2_imagenet1k_b1/classification/2         |
+| 45  | `Universal Sentence Encoder (USE)`                                | TensorFlow      | TF Hub       | Clean  | Text embedding SavedModel - tfhub.dev/google/universal-sentence-encoder/2                                  |
+| 46  | `SSD Mobilenet V2 (Open Images)`                                  | TensorFlow      | TF Hub       | Clean  | Object detection SavedModel - tfhub.dev/google/openimages_v4/ssd/mobilenet_v2/1                            |
 
 ## Malicious Models (Threat Detection Testing)
 
@@ -334,11 +334,11 @@ These queries and models provide comprehensive coverage for testing ModelAudit a
 
 ### Threshold Matrix
 
-| File Size      | Threshold (opcodes/MB) | Sensitivity | Example Models                |
-|--------------- |----------------------|-------------|-------------------------------|
-| < 10MB         | 80                   | High        | Small custom models           |
-| 10MB - 1GB     | 200                  | Medium      | Standard models               |
-| > 1GB          | 500                  | Contextual  | Large LLMs (Llama, GPT-like) |
+| File Size  | Threshold (opcodes/MB) | Sensitivity | Example Models               |
+| ---------- | ---------------------- | ----------- | ---------------------------- |
+| < 10MB     | 80                     | High        | Small custom models          |
+| 10MB - 1GB | 200                    | Medium      | Standard models              |
+| > 1GB      | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
 
 ### Before vs After
 
