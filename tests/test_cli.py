@@ -90,7 +90,10 @@ def test_scan_command_help():
     assert "--output" in result.output
     assert "--timeout" in result.output
     assert "--verbose" in result.output
-    assert "--max-file-size" in result.output
+    assert "--max-size" in result.output  # Updated from --max-file-size
+    assert "--strict" in result.output  # New consolidated flag
+    assert "--dry-run" in result.output  # New flag
+    assert "Smart Detection:" in result.output  # New feature documentation
 
 
 def test_scan_nonexistent_file():
@@ -290,7 +293,7 @@ def test_scan_max_file_size(tmp_path):
         [
             "scan",
             str(test_file),
-            "--max-file-size",
+            "--max-size",
             "500",  # 500 bytes limit
         ],
         catch_exceptions=True,
@@ -420,19 +423,17 @@ def test_scan_huggingface_url_help():
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "https://huggingface.co/user/model" in result.output
-    assert "https://pytorch.org/hub/pytorch_vision_resnet/" in result.output
-    assert "hf://user/model" in result.output
-    assert "s3://my-bucket/models/" in result.output
-    assert "models:/MyModel/1" in result.output
+    assert "hf://user/llama" in result.output  # Updated to new example format  
+    assert "s3://bucket/models/" in result.output
+    assert "models:/model/v1" in result.output
 
 
 def test_scan_jfrog_url_help():
-    """Test that JFrog URL example is in the help text."""
+    """Test that JFrog authentication is mentioned in the help text."""
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "jfrog.io" in result.output
+    assert "JFROG_API_TOKEN" in result.output  # Updated to check for auth info instead of URL example
 
 
 def test_scan_mlflow_url_help():
@@ -440,8 +441,8 @@ def test_scan_mlflow_url_help():
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "models:/MyModel/1" in result.output
-    assert "models:/MyModel/Production" in result.output
+    assert "models:/model/v1" in result.output  # Updated to match new example format
+    assert "MLFLOW_TRACKING_URI" in result.output  # Check for auth info
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -799,10 +800,8 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
             "malicious",
             "--blacklist",
             "unsafe",
-            "--max-file-size",
-            "1000000",
-            "--max-total-size",
-            "5000000",
+            "--max-size",
+            "5000000",  # Combined limit (using the larger value)
             "--verbose",
         ],
     )

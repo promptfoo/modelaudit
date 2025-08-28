@@ -239,16 +239,16 @@ def parse_size_string(size_str: str) -> int:
     if size_str.isdigit():
         return int(size_str)
 
-    # Parse with units
-    units = {
-        "B": 1,
-        "KB": 1024,
-        "MB": 1024**2,
-        "GB": 1024**3,
-        "TB": 1024**4,
-    }
+    # Parse with units (process longest units first to avoid conflicts)
+    units = [
+        ("TB", 1024**4),
+        ("GB", 1024**3),
+        ("MB", 1024**2),
+        ("KB", 1024),
+        ("B", 1),
+    ]
 
-    for unit, multiplier in units.items():
+    for unit, multiplier in units:
         if size_str.endswith(unit):
             try:
                 number_part = size_str[: -len(unit)]
