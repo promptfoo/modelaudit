@@ -69,7 +69,7 @@ class TestCacheDirOption:
 
         # Verify download was called with the cache directory
         mock_download_model.assert_called_once_with(
-            "hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=True
+            "hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=False
         )
         assert result.exit_code == 0
 
