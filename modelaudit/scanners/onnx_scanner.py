@@ -109,10 +109,17 @@ class OnnxScanner(BaseScanner):
             )
 
             # Create single aggregated checks for the file (only if checks are enabled)
-            if self.config.get("check_jit_script", True):
+            check_jit = self._get_bool_config("check_jit_script", True)
+            if check_jit:
                 self.summarize_jit_script_findings(jit_findings, result, context=path)
-            if self.config.get("check_network_comm", True):
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+            check_net = self._get_bool_config("check_network_comm", True)
+            if check_net:
                 self.summarize_network_communication_findings(network_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         except Exception as e:
             # Log but don't fail the scan

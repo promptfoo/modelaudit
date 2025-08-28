@@ -353,6 +353,25 @@ class BaseScanner(ABC):
         self.progress_tracker: Optional[Any] = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
+    def _get_bool_config(self, key: str, default: bool = True) -> bool:
+        """
+        Helper method to parse boolean configuration values with flexible input handling.
+
+        Args:
+            key: Configuration key to retrieve
+            default: Default value if key is not found
+
+        Returns:
+            Boolean value parsed from config, with string values like "false", "0", "no", "off"
+            being treated as False
+        """
+        val = self.config.get(key, default)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() not in {"false", "0", "no", "off"}
+        return bool(val)
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Return True if this scanner can handle the file at the given path"""
@@ -662,25 +681,44 @@ class BaseScanner(ABC):
                 ):
                     max_severity = finding_severity
 
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
             result.add_check(
-                name="JIT/Script Code Execution Detection",
+                name="JIT/Script Code Execution Summary",
                 passed=False,
                 message=f"Found {len(findings)} JIT/Script code risks across file",
                 severity=max_severity,
                 location=context,
                 details={
                     "findings_count": len(findings),
-                    "findings": findings[:10],  # Include up to 10 examples
+                    "findings": sanitized_findings,  # Redacted examples
                     "total_findings": len(findings),
+                    "aggregated": True,
+                    "aggregation_type": "summary",
                 },
                 why="JIT/Script code patterns can execute arbitrary code during model loading",
             )
         else:
             result.add_check(
-                name="JIT/Script Code Execution Detection",
+                name="JIT/Script Code Execution Summary",
                 passed=True,
                 message="No JIT/Script code execution risks detected",
                 location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
             )
 
     def check_for_jit_script_code(
@@ -836,36 +874,56 @@ class BaseScanner(ABC):
                     max_severity = finding_severity
 
             # Extract unique patterns for the message
-            unique_patterns = set()
+            unique_patterns: set[str] = set()
             for finding in findings[:10]:  # Check first 10 findings for patterns
                 # Check multiple fields for pattern information
-                for field in ["pattern", "matched_text", "domain", "url", "message"]:
-                    pattern = finding.get(field, "")
-                    if pattern and isinstance(pattern, str) and len(pattern) < 50:
+                # Exclude 'matched_text' to reduce PII leakage
+                for field in ["pattern", "domain", "url", "message"]:
+                    pattern = str(finding.get(field, "") or "").strip()
+                    if pattern and len(pattern) < 50:
                         # Add short, meaningful patterns (avoid very long strings)
                         unique_patterns.add(pattern)
 
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
             pattern_summary = ", ".join(sorted(unique_patterns)[:5]) if unique_patterns else "various patterns"
             result.add_check(
-                name="Network Communication Detection",
+                name="Network Communication Summary",
                 passed=False,
                 message=f"Found {len(findings)} network communication patterns ({pattern_summary}) across file",
                 severity=max_severity,
                 location=context,
                 details={
                     "findings_count": len(findings),
-                    "findings": findings[:10],  # Include up to 10 examples
+                    "findings": sanitized_findings,  # Redacted examples
                     "total_findings": len(findings),
-                    "patterns": sorted(unique_patterns),
+                    "patterns": sorted(unique_patterns)[:10],
+                    "aggregated": True,
+                    "aggregation_type": "summary",
                 },
                 why="Models should not contain network communication capabilities",
             )
         else:
             result.add_check(
-                name="Network Communication Detection",
+                name="Network Communication Summary",
                 passed=True,
                 message="No network communication patterns detected",
                 location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
             )
 
     def check_for_network_communication(
