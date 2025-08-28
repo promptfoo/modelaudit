@@ -311,10 +311,11 @@ class PyTorchZipScanner(BaseScanner):
             try:
                 with zip_file.open(name, "r") as zf:
                     # Collect all data from this file for analysis
-                    file_data = b""
+                    chunks: list[bytes] = []
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         bytes_scanned += len(chunk)
-                        file_data += chunk
+                        chunks.append(chunk)
+                    file_data = b"".join(chunks)
 
                     # Collect findings for this file without creating individual checks
                     if file_data:  # Only process if we have data
@@ -337,10 +338,17 @@ class PyTorchZipScanner(BaseScanner):
 
         # Create single aggregated checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            if self.config.get("check_jit_script", True):
+            check_jit = self._get_bool_config("check_jit_script", True)
+            if check_jit:
                 self.summarize_jit_script_findings(all_jit_findings, result, context=path)
-            if self.config.get("check_network_comm", True):
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+            check_net = self._get_bool_config("check_network_comm", True)
+            if check_net:
                 self.summarize_network_communication_findings(all_network_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         return bytes_scanned
 
