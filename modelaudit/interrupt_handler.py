@@ -68,8 +68,8 @@ class InterruptHandler:
             os._exit(130)  # 130 is the standard exit code for SIGINT
         else:
             # First interrupt - initiate graceful shutdown
-            logger.info(f"Signal {signum} received, initiating graceful shutdown")
-            logger.info("Press Ctrl+C again to force immediate termination")
+            logger.debug(f"Interrupt signal {signum} received, initiating graceful shutdown")
+            logger.debug("Press Ctrl+C again to force immediate termination")
             self._interrupted.set()
 
     def is_interrupted(self) -> bool:

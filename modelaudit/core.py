@@ -178,7 +178,7 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     # Log information about duplicate content found
     for content_hash, paths in content_groups.items():
         if len(paths) > 1:
-            logger.info(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]}...)")
+            logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
             for path in paths:
                 logger.debug(f"  - {path}")
 
@@ -846,7 +846,7 @@ def scan_model_directory_or_file(
                 )
             # Stop scanning if size limit reached
             if limit_reached:
-                logger.info("Scan terminated early due to total size limit")
+                logger.warning("Scan terminated early due to total size limit")
                 _add_issue_to_model(
                     results,
                     "Scan terminated early due to total size limit",
@@ -940,7 +940,7 @@ def scan_model_directory_or_file(
                     progress_callback(f"Completed scanning: {target}", 100.0)
 
     except KeyboardInterrupt:
-        logger.info("Scan interrupted by user")
+        logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
@@ -962,7 +962,11 @@ def scan_model_directory_or_file(
     try:
         _consolidate_checks(results)
     except Exception as e:
+<<<<<<< HEAD
         logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
+=======
+        logger.warning(f"Error consolidating checks: {e!s}")
+>>>>>>> main
 
     # Add license warnings if any
     try:

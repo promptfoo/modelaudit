@@ -861,6 +861,7 @@ class BaseScanner(ABC):
                     max_severity = finding_severity
 
             # Extract unique patterns for the message
+<<<<<<< HEAD
             unique_patterns: set[str] = set()
             for finding in findings[:10]:  # Check first 10 findings for patterns
                 # Check multiple fields for pattern information
@@ -868,6 +869,14 @@ class BaseScanner(ABC):
                 for field in ["pattern", "domain", "url", "message"]:
                     pattern = str(finding.get(field, "") or "").strip()
                     if pattern and len(pattern) < 50:
+=======
+            unique_patterns = set()
+            for finding in findings[:10]:  # Check first 10 findings for patterns
+                # Check multiple fields for pattern information
+                for field in ["pattern", "matched_text", "domain", "url", "message"]:
+                    pattern = finding.get(field, "")
+                    if pattern and isinstance(pattern, str) and len(pattern) < 50:
+>>>>>>> main
                         # Add short, meaningful patterns (avoid very long strings)
                         unique_patterns.add(pattern)
 
@@ -882,9 +891,13 @@ class BaseScanner(ABC):
                     "findings_count": len(findings),
                     "findings": findings[:10],  # Include up to 10 examples
                     "total_findings": len(findings),
+<<<<<<< HEAD
                     "patterns": sorted(unique_patterns)[:10],
                     "aggregated": True,
                     "aggregation_type": "summary",
+=======
+                    "patterns": sorted(unique_patterns),
+>>>>>>> main
                 },
                 why="Models should not contain network communication capabilities",
             )

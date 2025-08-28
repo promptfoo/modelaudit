@@ -433,9 +433,9 @@ class ScannerRegistry:
 
                 self._failed_scanners[scanner_id] = error_msg
 
-                # For expected dependency issues, use info level
+                # For expected dependency issues, use debug level
                 if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
-                    logger.info(error_msg)
+                    logger.debug(error_msg)
                 else:
                     logger.debug(error_msg)
 
@@ -453,7 +453,7 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
-                        logger.info(error_msg)  # Info level - expected for NumPy issues
+                        logger.debug(error_msg)  # Debug level - expected NumPy compatibility issues
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
                         logger.warning(error_msg)  # Warning - unexpected NumPy issue
