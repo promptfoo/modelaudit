@@ -948,11 +948,11 @@ def scan_model_directory_or_file(
 
     # Final timing is handled by finalize_statistics()
 
-    # Consolidate checks for cleaner reporting - temporarily disable while refactoring
-    # try:
-    #     _consolidate_checks(results)
-    # except Exception as e:
-    #     logger.warning(f"Error consolidating checks: {e!s}")
+    # Consolidate checks for cleaner reporting
+    try:
+        _consolidate_checks(results)
+    except Exception as e:
+        logger.warning(f"Error consolidating checks: {e!s}")
 
     # Add license warnings if any
     try:
