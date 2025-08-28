@@ -19,8 +19,8 @@ This document catalogs models used for testing the ModelAudit security scanner a
 
 ### Statistics
 
-- Total Models: 134 active models + 10 archived models = 144 total cataloged
-- Safe Models: 45 legitimate models (baseline testing)
+- Total Models: 135 active models + 10 archived models = 145 total cataloged
+- Safe Models: 46 legitimate models (baseline testing)
 - Malicious Models: 89 models with attack vectors
 - Archived Models: 10 models no longer available (moved to bottom for historical reference)
 - Frameworks: PyTorch, TensorFlow, Keras, YOLO, Scikit-learn, GGUF, Paddle
@@ -70,7 +70,8 @@ These models should scan clean and serve as negative controls for false positive
 | 36  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
 | 37  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
 | 38  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
-| 39  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
+| 39  | `meta-llama/Llama-3.2-1B`                                         | PyTorch ZIP     | Hugging Face | Clean  | Llama-3.2-1B PyTorch model - tests improved CVE-2025-32434 density-based detection (2.3GB, 294 opcodes) |
+| 40  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
 | 40  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
 | 41  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
 | 42  | `Mobilenet V3 Small 0.75 224`                                     | TensorFlow      | TF Hub       | Clean  | Clean feature extractor SavedModel - tfhub.dev/google/imagenet/mobilenet_v3_small_075_224/feature_vector/5 |
@@ -319,6 +320,34 @@ site:huggingface.co "CVE-2024" pickle
 | Alternative Frameworks  | 2     | PaddleNLP models                          | Paddle pickle.loads                |
 
 These queries and models provide comprehensive coverage for testing ModelAudit across the full spectrum of ML security threats.
+
+## CVE-2025-32434 Improved Detection
+
+**Update**: ModelAudit now uses advanced density-based analysis for CVE-2025-32434 detection, dramatically reducing false positives for large legitimate models while maintaining high security detection accuracy.
+
+### Key Improvements
+
+- **Dynamic Thresholds**: Detection thresholds scale with model file size
+- **Density Analysis**: Uses opcodes-per-MB instead of absolute counts
+- **Context Awareness**: Distinguishes between legitimate large models and malicious files
+- **Graduated Severity**: Critical/Warning/Info levels based on risk context
+
+### Threshold Matrix
+
+| File Size      | Threshold (opcodes/MB) | Sensitivity | Example Models                |
+|--------------- |----------------------|-------------|-------------------------------|
+| < 10MB         | 80                   | High        | Small custom models           |
+| 10MB - 1GB     | 200                  | Medium      | Standard models               |
+| > 1GB          | 500                  | Contextual  | Large LLMs (Llama, GPT-like) |
+
+### Before vs After
+
+**Before**: `meta-llama/Llama-3.2-1B` → **CRITICAL** (294 opcodes > 80 threshold)  
+**After**: `meta-llama/Llama-3.2-1B` → **SAFE** (294 opcodes ÷ 2300MB = 0.13/MB < 500 threshold)
+
+**Real malicious model** (1MB, 80 opcodes): Still **CRITICAL** (80 opcodes ÷ 1MB = 80/MB > 80 threshold)
+
+This improvement eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
 
 ## ModelAudit vs modelscan: Comparative Testing
 

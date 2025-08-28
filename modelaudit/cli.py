@@ -637,8 +637,11 @@ def scan_command(
         logger.setLevel(logging.DEBUG)
         logging.getLogger("modelaudit.core").setLevel(logging.DEBUG)
     else:
-        # Suppress INFO logs from core module in normal mode
+        # Suppress INFO logs from technical modules in normal mode to reduce noise
+        # Users can still see these with --verbose if needed
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.utils.secure_hasher").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
 
     # Setup progress tracking
     progress_tracker = None
@@ -822,7 +825,7 @@ def scan_command(
 
                         # Download with caching support and progress bar
                         download_path = download_model(
-                            path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output)
+                            path, cache_dir=hf_cache_dir, show_progress=should_show_spinner()
                         )
                         actual_path = str(download_path)
                         # Only track for cleanup if not using cache

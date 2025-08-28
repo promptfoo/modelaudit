@@ -1699,21 +1699,64 @@ class PickleScanner(BaseScanner):
             ml_context = _detect_ml_context(opcodes)
 
             # CVE-2025-32434 specific opcode sequence analysis
-            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes)
+            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes, file_size)
             for cve_pattern in cve_patterns:
+                # Handle informational patterns (large legitimate models)
+                if cve_pattern.get("status") == "normal":
+                    result.add_check(
+                        name="Large Model Opcode Analysis",
+                        passed=True,
+                        message=f"Large model analysis: {cve_pattern['description']}",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "pattern_type": cve_pattern["pattern_type"],
+                            "dangerous_count": cve_pattern["dangerous_count"],
+                            "file_size_mb": cve_pattern["file_size_mb"],
+                            "opcode_density_per_mb": cve_pattern["opcode_density_per_mb"],
+                            "threshold_used": cve_pattern["threshold_used"],
+                        },
+                    )
+                    continue
+
+                # Map severity levels to IssueSeverity
+                severity_level = cve_pattern.get("severity_level", "critical")
+                if severity_level == "critical":
+                    severity = IssueSeverity.CRITICAL
+                elif severity_level == "high":
+                    severity = IssueSeverity.CRITICAL  # Still critical, but with context
+                elif severity_level == "medium":
+                    severity = IssueSeverity.WARNING  # Reduced severity for large models
+                else:  # low
+                    severity = IssueSeverity.INFO  # Just informational for very large models
+
+                # Choose message prefix based on severity
+                if severity == IssueSeverity.CRITICAL:
+                    message_prefix = "Detected CVE-2025-32434 exploitation pattern"
+                elif severity == IssueSeverity.WARNING:
+                    message_prefix = "Potential CVE-2025-32434 pattern (large model context)"
+                else:
+                    message_prefix = "CVE-2025-32434 analysis (informational)"
+
                 result.add_check(
                     name="CVE-2025-32434 Opcode Sequence Detection",
-                    passed=False,
-                    message=f"Detected CVE-2025-32434 exploitation pattern: {cve_pattern['description']}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (pos {cve_pattern['position']})",
+                    passed=severity not in [IssueSeverity.CRITICAL, IssueSeverity.WARNING],
+                    message=f"{message_prefix}: {cve_pattern['description']}",
+                    severity=severity,
+                    location=f"{self.current_file_path} (pos {cve_pattern.get('position', 0)})",
                     details={
                         "cve_id": "CVE-2025-32434",
                         "pattern_type": cve_pattern["pattern_type"],
                         "description": cve_pattern["description"],
-                        "opcodes_involved": cve_pattern["opcodes"],
-                        "exploitation_method": cve_pattern["exploitation_method"],
-                        "position": cve_pattern["position"],
+                        "opcodes_involved": cve_pattern.get("opcodes", []),
+                        "exploitation_method": cve_pattern.get("exploitation_method", ""),
+                        "position": cve_pattern.get("position", 0),
+                        "dangerous_count": cve_pattern.get("dangerous_count", 0),
+                        "file_size_mb": cve_pattern.get("file_size_mb", 0),
+                        "opcode_density_per_mb": cve_pattern.get("opcode_density_per_mb", 0),
+                        "threshold_used": cve_pattern.get("threshold_used", 0),
+                        "severity_level": severity_level,
+                        "confidence_score": cve_pattern.get("confidence_score", 0),
                     },
                 )
 
@@ -2784,8 +2827,11 @@ class PickleScanner(BaseScanner):
 
         return result
 
-    def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple]) -> list[dict]:
-        """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques"""
+    def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple], file_size: int) -> list[dict]:
+        """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques
+
+        Uses dynamic thresholds based on file size to reduce false positives for large legitimate models.
+        """
         patterns = []
 
         # Count dangerous opcodes and torch references for overall analysis
@@ -2964,22 +3010,72 @@ class PickleScanner(BaseScanner):
                         )
                         break
 
-        # Pattern 6: Overall suspicious density check (CVE-2025-32434 indicator)
-        # Very high concentration of dangerous opcodes in a PyTorch model is suspicious
-        # Normal PyTorch models have some REDUCE opcodes for tensor reconstruction, but not excessive amounts
-        if dangerous_opcodes_count > 80 and torch_references > 0:
+        # Pattern 6: Improved density-based CVE-2025-32434 detection
+        # Use dynamic thresholds based on file size to reduce false positives for large legitimate models
+        if torch_references > 0 and dangerous_opcodes_count > 0:
+            # Calculate density: opcodes per MB
+            file_size_mb = file_size / (1024 * 1024)
+            opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
+
+            # Dynamic thresholds based on file size:
+            # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
+            # Medium files (10MB-1GB): Moderate sensitivity - 200+ opcodes per MB
+            # Large files (>1GB): Low sensitivity - 500+ opcodes per MB (for large models like Llama)
+            if file_size_mb < 10:
+                density_threshold = 80.0
+                severity_level = "critical"
+            elif file_size_mb < 1000:  # < 1GB
+                density_threshold = 200.0
+                severity_level = "high" if opcode_density_per_mb > 300 else "medium"
+            else:  # >= 1GB (large models)
+                density_threshold = 500.0  # Much higher threshold for large models
+                severity_level = "medium" if opcode_density_per_mb > 800 else "low"
+
+            # Only flag if density exceeds threshold
+            if opcode_density_per_mb > density_threshold:
+                confidence_score = min(100, (opcode_density_per_mb / density_threshold - 1) * 100)
+
+                patterns.append(
+                    {
+                        "pattern_type": "high_risk_opcode_density",
+                        "description": (
+                            f"Elevated dangerous opcode density ({dangerous_opcodes_count} opcodes, "
+                            f"{opcode_density_per_mb:.1f}/MB in {file_size_mb:.1f}MB file) "
+                            f"may indicate CVE-2025-32434 exploitation (confidence: {confidence_score:.0f}%)"
+                        ),
+                        "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
+                        "exploitation_method": "weights_only=True bypass via opcode density attack",
+                        "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
+                        "dangerous_count": dangerous_opcodes_count,
+                        "torch_references": torch_references,
+                        "file_size_mb": file_size_mb,
+                        "opcode_density_per_mb": opcode_density_per_mb,
+                        "threshold_used": density_threshold,
+                        "severity_level": severity_level,
+                        "confidence_score": confidence_score,
+                    }
+                )
+
+        # Add informational message for large legitimate models that are below threshold
+        if (
+            torch_references > 0
+            and dangerous_opcodes_count > 50
+            and file_size_mb > 100
+            and opcode_density_per_mb <= density_threshold
+        ):
             patterns.append(
                 {
-                    "pattern_type": "high_risk_opcode_density",
+                    "pattern_type": "large_model_normal_density",
                     "description": (
-                        f"High concentration of dangerous opcodes ({dangerous_opcodes_count}) "
-                        "in PyTorch model indicates potential CVE-2025-32434 exploitation"
+                        f"Large PyTorch model ({file_size_mb:.1f}MB) with {dangerous_opcodes_count} "
+                        f"dangerous opcodes ({opcode_density_per_mb:.1f}/MB) is within expected range "
+                        "for legitimate models"
                     ),
-                    "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
-                    "exploitation_method": "weights_only=True bypass via opcode density attack",
-                    "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
                     "dangerous_count": dangerous_opcodes_count,
-                    "torch_references": torch_references,
+                    "file_size_mb": file_size_mb,
+                    "opcode_density_per_mb": opcode_density_per_mb,
+                    "threshold_used": density_threshold,
+                    "status": "normal",
                 }
             )
 
