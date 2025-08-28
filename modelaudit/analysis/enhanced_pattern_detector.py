@@ -73,6 +73,11 @@ class EnhancedPatternDetector:
                     r"\bfrom\s+importlib\b",
                     r"\bimport\s+importlib\b",
                     r"\bimportlib\b",  # importlib as string value (restored general pattern)
+                    r"\brunpy\.run_module\b",
+                    r"\brunpy\.run_path\b",
+                    r"\brunpy\._run_module_as_main\b",
+                    r"\brunpy\._run_code\b",
+                    r"\brunpy\b",  # General runpy module reference
                 ],
                 "severity": "critical",
                 "description": "Dynamic module import",
