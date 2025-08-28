@@ -337,8 +337,10 @@ class PyTorchZipScanner(BaseScanner):
 
         # Create single aggregated checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            self.summarize_jit_script_findings(all_jit_findings, result, context=path)
-            self.summarize_network_communication_findings(all_network_findings, result, context=path)
+            if self.config.get("check_jit_script", True):
+                self.summarize_jit_script_findings(all_jit_findings, result, context=path)
+            if self.config.get("check_network_comm", True):
+                self.summarize_network_communication_findings(all_network_findings, result, context=path)
 
         return bytes_scanned
 
