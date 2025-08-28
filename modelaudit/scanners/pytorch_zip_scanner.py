@@ -242,10 +242,12 @@ class PyTorchZipScanner(BaseScanner):
 
         # Get the original ZIP file size for proper density calculations
         # This is crucial for CVE-2025-32434 detection to avoid false positives
-        try:
-            original_file_size = os.path.getsize(path)
-        except OSError:
-            original_file_size = 0
+        original_file_size = int(result.metadata.get("file_size") or 0)
+        if original_file_size <= 0:
+            try:
+                original_file_size = os.path.getsize(path)
+            except OSError:
+                original_file_size = 1  # Avoid divide-by-zero in density calculations
 
         for name in pickle_files:
             info = zip_file.getinfo(name)
@@ -259,6 +261,7 @@ class PyTorchZipScanner(BaseScanner):
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
             if pickle_data_size <= max_in_mem:
                 data = zip_file.read(name)
+                bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
                     # IMPORTANT: Pass original ZIP file size, not pickle data size
                     # This enables proper density-based CVE detection
@@ -268,6 +271,7 @@ class PyTorchZipScanner(BaseScanner):
                 with zip_file.open(name, "r") as zf, tempfile.SpooledTemporaryFile(max_size=max_in_mem) as spool:
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         spool.write(chunk)
+                        bytes_scanned += len(chunk)
                     spool.seek(0)
                     # IMPORTANT: Pass original ZIP file size, not pickle data size
                     # This enables proper density-based CVE detection

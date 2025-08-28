@@ -50,10 +50,11 @@ class TestCacheDirOption:
         assert "--cache-dir" in result.output
         assert "Directory for caching downloaded files" in result.output
 
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_huggingface_download_with_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_huggingface_download_with_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path):
         """Test HuggingFace download uses specified cache directory."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -69,14 +70,15 @@ class TestCacheDirOption:
 
         # Verify download was called with the cache directory
         mock_download_model.assert_called_once_with(
-            "hf://test/model", cache_dir=Path(str(cache_dir)), show_progress=False
+            "hf://test/model", cache_dir=cache_dir, show_progress=False
         )
         assert result.exit_code == 0
 
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cloud_download_with_cache_dir(self, mock_scan, mock_is_cloud_url, mock_download_cloud, tmp_path):
+    def test_cloud_download_with_cache_dir(self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner, tmp_path):
         """Test cloud storage download uses specified cache directory."""
         # Setup mocks
         mock_is_cloud_url.return_value = True
@@ -93,7 +95,7 @@ class TestCacheDirOption:
         # Verify download was called with the cache directory
         mock_download_cloud.assert_called_once_with(
             "s3://bucket/model.pt",
-            cache_dir=Path(str(cache_dir)),
+            cache_dir=cache_dir,
             max_size=None,
             use_cache=True,
             show_progress=False,

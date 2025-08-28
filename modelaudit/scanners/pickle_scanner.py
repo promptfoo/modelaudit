@@ -3015,7 +3015,8 @@ class PickleScanner(BaseScanner):
         if torch_references > 0 and dangerous_opcodes_count > 0:
             # Calculate density: opcodes per MB
             file_size_mb = file_size / (1024 * 1024)
-            opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
+            raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
+            opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
 
             # Dynamic thresholds based on file size:
             # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
@@ -3033,7 +3034,7 @@ class PickleScanner(BaseScanner):
 
             # Only flag if density exceeds threshold
             if opcode_density_per_mb > density_threshold:
-                confidence_score = min(100, (opcode_density_per_mb / density_threshold - 1) * 100)
+                confidence_score = int(min(100.0, (raw_opcode_density_per_mb / density_threshold - 1.0) * 100.0))
 
                 patterns.append(
                     {

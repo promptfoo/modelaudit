@@ -70,7 +70,7 @@ These models should scan clean and serve as negative controls for false positive
 | 36  | `helenai/distilbert-base-uncased-finetuned-sst-2-english-ov-int8` | OpenVINO        | Hugging Face | Clean  | OpenVINO IR INT8 - INT8 IR handling                                                                        |
 | 37  | `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`                          | GGUF LLM        | Hugging Face | Clean  | Safe GGUF baseline - template parsing validation                                                           |
 | 38  | `QuantFactory/Meta-Llama-3-8B-Instruct-GGUF`                      | GGUF LLM        | Hugging Face | Clean  | Llama3 GGUF - large file and template parsing                                                              |
-| 39  | `meta-llama/Llama-3.2-1B`                                         | PyTorch ZIP     | Hugging Face | Clean  | Llama-3.2-1B PyTorch model - tests improved CVE-2025-32434 density-based detection (2.3GB, 294 opcodes)    |
+| 39  | `meta-llama/Llama-3.2-1B`                                         | PyTorch ZIP     | Hugging Face | Clean  | Llama-3.2-1B PyTorch model - tests improved CVE-2025-32434 density-based detection (2.3 GB, 294 opcodes)   |
 | 40  | `PaddlePaddle/PP-OCRv5_server_det`                                | Paddle          | Hugging Face | Clean  | Paddle inference format - deployment assets                                                                |
 | 41  | `PaddlePaddle/PP-OCRv3_mobile_det`                                | Paddle          | Hugging Face | Clean  | Paddle mobile inference - smaller inference bundles                                                        |
 | 42  | `PaddlePaddle/PP-DocLayout-M`                                     | Paddle          | Hugging Face | Clean  | Paddle layout detection - inference packaging validation                                                   |
@@ -334,18 +334,18 @@ These queries and models provide comprehensive coverage for testing ModelAudit a
 
 ### Threshold Matrix
 
-| File Size  | Threshold (opcodes/MB) | Sensitivity | Example Models               |
-| ---------- | ---------------------- | ----------- | ---------------------------- |
-| < 10MB     | 80                     | High        | Small custom models          |
-| 10MB - 1GB | 200                    | Medium      | Standard models              |
-| > 1GB      | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
+| File Size     | Threshold (opcodes/MB) | Sensitivity | Example Models               |
+| ------------- | ---------------------- | ----------- | ---------------------------- |
+| < 10 MB       | 80                     | High        | Small custom models          |
+| 10 MB – 1 GB  | 200                    | Medium      | Standard models              |
+| > 1 GB        | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
 
-### Before vs After
+### Before vs. After
 
 **Before**: `meta-llama/Llama-3.2-1B` → **CRITICAL** (294 opcodes > 80 threshold)  
-**After**: `meta-llama/Llama-3.2-1B` → **SAFE** (294 opcodes ÷ 2300MB = 0.13/MB < 500 threshold)
+**After**: `meta-llama/Llama-3.2-1B` → **SAFE** (294 opcodes ÷ 2,300 MB = 0.13 opcodes/MB < 500 threshold)
 
-**Real malicious model** (1MB, 80 opcodes): Still **CRITICAL** (80 opcodes ÷ 1MB = 80/MB > 80 threshold)
+**Real malicious model** (1 MB, 80 opcodes): Still **CRITICAL** (80 opcodes ÷ 1 MB = 80 opcodes/MB > 80 threshold)
 
 This improvement eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
 

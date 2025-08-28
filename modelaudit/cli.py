@@ -825,7 +825,7 @@ def scan_command(
 
                         # Download with caching support and progress bar
                         download_path = download_model(
-                            path, cache_dir=hf_cache_dir, show_progress=should_show_spinner()
+                            path, cache_dir=hf_cache_dir, show_progress=(format == "text" and not output and should_show_spinner())
                         )
                         actual_path = str(download_path)
                         # Only track for cleanup if not using cache
