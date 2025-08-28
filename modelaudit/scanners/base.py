@@ -698,10 +698,14 @@ class BaseScanner(ABC):
             )
         else:
             result.add_check(
-                name="JIT/Script Code Execution Detection",
+                name="JIT/Script Code Execution Summary",
                 passed=True,
                 message="No JIT/Script code execution risks detected",
                 location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
             )
 
     def check_for_jit_script_code(
@@ -886,10 +890,14 @@ class BaseScanner(ABC):
             )
         else:
             result.add_check(
-                name="Network Communication Detection",
+                name="Network Communication Summary",
                 passed=True,
                 message="No network communication patterns detected",
                 location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
             )
 
     def check_for_network_communication(
