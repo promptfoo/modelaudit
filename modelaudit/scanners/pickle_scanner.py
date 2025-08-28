@@ -1381,13 +1381,13 @@ class PickleScanner(BaseScanner):
                     message += f" (Risk reduced due to ML context: {ml_explanation})"
         else:
             # Get unique matched texts for better specificity
-            unique_matches = list(set(match.matched_text for match in matches))
+            unique_matches = list({match.matched_text for match in matches})
             if len(unique_matches) <= 3:
                 match_text = ", ".join(f"'{m}'" for m in unique_matches)
                 message = f"Detected {pattern_name} pattern: {match_text}"
             else:
                 message = f"Detected {len(matches)} instances of {pattern_name} pattern"
-            
+
             ml_adjusted_count = sum(1 for m in matches if m.ml_context_adjustment < 0.9)
             if ml_adjusted_count > 0:
                 message += f" ({ml_adjusted_count} with reduced risk due to ML context)"
@@ -1424,7 +1424,9 @@ class PickleScanner(BaseScanner):
             why=self._generate_pattern_explanation(representative, min_ml_adjustment),
         )
 
-    def _calculate_effective_severity(self, base_severity: str, ml_adjustment: float, confidence: float = 1.0) -> IssueSeverity:
+    def _calculate_effective_severity(
+        self, base_severity: str, ml_adjustment: float, confidence: float = 1.0
+    ) -> IssueSeverity:
         """Calculate effective severity considering ML context adjustment and confidence."""
         # If confidence is very low, reduce severity
         if confidence < 0.3:  # Very low confidence
@@ -1432,7 +1434,7 @@ class PickleScanner(BaseScanner):
                 return IssueSeverity.WARNING
             elif base_severity == "warning":
                 return IssueSeverity.INFO
-        
+
         # If ML context reduces risk significantly, lower severity
         if ml_adjustment < 0.3:  # 70%+ risk reduction
             if base_severity == "critical":

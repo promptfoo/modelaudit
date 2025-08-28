@@ -68,13 +68,13 @@ class EnhancedPatternDetector:
                 "patterns": [
                     r"\b__import__\s*\(",
                     r"\bimportlib\.import_module\b",
-                    r"\bimportlib\.machinery\b", 
+                    r"\bimportlib\.machinery\b",
                     r"\bimportlib\.util\b",
                     r"\bfrom\s+importlib\b",
                     r"\bimport\s+importlib\b",
-                    r"\bimportlib\b"  # importlib as string value (restored general pattern)
+                    r"\bimportlib\b",  # importlib as string value (restored general pattern)
                 ],
-                "severity": "critical", 
+                "severity": "critical",
                 "description": "Dynamic module import",
                 "category": "dynamic_import",
             },
@@ -282,7 +282,7 @@ class EnhancedPatternDetector:
         # Lower confidence if surrounded by comments or documentation
         if "#" in surrounding or "//" in surrounding:
             base_confidence -= 0.2
-            
+
         # Lower confidence for documentation-like contexts
         doc_indicators = ["documentation", "comment", "note", "description", "does not use", "safe"]
         if any(indicator in surrounding.lower() for indicator in doc_indicators):
