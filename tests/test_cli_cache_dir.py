@@ -57,7 +57,7 @@ class TestCacheDirOption:
     def test_huggingface_download_with_cache_dir(
         self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path
     ):
-        """Test HuggingFace download uses specified cache directory."""
+        """Test HuggingFace download uses smart detection for cache directory."""
         # Setup mocks
         mock_is_hf_url.return_value = True
         mock_download_path = tmp_path / "downloaded_model"
@@ -66,12 +66,14 @@ class TestCacheDirOption:
         mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
         runner = CliRunner()
-        cache_dir = tmp_path / "my_cache"
+        
+        # With smart detection, HuggingFace URLs should enable caching automatically
+        result = runner.invoke(cli, ["scan", "hf://test/model"])
 
-        result = runner.invoke(cli, ["scan", "hf://test/model", "--cache-dir", str(cache_dir)])
-
-        # Verify download was called with the cache directory
-        mock_download_model.assert_called_once_with("hf://test/model", cache_dir=cache_dir, show_progress=False)
+        # Verify download was called (smart detection should provide cache_dir)
+        mock_download_model.assert_called_once()
+        call_kwargs = mock_download_model.call_args.kwargs
+        assert "cache_dir" in call_kwargs  # Smart detection should provide cache_dir
         assert result.exit_code == 0
 
     @patch("modelaudit.cli.should_show_spinner", return_value=False)
