@@ -160,5 +160,6 @@ def test_scan_command_has_cache_options():
     result = runner.invoke(cli, ["scan", "--help"])
 
     assert result.exit_code == 0
-    assert "--cache / --no-cache" in result.output
-    assert "--cache-dir" in result.output
+    assert "--no-cache" in result.output
+    # --cache-dir is now handled by smart detection, not a CLI flag
+    assert "smart detection" in result.output.lower()

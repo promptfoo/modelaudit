@@ -757,10 +757,12 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 
     # Should succeed
     assert result.exit_code == 0
+    # Check for scan summary or successful completion indicators
     assert (
-        "Downloaded & Scanned" in result.output
+        "SCAN SUMMARY" in result.output
+        or "Files:" in result.output  
+        or "Duration:" in result.output
         or "Clean" in result.output
-        or "Downloaded and scanned successfully" in result.output
     )
 
     # Verify MLflow scan was called with correct parameters
