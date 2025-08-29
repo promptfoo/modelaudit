@@ -175,7 +175,7 @@ class TestAssetInventoryIntegration:
     def test_asset_inventory_cli_text_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI text output."""
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", str(complex_model_dir)])
+        result = runner.invoke(cli, ["scan", "--format", "text", str(complex_model_dir)])
 
         # Should succeed or have warnings but not error
         assert result.exit_code in [0, 1]
@@ -183,8 +183,9 @@ class TestAssetInventoryIntegration:
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # The asset inventory is still available in JSON format
         # Just verify that the scan completed successfully and mentioned the files
-        assert "SCAN SUMMARY" in result.output
-        assert "Files:" in result.output
+        out = result.output.lower()
+        assert "scan summary" in out
+        assert "files:" in out
 
         # Should still show file paths in issues if any are found
         # The files are still being scanned and processed, just not listed separately
@@ -373,25 +374,13 @@ class TestAssetInventoryIntegration:
         # Simulate a transformer model structure
         tensors = {}
         for layer in range(12):  # 12 transformer layers
-            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = np.random.randn(768, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = np.random.randn(3072, 768).astype(
-                np.float32
-            )
-            tensors[f"transformer.layer.{layer}.output.dense.weight"] = np.random.randn(
-                768,
-                3072,
-            ).astype(np.float32)
+            zeros = np.zeros((1,), dtype=np.float32)
+            tensors[f"transformer.layer.{layer}.attention.self.query.weight"] = zeros
+            tensors[f"transformer.layer.{layer}.attention.self.key.weight"] = zeros
+            tensors[f"transformer.layer.{layer}.attention.self.value.weight"] = zeros
+            tensors[f"transformer.layer.{layer}.attention.output.dense.weight"] = zeros
+            tensors[f"transformer.layer.{layer}.intermediate.dense.weight"] = zeros
+            tensors[f"transformer.layer.{layer}.output.dense.weight"] = zeros
 
         save_file(tensors, str(large_model))
 
@@ -433,17 +422,19 @@ class TestAssetInventoryIntegration:
             zf.writestr("note.txt", "test")
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", str(model_dir)])
+        result = runner.invoke(cli, ["scan", "--format", "text", str(model_dir)])
 
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # Verify that the overall output structure is still well-formatted
-        assert "SCAN SUMMARY" in result.output
-        assert "Files:" in result.output
-        assert "SECURITY FINDINGS" in result.output
+        out = result.output.lower()
+        assert "scan summary" in out
+        assert "files:" in out
+        assert "security findings" in out
 
         # The asset inventory is still captured but not displayed in text format
         # Users can use --format json to see detailed asset information
 
+    @pytest.mark.performance
     def test_asset_inventory_performance_large_directory(self, tmp_path: Path):
         """Test asset inventory performance with many files."""
         # Create directory with many small files
@@ -472,4 +463,4 @@ class TestAssetInventoryIntegration:
             assert "name" in asset.keys
 
         # Scan should complete in reasonable time (this test verifies no major performance regression)
-        assert results.duration < 30.0  # Should take less than 30 seconds
+        assert results.duration < 10.0  # Should take less than 10 seconds

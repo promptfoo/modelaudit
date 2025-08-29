@@ -75,7 +75,7 @@ class SecureFileHasher:
         if file_size <= self.full_hash_threshold:
             return self._secure_full_hash_with_stat(file_path, file_stat)
         else:
-            logger.info(f"Large file ({file_size / 1024**3:.1f}GB), using enhanced fingerprint for {file_path}")
+            logger.debug(f"Large file ({file_size / 1024**3:.1f}GB), using enhanced fingerprint for {file_path}")
             return self._secure_enhanced_fingerprint_with_stat(file_path, file_stat)
 
     def _secure_full_hash(self, file_path: str) -> str:

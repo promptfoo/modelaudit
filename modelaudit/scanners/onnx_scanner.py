@@ -97,19 +97,30 @@ class OnnxScanner(BaseScanner):
                 model_data = f.read()
             # Check for interrupts after file reading
             self.check_interrupted()
-            self.check_for_jit_script_code(
+            # Collect findings without creating individual checks
+            jit_findings = self.collect_jit_script_findings(
                 model_data,
-                result,
                 model_type="onnx",
                 context=path,
             )
-
-            # Check for network communication patterns
-            self.check_for_network_communication(
+            network_findings = self.collect_network_communication_findings(
                 model_data,
-                result,
                 context=path,
             )
+
+            # Create single aggregated checks for the file (only if checks are enabled)
+            check_jit = self._get_bool_config("check_jit_script", True)
+            if check_jit:
+                self.summarize_jit_script_findings(jit_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+            check_net = self._get_bool_config("check_network_comm", True)
+            if check_net:
+                self.summarize_network_communication_findings(network_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+
         except Exception as e:
             # Log but don't fail the scan
             result.add_check(
