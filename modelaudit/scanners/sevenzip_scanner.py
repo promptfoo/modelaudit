@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import Any, ClassVar, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 if TYPE_CHECKING:
     import py7zr as _py7zr
