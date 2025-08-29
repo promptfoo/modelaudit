@@ -66,6 +66,8 @@ pybcj==1.0.6
 pycryptodomex==3.23.0
     # via py7zr
 pydantic==2.11.7
+    # via fastapi
+    # via mlflow-skinny
     # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
