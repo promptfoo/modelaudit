@@ -44,6 +44,8 @@ boolean-py==5.0
     # via license-expression
 botocore==1.38.27
     # via aiobotocore
+brotli==1.1.0
+    # via py7zr
 cachetools==5.5.2
     # via google-auth
     # via mlflow-skinny
@@ -166,6 +168,8 @@ idna==3.10
 importlib-metadata==8.7.0
     # via mlflow-skinny
     # via opentelemetry-api
+inflate64==1.0.3
+    # via py7zr
 iniconfig==2.1.0
     # via pytest
 itsdangerous==2.2.0
@@ -217,6 +221,8 @@ multidict==6.6.0
     # via aiobotocore
     # via aiohttp
     # via yarl
+multivolumefile==0.2.3
+    # via py7zr
 mypy==1.16.1
 mypy-extensions==1.1.0
     # via mypy
@@ -294,8 +300,12 @@ protobuf==5.29.5
     # via proto-plus
     # via tensorboard
     # via tensorflow
+psutil==7.0.0
+    # via py7zr
 py-serializable==2.0.0
     # via cyclonedx-python-lib
+py7zr==1.0.0
+    # via modelaudit
 pyaml==25.7.0
     # via coremltools
 pyarrow==20.0.0
@@ -305,9 +315,14 @@ pyasn1==0.6.1
     # via rsa
 pyasn1-modules==0.4.2
     # via google-auth
+pybcj==1.0.6
+    # via py7zr
+pycryptodomex==3.23.0
+    # via py7zr
 pydantic==2.11.7
     # via fastapi
     # via mlflow-skinny
+    # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
 pygments==2.19.2
@@ -315,6 +330,8 @@ pygments==2.19.2
     # via rich
 pyparsing==3.2.3
     # via matplotlib
+pyppmd==1.2.0
+    # via py7zr
 pytest==8.4.1
     # via pytest-asyncio
     # via pytest-cov
@@ -337,6 +354,8 @@ pyyaml==6.0.2
     # via mlflow-skinny
     # via modelaudit
     # via pyaml
+pyzstd==0.17.0
+    # via py7zr
 requests==2.32.4
     # via databricks-sdk
     # via docker
@@ -402,6 +421,8 @@ tensorflow-io-gcs-filesystem==0.37.1
 termcolor==2.3.0
     # via tensorflow
     # via yaspin
+texttable==1.7.0
+    # via py7zr
 tflite==2.18.0
     # via modelaudit
 threadpoolctl==3.6.0
@@ -434,6 +455,7 @@ typing-extensions==4.14.0
     # via optree
     # via pydantic
     # via pydantic-core
+    # via pyzstd
     # via sqlalchemy
     # via tensorflow
     # via torch
