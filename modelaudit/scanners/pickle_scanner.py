@@ -3533,7 +3533,10 @@ class PickleScanner(BaseScanner):
                                 message=f"Detected pattern: {getattr(pattern, 'pattern_type', 'unknown')}",
                                 severity=IssueSeverity.WARNING,
                                 location=path,
-                                details={"pattern": getattr(pattern, "pattern_type", "unknown"), "confidence": getattr(pattern, "confidence", 0.0)},
+                                details={
+                                    "pattern": getattr(pattern, "pattern_type", "unknown"),
+                                    "confidence": getattr(pattern, "confidence", 0.0),
+                                },
                             )
                 except Exception:
                     pass  # Skip pattern detection on error
