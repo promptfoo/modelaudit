@@ -433,7 +433,7 @@ class TestAssetInventoryIntegration:
             zf.writestr("note.txt", "test")
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", str(model_dir)])
+        result = runner.invoke(cli, ["scan", "--format", "text", str(model_dir)])
 
         # Note: SCANNED FILES section was removed to reduce output verbosity
         # Verify that the overall output structure is still well-formatted

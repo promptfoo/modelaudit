@@ -79,7 +79,7 @@ def test_cli_skip_message_in_verbose():
         (Path(tmp_dir) / "model.pkl").write_bytes(b"model")
 
         # Run scan in verbose mode
-        result = runner.invoke(cli, ["scan", "--verbose", tmp_dir])
+        result = runner.invoke(cli, ["scan", "--format", "text", "--verbose", tmp_dir])
 
         # The model.pkl should be mentioned in the output
         assert "model.pkl" in result.output or "pickle" in result.output.lower()

@@ -540,7 +540,7 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/malicious-model"])
+    result = runner.invoke(cli, ["scan", "--format", "text", "--no-cache", "hf://test/malicious-model"])
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
@@ -757,7 +757,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "models:/TestModel/1"], env={"MLFLOW_TRACKING_URI": "http://localhost:5000"})
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"], env={"MLFLOW_TRACKING_URI": "http://localhost:5000"})
 
     # Should succeed
     assert result.exit_code == 0
@@ -962,7 +962,7 @@ def test_exit_code_clean_scan(tmp_path):
         pickle.dump(data, f)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file)])
+    result = runner.invoke(cli, ["scan", "--format", "text", str(test_file)])
 
     # Should exit with code 0 for clean scan
     assert result.exit_code == 0, f"Expected exit code 0, got {result.exit_code}. Output: {result.output}"
@@ -986,7 +986,7 @@ def test_exit_code_security_issues(tmp_path):
         pickle.dump(MaliciousClass(), f)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(evil_pickle_path)])
+    result = runner.invoke(cli, ["scan", "--format", "text", str(evil_pickle_path)])
 
     # Should exit with code 1 for security findings
     assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
