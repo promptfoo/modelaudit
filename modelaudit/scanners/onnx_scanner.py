@@ -1,3 +1,4 @@
+import contextlib
 import os
 from pathlib import Path
 from typing import Any, ClassVar
@@ -13,10 +14,8 @@ try:
     try:
         from onnx import mapping  # type: ignore[no-redef]
     except ImportError:
-        try:
+        with contextlib.suppress(ImportError):
             from onnx.onnx_cpp2py_export import mapping  # type: ignore[no-redef] # Fallback for older versions
-        except ImportError:
-            pass  # mapping remains None
 
     HAS_ONNX = True
 except Exception:
