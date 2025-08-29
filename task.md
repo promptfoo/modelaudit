@@ -1,269 +1,121 @@
-# Enhanced Pickle Static Analysis - Task Specification
+# CLI Flag Consolidation Plan
 
-## Overview
+## Goal
 
-Enhance ModelAudit's pickle scanner with advanced static analysis capabilities to detect sophisticated pickle-based attacks while maintaining the security-first approach of never executing pickle code.
+Reduce ModelAudit CLI complexity from 25 flags to 12 flags (-52%) through smart detection and consolidation.
 
-## Current State Analysis
+## Smart Detection Handles Most Complexity
 
-ModelAudit's pickle scanner (`modelaudit/scanners/pickle_scanner.py`) already has:
+### Auto-detect based on input:
 
-- ✅ Safe static-only analysis using `pickletools.genops()`
-- ✅ Individual opcode detection for dangerous operations
-- ✅ Raw byte pattern matching for suspicious strings
-- ✅ Basic stack depth tracking
-- ✅ CVE signature matching
+- `s3://`, `gs://` → Enable caching, reasonable size limits
+- `hf://`, `huggingface.co` → Selective download
+- `models://` → MLflow mode (registry detection)
+- `.jfrog.io` URLs → JFrog auth from env vars only
+- Local file > 1GB → Large model optimizations
+- Directory → Skip non-model files automatically
+- TTY detection → Colors on/off, spinner behavior
 
-## Phase 1 Implementation (High Impact, Low Risk)
+## New CLI Interface (12 flags)
 
-### 1. Advanced Opcode Sequence Analysis
+### Core output control (4)
 
-**Goal:** Detect dangerous opcode chains that individually safe opcodes become dangerous when combined.
+- `--format/-f [text|json|sarif]` - Output format
+- `--output/-o FILE` - Output file
+- `--verbose/-v` - Verbosity
+- `--quiet/-q` - Silence detection messages
 
-**Current Issue:** Scanner checks `GLOBAL 'os' 'system'` and `REDUCE` separately, missing the attack pattern.
+### Security behavior (2)
 
-**Enhancement:**
+- `--blacklist/-b PATTERN` - Additional patterns
+- `--strict` - Fail on any warnings
 
-```python
-# Detect attack patterns:
-GLOBAL 'os' 'system' → REDUCE = os.system() call
-STACK_GLOBAL → BUILD_TUPLE → REDUCE = dynamic import with args
-INST 'subprocess' 'Popen' → BUILD_LIST → REDUCE = process execution
+### Progress & reporting (2)
+
+- `--progress` - Force enable progress (auto-detected by default)
+- `--sbom FILE` - Generate SBOM file
+
+### Override smart detection (2)
+
+- `--timeout/-t SECONDS` - Override auto-detected timeout
+- `--max-size SIZE` - Override auto-detected size limits
+
+### Preview/debugging (2)
+
+- `--dry-run` - Preview what would happen
+- `--no-cache` - Force disable caching
+
+## Flags to Remove (13 eliminated)
+
+### Auto-detected instead:
+
+- `--large-model-support/--no-large-model-support` → Auto-enabled for files >1GB
+- `--selective/--all-files` → Auto-enabled for cloud directories
+- `--cache/--cache-dir` → Smart defaults based on input type
+- `--max-file-size/--max-total-size/--max-download-size` → Single `--max-size`
+- `--no-skip-files/--skip-files` → Controlled by `--strict` mode
+- `--stream` → Auto-enabled for very large cloud files
+
+### Moved to env vars only:
+
+- `--jfrog-api-token/--jfrog-access-token` → `JFROG_*` env vars
+- `--registry-uri` → `MLFLOW_TRACKING_URI` env var
+
+### Removed (rarely used/consolidated):
+
+- `--progress-log/--progress-format/--progress-interval` → Smart defaults only
+- `--preview` → Replaced by `--dry-run`
+- `--strict-license` → Part of `--strict` mode
+
+## Implementation Steps
+
+### Phase 1: Add Smart Detection Logic
+
+1. Create detection utilities in `modelaudit/utils/smart_detection.py`
+2. Implement input type detection (cloud, local, registry)
+3. Implement file size detection for large model optimizations
+4. Implement TTY detection for UI behavior
+
+### Phase 2: Update CLI Interface
+
+1. Add new consolidated flags (`--quiet`, `--strict`, `--dry-run`, `--no-cache`)
+2. Update existing flags to use smart detection as defaults
+3. Remove deprecated flags from CLI definition
+4. Update help text and documentation
+
+### Phase 3: Update Core Logic
+
+1. Modify `scan_command()` to use smart detection
+2. Update default value logic throughout the scanning pipeline
+3. Ensure all removed flag functionality is preserved through detection
+4. Update tests to reflect new interface
+
+### Phase 4: Documentation & Migration
+
+1. Update all examples in README and docs
+2. Update CLAUDE.md with new flag usage
+3. Ensure backward compatibility where possible
+4. Create migration guide for existing users
+
+## Expected User Experience
+
+```bash
+# Simple case - just works
+modelaudit scan model.pkl
+
+# Cloud case - auto-detects and handles complexity
+modelaudit scan s3://bucket/models/
+
+# Force progress + generate SBOM
+modelaudit scan models/ --progress --sbom audit.json
+
+# Override only when needed
+modelaudit scan huge-model.pt --max-size 20GB --timeout 7200 --strict
 ```
 
-**Implementation:**
-
-- Add `OpcodeSequenceAnalyzer` class
-- Track sliding window of recent opcodes
-- Pattern matching for known attack sequences
-- Context-aware severity scoring
-
-### 2. Enhanced Pattern Detection
-
-**Goal:** Make string pattern detection context-aware and ML framework intelligent.
-
-**Current Issue:** High false positives on legitimate ML framework operations.
-
-**Enhancement:**
-
-- Distinguish `torch.load()` vs `pickle.load()` contexts
-- Analyze function arguments, not just function names
-- Detect obfuscated imports (`__import__`, `getattr`)
-- Context-aware severity (ML operations vs system calls)
-
-**Implementation:**
-
-- Extend `_scan_for_dangerous_patterns()` method
-- Add ML framework knowledge base
-- Implement argument flow analysis
-- Reduce false positives for legitimate model operations
-
-### 3. ML Context Awareness
-
-**Goal:** Reduce false positives by understanding legitimate ML model operations.
-
-**Current Issue:** Legitimate PyTorch/TensorFlow operations flagged as suspicious.
-
-**Enhancement:**
-
-- Whitelist known safe ML framework patterns
-- Distinguish model parameter loading from arbitrary code execution
-- Analyze import context (ML libs vs system libs)
-- Framework-specific risk scoring
-
-**Implementation:**
-
-- Create `MLFrameworkKnowledgeBase` class
-- Update severity scoring based on ML context
-- Add framework-specific whitelisting
-- Improve issue explanations with ML context
-
-## Implementation Plan
-
-### File Structure
-
-```
-modelaudit/analysis/
-├── __init__.py
-├── opcode_sequence_analyzer.py  # NEW: Advanced opcode analysis
-├── ml_context_analyzer.py       # NEW: ML framework awareness
-└── enhanced_pattern_detector.py # NEW: Context-aware patterns
-```
-
-### Integration Points
-
-- Extend `pickle_scanner.py._scan_pickle_bytes()` method
-- Add new analyzers to the opcode processing loop
-- Enhance existing `_scan_for_dangerous_patterns()` method
-- Update issue severity scoring and explanations
-
-### Testing Strategy
-
-#### 1. Regression Testing
-
-- Ensure all existing detections still work
-- Verify no performance degradation on large files
-- Maintain compatibility with existing API
-
-#### 2. New Vulnerability Detection
-
-Create test cases for previously undetected attacks:
-
-```python
-# Test Case 1: Chained function calls
-GLOBAL 'builtins' 'eval'
-GLOBAL 'base64' 'b64decode'
-# ... attack sequence
-
-# Test Case 2: Obfuscated imports
-STACK_GLOBAL  # dynamic __import__
-BUILD_TUPLE
-REDUCE
-# ... hidden subprocess call
-
-# Test Case 3: ML framework exploitation
-# Legitimate-looking torch operation that executes code
-```
-
-#### 3. False Positive Reduction
-
-Test legitimate ML models to ensure clean scans:
-
-- Standard PyTorch models (ResNet, BERT, etc.)
-- TensorFlow SavedModel files
-- Hugging Face transformers
-- scikit-learn pickle models
-
-### Success Metrics
-
-#### Detection Improvements
-
-- [ ] Detect chained opcode attack sequences (new capability)
-- [ ] Identify obfuscated import patterns (new capability)
-- [ ] Catch argument-based attacks (enhanced capability)
-- [ ] Maintain 100% detection of existing test cases
-
-#### False Positive Reduction
-
-- [ ] <5% false positive rate on legitimate ML models
-- [ ] Clear explanations distinguishing ML ops from attacks
-- [ ] Framework-aware risk scoring
-- [ ] Improved user experience with actionable feedback
-
-#### Performance
-
-- [ ] <10% performance impact on large pickle files
-- [ ] Memory usage remains bounded
-- [ ] Maintain real-time scanning capabilities
-
-## Phase 2 & 3 (Future Enhancements)
-
-### Phase 2: Advanced Analysis
-
-- Data flow tracking through pickle stack
-- Obfuscation detection and decoding
-- Resource consumption prediction
-- Cross-file reference analysis
-
-### Phase 3: Deep Analysis
-
-- Control flow graph construction
-- Complex execution path analysis
-- Behavioral pattern recognition
-- Advanced ML security research integration
-
-## Testing Plan
-
-### 1. Unit Tests
-
-- Individual analyzer component tests
-- Opcode sequence pattern matching tests
-- ML context recognition tests
-- Performance benchmarks
-
-### 2. Integration Tests
-
-- End-to-end pickle scanning with new analyzers
-- Compatibility with existing scanner infrastructure
-- Large file handling verification
-
-### 3. Security Tests
-
-- Known CVE reproduction tests
-- Novel attack pattern detection tests
-- Adversarial test case generation
-- Red team collaboration for attack validation
-
-### 4. Real-World Validation
-
-- Scan popular ML model repositories
-- Test against Hugging Face model hub samples
-- Validate against PyTorch model zoo
-- Community feedback collection
-
-## Deliverables
-
-### Code Deliverables
-
-- [ ] `OpcodeSequenceAnalyzer` implementation
-- [ ] `MLContextAnalyzer` implementation
-- [ ] Enhanced pattern detection system
-- [ ] Comprehensive test suite
-- [ ] Performance benchmarks
-- [ ] Documentation updates
-
-### Validation Deliverables
-
-- [ ] Before/after detection comparison report
-- [ ] False positive reduction metrics
-- [ ] Performance impact analysis
-- [ ] Security research paper (optional)
-
-## Risk Mitigation
-
-### Security Risks
-
-- **Risk:** New code introduces vulnerabilities
-- **Mitigation:** Static analysis only, no pickle execution, comprehensive testing
-
-### Performance Risks
-
-- **Risk:** Analysis overhead impacts usability
-- **Mitigation:** Incremental implementation, performance monitoring, optimization
-
-### Compatibility Risks
-
-- **Risk:** Breaking changes to existing functionality
-- **Mitigation:** Extensive regression testing, gradual rollout, feature flags
-
-## Timeline
-
-### Week 1-2: Foundation
-
-- Implement `OpcodeSequenceAnalyzer`
-- Create basic test framework
-- Integration with existing scanner
-
-### Week 3-4: Enhancement
-
-- Add ML context awareness
-- Implement enhanced pattern detection
-- Comprehensive testing
-
-### Week 5-6: Validation
-
-- End-to-end testing
-- Performance optimization
-- Documentation and PR preparation
-
-## Success Criteria
-
-This implementation is successful if:
-
-1. **New detections:** Catches attack patterns that bypass current scanner
-2. **Reduced false positives:** <5% false positive rate on legitimate ML models
-3. **Performance maintained:** <10% impact on scanning speed
-4. **Security preserved:** Zero risk of pickle execution
-5. **User experience:** Clear, actionable security feedback
-
-The goal is to significantly advance ModelAudit's pickle security analysis while maintaining its core security principles and usability.
+## Success Metrics
+
+- CLI help output is significantly shorter and more focused
+- Common use cases require fewer flags
+- All existing functionality is preserved
+- Tests continue to pass with updated interface

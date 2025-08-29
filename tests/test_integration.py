@@ -57,7 +57,7 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
 def test_cli_scan_directory(temp_model_dir):
     """Test scanning a directory with multiple models using the CLI."""
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(temp_model_dir)])
+    result = runner.invoke(cli, ["scan", "--format", "text", str(temp_model_dir)])
 
     # Exit code should be deterministic based on content
     # The temp_model_dir contains real models that should be clean
@@ -135,7 +135,7 @@ def test_cli_with_all_options(temp_model_dir):
             str(output_file),
             "--timeout",
             "60",
-            "--max-file-size",
+            "--max-size",
             "1000000",
             "--verbose",
         ],

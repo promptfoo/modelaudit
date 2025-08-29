@@ -249,7 +249,7 @@ def show_usage_examples():
         },
         {
             "description": "Scan with custom file size limits",
-            "command": "modelaudit scan ./large_model --max-file-size 1073741824",
+            "command": "modelaudit scan ./large_model --max-size 1GB",
         },
     ]
 
