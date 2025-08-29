@@ -60,9 +60,9 @@ class TestCLILicenseIntegration:
         """Test CLI scanning of AGPL component triggers warnings."""
         agpl_dir = test_data_dir / "agpl_component"
 
-        # Run CLI scan with --no-skip-files to scan the .py file containing AGPL license
+        # Run CLI scan with --strict to scan the .py file containing AGPL license
         result = subprocess.run(
-            [*cli_command, "scan", str(agpl_dir), "--format", "json", "--no-skip-files"],
+            [*cli_command, "scan", str(agpl_dir), "--format", "json", "--strict"],
             capture_output=True,
             text=True,
         )

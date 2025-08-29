@@ -135,7 +135,7 @@ def test_cli_with_all_options(temp_model_dir):
             str(output_file),
             "--timeout",
             "60",
-            "--max-file-size",
+            "--max-size",
             "1000000",
             "--verbose",
         ],
