@@ -9,13 +9,14 @@ try:
     import onnx
 
     # Handle different ONNX versions - mapping module location changed
+    mapping = None
     try:
-        from onnx import mapping
+        from onnx import mapping  # type: ignore[no-redef]
     except ImportError:
         try:
-            from onnx.onnx_cpp2py_export import mapping  # Fallback for older versions
+            from onnx.onnx_cpp2py_export import mapping  # type: ignore[no-redef] # Fallback for older versions
         except ImportError:
-            mapping = None
+            pass  # mapping remains None
 
     HAS_ONNX = True
 except Exception:
@@ -257,7 +258,7 @@ class OnnxScanner(BaseScanner):
         try:
             if mapping is None:
                 return  # Skip if mapping is not available
-            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])  # type: ignore[unreachable]
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
@@ -306,7 +307,7 @@ class OnnxScanner(BaseScanner):
                 try:
                     if mapping is None:
                         continue  # Skip if mapping is not available
-                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])  # type: ignore[unreachable]
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d
