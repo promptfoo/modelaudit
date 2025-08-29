@@ -15,7 +15,7 @@ try:
         TENSOR_TYPE_TO_NP_TYPE = mapping.TENSOR_TYPE_TO_NP_TYPE
     except (ImportError, AttributeError):
         # Fallback for newer ONNX versions - define basic mapping manually
-        TENSOR_TYPE_TO_NP_TYPE = {
+        TENSOR_TYPE_TO_NP_TYPE = {  # type: ignore[assignment]
             1: np.float32,
             2: np.uint8,
             3: np.int8,

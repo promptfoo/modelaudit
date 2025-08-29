@@ -925,10 +925,9 @@ class PickleScanner(BaseScanner):
             try:
                 fickling_result = self._run_fickling_analysis(path, result)
                 if fickling_result is not None:
-                    # Fickling analysis completed - enhance with our comprehensive analysis
+                    # Fickling analysis completed - now run comprehensive analysis as well
                     result.metadata["fickling_enhanced"] = True
-                    self._enhance_result_with_comprehensive_analysis(result, path)
-                    return result
+                    # Continue to comprehensive analysis - don't return early
             except Exception as e:
                 # Fickling failed - add warning but continue with comprehensive analysis
                 result.metadata["fickling_error"] = str(e)
