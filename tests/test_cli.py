@@ -757,7 +757,9 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"], env={"MLFLOW_TRACKING_URI": "http://localhost:5000"})
+    result = runner.invoke(
+        cli, ["scan", "--format", "text", "models:/TestModel/1"], env={"MLFLOW_TRACKING_URI": "http://localhost:5000"}
+    )
 
     # Should succeed
     assert result.exit_code == 0
