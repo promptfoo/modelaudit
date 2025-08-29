@@ -1,0 +1,395 @@
+{
+  "bytes_scanned": 78,
+  "issues": [
+    {
+      "message": "Detected dynamic_import pattern: '__import__('",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "pattern_type": "dynamic_import",
+        "matches_found": 1,
+        "confidence": 0.7999999999999999,
+        "ml_risk_adjustment": 1.0,
+        "effective_severity": "critical",
+        "detection_method": "enhanced_pattern_detection"
+      },
+      "why": "The pattern 'dynamic_import' indicates potential dynamic_import risks.",
+      "timestamp": 1756442211.8350961,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Legacy dangerous pattern detected: __import__",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "pattern": "__import__",
+        "detection_method": "legacy_pattern_matching"
+      },
+      "timestamp": 1756442211.8351738,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious reference builtins.exec",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "module": "builtins",
+        "function": "exec",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "Direct access to builtin functions can be used to bypass restrictions or access dangerous functionality like eval/exec.",
+      "timestamp": 1756442211.843401,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious string pattern: __import__\\s*\\( (validated as executable code: Dynamic code execution: __import__)",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 31)",
+      "details": {
+        "position": 31,
+        "opcode": "SHORT_BINUNICODE",
+        "pattern": "__import__\\s*\\( (validated as executable code: Dynamic code execution: __import__)",
+        "string_preview": "__import__(\"os\").system(\"echo getattr\")",
+        "ml_context_confidence": 0.0
+      },
+      "why": "This string contains patterns that match known security risks such as shell commands, code execution functions, or encoded data.",
+      "timestamp": 1756442211.8458219,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Found REDUCE opcode - potential __reduce__ method execution",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 75)",
+      "details": {
+        "position": 75,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.0,
+        "entropy_classification": "unknown",
+        "entropy_confidence": 0.0
+      },
+      "why": "The REDUCE opcode calls a callable with arguments, effectively executing arbitrary Python functions. This is the primary mechanism for pickle-based code execution attacks through __reduce__ methods.",
+      "timestamp": 1756442211.846245,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious module reference found: builtins.exec",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 29)",
+      "details": {
+        "module": "builtins",
+        "function": "exec",
+        "position": 29,
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "Direct access to builtin functions can be used to bypass restrictions or access dangerous functionality like eval/exec.",
+      "timestamp": 1756442211.846288,
+      "type": "pickle_check"
+    }
+  ],
+  "checks": [
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "path": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl"
+      },
+      "timestamp": 1756442211.833806
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "path": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl"
+      },
+      "timestamp": 1756442211.833822
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {},
+      "timestamp": 1756442211.833877
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "md5": "f8861c1b448533f5ee52596dcbe55128",
+        "sha256": "1d9b1cfe6e528a69990bc4a7ea5d22bc279cf29fafd27ad730cdb34b282f6ea8",
+        "sha512": "79a497cf6956390f7a59a2b6ac8fde9c579c0f4b8ace0bf9a48cbe6fe667f8874eceef5c4fd48188a0728339315778f904e71f2fd33a7974f597850bdc13dc5b",
+        "file_size": 78
+      },
+      "timestamp": 1756442211.8339279
+    },
+    {
+      "name": "Enhanced Pattern Detection: Dynamic Import",
+      "status": "failed",
+      "message": "Detected dynamic_import pattern: '__import__('",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "component_count": 2,
+        "findings": [
+          {
+            "pattern_type": "dynamic_import",
+            "matches_found": 1,
+            "confidence": 0.7999999999999999,
+            "ml_risk_adjustment": 1.0,
+            "effective_severity": "critical",
+            "detection_method": "enhanced_pattern_detection"
+          },
+          {
+            "pattern_type": "dynamic_import",
+            "matches_found": 1,
+            "confidence": 0.7999999999999999,
+            "ml_risk_adjustment": 1.0,
+            "effective_severity": "critical",
+            "detection_method": "enhanced_pattern_detection"
+          }
+        ]
+      },
+      "why": "The pattern 'dynamic_import' indicates potential dynamic_import risks.",
+      "timestamp": 1756442211.8353841
+    },
+    {
+      "name": "Legacy Pattern Detection",
+      "status": "failed",
+      "message": "Legacy dangerous pattern detected: __import__",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "component_count": 2,
+        "findings": [
+          {
+            "pattern": "__import__",
+            "detection_method": "legacy_pattern_matching"
+          },
+          {
+            "pattern": "__import__",
+            "detection_method": "legacy_pattern_matching"
+          }
+        ]
+      },
+      "timestamp": 1756442211.8354099
+    },
+    {
+      "name": "Dangerous Pattern Detection",
+      "status": "passed",
+      "message": "No dangerous patterns found in raw file content",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "detection_method": "raw_content_scan",
+        "patterns_checked": [
+          "posix",
+          "subprocess",
+          "eval",
+          "exec",
+          "__import__",
+          "builtins"
+        ]
+      },
+      "timestamp": 1756442211.835213
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {},
+      "timestamp": 1756442211.840849
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756442211.843276
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756442211.8432808
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 4",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "protocol_version": 4
+      },
+      "timestamp": 1756442211.843284
+    },
+    {
+      "name": "Opcode Count Check",
+      "status": "passed",
+      "message": "Opcode count (15) is within limits",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "opcode_count": 15,
+        "max_opcodes": 1000000
+      },
+      "timestamp": 1756442211.843366
+    },
+    {
+      "name": "Stack Depth Validation",
+      "status": "passed",
+      "message": "Maximum stack depth (0) is within safe limits",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "max_depth_reached": 0,
+        "ml_adjusted_limit": 1000,
+        "base_limit": 1000,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756442211.84339
+    },
+    {
+      "name": "Advanced Global Reference Check",
+      "status": "failed",
+      "message": "Suspicious reference builtins.exec",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "module": "builtins",
+        "function": "exec",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "Direct access to builtin functions can be used to bypass restrictions or access dangerous functionality like eval/exec.",
+      "timestamp": 1756442211.8433979
+    },
+    {
+      "name": "String Pattern Security Check",
+      "status": "failed",
+      "message": "Suspicious string pattern: __import__\\s*\\( (validated as executable code: Dynamic code execution: __import__)",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 31)",
+      "details": {
+        "position": 31,
+        "opcode": "SHORT_BINUNICODE",
+        "pattern": "__import__\\s*\\( (validated as executable code: Dynamic code execution: __import__)",
+        "string_preview": "__import__(\"os\").system(\"echo getattr\")",
+        "ml_context_confidence": 0.0
+      },
+      "why": "This string contains patterns that match known security risks such as shell commands, code execution functions, or encoded data.",
+      "timestamp": 1756442211.845811
+    },
+    {
+      "name": "REDUCE Opcode Safety Check",
+      "status": "failed",
+      "message": "Found REDUCE opcode - potential __reduce__ method execution",
+      "severity": "warning",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 75)",
+      "details": {
+        "position": 75,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.0,
+        "entropy_classification": "unknown",
+        "entropy_confidence": 0.0
+      },
+      "why": "The REDUCE opcode calls a callable with arguments, effectively executing arbitrary Python functions. This is the primary mechanism for pickle-based code execution attacks through __reduce__ methods.",
+      "timestamp": 1756442211.846241
+    },
+    {
+      "name": "STACK_GLOBAL Module Check",
+      "status": "failed",
+      "message": "Suspicious module reference found: builtins.exec",
+      "severity": "critical",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl (pos 29)",
+      "details": {
+        "module": "builtins",
+        "function": "exec",
+        "position": 29,
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "Direct access to builtin functions can be used to bypass restrictions or access dangerous functionality like eval/exec.",
+      "timestamp": 1756442211.846285
+    },
+    {
+      "name": "Reduce Pattern Analysis",
+      "status": "passed",
+      "message": "No dangerous __reduce__ patterns detected",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "opcode_count": 15,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756442211.846328
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "passed",
+      "message": "No suspicious opcode sequences detected",
+      "location": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "details": {
+        "opcode_count": 15,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756442211.846338
+    }
+  ],
+  "files_scanned": 1,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl",
+      "type": "pickle",
+      "size": 78
+    }
+  ],
+  "has_errors": false,
+  "scanner_names": [],
+  "file_metadata": {
+    "/Users/mdangelo/projects/modelaudit/getattr_payload.pkl": {
+      "file_size": 78,
+      "file_hashes": {
+        "md5": "f8861c1b448533f5ee52596dcbe55128",
+        "sha256": "1d9b1cfe6e528a69990bc4a7ea5d22bc279cf29fafd27ad730cdb34b282f6ea8",
+        "sha512": "79a497cf6956390f7a59a2b6ac8fde9c579c0f4b8ace0bf9a48cbe6fe667f8874eceef5c4fd48188a0728339315778f904e71f2fd33a7974f597850bdc13dc5b"
+      },
+      "max_stack_depth": 0,
+      "opcode_count": 15,
+      "suspicious_count": 2,
+      "ml_context": {
+        "frameworks": {},
+        "overall_confidence": 0.0,
+        "is_ml_content": false,
+        "detected_patterns": [],
+        "optimization_hints": []
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": ["/Users/mdangelo/projects/modelaudit/LICENSE"],
+      "is_dataset": true,
+      "is_model": true,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756442211.86865
+    }
+  },
+  "start_time": 1756442211.497618,
+  "duration": 0.4654121398925781,
+  "total_checks": 19,
+  "passed_checks": 13,
+  "failed_checks": 6,
+  "success": true
+}

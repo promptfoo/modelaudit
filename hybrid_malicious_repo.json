@@ -1,0 +1,1590 @@
+{
+  "bytes_scanned": 265501945,
+  "issues": [
+    {
+      "message": "PyTorch model contains dangerous opcodes (GLOBAL, STACK_GLOBAL) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["GLOBAL", "STACK_GLOBAL"],
+        "code_execution_risks": [
+          "Dynamic import and attribute access",
+          "Module import and attribute access",
+          "Direct code execution patterns"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441703.1713002,
+      "type": "pytorch_zip_check"
+    },
+    {
+      "message": "Detected code_eval pattern: 'exec('",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern_type": "code_eval",
+        "matches_found": 1,
+        "confidence": 0.7999999999999999,
+        "ml_risk_adjustment": 1.0,
+        "effective_severity": "critical",
+        "detection_method": "enhanced_pattern_detection",
+        "pickle_filename": "archive/data.pkl"
+      },
+      "why": "The pattern 'code_eval' indicates potential code_execution risks.",
+      "timestamp": 1756441703.1441548,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Detected file_operations pattern: 'open('",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern_type": "file_operations",
+        "matches_found": 1,
+        "confidence": 0.7999999999999999,
+        "ml_risk_adjustment": 1.0,
+        "effective_severity": "warning",
+        "detection_method": "enhanced_pattern_detection",
+        "pickle_filename": "archive/data.pkl"
+      },
+      "why": "The pattern 'file_operations' indicates potential file_access risks.",
+      "timestamp": 1756441703.144275,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Legacy dangerous pattern detected: exec(",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern": "exec(",
+        "detection_method": "legacy_pattern_matching",
+        "pickle_filename": "archive/data.pkl"
+      },
+      "timestamp": 1756441703.144342,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Legacy dangerous pattern detected: open(",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern": "open(",
+        "detection_method": "legacy_pattern_matching",
+        "pickle_filename": "archive/data.pkl"
+      },
+      "timestamp": 1756441703.144386,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Detected CVE-2025-32434 exploitation pattern: Code execution function (__builtin__ eval) with string payload",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl /Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "pattern_type": "eval_exec_with_payload",
+        "description": "Code execution function (__builtin__ eval) with string payload",
+        "opcodes_involved": ["GLOBAL", "BINUNICODE"],
+        "exploitation_method": "Direct code execution via eval/exec",
+        "position": 2,
+        "dangerous_count": 0,
+        "file_size_mb": 0,
+        "opcode_density_per_mb": 0,
+        "threshold_used": 0,
+        "severity_level": "critical",
+        "confidence_score": 0,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "timestamp": 1756441703.1695302,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious reference __builtin__.eval",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "module": "__builtin__",
+        "function": "eval",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.315,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "timestamp": 1756441703.169633,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious reference __builtin__.eval",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl /Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "module": "__builtin__",
+        "function": "eval",
+        "position": 2,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.315,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "timestamp": 1756441703.169664,
+      "type": "pickle_check"
+    },
+    {
+      "message": "PyTorch model contains dangerous opcodes (REDUCE, NEWOBJ, OBJ) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["REDUCE", "NEWOBJ", "OBJ"],
+        "code_execution_risks": [
+          "__reduce__ method exploitation",
+          "New-style object creation",
+          "Object creation code execution"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441766.556012,
+      "type": "pytorch_zip_check"
+    },
+    {
+      "message": "Detected CVE-2025-32434 exploitation pattern: Elevated dangerous opcode density (10 opcodes, 100.0/MB in 0.0MB file) may indicate CVE-2025-32434 exploitation (confidence: 25%)",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl /Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl (pos 51)",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "pattern_type": "high_risk_opcode_density",
+        "description": "Elevated dangerous opcode density (10 opcodes, 100.0/MB in 0.0MB file) may indicate CVE-2025-32434 exploitation (confidence: 25%)",
+        "opcodes_involved": [
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "REDUCE"
+        ],
+        "exploitation_method": "weights_only=True bypass via opcode density attack",
+        "position": 51,
+        "dangerous_count": 10,
+        "file_size_mb": 0.00505828857421875,
+        "opcode_density_per_mb": 100.0,
+        "threshold_used": 80.0,
+        "severity_level": "critical",
+        "confidence_score": 25,
+        "pickle_filename": "training_args/data.pkl"
+      },
+      "timestamp": 1756441766.55565,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Unable to parse pickle file: ValueError",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "exception": "not enough data in stream to read uint4",
+        "exception_type": "ValueError",
+        "file_extension": ".pkl",
+        "opcodes_analyzed": 14,
+        "file_size": 67
+      },
+      "why": "The file could not be parsed as a valid pickle file. Error: not enough data in stream to read uint4",
+      "timestamp": 1756441766.582568,
+      "type": "pickle_check"
+    },
+    {
+      "message": "PyTorch model contains dangerous opcodes (REDUCE, GLOBAL, STACK_GLOBAL) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["REDUCE", "GLOBAL", "STACK_GLOBAL"],
+        "code_execution_risks": [
+          "__reduce__ method exploitation",
+          "Dynamic import and attribute access",
+          "Module import and attribute access",
+          "Direct code execution patterns"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441766.604116,
+      "type": "pytorch_zip_check"
+    },
+    {
+      "message": "Suspicious reference os.popen",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "module": "os",
+        "function": "popen",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "why": "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system commands, file system manipulation, and environment variable access. Malicious models can use this to compromise the host system, steal data, or install malware.",
+      "timestamp": 1756441766.603622,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Suspicious reference os.popen",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl /Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "module": "os",
+        "function": "popen",
+        "position": 2,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.0,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "why": "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system commands, file system manipulation, and environment variable access. Malicious models can use this to compromise the host system, steal data, or install malware.",
+      "timestamp": 1756441766.603669,
+      "type": "pickle_check"
+    },
+    {
+      "message": "Found REDUCE opcode - potential __reduce__ method execution",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl /Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl (pos 36)",
+      "details": {
+        "position": 36,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.0,
+        "entropy_classification": "unknown",
+        "entropy_confidence": 0.0,
+        "pickle_filename": "archive/data.pkl"
+      },
+      "why": "The REDUCE opcode calls a callable with arguments, effectively executing arbitrary Python functions. This is the primary mechanism for pickle-based code execution attacks through __reduce__ methods.",
+      "timestamp": 1756441766.604033,
+      "type": "pickle_check"
+    }
+  ],
+  "checks": [
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin"
+      },
+      "timestamp": 1756441702.0393002
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin"
+      },
+      "timestamp": 1756441702.0393212
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {},
+      "timestamp": 1756441702.039382
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "md5": "746bc0c404d6b0dc810fa7336a69aeea",
+        "sha256": "b3150dee8d68134057d44c33649cc3e6dc6049fd5c84b337d620fbd0175b0e15",
+        "sha512": "dfa677ecd226e23a1ede623a4fda147c01a09135665d3c7e650a80d72893be23a01bdef222e761172201e6197d9dfa80ac5aa1fae09b36c89ccfccb424acd179",
+        "file_size": 265482553
+      },
+      "timestamp": 1756441703.1281059
+    },
+    {
+      "name": "PyTorch ZIP Format Validation",
+      "status": "passed",
+      "message": "Valid ZIP format detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {},
+      "timestamp": 1756441703.128174
+    },
+    {
+      "name": "Path Traversal Protection",
+      "status": "passed",
+      "message": "All archive entries have safe paths",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "entries_checked": 102
+      },
+      "timestamp": 1756441703.13424
+    },
+    {
+      "name": "CVE-2025-32434 PyTorch Version Check",
+      "status": "passed",
+      "message": "Could not determine PyTorch version from model file",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "version_detection": "failed",
+        "recommendation": "Verify PyTorch version manually - avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
+      },
+      "timestamp": 1756441703.1356401
+    },
+    {
+      "name": "CVE-2025-32434 weights_only=True Safety Warning",
+      "status": "failed",
+      "message": "PyTorch model contains dangerous opcodes (GLOBAL, STACK_GLOBAL) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["GLOBAL", "STACK_GLOBAL"],
+        "code_execution_risks": [
+          "Dynamic import and attribute access",
+          "Module import and attribute access",
+          "Direct code execution patterns"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441703.171295
+    },
+    {
+      "name": "Enhanced Pattern Detection: Code Eval",
+      "status": "failed",
+      "message": "Detected code_eval pattern: 'exec('",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern_type": "code_eval",
+        "matches_found": 1,
+        "confidence": 0.7999999999999999,
+        "ml_risk_adjustment": 1.0,
+        "effective_severity": "critical",
+        "detection_method": "enhanced_pattern_detection"
+      },
+      "why": "The pattern 'code_eval' indicates potential code_execution risks.",
+      "timestamp": 1756441703.144133
+    },
+    {
+      "name": "Enhanced Pattern Detection: File Operations",
+      "status": "failed",
+      "message": "Detected file_operations pattern: 'open('",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern_type": "file_operations",
+        "matches_found": 1,
+        "confidence": 0.7999999999999999,
+        "ml_risk_adjustment": 1.0,
+        "effective_severity": "warning",
+        "detection_method": "enhanced_pattern_detection"
+      },
+      "why": "The pattern 'file_operations' indicates potential file_access risks.",
+      "timestamp": 1756441703.1442719
+    },
+    {
+      "name": "Legacy Pattern Detection",
+      "status": "failed",
+      "message": "Legacy Pattern Detection found 2 issues",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "component_count": 2,
+        "findings": [
+          {
+            "pattern": "exec(",
+            "detection_method": "legacy_pattern_matching"
+          },
+          {
+            "pattern": "open(",
+            "detection_method": "legacy_pattern_matching"
+          }
+        ]
+      },
+      "timestamp": 1756441703.144382
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {},
+      "timestamp": 1756441703.156613
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441765.167745
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441765.1677551
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 2",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "protocol_version": 2
+      },
+      "timestamp": 1756441703.162709
+    },
+    {
+      "name": "Opcode Count Check",
+      "status": "passed",
+      "message": "Opcode count (3093) is within limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 3093,
+        "max_opcodes": 1000000
+      },
+      "timestamp": 1756441703.1687338
+    },
+    {
+      "name": "CVE-2025-32434 Opcode Sequence Detection",
+      "status": "failed",
+      "message": "Detected CVE-2025-32434 exploitation pattern: Code execution function (__builtin__ eval) with string payload",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "pattern_type": "eval_exec_with_payload",
+        "description": "Code execution function (__builtin__ eval) with string payload",
+        "opcodes_involved": ["GLOBAL", "BINUNICODE"],
+        "exploitation_method": "Direct code execution via eval/exec",
+        "position": 2,
+        "dangerous_count": 0,
+        "file_size_mb": 0,
+        "opcode_density_per_mb": 0,
+        "threshold_used": 0,
+        "severity_level": "critical",
+        "confidence_score": 0
+      },
+      "timestamp": 1756441703.1695201
+    },
+    {
+      "name": "Large Model Opcode Analysis",
+      "status": "passed",
+      "message": "Large model analysis: Large PyTorch model (253.2MB) with 201 dangerous opcodes (0.8/MB) is within expected range for legitimate models",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "pattern_type": "large_model_normal_density",
+        "dangerous_count": 201,
+        "file_size_mb": 253.18389225006104,
+        "opcode_density_per_mb": 0.8,
+        "threshold_used": 200.0
+      },
+      "timestamp": 1756441703.169614
+    },
+    {
+      "name": "Stack Depth Validation",
+      "status": "passed",
+      "message": "Maximum stack depth (401) is within safe limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "max_depth_reached": 401,
+        "ml_adjusted_limit": 2500,
+        "base_limit": 1000,
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1756441703.1696188
+    },
+    {
+      "name": "Advanced Global Reference Check",
+      "status": "failed",
+      "message": "Suspicious reference __builtin__.eval",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "module": "__builtin__",
+        "function": "eval",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1756441703.1696289
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "failed",
+      "message": "Suspicious reference __builtin__.eval",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "component_count": 4,
+        "findings": [
+          {
+            "module": "__builtin__",
+            "function": "eval",
+            "position": 2,
+            "opcode": "GLOBAL",
+            "ml_context_confidence": 0.315
+          }
+        ]
+      },
+      "timestamp": 1756441703.169698
+    },
+    {
+      "name": "Reduce Pattern Analysis",
+      "status": "passed",
+      "message": "No dangerous __reduce__ patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 3093,
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1756441703.170482
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "passed",
+      "message": "No suspicious opcode sequences detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 3093,
+        "ml_context_confidence": 0.315
+      },
+      "timestamp": 1756441703.170766
+    },
+    {
+      "name": "Python Code File Detection",
+      "status": "passed",
+      "message": "No Python code files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {},
+      "timestamp": 1756441765.167776
+    },
+    {
+      "name": "Executable File Detection",
+      "status": "passed",
+      "message": "No executable files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {},
+      "timestamp": 1756441765.167777
+    },
+    {
+      "name": "PyTorch Structure Validation",
+      "status": "passed",
+      "message": "PyTorch model has expected structure with data.pkl",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "pickle_files": ["archive/data.pkl"]
+      },
+      "timestamp": 1756441765.167784
+    },
+    {
+      "name": "Blacklist Pattern Check",
+      "status": "passed",
+      "message": "No blacklist patterns configured for scanning",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "details": {
+        "reason": "no_blacklist_configured",
+        "entries_available": 102
+      },
+      "timestamp": 1756441765.167788
+    },
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin"
+      },
+      "timestamp": 1756441766.540216
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin"
+      },
+      "timestamp": 1756441766.540235
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {},
+      "timestamp": 1756441766.540302
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "md5": "90288b9a54416a925d46cc7facceb10e",
+        "sha256": "bed154dfcca2375fbd5bd2948677ea02f04fb308a4364c471f22afe07e16951d",
+        "sha512": "6cf645b7ea386b4cca78196c38f500fe4d1059cf2589fb80e6bfa20bcf0ab710107625fc69fa491400cf5e0dfa512b3fa94eea16a42f1abb7274ba8d22787c58",
+        "file_size": 5304
+      },
+      "timestamp": 1756441766.54037
+    },
+    {
+      "name": "PyTorch ZIP Format Validation",
+      "status": "passed",
+      "message": "Valid ZIP format detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {},
+      "timestamp": 1756441766.540386
+    },
+    {
+      "name": "Path Traversal Protection",
+      "status": "passed",
+      "message": "All archive entries have safe paths",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "entries_checked": 4
+      },
+      "timestamp": 1756441766.540709
+    },
+    {
+      "name": "CVE-2025-32434 PyTorch Version Check",
+      "status": "passed",
+      "message": "Could not determine PyTorch version from model file",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "version_detection": "failed",
+        "recommendation": "Verify PyTorch version manually - avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
+      },
+      "timestamp": 1756441766.541163
+    },
+    {
+      "name": "CVE-2025-32434 weights_only=True Safety Warning",
+      "status": "failed",
+      "message": "PyTorch model contains dangerous opcodes (REDUCE, NEWOBJ, OBJ) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["REDUCE", "NEWOBJ", "OBJ"],
+        "code_execution_risks": [
+          "__reduce__ method exploitation",
+          "New-style object creation",
+          "Object creation code execution"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441766.5560079
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {},
+      "timestamp": 1756441766.553337
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441766.557201
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441766.557204
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 2",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "protocol_version": 2
+      },
+      "timestamp": 1756441766.554413
+    },
+    {
+      "name": "Opcode Count Check",
+      "status": "passed",
+      "message": "Opcode count (559) is within limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "opcode_count": 559,
+        "max_opcodes": 1000000
+      },
+      "timestamp": 1756441766.555451
+    },
+    {
+      "name": "CVE-2025-32434 Opcode Sequence Detection",
+      "status": "failed",
+      "message": "Detected CVE-2025-32434 exploitation pattern: Elevated dangerous opcode density (10 opcodes, 100.0/MB in 0.0MB file) may indicate CVE-2025-32434 exploitation (confidence: 25%)",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl (pos 51)",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "pattern_type": "high_risk_opcode_density",
+        "description": "Elevated dangerous opcode density (10 opcodes, 100.0/MB in 0.0MB file) may indicate CVE-2025-32434 exploitation (confidence: 25%)",
+        "opcodes_involved": [
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "NEWOBJ",
+          "REDUCE",
+          "REDUCE",
+          "REDUCE"
+        ],
+        "exploitation_method": "weights_only=True bypass via opcode density attack",
+        "position": 51,
+        "dangerous_count": 10,
+        "file_size_mb": 0.00505828857421875,
+        "opcode_density_per_mb": 100.0,
+        "threshold_used": 80.0,
+        "severity_level": "critical",
+        "confidence_score": 25
+      },
+      "timestamp": 1756441766.555636
+    },
+    {
+      "name": "Stack Depth Validation",
+      "status": "passed",
+      "message": "Maximum stack depth (2) is within safe limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "max_depth_reached": 2,
+        "ml_adjusted_limit": 2500,
+        "base_limit": 1000,
+        "ml_context_confidence": 0.24
+      },
+      "timestamp": 1756441766.5557141
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "passed",
+      "message": "Global Module Reference Check completed successfully",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl (pos 2)",
+      "details": {
+        "component_count": 10
+      },
+      "timestamp": 1756441766.555823
+    },
+    {
+      "name": "Reduce Pattern Analysis",
+      "status": "passed",
+      "message": "No dangerous __reduce__ patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "opcode_count": 559,
+        "ml_context_confidence": 0.24
+      },
+      "timestamp": 1756441766.555895
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "passed",
+      "message": "No suspicious opcode sequences detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin:training_args/data.pkl",
+      "details": {
+        "opcode_count": 559,
+        "ml_context_confidence": 0.24
+      },
+      "timestamp": 1756441766.555948
+    },
+    {
+      "name": "Python Code File Detection",
+      "status": "passed",
+      "message": "No Python code files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {},
+      "timestamp": 1756441766.557208
+    },
+    {
+      "name": "Executable File Detection",
+      "status": "passed",
+      "message": "No executable files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {},
+      "timestamp": 1756441766.5572102
+    },
+    {
+      "name": "PyTorch Structure Validation",
+      "status": "passed",
+      "message": "PyTorch model has expected structure with data.pkl",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "pickle_files": ["training_args/data.pkl"]
+      },
+      "timestamp": 1756441766.557214
+    },
+    {
+      "name": "Blacklist Pattern Check",
+      "status": "passed",
+      "message": "No blacklist patterns configured for scanning",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "details": {
+        "reason": "no_blacklist_configured",
+        "entries_available": 4
+      },
+      "timestamp": 1756441766.5572171
+    },
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl"
+      },
+      "timestamp": 1756441766.582013
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl"
+      },
+      "timestamp": 1756441766.582029
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {},
+      "timestamp": 1756441766.5820868
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "md5": "4aebcd9b12fa38fb446275b034cc9202",
+        "sha256": "b82e73f51c6d648ed4339e4279b1613fbab80a01252dac254174db7853e25af8",
+        "sha512": "4b7c2a83780006a2b8754fa8e8b5887d627639832eda592abd04fe90e3f6a639b288a62cddee2a6d40e75982ddb0ed3640b8c80e1477937b97d5b9009a45c1b3",
+        "file_size": 67
+      },
+      "timestamp": 1756441766.582135
+    },
+    {
+      "name": "Dangerous Pattern Detection",
+      "status": "passed",
+      "message": "No dangerous patterns found in raw file content",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "detection_method": "raw_content_scan",
+        "patterns_checked": [
+          "posix",
+          "subprocess",
+          "eval",
+          "exec",
+          "__import__",
+          "builtins"
+        ]
+      },
+      "timestamp": 1756441766.582238
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {},
+      "timestamp": 1756441766.58241
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756441766.5824902
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756441766.5824928
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 4",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "protocol_version": 4
+      },
+      "timestamp": 1756441766.582496
+    },
+    {
+      "name": "Pickle Format Validation",
+      "status": "failed",
+      "message": "Unable to parse pickle file: ValueError",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "exception": "not enough data in stream to read uint4",
+        "exception_type": "ValueError",
+        "file_extension": ".pkl",
+        "opcodes_analyzed": 14,
+        "file_size": 67
+      },
+      "why": "The file could not be parsed as a valid pickle file. Error: not enough data in stream to read uint4",
+      "timestamp": 1756441766.582565
+    },
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin"
+      },
+      "timestamp": 1756441766.602981
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin"
+      },
+      "timestamp": 1756441766.602997
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {},
+      "timestamp": 1756441766.6030478
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "md5": "094e7b77705a8709bf230bf4ae58dcf4",
+        "sha256": "1ed1ef9f85b8d061deed2c1ceca1676dfe86cd8b05600713ea5cad3df4c3ccc1",
+        "sha512": "45b21ec9ced306c90ac24723fe1ea6b4fe2bff207aa94b5ee3b0ba0b70aa533ccd9e86f8066000530b6254f08495fd1c51135667e280b861d8bf596812c01806",
+        "file_size": 431
+      },
+      "timestamp": 1756441766.603088
+    },
+    {
+      "name": "PyTorch ZIP Format Validation",
+      "status": "passed",
+      "message": "Valid ZIP format detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {},
+      "timestamp": 1756441766.603103
+    },
+    {
+      "name": "Path Traversal Protection",
+      "status": "passed",
+      "message": "All archive entries have safe paths",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "entries_checked": 2
+      },
+      "timestamp": 1756441766.603301
+    },
+    {
+      "name": "CVE-2025-32434 PyTorch Version Check",
+      "status": "passed",
+      "message": "Could not determine PyTorch version from model file",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "version_detection": "failed",
+        "recommendation": "Verify PyTorch version manually - avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
+      },
+      "timestamp": 1756441766.6033669
+    },
+    {
+      "name": "CVE-2025-32434 weights_only=True Safety Warning",
+      "status": "failed",
+      "message": "PyTorch model contains dangerous opcodes (REDUCE, GLOBAL, STACK_GLOBAL) that can execute code even when loaded with torch.load(weights_only=True). This contradicts the common assumption that weights_only=True provides safety against code execution.",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "cve_id": "CVE-2025-32434",
+        "dangerous_opcodes": ["REDUCE", "GLOBAL", "STACK_GLOBAL"],
+        "code_execution_risks": [
+          "__reduce__ method exploitation",
+          "Dynamic import and attribute access",
+          "Module import and attribute access",
+          "Direct code execution patterns"
+        ],
+        "weights_only_false_security": true,
+        "vulnerability_description": "The weights_only=True parameter in torch.load() does not prevent code execution from malicious pickle files, contrary to common security assumptions.",
+        "recommendation": "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider safer serialization formats like SafeTensors. Always validate model sources.",
+        "affected_pytorch_versions": "All versions ≤2.5.1",
+        "fixed_in": "PyTorch 2.6.0"
+      },
+      "timestamp": 1756441766.6041112
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {},
+      "timestamp": 1756441766.6034932
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441766.604249
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "component_count": 2
+      },
+      "timestamp": 1756441766.604251
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 2",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "protocol_version": 2
+      },
+      "timestamp": 1756441766.6035578
+    },
+    {
+      "name": "Opcode Count Check",
+      "status": "passed",
+      "message": "Opcode count (10) is within limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 10,
+        "max_opcodes": 1000000
+      },
+      "timestamp": 1756441766.603592
+    },
+    {
+      "name": "Stack Depth Validation",
+      "status": "passed",
+      "message": "Maximum stack depth (0) is within safe limits",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "max_depth_reached": 0,
+        "ml_adjusted_limit": 1000,
+        "base_limit": 1000,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756441766.603606
+    },
+    {
+      "name": "Advanced Global Reference Check",
+      "status": "failed",
+      "message": "Suspicious reference os.popen",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "module": "os",
+        "function": "popen",
+        "opcode": "STACK_GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system commands, file system manipulation, and environment variable access. Malicious models can use this to compromise the host system, steal data, or install malware.",
+      "timestamp": 1756441766.603619
+    },
+    {
+      "name": "Global Module Reference Check",
+      "status": "failed",
+      "message": "Suspicious reference os.popen",
+      "severity": "critical",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl (pos 2)",
+      "details": {
+        "module": "os",
+        "function": "popen",
+        "position": 2,
+        "opcode": "GLOBAL",
+        "ml_context_confidence": 0.0
+      },
+      "why": "The 'os' module provides direct access to operating system functions, allowing execution of arbitrary system commands, file system manipulation, and environment variable access. Malicious models can use this to compromise the host system, steal data, or install malware.",
+      "timestamp": 1756441766.603667
+    },
+    {
+      "name": "REDUCE Opcode Safety Check",
+      "status": "failed",
+      "message": "Found REDUCE opcode - potential __reduce__ method execution",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl (pos 36)",
+      "details": {
+        "position": 36,
+        "opcode": "REDUCE",
+        "ml_context_confidence": 0.0,
+        "entropy_classification": "unknown",
+        "entropy_confidence": 0.0
+      },
+      "why": "The REDUCE opcode calls a callable with arguments, effectively executing arbitrary Python functions. This is the primary mechanism for pickle-based code execution attacks through __reduce__ methods.",
+      "timestamp": 1756441766.60403
+    },
+    {
+      "name": "Reduce Pattern Analysis",
+      "status": "passed",
+      "message": "No dangerous __reduce__ patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 10,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756441766.60406
+    },
+    {
+      "name": "Opcode Sequence Analysis",
+      "status": "passed",
+      "message": "No suspicious opcode sequences detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin:archive/data.pkl",
+      "details": {
+        "opcode_count": 10,
+        "ml_context_confidence": 0.0
+      },
+      "timestamp": 1756441766.6040661
+    },
+    {
+      "name": "Python Code File Detection",
+      "status": "passed",
+      "message": "No Python code files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {},
+      "timestamp": 1756441766.604255
+    },
+    {
+      "name": "Executable File Detection",
+      "status": "passed",
+      "message": "No executable files found in model",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {},
+      "timestamp": 1756441766.604257
+    },
+    {
+      "name": "PyTorch Structure Validation",
+      "status": "passed",
+      "message": "PyTorch model has expected structure with data.pkl",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "pickle_files": ["archive/data.pkl"]
+      },
+      "timestamp": 1756441766.6042602
+    },
+    {
+      "name": "Blacklist Pattern Check",
+      "status": "passed",
+      "message": "No blacklist patterns configured for scanning",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "details": {
+        "reason": "no_blacklist_configured",
+        "entries_available": 2
+      },
+      "timestamp": 1756441766.6042628
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/training_args.bin.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/training_args.bin.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.647755
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model.pb.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model.pb.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.6577559
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/malicious_pickle.pkl.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/malicious_pickle.pkl.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.667676
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model_2.pb.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model_2.pb.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.67762
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model_2.bin.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model_2.bin.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.687684
+    },
+    {
+      "name": "HuggingFace Cache File Skip",
+      "status": "passed",
+      "message": "HuggingFace cache file skipped (not a model file)",
+      "severity": "info",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model.bin.metadata",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model.bin.metadata",
+        "reason": "huggingface_cache_file"
+      },
+      "timestamp": 1756441766.698346
+    }
+  ],
+  "files_scanned": 12,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin",
+      "type": "pytorch_zip",
+      "size": 265482553
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin",
+      "type": "pytorch_zip",
+      "size": 5304
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "type": "pickle",
+      "size": 67
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin",
+      "type": "pytorch_zip",
+      "size": 431
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/tensorflow_saved_model_2.pb",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/tensorflow_saved_model.pb",
+      "type": "unknown"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/training_args.bin.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model.pb.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/malicious_pickle.pkl.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model_2.pb.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model_2.bin.metadata",
+      "type": "skipped"
+    },
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model.bin.metadata",
+      "type": "skipped"
+    }
+  ],
+  "has_errors": true,
+  "scanner_names": [],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model_2.bin": {
+      "file_size": 265482553,
+      "file_hashes": {
+        "md5": "746bc0c404d6b0dc810fa7336a69aeea",
+        "sha256": "b3150dee8d68134057d44c33649cc3e6dc6049fd5c84b337d620fbd0175b0e15",
+        "sha512": "dfa677ecd226e23a1ede623a4fda147c01a09135665d3c7e650a80d72893be23a01bdef222e761172201e6197d9dfa80ac5aa1fae09b36c89ccfccb424acd179"
+      },
+      "max_stack_depth": 401,
+      "opcode_count": 3093,
+      "suspicious_count": 2,
+      "ml_context": {
+        "frameworks": {
+          "pytorch": {
+            "confidence": 0.315,
+            "indicators": [],
+            "file_patterns": []
+          }
+        },
+        "overall_confidence": 0.315,
+        "is_ml_content": true,
+        "detected_patterns": ["module:torch(2)", "module:collections(1)"],
+        "optimization_hints": []
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.497528,
+      "pickle_files": ["archive/data.pkl"],
+      "pytorch_archive_version": "3",
+      "pytorch_version_source": "archive/version",
+      "content_hash": "b3150dee8d68134057d44c33649cc3e6dc6049fd5c84b337d620fbd0175b0e15"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/training_args.bin": {
+      "file_size": 5304,
+      "file_hashes": {
+        "md5": "90288b9a54416a925d46cc7facceb10e",
+        "sha256": "bed154dfcca2375fbd5bd2948677ea02f04fb308a4364c471f22afe07e16951d",
+        "sha512": "6cf645b7ea386b4cca78196c38f500fe4d1059cf2589fb80e6bfa20bcf0ab710107625fc69fa491400cf5e0dfa512b3fa94eea16a42f1abb7274ba8d22787c58"
+      },
+      "max_stack_depth": 2,
+      "opcode_count": 559,
+      "suspicious_count": 0,
+      "ml_context": {
+        "frameworks": {
+          "pytorch": {
+            "confidence": 0.135,
+            "indicators": [],
+            "file_patterns": []
+          },
+          "huggingface": {
+            "confidence": 0.24,
+            "indicators": [],
+            "file_patterns": []
+          }
+        },
+        "overall_confidence": 0.24,
+        "is_ml_content": true,
+        "detected_patterns": ["module:torch(1)", "module:transformers(6)"],
+        "optimization_hints": []
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.5075352,
+      "pickle_files": ["training_args/data.pkl"],
+      "content_hash": "bed154dfcca2375fbd5bd2948677ea02f04fb308a4364c471f22afe07e16951d"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl": {
+      "file_size": 67,
+      "file_hashes": {
+        "md5": "4aebcd9b12fa38fb446275b034cc9202",
+        "sha256": "b82e73f51c6d648ed4339e4279b1613fbab80a01252dac254174db7853e25af8",
+        "sha512": "4b7c2a83780006a2b8754fa8e8b5887d627639832eda592abd04fe90e3f6a639b288a62cddee2a6d40e75982ddb0ed3640b8c80e1477937b97d5b9009a45c1b3"
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": true,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.514101,
+      "content_hash": "b82e73f51c6d648ed4339e4279b1613fbab80a01252dac254174db7853e25af8"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/pytorch_model.bin": {
+      "file_size": 431,
+      "file_hashes": {
+        "md5": "094e7b77705a8709bf230bf4ae58dcf4",
+        "sha256": "1ed1ef9f85b8d061deed2c1ceca1676dfe86cd8b05600713ea5cad3df4c3ccc1",
+        "sha512": "45b21ec9ced306c90ac24723fe1ea6b4fe2bff207aa94b5ee3b0ba0b70aa533ccd9e86f8066000530b6254f08495fd1c51135667e280b861d8bf596812c01806"
+      },
+      "max_stack_depth": 0,
+      "opcode_count": 10,
+      "suspicious_count": 2,
+      "ml_context": {
+        "frameworks": {},
+        "overall_confidence": 0.0,
+        "is_ml_content": false,
+        "detected_patterns": [],
+        "optimization_hints": []
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.520618,
+      "pickle_files": ["archive/data.pkl"],
+      "pytorch_archive_version": "3",
+      "pytorch_version_source": "archive/version",
+      "content_hash": "1ed1ef9f85b8d061deed2c1ceca1676dfe86cd8b05600713ea5cad3df4c3ccc1"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/tensorflow_saved_model_2.pb": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": true,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.526915,
+      "content_hash": "9611fbfd52d487be2f65d9995569e5378518b41be32d9652e718f29c300a0eb9"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/tensorflow_saved_model.pb": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": true,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.532882,
+      "content_hash": "0a6c8a2ff10c49937114f16bf15ab200d4f398023fb5d9b0475b295f02fbfd9c"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/training_args.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.538183,
+      "content_hash": "317157bd8f502ad54e5501d50636020c6bbaa0439b9cfe300dd2ae0e8b5fa5cb"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model.pb.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.543357,
+      "content_hash": "d172ee2392565820a1f5a9837bdf3f23a879d2a961e143f3c2ededfae87f3372"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/malicious_pickle.pkl.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.555847,
+      "content_hash": "5624e4862803e6d7c4a01972351e5e71eed91ee189da08664219c2c88fac3665"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/tensorflow_saved_model_2.pb.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.561749,
+      "content_hash": "d11a6f13188c8114b321d1e330d0a6af748b6045665e62b5d0ae0f52140ec6aa"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model_2.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.566926,
+      "content_hash": "5e90cbbd89136e4a692c874f0d5b0d0863226a8fbc72683094576dfda7c8d4f2"
+    },
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/.cache/huggingface/download/pytorch_model.bin.metadata": {
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": false,
+      "is_model": false,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441774.572457,
+      "content_hash": "c08f80770ca97165f9d95f53324d34243b2f784d7900b2311eb64180b5eb32ae"
+    }
+  },
+  "start_time": 1756441773.805948,
+  "duration": 0.7677788734436035,
+  "total_checks": 89,
+  "passed_checks": 74,
+  "failed_checks": 15,
+  "success": true
+}

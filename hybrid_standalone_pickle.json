@@ -1,0 +1,170 @@
+{
+  "bytes_scanned": 0,
+  "issues": [
+    {
+      "message": "Unable to parse pickle file: ValueError",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "exception": "not enough data in stream to read uint4",
+        "exception_type": "ValueError",
+        "file_extension": ".pkl",
+        "opcodes_analyzed": 14,
+        "file_size": 67
+      },
+      "why": "The file could not be parsed as a valid pickle file. Error: not enough data in stream to read uint4",
+      "timestamp": 1756441766.582568,
+      "type": "pickle_check"
+    }
+  ],
+  "checks": [
+    {
+      "name": "Path Exists",
+      "status": "passed",
+      "message": "Path exists",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl"
+      },
+      "timestamp": 1756441766.582013
+    },
+    {
+      "name": "Path Readable",
+      "status": "passed",
+      "message": "Path is readable",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl"
+      },
+      "timestamp": 1756441766.582029
+    },
+    {
+      "name": "File Type Validation",
+      "status": "passed",
+      "message": "File type validation passed",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {},
+      "timestamp": 1756441766.5820868
+    },
+    {
+      "name": "File Integrity Hash",
+      "status": "passed",
+      "message": "File integrity hashes calculated",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "md5": "4aebcd9b12fa38fb446275b034cc9202",
+        "sha256": "b82e73f51c6d648ed4339e4279b1613fbab80a01252dac254174db7853e25af8",
+        "sha512": "4b7c2a83780006a2b8754fa8e8b5887d627639832eda592abd04fe90e3f6a639b288a62cddee2a6d40e75982ddb0ed3640b8c80e1477937b97d5b9009a45c1b3",
+        "file_size": 67
+      },
+      "timestamp": 1756441766.582135
+    },
+    {
+      "name": "Dangerous Pattern Detection",
+      "status": "passed",
+      "message": "No dangerous patterns found in raw file content",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "detection_method": "raw_content_scan",
+        "patterns_checked": [
+          "posix",
+          "subprocess",
+          "eval",
+          "exec",
+          "__import__",
+          "builtins"
+        ]
+      },
+      "timestamp": 1756441766.582238
+    },
+    {
+      "name": "Embedded Secrets Detection",
+      "status": "passed",
+      "message": "No embedded secrets detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {},
+      "timestamp": 1756441766.58241
+    },
+    {
+      "name": "JIT/Script Code Execution Summary",
+      "status": "passed",
+      "message": "No JIT/Script code execution risks detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756441766.5824902
+    },
+    {
+      "name": "Network Communication Summary",
+      "status": "passed",
+      "message": "No network communication patterns detected",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "aggregated": true,
+        "aggregation_type": "summary"
+      },
+      "timestamp": 1756441766.5824928
+    },
+    {
+      "name": "Pickle Protocol Version Check",
+      "status": "passed",
+      "message": "Valid pickle protocol version 4",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "protocol_version": 4
+      },
+      "timestamp": 1756441766.582496
+    },
+    {
+      "name": "Pickle Format Validation",
+      "status": "failed",
+      "message": "Unable to parse pickle file: ValueError",
+      "severity": "warning",
+      "location": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "details": {
+        "exception": "not enough data in stream to read uint4",
+        "exception_type": "ValueError",
+        "file_extension": ".pkl",
+        "opcodes_analyzed": 14,
+        "file_size": 67
+      },
+      "why": "The file could not be parsed as a valid pickle file. Error: not enough data in stream to read uint4",
+      "timestamp": 1756441766.582565
+    }
+  ],
+  "files_scanned": 1,
+  "assets": [
+    {
+      "path": "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl",
+      "type": "pickle",
+      "size": 67
+    }
+  ],
+  "has_errors": true,
+  "scanner_names": [],
+  "file_metadata": {
+    "/Users/mdangelo/.modelaudit/cache/huggingface/nono31/malicious-models-repo/malicious_pickle.pkl": {
+      "file_size": 67,
+      "file_hashes": {
+        "md5": "4aebcd9b12fa38fb446275b034cc9202",
+        "sha256": "b82e73f51c6d648ed4339e4279b1613fbab80a01252dac254174db7853e25af8",
+        "sha512": "4b7c2a83780006a2b8754fa8e8b5887d627639832eda592abd04fe90e3f6a639b288a62cddee2a6d40e75982ddb0ed3640b8c80e1477937b97d5b9009a45c1b3"
+      },
+      "license_info": [],
+      "copyright_notices": [],
+      "license_files_nearby": [],
+      "is_dataset": true,
+      "is_model": true,
+      "risk_score": 0.0,
+      "scan_timestamp": 1756441844.235085
+    }
+  },
+  "start_time": 1756441844.22644,
+  "duration": 0.010796070098876953,
+  "total_checks": 10,
+  "passed_checks": 9,
+  "failed_checks": 1,
+  "success": true
+}
