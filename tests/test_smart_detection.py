@@ -23,6 +23,8 @@ def test_detect_input_type_cloud():
     """Test detection of cloud storage types."""
     assert detect_input_type("s3://bucket/model.pt") == "cloud_s3"
     assert detect_input_type("gs://bucket/model.pt") == "cloud_gcs"
+    assert detect_input_type("az://container/model.pt") == "cloud_azure"
+    assert detect_input_type("https://account.blob.core.windows.net/container") == "cloud_azure"
 
 
 def test_detect_input_type_registries():

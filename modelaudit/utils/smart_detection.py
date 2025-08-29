@@ -10,12 +10,17 @@ def detect_input_type(path: str) -> str:
     """Detect the type of input path.
 
     Returns:
-        One of: 'cloud_s3', 'cloud_gcs', 'huggingface', 'pytorch_hub',
+        One of: 'cloud_s3', 'cloud_gcs', 'cloud_azure', 'huggingface', 'pytorch_hub',
                 'mlflow', 'jfrog', 'local_file', 'local_directory'
     """
     # Cloud storage detection
-    if path.startswith(("s3://", "gs://")):
-        return "cloud_s3" if path.startswith("s3://") else "cloud_gcs"
+    if path.startswith(("s3://", "gs://", "az://")) or ".blob.core.windows.net" in path:
+        if path.startswith("s3://"):
+            return "cloud_s3"
+        elif path.startswith("gs://"):
+            return "cloud_gcs"
+        else:
+            return "cloud_azure"
 
     # HuggingFace detection
     if path.startswith(("hf://", "https://huggingface.co/", "https://hf.co/")):
@@ -153,7 +158,7 @@ def _should_show_progress(input_types: list[str], max_size: int, tty_caps: dict[
 def _should_use_cache(input_types: list[str]) -> bool:
     """Determine if caching should be enabled by default."""
     # Enable caching for any remote/cloud operations
-    remote_types = ["cloud_s3", "cloud_gcs", "huggingface", "pytorch_hub", "mlflow", "jfrog"]
+    remote_types = ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface", "pytorch_hub", "mlflow", "jfrog"]
     return any(t in remote_types for t in input_types)
 
 
@@ -165,7 +170,7 @@ def _get_default_cache_dir() -> str:
 def _should_use_selective_download(input_types: list[str]) -> bool:
     """Determine if selective download should be used."""
     # Use selective download for cloud directories and HuggingFace models
-    return any(t in ["cloud_s3", "cloud_gcs", "huggingface"] for t in input_types)
+    return any(t in ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface"] for t in input_types)
 
 
 def _has_strict_mode_inputs(input_types: list[str]) -> bool:

@@ -594,7 +594,7 @@ def scan_command(
             click.echo("Smart detection enabled")
 
     # Print a nice header if not in structured format mode and not writing to a file
-    if final_format == "text" and not output:
+    if final_format == "text" and not output and not quiet:
         # Add delegation indicator if running via promptfoo
         delegation_note = ""
         if is_delegated_from_promptfoo():
@@ -641,7 +641,6 @@ def scan_command(
             if "modelaudit.scanners" in sys.modules:
                 if verbose:
                     click.echo("Progress tracking disabled during scanner initialization", err=True)
-                progress = False
                 progress_tracker = None
             else:
                 from .progress import (
@@ -999,7 +998,7 @@ def scan_command(
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan using Pydantic model
-                        audit_result.aggregate_scan_result(results)
+                        audit_result.aggregate_scan_result(results.model_dump())
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -1332,7 +1331,7 @@ def scan_command(
             f.write(sbom_text)
 
     # Format the output
-    if format == "json":
+    if final_format == "json":
         # Filter out DEBUG issues and checks unless verbose mode is enabled
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
@@ -1340,7 +1339,7 @@ def scan_command(
 
         # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
-    elif format == "sarif":
+    elif final_format == "sarif":
         # SARIF format for integration with security tools
         output_text = format_sarif_output(audit_result, expanded_paths, verbose)
     else:
