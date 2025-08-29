@@ -7,11 +7,20 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 try:
     import numpy as np
     import onnx
-    from onnx import mapping
+
+    # Handle different ONNX versions - mapping module location changed
+    try:
+        from onnx import mapping
+    except ImportError:
+        try:
+            from onnx.onnx_cpp2py_export import mapping  # Fallback for older versions
+        except ImportError:
+            mapping = None
 
     HAS_ONNX = True
 except Exception:
     HAS_ONNX = False
+    mapping = None
 
 
 class OnnxScanner(BaseScanner):
@@ -246,6 +255,8 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
+            if mapping is None:
+                return  # Skip if mapping is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
@@ -293,6 +304,8 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
+                    if mapping is None:
+                        continue  # Skip if mapping is not available
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:

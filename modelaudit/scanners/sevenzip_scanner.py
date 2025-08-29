@@ -12,7 +12,7 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
-    py7zr = None  # type: ignore
+    py7zr = None  # type: ignore[assignment]
 
 
 class SevenZipScanner(BaseScanner):
