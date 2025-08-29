@@ -1010,13 +1010,12 @@ def test_doctor_command():
     result = runner.invoke(cli, ["doctor"])
 
     assert result.exit_code == 0
-    assert "ModelAudit System Diagnostics" in result.output
+    assert "ModelAudit Scanner Diagnostic Report" in result.output
     assert "Python version:" in result.output
     assert "NumPy status:" in result.output
-    assert "Scanner Status:" in result.output
-    assert "Available:" in result.output
-    assert "Loaded:" in result.output
-    assert "Failed:" in result.output
+    assert "Total scanners:" in result.output
+    assert "Loaded successfully:" in result.output
+    assert "Failed to load:" in result.output
 
 
 def test_doctor_command_with_show_failed():
@@ -1025,10 +1024,10 @@ def test_doctor_command_with_show_failed():
     result = runner.invoke(cli, ["doctor", "--show-failed"])
 
     assert result.exit_code == 0
-    assert "ModelAudit System Diagnostics" in result.output
+    assert "ModelAudit Scanner Diagnostic Report" in result.output
 
     # Should show failed scanners if any exist
-    if "Failed: 0" not in result.output:
+    if "Failed to load: 0" not in result.output:
         assert "Failed Scanners:" in result.output or "Recommendations:" in result.output
 
 

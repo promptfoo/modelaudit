@@ -240,9 +240,18 @@ class PyTorchZipScanner(BaseScanner):
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
 
+        # Get the original ZIP file size for proper density calculations
+        # This is crucial for CVE-2025-32434 detection to avoid false positives
+        original_file_size = int(result.metadata.get("file_size") or 0)
+        if original_file_size <= 0:
+            try:
+                original_file_size = os.path.getsize(path)
+            except OSError:
+                original_file_size = 1  # Avoid divide-by-zero in density calculations
+
         for name in pickle_files:
             info = zip_file.getinfo(name)
-            file_size = info.file_size
+            pickle_data_size = info.file_size
 
             # Set the current file path on the pickle scanner for proper error reporting
             self.pickle_scanner.current_file_path = f"{path}:{name}"
@@ -250,20 +259,25 @@ class PyTorchZipScanner(BaseScanner):
             # Choose scanning approach based on file size with spooling for seekability
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
-            if file_size <= max_in_mem:
+            if pickle_data_size <= max_in_mem:
                 data = zip_file.read(name)
+                bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
+                    # IMPORTANT: Pass original ZIP file size, not pickle data size
+                    # This enables proper density-based CVE detection
+                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, original_file_size)
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
                 with zip_file.open(name, "r") as zf, tempfile.SpooledTemporaryFile(max_size=max_in_mem) as spool:
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         spool.write(chunk)
-                    size_on_disk = spool.tell()
+                        bytes_scanned += len(chunk)
                     spool.seek(0)
+                    # IMPORTANT: Pass original ZIP file size, not pickle data size
+                    # This enables proper density-based CVE detection
                     sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        spool,
-                        size_on_disk,
+                        spool,  # type: ignore[arg-type]
+                        original_file_size,
                     )
 
             # Update issue metadata and locations
@@ -288,38 +302,53 @@ class PyTorchZipScanner(BaseScanner):
     def _scan_for_jit_patterns(
         self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
     ) -> int:
-        """Check for JIT/Script code execution risks"""
+        """Check for JIT/Script code execution risks and network communication patterns"""
         bytes_scanned = 0
-        jit_patterns_found = False
+        all_jit_findings = []
+        all_network_findings = []
 
         for name in safe_entries:
-            if jit_patterns_found:
-                break  # Already found patterns, no need to continue
-
             try:
                 with zip_file.open(name, "r") as zf:
-                    # 1MB streaming chunks
+                    # Collect all data from this file for analysis
+                    chunks: list[bytes] = []
                     for chunk in iter(lambda: zf.read(1024 * 1024), b""):
                         bytes_scanned += len(chunk)
-                        # Dispatch to base scanner helpers
-                        jit_count = self.check_for_jit_script_code(
-                            chunk,
-                            result,
+                        chunks.append(chunk)
+                    file_data = b"".join(chunks)
+
+                    # Collect findings for this file without creating individual checks
+                    if file_data:  # Only process if we have data
+                        jit_findings = self.collect_jit_script_findings(
+                            file_data,
                             model_type="pytorch",
                             context=f"{path}:{name}",
                         )
-                        self.check_for_network_communication(
-                            chunk,
-                            result,
+                        network_findings = self.collect_network_communication_findings(
+                            file_data,
                             context=f"{path}:{name}",
                         )
-                        if jit_count:
-                            jit_patterns_found = True
-                            break
+
+                        all_jit_findings.extend(jit_findings)
+                        all_network_findings.extend(network_findings)
 
             except Exception:
                 # Skip files that can't be read
                 pass
+
+        # Create single aggregated checks for the entire ZIP file
+        if safe_entries:  # Only create checks if we processed files
+            check_jit = self._get_bool_config("check_jit_script", True)
+            if check_jit:
+                self.summarize_jit_script_findings(all_jit_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+            check_net = self._get_bool_config("check_network_comm", True)
+            if check_net:
+                self.summarize_network_communication_findings(all_network_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         return bytes_scanned
 

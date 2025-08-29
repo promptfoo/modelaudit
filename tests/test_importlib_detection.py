@@ -4,6 +4,7 @@ import pickle
 import tempfile
 from pathlib import Path
 
+from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
@@ -25,7 +26,7 @@ malicious.system('echo pwned')
         result = scanner.scan(temp_path)
 
         # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
 
         # Should have at least one critical issue
         assert len(critical_issues) > 0, "No critical issues found for importlib"
@@ -39,11 +40,17 @@ malicious.system('echo pwned')
 
 
 def test_importlib_pattern_in_raw_bytes():
-    """Test that raw importlib pattern is detected as CRITICAL."""
+    """Test that importlib pattern is detected as CRITICAL in pickle with direct module reference."""
+
+    # Create a malicious pickle using __reduce__ that imports via importlib
+    class MaliciousImportLib:
+        def __reduce__(self):
+            import importlib
+
+            return (importlib.import_module, ("os",))
+
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        # Write pickle with importlib.import_module reference
-        # This is a simplified pickle that references importlib.import_module
-        f.write(b"\x80\x02cimportlib\nimport_module\nq\x00X\x02\x00\x00\x00os\nq\x01\x85q\x02Rq\x03.")
+        pickle.dump(MaliciousImportLib(), f)
         temp_path = f.name
 
     try:
@@ -51,10 +58,10 @@ def test_importlib_pattern_in_raw_bytes():
         result = scanner.scan(temp_path)
 
         # Check for critical issues
-        critical_issues = [issue for issue in result.issues if str(issue.severity) == "IssueSeverity.CRITICAL"]
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
 
         # Should detect importlib as critical
-        assert len(critical_issues) > 0, "No critical issues found for raw importlib bytes"
+        assert len(critical_issues) > 0, "No critical issues found for importlib pickle"
 
         # Verify importlib is in the critical messages
         importlib_critical = any("importlib" in issue.message.lower() for issue in critical_issues)
@@ -167,7 +174,7 @@ def test_importlib_not_false_positive_in_comments():
         critical_importlib_issues = [
             issue
             for issue in result.issues
-            if str(issue.severity) == "IssueSeverity.CRITICAL" and "importlib" in issue.message.lower()
+            if issue.severity == IssueSeverity.CRITICAL and "importlib" in issue.message.lower()
         ]
 
         # Should not flag importlib in documentation as critical

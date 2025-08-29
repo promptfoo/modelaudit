@@ -97,7 +97,7 @@ class ScanResultsCache:
                 json.dump(cache_entry, f, indent=2)
 
             self._record_cache_hit()
-            logger.info(f"Cache HIT for {os.path.basename(file_path)}")
+            logger.debug(f"Cache hit for {os.path.basename(file_path)}")
             return cache_entry["scan_result"]  # type: ignore[no-any-return]
 
         except Exception as e:
@@ -155,7 +155,7 @@ class ScanResultsCache:
             logger.debug(f"Cached scan result for {os.path.basename(file_path)}")
 
         except Exception as e:
-            logger.warning(f"Failed to cache result for {file_path}: {e}")
+            logger.debug(f"Failed to cache result for {file_path}: {e}")
 
     def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result] = None) -> Optional[str]:
         """
@@ -329,7 +329,7 @@ class ScanResultsCache:
         removed_count = 0
         cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
 
-        logger.info(f"Cleaning up cache entries older than {max_age_days} days...")
+        logger.debug(f"Cleaning cache entries older than {max_age_days} days")
 
         # Walk through all cache files
         for cache_file in self.cache_dir.rglob("*.json"):
@@ -355,7 +355,7 @@ class ScanResultsCache:
         # Clean up empty directories
         self._cleanup_empty_directories()
 
-        logger.info(f"Removed {removed_count} old cache entries")
+        logger.debug(f"Removed {removed_count} old cache entries")
         return removed_count
 
     def _cleanup_empty_directories(self):
@@ -414,7 +414,7 @@ class ScanResultsCache:
         """Clear entire cache."""
         import shutil
 
-        logger.info("Clearing entire scan results cache...")
+        logger.debug("Clearing entire scan results cache")
 
         # Remove all cache files except metadata
         for item in self.cache_dir.iterdir():
@@ -426,7 +426,7 @@ class ScanResultsCache:
 
         # Reset metadata
         self._create_initial_metadata()
-        logger.info("Cache cleared successfully")
+        logger.debug("Cache cleared successfully")
 
     def _ensure_metadata_exists(self):
         """Ensure cache metadata file exists."""
