@@ -5,18 +5,23 @@ from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+
+def _get_onnx_mapping():
+    """Get ONNX mapping module from different locations depending on version."""
+    try:
+        from onnx import mapping
+        return mapping
+    except ImportError:
+        with contextlib.suppress(ImportError):
+            from onnx.onnx_cpp2py_export import mapping  # Fallback for older versions
+            return mapping
+    return None
+
 try:
     import numpy as np
     import onnx
 
-    # Handle different ONNX versions - mapping module location changed
-    mapping = None
-    try:
-        from onnx import mapping  # type: ignore[no-redef]
-    except ImportError:
-        with contextlib.suppress(ImportError):
-            from onnx.onnx_cpp2py_export import mapping  # type: ignore[no-redef] # Fallback for older versions
-
+    mapping = _get_onnx_mapping()
     HAS_ONNX = True
 except Exception:
     HAS_ONNX = False
@@ -257,7 +262,7 @@ class OnnxScanner(BaseScanner):
         try:
             if mapping is None:
                 return  # Skip if mapping is not available
-            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])  # type: ignore[unreachable]
+            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
@@ -306,7 +311,7 @@ class OnnxScanner(BaseScanner):
                 try:
                     if mapping is None:
                         continue  # Skip if mapping is not available
-                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])  # type: ignore[unreachable]
+                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d
