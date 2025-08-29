@@ -4,7 +4,10 @@ import struct
 import time
 from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
 
+from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.ml_context_analyzer import MLContextAnalyzer
+from modelaudit.analysis.opcode_sequence_analyzer import OpcodeSequenceAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
 from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.suspicious_symbols import (
@@ -196,9 +199,10 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     if total_opcodes == 0:
         return context
 
-    # Analyze GLOBAL opcodes for ML patterns
+    # Analyze GLOBAL and STACK_GLOBAL opcodes for ML patterns
     global_refs: dict[str, int] = {}
     total_global_opcodes = 0
+    stack_strings = []  # Track strings for STACK_GLOBAL reconstruction
 
     for opcode, arg, _pos in opcodes:
         if opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -212,6 +216,25 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
                 module = arg
 
             global_refs[module] = global_refs.get(module, 0) + 1
+
+        elif opcode.name in ["SHORT_BINUNICODE", "BINUNICODE", "UNICODE"] and isinstance(arg, str):
+            # Collect strings that might be used for STACK_GLOBAL
+            stack_strings.append(arg)
+
+        elif opcode.name == "STACK_GLOBAL":
+            total_global_opcodes += 1
+            # STACK_GLOBAL uses the top two stack items as module and name
+            # We approximate this by using the last two strings we've seen
+            if len(stack_strings) >= 2:
+                module = stack_strings[-2]  # Second-to-last string (module)
+                name = stack_strings[-1]  # Last string (name)
+
+                # Create a reference similar to GLOBAL format
+                full_ref = f"{module}.{name}"
+                global_refs[module] = global_refs.get(module, 0) + 1
+
+                # Also track the full reference for pattern matching
+                global_refs[full_ref] = global_refs.get(full_ref, 0) + 1
 
     # Check each framework with improved scoring
     for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
@@ -258,7 +281,12 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     if context["frameworks"]:
         context["overall_confidence"] = max(fw["confidence"] for fw in context["frameworks"].values())
         # Much more lenient threshold - any significant ML pattern detection
-        context["is_ml_content"] = context["overall_confidence"] > 0.15  # Was 0.3
+        # Special case: collections.OrderedDict is the standard PyTorch state_dict container
+        has_collections_ordered_dict = "collections.OrderedDict" in global_refs
+        context["is_ml_content"] = (
+            context["overall_confidence"] > 0.15  # Was 0.3
+            or has_collections_ordered_dict
+        )  # Special case for PyTorch state_dict
 
     return context
 
@@ -789,6 +817,11 @@ class PickleScanner(BaseScanner):
         self.semantic_analyzer = SemanticAnalyzer()
         self.framework_kb = FrameworkKnowledgeBase()
 
+        # Initialize enhanced analysis components
+        self.opcode_sequence_analyzer = OpcodeSequenceAnalyzer()
+        self.ml_context_analyzer = MLContextAnalyzer()
+        self.enhanced_pattern_detector = EnhancedPatternDetector()
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if the file is a pickle based on extension and content"""
@@ -847,6 +880,10 @@ class PickleScanner(BaseScanner):
 
         # Initialize context for this file
         self._initialize_context(path)
+
+        # Reset analyzers for clean state
+        if hasattr(self, "opcode_sequence_analyzer"):
+            self.opcode_sequence_analyzer.reset()
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -1241,130 +1278,32 @@ class PickleScanner(BaseScanner):
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
-        """Scan raw bytes for dangerous patterns. Used by both scan and _scan_pickle_bytes."""
-        # Early detection of dangerous patterns (existing + CVE-specific + binary code patterns)
-        dangerous_patterns = [
-            b"posix",  # Common in malicious pickles (posix.system)
-            b"subprocess",
-            b"eval",
-            b"exec",
-            b"compile",  # Can compile and execute arbitrary code
-            b"__import__",
-            b"builtins",  # Often used for builtins.eval, builtins.exec
-            b"__builtins__",  # Alternative reference to builtins
-            b"globals",  # Access to global namespace for code injection
-            b"locals",  # Access to local namespace for code injection
-            b"runpy",  # Can run modules and scripts (runpy.run_module, runpy.run_path)
-            b"webbrowser",  # Can open malicious URLs (webbrowser.open)
-            b"importlib",  # Dynamic imports (importlib.import_module)
-            b"execfile",  # Execute Python files (Python 2 legacy but still dangerous)
-            # Enhanced os/subprocess detection
-            b"os.system",  # Direct system command execution
-            b"os.popen",  # Process spawning with pipe
-            b"os.spawn",  # Process spawning variants (spawnv, spawnve, etc.)
-            b"subprocess.call",  # Subprocess call
-            b"subprocess.run",  # Subprocess run (Python 3.5+)
-            b"subprocess.Popen",  # Process creation
-            b"commands",  # Python 2 legacy commands module
-            b"getoutput",  # commands.getoutput
-            b"getstatusoutput",  # commands.getstatusoutput
-            b"system",  # Catches both os.system and from os import system
-        ]
+        """Enhanced scan for dangerous patterns with ML context awareness and obfuscation detection."""
+        # Use enhanced pattern detector with context
+        context = {
+            "file_path": context_path,
+            "stack_state": getattr(self.opcode_sequence_analyzer, "stack_simulation", []),
+        }
 
-        # Add all binary code patterns to ensure consistency with binary scanning
-        dangerous_patterns.extend(BINARY_CODE_PATTERNS)
+        # Detect patterns using enhanced analyzer
+        pattern_matches = self.enhanced_pattern_detector.detect_patterns(data, context)
 
-        # Add CVE-specific binary patterns
-        dangerous_patterns.extend(CVE_BINARY_PATTERNS)
+        # Process matches and create appropriate checks
+        if pattern_matches:
+            # Group matches by pattern type for better reporting
+            pattern_groups: dict[str, list[PatternMatch]] = {}
+            for match in pattern_matches:
+                pattern_name = match.pattern_name
+                if pattern_name not in pattern_groups:
+                    pattern_groups[pattern_name] = []
+                pattern_groups[pattern_name].append(match)
 
-        # CVE-2025-32434 specific patterns - PyTorch weights_only=True bypass techniques
-        cve_2025_32434_patterns = [
-            # Patterns that specifically exploit the weights_only=True assumption
-            b"torch.load",  # Direct torch.load references in payload
-            b"weights_only",  # References to the weights_only parameter
-            b"torch._C",  # Internal PyTorch C++ interface access
-            b"torch.jit._script",  # TorchScript exploitation paths
-            b"torch.jit.trace",  # JIT tracing exploitation
-            b"torch.serialization",  # PyTorch serialization internals
-            b"torch._utils",  # Internal PyTorch utilities
-            b"torch.nn.Module",  # Neural network module manipulation
-            b"torch._six",  # PyTorch compatibility utilities
-            b"torch.cuda._lazy_call",  # CUDA lazy execution exploitation
-            b"torch.autograd.Function",  # Autograd function injection
-            b"F.apply",  # Function application bypass
-            # Base64/hex encoded PyTorch payloads
-            b"dG9yY2g",  # base64 "torch"
-            b"746f726368",  # hex "torch"
-            b"UHlUb3JjaA",  # base64 "PyTorch"
-            b"507954617268",  # hex "PyTorch"
-            # Obfuscated torch references
-            b"__torch__",  # Torch module references
-            b"_torch_",  # Alternative torch references
-            # Lambda exploitation in PyTorch context
-            b"lambda",  # Lambda functions for code injection
-            b"functools.partial",  # Partial function application
-            # PyTorch-specific dangerous operations
-            b"torch.save",  # Model saving manipulation
-            b"torch.hub",  # PyTorch Hub exploitation
-            b"torchvision.transforms",  # Transform pipeline injection
-            b"torch.utils.data",  # Data pipeline manipulation
-        ]
+            # Create checks for each pattern group
+            for _pattern_name, matches in pattern_groups.items():
+                self._create_enhanced_pattern_check(matches, result, context_path)
 
-        # Combine all patterns
-        all_dangerous_patterns = dangerous_patterns + cve_2025_32434_patterns
-
-        # Limit how much we scan for performance
-        max_scan_size = min(8192, len(data))
-        scan_data = data[:max_scan_size]
-
-        for pattern in all_dangerous_patterns:
-            # Check for interrupts during pattern scanning
-            self.check_interrupted()
-            # Use find() instead of 'in' operator to be more explicit
-            if scan_data.find(pattern) != -1:
-                # Extract context around the pattern for semantic analysis
-                pattern_str = pattern.decode("utf-8", errors="ignore")
-                pattern_pos = scan_data.find(pattern)
-                context_start = max(0, pattern_pos - 100)
-                context_end = min(len(scan_data), pattern_pos + len(pattern) + 100)
-                context = scan_data[context_start:context_end].decode("utf-8", errors="ignore")
-
-                # Use semantic analysis to check if this is actually dangerous
-                # For now, just check if it's in documentation or comments
-                is_safe = "documentation" in context.lower() or "#" in context
-
-                # Additional PyTorch-specific safety checks
-                if pattern == b"torch._utils":
-                    # torch._utils is safe when used with legitimate tensor rebuilding functions
-                    legitimate_pytorch_functions = [
-                        b"_rebuild_tensor_v2",
-                        b"_rebuild_parameter",
-                        b"_rebuild_tensor",
-                        b"_rebuild_sparse_tensor",
-                        b"_rebuild_nested_tensor",
-                    ]
-                    is_safe = is_safe or any(func in context.encode() for func in legitimate_pytorch_functions)
-
-                # Skip if semantic analysis says it's safe (e.g., in documentation)
-                if is_safe:
-                    continue
-
-                result.add_check(
-                    name="Dangerous Pattern Detection",
-                    passed=False,
-                    message=f"Suspicious code pattern in binary data: {pattern_str}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=context_path,
-                    details={
-                        "pattern": pattern_str,
-                        "detection_method": "raw_content_scan",
-                        "semantic_safe": is_safe,
-                    },
-                    why=(
-                        f"The file contains the dangerous pattern '{pattern_str}' "
-                        f"which could indicate malicious code execution during unpickling."
-                    ),
-                )
+        # Legacy pattern detection for backwards compatibility
+        self._scan_legacy_patterns(data, result, context_path)
 
         # Perform CVE-specific pattern analysis on the data
         self._analyze_cve_patterns(data, result, context_path)
@@ -1411,6 +1350,200 @@ class PickleScanner(BaseScanner):
                     f"a {attr.severity.lower()} vulnerability ({attr.cwe}) affecting {attr.affected_versions}. "
                     f"This could indicate potential exploitation attempts. {attr.remediation}",
                 )
+
+    def _create_enhanced_pattern_check(self, matches, result: ScanResult, context_path: str) -> None:
+        """Create a check for enhanced pattern matches with ML context awareness."""
+        if not matches:
+            return
+
+        # Use the first match as representative (they're all the same pattern type)
+        representative = matches[0]
+        pattern_name = representative.pattern_name
+        severity = representative.severity
+
+        # Calculate effective risk considering ML context and confidence
+        max_confidence = max(match.confidence for match in matches)
+        min_ml_adjustment = min(match.ml_context_adjustment for match in matches)
+        effective_severity = self._calculate_effective_severity(severity, min_ml_adjustment, max_confidence)
+
+        # Create detailed message
+        if len(matches) == 1:
+            match = matches[0]
+            if match.deobfuscated_text:
+                message = f"Detected {pattern_name} pattern in deobfuscated content: '{match.matched_text}'"
+            else:
+                message = f"Detected {pattern_name} pattern: '{match.matched_text}'"
+
+            # Add ML context explanation if significant adjustment
+            if match.ml_context_adjustment < 0.7:
+                ml_explanation = match.context.get("ml_explanation", "")
+                if ml_explanation:
+                    message += f" (Risk reduced due to ML context: {ml_explanation})"
+        else:
+            # Get unique matched texts for better specificity
+            unique_matches = list({match.matched_text for match in matches})
+            if len(unique_matches) <= 3:
+                match_text = ", ".join(f"'{m}'" for m in unique_matches)
+                message = f"Detected {pattern_name} pattern: {match_text}"
+            else:
+                message = f"Detected {len(matches)} instances of {pattern_name} pattern"
+
+            ml_adjusted_count = sum(1 for m in matches if m.ml_context_adjustment < 0.9)
+            if ml_adjusted_count > 0:
+                message += f" ({ml_adjusted_count} with reduced risk due to ML context)"
+
+        # Collect details
+        details = {
+            "pattern_type": pattern_name,
+            "matches_found": len(matches),
+            "confidence": max_confidence,
+            "ml_risk_adjustment": min_ml_adjustment,
+            "effective_severity": effective_severity,
+            "detection_method": "enhanced_pattern_detection",
+        }
+
+        # Add obfuscation details if any matches were deobfuscated
+        deobfuscated_matches = [m for m in matches if m.deobfuscated_text]
+        if deobfuscated_matches:
+            details["obfuscation_detected"] = True
+            details["deobfuscated_samples"] = [m.deobfuscated_text for m in deobfuscated_matches[:3]]
+
+        # Add ML context details if available
+        if matches[0].context.get("ml_framework"):
+            details["ml_framework"] = matches[0].context["ml_framework"]
+            details["ml_confidence"] = matches[0].context.get("ml_confidence", 0)
+
+        # Create the check with appropriate severity
+        result.add_check(
+            name=f"Enhanced Pattern Detection: {pattern_name.replace('_', ' ').title()}",
+            passed=False,
+            message=message,
+            severity=effective_severity,
+            location=context_path,
+            details=details,
+            why=self._generate_pattern_explanation(representative, min_ml_adjustment),
+        )
+
+    def _calculate_effective_severity(
+        self, base_severity: str, ml_adjustment: float, confidence: float = 1.0
+    ) -> IssueSeverity:
+        """Calculate effective severity considering ML context adjustment and confidence."""
+        # If confidence is very low, reduce severity
+        if confidence < 0.3:  # Very low confidence
+            if base_severity == "critical":
+                return IssueSeverity.WARNING
+            elif base_severity == "warning":
+                return IssueSeverity.INFO
+
+        # If ML context reduces risk significantly, lower severity
+        if ml_adjustment < 0.3:  # 70%+ risk reduction
+            if base_severity == "critical":
+                return IssueSeverity.WARNING
+            elif base_severity == "warning":
+                return IssueSeverity.INFO
+        elif ml_adjustment < 0.6 and base_severity == "critical":  # 40%+ risk reduction
+            return IssueSeverity.WARNING
+
+        # Map base severity to IssueSeverity enum
+        severity_map = {
+            "critical": IssueSeverity.CRITICAL,
+            "warning": IssueSeverity.WARNING,
+            "info": IssueSeverity.INFO,
+        }
+
+        return severity_map.get(base_severity, IssueSeverity.WARNING)
+
+    def _generate_pattern_explanation(self, match, ml_adjustment: float) -> str:
+        """Generate explanation for why a pattern is dangerous."""
+        base_explanation = (
+            f"The pattern '{match.pattern_name}' indicates potential {match.context.get('category', 'security')} risks."
+        )
+
+        if match.deobfuscated_text:
+            base_explanation += (
+                " The pattern was detected after deobfuscating encoded content, "
+                "which is often used to hide malicious intent."
+            )
+
+        if ml_adjustment < 0.7:
+            base_explanation += (
+                " However, this appears to be in the context of legitimate ML framework operations, "
+                "which reduces the risk significantly."
+            )
+
+        return base_explanation
+
+    def _scan_legacy_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
+        """Legacy pattern detection for backwards compatibility."""
+        # Keep existing pattern detection logic for patterns not covered by enhanced detector
+        dangerous_patterns = [
+            # CVE-2025-32434 specific patterns - PyTorch weights_only=True bypass techniques
+            b"torch.load",  # Direct torch.load references in payload
+            b"weights_only",  # References to the weights_only parameter
+        ]
+
+        # Add all binary code patterns to ensure consistency with binary scanning
+        dangerous_patterns.extend(BINARY_CODE_PATTERNS)
+        dangerous_patterns.extend(CVE_BINARY_PATTERNS)
+
+        # Simple pattern matching for legacy compatibility
+        for pattern in dangerous_patterns:
+            if pattern in data:
+                pattern_str = pattern.decode("utf-8", errors="replace")
+                result.add_check(
+                    name="Legacy Pattern Detection",
+                    passed=False,
+                    message=f"Legacy dangerous pattern detected: {pattern_str}",
+                    severity=IssueSeverity.WARNING,
+                    location=context_path,
+                    details={"pattern": pattern_str, "detection_method": "legacy_pattern_matching"},
+                )
+
+    def _create_opcode_sequence_check(self, sequence_result, result: ScanResult) -> None:
+        """Create a check for detected dangerous opcode sequences."""
+        # Map severity to IssueSeverity enum
+        severity_map = {
+            "critical": IssueSeverity.CRITICAL,
+            "warning": IssueSeverity.WARNING,
+            "info": IssueSeverity.INFO,
+        }
+        severity = severity_map.get(sequence_result.severity, IssueSeverity.WARNING)
+
+        # Create detailed message
+        message = f"Dangerous opcode sequence detected: {' → '.join(sequence_result.matched_opcodes)}"
+
+        # Add stack context if available
+        stack_info = ""
+        if sequence_result.evidence.get("stack_state"):
+            stack_context = sequence_result.evidence["stack_state"]
+            if stack_context:
+                # Show the most relevant stack items
+                relevant_items = [str(item) for item in stack_context[-3:] if item]
+                if relevant_items:
+                    stack_info = f" (Stack context: {' → '.join(relevant_items)})"
+                    message += stack_info
+
+        # Create the check
+        result.add_check(
+            name=f"Opcode Sequence Analysis: {sequence_result.pattern_name.replace('_', ' ').title()}",
+            passed=False,
+            message=message,
+            severity=severity,
+            location=f"{self.current_file_path} (pos {sequence_result.position})"
+            if sequence_result.position
+            else self.current_file_path,
+            details={
+                "pattern_name": sequence_result.pattern_name,
+                "matched_opcodes": sequence_result.matched_opcodes,
+                "confidence": sequence_result.confidence,
+                "evidence": sequence_result.evidence,
+                "detection_method": "opcode_sequence_analysis",
+            },
+            why=(
+                f"{sequence_result.description}. This sequence of opcodes can be used to execute "
+                "arbitrary code during unpickling."
+            ),
+        )
 
     def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
@@ -1512,22 +1645,30 @@ class PickleScanner(BaseScanner):
         # Check for embedded secrets in the pickle data
         self.check_for_embedded_secrets(file_data, result, self.current_file_path)
 
-        # Check for JIT/Script code execution risks in the pickle data
-        # Pickle files can contain TorchScript or other JIT code
-        self.check_for_jit_script_code(
+        # Check for JIT/Script code execution risks and network communication patterns
+        # Collect findings without creating individual checks
+        jit_findings = self.collect_jit_script_findings(
             file_data,
-            result,
             model_type="pytorch",  # Most pickle files in ML are PyTorch
             context=self.current_file_path,
         )
-
-        # Check for network communication patterns
-        # Models should not contain network capabilities
-        self.check_for_network_communication(
+        network_findings = self.collect_network_communication_findings(
             file_data,
-            result,
             context=self.current_file_path,
         )
+
+        # Create single aggregated checks for the file (only if checks are enabled)
+        check_jit = self._get_bool_config("check_jit_script", True)
+        if check_jit:
+            self.summarize_jit_script_findings(jit_findings, result, context=self.current_file_path)
+        else:
+            result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+        check_net = self._get_bool_config("check_network_comm", True)
+        if check_net:
+            self.summarize_network_communication_findings(network_findings, result, context=self.current_file_path)
+        else:
+            result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
@@ -1592,6 +1733,14 @@ class PickleScanner(BaseScanner):
 
                 opcodes.append((opcode, arg, pos))
                 opcode_count += 1
+
+                # Enhanced opcode sequence analysis
+                sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
+
+                # Process any detected dangerous sequences
+                if sequence_results:
+                    for seq_result in sequence_results:
+                        self._create_opcode_sequence_check(seq_result, result)
 
                 # Track stack depth based on opcode type
                 # Stack-building opcodes
@@ -1699,21 +1848,64 @@ class PickleScanner(BaseScanner):
             ml_context = _detect_ml_context(opcodes)
 
             # CVE-2025-32434 specific opcode sequence analysis
-            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes)
+            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes, file_size)
             for cve_pattern in cve_patterns:
+                # Handle informational patterns (large legitimate models)
+                if cve_pattern.get("status") == "normal":
+                    result.add_check(
+                        name="Large Model Opcode Analysis",
+                        passed=True,
+                        message=f"Large model analysis: {cve_pattern['description']}",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "pattern_type": cve_pattern["pattern_type"],
+                            "dangerous_count": cve_pattern["dangerous_count"],
+                            "file_size_mb": cve_pattern["file_size_mb"],
+                            "opcode_density_per_mb": cve_pattern["opcode_density_per_mb"],
+                            "threshold_used": cve_pattern["threshold_used"],
+                        },
+                    )
+                    continue
+
+                # Map severity levels to IssueSeverity
+                severity_level = cve_pattern.get("severity_level", "critical")
+                if severity_level == "critical":
+                    severity = IssueSeverity.CRITICAL
+                elif severity_level == "high":
+                    severity = IssueSeverity.CRITICAL  # Still critical, but with context
+                elif severity_level == "medium":
+                    severity = IssueSeverity.WARNING  # Reduced severity for large models
+                else:  # low
+                    severity = IssueSeverity.INFO  # Just informational for very large models
+
+                # Choose message prefix based on severity
+                if severity == IssueSeverity.CRITICAL:
+                    message_prefix = "Detected CVE-2025-32434 exploitation pattern"
+                elif severity == IssueSeverity.WARNING:
+                    message_prefix = "Potential CVE-2025-32434 pattern (large model context)"
+                else:
+                    message_prefix = "CVE-2025-32434 analysis (informational)"
+
                 result.add_check(
                     name="CVE-2025-32434 Opcode Sequence Detection",
-                    passed=False,
-                    message=f"Detected CVE-2025-32434 exploitation pattern: {cve_pattern['description']}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (pos {cve_pattern['position']})",
+                    passed=severity not in [IssueSeverity.CRITICAL, IssueSeverity.WARNING],
+                    message=f"{message_prefix}: {cve_pattern['description']}",
+                    severity=severity,
+                    location=f"{self.current_file_path} (pos {cve_pattern.get('position', 0)})",
                     details={
                         "cve_id": "CVE-2025-32434",
                         "pattern_type": cve_pattern["pattern_type"],
                         "description": cve_pattern["description"],
-                        "opcodes_involved": cve_pattern["opcodes"],
-                        "exploitation_method": cve_pattern["exploitation_method"],
-                        "position": cve_pattern["position"],
+                        "opcodes_involved": cve_pattern.get("opcodes", []),
+                        "exploitation_method": cve_pattern.get("exploitation_method", ""),
+                        "position": cve_pattern.get("position", 0),
+                        "dangerous_count": cve_pattern.get("dangerous_count", 0),
+                        "file_size_mb": cve_pattern.get("file_size_mb", 0),
+                        "opcode_density_per_mb": cve_pattern.get("opcode_density_per_mb", 0),
+                        "threshold_used": cve_pattern.get("threshold_used", 0),
+                        "severity_level": severity_level,
+                        "confidence_score": cve_pattern.get("confidence_score", 0),
                     },
                 )
 
@@ -2784,8 +2976,11 @@ class PickleScanner(BaseScanner):
 
         return result
 
-    def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple]) -> list[dict]:
-        """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques"""
+    def _detect_cve_2025_32434_sequences(self, opcodes: list[tuple], file_size: int) -> list[dict]:
+        """Detect specific opcode sequences that indicate CVE-2025-32434 exploitation techniques
+
+        Uses dynamic thresholds based on file size to reduce false positives for large legitimate models.
+        """
         patterns = []
 
         # Count dangerous opcodes and torch references for overall analysis
@@ -2964,22 +3159,73 @@ class PickleScanner(BaseScanner):
                         )
                         break
 
-        # Pattern 6: Overall suspicious density check (CVE-2025-32434 indicator)
-        # Very high concentration of dangerous opcodes in a PyTorch model is suspicious
-        # Normal PyTorch models have some REDUCE opcodes for tensor reconstruction, but not excessive amounts
-        if dangerous_opcodes_count > 80 and torch_references > 0:
+        # Pattern 6: Improved density-based CVE-2025-32434 detection
+        # Use dynamic thresholds based on file size to reduce false positives for large legitimate models
+        if torch_references > 0 and dangerous_opcodes_count > 0:
+            # Calculate density: opcodes per MB
+            file_size_mb = file_size / (1024 * 1024)
+            raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
+            opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
+
+            # Dynamic thresholds based on file size:
+            # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
+            # Medium files (10MB-1GB): Moderate sensitivity - 200+ opcodes per MB
+            # Large files (>1GB): Low sensitivity - 500+ opcodes per MB (for large models like Llama)
+            if file_size_mb < 10:
+                density_threshold = 80.0
+                severity_level = "critical"
+            elif file_size_mb < 1000:  # < 1GB
+                density_threshold = 200.0
+                severity_level = "high" if opcode_density_per_mb > 300 else "medium"
+            else:  # >= 1GB (large models)
+                density_threshold = 500.0  # Much higher threshold for large models
+                severity_level = "medium" if opcode_density_per_mb > 800 else "low"
+
+            # Only flag if density exceeds threshold
+            if opcode_density_per_mb > density_threshold:
+                confidence_score = int(min(100.0, (raw_opcode_density_per_mb / density_threshold - 1.0) * 100.0))
+
+                patterns.append(
+                    {
+                        "pattern_type": "high_risk_opcode_density",
+                        "description": (
+                            f"Elevated dangerous opcode density ({dangerous_opcodes_count} opcodes, "
+                            f"{opcode_density_per_mb:.1f}/MB in {file_size_mb:.1f}MB file) "
+                            f"may indicate CVE-2025-32434 exploitation (confidence: {confidence_score:.0f}%)"
+                        ),
+                        "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
+                        "exploitation_method": "weights_only=True bypass via opcode density attack",
+                        "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
+                        "dangerous_count": dangerous_opcodes_count,
+                        "torch_references": torch_references,
+                        "file_size_mb": file_size_mb,
+                        "opcode_density_per_mb": opcode_density_per_mb,
+                        "threshold_used": density_threshold,
+                        "severity_level": severity_level,
+                        "confidence_score": confidence_score,
+                    }
+                )
+
+        # Add informational message for large legitimate models that are below threshold
+        if (
+            torch_references > 0
+            and dangerous_opcodes_count > 50
+            and file_size_mb > 100
+            and opcode_density_per_mb <= density_threshold
+        ):
             patterns.append(
                 {
-                    "pattern_type": "high_risk_opcode_density",
+                    "pattern_type": "large_model_normal_density",
                     "description": (
-                        f"High concentration of dangerous opcodes ({dangerous_opcodes_count}) "
-                        "in PyTorch model indicates potential CVE-2025-32434 exploitation"
+                        f"Large PyTorch model ({file_size_mb:.1f}MB) with {dangerous_opcodes_count} "
+                        f"dangerous opcodes ({opcode_density_per_mb:.1f}/MB) is within expected range "
+                        "for legitimate models"
                     ),
-                    "opcodes": [op for op, pos in dangerous_opcodes_found[:10]],  # First 10 for brevity
-                    "exploitation_method": "weights_only=True bypass via opcode density attack",
-                    "position": dangerous_opcodes_found[0][1] if dangerous_opcodes_found else 0,
                     "dangerous_count": dangerous_opcodes_count,
-                    "torch_references": torch_references,
+                    "file_size_mb": file_size_mb,
+                    "opcode_density_per_mb": opcode_density_per_mb,
+                    "threshold_used": density_threshold,
+                    "status": "normal",
                 }
             )
 

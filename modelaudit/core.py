@@ -179,7 +179,7 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     # Log information about duplicate content found
     for content_hash, paths in content_groups.items():
         if len(paths) > 1:
-            logger.info(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]}...)")
+            logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
             for path in paths:
                 logger.debug(f"  - {path}")
 
@@ -365,7 +365,7 @@ def _update_result_counts(
 
     # Log consolidation summary
     reduction_count = original_count - total_checks
-    logger.info(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
+    logger.debug(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
 
     if skipped_checks > 0:
         logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
@@ -404,9 +404,15 @@ def _consolidate_checks(results: ModelAuditResultModel) -> None:
             continue
 
         # Multiple checks - consolidate them
-        passed_count = sum(1 for c in group_checks if c.get("status") == "passed")
-        failed_count = len(group_checks) - passed_count
-        consolidated_status = "failed" if failed_count > 0 else "passed"
+        statuses = [c.get("status") for c in group_checks]
+        failed_count = sum(s == "failed" for s in statuses)
+        passed_count = sum(s == "passed" for s in statuses)
+        if failed_count:
+            consolidated_status = "failed"
+        elif passed_count:
+            consolidated_status = "passed"
+        else:
+            consolidated_status = "skipped"
 
         # Build consolidated check
         consolidated_check = {
@@ -545,6 +551,10 @@ def scan_model_directory_or_file(
                 raise ValueError(f"No scanner available for {stream_url}")
 
             # Return early for streaming - finalize the model
+            try:
+                _consolidate_checks(results)
+            except Exception as e:
+                logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
             results.finalize_statistics()
             return results
 
@@ -837,7 +847,7 @@ def scan_model_directory_or_file(
                 )
             # Stop scanning if size limit reached
             if limit_reached:
-                logger.info("Scan terminated early due to total size limit")
+                logger.warning("Scan terminated early due to total size limit")
                 _add_issue_to_model(
                     results,
                     "Scan terminated early due to total size limit",
@@ -931,7 +941,7 @@ def scan_model_directory_or_file(
                     progress_callback(f"Completed scanning: {target}", 100.0)
 
     except KeyboardInterrupt:
-        logger.info("Scan interrupted by user")
+        logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
@@ -949,11 +959,11 @@ def scan_model_directory_or_file(
 
     # Final timing is handled by finalize_statistics()
 
-    # Consolidate checks for cleaner reporting - temporarily disable while refactoring
-    # try:
-    #     _consolidate_checks(results)
-    # except Exception as e:
-    #     logger.warning(f"Error consolidating checks: {e!s}")
+    # Consolidate checks for cleaner reporting
+    try:
+        _consolidate_checks(results)
+    except Exception as e:
+        logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
 
     # Add license warnings if any
     try:
@@ -1214,7 +1224,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-            logger.warning(discrepancy_msg)
+            logger.debug(discrepancy_msg)
 
     # Prefer scanner based on header format using lazy loading
     preferred_scanner: Optional[type[BaseScanner]] = None

@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2025-08-28
+
 ### Added
 
-- **feat**: add SARIF output format support for integration with security tools and CI/CD pipelines
+- **feat**: improve CVE-2025-32434 detection with density-based analysis (#351)
+- **feat**: implement graceful degradation and enhanced error handling (#343)
+- **feat**: improve PyTorch ZIP scanner maintainability by splitting scan() into smaller functions (#346)
+- **feat**: add SARIF output format support for integration with security tools and CI/CD pipelines (#349)
+- **feat**: optimize cache performance by reducing file system calls (#338)
+- **feat**: comprehensive task list update and critical CLI usability audit (#340)
+- **feat**: add cache management CLI commands mirroring promptfoo's pattern (#331)
+- **feat**: add comprehensive metadata security scanner and enhanced HuggingFace support (#335)
+- **feat**: add comprehensive CVE detection for pickle/joblib vulnerabilities (#326)
 - **feat**: add Jinja2 template injection scanner (#323)
 - **feat**: comprehensive deep Pydantic integration with advanced type safety (#322)
 - **feat**: optimize CI for faster feedback (#320)
@@ -22,15 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **test**: speed up tests and CI runtime (#316)
 - **test**: cover Windows path extraction scenarios (#313)
 - **feat**: detect dangerous TensorFlow operations (#329)
-- **feat**: enhance pickle scanner with STACK_GLOBAL and memo tracking
+- **feat**: enhance pickle scanner with STACK_GLOBAL and memo tracking (#330)
 - **feat**: detect Windows and Unix OS module aliases to prevent system command execution via `nt` and `posix`
 
 ### Changed
 
+- **chore**: organize root directory structure (#341)
 - **chore**: make ctrl+c immediately terminate if pressed twice (#314)
 
 ### Fixed
 
+- **fix**: aggregate security checks per file instead of per chunk (#352)
+- **fix**: eliminate circular import between base.py and core.py (#342)
 - **fix**: default bytes_scanned in streaming operations (#312)
 - **fix**: validate directory file list before filtering (#311)
 - **fix**: tighten ONNX preview signature validation (#310)
@@ -277,7 +290,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: change weight distribution warnings to info level (#69)
 - **fix**: correct duration calculation (#68)
 
-## [0.1.1] - 2025-06-XX
+## [0.1.1] - 2025-06-16
 
 ### Added
 
@@ -300,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: switch config keys to info and reduce false positives (#8)
 - **fix**: reduce false positives for ML model configurations (#3)
 
-## [0.1.0] - 2025-06-XX
+## [0.1.0] - 2025-03-08
 
 ### Added
 

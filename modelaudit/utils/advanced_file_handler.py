@@ -395,7 +395,7 @@ class AdvancedFileHandler:
 
     def _scan_large_file_distributed(self) -> ScanResult:
         """Scan large files using memory-mapped approach with FULL security checks."""
-        logger.info(f"Scanning file ({self.total_size:,} bytes) with full security checks")
+        logger.debug(f"Scanning file ({self.total_size:,} bytes) with full security checks")
 
         # Add informational note about file size
         result = ScanResult(scanner_name=self.scanner.name)
