@@ -158,7 +158,7 @@ class TestSevenZipScanner:
                 archive.write(temp_pickle_path, "safe_model.pkl")
 
             # Mock the scanner registry to return a mock scanner
-            with patch("modelaudit.scanners.sevenzip_scanner.get_scanner_for_file") as mock_get_scanner:
+            with patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner:
                 mock_scanner = MagicMock()
                 mock_result = MagicMock()
                 mock_result.issues = []
@@ -197,7 +197,7 @@ class TestSevenZipScanner:
                 archive.write(temp_pickle_path, "malicious_model.pkl")
 
             # Mock the scanner registry to return a scanner that finds issues
-            with patch("modelaudit.scanners.sevenzip_scanner.get_scanner_for_file") as mock_get_scanner:
+            with patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner:
                 mock_scanner = MagicMock()
                 mock_result = MagicMock()
 
@@ -328,7 +328,7 @@ class TestSevenZipScanner:
                     archive.write(temp_path, archive_name)
 
             # Mock scanner that returns no issues
-            with patch("modelaudit.scanners.sevenzip_scanner.get_scanner_for_file") as mock_get_scanner:
+            with patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner:
                 mock_scanner = MagicMock()
                 mock_result = MagicMock()
                 mock_result.issues = []
@@ -389,12 +389,13 @@ class TestSevenZipScanner:
             result = scanner.scan(temp_7z_file)
 
             # Should handle extraction errors gracefully
-            extraction_checks = [c for c in result.checks if "File Extraction" in c.name]
-            assert len(extraction_checks) > 0
+            # With batch extraction, errors are caught at archive level
+            archive_checks = [c for c in result.checks if "Archive Extraction" in c.name]
+            assert len(archive_checks) > 0
 
-            check = extraction_checks[0]
+            check = archive_checks[0]
             assert check.status == CheckStatus.FAILED
-            assert "Failed to extract" in check.message
+            assert "Failed during archive extraction" in check.message
 
 
 class TestSevenZipScannerConfiguration:

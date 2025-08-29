@@ -12,7 +12,7 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
-    py7zr = None
+    py7zr = None  # type: ignore
 
 
 class SevenZipScanner(BaseScanner):
@@ -207,12 +207,12 @@ class SevenZipScanner(BaseScanner):
         """Extract scannable files and run appropriate scanners on them"""
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
             try:
-                # Extract only the scannable files
+                # Extract all scannable files at once to avoid py7zr state issues
+                archive.extract(path=tmp_dir, targets=scannable_files)
+
+                # Scan each extracted file
                 for file_name in scannable_files:
                     try:
-                        # Extract individual file
-                        archive.extract(path=tmp_dir, targets=[file_name])
-
                         extracted_path = os.path.join(tmp_dir, file_name)
                         if os.path.isfile(extracted_path):
                             # Check extracted file size
@@ -228,6 +228,16 @@ class SevenZipScanner(BaseScanner):
 
                             # Get appropriate scanner for the extracted file
                             self._scan_extracted_file(extracted_path, file_name, archive_path, result)
+                        else:
+                            # File was not extracted - log as warning
+                            result.add_check(
+                                name=f"File Extraction: {file_name}",
+                                passed=False,
+                                message=f"File {file_name} was not extracted successfully",
+                                severity=IssueSeverity.WARNING,
+                                location=f"{archive_path}:{file_name}",
+                                details={"error": "file_not_found_after_extraction"},
+                            )
 
                     except Exception as e:
                         result.add_check(
