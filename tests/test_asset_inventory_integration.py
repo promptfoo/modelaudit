@@ -175,7 +175,7 @@ class TestAssetInventoryIntegration:
     def test_asset_inventory_cli_text_output(self, complex_model_dir: Path):
         """Test that asset inventory appears correctly in CLI text output."""
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", str(complex_model_dir)])
+        result = runner.invoke(cli, ["scan", "--format", "text", str(complex_model_dir)])
 
         # Should succeed or have warnings but not error
         assert result.exit_code in [0, 1]

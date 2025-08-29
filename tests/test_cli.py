@@ -467,7 +467,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--no-cache", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "--format", "text", "https://huggingface.co/test/model"])
 
     # Should succeed
     assert result.exit_code == 0
