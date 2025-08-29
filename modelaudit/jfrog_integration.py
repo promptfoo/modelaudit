@@ -6,7 +6,7 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .core import scan_model_directory_or_file
 from .models import ModelAuditResultModel
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 def scan_jfrog_artifact(
     url: str,
     *,
-    api_token: Optional[str] = None,
-    access_token: Optional[str] = None,
+    api_token: str | None = None,
+    access_token: str | None = None,
     timeout: int = 3600,
     blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
