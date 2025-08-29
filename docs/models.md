@@ -159,23 +159,28 @@ Malicious Keras models with Lambda layer exploits and TensorFlow SavedModel atta
 
 Malicious pickled models from various ML libraries and serialization formats.
 
-| #   | Model Name                                          | Attack Vector | Source       | Primary Artifact                   | Detection Notes                                                |
-| --- | --------------------------------------------------- | ------------- | ------------ | ---------------------------------- | -------------------------------------------------------------- |
-| 53  | `willengler-uc/perovskite-screening`                | Dill pickle   | Hugging Face | `model.dill`                       | Flagged PAIT-PKL-100, good dill coverage                       |
-| 54  | `Iredteam/joblib-payload-chatbot`                   | Joblib pickle | Hugging Face | `*.joblib`                         | Explicit PoC repo for joblib RCE                               |
-| 55  | `MasterShomya/Tweets_Sentiment_Analyzer`            | Joblib pickle | Hugging Face | `tokenizer.joblib`                 | Joblib model flagged unsafe, plus unsafe Keras                 |
-| 56  | `faaza/house-price-pipeline`                        | Joblib pickle | Hugging Face | joblib model                       | Small joblib example, test low-signal repos                    |
-| 57  | `ankush-new-org/safe-model`                         | Mixed pickle  | Hugging Face | `model.pkl`                        | Flags include posix.system and XGBoost classes                 |
-| 58  | `Devishetty100/neoguardianai`                       | Joblib pickle | Hugging Face | `xgboost_model.joblib`             | Flagged PAIT-PKL-100, dill and xgboost imports                 |
-| 59  | `cis5190/SVM_model`                                 | Joblib pickle | Hugging Face | `BiLSTM_CNN.joblib`                | Marked "Protect AI Unsafe"                                     |
-| 61  | `hauson-fan/RagReuse`                               | Raw pickle    | Hugging Face | `psgs_w100.tsv.pkl`                | `posix.system` in pickle imports                               |
-| 62  | `timotejKralik/hate_speech_correction_slovak`       | Raw pickle    | Hugging Face | small pickle                       | Small pickle with `posix.system`                               |
-| 63  | `zpbrent/test`                                      | Raw pickle    | Hugging Face | micro pickles                      | Micro pickles exercising different torch opcodes               |
-| 64  | `ankushvangari-org2/unsafe-model`                   | Raw pickle    | Hugging Face | `unsafe_model.pkl`                 | Unsafe pickle                                                  |
-| 65  | `Ankush-Organization/safe-model`                    | Raw pickle    | Hugging Face | `model.pkl`                        | Includes `posix.system` plus XGBoost classes                   |
-| 66  | `cis5190/transformer_model`                         | Joblib pickle | Hugging Face | `transformer_model.joblib`         | Protect AI marks **PAIT‑PKL‑100**. Good for joblib path.       |
-| 67  | `bertin-project/bertin-base-stepwise`               | Joblib pickle | Hugging Face | `outputs/data_collator.joblib`     | **PAIT‑PKL‑100** with Tokenizers classes in imports.           |
-| 68  | `bertin-project/bertin-base-gaussian-exp-512seqlen` | Joblib pickle | Hugging Face | `outputs/.../data_collator.joblib` | **PAIT‑PKL‑100**. Similar to above, different checkpoint path. |
+| #   | Model Name                                          | Attack Vector | Source       | Primary Artifact                   | Detection Notes                                                                                                                    |
+| --- | --------------------------------------------------- | ------------- | ------------ | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 52  | **Local Fickling Test Cases**                       | Pickle RCE    | Local        | `simple_exec.pkl`                  | **✅ FICKLING ENHANCED** - Direct exec() with unused variables pattern, demonstrates fickling's unique "UnusedVariables" detection |
+| 52a | **Local Fickling Test Cases**                       | Pickle RCE    | Local        | `base64_payload.pkl`               | **✅ FICKLING ENHANCED** - Base64 obfuscated commands, tests fickling's pattern classification                                     |
+| 52b | **Local Fickling Test Cases**                       | Pickle RCE    | Local        | `getattr_payload.pkl`              | **✅ FICKLING ENHANCED** - Indirect attribute access attacks, fickling detects semantic patterns                                   |
+| 52c | **Local Fickling Test Cases**                       | Pickle RCE    | Local        | `eval_payload.pkl`                 | **✅ FICKLING ENHANCED** - eval() payload similar to CVE-2024-3568, fickling provides OvertlyBadEval classification                |
+| 52d | **Local Fickling Test Cases**                       | Pickle RCE    | Local        | `unused_var_payload.pkl`           | **✅ FICKLING ENHANCED** - Obfuscated unused variable pattern, demonstrates fickling's semantic analysis                           |
+| 53  | `willengler-uc/perovskite-screening`                | Dill pickle   | Hugging Face | `model.dill`                       | Flagged PAIT-PKL-100, good dill coverage                                                                                           |
+| 54  | `Iredteam/joblib-payload-chatbot`                   | Joblib pickle | Hugging Face | `*.joblib`                         | Explicit PoC repo for joblib RCE                                                                                                   |
+| 55  | `MasterShomya/Tweets_Sentiment_Analyzer`            | Joblib pickle | Hugging Face | `tokenizer.joblib`                 | Joblib model flagged unsafe, plus unsafe Keras                                                                                     |
+| 56  | `faaza/house-price-pipeline`                        | Joblib pickle | Hugging Face | joblib model                       | Small joblib example, test low-signal repos                                                                                        |
+| 57  | `ankush-new-org/safe-model`                         | Mixed pickle  | Hugging Face | `model.pkl`                        | Flags include posix.system and XGBoost classes                                                                                     |
+| 58  | `Devishetty100/neoguardianai`                       | Joblib pickle | Hugging Face | `xgboost_model.joblib`             | Flagged PAIT-PKL-100, dill and xgboost imports                                                                                     |
+| 59  | `cis5190/SVM_model`                                 | Joblib pickle | Hugging Face | `BiLSTM_CNN.joblib`                | Marked "Protect AI Unsafe"                                                                                                         |
+| 61  | `hauson-fan/RagReuse`                               | Raw pickle    | Hugging Face | `psgs_w100.tsv.pkl`                | `posix.system` in pickle imports                                                                                                   |
+| 62  | `timotejKralik/hate_speech_correction_slovak`       | Raw pickle    | Hugging Face | small pickle                       | Small pickle with `posix.system`                                                                                                   |
+| 63  | `zpbrent/test`                                      | Raw pickle    | Hugging Face | micro pickles                      | Micro pickles exercising different torch opcodes                                                                                   |
+| 64  | `ankushvangari-org2/unsafe-model`                   | Raw pickle    | Hugging Face | `unsafe_model.pkl`                 | Unsafe pickle                                                                                                                      |
+| 65  | `Ankush-Organization/safe-model`                    | Raw pickle    | Hugging Face | `model.pkl`                        | Includes `posix.system` plus XGBoost classes                                                                                       |
+| 66  | `cis5190/transformer_model`                         | Joblib pickle | Hugging Face | `transformer_model.joblib`         | Protect AI marks **PAIT‑PKL‑100**. Good for joblib path.                                                                           |
+| 67  | `bertin-project/bertin-base-stepwise`               | Joblib pickle | Hugging Face | `outputs/data_collator.joblib`     | **PAIT‑PKL‑100** with Tokenizers classes in imports.                                                                               |
+| 68  | `bertin-project/bertin-base-gaussian-exp-512seqlen` | Joblib pickle | Hugging Face | `outputs/.../data_collator.joblib` | **PAIT‑PKL‑100**. Similar to above, different checkpoint path.                                                                     |
 
 ### Demonstration & Mixed Attack Models
 
@@ -348,6 +353,45 @@ These queries and models provide comprehensive coverage for testing ModelAudit a
 **Real malicious model** (1 MB, 80 opcodes): Still **CRITICAL** (80 opcodes ÷ 1 MB = 80 opcodes/MB > 80 threshold)
 
 This improvement eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
+
+## Fickling Integration: Enhanced Pickle Analysis
+
+ModelAudit includes **fickling integration** for enhanced pickle security analysis. Fickling provides semantic analysis beyond basic opcode detection, identifying sophisticated attack patterns that standard scanners miss.
+
+### Unique Fickling Capabilities
+
+1. **Semantic Pattern Analysis**: Detects unused variables with malicious assignments (obfuscation technique)
+2. **Attack Classification**: Provides `OvertlyBadEval`, `UnusedVariables`, and severity grading
+3. **Enhanced Recommendations**: Specific actionable advice for each attack pattern
+4. **Code Execution Context**: Understands malicious intent vs. legitimate dangerous functions
+
+### Fickling-Enhanced Test Cases
+
+These local test cases demonstrate fickling's unique detection capabilities:
+
+| Test File             | Attack Pattern              | Fickling Detection                              | Standard Scanner                  |
+| --------------------- | --------------------------- | ----------------------------------------------- | --------------------------------- |
+| `simple_exec.pkl`     | Direct exec() calls         | ✅ `OvertlyBadEval` + `UnusedVariables` pattern | ⚠️ Generic opcode detection       |
+| `base64_payload.pkl`  | Base64 obfuscated commands  | ✅ Pattern classification + severity grading    | ⚠️ String pattern matching        |
+| `getattr_payload.pkl` | Indirect attribute access   | ✅ Semantic analysis of call patterns           | ⚠️ Basic function reference check |
+| `eval_payload.pkl`    | CVE-2024-3568-style payload | ✅ `OvertlyBadEval` with detailed context       | ⚠️ Simple eval detection          |
+
+### Evidence of Fickling Value
+
+**Sample Detection Output** from `simple_exec.pkl`:
+
+```
+✅ Fickling Enhanced Analysis:
+  • Malicious Code Execution: Call to `exec(...)` is almost certainly evidence of a malicious pickle file
+    - Classification: OvertlyBadEval (OVERTLY_MALICIOUS)
+    - Recommendation: Do not load this pickle - it contains code execution vulnerabilities
+
+  • Suspicious Unused Variables: Variable `_var0` is assigned value `exec(...)` but unused afterward
+    - Classification: UnusedVariables (SUSPICIOUS)
+    - Recommendation: Review unused variable assignments for hidden malicious code
+```
+
+This demonstrates fickling's **semantic understanding** of pickle structure beyond simple pattern matching.
 
 ## ModelAudit vs modelscan: Comparative Testing
 

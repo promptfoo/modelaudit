@@ -33,10 +33,11 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 # Optional fickling integration for enhanced analysis
 try:
+    import fickling
     from fickling.analysis import AnalysisResults, Severity, check_safety
     from fickling.exception import UnsafeFileError
     from fickling.fickle import Pickled
-    import fickling
+
     FICKLING_AVAILABLE = True
 except ImportError:
     # Graceful degradation when fickling is not available
@@ -45,7 +46,7 @@ except ImportError:
     Severity = None
     UnsafeFileError = Exception
     Pickled = None
-    
+
     def check_safety(*args, **kwargs):
         raise ImportError("Fickling is not available")
 
@@ -938,7 +939,7 @@ class PickleScanner(BaseScanner):
                     message=f"Fickling analysis failed, using fallback: {e}",
                     severity=IssueSeverity.INFO,
                     location=path,
-                    details={"error": str(e), "fallback": "comprehensive_analysis"}
+                    details={"error": str(e), "fallback": "comprehensive_analysis"},
                 )
 
         # Check if this is a .bin file that might be a PyTorch file
@@ -3393,28 +3394,28 @@ class PickleScanner(BaseScanner):
         """Run fickling analysis on the pickle file and integrate results."""
         if not FICKLING_AVAILABLE:
             return None
-            
+
         try:
             # Load pickle file with fickling
             with open(path, "rb") as f:
                 pickled = Pickled.load(f)
-            
+
             # Run fickling safety analysis
             analysis_results = check_safety(pickled)
-            
+
             # Convert fickling results to our format
             self._convert_fickling_results(analysis_results, result, pickled, path)
-            
+
             # Add fickling metadata
             result.metadata["fickling_analysis"] = True
             result.metadata["fickling_severity"] = analysis_results.severity.name
-            
+
             # Check basic fickling safety
             fickling_is_safe = fickling.is_likely_safe(path)
             result.metadata["fickling_safe"] = fickling_is_safe
-            
+
             return True
-            
+
         except UnsafeFileError as e:
             # Fickling detected unsafe content
             result.add_check(
@@ -3425,45 +3426,46 @@ class PickleScanner(BaseScanner):
                 location=path,
                 details={
                     "fickling_error": str(e),
-                    "recommendation": "Do not load this pickle file - it contains malicious code"
-                }
+                    "recommendation": "Do not load this pickle file - it contains malicious code",
+                },
             )
             return True
-            
+
         except Exception as e:
             # Fickling analysis failed
             logger.warning(f"Fickling analysis failed for {path}: {e}")
             return None
 
-    def _convert_fickling_results(self, analysis_results: AnalysisResults, result: ScanResult, 
-                                  pickled: Pickled, path: str) -> None:
+    def _convert_fickling_results(
+        self, analysis_results: AnalysisResults, result: ScanResult, pickled: Pickled, path: str
+    ) -> None:
         """Convert fickling analysis results to ModelAudit format."""
         for fickling_result in analysis_results.results:
             # Skip likely safe results unless they have interesting details
             if fickling_result.severity == Severity.LIKELY_SAFE:
                 continue
-                
+
             # Map fickling severity to our severity
             severity = self._map_fickling_severity(fickling_result.severity)
-            
+
             # Generate issue message and details
             analysis_name = fickling_result.analysis_name or "Unknown"
             message = f"Fickling Analysis - {analysis_name}: {fickling_result}"
-            
+
             details = {
                 "fickling_analysis": analysis_name,
                 "fickling_severity": fickling_result.severity.name,
                 "trigger": str(fickling_result.trigger) if fickling_result.trigger else None,
-                "recommendation": self._generate_fickling_recommendation(fickling_result)
+                "recommendation": self._generate_fickling_recommendation(fickling_result),
             }
-            
+
             result.add_check(
                 name="Fickling Security Analysis",
                 passed=False,
                 message=message,
                 severity=severity,
                 location=path,
-                details=details
+                details=details,
             )
 
     def _map_fickling_severity(self, fickling_severity: Severity) -> IssueSeverity:
@@ -3484,7 +3486,7 @@ class PickleScanner(BaseScanner):
     def _generate_fickling_recommendation(self, fickling_result) -> str:
         """Generate security recommendations based on fickling analysis."""
         analysis_name = fickling_result.analysis_name or ""
-        
+
         if "Eval" in analysis_name or "BadCalls" in analysis_name:
             return "Do not load this pickle - it contains code execution vulnerabilities"
         elif "Import" in analysis_name:
@@ -3498,24 +3500,29 @@ class PickleScanner(BaseScanner):
         """Enhance fickling results with our comprehensive analysis capabilities."""
         try:
             # Add ML context analysis
-            if hasattr(self, 'ml_context_analyzer'):
-                ml_context = self.ml_context_analyzer.analyze_file(path)
-                result.metadata["ml_context"] = ml_context
-            
-            # Add entropy analysis if available
-            if hasattr(self, 'entropy_analyzer'):
+            if hasattr(self, "ml_context_analyzer") and hasattr(self.ml_context_analyzer, "analyze_pickle_data"):
                 try:
-                    with open(path, 'rb') as f:
+                    with open(path, "rb") as f:
+                        data = f.read(8192)  # First 8KB for analysis
+                    ml_context = self.ml_context_analyzer.analyze_pickle_data(data)
+                    result.metadata["ml_context"] = ml_context
+                except Exception:
+                    pass  # Skip ML context analysis on error
+
+            # Add entropy analysis if available
+            if hasattr(self, "entropy_analyzer"):
+                try:
+                    with open(path, "rb") as f:
                         data = f.read(8192)  # First 8KB for entropy analysis
-                    entropy_score = self.entropy_analyzer.calculate_entropy(data)
+                    entropy_score = self.entropy_analyzer.calculate_shannon_entropy(data)
                     result.metadata["entropy_score"] = entropy_score
                 except Exception:
                     pass  # Skip entropy analysis on error
-                    
+
             # Add enhanced pattern detection
-            if hasattr(self, 'enhanced_pattern_detector'):
+            if hasattr(self, "enhanced_pattern_detector"):
                 try:
-                    with open(path, 'rb') as f:
+                    with open(path, "rb") as f:
                         data = f.read()
                     patterns = self.enhanced_pattern_detector.detect_patterns(data, {"file_path": path})
                     if patterns:
@@ -3523,13 +3530,13 @@ class PickleScanner(BaseScanner):
                             result.add_check(
                                 name="Enhanced Pattern Detection",
                                 passed=False,
-                                message=f"Detected pattern: {pattern.pattern_type}",
+                                message=f"Detected pattern: {getattr(pattern, 'pattern_type', 'unknown')}",
                                 severity=IssueSeverity.WARNING,
                                 location=path,
-                                details={"pattern": pattern.pattern_type, "confidence": pattern.confidence}
+                                details={"pattern": getattr(pattern, "pattern_type", "unknown"), "confidence": getattr(pattern, "confidence", 0.0)},
                             )
                 except Exception:
                     pass  # Skip pattern detection on error
-                    
+
         except Exception as e:
             logger.warning(f"Error enhancing fickling results for {path}: {e}")
