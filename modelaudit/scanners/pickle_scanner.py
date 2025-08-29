@@ -39,8 +39,8 @@ try:
     from fickling.fickle import Pickled
 
     FICKLING_AVAILABLE = True
-except ImportError:
-    # Graceful degradation when fickling is not available
+except Exception:
+    # Graceful degradation when fickling is not available or fails to import
     FICKLING_AVAILABLE = False
     AnalysisResults = None
     Severity = None
