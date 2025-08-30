@@ -10,11 +10,9 @@ try:
     import py7zr
 
     HAS_PY7ZR = True
-    SevenZipFileType = py7zr.SevenZipFile
 except ImportError:
     HAS_PY7ZR = False
     py7zr = None  # type: ignore[assignment]
-    SevenZipFileType = Any  # type: ignore[misc,assignment]
 
 
 class SevenZipScanner(BaseScanner):
@@ -204,7 +202,7 @@ class SevenZipScanner(BaseScanner):
                 )
 
     def _extract_and_scan_files(
-        self, archive: SevenZipFileType, scannable_files: list[str], archive_path: str, result: ScanResult
+        self, archive: Any, scannable_files: list[str], archive_path: str, result: ScanResult
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
