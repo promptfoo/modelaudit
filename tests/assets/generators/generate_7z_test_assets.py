@@ -19,7 +19,7 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
-    py7zr = None
+    py7zr = None  # type: ignore[assignment]
 
 
 def generate_malicious_7z(assets_dir: Path) -> None:
