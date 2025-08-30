@@ -10,7 +10,12 @@ import os
 import pickle
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import py7zr as _py7zr
+else:
+    _py7zr = None
 
 # Only try to import py7zr if available
 try:
@@ -19,7 +24,7 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
-    py7zr = None  # type: ignore[assignment]
+    py7zr = _py7zr
 
 
 def generate_malicious_7z(assets_dir: Path) -> None:
