@@ -202,7 +202,7 @@ class SevenZipScanner(BaseScanner):
                 )
 
     def _extract_and_scan_files(
-        self, archive: Any, scannable_files: list[str], archive_path: str, result: ScanResult
+        self, archive: "py7zr.SevenZipFile", scannable_files: list[str], archive_path: str, result: ScanResult
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
