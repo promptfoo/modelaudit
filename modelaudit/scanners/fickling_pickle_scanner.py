@@ -639,6 +639,60 @@ class FicklingPickleScanner(BaseScanner):
         except Exception:
             return []
 
+    def _candidate_hex_strings(self, data: bytes) -> list[str]:
+        """Extract potential hex encoded strings from binary data"""
+        import re
+
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            # Look for hex-like strings - both with and without \x prefix
+            # At least 32 chars (16 bytes), even length, valid hex chars
+            # Use word boundaries to avoid partial matches
+            patterns = [
+                r"\b[0-9a-fA-F]{32,}\b",  # Plain hex with word boundaries
+                r"(?:\\x[0-9a-fA-F]{2}){16,}",  # \x prefixed hex
+                # Also look for hex strings that start with common pickle headers
+                r"8[0-9a-fA-F]{31,}",  # Hex starting with 8 (common in pickle protocol bytes)
+            ]
+            candidates = []
+            for pattern in patterns:
+                matches = re.findall(pattern, text)
+                candidates.extend(matches)
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_candidates = []
+            for candidate in candidates:
+                if candidate not in seen:
+                    seen.add(candidate)
+                    unique_candidates.append(candidate)
+            return unique_candidates
+        except Exception:
+            return []
+
+    def _decode_hex_string(self, hex_str: str) -> bytes | None:
+        """Decode a hex string to bytes with validation"""
+        import binascii
+        import re
+
+        try:
+            # Handle \x prefixed hex strings
+            if "\\x" in hex_str:
+                hex_str = hex_str.replace("\\x", "")
+
+            # Validate hex string format
+            if (
+                16 <= len(hex_str) <= 5000  # Reasonable length
+                and len(hex_str) % 2 == 0
+                and re.fullmatch(r"[0-9a-fA-F]+", hex_str)
+                and not re.match(r"^(.)\1*$", hex_str)  # Not all same character
+            ):
+                decoded = binascii.unhexlify(hex_str)
+                if len(decoded) >= 8:  # At least 8 bytes
+                    return decoded
+        except Exception:
+            pass
+        return None
+
     def _scan_for_nested_pickles(self, pickled, result: ScanResult) -> None:
         """Scan for nested pickle payloads in strings/bytes within the pickle."""
         try:
@@ -667,6 +721,20 @@ class FicklingPickleScanner(BaseScanner):
                             message="Encoded pickle payload detected in serialized data",
                             severity=IssueSeverity.CRITICAL,
                             details={"encoding": "base64", "recommendation": "Nested pickles can hide malicious code"},
+                        )
+                        break
+                except Exception:
+                    continue
+
+            # Look for hex-encoded nested payloads within string data in the pickle
+            for token in self._candidate_hex_strings(raw):
+                try:
+                    decoded = self._decode_hex_string(token)
+                    if decoded and self._contains_pickle_magic(decoded) and len(decoded) > 20:
+                        result.add_issue(
+                            message="Hex-encoded pickle payload detected in serialized data",
+                            severity=IssueSeverity.CRITICAL,
+                            details={"encoding": "hex", "recommendation": "Nested pickles can hide malicious code"},
                         )
                         break
                 except Exception:

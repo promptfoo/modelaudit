@@ -124,7 +124,7 @@ class TestScannerRegistry:
     def test_heavy_dependency_marking(self):
         """Test that heavy dependencies are properly marked."""
         # Check heavy dependency scanners
-        heavy_scanners = ["tf_savedmodel", "keras_h5", "onnx", "tflite"]
+        heavy_scanners = ["tf_savedmodel", "keras_h5", "onnx", "tflite", "pickle"]
 
         for scanner_id in heavy_scanners:
             scanner_info = _registry.get_scanner_info(scanner_id)
@@ -132,7 +132,7 @@ class TestScannerRegistry:
             assert len(scanner_info["dependencies"]) > 0
 
         # Check light dependency scanners
-        light_scanners = ["pickle", "pytorch_binary", "zip", "manifest"]
+        light_scanners = ["pytorch_binary", "zip", "manifest"]
 
         for scanner_id in light_scanners:
             scanner_info = _registry.get_scanner_info(scanner_id)
