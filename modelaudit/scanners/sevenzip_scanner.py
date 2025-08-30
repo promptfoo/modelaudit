@@ -1,6 +1,11 @@
 import os
 import tempfile
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
+
+if TYPE_CHECKING:
+    import py7zr as _py7zr
+else:
+    _py7zr = None
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -12,7 +17,7 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
-    py7zr = None  # type: ignore[assignment]
+    py7zr = _py7zr
 
 
 class SevenZipScanner(BaseScanner):
