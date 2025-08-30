@@ -120,7 +120,7 @@ google-auth==2.40.3
     # via google-cloud-core
     # via google-cloud-storage
     # via tensorboard
-google-auth-oauthlib==1.0.0
+google-auth-oauthlib==1.2.2
     # via gcsfs
     # via tensorboard
 google-cloud-core==2.4.3
@@ -192,7 +192,7 @@ markupsafe==3.0.2
     # via jinja2
     # via mako
     # via werkzeug
-matplotlib==3.10.5
+matplotlib==3.10.6
     # via mlflow
 ml-dtypes==0.3.2
     # via modelaudit
