@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **docs**: update AGENTS.md with exact CI compliance instructions (#357)
+- **feat**: improve logging standards and consistency (#355)
+- **feat**: re-enable check consolidation system (#353)
+
+### Fixed
+
+- **fix**: correct release dates in CHANGELOG.md (#354)
+
 ## [0.2.4] - 2025-08-28
 
 ### Added
