@@ -288,37 +288,64 @@ class FicklingPickleScanner(BaseScanner):
                     },
                 )
 
-            # Also check for basic dangerous patterns
+            # Comprehensive dangerous pattern detection with specific pattern reporting
             dangerous_patterns = [
-                (b"joblib.load", "Joblib load operation detected"),
-                (b"sklearn", "Scikit-learn reference detected"),
-                (b"__reduce__", "Pickle reduce method detected"),
-                (b"os.system", "OS system call detected"),
-                (b"posix.system", "POSIX system call detected"),
-                (b"subprocess", "Subprocess execution detected"),
-                (b"eval(", "Eval operation detected"),
-                (b"exec(", "Exec operation detected"),
-                (b"compile(", "Compile operation detected"),
-                (b"__builtin__", "Builtin module access detected"),
-                (b"__builtins__", "__builtins__ module access detected"),
-                (b"builtins", "Builtins module access detected"),
-                (b"globals(", "Globals manipulation detected"),
-                (b"locals(", "Locals manipulation detected"),
-                (b"dill", "dill library reference detected"),
-                (b"NumpyArrayWrapper", "Numpy array wrapper detected"),
+                # OS and subprocess operations
+                (b"os.system", IssueSeverity.CRITICAL, "os.system"),
+                (b"os.popen", IssueSeverity.CRITICAL, "os.popen"), 
+                (b"os.spawn", IssueSeverity.CRITICAL, "os.spawn"),
+                (b"posix.system", IssueSeverity.CRITICAL, "posix.system"),
+                (b"subprocess.call", IssueSeverity.CRITICAL, "subprocess.call"),
+                (b"subprocess.run", IssueSeverity.CRITICAL, "subprocess.run"),
+                (b"subprocess.Popen", IssueSeverity.CRITICAL, "subprocess.Popen"),
+                # Generic subprocess detection for other subprocess patterns
+                (b"subprocess", IssueSeverity.CRITICAL, "subprocess"),
+                
+                # Indirect imports - these catch "from os import system" patterns
+                (b"from os import system", IssueSeverity.CRITICAL, "import"),
+                (b"from subprocess import", IssueSeverity.CRITICAL, "import"),
+                (b"from commands import", IssueSeverity.CRITICAL, "import"),
+                
+                # Bare dangerous function names (could be from indirect imports)
+                (b"system(", IssueSeverity.CRITICAL, "system"),
+                (b"popen(", IssueSeverity.CRITICAL, "system"),
+                (b"spawn(", IssueSeverity.CRITICAL, "system"),
+                
+                # Commands module (Python 2 style)
+                (b"commands.getoutput", IssueSeverity.CRITICAL, "commands.getoutput"),
+                (b"commands.getstatusoutput", IssueSeverity.CRITICAL, "commands.getstatusoutput"),
+                (b"commands", IssueSeverity.CRITICAL, "commands"),
+                
+                # Code execution
+                (b"eval(", IssueSeverity.CRITICAL, "eval"),
+                (b"exec(", IssueSeverity.CRITICAL, "exec"),
+                (b"compile(", IssueSeverity.CRITICAL, "compile"),
+                
+                # Module access
+                (b"__builtin__", IssueSeverity.CRITICAL, "__builtin__"),
+                (b"__builtins__", IssueSeverity.CRITICAL, "__builtins__"),
+                (b"builtins", IssueSeverity.CRITICAL, "builtins"),
+                (b"globals(", IssueSeverity.CRITICAL, "globals"),
+                (b"locals(", IssueSeverity.CRITICAL, "locals"),
+                
+                # ML-specific patterns (lower severity as they're common in legit models)
+                (b"joblib.load", IssueSeverity.WARNING, "joblib.load"),
+                (b"sklearn", IssueSeverity.WARNING, "sklearn"),
+                (b"__reduce__", IssueSeverity.WARNING, "__reduce__"),
+                (b"dill", IssueSeverity.WARNING, "dill"),
+                (b"NumpyArrayWrapper", IssueSeverity.WARNING, "NumpyArrayWrapper"),
             ]
 
-            for pattern, message in dangerous_patterns:
-                if pattern in binary_content:
-                    # Determine severity based on pattern criticality
-                    severity = IssueSeverity.CRITICAL
-                    if pattern in [b"joblib.load", b"sklearn", b"__reduce__", b"dill", b"NumpyArrayWrapper"]:
-                        # These patterns are more common in legitimate ML models
-                        severity = IssueSeverity.WARNING
+            # Track which patterns we've already reported to avoid duplicates
+            reported_patterns = set()
+
+            for pattern, severity, pattern_name in dangerous_patterns:
+                if pattern in binary_content and pattern_name not in reported_patterns:
+                    reported_patterns.add(pattern_name)
                     result.add_issue(
-                        message=f"Dangerous pattern: {message}",
+                        message=f"Detected dangerous pattern: {pattern_name}",
                         severity=severity,
-                        details={"pattern": pattern.decode("utf-8", errors="ignore")},
+                        details={"pattern": pattern_name, "detection_method": "binary_pattern_scan"},
                     )
 
         except Exception as e:

@@ -124,8 +124,15 @@ class OciLayerScanner(BaseScanner):
                         if not member.isfile():
                             continue
                         name = member.name
-                        _, ext = os.path.splitext(name)
-                        if not any(s.can_handle(name) for s in SCANNER_REGISTRY):
+                        _, ext = os.path.splitext(name.lower())
+                        # Check if any scanner supports this extension instead of calling can_handle
+                        # on non-existent file (since file is still in tar)
+                        supported = False
+                        for scanner_class in SCANNER_REGISTRY:
+                            if hasattr(scanner_class, 'supported_extensions') and ext in scanner_class.supported_extensions:
+                                supported = True
+                                break
+                        if not supported:
                             continue
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
