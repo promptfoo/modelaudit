@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, ClassVar, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
