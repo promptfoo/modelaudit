@@ -208,7 +208,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
