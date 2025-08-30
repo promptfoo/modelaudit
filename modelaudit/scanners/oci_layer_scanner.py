@@ -129,7 +129,10 @@ class OciLayerScanner(BaseScanner):
                         # on non-existent file (since file is still in tar)
                         supported = False
                         for scanner_class in SCANNER_REGISTRY:
-                            if hasattr(scanner_class, 'supported_extensions') and ext in scanner_class.supported_extensions:
+                            if (
+                                hasattr(scanner_class, "supported_extensions")
+                                and ext in scanner_class.supported_extensions
+                            ):
                                 supported = True
                                 break
                         if not supported:

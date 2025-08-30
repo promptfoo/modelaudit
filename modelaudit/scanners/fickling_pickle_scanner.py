@@ -292,7 +292,7 @@ class FicklingPickleScanner(BaseScanner):
             dangerous_patterns = [
                 # OS and subprocess operations
                 (b"os.system", IssueSeverity.CRITICAL, "os.system"),
-                (b"os.popen", IssueSeverity.CRITICAL, "os.popen"), 
+                (b"os.popen", IssueSeverity.CRITICAL, "os.popen"),
                 (b"os.spawn", IssueSeverity.CRITICAL, "os.spawn"),
                 (b"posix.system", IssueSeverity.CRITICAL, "posix.system"),
                 (b"subprocess.call", IssueSeverity.CRITICAL, "subprocess.call"),
@@ -300,34 +300,28 @@ class FicklingPickleScanner(BaseScanner):
                 (b"subprocess.Popen", IssueSeverity.CRITICAL, "subprocess.Popen"),
                 # Generic subprocess detection for other subprocess patterns
                 (b"subprocess", IssueSeverity.CRITICAL, "subprocess"),
-                
                 # Indirect imports - these catch "from os import system" patterns
                 (b"from os import system", IssueSeverity.CRITICAL, "import"),
                 (b"from subprocess import", IssueSeverity.CRITICAL, "import"),
                 (b"from commands import", IssueSeverity.CRITICAL, "import"),
-                
                 # Bare dangerous function names (could be from indirect imports)
                 (b"system(", IssueSeverity.CRITICAL, "system"),
                 (b"popen(", IssueSeverity.CRITICAL, "system"),
                 (b"spawn(", IssueSeverity.CRITICAL, "system"),
-                
                 # Commands module (Python 2 style)
                 (b"commands.getoutput", IssueSeverity.CRITICAL, "commands.getoutput"),
                 (b"commands.getstatusoutput", IssueSeverity.CRITICAL, "commands.getstatusoutput"),
                 (b"commands", IssueSeverity.CRITICAL, "commands"),
-                
                 # Code execution
                 (b"eval(", IssueSeverity.CRITICAL, "eval"),
                 (b"exec(", IssueSeverity.CRITICAL, "exec"),
                 (b"compile(", IssueSeverity.CRITICAL, "compile"),
-                
                 # Module access
                 (b"__builtin__", IssueSeverity.CRITICAL, "__builtin__"),
                 (b"__builtins__", IssueSeverity.CRITICAL, "__builtins__"),
                 (b"builtins", IssueSeverity.CRITICAL, "builtins"),
                 (b"globals(", IssueSeverity.CRITICAL, "globals"),
                 (b"locals(", IssueSeverity.CRITICAL, "locals"),
-                
                 # ML-specific patterns (lower severity as they're common in legit models)
                 (b"joblib.load", IssueSeverity.WARNING, "joblib.load"),
                 (b"sklearn", IssueSeverity.WARNING, "sklearn"),
@@ -756,8 +750,8 @@ class FicklingPickleScanner(BaseScanner):
             # Look for hex-encoded nested payloads within string data in the pickle
             for token in self._candidate_hex_strings(raw):
                 try:
-                    decoded = self._decode_hex_string(token)
-                    if decoded and self._contains_pickle_magic(decoded) and len(decoded) > 20:
+                    hex_decoded: bytes | None = self._decode_hex_string(token)
+                    if hex_decoded is not None and self._contains_pickle_magic(hex_decoded) and len(hex_decoded) > 20:
                         result.add_issue(
                             message="Hex-encoded pickle payload detected in serialized data",
                             severity=IssueSeverity.CRITICAL,
