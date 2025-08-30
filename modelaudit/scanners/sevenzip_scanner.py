@@ -1,9 +1,6 @@
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
-
-if TYPE_CHECKING:
-    import py7zr as _py7zr
+from typing import Any, ClassVar, Optional
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -205,7 +202,7 @@ class SevenZipScanner(BaseScanner):
                 )
 
     def _extract_and_scan_files(
-        self, archive: "_py7zr.SevenZipFile", scannable_files: list[str], archive_path: str, result: ScanResult
+        self, archive: Any, scannable_files: list[str], archive_path: str, result: ScanResult
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
