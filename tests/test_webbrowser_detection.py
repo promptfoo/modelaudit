@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 
 def test_webbrowser_open_detection():
@@ -23,7 +23,7 @@ webbrowser.open("https://malicious.site/pwned")
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues
@@ -55,7 +55,7 @@ def test_webbrowser_pattern_in_raw_bytes():
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues
@@ -84,7 +84,7 @@ def test_webbrowser_methods_detection():
             temp_path = f.name
 
         try:
-            scanner = PickleScanner()
+            scanner = FicklingPickleScanner()
             result = scanner.scan(temp_path)
 
             # Should have issues (at least warnings)
@@ -108,7 +108,7 @@ def test_webbrowser_not_false_positive_in_comments():
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues mentioning webbrowser

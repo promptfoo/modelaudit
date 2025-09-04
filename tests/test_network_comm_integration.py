@@ -4,7 +4,7 @@ import pickle
 import zipfile
 
 from modelaudit.scanners.base import CheckStatus
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 
 
@@ -36,7 +36,7 @@ def exfiltrate(data):
             pickle.dump(data, f)
 
         # Scan the file
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(test_file))
 
         assert result is not None
@@ -117,7 +117,7 @@ class NetworkExfiltrator:
             pickle.dump(data, f)
 
         # Scan with network detection disabled
-        scanner = PickleScanner(config={"check_network_comm": False})
+        scanner = FicklingPickleScanner(config={"check_network_comm": False})
         result = scanner.scan(str(test_file))
 
         # Should not have any network communication checks
@@ -142,7 +142,7 @@ class NetworkExfiltrator:
         with open(test_file, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(test_file))
 
         network_checks = [
@@ -171,7 +171,7 @@ class NetworkExfiltrator:
         with open(test_file, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(test_file))
 
         # Should detect network communication issues
@@ -214,7 +214,7 @@ class NetworkExfiltrator:
         with open(test_file, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(test_file))
 
         # Should not have any failed network communication checks

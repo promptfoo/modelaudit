@@ -8,7 +8,7 @@ making it a critical security risk when found in pickle files.
 import os
 import tempfile
 
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
 
@@ -23,7 +23,7 @@ class TestRunpyDetection:
 
     def test_runpy_run_module_detection(self):
         """Test detection of runpy.run_module in pickle files."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with runpy.run_module
         # Protocol 2 pickle with GLOBAL opcode for runpy.run_module
@@ -53,7 +53,7 @@ class TestRunpyDetection:
 
     def test_runpy_run_path_detection(self):
         """Test detection of runpy.run_path in pickle files."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with runpy.run_path
         pickle_bytes = b"\x80\x02crunpy\nrun_path\nq\x00."
@@ -77,7 +77,7 @@ class TestRunpyDetection:
 
     def test_runpy_with_arguments(self):
         """Test detection of runpy with arguments (more realistic attack)."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle that uses runpy.run_module to execute os
         # This simulates: runpy.run_module('os').__dict__['system']('echo pwned')
@@ -118,7 +118,7 @@ class TestRunpyDetection:
 
     def test_runpy_run_module_as_main(self):
         """Test detection of runpy._run_module_as_main (internal but dangerous)."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with runpy._run_module_as_main
         pickle_bytes = b"\x80\x02crunpy\n_run_module_as_main\nq\x00."
@@ -142,7 +142,7 @@ class TestRunpyDetection:
 
     def test_runpy_pattern_in_raw_content(self):
         """Test that 'runpy' pattern is detected in raw file content."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a file with 'runpy' in it (even if not a valid pickle)
         content = b"Some content with runpy module reference"
@@ -169,7 +169,7 @@ class TestRunpyDetection:
 
     def test_multiple_runpy_functions(self):
         """Test detection of various runpy functions."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         runpy_functions = [
             b"run_module",
@@ -201,7 +201,7 @@ class TestRunpyDetection:
 
     def test_obfuscated_runpy_import(self):
         """Test detection of obfuscated runpy imports."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Test with different module name formats that might be used
         test_cases = [
@@ -228,7 +228,7 @@ class TestRunpyDetection:
 
     def test_runpy_severity_levels(self):
         """Test that runpy is consistently flagged as CRITICAL."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with runpy that would execute malicious code
         pickle_bytes = (

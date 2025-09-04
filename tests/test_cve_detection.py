@@ -19,8 +19,8 @@ import pytest
 from modelaudit.core import scan_file
 from modelaudit.cve_patterns import analyze_cve_patterns
 from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.scanners.joblib_scanner import JoblibScanner
-from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
 class TestCVE202013092Detection:
@@ -358,7 +358,7 @@ class TestCVEIntegration:
         test_file = tmp_path / "malicious.pkl"
         test_file.write_bytes(malicious_content)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(test_file))
 
         # Should detect dangerous patterns
@@ -447,12 +447,12 @@ class TestCVEPatternValidation:
 @pytest.mark.integration
 def test_cve_detection_with_existing_scanners():
     """Test that CVE detection works with the existing scanner infrastructure."""
+    from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
     from modelaudit.scanners.joblib_scanner import JoblibScanner
-    from modelaudit.scanners.pickle_scanner import PickleScanner
 
     # Test scanner instantiation
     joblib_scanner = JoblibScanner()
-    pickle_scanner = PickleScanner()
+    pickle_scanner = FicklingPickleScanner()
 
     # Check for CVE detection methods
     assert hasattr(joblib_scanner, "_detect_cve_patterns"), "JoblibScanner should have CVE detection"

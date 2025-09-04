@@ -2,7 +2,7 @@ import fsspec
 from fsspec.implementations.local import LocalFileSystem
 
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.utils import streaming
 
 
@@ -25,9 +25,9 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
+    monkeypatch.setattr(FicklingPickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
 
-    scanner = PickleScanner()
+    scanner = FicklingPickleScanner()
     result, was_complete = streaming.stream_analyze_file(url, scanner)
 
     assert was_complete is True
@@ -54,9 +54,9 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
+    monkeypatch.setattr(FicklingPickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
 
-    scanner = PickleScanner()
+    scanner = FicklingPickleScanner()
     result, was_complete = streaming.stream_analyze_file(url, scanner, max_bytes=4)
 
     assert called["called"] is True

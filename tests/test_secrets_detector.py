@@ -2,7 +2,7 @@
 
 import pickle
 
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.secrets_detector import SecretsDetector, detect_secrets_in_file
 
 
@@ -187,7 +187,7 @@ class TestPickleScannerWithSecrets:
             pickle.dump(data, f)
 
         # Scan the file
-        scanner = PickleScanner({"check_secrets": True})
+        scanner = FicklingPickleScanner({"check_secrets": True})
         result = scanner.scan(str(pickle_file))
 
         # Check that the secret was detected
@@ -214,7 +214,7 @@ class TestPickleScannerWithSecrets:
             pickle.dump(data, f)
 
         # Scan the file
-        scanner = PickleScanner({"check_secrets": True})
+        scanner = FicklingPickleScanner({"check_secrets": True})
         result = scanner.scan(str(pickle_file))
 
         # Check that no secrets were detected
@@ -233,7 +233,7 @@ class TestPickleScannerWithSecrets:
             pickle.dump(data, f)
 
         # Scan with secrets check disabled
-        scanner = PickleScanner({"check_secrets": False})
+        scanner = FicklingPickleScanner({"check_secrets": False})
         result = scanner.scan(str(pickle_file))
 
         # Should not have any secrets checks

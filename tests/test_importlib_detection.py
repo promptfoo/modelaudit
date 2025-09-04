@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 
 def test_importlib_import_module_detection():
@@ -22,7 +22,7 @@ malicious.system('echo pwned')
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues
@@ -54,7 +54,7 @@ def test_importlib_pattern_in_raw_bytes():
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues
@@ -88,7 +88,7 @@ def test_importlib_various_methods():
             temp_path = f.name
 
         try:
-            scanner = PickleScanner()
+            scanner = FicklingPickleScanner()
             result = scanner.scan(temp_path)
 
             # Should have issues (at least warnings)
@@ -115,7 +115,7 @@ module = loader.load_module()
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Should detect issues
@@ -143,7 +143,7 @@ spec.loader.exec_module(module)
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Should detect issues
@@ -167,7 +167,7 @@ def test_importlib_not_false_positive_in_comments():
         temp_path = f.name
 
     try:
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(temp_path)
 
         # Check for critical issues mentioning importlib

@@ -21,7 +21,7 @@ except ImportError:
     HAS_JOBLIB = False
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 
 class TestRealDillFiles:
@@ -39,7 +39,7 @@ class TestRealDillFiles:
         with open(dill_file, "wb") as f:
             dill.dump(lambda_func, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(dill_file))
 
         # Should scan the file (though may detect dill patterns as suspicious)
@@ -68,7 +68,7 @@ class TestRealDillFiles:
         with open(dill_file, "wb") as f:
             dill.dump(obj, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(dill_file))
 
         # Should handle complex dill objects
@@ -89,7 +89,7 @@ class TestRealDillFiles:
         with open(malicious_dill, "wb") as f:
             dill.dump(malicious_func, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(malicious_dill))
 
         # Should detect suspicious content - dill may serialize differently than expected
@@ -122,7 +122,7 @@ class TestRealJoblibFiles:
 
         joblib.dump(data, str(joblib_file))
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(joblib_file))
 
         # Should scan successfully
@@ -142,7 +142,7 @@ class TestRealJoblibFiles:
 
         joblib.dump(large_data, str(compressed_file), compress=3)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(compressed_file))
 
         # Compressed files may not follow standard pickle format
@@ -171,7 +171,7 @@ class TestRealJoblibFiles:
 
         joblib.dump(data, str(numpy_file))
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(numpy_file))
 
         # Joblib with numpy may use custom protocols/opcodes that aren't standard pickle
@@ -213,7 +213,7 @@ class TestPerformanceBenchmarks:
             f.write(b"joblib")  # Add marker
             pickle.dump(large_data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Benchmark scanning time
         start_time = time.perf_counter()
@@ -244,7 +244,7 @@ class TestPerformanceBenchmarks:
                 pickle.dump({"id": i, "data": list(range(100))}, f)
             files.append(str(file_path))
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Benchmark batch scanning
         start_time = time.perf_counter()
@@ -302,7 +302,7 @@ class TestErrorScenarios:
             f.write(b"\x80\x03")  # Pickle protocol
             f.write(b"\xff" * 100)  # Corrupted data
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(corrupted_file))
 
         # Should handle corruption gracefully
@@ -321,7 +321,7 @@ class TestErrorScenarios:
             os.chmod(str(restricted_file), 0o000)
 
             try:
-                scanner = PickleScanner()
+                scanner = FicklingPickleScanner()
                 result = scanner.scan(str(restricted_file))
 
                 # Should handle permission errors gracefully
@@ -341,7 +341,7 @@ class TestErrorScenarios:
 
             pickle.dump({"data": "test"}, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Mock slow file operation
         with patch("builtins.open") as mock_open:

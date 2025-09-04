@@ -12,7 +12,7 @@ from modelaudit.explanations import (
     get_tf_op_explanation,
 )
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 
 def test_issue_with_why_field():
@@ -73,7 +73,7 @@ def test_explanations_for_opcodes():
 
 def test_pickle_scanner_includes_why():
     """Test that pickle scanner includes 'why' explanations for dangerous imports."""
-    scanner = PickleScanner()
+    scanner = FicklingPickleScanner()
 
     # Create a pickle with os.system call
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:

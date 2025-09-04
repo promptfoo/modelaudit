@@ -15,7 +15,7 @@ from click.testing import CliRunner
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 
 class TestNestedPickleIntegration:
@@ -66,7 +66,7 @@ class TestNestedPickleIntegration:
             print(f"\nTesting malicious file: {malicious_file.name}")
 
             # Scan the malicious file
-            scanner = PickleScanner()
+            scanner = FicklingPickleScanner()
             result = scanner.scan(str(malicious_file))
 
             # Should complete successfully
@@ -107,7 +107,7 @@ class TestNestedPickleIntegration:
             print(f"\nTesting safe file: {safe_file.name}")
 
             # Scan the safe file
-            scanner = PickleScanner()
+            scanner = FicklingPickleScanner()
             result = scanner.scan(str(safe_file))
 
             # Should complete successfully
@@ -336,7 +336,7 @@ class TestNestedPickleIntegration:
             for test_file, description, should_detect in edge_cases:
                 print(f"\nTesting edge case: {description}")
 
-                scanner = PickleScanner()
+                scanner = FicklingPickleScanner()
                 result = scanner.scan(str(test_file))
 
                 assert result.success, f"Scan should succeed for {description}"
@@ -367,7 +367,7 @@ class TestNestedPickleIntegration:
 
             print(f"\nTesting existing functionality: {filename}")
 
-            scanner = PickleScanner()
+            scanner = FicklingPickleScanner()
             result = scanner.scan(str(test_file))
 
             # Should still detect as malicious
@@ -389,7 +389,7 @@ class TestNestedPickleIntegration:
         if not malicious_file.exists():
             pytest.skip("nested_pickle_raw.pkl not found")
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(malicious_file))
 
         nested_issues = [

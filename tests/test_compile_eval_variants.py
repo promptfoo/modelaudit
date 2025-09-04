@@ -10,7 +10,7 @@ import pickle
 import tempfile
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.suspicious_symbols import DANGEROUS_BUILTINS
 
 
@@ -27,7 +27,7 @@ class TestCompileEvalVariants:
 
     def test_compile_detection(self):
         """Test detection of compile() function in pickle files."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with compile function
         # Protocol 2 pickle with compile reference
@@ -56,7 +56,7 @@ class TestCompileEvalVariants:
 
     def test_globals_detection(self):
         """Test detection of globals() function."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with globals() reference
         pickle_bytes = b"\x80\x02cbuiltins\nglobals\nq\x00."
@@ -86,7 +86,7 @@ class TestCompileEvalVariants:
 
     def test_locals_detection(self):
         """Test detection of locals() function."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with locals() reference
         pickle_bytes = b"\x80\x02cbuiltins\nlocals\nq\x00."
@@ -116,7 +116,7 @@ class TestCompileEvalVariants:
 
     def test_builtins_access_detection(self):
         """Test detection of __builtins__ access."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with __builtins__ reference
         pickle_bytes = b"\x80\x02c__builtins__\neval\nq\x00."
@@ -149,7 +149,7 @@ class TestCompileEvalVariants:
 
     def test_compile_with_exec_mode(self):
         """Test detection of compile() with exec mode (most dangerous)."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle that uses compile with exec mode
         # This simulates: compile('import os; os.system("cmd")', '<string>', 'exec')
@@ -184,7 +184,7 @@ class TestCompileEvalVariants:
 
     def test_eval_with_globals_manipulation(self):
         """Test detection of eval with globals() manipulation."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle that manipulates globals for eval
         # This simulates: eval('__import__("os").system("cmd")', globals())
@@ -230,7 +230,7 @@ class TestCompileEvalVariants:
 
     def test_eval_in_reduce_attack(self):
         """Test detection of eval used in __reduce__ for malicious unpickling."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle that contains eval in a __reduce__ context
         # This simulates creating an object that executes code when unpickled
@@ -268,7 +268,7 @@ class TestCompileEvalVariants:
 
     def test_setattr_getattr_detection(self):
         """Test detection of setattr/getattr for attribute manipulation."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Test setattr
         pickle_bytes = b"\x80\x02cbuiltins\nsetattr\nq\x00."
@@ -310,7 +310,7 @@ class TestCompileEvalVariants:
 
     def test_all_new_patterns_detected(self):
         """Test that all new dangerous patterns are properly detected."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Test patterns using valid pickle files that contain dangerous functions
         test_cases = [

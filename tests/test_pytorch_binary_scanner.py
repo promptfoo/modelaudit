@@ -226,9 +226,9 @@ def test_filetype_detection_for_bin_files(tmp_path):
 
 def test_pickle_scanner_handles_pickle_bin_files(tmp_path):
     """Test that pickle scanner correctly handles .bin files with pickle content."""
-    from modelaudit.scanners.pickle_scanner import PickleScanner
+    from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
-    scanner = PickleScanner()
+    scanner = FicklingPickleScanner()
 
     # Create a .bin file with pickle content
     pickle_bin = tmp_path / "model.bin"

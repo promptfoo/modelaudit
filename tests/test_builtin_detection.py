@@ -12,7 +12,7 @@ import os
 import tempfile
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
 
@@ -49,7 +49,7 @@ class TestBuiltinDetection:
 
     def test_pickle_scanner_detects_builtin_eval(self):
         """Test that PickleScanner detects __builtin__.eval as critical."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with __builtin__.eval
         pickle_bytes = b"\x80\x02c__builtin__\neval\nq\x00."
@@ -95,7 +95,7 @@ class TestBuiltinDetection:
             (b"\x80\x02c__builtin__\n__import__\nq\x00.", "__builtin__", "__import__", "Dynamic import"),
         ]
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         for pickle_bytes, expected_module, expected_function, description in test_cases:
             with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
@@ -130,7 +130,7 @@ class TestBuiltinDetection:
 
     def test_builtin_in_decode_exec_chain(self):
         """Test detection of __builtin__.eval in decode-exec chains."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create a pickle with base64.decode followed by __builtin__.eval
         pickle_bytes = (
@@ -181,7 +181,7 @@ class TestBuiltinDetection:
 
     def test_severity_levels_for_builtins(self):
         """Test that builtin eval/exec are flagged with appropriate severity."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Most dangerous: __builtin__.eval with actual code
         pickle_with_code = (

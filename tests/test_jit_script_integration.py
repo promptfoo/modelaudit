@@ -4,7 +4,7 @@ import pickle
 
 import pytest
 
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 
 try:
     import onnx  # noqa: F401
@@ -31,7 +31,7 @@ class TestJITScriptIntegration:
             pickle.dump(data, f)
 
         # Scan with JIT detection enabled
-        scanner = PickleScanner({"check_jit_script": True})
+        scanner = FicklingPickleScanner({"check_jit_script": True})
         result = scanner.scan(str(pickle_file))
 
         # Check that JIT/Script risks were detected
@@ -57,7 +57,7 @@ class TestJITScriptIntegration:
             pickle.dump(data, f)
 
         # Scan with JIT detection enabled
-        scanner = PickleScanner({"check_jit_script": True})
+        scanner = FicklingPickleScanner({"check_jit_script": True})
         result = scanner.scan(str(pickle_file))
 
         # Check that JIT/Script check passed
@@ -76,7 +76,7 @@ class TestJITScriptIntegration:
             pickle.dump(data, f)
 
         # Scan with JIT check disabled
-        scanner = PickleScanner({"check_jit_script": False})
+        scanner = FicklingPickleScanner({"check_jit_script": False})
         result = scanner.scan(str(pickle_file))
 
         # Should not have any JIT/Script checks

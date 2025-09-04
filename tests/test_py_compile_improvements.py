@@ -10,8 +10,8 @@ pytest.importorskip("h5py")
 
 import h5py
 
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
-from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
 class TestPyCompileImprovements:
@@ -30,7 +30,7 @@ class TestPyCompileImprovements:
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(pickle_path))
 
         # Should only flag the actual dangerous code, not the false positives
@@ -57,7 +57,7 @@ class TestPyCompileImprovements:
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(pickle_path))
 
         # Should detect the encoded Python code but not the benign data
@@ -212,7 +212,7 @@ class TestFalsePositiveMetrics:
         new_false_positives = 0
         new_true_positives = 0
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         for case in false_positive_cases:
             pickle_path = tmp_path / f"fp_{case['type']}.pkl"
@@ -281,7 +281,7 @@ class TestEdgeCases:
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(pickle_path))
 
         # Should detect exec usage
@@ -306,7 +306,7 @@ malicious()
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
         result = scanner.scan(str(pickle_path))
 
         # Should detect dangerous patterns in the code

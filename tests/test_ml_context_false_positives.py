@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.fickling_pickle_scanner import FicklingPickleScanner
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from modelaudit.utils.ml_context import (
     analyze_binary_for_ml_context,
@@ -149,7 +149,7 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
     @unittest.skip("Skipping due to test environment differences - core functionality verified with real models")
     def test_pickle_scanner_reduces_shebang_false_positives(self):
         """Test that pickle scanner reduces false positives in weight data."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         # Create file with many shebang patterns in weight data
         test_file = self.create_pickle_with_weight_data_and_shebangs(75)
@@ -199,7 +199,7 @@ class TestPickleScannerFalsePositiveReduction(unittest.TestCase):
     @unittest.skip("Skipping due to test environment differences - core functionality verified with real models")
     def test_pickle_scanner_still_detects_real_threats(self):
         """Test that scanner still detects actual executable threats."""
-        scanner = PickleScanner()
+        scanner = FicklingPickleScanner()
 
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             try:
