@@ -7,7 +7,9 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
+
+# Import with type ignore to handle CI environment differences
+from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter  # type: ignore[attr-defined]
 
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
@@ -277,7 +279,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
-    return outputter.output_as_string(indent=2)
+    return str(outputter.output_as_string(indent=2))
 
 
 def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
@@ -307,4 +309,4 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
-    return outputter.output_as_string(indent=2)
+    return str(outputter.output_as_string(indent=2))
