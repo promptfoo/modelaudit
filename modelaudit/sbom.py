@@ -276,7 +276,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, _get_output_format_json(), _get_schema_version_v15())
     return str(outputter.output_as_string(indent=2))
 
 
@@ -306,5 +306,15 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             component = _component_for_file_pydantic(input_path, metadata, issues)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, _get_output_format_json(), _get_schema_version_v15())
     return str(outputter.output_as_string(indent=2))
+
+
+def _get_output_format_json():
+    """Get OutputFormat.JSON to isolate potential CI environment issues."""
+    return OutputFormat.JSON  # type: ignore[attr-defined]
+
+
+def _get_schema_version_v15():
+    """Get SchemaVersion.V1_5 to isolate potential CI environment issues."""
+    return SchemaVersion.V1_5  # type: ignore[attr-defined]
