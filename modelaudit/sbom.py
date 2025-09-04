@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union, cast
+from typing import Any, Optional, Union
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
