@@ -312,9 +312,13 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
 
 def _get_output_format_json():
     """Get OutputFormat.JSON to isolate potential CI environment issues."""
-    return OutputFormat.JSON  # type: ignore[attr-defined]
+    # Use getattr to handle different CI environments
+    import cyclonedx.output
+    return getattr(cyclonedx.output, "OutputFormat").JSON
 
 
 def _get_schema_version_v15():
     """Get SchemaVersion.V1_5 to isolate potential CI environment issues."""
-    return SchemaVersion.V1_5  # type: ignore[attr-defined]
+    # Use getattr to handle different CI environments  
+    import cyclonedx.output
+    return getattr(cyclonedx.output, "SchemaVersion").V1_5
