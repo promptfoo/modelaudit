@@ -277,11 +277,8 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, cyclonedx_output.OutputFormat.JSON, cyclonedx_output.SchemaVersion.V1_5)
-    return cast(  # type: ignore[redundant-cast]
-        str,
-        outputter.output_as_string(indent=2),
-    )
+    outputter = make_outputter(bom, cyclonedx_output.OutputFormat.JSON, cyclonedx_output.SchemaVersion.V1_5)  # type: ignore[attr-defined]
+    return cast(str, outputter.output_as_string(indent=2))
 
 
 def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
@@ -310,5 +307,5 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             component = _component_for_file_pydantic(input_path, metadata, issues)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, cyclonedx_output.OutputFormat.JSON, cyclonedx_output.SchemaVersion.V1_5)
-    return outputter.output_as_string(indent=2)
+    outputter = make_outputter(bom, cyclonedx_output.OutputFormat.JSON, cyclonedx_output.SchemaVersion.V1_5)  # type: ignore[attr-defined]
+    return str(outputter.output_as_string(indent=2))
