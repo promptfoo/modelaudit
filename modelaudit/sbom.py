@@ -21,7 +21,7 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _calculate_risk_score(path: str, issues: list["Issue"]) -> int:
+def _calculate_risk_score(path: str, issues: list[Issue]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
     for issue in issues:
