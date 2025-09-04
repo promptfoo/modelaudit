@@ -21,6 +21,59 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def _get_component_type(path: str, metadata: Optional[dict[str, Any]]) -> ComponentType:
+    """Determine the appropriate CycloneDX v1.6 component type for a file."""
+    # ML model file types should use MACHINE_LEARNING_MODEL component type
+    ml_extensions = {
+        ".pkl",
+        ".pickle",
+        ".safetensors",
+        ".gguf",
+        ".ggml",
+        ".ggmf",
+        ".ggjt",
+        ".ggla",
+        ".ggsa",
+        ".h5",
+        ".hdf5",
+        ".onnx",
+        ".bin",
+        ".pth",
+        ".pt",
+        ".pb",
+        ".tflite",
+        ".mlmodel",
+        ".joblib",
+        ".joblib.gz",
+        ".dill",
+        ".xgb",
+        ".lgb",
+        ".cbm",
+        ".pmml",
+    }
+
+    file_ext = os.path.splitext(path.lower())[1]
+
+    # Check if it's a machine learning model
+    if file_ext in ml_extensions:
+        return ComponentType.MACHINE_LEARNING_MODEL
+
+    # Check metadata for model indicators
+    if metadata and (metadata.get("is_model") or metadata.get("tensors")):
+        return ComponentType.MACHINE_LEARNING_MODEL
+
+    # Archive/container types
+    if file_ext in {".zip", ".tar", ".gz", ".7z", ".bz2"}:
+        return ComponentType.CONTAINER
+
+    # Data files
+    if file_ext in {".json", ".yaml", ".yml", ".xml", ".csv", ".txt", ".md"}:
+        return ComponentType.DATA
+
+    # Default to FILE for everything else
+    return ComponentType.FILE
+
+
 def _calculate_risk_score(path: str, issues: list["Issue"]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
@@ -71,14 +124,24 @@ def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExp
 
 
 def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
-    """Create CycloneDX properties from file metadata."""
+    """Create CycloneDX v1.6 enhanced properties from file metadata."""
     props: list[Property] = []
 
-    # Add file type properties
+    # ML/AI model properties (enhanced for v1.6 ML-BOM support)
     if metadata.is_dataset:
-        props.append(Property(name="is_dataset", value="true"))
+        props.append(Property(name="ml:is_dataset", value="true"))
     if metadata.is_model:
-        props.append(Property(name="is_model", value="true"))
+        props.append(Property(name="ml:is_model", value="true"))
+
+    # Add ML context information if available
+    if hasattr(metadata, "ml_context") and metadata.ml_context:
+        ml_ctx = metadata.ml_context
+        if hasattr(ml_ctx, "framework") and ml_ctx.framework:
+            props.append(Property(name="ml:framework", value=ml_ctx.framework))
+        if hasattr(ml_ctx, "model_type") and ml_ctx.model_type:
+            props.append(Property(name="ml:model_type", value=ml_ctx.model_type))
+        if hasattr(ml_ctx, "confidence") and ml_ctx.confidence is not None:
+            props.append(Property(name="ml:confidence_score", value=str(ml_ctx.confidence)))
 
     # Add copyright information
     if metadata.copyright_notices:
@@ -98,6 +161,11 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     # Add license files information
     if metadata.license_files_nearby:
         props.append(Property(name="license_files_found", value=str(len(metadata.license_files_nearby))))
+
+    # Security and compliance properties
+    props.append(Property(name="security:scanned", value="true"))
+    props.append(Property(name="security:scanner", value="ModelAudit"))
+    props.append(Property(name="security:scanner_version", value="v0.2.4"))
 
     return props
 
@@ -124,11 +192,14 @@ def _component_for_file_pydantic(
         license_expressions = _extract_license_expressions(metadata)
         props.extend(_create_metadata_properties(metadata))
 
+    # Determine appropriate component type for CycloneDX v1.6
+    component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
+
     # Create the component
     component = Component(
         name=os.path.basename(path),
         bom_ref=path,
-        type=ComponentType.FILE,
+        type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,
     )
@@ -200,11 +271,21 @@ def _component_for_file(
                 compound_expression = " OR ".join(unique_licenses)
                 license_expressions.append(LicenseExpression(compound_expression))
 
-        # Add license-related properties
+        # Add ML/AI-related properties (enhanced for v1.6 ML-BOM support)
         if metadata.get("is_dataset"):
-            props.append(Property(name="is_dataset", value="true"))
+            props.append(Property(name="ml:is_dataset", value="true"))
         if metadata.get("is_model"):
-            props.append(Property(name="is_model", value="true"))
+            props.append(Property(name="ml:is_model", value="true"))
+
+        # Add ML context if available
+        ml_context = metadata.get("ml_context")
+        if ml_context and isinstance(ml_context, dict):
+            if ml_context.get("framework"):
+                props.append(Property(name="ml:framework", value=str(ml_context["framework"])))
+            if ml_context.get("model_type"):
+                props.append(Property(name="ml:model_type", value=str(ml_context["model_type"])))
+            if ml_context.get("confidence") is not None:
+                props.append(Property(name="ml:confidence_score", value=str(ml_context["confidence"])))
 
         # Add copyright information
         copyrights = metadata.get("copyright_notices", [])
@@ -225,10 +306,18 @@ def _component_for_file(
                 Property(name="license_files_found", value=str(len(license_files))),
             )
 
+    # Security and compliance properties (added for all files)
+    props.append(Property(name="security:scanned", value="true"))
+    props.append(Property(name="security:scanner", value="ModelAudit"))
+    props.append(Property(name="security:scanner_version", value="v0.2.4"))
+
+    # Determine appropriate component type for CycloneDX v1.6
+    component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+
     component = Component(
         name=os.path.basename(path),
         bom_ref=path,
-        type=ComponentType.FILE,
+        type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)],
         properties=props,
     )
@@ -276,7 +365,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
     return cast(  # type: ignore[redundant-cast]
         str,
         outputter.output_as_string(indent=2),
@@ -309,5 +398,5 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             component = _component_for_file_pydantic(input_path, metadata, issues)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
     return outputter.output_as_string(indent=2)

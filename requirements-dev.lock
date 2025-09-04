@@ -24,7 +24,7 @@ click==8.2.1
     # via modelaudit
 coverage==7.9.1
     # via pytest-cov
-cyclonedx-python-lib==10.2.0
+cyclonedx-python-lib==11.0.0
     # via modelaudit
 defusedxml==0.7.1
     # via modelaudit
@@ -74,7 +74,7 @@ pluggy==1.6.0
     # via pytest-cov
 psutil==7.0.0
     # via py7zr
-py-serializable==2.0.0
+py-serializable==2.1.0
     # via cyclonedx-python-lib
 py7zr==1.0.0
     # via modelaudit
@@ -83,8 +83,6 @@ pybcj==1.0.6
 pycryptodomex==3.23.0
     # via py7zr
 pydantic==2.11.7
-    # via fastapi
-    # via mlflow-skinny
     # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
@@ -128,6 +126,7 @@ types-requests==2.32.4.20250611
     # via types-tensorflow
 types-tensorflow==2.18.0.20250516
 typing-extensions==4.14.0
+    # via cyclonedx-python-lib
     # via huggingface-hub
     # via mypy
     # via pydantic

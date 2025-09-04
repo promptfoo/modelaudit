@@ -22,7 +22,7 @@ charset-normalizer==3.4.2
     # via requests
 click==8.2.1
     # via modelaudit
-cyclonedx-python-lib==10.2.0
+cyclonedx-python-lib==11.0.0
     # via modelaudit
 defusedxml==0.7.1
     # via modelaudit
@@ -57,7 +57,7 @@ platformdirs==4.3.8
     # via modelaudit
 psutil==7.0.0
     # via py7zr
-py-serializable==2.0.0
+py-serializable==2.1.0
     # via cyclonedx-python-lib
 py7zr==1.0.0
     # via modelaudit
@@ -66,8 +66,6 @@ pybcj==1.0.6
 pycryptodomex==3.23.0
     # via py7zr
 pydantic==2.11.7
-    # via fastapi
-    # via mlflow-skinny
     # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
@@ -94,6 +92,7 @@ texttable==1.7.0
 tqdm==4.67.1
     # via huggingface-hub
 typing-extensions==4.14.0
+    # via cyclonedx-python-lib
     # via huggingface-hub
     # via pydantic
     # via pydantic-core
