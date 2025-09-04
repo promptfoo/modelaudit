@@ -3,11 +3,11 @@ import os
 from collections.abc import Iterable
 from typing import Any, Optional, Union, cast
 
+from cyclonedx import output as cyclonedx_output
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx import output as cyclonedx_output
 from cyclonedx.output import make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
