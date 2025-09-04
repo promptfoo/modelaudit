@@ -7,7 +7,7 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
+from cyclonedx.output import make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
@@ -314,11 +314,11 @@ def _get_output_format_json():
     """Get OutputFormat.JSON to isolate potential CI environment issues."""
     # Use getattr to handle different CI environments
     import cyclonedx.output
-    return getattr(cyclonedx.output, "OutputFormat").JSON
+    return cyclonedx.output.OutputFormat.JSON
 
 
 def _get_schema_version_v15():
     """Get SchemaVersion.V1_5 to isolate potential CI environment issues."""
-    # Use getattr to handle different CI environments  
+    # Use getattr to handle different CI environments
     import cyclonedx.output
-    return getattr(cyclonedx.output, "SchemaVersion").V1_5
+    return cyclonedx.output.SchemaVersion.V1_5
