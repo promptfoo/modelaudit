@@ -7,7 +7,6 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
