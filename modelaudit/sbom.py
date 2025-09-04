@@ -8,8 +8,7 @@ from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 
-# Import with type ignore to handle CI environment differences
-from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter  # type: ignore[attr-defined]
+from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
