@@ -14,9 +14,7 @@ def _get_onnx_mapping() -> Any:
         return mapping
     except ImportError:
         with contextlib.suppress(ImportError):
-            from onnx.onnx_cpp2py_export import (
-                mapping,  # type: ignore[no-redef,attr-defined]  # Fallback for older versions
-            )
+            from onnx.onnx_cpp2py_export import mapping
 
             return mapping
     return None
