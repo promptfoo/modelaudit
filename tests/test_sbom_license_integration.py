@@ -92,7 +92,7 @@ def example():
 
         dataset_props = dataset_component.get("properties", [])
         is_dataset_prop = next(
-            (prop for prop in dataset_props if prop["name"] == "is_dataset"),
+            (prop for prop in dataset_props if prop["name"] == "ml:is_dataset"),
             None,
         )
         assert is_dataset_prop is not None
@@ -107,7 +107,7 @@ def example():
 
         model_props = model_component.get("properties", [])
         is_model_prop = next(
-            (prop for prop in model_props if prop["name"] == "is_model"),
+            (prop for prop in model_props if prop["name"] == "ml:is_model"),
             None,
         )
         assert is_model_prop is not None
@@ -289,7 +289,7 @@ def test(): pass
         # Check basic CycloneDX structure
         assert "bomFormat" in sbom_data
         assert sbom_data["bomFormat"] == "CycloneDX"
-        assert "specVersion" in sbom_data
+        assert sbom_data["specVersion"] == "1.6"
         assert "components" in sbom_data
         assert isinstance(sbom_data["components"], list)
 
