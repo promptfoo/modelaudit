@@ -7,28 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.5] - 2025-09-05
-
-### Added
-
-- **feat**: upgrade to CycloneDX v1.6 (ECMA-424) with enhanced ML-BOM support (#364)
-- **feat**: add 7-Zip archive scanning support (#344)
-- **feat**: re-enable check consolidation system (#353)
-
-### Changed
-
-- **feat**: consolidate CLI from 25 to 12 flags using smart detection (#359)
-- **feat**: enhance pickle static analysis with ML context awareness (#358)
-- **feat**: enhance check consolidation system with PII sanitization and performance improvements (#356)
-- **docs**: update AGENTS.md with exact CI compliance instructions (#357)
-- **feat**: improve logging standards and consistency (#355)
-- **chore(deps)**: bump the github-actions group with 2 updates (#362)
-- **chore**: update dependencies and modernize type annotations (#360)
-
 ### Fixed
 
-- **fix**: handle GGUF tensor dictionaries in SBOM asset creation (#363)
-- **fix**: correct release dates in CHANGELOG.md (#354)
+- **fix**: resolve SBOM generation for HuggingFace URLs and downloaded files  
+- **fix**: sync SBOM scanner_version with package version
 
 ## [0.2.4] - 2025-08-28
 
