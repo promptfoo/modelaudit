@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2025-09-05
+
 ### Added
 
 - **feat**: upgrade to CycloneDX v1.6 (ECMA-424) with enhanced ML-BOM support (#364)
@@ -350,7 +352,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/promptfoo/modelaudit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/promptfoo/modelaudit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/promptfoo/modelaudit/compare/v0.2.0...v0.2.1
