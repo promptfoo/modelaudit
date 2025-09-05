@@ -7,10 +7,10 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx.output import make_outputter
 
-# Import with specific type ignores for CI compatibility  
-from cyclonedx.output import OutputFormat, SchemaVersion  # type: ignore[attr-defined]
+# Import with specific type ignores for CI compatibility
+from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter  # type: ignore[attr-defined]
+
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
 
