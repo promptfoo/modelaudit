@@ -9,12 +9,12 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:
-        from onnx import mapping
+        from onnx import mapping  # type: ignore[attr-defined]
 
         return mapping
     except ImportError:
         with contextlib.suppress(ImportError):
-            from onnx.onnx_cpp2py_export import mapping
+            from onnx.onnx_cpp2py_export import mapping  # type: ignore[attr-defined]
 
             return mapping
     return None
