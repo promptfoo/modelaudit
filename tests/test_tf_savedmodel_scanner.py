@@ -42,7 +42,12 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
 
 def create_tf_savedmodel(tmp_path, *, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    try:
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    except Exception:
+        # If TensorFlow is not available or crashes, skip this test function
+        import pytest
+        pytest.skip("TensorFlow not available or has system issues")
 
     # Create a directory that mimics a TensorFlow SavedModel
     model_dir = tmp_path / "tf_model"
@@ -268,7 +273,12 @@ def _create_test_savedmodel_with_op(tmp_path, op_name, model_name=None):
 
 def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
     """Helper function to create a test SavedModel with multiple TensorFlow operations."""
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    try:
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    except Exception:
+        # If TensorFlow is not available or crashes, skip this test function
+        import pytest
+        pytest.skip("TensorFlow not available or has system issues")
 
     if model_name is None:
         model_name = f"test_model_{'_'.join(op.lower() for op in op_names[:2])}"

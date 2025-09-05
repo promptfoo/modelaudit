@@ -22,12 +22,22 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-try:
-    import tensorflow as tf
+HAS_TENSORFLOW = False
+tf = None
 
-    HAS_TENSORFLOW = True
-except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
-    HAS_TENSORFLOW = False
+def _import_tensorflow():
+    """Lazy import of TensorFlow to avoid crashes during module import"""
+    global HAS_TENSORFLOW, tf
+    if tf is not None or HAS_TENSORFLOW:
+        return  # Already attempted import
+        
+    try:
+        import tensorflow as _tf
+        tf = _tf
+        HAS_TENSORFLOW = True
+    except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
+        HAS_TENSORFLOW = False
+        tf = None
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -69,6 +79,7 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
+            _import_tensorflow()  # Lazy import
             return HAS_TENSORFLOW and os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
@@ -89,7 +100,10 @@ class WeightDistributionScanner(BaseScanner):
             return False
         if ext in [".h5", ".keras", ".hdf5"] and not HAS_H5PY:
             return False
-        return not (ext == ".pb" and not HAS_TENSORFLOW)
+        if ext == ".pb":
+            _import_tensorflow()  # Lazy import
+            return HAS_TENSORFLOW
+        return True
 
     def scan(self, path: str) -> ScanResult:
         """Scan a model file for weight distribution anomalies"""
@@ -321,6 +335,7 @@ class WeightDistributionScanner(BaseScanner):
 
     def _extract_tensorflow_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from TensorFlow SavedModel files"""
+        _import_tensorflow()  # Lazy import
         if not HAS_TENSORFLOW:
             return {}
 

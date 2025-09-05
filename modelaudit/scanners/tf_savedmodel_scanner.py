@@ -25,22 +25,31 @@ DANGEROUS_TF_OPERATIONS = {
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
 # Try to import TensorFlow, but handle the case where it's not installed or has system issues
-try:
-    import tensorflow as tf  # noqa: F401
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+HAS_TENSORFLOW = False
+SavedModelType: Optional[type] = None
 
-    HAS_TENSORFLOW = True
-    SavedModelType: type = SavedModel
-except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
-    HAS_TENSORFLOW = False
+def _import_tensorflow():
+    """Lazy import of TensorFlow to avoid crashes during module import"""
+    global HAS_TENSORFLOW, SavedModelType
+    if SavedModelType is not None:
+        return  # Already attempted import
+        
+    try:
+        import tensorflow as tf  # noqa: F401
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
-    # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModel:  # type: ignore[no-redef]
-        """Placeholder for SavedModel when TensorFlow is not installed"""
+        HAS_TENSORFLOW = True
+        SavedModelType = SavedModel
+    except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
+        HAS_TENSORFLOW = False
 
-        meta_graphs: ClassVar[list] = []
+        # Create a placeholder for type hints when TensorFlow is not available
+        class SavedModel:  # type: ignore[no-redef]
+            """Placeholder for SavedModel when TensorFlow is not installed"""
 
-    SavedModelType = SavedModel
+            meta_graphs: ClassVar[list] = []
+
+        SavedModelType = SavedModel
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -58,6 +67,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
+        _import_tensorflow()  # Lazy import
         if not HAS_TENSORFLOW:
             return False
 
