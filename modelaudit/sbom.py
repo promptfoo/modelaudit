@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union, cast
+from typing import Any, Optional, Union
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -21,7 +21,7 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _calculate_risk_score(path: str, issues: list["Issue"]) -> int:
+def _calculate_risk_score(path: str, issues: list[Issue]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
     for issue in issues:
@@ -277,10 +277,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
-    return cast(  # type: ignore[redundant-cast]
-        str,
-        outputter.output_as_string(indent=2),
-    )
+    return str(outputter.output_as_string(indent=2))
 
 
 def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
@@ -310,4 +307,4 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
-    return outputter.output_as_string(indent=2)
+    return str(outputter.output_as_string(indent=2))

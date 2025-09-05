@@ -591,7 +591,7 @@ def scan_command(
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            click.echo("Smart detection enabled")
+            pass  # No smart detection message needed
 
     # Print a nice header if not in structured format mode and not writing to a file
     if final_format == "text" and not output and not quiet:
