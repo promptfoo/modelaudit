@@ -315,6 +315,7 @@ def _get_output_format_json():
     # Import locally to avoid CI environment mypy issues
     try:
         from cyclonedx.output import OutputFormat
+
         return OutputFormat.JSON
     except (ImportError, AttributeError):
         # Fallback for CI environments - return string that CycloneDX accepts
@@ -326,6 +327,7 @@ def _get_schema_version_v15():
     # Import locally to avoid CI environment mypy issues
     try:
         from cyclonedx.output import SchemaVersion
+
         return SchemaVersion.V1_5
     except (ImportError, AttributeError):
         # Fallback for CI environments - return string that CycloneDX accepts
