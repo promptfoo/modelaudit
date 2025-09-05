@@ -235,6 +235,10 @@ pretty = true
 # Continue ignoring missing imports for now
 ignore_missing_imports = true
 
+# Temporary workaround for numpy/tensorflow/cyclonedx type compatibility issues
+# See: https://github.com/python/mypy/issues/15238
+follow_imports = "silent"
+
 # Per-module overrides for gradual adoption
 [[tool.mypy.overrides]]
 module = "modelaudit.tests.*"
