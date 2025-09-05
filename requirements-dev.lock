@@ -73,7 +73,7 @@ cryptography==45.0.7
     # via mlflow
 cycler==0.12.1
     # via matplotlib
-cyclonedx-python-lib==10.2.0
+cyclonedx-python-lib==11.0.0
     # via modelaudit
 databricks-sdk==0.65.0
     # via mlflow-skinny
@@ -308,7 +308,7 @@ protobuf==6.32.0
     # via proto-plus
     # via tensorboard
     # via tensorflow
-py-serializable==2.0.0
+py-serializable==2.1.0
     # via cyclonedx-python-lib
 pyaml==25.7.0
     # via coremltools
@@ -438,6 +438,7 @@ typing-extensions==4.14.0
     # via alembic
     # via anyio
     # via cattrs
+    # via cyclonedx-python-lib
     # via fastapi
     # via graphene
     # via huggingface-hub

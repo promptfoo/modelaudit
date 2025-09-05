@@ -78,25 +78,31 @@ class TestGgufSbomIntegration:
             # Parse and validate SBOM structure
             sbom_data = json.loads(sbom_json)
 
-            # Check required CycloneDX fields
+            # Check required CycloneDX v1.6 fields
             assert sbom_data["bomFormat"] == "CycloneDX"
-            assert sbom_data["specVersion"] == "1.5"
+            assert sbom_data["specVersion"] == "1.6"
             assert "components" in sbom_data
             assert len(sbom_data["components"]) == 1
 
-            # Check component structure
+            # Check component structure - v1.6 should use machine-learning-model type for GGUF
             component = sbom_data["components"][0]
             assert component["name"] == "test.gguf"
-            assert component["type"] == "file"
+            assert component["type"] == "machine-learning-model"
             assert "hashes" in component
             assert len(component["hashes"]) == 1
             assert component["hashes"][0]["alg"] == "SHA-256"
 
-            # Check properties
+            # Check properties - v1.6 should include enhanced ML and security properties
             properties = {prop["name"]: prop["value"] for prop in component.get("properties", [])}
             assert "size" in properties
             assert "risk_score" in properties
             assert int(properties["risk_score"]) >= 0
+
+            # v1.6 enhanced properties
+            assert "security:scanned" in properties
+            assert properties["security:scanned"] == "true"
+            assert "security:scanner" in properties
+            assert properties["security:scanner"] == "ModelAudit"
 
     def test_gguf_sbom_tensor_metadata_handling(self):
         """Test that GGUF tensor metadata is properly handled in assets."""
