@@ -677,8 +677,11 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL."""
     mock_is_jfrog.return_value = True
-    mock_scan_jfrog.return_value = create_mock_scan_result(
-        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    mock_scan_jfrog.return_value = (
+        create_mock_scan_result(
+            bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+        ),
+        "/tmp/downloaded_file"
     )
 
     runner = CliRunner()
@@ -695,6 +698,9 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=None,
+        return_download_path=True,
     )
 
 
@@ -717,8 +723,11 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
     """Test scanning a JFrog URL with authentication."""
     mock_is_jfrog.return_value = True
-    mock_scan_jfrog.return_value = create_mock_scan_result(
-        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    mock_scan_jfrog.return_value = (
+        create_mock_scan_result(
+            bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+        ),
+        "/tmp/downloaded_file"
     )
 
     runner = CliRunner()
@@ -745,6 +754,9 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=None,
+        return_download_path=True,
     )
 
 
@@ -752,8 +764,11 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
 def test_scan_mlflow_uri_success(mock_scan_mlflow):
     """Test successful scanning of an MLflow URI."""
     # Setup mock
-    mock_scan_mlflow.return_value = create_mock_scan_result(
-        bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    mock_scan_mlflow.return_value = (
+        create_mock_scan_result(
+            bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+        ),
+        "/tmp/mlflow_download"
     )
 
     runner = CliRunner()
@@ -786,13 +801,16 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
     """Test MLflow URI scanning with additional options."""
     # Setup mock
-    mock_scan_mlflow.return_value = create_mock_scan_result(
-        bytes_scanned=2048,
-        issues=[{"message": "Test issue", "severity": "warning"}],
-        files_scanned=1,
-        assets=[],
-        has_errors=False,
-        scanners=["test_scanner"],
+    mock_scan_mlflow.return_value = (
+        create_mock_scan_result(
+            bytes_scanned=2048,
+            issues=[{"message": "Test issue", "severity": "warning"}],
+            files_scanned=1,
+            assets=[],
+            has_errors=False,
+            scanners=["test_scanner"],
+        ),
+        "/tmp/mlflow_download"
     )
 
     runner = CliRunner()
@@ -843,13 +861,16 @@ def test_scan_mlflow_uri_error(mock_scan_mlflow):
 def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
     """Test MLflow URI scanning with JSON output format."""
     # Setup mock
-    mock_scan_mlflow.return_value = create_mock_scan_result(
-        bytes_scanned=1024,
-        issues=[],
-        files_scanned=1,
-        assets=[{"path": "model.pkl", "type": "pickle"}],
-        has_errors=False,
-        scanners=["pickle"],
+    mock_scan_mlflow.return_value = (
+        create_mock_scan_result(
+            bytes_scanned=1024,
+            issues=[],
+            files_scanned=1,
+            assets=[{"path": "model.pkl", "type": "pickle"}],
+            has_errors=False,
+            scanners=["pickle"],
+        ),
+        "/tmp/mlflow_download"
     )
 
     runner = CliRunner()

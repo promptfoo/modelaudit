@@ -6,7 +6,7 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from .core import scan_model_directory_or_file
 from .models import ModelAuditResultModel
@@ -26,7 +26,7 @@ def scan_jfrog_artifact(
     max_total_size: int = 0,
     return_download_path: bool = False,
     **kwargs: Any,
-) -> ModelAuditResultModel | tuple[ModelAuditResultModel, str]:
+) -> Union[ModelAuditResultModel, tuple[ModelAuditResultModel, str]]:
     """Download and scan an artifact from JFrog Artifactory.
 
     Parameters

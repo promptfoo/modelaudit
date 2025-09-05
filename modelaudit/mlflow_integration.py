@@ -2,7 +2,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from .core import scan_model_directory_or_file
 from .models import ModelAuditResultModel
@@ -20,7 +20,7 @@ def scan_mlflow_model(
     max_total_size: int = 0,
     return_download_path: bool = False,
     **kwargs: Any,
-) -> ModelAuditResultModel | tuple[ModelAuditResultModel, str]:
+) -> Union[ModelAuditResultModel, tuple[ModelAuditResultModel, str]]:
     """Download and scan a model from the MLflow model registry.
 
     Parameters
