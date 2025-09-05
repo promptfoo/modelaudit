@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 from click.testing import CliRunner
@@ -699,7 +699,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         strict_license=False,
         skip_file_types=True,
         cache_enabled=True,
-        cache_dir=None,
+        cache_dir=ANY,
         return_download_path=True,
     )
 
@@ -755,7 +755,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         strict_license=False,
         skip_file_types=True,
         cache_enabled=True,
-        cache_dir=None,
+        cache_dir=ANY,
         return_download_path=True,
     )
 

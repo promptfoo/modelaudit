@@ -26,7 +26,7 @@ def scan_jfrog_artifact(
     max_total_size: int = 0,
     return_download_path: bool = False,
     **kwargs: Any,
-) -> Union[ModelAuditResultModel, tuple[ModelAuditResultModel, str]]:
+) -> Union[ModelAuditResultModel, tuple[ModelAuditResultModel, str]]:  # noqa: UP007
     """Download and scan an artifact from JFrog Artifactory.
 
     Parameters
