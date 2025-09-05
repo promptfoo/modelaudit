@@ -175,9 +175,6 @@ modelaudit model.pkl --strict --format json --output report.json
 
 # Override size limits for huge models
 modelaudit huge-model.pt --max-size 50GB --timeout 7200
-
-# Preview mode without downloading
-modelaudit s3://bucket/model.pt --dry-run
 ```
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
@@ -193,12 +190,11 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - **Terminal type** (TTY/CI) → appropriate UI (progress vs quiet mode)
 - **Cloud operations** → automatic caching, size limits, timeouts
 
-**🎛️ Override Controls (13 focused flags):**
+**🎛️ Override Controls (12 focused flags):**
 
 - `--strict` – scan all file types, strict license validation, fail on warnings
 - `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`)
 - `--timeout SECONDS` – override auto-detected timeout
-- `--dry-run` – preview what would be scanned/downloaded
 - `--progress` – force enable progress reporting
 - `--no-cache` – disable caching (overrides smart detection)
 - `--format json` / `--output file.json` – structured output for CI/CD

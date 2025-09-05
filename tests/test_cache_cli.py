@@ -27,14 +27,6 @@ class TestCacheCLI:
             assert "Total entries: 0" in result.output
             assert "Hit rate: 0.0%" in result.output
 
-    def test_cache_clear_dry_run(self):
-        """Test cache clear dry run."""
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "clear", "--dry-run"])
-
-        assert result.exit_code == 0
-        assert "Would clear" in result.output
-
     def test_cache_clear_with_data(self):
         """Test cache clear with actual data."""
         # Reset global cache manager to ensure isolation
@@ -61,14 +53,6 @@ class TestCacheCLI:
             # Verify cleared
             result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
             assert "Total entries: 0" in result.output
-
-    def test_cache_cleanup_dry_run(self):
-        """Test cache cleanup dry run."""
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "cleanup", "--dry-run", "--max-age", "7"])
-
-        assert result.exit_code == 0
-        assert "Would cleanup cache entries older than 7 days" in result.output
 
     def test_cache_cleanup_with_max_age(self):
         """Test cache cleanup with custom max age."""
@@ -130,7 +114,7 @@ class TestCacheCLI:
         result = runner.invoke(cli, ["cache", "clear", "--help"])
         assert result.exit_code == 0
         assert "Clear the entire scan results cache" in result.output
-        assert "--dry-run" in result.output
+        assert "--cache-dir" in result.output
 
         # Test stats help
         result = runner.invoke(cli, ["cache", "stats", "--help"])

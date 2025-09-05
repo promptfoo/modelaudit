@@ -92,7 +92,7 @@ def test_scan_command_help():
     assert "--verbose" in result.output
     assert "--max-size" in result.output  # Updated from --max-file-size
     assert "--strict" in result.output  # New consolidated flag
-    assert "--dry-run" in result.output  # New flag
+    assert "--no-cache" in result.output  # Cache control flag
     assert "Smart Detection:" in result.output  # New feature documentation
 
 

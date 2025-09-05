@@ -257,21 +257,12 @@ def cache() -> None:
 
 @cache.command()
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
-@click.option("--dry-run", is_flag=True, help="Show what would be cleared without actually clearing")
-def clear(cache_dir: Optional[str], dry_run: bool) -> None:
+def clear(cache_dir: Optional[str]) -> None:
     """Clear the entire scan results cache"""
     from .cache import get_cache_manager
 
     try:
         cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-        if dry_run:
-            stats = cache_manager.get_stats()
-            total_entries = stats.get("total_entries", 0)
-            total_size_mb = stats.get("total_size_mb", 0.0)
-
-            click.echo(f"Would clear {total_entries} cache entries ({total_size_mb:.1f}MB)")
-            return
 
         # Get stats before clearing for reporting
         stats = cache_manager.get_stats()
@@ -302,24 +293,12 @@ def clear(cache_dir: Optional[str], dry_run: bool) -> None:
 @cache.command()
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
 @click.option("--max-age", type=int, default=30, help="Maximum age of entries to keep in days [default: 30]")
-@click.option("--dry-run", is_flag=True, help="Show what would be cleaned without actually cleaning")
-def cleanup(cache_dir: Optional[str], max_age: int, dry_run: bool) -> None:
+def cleanup(cache_dir: Optional[str], max_age: int) -> None:
     """Clean up old cache entries"""
     from .cache import get_cache_manager
 
     try:
         cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-        if dry_run:
-            # For dry run, we'd need to implement a preview method
-            # For now, just show current stats
-            stats = cache_manager.get_stats()
-            total_entries = stats.get("total_entries", 0)
-            total_size_mb = stats.get("total_size_mb", 0.0)
-
-            click.echo(f"Would cleanup cache entries older than {max_age} days")
-            click.echo(f"Current cache: {total_entries} entries ({total_size_mb:.1f}MB)")
-            return
 
         # Clean up old entries
         removed_count = cache_manager.cleanup(max_age)
@@ -443,12 +422,7 @@ def delegate_info() -> None:
     type=str,
     help="Override auto-detected size limits (e.g., 10GB, 500MB)",
 )
-# Preview/debugging (2 flags)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Preview what would be scanned/downloaded without actually doing it",
-)
+# Cache control (1 flag)
 @click.option(
     "--no-cache",
     is_flag=True,
@@ -466,7 +440,6 @@ def scan_command(
     sbom: Optional[str],
     timeout: Optional[int],
     max_size: Optional[str],
-    dry_run: bool,
     no_cache: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
@@ -879,42 +852,7 @@ def scan_command(
                     # max_download_bytes is already set from smart defaults
                     # Max download size parsing removed - handled by smart defaults
 
-                    # Handle dry-run mode (replaces preview)
-                    if dry_run:
-                        import asyncio
-
-                        from .utils.cloud_storage import analyze_cloud_target
-
-                        try:
-                            metadata = asyncio.run(analyze_cloud_target(path))
-                            click.echo(f"\n📊 Preview for {style_text(path, fg='cyan')}:")
-                            click.echo(f"   Type: {metadata['type']}")
-
-                            if metadata["type"] == "file":
-                                click.echo(f"   Size: {metadata.get('human_size', 'unknown')}")
-                                click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
-                            elif metadata["type"] == "directory":
-                                click.echo(f"   Files: {metadata.get('file_count', 0)}")
-                                click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}")
-                                click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
-
-                                if final_selective:
-                                    from .utils.cloud_storage import filter_scannable_files
-
-                                    scannable = filter_scannable_files(metadata.get("files", []))
-                                    click.echo(
-                                        f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}"
-                                    )
-
-                            # Skip actual download in preview mode
-                            continue
-
-                        except Exception as e:
-                            click.echo(f"Error analyzing {path}: {e!s}", err=True)
-                            audit_result.has_errors = True
-                            continue
-
-                    # Normal download mode
+                    # Download and scan mode
                     download_spinner = None
                     if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")

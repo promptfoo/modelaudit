@@ -40,9 +40,8 @@ Reduce ModelAudit CLI complexity from 25 flags to 12 flags (-52%) through smart 
 - `--timeout/-t SECONDS` - Override auto-detected timeout
 - `--max-size SIZE` - Override auto-detected size limits
 
-### Preview/debugging (2)
+### Cache control (1)
 
-- `--dry-run` - Preview what would happen
 - `--no-cache` - Force disable caching
 
 ## Flags to Remove (13 eliminated)
@@ -64,7 +63,7 @@ Reduce ModelAudit CLI complexity from 25 flags to 12 flags (-52%) through smart 
 ### Removed (rarely used/consolidated):
 
 - `--progress-log/--progress-format/--progress-interval` → Smart defaults only
-- `--preview` → Replaced by `--dry-run`
+- `--preview` → Removed (no longer needed)
 - `--strict-license` → Part of `--strict` mode
 
 ## Implementation Steps
@@ -78,7 +77,7 @@ Reduce ModelAudit CLI complexity from 25 flags to 12 flags (-52%) through smart 
 
 ### Phase 2: Update CLI Interface
 
-1. Add new consolidated flags (`--quiet`, `--strict`, `--dry-run`, `--no-cache`)
+1. Add new consolidated flags (`--quiet`, `--strict`, `--no-cache`)
 2. Update existing flags to use smart detection as defaults
 3. Remove deprecated flags from CLI definition
 4. Update help text and documentation
