@@ -5,7 +5,7 @@
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
-[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/promptfoo/modelaudit)](https://github.com/promptfoo/modelaudit/blob/main/LICENSE)
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
@@ -85,6 +85,7 @@ ModelAudit scans **all major ML model formats** with specialized security analys
 | **PyTorch**     | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Contains pickle serialization - always scan  |
 | **Pickle**      | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
 | **Joblib**      | `.joblib`                             | 🔴 HIGH    | Can contain pickled objects                  |
+| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`  | 🔴 HIGH    | Can contain malicious payloads               |
 | **SafeTensors** | `.safetensors`                        | 🟢 SAFE    | Preferred secure format                      |
 | **GGUF/GGML**   | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard, binary format                  |
 | **ONNX**        | `.onnx`                               | 🟢 SAFE    | Industry standard, good interoperability     |
@@ -192,7 +193,7 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - **Terminal type** (TTY/CI) → appropriate UI (progress vs quiet mode)
 - **Cloud operations** → automatic caching, size limits, timeouts
 
-**🎛️ Override Controls (12 focused flags):**
+**🎛️ Override Controls (13 focused flags):**
 
 - `--strict` – scan all file types, strict license validation, fail on warnings
 - `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`)
@@ -201,7 +202,7 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - `--progress` – force enable progress reporting
 - `--no-cache` – disable caching (overrides smart detection)
 - `--format json` / `--output file.json` – structured output for CI/CD
-- `--sbom file.json` – generate software bill of materials
+- `--sbom file.json` – generate CycloneDX v1.6 SBOM with enhanced ML-BOM support
 - `--verbose` / `--quiet` – control output detail level
 - `--blacklist PATTERN` – additional security patterns
 
