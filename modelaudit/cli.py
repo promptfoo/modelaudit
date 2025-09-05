@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional, Union, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 if TYPE_CHECKING:
     from .models import ModelAuditResultModel
@@ -1006,7 +1006,7 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             return_download_path=True,
                         )
-                        
+
                         # Type assertions for mypy
                         assert isinstance(results_tuple, tuple), "Expected tuple from scan_mlflow_model"
                         results = cast("ModelAuditResultModel", results_tuple[0])
@@ -1062,7 +1062,7 @@ def scan_command(
                             skip_file_types=final_skip_files,
                             return_download_path=True,
                         )
-                        
+
                         # Type assertions for mypy
                         assert isinstance(jfrog_results_tuple, tuple), "Expected tuple from scan_jfrog_artifact"
                         jfrog_results = cast("ModelAuditResultModel", jfrog_results_tuple[0])
