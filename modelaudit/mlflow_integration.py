@@ -87,7 +87,9 @@ def scan_mlflow_model(
         )
 
         if return_download_path:
+            # Defer cleanup - caller must handle temp directory cleanup
             return results, download_path
         return results
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if not return_download_path:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

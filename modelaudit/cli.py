@@ -4,10 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
-
-if TYPE_CHECKING:
-    from .models import ModelAuditResultModel
+from typing import Any, Optional, Union
 
 import click
 from yaspin import yaspin
@@ -528,6 +525,7 @@ def scan_command(
 
     # Track mapping from original URLs to downloaded file paths for SBOM generation
     path_mappings: dict[str, str] = {}
+    temp_dirs_to_cleanup: list[str] = []
 
     # Generate smart defaults based on input analysis
     smart_defaults = generate_smart_defaults(expanded_paths)
@@ -1004,6 +1002,10 @@ def scan_command(
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
                             max_total_size=final_max_total_size,
+                            strict_license=final_strict_license,
+                            skip_file_types=final_skip_files,
+                            cache_enabled=final_cache,
+                            cache_dir=final_cache_dir,
                             return_download_path=True,
                         )
 
@@ -1013,6 +1015,8 @@ def scan_command(
 
                         # Record path mapping for SBOM generation
                         path_mappings[path] = mlflow_download_path
+                        # Track temp directory for cleanup after SBOM generation
+                        temp_dirs_to_cleanup.append(os.path.dirname(mlflow_download_path))
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
@@ -1059,6 +1063,8 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            cache_enabled=final_cache,
+                            cache_dir=final_cache_dir,
                             return_download_path=True,
                         )
 
@@ -1068,6 +1074,8 @@ def scan_command(
 
                         # Record path mapping for SBOM generation
                         path_mappings[path] = jfrog_download_path
+                        # Track temp directory for cleanup after SBOM generation
+                        temp_dirs_to_cleanup.append(os.path.dirname(jfrog_download_path))
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded and scanned", fg="green", bold=True))
@@ -1360,6 +1368,14 @@ def scan_command(
         sbom_text = generate_sbom_with_path_mapping(expanded_paths, audit_result.model_dump(), path_mappings)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
+
+    # Cleanup temp directories after SBOM generation
+    for temp_dir in temp_dirs_to_cleanup:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.debug(f"Cleaned up temp directory: {temp_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp directory {temp_dir}: {e}")
 
     # Format the output
     if final_format == "json":
