@@ -316,6 +316,7 @@ def _get_json_format() -> Any:
     try:
         # Use getattr to avoid mypy strict mode issues
         from cyclonedx import output
+
         output_format = getattr(output, "OutputFormat", None)
         return output_format.JSON if output_format else "JSON"
     except (ImportError, AttributeError):
@@ -327,6 +328,7 @@ def _get_v15_schema() -> Any:
     try:
         # Use getattr to avoid mypy strict mode issues
         from cyclonedx import output
+
         schema_version = getattr(output, "SchemaVersion", None)
         return schema_version.V1_5 if schema_version else "1.5"
     except (ImportError, AttributeError):
