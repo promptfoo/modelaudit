@@ -1009,8 +1009,7 @@ def scan_command(
 
                         # Type assertions for mypy
                         assert isinstance(results_tuple, tuple), "Expected tuple from scan_mlflow_model"
-                        results = cast("ModelAuditResultModel", results_tuple[0])
-                        mlflow_download_path = cast(str, results_tuple[1])
+                        results, mlflow_download_path = results_tuple
 
                         # Record path mapping for SBOM generation
                         path_mappings[path] = mlflow_download_path
@@ -1065,8 +1064,7 @@ def scan_command(
 
                         # Type assertions for mypy
                         assert isinstance(jfrog_results_tuple, tuple), "Expected tuple from scan_jfrog_artifact"
-                        jfrog_results = cast("ModelAuditResultModel", jfrog_results_tuple[0])
-                        jfrog_download_path = cast(str, jfrog_results_tuple[1])
+                        jfrog_results, jfrog_download_path = jfrog_results_tuple
 
                         # Record path mapping for SBOM generation
                         path_mappings[path] = jfrog_download_path
