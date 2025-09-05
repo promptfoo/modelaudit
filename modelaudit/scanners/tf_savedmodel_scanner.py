@@ -10,7 +10,7 @@ from modelaudit.utils.code_validation import (
     validate_python_syntax,
 )
 
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                     )
                     return result
-                    
+
                 saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
                 for op_info in self._scan_tf_operations(saved_model):
