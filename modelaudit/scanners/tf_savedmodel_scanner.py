@@ -24,14 +24,14 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Try to import TensorFlow, but handle the case where it's not installed
+# Try to import TensorFlow, but handle the case where it's not installed or has system issues
 try:
     import tensorflow as tf  # noqa: F401
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     HAS_TENSORFLOW = True
     SavedModelType: type = SavedModel
-except ImportError:
+except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
     HAS_TENSORFLOW = False
 
     # Create a placeholder for type hints when TensorFlow is not available

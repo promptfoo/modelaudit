@@ -75,11 +75,12 @@ numpy1 = [
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
     "coremltools>=8.0",
-    "tensorrt>=8.6.0",
     "huggingface-hub>=0.23.0",
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
+    "pandas>=1.3.0,<2.4.0",
+    "pyarrow>=10.0.0,<16.0.0",
 ]
 # All dependencies except platform-specific ones (for CI)
 all-ci = [

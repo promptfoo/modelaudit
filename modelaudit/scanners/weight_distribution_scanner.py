@@ -26,7 +26,7 @@ try:
     import tensorflow as tf
 
     HAS_TENSORFLOW = True
-except ImportError:
+except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
     HAS_TENSORFLOW = False
 
 

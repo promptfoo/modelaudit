@@ -10,7 +10,7 @@ try:
     import tensorflow  # noqa: F401
 
     HAS_TENSORFLOW = True
-except ImportError:
+except Exception:  # Catch all exceptions including system errors, mutex failures, etc.
     HAS_TENSORFLOW = False
 
 
