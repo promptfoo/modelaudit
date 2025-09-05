@@ -28,6 +28,7 @@ PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 HAS_TENSORFLOW = False
 SavedModelType: Optional[type] = None
 
+
 def _import_tensorflow():
     """Lazy import of TensorFlow to avoid crashes during module import"""
     global HAS_TENSORFLOW, SavedModelType

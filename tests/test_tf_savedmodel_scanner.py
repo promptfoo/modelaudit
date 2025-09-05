@@ -47,6 +47,7 @@ def create_tf_savedmodel(tmp_path, *, malicious=False):
     except Exception:
         # If TensorFlow is not available or crashes, skip this test function
         import pytest
+
         pytest.skip("TensorFlow not available or has system issues")
 
     # Create a directory that mimics a TensorFlow SavedModel
@@ -278,6 +279,7 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
     except Exception:
         # If TensorFlow is not available or crashes, skip this test function
         import pytest
+
         pytest.skip("TensorFlow not available or has system issues")
 
     if model_name is None:

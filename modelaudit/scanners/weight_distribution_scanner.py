@@ -25,6 +25,7 @@ except ImportError:
 HAS_TENSORFLOW = False
 tf = None
 
+
 def _import_tensorflow():
     """Lazy import of TensorFlow to avoid crashes during module import"""
     global HAS_TENSORFLOW, tf
@@ -33,6 +34,7 @@ def _import_tensorflow():
 
     try:
         import tensorflow as _tf
+
         tf = _tf
         HAS_TENSORFLOW = True
     except Exception:  # Catch all exceptions including ImportError and system errors (mutex failures, etc.)
