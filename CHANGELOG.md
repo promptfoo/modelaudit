@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **fix**: resolve SBOM generation for HuggingFace URLs and downloaded files
+- **fix**: resolve SBOM generation for HuggingFace URLs and downloaded files (#368)
 - **fix**: handle GGUF tensor dictionaries in SBOM asset creation (#363)
 - **fix**: correct release dates in CHANGELOG.md (#354)
 
