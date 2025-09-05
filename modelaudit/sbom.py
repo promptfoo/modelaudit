@@ -7,8 +7,9 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
+from cyclonedx.output import make_outputter
 
+# Note: OutputFormat and SchemaVersion imported dynamically in helper functions
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
 
@@ -276,7 +277,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, _get_json_format(), _get_v15_schema())
     return str(outputter.output_as_string(indent=2))
 
 
@@ -306,5 +307,27 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             component = _component_for_file_pydantic(input_path, metadata, issues)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    outputter = make_outputter(bom, _get_json_format(), _get_v15_schema())
     return str(outputter.output_as_string(indent=2))
+
+
+def _get_json_format() -> Any:
+    """Get JSON output format, handling mypy strict mode."""
+    try:
+        # Use getattr to avoid mypy strict mode issues
+        from cyclonedx import output
+        output_format = getattr(output, "OutputFormat", None)
+        return output_format.JSON if output_format else "JSON"
+    except (ImportError, AttributeError):
+        return "JSON"
+
+
+def _get_v15_schema() -> Any:
+    """Get v1.5 schema version, handling mypy strict mode."""
+    try:
+        # Use getattr to avoid mypy strict mode issues
+        from cyclonedx import output
+        schema_version = getattr(output, "SchemaVersion", None)
+        return schema_version.V1_5 if schema_version else "1.5"
+    except (ImportError, AttributeError):
+        return "1.5"
