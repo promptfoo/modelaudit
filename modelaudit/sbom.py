@@ -7,7 +7,7 @@ from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
-from cyclonedx.output import make_outputter
+from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
@@ -276,7 +276,7 @@ def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> 
             component = _component_for_file(input_path, meta, issues_dicts)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, _get_output_format_json(), _get_schema_version_v15())
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
     return str(outputter.output_as_string(indent=2))
 
 
@@ -306,29 +306,5 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             component = _component_for_file_pydantic(input_path, metadata, issues)
             bom.components.add(component)
 
-    outputter = make_outputter(bom, _get_output_format_json(), _get_schema_version_v15())
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
     return str(outputter.output_as_string(indent=2))
-
-
-def _get_output_format_json():
-    """Get JSON output format for CycloneDX."""
-    # Import locally to avoid CI environment mypy issues
-    try:
-        from cyclonedx.output import OutputFormat
-
-        return OutputFormat.JSON
-    except (ImportError, AttributeError):
-        # Fallback for CI environments - return string that CycloneDX accepts
-        return "JSON"
-
-
-def _get_schema_version_v15():
-    """Get v1.5 schema version for CycloneDX."""
-    # Import locally to avoid CI environment mypy issues
-    try:
-        from cyclonedx.output import SchemaVersion
-
-        return SchemaVersion.V1_5
-    except (ImportError, AttributeError):
-        # Fallback for CI environments - return string that CycloneDX accepts
-        return "1.5"
