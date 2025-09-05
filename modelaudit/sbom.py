@@ -9,6 +9,7 @@ from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
+from . import __version__
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
 
@@ -165,7 +166,7 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     # Security and compliance properties
     props.append(Property(name="security:scanned", value="true"))
     props.append(Property(name="security:scanner", value="ModelAudit"))
-    props.append(Property(name="security:scanner_version", value="v0.2.4"))
+    props.append(Property(name="security:scanner_version", value=f"v{__version__}"))
 
     return props
 
@@ -309,7 +310,7 @@ def _component_for_file(
     # Security and compliance properties (added for all files)
     props.append(Property(name="security:scanned", value="true"))
     props.append(Property(name="security:scanner", value="ModelAudit"))
-    props.append(Property(name="security:scanner_version", value="v0.2.4"))
+    props.append(Property(name="security:scanner_version", value=f"v{__version__}"))
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
