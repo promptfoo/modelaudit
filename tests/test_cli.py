@@ -681,7 +681,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         create_mock_scan_result(
             bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
         ),
-        "/tmp/downloaded_file"
+        "/tmp/downloaded_file",
     )
 
     runner = CliRunner()
@@ -727,7 +727,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         create_mock_scan_result(
             bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
         ),
-        "/tmp/downloaded_file"
+        "/tmp/downloaded_file",
     )
 
     runner = CliRunner()
@@ -768,7 +768,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         create_mock_scan_result(
             bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
         ),
-        "/tmp/mlflow_download"
+        "/tmp/mlflow_download",
     )
 
     runner = CliRunner()
@@ -810,7 +810,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
             has_errors=False,
             scanners=["test_scanner"],
         ),
-        "/tmp/mlflow_download"
+        "/tmp/mlflow_download",
     )
 
     runner = CliRunner()
@@ -870,7 +870,7 @@ def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
             has_errors=False,
             scanners=["pickle"],
         ),
-        "/tmp/mlflow_download"
+        "/tmp/mlflow_download",
     )
 
     runner = CliRunner()
