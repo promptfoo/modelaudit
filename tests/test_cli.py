@@ -794,6 +794,11 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=ANY,
+        return_download_path=True,
     )
 
 
@@ -839,6 +844,11 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=5000000,
         max_total_size=5000000,
+        strict_license=False,
+        skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=ANY,
+        return_download_path=True,
     )
 
 
