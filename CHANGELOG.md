@@ -7,10 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **feat**: upgrade to CycloneDX v1.6 (ECMA-424) with enhanced ML-BOM support (#364)
+- **feat**: add 7-Zip archive scanning support (#344)
+- **feat**: re-enable check consolidation system (#353)
+
+### Changed
+
+- **feat**: consolidate CLI from 25 to 12 flags using smart detection (#359)
+- **feat**: enhance pickle static analysis with ML context awareness (#358)
+- **feat**: enhance check consolidation system with PII sanitization and performance improvements (#356)
+- **docs**: update AGENTS.md with exact CI compliance instructions (#357)
+- **feat**: improve logging standards and consistency (#355)
+- **chore(deps)**: bump the github-actions group with 2 updates (#362)
+- **chore**: update dependencies and modernize type annotations (#360)
+
 ### Fixed
 
-- **fix**: resolve SBOM generation for HuggingFace URLs and downloaded files  
-- **fix**: sync SBOM scanner_version with package version
+- **fix**: resolve SBOM generation for HuggingFace URLs and downloaded files
+- **fix**: handle GGUF tensor dictionaries in SBOM asset creation (#363)
+- **fix**: correct release dates in CHANGELOG.md (#354)
 
 ## [0.2.4] - 2025-08-28
 
@@ -334,9 +351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...HEAD
-[0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
-[0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...HEAD
 [0.2.3]: https://github.com/promptfoo/modelaudit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/promptfoo/modelaudit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/promptfoo/modelaudit/compare/v0.2.0...v0.2.1
