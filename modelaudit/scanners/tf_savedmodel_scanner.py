@@ -10,7 +10,7 @@ from modelaudit.utils.code_validation import (
     validate_python_syntax,
 )
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _import_tensorflow():
     global HAS_TENSORFLOW, SavedModelType
     if SavedModelType is not None:
         return  # Already attempted import
-        
+
     try:
         import tensorflow as tf  # noqa: F401
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
@@ -44,7 +44,7 @@ def _import_tensorflow():
         HAS_TENSORFLOW = False
 
         # Create a placeholder for type hints when TensorFlow is not available
-        class SavedModel:  # type: ignore[no-redef]
+        class SavedModel:
             """Placeholder for SavedModel when TensorFlow is not installed"""
 
             meta_graphs: ClassVar[list] = []
@@ -147,6 +147,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 content = f.read()
                 result.bytes_scanned = len(content)
 
+                if SavedModelType is None:
+                    result.add_check(
+                        name="TensorFlow Availability Check",
+                        passed=False,
+                        message="TensorFlow not available for SavedModel parsing",
+                        severity=IssueSeverity.CRITICAL,
+                    )
+                    return result
+                    
                 saved_model = SavedModelType()
                 saved_model.ParseFromString(content)
                 for op_info in self._scan_tf_operations(saved_model):

@@ -30,7 +30,7 @@ def _import_tensorflow():
     global HAS_TENSORFLOW, tf
     if tf is not None or HAS_TENSORFLOW:
         return  # Already attempted import
-        
+
     try:
         import tensorflow as _tf
         tf = _tf
@@ -336,7 +336,7 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_tensorflow_weights(self, path: str) -> dict[str, np.ndarray]:
         """Extract weights from TensorFlow SavedModel files"""
         _import_tensorflow()  # Lazy import
-        if not HAS_TENSORFLOW:
+        if not HAS_TENSORFLOW or tf is None:
             return {}
 
         weights_info: dict[str, np.ndarray] = {}
