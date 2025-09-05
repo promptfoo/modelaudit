@@ -4,7 +4,10 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from .models import ModelAuditResultModel
 
 import click
 from yaspin import yaspin
@@ -994,14 +997,23 @@ def scan_command(
                         from .mlflow_integration import scan_mlflow_model
 
                         # Use scan_mlflow_model to download and get scan results directly
-                        results: ModelAuditResultModel = scan_mlflow_model(
+                        results_tuple = scan_mlflow_model(
                             path,
                             registry_uri=registry_uri,
                             timeout=final_timeout,
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
                             max_total_size=final_max_total_size,
+                            return_download_path=True,
                         )
+                        
+                        # Type assertions for mypy
+                        assert isinstance(results_tuple, tuple), "Expected tuple from scan_mlflow_model"
+                        results = cast("ModelAuditResultModel", results_tuple[0])
+                        mlflow_download_path = cast(str, results_tuple[1])
+
+                        # Record path mapping for SBOM generation
+                        path_mappings[path] = mlflow_download_path
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
@@ -1038,7 +1050,7 @@ def scan_command(
 
                     try:
                         # Use the integrated JFrog scanning function
-                        jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
+                        jfrog_results_tuple = scan_jfrog_artifact(
                             path,
                             api_token=jfrog_api_token,
                             access_token=jfrog_access_token,
@@ -1048,7 +1060,16 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            return_download_path=True,
                         )
+                        
+                        # Type assertions for mypy
+                        assert isinstance(jfrog_results_tuple, tuple), "Expected tuple from scan_jfrog_artifact"
+                        jfrog_results = cast("ModelAuditResultModel", jfrog_results_tuple[0])
+                        jfrog_download_path = cast(str, jfrog_results_tuple[1])
+
+                        # Record path mapping for SBOM generation
+                        path_mappings[path] = jfrog_download_path
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded and scanned", fg="green", bold=True))

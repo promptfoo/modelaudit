@@ -18,8 +18,9 @@ def scan_mlflow_model(
     blacklist_patterns: Optional[list[str]] = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    return_download_path: bool = False,
     **kwargs: Any,
-) -> ModelAuditResultModel:
+) -> ModelAuditResultModel | tuple[ModelAuditResultModel, str]:
     """Download and scan a model from the MLflow model registry.
 
     Parameters
@@ -38,14 +39,15 @@ def scan_mlflow_model(
         Maximum file size to scan in bytes (0 = unlimited).
     max_total_size:
         Maximum total bytes to scan before stopping (0 = unlimited).
+    return_download_path:
+        If True, return a tuple of (scan_results, download_path).
     **kwargs:
         Additional arguments passed to :func:`scan_model_directory_or_file`.
 
     Returns
     -------
-    dict
-        Scan results dictionary as returned by
-        :func:`scan_model_directory_or_file`.
+    ModelAuditResultModel or tuple[ModelAuditResultModel, str]
+        Scan results, or tuple of (scan_results, download_path) if return_download_path=True.
 
     Raises
     ------
@@ -74,7 +76,7 @@ def scan_mlflow_model(
             "cache_dir": scan_kwargs.pop("cache_dir", None),
         }
 
-        return scan_model_directory_or_file(
+        results = scan_model_directory_or_file(
             download_path,
             timeout=timeout,
             blacklist_patterns=blacklist_patterns,
@@ -83,5 +85,9 @@ def scan_mlflow_model(
             **cache_config,
             **scan_kwargs,
         )
+
+        if return_download_path:
+            return results, download_path
+        return results
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

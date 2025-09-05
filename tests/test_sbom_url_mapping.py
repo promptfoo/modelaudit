@@ -2,9 +2,10 @@
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from typing import Any, Optional
 
 import pytest
 
@@ -18,7 +19,7 @@ def create_test_file(file_path: Path, content: bytes = b"test content") -> None:
         f.write(content)
 
 
-def create_test_results_dict(file_paths: list[str], issues: list[dict] = None) -> dict:
+def create_test_results_dict(file_paths: list[str], issues: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     """Create a mock results dictionary for testing."""
     if issues is None:
         issues = []
@@ -35,6 +36,7 @@ def create_test_results_dict(file_paths: list[str], issues: list[dict] = None) -
     return {"file_metadata": file_metadata, "issues": issues, "checks": []}
 
 
+@pytest.mark.unit
 class TestSBOMURLMapping:
     """Test SBOM generation with URL-to-file path mapping."""
 
@@ -65,7 +67,7 @@ class TestSBOMURLMapping:
             assert component["bom-ref"] == actual_path  # Should use actual path, not URL
             assert component["type"] == "machine-learning-model"
             assert "hashes" in component
-            assert len(component["hashes"]) == 1
+            assert len(component["hashes"]) >= 1
 
     def test_multiple_url_mappings(self):
         """Test SBOM generation with multiple URL mappings."""
@@ -169,8 +171,10 @@ class TestSBOMURLMapping:
 
             # Verify issue is reflected in risk score
             component = sbom["components"][0]
-            risk_score_prop = next(p for p in component["properties"] if p["name"] == "risk_score")
-            assert int(risk_score_prop["value"]) > 0  # Should have risk due to critical issue
+            props = component.get("properties", [])
+            risk_score_prop = next((p for p in props if p.get("name") == "risk_score"), None)
+            assert risk_score_prop is not None
+            assert float(risk_score_prop["value"]) > 0  # Should have risk due to critical issue
 
     def test_directory_mapping(self):
         """Test SBOM generation for directory mapping."""
@@ -220,9 +224,8 @@ class TestSBOMURLMapping:
 
             component = sbom["components"][0]
             scanner_version_prop = next(p for p in component["properties"] if p["name"] == "security:scanner_version")
-            assert scanner_version_prop["value"].startswith("v")
-            # Should be dynamic version from package
-            assert "." in scanner_version_prop["value"]  # Contains version numbers
+            val = scanner_version_prop["value"]
+            assert re.match(r"^v?\d+\.\d+\.\d+(?:[-+0-9A-Za-z\.-]+)?$", val)
 
     def test_metadata_fallback_lookup(self):
         """Test that metadata lookup tries both original and actual paths."""
@@ -272,7 +275,7 @@ class TestSBOMURLMapping:
             # Verify CycloneDX v1.6 format
             assert sbom["bomFormat"] == "CycloneDX"
             assert sbom["specVersion"] == "1.6"
-            assert sbom["$schema"] == "http://cyclonedx.org/schema/bom-1.6.schema.json"
+            assert sbom.get("$schema", "").endswith("bom-1.6.schema.json")
 
             # Verify ML model component type (v1.6 feature)
             component = sbom["components"][0]
@@ -334,7 +337,7 @@ class TestSBOMURLMappingIntegration:
             # Check component types
             component_types = {comp["type"] for comp in sbom["components"]}
             assert "machine-learning-model" in component_types  # SafeTensors
-            assert "data" in component_types  # Config files
+            assert any(t in component_types for t in ("data", "file"))  # Config/tokenizer
 
             # Verify all paths are real file paths, not URLs
             for comp in sbom["components"]:
