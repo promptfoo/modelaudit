@@ -51,7 +51,7 @@ yaml = ["pyyaml>=6.0,<7.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0,<2.0"]
 dill = ["dill>=0.3.0,<1.0"]
-joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<1.6.0"]
+joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
 coreml = ["coremltools>=8.0"]
@@ -71,10 +71,11 @@ numpy1 = [
     "onnx>=1.12.0,<2.0",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
-    "scikit-learn>=1.0.0,<1.6.0",
+    "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
     "coremltools>=8.0",
+    "tensorrt>=8.6.0",
     "huggingface-hub>=0.23.0",
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
@@ -90,7 +91,7 @@ all-ci = [
     "onnx>=1.12.0,<2.0",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
-    "scikit-learn>=1.0.0,<1.6.0",
+    "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
     "coremltools>=8.0",
@@ -109,7 +110,7 @@ all = [
     "onnx>=1.12.0,<2.0",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
-    "scikit-learn>=1.0.0,<1.6.0",
+    "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
     "coremltools>=8.0",
@@ -142,7 +143,7 @@ dev-dependencies = [
     "pytest-cov>=6.2.1",
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
-    # "pytest-asyncio>=1.1.0",  # Temporarily disabled to fix CI hanging issues
+    "pytest-asyncio>=1.1.0",
 ]
 
 [tool.ruff]
@@ -192,14 +193,8 @@ addopts = [
     "--strict-config",
     "--disable-warnings",
     "--tb=short",
-    "--maxfail=1",       # Stop on first failure for faster feedback
-    "-x",                # Stop on first failure immediately
 ]
 testpaths = ["tests"]
-# Asyncio configuration temporarily disabled to fix CI hanging issues
-# asyncio_mode = "strict"
-# asyncio_default_fixture_loop_scope = "function"
-# asyncio_default_test_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
@@ -210,9 +205,6 @@ markers = [
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
-    "ignore::ResourceWarning",
-    "ignore::UserWarning:tensorboard",
-    "ignore::FutureWarning:tensorflow",
 ]
 
 [tool.mypy]
