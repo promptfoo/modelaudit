@@ -44,6 +44,64 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 ✗ 2 security issues found. See details above.
 ```
 
+## Installation
+
+**Recommended (includes common ML frameworks):**
+
+```bash
+pip install modelaudit[all]
+```
+
+**Basic installation:**
+
+```bash
+# Core functionality only (pickle, numpy, archives)
+pip install modelaudit
+```
+
+**Specific frameworks:**
+
+```bash
+pip install modelaudit[tensorflow]  # TensorFlow (.pb)
+pip install modelaudit[pytorch]     # PyTorch (.pt, .pth)
+pip install modelaudit[h5]          # Keras (.h5, .keras)
+pip install modelaudit[onnx]        # ONNX (.onnx)
+pip install modelaudit[safetensors] # SafeTensors (.safetensors)
+
+# Multiple frameworks
+pip install modelaudit[tensorflow,pytorch,h5]
+```
+
+**Additional features:**
+
+```bash
+pip install modelaudit[cloud]       # S3, GCS, Azure storage
+pip install modelaudit[coreml]      # Apple Core ML
+pip install modelaudit[flax]        # JAX/Flax models
+pip install modelaudit[mlflow]      # MLflow registry
+pip install modelaudit[huggingface] # Hugging Face integration
+```
+
+**Compatibility:**
+
+```bash
+# NumPy 1.x compatibility (some frameworks require NumPy < 2.0)
+pip install modelaudit[numpy1]
+
+# For CI/CD environments (omits dependencies like TensorRT that may not be available)
+pip install modelaudit[all-ci]
+```
+
+**Docker:**
+
+```bash
+docker pull ghcr.io/promptfoo/modelaudit:latest
+# Linux/macOS
+docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
+# Windows
+docker run --rm -v "%cd%":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
+```
+
 ## Security Checks
 
 ### Code Execution Detection
@@ -146,78 +204,20 @@ modelaudit https://company.jfrog.io/repo/model.pt
 
 ### Command Options
 
-- `--format` - Output format: text, json, sarif
-- `--output` - Write results to file
-- `--verbose` - Detailed output
-- `--quiet` - Minimal output
-- `--strict` - Fail on warnings, scan all files
-- `--timeout` - Override scan timeout
-- `--max-size` - Set size limits (e.g., 10 GB)
-- `--dry-run` - Preview without scanning
-- `--progress` - Force progress display
-- `--sbom` - Generate CycloneDX SBOM
-- `--blacklist` - Additional patterns to flag
-- `--no-cache` - Disable result caching
+- **`--format`** - Output format: text, json, sarif
+- **`--output`** - Write results to file
+- **`--verbose`** - Detailed output
+- **`--quiet`** - Minimal output
+- **`--strict`** - Fail on warnings, scan all files
+- **`--timeout`** - Override scan timeout
+- **`--max-size`** - Set size limits (e.g., 10 GB)
+- **`--dry-run`** - Preview without scanning
+- **`--progress`** - Force progress display
+- **`--sbom`** - Generate CycloneDX SBOM
+- **`--blacklist`** - Additional patterns to flag
+- **`--no-cache`** - Disable result caching
 
 [Advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
-
-## Installation
-
-**Recommended (includes common ML frameworks):**
-
-```bash
-pip install modelaudit[all]
-```
-
-**Basic installation:**
-
-```bash
-# Core functionality only (pickle, numpy, archives)
-pip install modelaudit
-```
-
-**Specific frameworks:**
-
-```bash
-pip install modelaudit[tensorflow]  # TensorFlow (.pb)
-pip install modelaudit[pytorch]     # PyTorch (.pt, .pth)
-pip install modelaudit[h5]          # Keras (.h5, .keras)
-pip install modelaudit[onnx]        # ONNX (.onnx)
-pip install modelaudit[safetensors] # SafeTensors (.safetensors)
-
-# Multiple frameworks
-pip install modelaudit[tensorflow,pytorch,h5]
-```
-
-**Additional features:**
-
-```bash
-pip install modelaudit[cloud]       # S3, GCS, Azure storage
-pip install modelaudit[coreml]      # Apple Core ML
-pip install modelaudit[flax]        # JAX/Flax models
-pip install modelaudit[mlflow]      # MLflow registry
-pip install modelaudit[huggingface] # Hugging Face integration
-```
-
-**Compatibility:**
-
-```bash
-# NumPy 1.x compatibility (some frameworks require NumPy < 2.0)
-pip install modelaudit[numpy1]
-
-# For CI/CD environments (omits dependencies like TensorRT that may not be available)
-pip install modelaudit[all-ci]
-```
-
-**Docker:**
-
-```bash
-docker pull ghcr.io/promptfoo/modelaudit:latest
-# Linux/macOS
-docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
-# Windows
-docker run --rm -v "%cd%":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
-```
 
 ## Output Formats
 
