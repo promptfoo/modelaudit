@@ -102,35 +102,38 @@ def test_max_file_size(safe_tmp_path):
 
 def test_max_total_size(safe_tmp_path):
     """Test max_total_size parameter."""
+    import os
     import pickle
+    import time
 
     file1 = safe_tmp_path / "a.pkl"
     with file1.open("wb") as f:
         pickle.dump({"data": "x" * 100}, f)
         f.flush()
+        os.fsync(f.fileno())
 
     file2 = safe_tmp_path / "b.pkl"
     with file2.open("wb") as f:
         pickle.dump({"data": "y" * 100}, f)
         f.flush()
+        os.fsync(f.fileno())
 
     file3 = safe_tmp_path / "c.pkl"
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
         f.flush()
+        os.fsync(f.fileno())
 
-    # Ensure files are fully written and flushed to disk
-    import os
-    import time
-
-    # Force filesystem sync
-    os.sync() if hasattr(os, "sync") else None
-    time.sleep(0.2)
+    # Give time for filesystem operations to complete
+    time.sleep(0.1)
 
     # Verify all files exist and have expected content
-    assert file1.exists() and file1.stat().st_size > 0
-    assert file2.exists() and file2.stat().st_size > 0
-    assert file3.exists() and file3.stat().st_size > 0
+    assert file1.exists(), f"File {file1} does not exist"
+    assert file1.stat().st_size > 0, f"File {file1} is empty"
+    assert file2.exists(), f"File {file2} does not exist"
+    assert file2.stat().st_size > 0, f"File {file2} is empty"
+    assert file3.exists(), f"File {file3} does not exist"
+    assert file3.stat().st_size > 0, f"File {file3} is empty"
 
     results = scan_model_directory_or_file(str(safe_tmp_path), max_total_size=150)
 
