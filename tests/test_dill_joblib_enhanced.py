@@ -349,6 +349,7 @@ class TestIntegration:
 
     def test_backward_compatibility(self):
         """Test that regular pickle scanning still works unchanged."""
+        import contextlib
         import os
         import tempfile
 
@@ -366,10 +367,8 @@ class TestIntegration:
                 assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
             finally:
                 # Clean up the temporary file
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(temp_file.name)
-                except OSError:
-                    pass
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""

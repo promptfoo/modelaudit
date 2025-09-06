@@ -982,6 +982,7 @@ def test_format_text_output_very_fast_scan_with_issues():
 
 def test_exit_code_clean_scan():
     """Test exit code 0 when scan is clean with no issues."""
+    import contextlib
     import os
     import pickle
     import tempfile
@@ -1010,32 +1011,38 @@ def test_exit_code_clean_scan():
             assert result.files_scanned == 1
         finally:
             # Clean up the temporary file
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(temp_file.name)
-            except OSError:
-                pass
 
 
-def test_exit_code_security_issues(tmp_path):
+def test_exit_code_security_issues():
     """Test exit code 1 when security issues are found."""
+    import contextlib
+    import os
     import pickle
-
-    # Create a malicious pickle file
-    evil_pickle_path = tmp_path / "malicious.pkl"
+    import tempfile
 
     class MaliciousClass:
         def __reduce__(self):
             return (os.system, ('echo "This is a malicious pickle"',))
 
-    with evil_pickle_path.open("wb") as f:
-        pickle.dump(MaliciousClass(), f)
+    # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
+        try:
+            # Create a malicious pickle file
+            pickle.dump(MaliciousClass(), temp_file)
+            temp_file.flush()
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--format", "text", str(evil_pickle_path)])
+            runner = CliRunner()
+            result = runner.invoke(cli, ["scan", "--format", "text", temp_file.name])
 
-    # Should exit with code 1 for security findings
-    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    assert "error" in result.output.lower() or "warning" in result.output.lower()
+            # Should exit with code 1 for security findings
+            assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+            assert "error" in result.output.lower() or "warning" in result.output.lower()
+        finally:
+            # Clean up the temporary file
+            with contextlib.suppress(OSError):
+                os.unlink(temp_file.name)
 
 
 def test_exit_code_scan_errors(tmp_path):
