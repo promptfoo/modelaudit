@@ -40,7 +40,7 @@ class TestAssetInventoryIntegration:
         safetensors_file.parent.mkdir(parents=True, exist_ok=True)
         if safetensors_file.exists():
             safetensors_file.unlink()
-        
+
         safetensors_data = {
             "embedding.weight": np.random.randn(1000, 768).astype(np.float32),
             "decoder.weight": np.random.randn(768, 50257).astype(np.float32),
