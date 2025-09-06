@@ -75,7 +75,9 @@ class TestJFrogDownload:
 
         # Test access token
         download_artifact(
-            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path, access_token="test-access-token"
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=safe_tmp_path,
+            access_token="test-access-token",
         )
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer test-access-token"

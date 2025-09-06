@@ -1,5 +1,4 @@
 import pickle
-from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.utils import resolve_dvc_file

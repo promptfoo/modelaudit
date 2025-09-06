@@ -60,7 +60,6 @@ class TestCacheDirOption:
         """Test HuggingFace download uses smart detection for cache directory."""
         import os
         import tempfile
-        import contextlib
 
         # Use tempfile.TemporaryDirectory to avoid pytest safe_tmp_path fixture issues
         with tempfile.TemporaryDirectory() as temp_dir:
