@@ -173,7 +173,7 @@ jobs:
 
       - name: Run fast tests with fail-fast
         run: |
-          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          rye run pytest -x --maxfail=1 -m "not slow and not integration and not performance" --tb=short --durations=10
 
   test:
     name: Test Python ${{ matrix.python-version }}
@@ -220,17 +220,17 @@ jobs:
       - name: Run fast tests with fail-fast (no coverage on PRs)
         if: github.event_name == 'pull_request'
         run: |
-          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          rye run pytest -x --maxfail=1 -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run fast tests with coverage (main branch only)
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
+          rye run pytest -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
 
       - name: Run fast tests without coverage (main branch, non-3.12)
         if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          rye run pytest -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'
