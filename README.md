@@ -50,7 +50,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 - Dangerous Python modules: `os`, `sys`, `subprocess`, `eval`, `exec`
 - Pickle opcodes: `REDUCE`, `GLOBAL`, `INST`, `OBJ`, `NEWOBJ`, `STACK_GLOBAL`, `BUILD`, `NEWOBJ_EX`
-- Binary executable signatures and shellcode patterns
+- Embedded executable file detection
 
 ### Embedded Data Extraction
 
@@ -70,6 +70,10 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 - Keras unsafe layers and custom objects
 - Template injection in model configurations
 
+### Context-Aware Analysis
+
+- Intelligently distinguishes between legitimate ML framework patterns and genuine threats to reduce false positives in complex model files
+
 ## Supported Formats
 
 ModelAudit includes 29 specialized scanners for ML model formats ([see complete list](https://www.promptfoo.dev/docs/model-audit/scanners/)):
@@ -82,7 +86,7 @@ ModelAudit includes 29 specialized scanners for ML model formats ([see complete 
 | **Keras**       | `.h5`, `.keras`, `.hdf5`                  | Unsafe layers, custom objects                      |
 | **ONNX**        | `.onnx`                                   | Custom operators, metadata                         |
 | **SafeTensors** | `.safetensors`                            | Header validation, metadata                        |
-| **GGUF/GGML**   | `.gguf`, `.ggml`                          | Template injection, metadata                       |
+| **GGUF/GGML**   | `.gguf`, `.ggml`                          | Header validation, metadata                        |
 | **Joblib**      | `.joblib`                                 | Pickled objects, scikit-learn                      |
 | **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`             | Serialized transforms                              |
 | **NumPy**       | `.npy`, `.npz`                            | Array metadata, pickle objects                     |
@@ -201,7 +205,7 @@ pip install modelaudit[huggingface] # Hugging Face integration
 # NumPy 1.x compatibility (some frameworks require NumPy < 2.0)
 pip install modelaudit[numpy1]
 
-# For CI/CD environments (omits platform-specific dependencies like torch)
+# For CI/CD environments (omits dependencies like TensorRT that may not be available)
 pip install modelaudit[all-ci]
 ```
 
@@ -294,12 +298,12 @@ export JFROG_API_TOKEN=your_token
 # MLflow
 export MLFLOW_TRACKING_URI=http://localhost:5000
 
-# AWS S3
+# AWS, Google Cloud, and Azure
+# Authentication is handled automatically by the respective client libraries
+# (e.g., via IAM roles, `aws configure`, `gcloud auth login`, or environment variables).
+# For specific env var setup, refer to the library's documentation.
 export AWS_ACCESS_KEY_ID=your_access_key
 export AWS_SECRET_ACCESS_KEY=your_secret_key
-# Optional: AWS_SESSION_TOKEN or AWS_PROFILE
-
-# Google Cloud Storage
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
 # Hugging Face
