@@ -232,6 +232,10 @@ then run redteaming if you need to test how the model responds when invoked.
 
 ## ⚙️ Installation Options
 
+**Requirements:**
+- Python 3.10 or higher
+- Compatible with Python 3.10, 3.11, 3.12, and 3.13
+
 **Basic installation (recommended for most users):**
 
 ### Quick Install Decision Guide

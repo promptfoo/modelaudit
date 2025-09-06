@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import click
 from yaspin import yaspin
@@ -44,7 +44,7 @@ def should_show_spinner() -> bool:
     return sys.stdout.isatty()
 
 
-def style_text(text: str, **kwargs) -> str:
+def style_text(text: str, **kwargs: Any) -> str:
     """Style text only if colors are enabled."""
     if should_use_color():
         return click.style(text, **kwargs)
@@ -68,7 +68,7 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
     return expanded
 
 
-def create_progress_callback_wrapper(progress_callback: Optional[Any], spinner: Optional[Any]) -> Optional[Any]:
+def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
     """Create a type-safe progress callback wrapper."""
     if not progress_callback:
         return None
@@ -93,12 +93,12 @@ def is_mlflow_uri(path: str) -> bool:
 class DefaultCommandGroup(click.Group):
     """Custom group that makes 'scan' the default command"""
 
-    def get_command(self, ctx, cmd_name) -> Optional[click.Command]:
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         """Get command by name, return None if not found"""
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
 
-    def resolve_command(self, ctx, args) -> tuple[str, click.Command, list[str]]:
+    def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple[str, click.Command, list[str]]:
         """Resolve command, using 'scan' as default when paths are provided"""
         # If we have args and the first arg is not a known command, use 'scan' as default
         if args and args[0] not in self.list_commands(ctx):
@@ -107,7 +107,7 @@ class DefaultCommandGroup(click.Group):
 
         return super().resolve_command(ctx, args)
 
-    def format_help(self, ctx, formatter) -> None:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Show help with both commands but emphasize scan as primary"""
         formatter.write_text("ModelAudit - Security scanner for ML model files")
         formatter.write_paragraph()
@@ -163,7 +163,7 @@ def auth() -> None:
     help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
-def login(org_id: Optional[str], host: Optional[str], api_key: Optional[str]) -> None:
+def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     """Login"""
     try:
         token = None
@@ -258,7 +258,7 @@ def cache() -> None:
 @cache.command()
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
 @click.option("--dry-run", is_flag=True, help="Show what would be cleared without actually clearing")
-def clear(cache_dir: Optional[str], dry_run: bool) -> None:
+def clear(cache_dir: str | None, dry_run: bool) -> None:
     """Clear the entire scan results cache"""
     from .cache import get_cache_manager
 
@@ -303,7 +303,7 @@ def clear(cache_dir: Optional[str], dry_run: bool) -> None:
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
 @click.option("--max-age", type=int, default=30, help="Maximum age of entries to keep in days [default: 30]")
 @click.option("--dry-run", is_flag=True, help="Show what would be cleaned without actually cleaning")
-def cleanup(cache_dir: Optional[str], max_age: int, dry_run: bool) -> None:
+def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
     """Clean up old cache entries"""
     from .cache import get_cache_manager
 
@@ -338,7 +338,7 @@ def cleanup(cache_dir: Optional[str], max_age: int, dry_run: bool) -> None:
 
 @cache.command()
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
-def stats(cache_dir: Optional[str]) -> None:
+def stats(cache_dir: str | None) -> None:
     """Show cache statistics"""
     from .cache import get_cache_manager
 
@@ -456,16 +456,16 @@ def delegate_info() -> None:
 )
 def scan_command(
     paths: tuple[str, ...],
-    format: Optional[str],
-    output: Optional[str],
+    format: str | None,
+    output: str | None,
     verbose: bool,
     quiet: bool,
     blacklist: tuple[str, ...],
     strict: bool,
     progress: bool,
-    sbom: Optional[str],
-    timeout: Optional[int],
-    max_size: Optional[str],
+    sbom: str | None,
+    timeout: int | None,
+    max_size: str | None,
     dry_run: bool,
     no_cache: bool,
 ) -> None:
@@ -1712,7 +1712,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     return "\n".join(output_lines)
 
 
-def _get_issue_attr(issue: Union[dict[str, Any], Any], attr: str, default: Any = None) -> Any:
+def _get_issue_attr(issue: dict[str, Any] | Any, attr: str, default: Any = None) -> Any:
     """Safely get an attribute from an issue whether it's a dict or Pydantic object."""
     if isinstance(issue, dict):
         return issue.get(attr, default)
@@ -1722,7 +1722,7 @@ def _get_issue_attr(issue: Union[dict[str, Any], Any], attr: str, default: Any =
 
 
 def _format_issue(
-    issue: Union[dict[str, Any], Any],
+    issue: dict[str, Any] | Any,
     output_lines: list[str],
     severity: str,
 ) -> None:

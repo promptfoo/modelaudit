@@ -278,7 +278,7 @@ class TestPerformanceAndEdgeCases:
 
         # Scan files concurrently (simulated)
         results = []
-        for scanner, file_path in zip(scanners, files):
+        for scanner, file_path in zip(scanners, files, strict=False):
             result = scanner.scan(file_path)
             results.append(result)
 

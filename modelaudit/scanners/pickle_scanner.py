@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, Optional, Union
+from typing import IO, Any, BinaryIO, ClassVar
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -60,7 +60,7 @@ def _compute_pickle_length(path: str) -> int:
 # ============================================================================
 
 # ML Framework Detection Patterns
-ML_FRAMEWORK_PATTERNS: dict[str, dict[str, Union[list[str], float]]] = {
+ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
     "pytorch": {
         "modules": [
             "torch",
@@ -268,7 +268,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if framework_score > 5.0:  # Much lower threshold - any ML module presence
             # Normalize confidence to 0-1 range
             confidence_boost = patterns["confidence_boost"]
-            if isinstance(confidence_boost, (int, float)):
+            if isinstance(confidence_boost, int | float):
                 confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
                 context["frameworks"][framework] = {
                     "confidence": confidence,
@@ -306,7 +306,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     return is_suspicious_global(mod, func)
 
 
-def _is_actually_dangerous_string(s: str, ml_context: dict) -> Optional[str]:
+def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
     Now includes py_compile validation to reduce false positives.
@@ -622,7 +622,7 @@ def is_suspicious_global(mod: str, func: str) -> bool:
     return False
 
 
-def is_suspicious_string(s: str) -> Optional[str]:
+def is_suspicious_string(s: str) -> str | None:
     """Check if a string contains suspicious patterns"""
     import re
 
@@ -643,7 +643,7 @@ def is_suspicious_string(s: str) -> Optional[str]:
     return None
 
 
-def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> Optional[dict[str, Any]]:
+def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method
     Returns details about the dangerous pattern if found, None otherwise
@@ -808,7 +808,7 @@ class PickleScanner(BaseScanner):
         ".ckpt",
     ]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
@@ -1351,7 +1351,7 @@ class PickleScanner(BaseScanner):
                     f"This could indicate potential exploitation attempts. {attr.remediation}",
                 )
 
-    def _create_enhanced_pattern_check(self, matches, result: ScanResult, context_path: str) -> None:
+    def _create_enhanced_pattern_check(self, matches: Any, result: ScanResult, context_path: str) -> None:
         """Create a check for enhanced pattern matches with ML context awareness."""
         if not matches:
             return
@@ -1453,7 +1453,7 @@ class PickleScanner(BaseScanner):
 
         return severity_map.get(base_severity, IssueSeverity.WARNING)
 
-    def _generate_pattern_explanation(self, match, ml_adjustment: float) -> str:
+    def _generate_pattern_explanation(self, match: Any, ml_adjustment: float) -> str:
         """Generate explanation for why a pattern is dangerous."""
         base_explanation = (
             f"The pattern '{match.pattern_name}' indicates potential {match.context.get('category', 'security')} risks."
@@ -1499,7 +1499,7 @@ class PickleScanner(BaseScanner):
                     details={"pattern": pattern_str, "detection_method": "legacy_pattern_matching"},
                 )
 
-    def _create_opcode_sequence_check(self, sequence_result, result: ScanResult) -> None:
+    def _create_opcode_sequence_check(self, sequence_result: Any, result: ScanResult) -> None:
         """Create a check for detected dangerous opcode sequences."""
         # Map severity to IssueSeverity enum
         severity_map = {
@@ -1548,12 +1548,12 @@ class PickleScanner(BaseScanner):
     def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str]] = set()
-        memo: dict[Union[int, str], str] = {}
+        memo: dict[int | str, str] = {}
 
         last_byte = b"dummy"
         while last_byte != b"":
             try:
-                ops: list[tuple[Any, Any, Union[int, None]]] = list(pickletools.genops(data))
+                ops: list[tuple[Any, Any, int | None]] = list(pickletools.genops(data))
             except Exception as e:
                 if globals_found:
                     logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
@@ -1593,7 +1593,7 @@ class PickleScanner(BaseScanner):
         return globals_found
 
     def _extract_stack_global_values(
-        self, ops: list[tuple[Any, Any, Union[int, None]]], position: int, memo: dict[Union[int, str], str]
+        self, ops: list[tuple[Any, Any, int | None]], position: int, memo: dict[int | str, str]
     ) -> list[str]:
         """Extract values for STACK_GLOBAL opcode by walking backwards through stack."""
         values: list[str] = []
@@ -1724,7 +1724,7 @@ class PickleScanner(BaseScanner):
             # Dynamic stack depth limit - will be adjusted based on ML context
             base_stack_depth_limit = 1000  # Base limit for unknown content
             # Store warnings for ML-context-aware processing
-            stack_depth_warnings: list[dict[str, Union[int, str]]] = []
+            stack_depth_warnings: list[dict[str, int | str]] = []
 
             for opcode, arg, pos in pickletools.genops(file_obj):
                 # Check for interrupts periodically during opcode processing
@@ -2226,7 +2226,7 @@ class PickleScanner(BaseScanner):
                         )
 
                 # Detect nested pickle bytes
-                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, (bytes, bytearray)):
+                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, bytes | bytearray):
                     sample = bytes(arg[:1024])  # limit
                     if _looks_like_pickle(sample):
                         severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
@@ -2518,7 +2518,7 @@ class PickleScanner(BaseScanner):
 
             # Check if this is a known benign error in legitimate serialization files
             is_benign_error = (
-                isinstance(e, (ValueError, struct.error))
+                isinstance(e, ValueError | struct.error)
                 and any(
                     msg in str(e).lower()
                     for msg in [

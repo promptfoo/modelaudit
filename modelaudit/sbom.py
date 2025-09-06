@@ -1,7 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -21,7 +21,7 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _get_component_type(path: str, metadata: Optional[dict[str, Any]]) -> ComponentType:
+def _get_component_type(path: str, metadata: dict[str, Any] | None) -> ComponentType:
     """Determine the appropriate CycloneDX v1.6 component type for a file."""
     # ML model file types should use MACHINE_LEARNING_MODEL component type
     ml_extensions = {
@@ -172,7 +172,7 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
 
 def _component_for_file_pydantic(
     path: str,
-    metadata: Optional[FileMetadataModel],
+    metadata: FileMetadataModel | None,
     issues: list[Issue],
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
@@ -329,7 +329,7 @@ def _component_for_file(
     return component
 
 
-def generate_sbom(paths: Iterable[str], results: Union[dict[str, Any], Any]) -> str:
+def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     bom = Bom()
     issues = results.get("issues", [])
     # Convert issues to dicts if they are Pydantic models

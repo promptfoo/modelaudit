@@ -350,6 +350,7 @@ python-dotenv==1.1.1
     # via modelaudit
 pytz==2025.2
     # via pandas
+pyupgrade==3.20.0
 pyyaml==6.0.2
     # via huggingface-hub
     # via mlflow-skinny
@@ -421,6 +422,8 @@ tflite==2.18.0
     # via modelaudit
 threadpoolctl==3.6.0
     # via scikit-learn
+tokenize-rt==6.2.0
+    # via pyupgrade
 torch==2.8.0
     # via modelaudit
 tqdm==4.67.1

@@ -8,7 +8,7 @@ Part of ModelAudit's critical security validation suite.
 
 import math
 import re
-from typing import Any, Optional
+from typing import Any
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -81,7 +81,7 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
 class SecretsDetector:
     """Detects embedded secrets, API keys, and credentials in model data."""
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the secrets detector with optional configuration.
 
         Args:
@@ -547,7 +547,7 @@ class SecretsDetector:
                 findings.extend(self.scan_bytes(value, key_context))
             elif isinstance(value, dict):
                 findings.extend(self.scan_dict(value, key_context))
-            elif isinstance(value, (list, tuple)):
+            elif isinstance(value, list | tuple):
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
                     if isinstance(item, str):
@@ -586,7 +586,7 @@ class SecretsDetector:
                 findings.extend(self.scan_bytes(byte_data, f"{context}[array]"))
             except Exception:
                 pass
-        elif isinstance(weights, (list, tuple)):
+        elif isinstance(weights, list | tuple):
             for i, item in enumerate(weights):
                 findings.extend(self.scan_model_weights(item, f"{context}[{i}]"))
 

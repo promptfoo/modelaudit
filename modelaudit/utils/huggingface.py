@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .disk_space import check_disk_space
@@ -143,7 +143,7 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {url}: {e!s}") from e
 
 
-def get_model_size(repo_id: str) -> Optional[int]:
+def get_model_size(repo_id: str) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -171,7 +171,7 @@ def get_model_size(repo_id: str) -> Optional[int]:
         return None
 
 
-def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
+def download_model(url: str, cache_dir: Path | None = None, show_progress: bool = True) -> Path:
     """Download a model from HuggingFace.
 
     Args:
@@ -324,7 +324,7 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
         raise Exception(f"Failed to download model from {url}: {e!s}") from e
 
 
-def download_file_from_hf(url: str, cache_dir: Optional[Path] = None) -> Path:
+def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:

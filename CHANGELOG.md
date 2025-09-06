@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: drop Python 3.9 support, require Python 3.10+ minimum
+- **feat**: add Python 3.13 support
 - **feat**: consolidate CLI from 25 to 12 flags using smart detection (#359)
 - **feat**: enhance pickle static analysis with ML context awareness (#358)
 - **feat**: enhance check consolidation system with PII sanitization and performance improvements (#356)

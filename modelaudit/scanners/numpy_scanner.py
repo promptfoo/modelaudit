@@ -76,7 +76,7 @@ class NumPyScanner(BaseScanner):
                     f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
-    def _validate_dtype(self, dtype) -> None:
+    def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
         dangerous_names = ["object"]
@@ -93,7 +93,7 @@ class NumPyScanner(BaseScanner):
                 f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
-    def _calculate_safe_array_size(self, shape: tuple, dtype) -> int:
+    def _calculate_safe_array_size(self, shape: tuple, dtype: Any) -> int:
         """Calculate array size with overflow protection"""
         total_elements = 1
         max_elements = sys.maxsize // max(dtype.itemsize, 1)

@@ -3,7 +3,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -30,7 +30,7 @@ class ZipScanner(BaseScanner):
     description = "Scans ZIP archive files and their contents recursively"
     supported_extensions: ClassVar[list[str]] = [".zip", ".npz"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
         self.max_entries = self.config.get(
