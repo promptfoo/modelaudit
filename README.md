@@ -1,6 +1,6 @@
 # ModelAudit
 
-Static security scanner for AI/ML model files. Detects malicious code, dangerous deserialization, risky module usage, and embedded secrets without loading or executing models.
+Static security scanner for AI/ML model files. It detects malicious code, dangerous deserialization, risky module usage, and embedded secrets—all without loading or executing the model.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
@@ -14,7 +14,7 @@ Static security scanner for AI/ML model files. Detects malicious code, dangerous
 ## Quick Start
 
 ```bash
-# Install with common ML framework support
+# Install with all supported ML framework dependencies
 pip install modelaudit[all]
 
 # Scan a model file
@@ -41,7 +41,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 2. suspicious_model.pkl (pos 52): [WARNING] Dangerous pickle deserialization
    Why: Could execute code when the model loads
 
-✗ Security issues found
+✗ 2 security issues found. See details above.
 ```
 
 ## Security Checks
@@ -74,20 +74,20 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ModelAudit includes 29 specialized scanners for ML model formats ([see complete list](https://www.promptfoo.dev/docs/model-audit/scanners/)):
 
-| Format          | Extensions                                | Security Focus                       |
-| --------------- | ----------------------------------------- | ------------------------------------ |
-| **Pickle**      | `.pkl`, `.pickle`, `.dill`, `.pt`, `.pth` | Code execution, malicious opcodes    |
-| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`      | Path traversal, embedded executables |
-| **TensorFlow**  | `.pb`, SavedModel directories             | Dangerous operations, custom ops     |
-| **Keras**       | `.h5`, `.keras`, `.hdf5`                  | Unsafe layers, custom objects        |
-| **ONNX**        | `.onnx`                                   | Custom operators, metadata           |
-| **SafeTensors** | `.safetensors`                            | Header validation, metadata          |
-| **GGUF/GGML**   | `.gguf`, `.ggml`                          | Template injection, metadata         |
-| **Joblib**      | `.joblib`                                 | Pickled objects, scikit-learn        |
-| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`             | Serialized transforms                |
-| **NumPy**       | `.npy`, `.npz`                            | Array metadata, pickle objects       |
-| **Core ML**     | `.mlmodel`                                | Custom layers, metadata              |
-| **ExecuTorch**  | `.ptl`, `.pte`                            | Mobile model validation              |
+| Format          | Extensions                                | Security Focus                                     |
+| --------------- | ----------------------------------------- | -------------------------------------------------- |
+| **Pickle**      | `.pkl`, `.pickle`, `.dill`, `.pt`, `.pth` | Code execution, malicious opcodes, deserialization |
+| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`      | Path traversal, embedded executables               |
+| **TensorFlow**  | `.pb`, SavedModel directories             | Dangerous operations, custom ops                   |
+| **Keras**       | `.h5`, `.keras`, `.hdf5`                  | Unsafe layers, custom objects                      |
+| **ONNX**        | `.onnx`                                   | Custom operators, metadata                         |
+| **SafeTensors** | `.safetensors`                            | Header validation, metadata                        |
+| **GGUF/GGML**   | `.gguf`, `.ggml`                          | Template injection, metadata                       |
+| **Joblib**      | `.joblib`                                 | Pickled objects, scikit-learn                      |
+| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`             | Serialized transforms                              |
+| **NumPy**       | `.npy`, `.npz`                            | Array metadata, pickle objects                     |
+| **Core ML**     | `.mlmodel`                                | Custom layers, metadata                            |
+| **ExecuTorch**  | `.ptl`, `.pte`                            | Mobile model validation                            |
 
 Plus scanners for TensorFlow Lite, TensorRT, PaddlePaddle, OpenVINO, text files, and configuration formats.
 
@@ -124,9 +124,9 @@ NO_COLOR=1 modelaudit models/
 ### Remote Sources
 
 ```bash
-# Hugging Face models
-modelaudit hf://microsoft/DialoGPT-medium
+# Hugging Face models (via direct URL or hf:// scheme)
 modelaudit https://huggingface.co/gpt2
+modelaudit hf://microsoft/DialoGPT-medium
 
 # Cloud storage
 modelaudit s3://bucket/model.pt
@@ -154,12 +154,6 @@ modelaudit https://company.jfrog.io/repo/model.pt
 - `--sbom` - Generate CycloneDX SBOM
 - `--blacklist` - Additional patterns to flag
 - `--no-cache` - Disable result caching
-
-### Exit Codes
-
-- `0` - No security issues found
-- `1` - Security issues detected
-- `2` - Scan errors occurred
 
 [Advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
@@ -207,7 +201,7 @@ pip install modelaudit[huggingface] # Hugging Face integration
 # NumPy 1.x compatibility (some frameworks require NumPy < 2.0)
 pip install modelaudit[numpy1]
 
-# CI/CD (excludes platform-specific packages)
+# For CI/CD environments (omits platform-specific dependencies like torch)
 pip install modelaudit[all-ci]
 ```
 
@@ -215,7 +209,10 @@ pip install modelaudit[all-ci]
 
 ```bash
 docker pull ghcr.io/promptfoo/modelaudit:latest
+# Linux/macOS
 docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
+# Windows
+docker run --rm -v "%cd%":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 ## Output Formats
@@ -280,7 +277,15 @@ modelaudit your-model.onnx
 # Output: "Install with 'pip install modelaudit[onnx]'"
 ```
 
+### Exit Codes
+
+- `0` - No security issues found
+- `1` - Security issues detected
+- `2` - Scan errors occurred
+
 ### Authentication
+
+ModelAudit uses environment variables for authenticating to remote services:
 
 ```bash
 # JFrog Artifactory
