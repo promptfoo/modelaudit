@@ -107,19 +107,25 @@ def test_max_total_size(safe_tmp_path):
     file1 = safe_tmp_path / "a.pkl"
     with file1.open("wb") as f:
         pickle.dump({"data": "x" * 100}, f)
+        f.flush()
 
     file2 = safe_tmp_path / "b.pkl"
     with file2.open("wb") as f:
         pickle.dump({"data": "y" * 100}, f)
+        f.flush()
 
     file3 = safe_tmp_path / "c.pkl"
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
+        f.flush()
 
     # Ensure files are fully written and flushed to disk
+    import os
     import time
 
-    time.sleep(0.1)
+    # Force filesystem sync
+    os.sync() if hasattr(os, "sync") else None
+    time.sleep(0.2)
 
     # Verify all files exist and have expected content
     assert file1.exists() and file1.stat().st_size > 0
