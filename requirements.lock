@@ -162,8 +162,6 @@ numpy==1.26.4
     # via ml-dtypes
     # via modelaudit
     # via onnx
-    # via pandas
-    # via pyarrow
     # via scikit-learn
     # via scipy
     # via tensorboard
@@ -185,8 +183,6 @@ packaging==25.0
     # via keras
     # via tensorboard
     # via tensorflow
-pandas==2.3.2
-    # via modelaudit
 pillow==11.3.0
     # via tensorboard
 platformdirs==4.3.8
@@ -208,8 +204,6 @@ py-serializable==2.1.0
     # via cyclonedx-python-lib
 pyaml==25.7.0
     # via coremltools
-pyarrow==15.0.2
-    # via modelaudit
 pyasn1==0.6.1
     # via pyasn1-modules
     # via rsa
@@ -224,11 +218,8 @@ pygments==2.19.2
 python-dateutil==2.9.0.post0
     # via aiobotocore
     # via botocore
-    # via pandas
 python-dotenv==1.1.1
     # via modelaudit
-pytz==2025.2
-    # via pandas
 pyyaml==6.0.2
     # via huggingface-hub
     # via modelaudit
@@ -301,8 +292,6 @@ typing-extensions==4.14.0
     # via typing-inspection
 typing-inspection==0.4.1
     # via pydantic
-tzdata==2025.2
-    # via pandas
 urllib3==2.5.0
     # via botocore
     # via requests

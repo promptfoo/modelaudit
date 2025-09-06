@@ -36,21 +36,15 @@ class TestAssetInventoryIntegration:
 
         # Create SafeTensors model with multiple tensors
         safetensors_file = model_dir / "model.safetensors"
-        # Ensure parent directory exists and file doesn't exist
-        safetensors_file.parent.mkdir(parents=True, exist_ok=True)
-        if safetensors_file.exists():
-            safetensors_file.unlink()
+        # Parent dir already exists via model_dir.mkdir(); tmp_path isolation guarantees a clean path.
 
+        # Keep arrays tiny and deterministic to ensure fast, reliable tests
         safetensors_data = {
-            "embedding.weight": np.random.randn(1000, 768).astype(np.float32),
-            "decoder.weight": np.random.randn(768, 50257).astype(np.float32),
-            "layer_norm.bias": np.random.randn(768).astype(np.float32),
+            "embedding.weight": np.zeros((2, 2), dtype=np.float32),
+            "decoder.weight": np.zeros((2, 3), dtype=np.float32),
+            "layer_norm.bias": np.zeros((4,), dtype=np.float32),
         }
-        try:
-            save_file(safetensors_data, str(safetensors_file))
-        except Exception as e:
-            # If safetensors fails, create a dummy file to keep tests working
-            safetensors_file.write_bytes(b"dummy_safetensors_data")
+        save_file(safetensors_data, str(safetensors_file))
 
         # Create JSON config with keys
         config_file = model_dir / "config.json"
@@ -142,10 +136,11 @@ class TestAssetInventoryIntegration:
 
         # Verify nested contents have correct paths
         nested_paths = {c["path"] for c in zip_asset.contents}
+        zip_path = str(Path(complex_model_dir) / "weights.zip")
         expected_nested = {
-            f"{complex_model_dir}/weights.zip:model_state.pkl",
-            f"{complex_model_dir}/weights.zip:optimizer.safetensors",
-            f"{complex_model_dir}/weights.zip:README.txt",
+            f"{zip_path}:model_state.pkl",
+            f"{zip_path}:optimizer.safetensors",
+            f"{zip_path}:README.txt",
         }
         assert expected_nested.issubset(nested_paths)
 
