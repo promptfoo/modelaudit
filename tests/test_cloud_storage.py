@@ -110,13 +110,14 @@ def test_download_missing_dependency(mock_import):
         download_from_cloud("s3://bucket/model.pt")
 
 
+@pytest.mark.asyncio
 @patch("fsspec.filesystem")
-def test_analyze_cloud_target_closes_fs(mock_fs):
+async def test_analyze_cloud_target_closes_fs(mock_fs):
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     mock_fs.return_value = fs
 
-    metadata = asyncio.run(analyze_cloud_target("s3://bucket/model.pt"))
+    metadata = await analyze_cloud_target("s3://bucket/model.pt")
 
     assert metadata["size"] == 1024
     fs.close.assert_called_once()
