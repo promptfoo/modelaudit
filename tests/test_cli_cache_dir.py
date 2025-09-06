@@ -55,99 +55,120 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     def test_huggingface_download_with_cache_dir(
-        self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path
+        self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner
     ):
         """Test HuggingFace download uses smart detection for cache directory."""
-        # Setup mocks
-        mock_is_hf_url.return_value = True
-        mock_download_path = tmp_path / "downloaded_model"
-        mock_download_path.mkdir()
-        mock_download_model.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        import os
+        import tempfile
+        import contextlib
 
-        runner = CliRunner()
+        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Setup mocks
+            mock_is_hf_url.return_value = True
+            mock_download_path = os.path.join(temp_dir, "downloaded_model")
+            os.makedirs(mock_download_path)
+            mock_download_model.return_value = mock_download_path
+            mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
-        # With smart detection, HuggingFace URLs should enable caching automatically
-        result = runner.invoke(cli, ["scan", "hf://test/model"])
+            runner = CliRunner()
 
-        # Verify download was called (smart detection should provide cache_dir)
-        mock_download_model.assert_called_once()
-        call_kwargs = mock_download_model.call_args.kwargs
-        assert "cache_dir" in call_kwargs  # Smart detection should provide cache_dir
-        assert result.exit_code == 0
+            # With smart detection, HuggingFace URLs should enable caching automatically
+            result = runner.invoke(cli, ["scan", "hf://test/model"])
+
+            # Verify download was called (smart detection should provide cache_dir)
+            mock_download_model.assert_called_once()
+            call_kwargs = mock_download_model.call_args.kwargs
+            assert "cache_dir" in call_kwargs  # Smart detection should provide cache_dir
+            assert result.exit_code == 0
 
     @patch("modelaudit.cli.should_show_spinner", return_value=False)
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     def test_cloud_download_with_cache_dir(
-        self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner, tmp_path
+        self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner
     ):
         """Test cloud storage download uses smart detection for cache directory."""
-        # Setup mocks
-        mock_is_cloud_url.return_value = True
-        mock_download_path = tmp_path / "downloaded_model"
-        mock_download_path.mkdir()
-        mock_download_cloud.return_value = mock_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        import os
+        import tempfile
 
-        runner = CliRunner()
+        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Setup mocks
+            mock_is_cloud_url.return_value = True
+            mock_download_path = os.path.join(temp_dir, "downloaded_model")
+            os.makedirs(mock_download_path)
+            mock_download_cloud.return_value = mock_download_path
+            mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
-        # With smart detection, cloud URLs should enable caching automatically
-        result = runner.invoke(cli, ["scan", "s3://bucket/model.pt"])
+            runner = CliRunner()
 
-        # Verify download was called (smart detection should provide cache_dir)
-        mock_download_cloud.assert_called_once()
-        call_kwargs = mock_download_cloud.call_args.kwargs
-        assert "cache_dir" in call_kwargs  # Smart detection should provide cache_dir
-        assert result.exit_code == 0
+            # With smart detection, cloud URLs should enable caching automatically
+            result = runner.invoke(cli, ["scan", "s3://bucket/model.pt"])
+
+            # Verify download was called (smart detection should provide cache_dir)
+            mock_download_cloud.assert_called_once()
+            call_kwargs = mock_download_cloud.call_args.kwargs
+            assert "cache_dir" in call_kwargs  # Smart detection should provide cache_dir
+            assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_no_cleanup_with_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_no_cleanup_with_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model):
         """Test that temporary directories are not cleaned up when using smart detection caching."""
-        # Setup mocks
-        mock_is_hf_url.return_value = True
-        cache_dir = tmp_path / "smart_cache"
-        download_path = cache_dir / "model"
-        download_path.mkdir(parents=True)
-        mock_download_model.return_value = download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        import os
+        import tempfile
 
-        runner = CliRunner()
+        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Setup mocks
+            mock_is_hf_url.return_value = True
+            cache_dir = os.path.join(temp_dir, "smart_cache")
+            download_path = os.path.join(cache_dir, "model")
+            os.makedirs(download_path)
+            mock_download_model.return_value = download_path
+            mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
-        # With smart detection, HuggingFace URLs enable caching by default (no cleanup)
-        result = runner.invoke(cli, ["scan", "hf://test/model"])
+            runner = CliRunner()
 
-        # Verify cleanup was NOT called since smart detection enables caching
-        mock_rmtree.assert_not_called()
-        assert result.exit_code == 0
+            # With smart detection, HuggingFace URLs enable caching by default (no cleanup)
+            result = runner.invoke(cli, ["scan", "hf://test/model"])
+
+            # Verify cleanup was NOT called since smart detection enables caching
+            mock_rmtree.assert_not_called()
+            assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_cleanup_without_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_cleanup_without_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model):
         """Test that temporary directories ARE cleaned up when NOT using --cache-dir."""
-        # Setup mocks
-        mock_is_hf_url.return_value = True
-        temp_download_path = tmp_path / "temp_model"
-        temp_download_path.mkdir()
-        mock_download_model.return_value = temp_download_path
-        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+        import os
+        import tempfile
 
-        runner = CliRunner()
+        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Setup mocks
+            mock_is_hf_url.return_value = True
+            temp_download_path = os.path.join(temp_dir, "temp_model")
+            os.makedirs(temp_download_path)
+            mock_download_model.return_value = temp_download_path
+            mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
 
-        result = runner.invoke(
-            cli,
-            ["scan", "--no-cache", "hf://test/model"],  # No --cache-dir option, disable caching
-        )
+            runner = CliRunner()
 
-        # Verify cleanup WAS called since we didn't use a cache directory
-        mock_rmtree.assert_called_once_with(str(temp_download_path))
-        assert result.exit_code == 0
+            result = runner.invoke(
+                cli,
+                ["scan", "--no-cache", "hf://test/model"],  # No --cache-dir option, disable caching
+            )
+
+            # Verify cleanup WAS called since we didn't use a cache directory
+            mock_rmtree.assert_called_once_with(temp_download_path)
+            assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")

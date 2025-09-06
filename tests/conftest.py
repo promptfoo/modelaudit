@@ -63,9 +63,26 @@ def sample_results():
 
 
 @pytest.fixture
-def temp_model_dir(tmp_path):
+def safe_tmp_path():
+    """Create a temporary directory that works reliably in CI environments.
+    
+    This replaces pytest's tmp_path fixture which has race conditions in CI.
+    """
+    import tempfile
+    import shutil
+    from pathlib import Path
+    
+    temp_path = tempfile.mkdtemp()
+    try:
+        yield Path(temp_path)
+    finally:
+        shutil.rmtree(temp_path, ignore_errors=True)
+
+
+@pytest.fixture
+def temp_model_dir(safe_tmp_path):
     """Create a temporary directory with various model files for testing."""
-    model_dir = tmp_path / "models"
+    model_dir = safe_tmp_path / "models"
     model_dir.mkdir()
 
     # Create a real pickle file
