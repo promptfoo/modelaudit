@@ -1045,7 +1045,7 @@ def test_exit_code_security_issues():
                 os.unlink(temp_file.name)
 
 
-def test_exit_code_scan_errors(tmp_path):
+def test_exit_code_scan_errors():
     """Test exit code 2 when errors occur during scanning."""
     runner = CliRunner()
 
