@@ -347,19 +347,29 @@ class TestIntegration:
             assert result.metadata.get("truncated") is True
             assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
 
-    def test_backward_compatibility(self, tmp_path):
+    def test_backward_compatibility(self):
         """Test that regular pickle scanning still works unchanged."""
-        regular_pickle = tmp_path / "regular.pkl"
+        import os
+        import tempfile
 
-        with open(regular_pickle, "wb") as f:
-            pickle.dump({"normal": "data"}, f)
+        # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
+            try:
+                pickle.dump({"normal": "data"}, temp_file)
+                temp_file.flush()
 
-        scanner = PickleScanner()
-        result = scanner.scan(str(regular_pickle))
+                scanner = PickleScanner()
+                result = scanner.scan(temp_file.name)
 
-        # Should work normally
-        assert result.success is True
-        assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
+                # Should work normally
+                assert result.success is True
+                assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
+            finally:
+                # Clean up the temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except OSError:
+                    pass
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""

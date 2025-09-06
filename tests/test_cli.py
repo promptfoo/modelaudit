@@ -980,30 +980,40 @@ def test_format_text_output_very_fast_scan_with_issues():
     assert "warning" in output.lower()
 
 
-def test_exit_code_clean_scan(tmp_path):
+def test_exit_code_clean_scan():
     """Test exit code 0 when scan is clean with no issues."""
+    import os
     import pickle
+    import tempfile
 
     from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
-    # Create a clean pickle file that should have no security issues
-    test_file = tmp_path / "clean_model.pkl"
-    data = {
-        "weights": [1.0, 2.0, 3.0],
-        "biases": [0.1, 0.2, 0.3],
-        "model_name": "clean_model",
-    }
-    with (test_file).open("wb") as f:
-        pickle.dump(data, f)
+    # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
+        try:
+            # Create a clean pickle file that should have no security issues
+            data = {
+                "weights": [1.0, 2.0, 3.0],
+                "biases": [0.1, 0.2, 0.3],
+                "model_name": "clean_model",
+            }
+            pickle.dump(data, temp_file)
+            temp_file.flush()
 
-    # Test the core scanning functionality directly to avoid CLI hanging issues
-    result = scan_model_directory_or_file(str(test_file))
-    exit_code = determine_exit_code(result)
+            # Test the core scanning functionality directly to avoid CLI hanging issues
+            result = scan_model_directory_or_file(temp_file.name)
+            exit_code = determine_exit_code(result)
 
-    # Should exit with code 0 for clean scan
-    assert exit_code == 0, f"Expected exit code 0, got {exit_code}. Issues: {result.issues}"
-    assert result.success is True
-    assert result.files_scanned == 1
+            # Should exit with code 0 for clean scan
+            assert exit_code == 0, f"Expected exit code 0, got {exit_code}. Issues: {result.issues}"
+            assert result.success is True
+            assert result.files_scanned == 1
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_file.name)
+            except OSError:
+                pass
 
 
 def test_exit_code_security_issues(tmp_path):
