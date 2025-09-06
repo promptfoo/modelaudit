@@ -1,6 +1,6 @@
 # ModelAudit
 
-Static security scanner for AI/ML model files. Detects malicious code, unsafe operations, and embedded secrets without loading or executing models.
+Static security scanner for AI/ML model files. Detects malicious code, dangerous deserialization, risky module usage, and embedded secrets without loading or executing models.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
@@ -72,7 +72,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes 29 specialized scanners for ML model formats:
+ModelAudit includes 29 specialized scanners for ML model formats ([see complete list](https://www.promptfoo.dev/docs/model-audit/scanners/)):
 
 | Format          | Extensions                                | Security Focus                       |
 | --------------- | ----------------------------------------- | ------------------------------------ |
@@ -131,6 +131,7 @@ modelaudit https://huggingface.co/gpt2
 # Cloud storage
 modelaudit s3://bucket/model.pt
 modelaudit gs://bucket/models/
+modelaudit https://account.blob.core.windows.net/container/model.pt
 
 # MLflow registry
 modelaudit models:/MyModel/Production
@@ -214,7 +215,7 @@ pip install modelaudit[all-ci]
 
 ```bash
 docker pull ghcr.io/promptfoo/modelaudit:latest
-docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
+docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 ## Output Formats
