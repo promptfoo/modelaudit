@@ -54,9 +54,7 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_huggingface_download_with_cache_dir(
-        self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner
-    ):
+    def test_huggingface_download_with_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner):
         """Test HuggingFace download uses smart detection for cache directory."""
         import os
         import tempfile
@@ -85,9 +83,7 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cloud_download_with_cache_dir(
-        self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner
-    ):
+    def test_cloud_download_with_cache_dir(self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner):
         """Test cloud storage download uses smart detection for cache directory."""
         import os
         import tempfile
