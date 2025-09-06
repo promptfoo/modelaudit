@@ -14,13 +14,16 @@ from modelaudit.utils.code_validation import (
 from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-# Try to import h5py, but handle the case where it's not installed
-try:
-    import h5py
-
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
+def _import_h5py():
+    """Lazy import of h5py library to avoid loading at module level."""
+    global HAS_H5PY, h5py
+    if 'HAS_H5PY' not in globals():
+        try:
+            import h5py as h5py_temp
+            globals()['h5py'] = h5py_temp
+            globals()['HAS_H5PY'] = True
+        except ImportError:
+            globals()['HAS_H5PY'] = False
 
 
 class KerasH5Scanner(BaseScanner):
@@ -44,14 +47,17 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not HAS_H5PY:
-            return False
-
+        # First check file type WITHOUT importing h5py
         if not os.path.isfile(path):
             return False
 
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
+            return False
+
+        # Only import h5py if file extension matches
+        _import_h5py()
+        if not HAS_H5PY:
             return False
 
         # Try to open as HDF5 file
@@ -75,6 +81,9 @@ class KerasH5Scanner(BaseScanner):
         if size_check:
             return size_check
 
+        # Ensure h5py is imported
+        _import_h5py()
+        
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()

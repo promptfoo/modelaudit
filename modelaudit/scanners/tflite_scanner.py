@@ -3,12 +3,16 @@ from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-try:
-    import tflite
-
-    HAS_TFLITE = True
-except Exception:  # pragma: no cover - optional dependency
-    HAS_TFLITE = False
+def _import_tflite():
+    """Lazy import of tflite library to avoid loading at module level."""
+    global HAS_TFLITE, tflite
+    if 'HAS_TFLITE' not in globals():
+        try:
+            import tflite as tflite_temp
+            globals()['tflite'] = tflite_temp
+            globals()['HAS_TFLITE'] = True
+        except Exception:  # pragma: no cover - optional dependency
+            globals()['HAS_TFLITE'] = False
 
 # Thresholds to detect potential overflow or malicious sizes
 _MAX_COUNT = 1_000_000
@@ -24,9 +28,16 @@ class TFLiteScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_TFLITE:
+        # First check file type WITHOUT importing tflite
+        if not os.path.isfile(path):
             return False
-        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        
+        # Only import tflite if file extension matches
+        _import_tflite()
+        return HAS_TFLITE
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -36,6 +47,9 @@ class TFLiteScanner(BaseScanner):
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
+        # Ensure tflite is imported
+        _import_tflite()
+        
         if not HAS_TFLITE:
             result.add_check(
                 name="TFLite Library Check",

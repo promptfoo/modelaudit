@@ -68,18 +68,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        _import_tensorflow()  # Lazy import
-        if not HAS_TENSORFLOW:
-            return False
-
+        # First check file type WITHOUT importing TensorFlow
         if os.path.isfile(path):
             # Handle any .pb file (protobuf format)
             ext = os.path.splitext(path)[1].lower()
-            return ext == ".pb"
-        if os.path.isdir(path):
+            if ext != ".pb":
+                return False
+        elif os.path.isdir(path):
             # For directory, check if saved_model.pb exists
-            return os.path.exists(os.path.join(path, "saved_model.pb"))
-        return False
+            if not os.path.exists(os.path.join(path, "saved_model.pb")):
+                return False
+        else:
+            return False
+        
+        # Only import TensorFlow if file looks like it could be a TF model
+        _import_tensorflow()  # Lazy import
+        return HAS_TENSORFLOW
 
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""

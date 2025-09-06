@@ -3,12 +3,16 @@ from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-try:  # pragma: no cover - optional dependency
-    from coremltools.proto import Model_pb2
-
-    HAS_COREML = True
-except Exception:  # pragma: no cover - optional dependency
-    HAS_COREML = False
+def _import_coreml():
+    """Lazy import of coreml library to avoid loading at module level."""
+    global HAS_COREML, Model_pb2
+    if 'HAS_COREML' not in globals():
+        try:  # pragma: no cover - optional dependency
+            from coremltools.proto import Model_pb2 as Model_pb2_temp
+            globals()['Model_pb2'] = Model_pb2_temp
+            globals()['HAS_COREML'] = True
+        except Exception:  # pragma: no cover - optional dependency
+            globals()['HAS_COREML'] = False
 
 
 class CoreMLScanner(BaseScanner):
@@ -20,9 +24,16 @@ class CoreMLScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_COREML:
+        # First check file type WITHOUT importing coreml
+        if not os.path.isfile(path):
             return False
-        return os.path.isfile(path) and os.path.splitext(path)[1].lower() in cls.supported_extensions
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        
+        # Only import coreml if file extension matches
+        _import_coreml()
+        return HAS_COREML
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -36,6 +47,9 @@ class CoreMLScanner(BaseScanner):
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
+        # Ensure coreml is imported
+        _import_coreml()
+        
         if not HAS_COREML:
             result.add_check(
                 name="CoreML Library Check",

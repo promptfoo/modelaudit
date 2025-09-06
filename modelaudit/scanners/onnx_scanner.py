@@ -20,15 +20,21 @@ def _get_onnx_mapping() -> Any:
     return None
 
 
-try:
-    import numpy as np
-    import onnx
-
-    mapping = _get_onnx_mapping()
-    HAS_ONNX = True
-except Exception:
-    HAS_ONNX = False
-    mapping = None
+def _import_onnx():
+    """Lazy import of ONNX libraries to avoid loading at module level."""
+    global HAS_ONNX, np, onnx, mapping
+    if 'HAS_ONNX' not in globals():
+        try:
+            import numpy as np_temp
+            import onnx as onnx_temp
+            
+            globals()['np'] = np_temp
+            globals()['onnx'] = onnx_temp
+            globals()['mapping'] = _get_onnx_mapping()
+            globals()['HAS_ONNX'] = True
+        except Exception:
+            globals()['HAS_ONNX'] = False
+            globals()['mapping'] = None
 
 
 class OnnxScanner(BaseScanner):
@@ -40,11 +46,16 @@ class OnnxScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_ONNX:
-            return False
+        # First check file type WITHOUT importing ONNX libraries
         if not os.path.isfile(path):
             return False
-        return os.path.splitext(path)[1].lower() in cls.supported_extensions
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+        
+        # Only import ONNX if file extension matches
+        _import_onnx()
+        return HAS_ONNX
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -63,6 +74,9 @@ class OnnxScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
+        # Ensure ONNX libraries are imported
+        _import_onnx()
+        
         if not HAS_ONNX:
             result.add_check(
                 name="ONNX Library Check",

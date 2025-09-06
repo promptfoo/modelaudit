@@ -81,8 +81,11 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
-            _import_tensorflow()  # Lazy import
-            return HAS_TENSORFLOW and os.path.exists(os.path.join(path, "saved_model.pb"))
+            # Check if it looks like a TensorFlow SavedModel before importing TensorFlow
+            if not os.path.exists(os.path.join(path, "saved_model.pb")):
+                return False
+            _import_tensorflow()  # Lazy import only if directory structure matches
+            return HAS_TENSORFLOW
 
         if not os.path.isfile(path):
             return False
@@ -103,6 +106,7 @@ class WeightDistributionScanner(BaseScanner):
         if ext in [".h5", ".keras", ".hdf5"] and not HAS_H5PY:
             return False
         if ext == ".pb":
+            # Only import TensorFlow for .pb files
             _import_tensorflow()  # Lazy import
             return HAS_TENSORFLOW
         return True
