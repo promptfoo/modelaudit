@@ -90,7 +90,7 @@ def exponential_backoff(
         # All retries exhausted
         raise RetryError(
             f"Failed after {max_retries + 1} attempts: {getattr(func, '__name__', 'unknown')}",
-            last_error=last_exception
+            last_error=last_exception,
         )
 
     return wrapper

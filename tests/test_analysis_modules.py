@@ -1,4 +1,5 @@
 """Basic tests for analysis modules."""
+
 from pathlib import Path
 
 

@@ -10,6 +10,7 @@ try:
     # Try to import exceptions module - not available in all msgpack versions
     try:
         from msgpack import exceptions as msgpack_exceptions
+
         HAS_MSGPACK_EXCEPTIONS = True
     except (ImportError, AttributeError):
         msgpack_exceptions = None  # type: ignore[assignment]
@@ -841,9 +842,12 @@ class FlaxMsgpackScanner(BaseScanner):
             except Exception as e:
                 # Check if this is the specific ExtraData exception we're looking for
                 extra_data_detected = False
-                if (HAS_MSGPACK_EXCEPTIONS and msgpack_exceptions and
-                    hasattr(msgpack_exceptions, "ExtraData") and
-                    isinstance(e, msgpack_exceptions.ExtraData)):
+                if (
+                    HAS_MSGPACK_EXCEPTIONS
+                    and msgpack_exceptions
+                    and hasattr(msgpack_exceptions, "ExtraData")
+                    and isinstance(e, msgpack_exceptions.ExtraData)
+                ):
                     extra_data_detected = True
 
                 if extra_data_detected:
