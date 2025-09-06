@@ -214,7 +214,7 @@ python_version = "3.10"
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
 warn_unused_configs = true     # Warn about unused config options
-warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_unused_ignores = false    # Allow type: ignore comments for multiple tools (ty, mypy)
 warn_redundant_casts = true    # Remove unnecessary casts
 warn_unreachable = true        # Detect unreachable code
 no_implicit_optional = true    # Require Optional[] for None defaults
