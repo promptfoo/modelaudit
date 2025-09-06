@@ -116,6 +116,15 @@ def test_max_total_size(safe_tmp_path):
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
 
+    # Ensure files are fully written and flushed to disk
+    import time
+    time.sleep(0.1)
+    
+    # Verify all files exist and have expected content
+    assert file1.exists() and file1.stat().st_size > 0
+    assert file2.exists() and file2.stat().st_size > 0  
+    assert file3.exists() and file3.stat().st_size > 0
+
     results = scan_model_directory_or_file(str(safe_tmp_path), max_total_size=150)
 
     assert results.success is True
