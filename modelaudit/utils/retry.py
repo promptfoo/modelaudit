@@ -75,7 +75,8 @@ def exponential_backoff(
 
                 # Log retry attempt
                 logger.debug(
-                    f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {delay:.1f} seconds..."
+                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {e}. "
+                    f"Retrying in {delay:.1f} seconds..."
                 )
 
                 if verbose:
@@ -87,7 +88,10 @@ def exponential_backoff(
                 time.sleep(delay)
 
         # All retries exhausted
-        raise RetryError(f"Failed after {max_retries + 1} attempts: {func.__name__}", last_error=last_exception)
+        raise RetryError(
+            f"Failed after {max_retries + 1} attempts: {getattr(func, '__name__', 'unknown')}",
+            last_error=last_exception
+        )
 
     return wrapper
 
@@ -179,7 +183,7 @@ def retry_cloud_operation(
     try:
         import fsspec
 
-        retry_exceptions = (*retry_exceptions, fsspec.exceptions.FSTimeoutError)
+        retry_exceptions = (*retry_exceptions, fsspec.exceptions.FSTimeoutError)  # type: ignore[attr-defined]
     except (ImportError, AttributeError):
         pass
 

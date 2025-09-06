@@ -189,7 +189,7 @@ class TestOpcodePattern:
         assert pattern.name == "test"
         assert pattern.opcodes == ["GLOBAL", "REDUCE"]
         assert pattern.severity == "critical"
-        assert "CVE-2019-16935" in pattern.cve_references
+        assert pattern.cve_references is not None and "CVE-2019-16935" in pattern.cve_references
 
     def test_pattern_matching(self):
         """Test pattern matching method."""

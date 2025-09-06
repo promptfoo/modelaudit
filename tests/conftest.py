@@ -105,8 +105,8 @@ def mock_progress_callback():
         progress_percentages.append(percentage)
 
     # Add the recorded messages and percentages as attributes
-    progress_callback.messages = progress_messages
-    progress_callback.percentages = progress_percentages
+    progress_callback.messages = progress_messages  # type: ignore[attr-defined]
+    progress_callback.percentages = progress_percentages  # type: ignore[attr-defined]
 
     return progress_callback
 
