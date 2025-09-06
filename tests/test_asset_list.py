@@ -114,9 +114,9 @@ def test_assets_nested_zip_with_models(safe_tmp_path: Path) -> None:
     """Test that nested ZIP files with model files show proper asset structure."""
     # Create zip file atomically - guaranteed to be complete when this returns
     from .test_helpers import prepare_test_scenario_nested_zip
-    
+
     zip_path = prepare_test_scenario_nested_zip(safe_tmp_path)
-    
+
     # Zip file is guaranteed to exist and be complete at this point
     results = scan_model_directory_or_file(str(zip_path))
     zip_asset = results.assets[0]

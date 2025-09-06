@@ -106,7 +106,7 @@ def test_max_total_size(safe_tmp_path):
 
     # Create test files atomically - they're guaranteed to be complete when this returns
     created_files = prepare_test_scenario_max_total_size(safe_tmp_path)
-    
+
     # All files are guaranteed to exist and be complete at this point
     results = scan_model_directory_or_file(str(safe_tmp_path), max_total_size=150)
 
