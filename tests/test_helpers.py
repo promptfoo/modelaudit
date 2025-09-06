@@ -7,7 +7,7 @@ import pickle
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Union
+from typing import Any, Callable
 
 
 def create_pickle_file_atomically(target_path: Path, data: Any) -> None:
@@ -94,7 +94,7 @@ def atomic_test_files(base_path: Path, file_specs: list[dict[str, Any]]):
             file_path.unlink(missing_ok=True)
 
 
-def create_generic_file_atomically(target_path: Path, content: Union[str, bytes], mode: str = "wb") -> None:
+def create_generic_file_atomically(target_path: Path, content: str | bytes, mode: str = "wb") -> None:
     """Create any file atomically with given content."""
     temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
     try:

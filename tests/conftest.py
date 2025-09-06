@@ -68,10 +68,6 @@ def safe_tmp_path():
 
     This replaces pytest's tmp_path fixture which has race conditions in CI.
     """
-    import shutil
-    import tempfile
-    from pathlib import Path
-
     temp_path = tempfile.mkdtemp()
     try:
         yield Path(temp_path)
