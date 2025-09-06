@@ -114,17 +114,18 @@ def prepare_test_scenario_max_total_size(base_path: Path) -> dict[str, Path]:
     Prepare the test scenario for max_total_size test.
     Returns paths to all created files when they're guaranteed to be complete.
     """
-    file_specs = [
+    file_specs: list[dict[str, Any]] = [
         {"name": "a.pkl", "data": {"data": "x" * 100}},
         {"name": "b.pkl", "data": {"data": "y" * 100}},
         {"name": "c.pkl", "data": {"data": "z" * 100}},
     ]
 
-    created_files = {}
+    created_files: dict[str, Path] = {}
     for spec in file_specs:
-        file_path = base_path / spec["name"]
+        name: str = spec["name"]
+        file_path = base_path / name
         create_pickle_file_atomically(file_path, spec["data"])
-        created_files[spec["name"]] = file_path
+        created_files[name] = file_path
 
     return created_files
 
