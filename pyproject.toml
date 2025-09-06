@@ -192,7 +192,8 @@ addopts = [
     "--strict-config",
     "--disable-warnings",
     "--tb=short",
-    "--dist=loadgroup",  # More conservative parallel execution
+    "--maxfail=1",       # Stop on first failure for faster feedback
+    "-x",                # Stop on first failure immediately
 ]
 testpaths = ["tests"]
 # Asyncio configuration temporarily disabled to fix CI hanging issues
@@ -209,6 +210,9 @@ markers = [
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
+    "ignore::ResourceWarning",
+    "ignore::UserWarning:tensorboard",
+    "ignore::FutureWarning:tensorflow",
 ]
 
 [tool.mypy]
