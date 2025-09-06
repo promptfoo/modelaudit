@@ -72,7 +72,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes 32 specialized scanners for ML model formats:
+ModelAudit includes 29 specialized scanners for ML model formats:
 
 | Format          | Extensions                                | Security Focus                       |
 | --------------- | ----------------------------------------- | ------------------------------------ |
@@ -87,7 +87,7 @@ ModelAudit includes 32 specialized scanners for ML model formats:
 | **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`             | Serialized transforms                |
 | **NumPy**       | `.npy`, `.npz`                            | Array metadata, pickle objects       |
 | **Core ML**     | `.mlmodel`                                | Custom layers, metadata              |
-| **Executorch**  | `.ptl`, `.pte`                            | Mobile model validation              |
+| **ExecuTorch**  | `.ptl`, `.pte`                            | Mobile model validation              |
 
 Plus scanners for TensorFlow Lite, TensorRT, PaddlePaddle, OpenVINO, text files, and configuration formats.
 
@@ -124,7 +124,7 @@ NO_COLOR=1 modelaudit models/
 ### Remote Sources
 
 ```bash
-# HuggingFace models
+# Hugging Face models
 modelaudit hf://microsoft/DialoGPT-medium
 modelaudit https://huggingface.co/gpt2
 
@@ -147,7 +147,7 @@ modelaudit https://company.jfrog.io/repo/model.pt
 - `--quiet` - Minimal output
 - `--strict` - Fail on warnings, scan all files
 - `--timeout` - Override scan timeout
-- `--max-size` - Set size limits (e.g., 10GB)
+- `--max-size` - Set size limits (e.g., 10 GB)
 - `--dry-run` - Preview without scanning
 - `--progress` - Force progress display
 - `--sbom` - Generate CycloneDX SBOM
@@ -197,7 +197,7 @@ pip install modelaudit[cloud]       # S3, GCS, Azure storage
 pip install modelaudit[coreml]      # Apple Core ML
 pip install modelaudit[flax]        # JAX/Flax models
 pip install modelaudit[mlflow]      # MLflow registry
-pip install modelaudit[huggingface] # HuggingFace integration
+pip install modelaudit[huggingface] # Hugging Face integration
 ```
 
 **Compatibility:**
@@ -287,6 +287,17 @@ export JFROG_API_TOKEN=your_token
 
 # MLflow
 export MLFLOW_TRACKING_URI=http://localhost:5000
+
+# AWS S3
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+# Optional: AWS_SESSION_TOKEN or AWS_PROFILE
+
+# Google Cloud Storage
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+
+# Hugging Face
+export HF_TOKEN=your_token
 ```
 
 ## Documentation
