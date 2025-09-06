@@ -112,31 +112,12 @@ def test_assets_pickle_file(safe_tmp_path: Path) -> None:
 
 def test_assets_nested_zip_with_models(safe_tmp_path: Path) -> None:
     """Test that nested ZIP files with model files show proper asset structure."""
-    # Create a SafeTensors file to put in the ZIP
-    safetensors_data = {"weight": np.array([1.0, 2.0, 3.0]).astype(np.float32)}
-    inner_st_path = safe_tmp_path / "temp.safetensors"
-    save_file(safetensors_data, str(inner_st_path))
-
-    # Create ZIP with the SafeTensors file
-    zip_path = safe_tmp_path / "models.zip"
-    with zipfile.ZipFile(zip_path, "w") as z:
-        z.write(inner_st_path, "model.safetensors")
-        # Use a config.json filename that will be recognized by ManifestScanner
-        z.writestr("config.json", '{"model_type": "test", "hidden_size": 768}')
-
-    # Clean up temp file
-    inner_st_path.unlink()
-
-    # Ensure zip file is fully written to disk before scanning
-    import time
-
-    # Verify zip file exists and has content
-    assert zip_path.exists(), f"Zip file {zip_path} does not exist"
-    assert zip_path.stat().st_size > 0, f"Zip file {zip_path} is empty"
-
-    # Small delay to ensure filesystem operations complete
-    time.sleep(0.1)
-
+    # Create zip file atomically - guaranteed to be complete when this returns
+    from .test_helpers import prepare_test_scenario_nested_zip
+    
+    zip_path = prepare_test_scenario_nested_zip(safe_tmp_path)
+    
+    # Zip file is guaranteed to exist and be complete at this point
     results = scan_model_directory_or_file(str(zip_path))
     zip_asset = results.assets[0]
 

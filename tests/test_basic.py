@@ -102,39 +102,12 @@ def test_max_file_size(safe_tmp_path):
 
 def test_max_total_size(safe_tmp_path):
     """Test max_total_size parameter."""
-    import os
-    import pickle
-    import time
+    from .test_helpers import prepare_test_scenario_max_total_size
 
-    file1 = safe_tmp_path / "a.pkl"
-    with file1.open("wb") as f:
-        pickle.dump({"data": "x" * 100}, f)
-        f.flush()
-        os.fsync(f.fileno())
-
-    file2 = safe_tmp_path / "b.pkl"
-    with file2.open("wb") as f:
-        pickle.dump({"data": "y" * 100}, f)
-        f.flush()
-        os.fsync(f.fileno())
-
-    file3 = safe_tmp_path / "c.pkl"
-    with file3.open("wb") as f:
-        pickle.dump({"data": "z" * 100}, f)
-        f.flush()
-        os.fsync(f.fileno())
-
-    # Give time for filesystem operations to complete
-    time.sleep(0.1)
-
-    # Verify all files exist and have expected content
-    assert file1.exists(), f"File {file1} does not exist"
-    assert file1.stat().st_size > 0, f"File {file1} is empty"
-    assert file2.exists(), f"File {file2} does not exist"
-    assert file2.stat().st_size > 0, f"File {file2} is empty"
-    assert file3.exists(), f"File {file3} does not exist"
-    assert file3.stat().st_size > 0, f"File {file3} is empty"
-
+    # Create test files atomically - they're guaranteed to be complete when this returns
+    created_files = prepare_test_scenario_max_total_size(safe_tmp_path)
+    
+    # All files are guaranteed to exist and be complete at this point
     results = scan_model_directory_or_file(str(safe_tmp_path), max_total_size=150)
 
     assert results.success is True
