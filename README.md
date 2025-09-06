@@ -304,8 +304,8 @@ export HF_TOKEN=your_token
 ## Documentation
 
 - **Documentation**: [promptfoo.dev/docs/model-audit/](https://www.promptfoo.dev/docs/model-audit/)
-- **Troubleshooting**: [promptfoo.dev/docs/model-audit/troubleshooting/](https://www.promptfoo.dev/docs/model-audit/troubleshooting/)
-- **Issues**: [github.com/promptfoo/modelaudit/issues](https://github.com/promptfoo/modelaudit/issues)
+- **Usage Examples**: [promptfoo.dev/docs/model-audit/usage/](https://www.promptfoo.dev/docs/model-audit/usage/)
+- **Report Issues**: Contact support at [promptfoo.dev](https://www.promptfoo.dev/)
 
 ## 📝 License
 
