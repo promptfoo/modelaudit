@@ -29,7 +29,7 @@ modelaudit model.pkl --format json --output results.json
 
 **Example output:**
 
-```
+```text
 $ modelaudit suspicious_model.pkl
 
 ✓ Scanning suspicious_model.pkl
@@ -46,25 +46,25 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Security Checks
 
-**Code Execution Detection**
+### Code Execution Detection
 
 - Dangerous Python modules: `os`, `sys`, `subprocess`, `eval`, `exec`
-- Pickle opcodes: `REDUCE`, `GLOBAL`, `INST`, `OBJ`, `NEWOBJ`
+- Pickle opcodes: `REDUCE`, `GLOBAL`, `INST`, `OBJ`, `NEWOBJ`, `STACK_GLOBAL`, `BUILD`, `NEWOBJ_EX`
 - Binary executable signatures and shellcode patterns
 
-**Embedded Data Extraction**
+### Embedded Data Extraction
 
 - API keys, tokens, and credentials in model weights/metadata
 - URLs, IP addresses, and network endpoints
 - Suspicious configuration properties
 
-**Archive Security**
+### Archive Security
 
 - Path traversal attacks in ZIP/TAR archives
 - Executable files within model packages
 - Malicious filenames and directory structures
 
-**ML Framework Analysis**
+### ML Framework Analysis
 
 - TensorFlow operations: `PyFunc`, `PyFuncStateless`
 - Keras unsafe layers and custom objects
@@ -95,7 +95,7 @@ Plus scanners for TensorFlow Lite, TensorRT, PaddlePaddle, OpenVINO, text files,
 
 ## Usage Examples
 
-**Basic Scanning**
+### Basic Scanning
 
 ```bash
 # Scan single file
@@ -108,7 +108,7 @@ modelaudit ./models/
 modelaudit model.pkl --strict
 ```
 
-**CI/CD Integration**
+### CI/CD Integration
 
 ```bash
 # JSON output for automation
@@ -121,7 +121,7 @@ modelaudit model.pkl --sbom compliance_report.json
 NO_COLOR=1 modelaudit models/
 ```
 
-**Remote Sources**
+### Remote Sources
 
 ```bash
 # HuggingFace models
@@ -139,7 +139,7 @@ modelaudit models:/MyModel/Production
 modelaudit https://company.jfrog.io/repo/model.pt
 ```
 
-**Command Options**
+### Command Options
 
 - `--format` - Output format: text, json, sarif
 - `--output` - Write results to file
@@ -154,7 +154,7 @@ modelaudit https://company.jfrog.io/repo/model.pt
 - `--blacklist` - Additional patterns to flag
 - `--no-cache` - Disable result caching
 
-**Exit Codes**
+### Exit Codes
 
 - `0` - No security issues found
 - `1` - Security issues detected
@@ -219,9 +219,9 @@ docker run --rm -v $(pwd):/data ghcr.io/promptfoo/modelaudit:latest model.pkl
 
 ## Output Formats
 
-**Text (default):**
+### Text (default)
 
-```
+```text
 $ modelaudit model.pkl
 
 ✓ Scanning model.pkl
@@ -231,7 +231,7 @@ Files scanned: 1 | Issues found: 1 critical
    Why: Contains os.system() call that could run arbitrary commands
 ```
 
-**JSON (for automation):**
+### JSON (for automation)
 
 ```bash
 modelaudit model.pkl --format json
@@ -250,7 +250,7 @@ modelaudit model.pkl --format json
 }
 ```
 
-**SARIF (for security tools):**
+### SARIF (for security tools)
 
 ```bash
 modelaudit model.pkl --format sarif --output results.sarif
@@ -258,20 +258,20 @@ modelaudit model.pkl --format sarif --output results.sarif
 
 ## Troubleshooting
 
-**Check scanner availability:**
+### Check scanner availability
 
 ```bash
 modelaudit doctor --show-failed
 ```
 
-**NumPy compatibility issues:**
+### NumPy compatibility issues
 
 ```bash
 # Use NumPy 1.x compatibility mode
 pip install modelaudit[numpy1]
 ```
 
-**Missing dependencies:**
+### Missing dependencies
 
 ```bash
 # ModelAudit shows exactly what to install
@@ -279,7 +279,7 @@ modelaudit your-model.onnx
 # Output: "Install with 'pip install modelaudit[onnx]'"
 ```
 
-**Authentication:**
+### Authentication
 
 ```bash
 # JFrog Artifactory
