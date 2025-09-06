@@ -118,6 +118,7 @@ def test_max_total_size(safe_tmp_path):
 
     # Ensure files are fully written and flushed to disk
     import time
+
     time.sleep(0.1)
 
     # Verify all files exist and have expected content
