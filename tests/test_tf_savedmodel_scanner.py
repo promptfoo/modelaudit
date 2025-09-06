@@ -3,11 +3,10 @@ import pickle
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner, _import_tensorflow
+from modelaudit.scanners.tf_savedmodel_scanner import HAS_TENSORFLOW, TensorFlowSavedModelScanner, _import_tensorflow
 
 # Initialize TensorFlow detection at module level
 _import_tensorflow()
-from modelaudit.scanners.tf_savedmodel_scanner import HAS_TENSORFLOW
 
 
 def test_tf_savedmodel_scanner_can_handle(safe_tmp_path):
