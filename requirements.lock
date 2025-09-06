@@ -251,7 +251,7 @@ s3fs==2025.5.1
     # via modelaudit
 safetensors==0.6.2
     # via modelaudit
-scikit-learn==1.7.1
+scikit-learn==1.5.2
     # via modelaudit
 scipy==1.16.0
     # via modelaudit
