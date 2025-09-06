@@ -136,7 +136,7 @@ def prepare_test_scenario_nested_zip(base_path: Path) -> Path:
     Returns path to zip file when it's guaranteed to be complete.
     """
     temp_st_path = base_path / "temp.safetensors"
-    
+
     try:
         import numpy as np
         from safetensors.numpy import save_file
@@ -160,7 +160,7 @@ def prepare_test_scenario_nested_zip(base_path: Path) -> Path:
 
         create_zip_file_atomically(zip_path, add_zip_content)
         return zip_path
-    
+
     finally:
         # Always clean up temp file, regardless of what happens
         temp_st_path.unlink(missing_ok=True)
