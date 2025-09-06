@@ -28,10 +28,10 @@ class TestSecureFileHasher:
         hasher = SecureFileHasher(threshold)
         assert hasher.full_hash_threshold == threshold
 
-    def test_hash_small_file_secure_method(self, tmp_path):
+    def test_hash_small_file_secure_method(self, safe_tmp_path):
         """Test hashing of small files uses secure method."""
         # Create test file < 2GB
-        test_file = tmp_path / "small_test.bin"
+        test_file = safe_tmp_path / "small_test.bin"
         test_content = b"Hello, ModelAudit!" * 1000  # ~18KB
         test_file.write_bytes(test_content)
 
@@ -42,10 +42,10 @@ class TestSecureFileHasher:
         assert result.startswith("secure:")
         assert len(result.split(":")[1]) == 64  # Blake2b 256-bit = 64 hex chars
 
-    def test_hash_large_file_fingerprint_method(self, tmp_path):
+    def test_hash_large_file_fingerprint_method(self, safe_tmp_path):
         """Test hashing of large files uses fingerprint method."""
         # Create test file > 2GB threshold by setting low threshold
-        test_file = tmp_path / "large_test.bin"
+        test_file = safe_tmp_path / "large_test.bin"
         test_content = b"A" * 1024 * 1024  # 1MB
         test_file.write_bytes(test_content)
 
@@ -64,9 +64,9 @@ class TestSecureFileHasher:
         with pytest.raises(ValueError, match="File does not exist"):
             hasher.hash_file("/nonexistent/file.bin")
 
-    def test_hash_empty_file(self, tmp_path):
+    def test_hash_empty_file(self, safe_tmp_path):
         """Test hashing empty file raises ValueError."""
-        empty_file = tmp_path / "empty.bin"
+        empty_file = safe_tmp_path / "empty.bin"
         empty_file.write_bytes(b"")
 
         hasher = SecureFileHasher()
@@ -74,13 +74,13 @@ class TestSecureFileHasher:
         with pytest.raises(ValueError, match="File is empty"):
             hasher.hash_file(str(empty_file))
 
-    def test_hash_consistency(self, tmp_path):
+    def test_hash_consistency(self, safe_tmp_path):
         """Test that identical files produce identical hashes."""
         # Create two identical files
         content = b"Test content for consistency check" * 1000
 
-        file1 = tmp_path / "file1.bin"
-        file2 = tmp_path / "file2.bin"
+        file1 = safe_tmp_path / "file1.bin"
+        file2 = safe_tmp_path / "file2.bin"
 
         file1.write_bytes(content)
         file2.write_bytes(content)
@@ -91,10 +91,10 @@ class TestSecureFileHasher:
 
         assert hash1 == hash2
 
-    def test_hash_different_content(self, tmp_path):
+    def test_hash_different_content(self, safe_tmp_path):
         """Test that different files produce different hashes."""
-        file1 = tmp_path / "file1.bin"
-        file2 = tmp_path / "file2.bin"
+        file1 = safe_tmp_path / "file1.bin"
+        file2 = safe_tmp_path / "file2.bin"
 
         file1.write_bytes(b"Content A" * 1000)
         file2.write_bytes(b"Content B" * 1000)
@@ -105,9 +105,9 @@ class TestSecureFileHasher:
 
         assert hash1 != hash2
 
-    def test_verify_hash_success(self, tmp_path):
+    def test_verify_hash_success(self, safe_tmp_path):
         """Test successful hash verification."""
-        test_file = tmp_path / "verify_test.bin"
+        test_file = safe_tmp_path / "verify_test.bin"
         test_content = b"Verification test content"
         test_file.write_bytes(test_content)
 
@@ -117,9 +117,9 @@ class TestSecureFileHasher:
         # Verification should succeed
         assert hasher.verify_hash(str(test_file), file_hash) is True
 
-    def test_verify_hash_failure(self, tmp_path):
+    def test_verify_hash_failure(self, safe_tmp_path):
         """Test hash verification failure."""
-        test_file = tmp_path / "verify_test.bin"
+        test_file = safe_tmp_path / "verify_test.bin"
         test_content = b"Original content"
         test_file.write_bytes(test_content)
 
@@ -172,9 +172,9 @@ class TestSecureFileHasher:
 class TestConvenienceFunctions:
     """Test convenience functions."""
 
-    def test_hash_file_secure_function(self, tmp_path):
+    def test_hash_file_secure_function(self, safe_tmp_path):
         """Test hash_file_secure convenience function."""
-        test_file = tmp_path / "convenience_test.bin"
+        test_file = safe_tmp_path / "convenience_test.bin"
         test_file.write_bytes(b"Test content for convenience function")
 
         result = hash_file_secure(str(test_file))
@@ -182,9 +182,9 @@ class TestConvenienceFunctions:
         assert result.startswith("secure:")
         assert len(result.split(":")[1]) == 64
 
-    def test_hash_file_secure_with_threshold(self, tmp_path):
+    def test_hash_file_secure_with_threshold(self, safe_tmp_path):
         """Test hash_file_secure with custom threshold."""
-        test_file = tmp_path / "threshold_test.bin"
+        test_file = safe_tmp_path / "threshold_test.bin"
         test_content = b"A" * 1024  # 1KB
         test_file.write_bytes(test_content)
 
@@ -193,9 +193,9 @@ class TestConvenienceFunctions:
 
         assert result.startswith("fingerprint:")
 
-    def test_verify_file_hash_function(self, tmp_path):
+    def test_verify_file_hash_function(self, safe_tmp_path):
         """Test verify_file_hash convenience function."""
-        test_file = tmp_path / "verify_convenience_test.bin"
+        test_file = safe_tmp_path / "verify_convenience_test.bin"
         test_file.write_bytes(b"Content for verification test")
 
         # Get hash
@@ -214,10 +214,10 @@ class TestConvenienceFunctions:
 class TestBenchmarking:
     """Test benchmarking functionality."""
 
-    def test_benchmark_hashing_performance(self, tmp_path):
+    def test_benchmark_hashing_performance(self, safe_tmp_path):
         """Test benchmarking function."""
         # Create test file
-        test_file = tmp_path / "benchmark_test.bin"
+        test_file = safe_tmp_path / "benchmark_test.bin"
         test_content = b"Benchmark content " * 1000  # ~17KB
         test_file.write_bytes(test_content)
 
@@ -249,10 +249,10 @@ class TestBenchmarking:
 class TestErrorHandling:
     """Test error handling scenarios."""
 
-    def test_hash_permission_denied(self, tmp_path):
+    def test_hash_permission_denied(self, safe_tmp_path):
         """Test handling of permission denied errors."""
         # This test is platform-specific and may not work on all systems
-        test_file = tmp_path / "permission_test.bin"
+        test_file = safe_tmp_path / "permission_test.bin"
         test_file.write_bytes(b"Test content")
 
         # Try to make file unreadable (may not work on all systems)
@@ -270,13 +270,13 @@ class TestErrorHandling:
 
 
 # Integration test with actual pickle file
-def test_integration_with_pickle_file(tmp_path):
+def test_integration_with_pickle_file(safe_tmp_path):
     """Test integration with a real pickle file."""
     import pickle
 
     # Create a simple pickle file
     test_data = {"model": "test", "weights": [1, 2, 3, 4, 5]}
-    pickle_file = tmp_path / "test_model.pkl"
+    pickle_file = safe_tmp_path / "test_model.pkl"
 
     with open(pickle_file, "wb") as f:
         pickle.dump(test_data, f)

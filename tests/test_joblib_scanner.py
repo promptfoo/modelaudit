@@ -7,8 +7,8 @@ from modelaudit.scanners.joblib_scanner import JoblibScanner
 pytest.importorskip("joblib")
 
 
-def test_joblib_scanner_basic(tmp_path):
-    path = tmp_path / "model.joblib"
+def test_joblib_scanner_basic(safe_tmp_path):
+    path = safe_tmp_path / "model.joblib"
     joblib.dump({"a": np.arange(5)}, path, compress=3)
 
     scanner = JoblibScanner()
@@ -18,7 +18,7 @@ def test_joblib_scanner_basic(tmp_path):
     assert result.bytes_scanned > 0
 
 
-def test_joblib_scanner_closes_bytesio(tmp_path, monkeypatch):
+def test_joblib_scanner_closes_bytesio(safe_tmp_path, monkeypatch):
     """Ensure BytesIO objects used for pickles are closed."""
     import io
 
@@ -31,7 +31,7 @@ def test_joblib_scanner_closes_bytesio(tmp_path, monkeypatch):
 
     monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
 
-    path = tmp_path / "model.joblib"
+    path = safe_tmp_path / "model.joblib"
     joblib.dump({"a": np.arange(5)}, path, compress=3)
 
     scanner = JoblibScanner()

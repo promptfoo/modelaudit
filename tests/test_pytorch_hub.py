@@ -31,7 +31,7 @@ class TestPytorchHubURLDetection:
 @patch("modelaudit.utils.pytorch_hub.check_disk_space")
 @patch("modelaudit.utils.pytorch_hub.requests.head")
 @patch("modelaudit.utils.pytorch_hub.requests.get")
-def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp_path):
+def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, safe_tmp_path):
     html_resp = MagicMock()
     html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
     html_resp.raise_for_status = lambda: None
@@ -49,10 +49,10 @@ def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp
 
     result = download_pytorch_hub_model(
         "https://pytorch.org/hub/pytorch_vision_resnet/",
-        cache_dir=tmp_path,
+        cache_dir=safe_tmp_path,
     )
-    assert (tmp_path / "resnet50.pth").exists()
-    assert result == tmp_path
+    assert (safe_tmp_path / "resnet50.pth").exists()
+    assert result == safe_tmp_path
 
 
 def test_download_pytorch_hub_model_invalid_url():

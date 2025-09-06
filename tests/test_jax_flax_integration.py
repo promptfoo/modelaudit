@@ -83,10 +83,10 @@ class TestJaxFlaxIntegration:
             },
         }
 
-    def test_clean_flax_model_no_false_positives(self, tmp_path):
+    def test_clean_flax_model_no_false_positives(self, safe_tmp_path):
         """Test that clean Flax models don't trigger false positives."""
         clean_model = self.create_clean_flax_model()
-        model_path = tmp_path / "clean_model.msgpack"
+        model_path = safe_tmp_path / "clean_model.msgpack"
 
         with open(model_path, "wb") as f:
             msgpack.pack(clean_model, f, use_bin_type=True)
@@ -106,10 +106,10 @@ class TestJaxFlaxIntegration:
         assert result.metadata.get("model_architecture") == "transformer"
         assert result.metadata.get("estimated_parameters") > 300000
 
-    def test_malicious_jax_model_detection(self, tmp_path):
+    def test_malicious_jax_model_detection(self, safe_tmp_path):
         """Test that malicious JAX models trigger security warnings."""
         malicious_model = self.create_malicious_jax_model()
-        model_path = tmp_path / "malicious_model.jax"
+        model_path = safe_tmp_path / "malicious_model.jax"
 
         with open(model_path, "wb") as f:
             msgpack.pack(malicious_model, f, use_bin_type=True)
@@ -131,14 +131,14 @@ class TestJaxFlaxIntegration:
         for pattern in expected_patterns:
             assert any(pattern in msg for msg in issue_messages), f"Missing detection of {pattern}"
 
-    def test_file_extension_support(self, tmp_path):
+    def test_file_extension_support(self, safe_tmp_path):
         """Test support for various JAX/Flax file extensions."""
         simple_model = {"params": {"layer": b"\x00" * 100}, "step": 1000}
 
         extensions = [".msgpack", ".flax", ".orbax", ".jax"]
 
         for ext in extensions:
-            model_path = tmp_path / f"test_model{ext}"
+            model_path = safe_tmp_path / f"test_model{ext}"
             with open(model_path, "wb") as f:
                 msgpack.pack(simple_model, f)
 
@@ -151,7 +151,7 @@ class TestJaxFlaxIntegration:
             assert result.success, f"Failed to scan {ext} file"
 
     @pytest.mark.slow
-    def test_large_model_support(self, tmp_path):
+    def test_large_model_support(self, safe_tmp_path):
         """Test support for large JAX/Flax models."""
         # Create a model with substantial data; keep size reasonable in fast runs
         large_embedding = np.random.normal(0, 0.1, (10000, 512)).astype(np.float32).tobytes()
@@ -164,7 +164,7 @@ class TestJaxFlaxIntegration:
             "metadata": {"model_type": "embedding", "embedding_size": 512, "vocab_size": 100000},
         }
 
-        model_path = tmp_path / "large_model.flax"
+        model_path = safe_tmp_path / "large_model.flax"
         with open(model_path, "wb") as f:
             msgpack.pack(large_model, f, use_bin_type=True)
 
@@ -177,9 +177,9 @@ class TestJaxFlaxIntegration:
         # With smaller synthetic data, still ensure parameter estimation is non-trivial
         assert result.metadata.get("estimated_parameters") > 1000000
 
-    def test_clean_orbax_checkpoint(self, tmp_path):
+    def test_clean_orbax_checkpoint(self, safe_tmp_path):
         """Test scanning of clean Orbax checkpoint directories."""
-        orbax_dir = tmp_path / "clean_orbax"
+        orbax_dir = safe_tmp_path / "clean_orbax"
         orbax_dir.mkdir()
 
         # Clean metadata
@@ -218,9 +218,9 @@ class TestJaxFlaxIntegration:
             f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
         )
 
-    def test_malicious_orbax_checkpoint(self, tmp_path):
+    def test_malicious_orbax_checkpoint(self, safe_tmp_path):
         """Test detection of malicious Orbax checkpoints."""
-        orbax_dir = tmp_path / "malicious_orbax"
+        orbax_dir = safe_tmp_path / "malicious_orbax"
         orbax_dir.mkdir()
 
         # Malicious metadata
@@ -257,7 +257,7 @@ class TestJaxFlaxIntegration:
         assert any("pickle opcode" in msg for msg in issue_messages), "Should detect dangerous pickle opcodes"
 
     @pytest.mark.slow
-    def test_jax_specific_architecture_detection(self, tmp_path):
+    def test_jax_specific_architecture_detection(self, safe_tmp_path):
         """Test JAX-specific model architecture detection."""
         test_cases = [
             {
@@ -294,7 +294,7 @@ class TestJaxFlaxIntegration:
         ]
 
         for i, test_case in enumerate(test_cases):
-            model_path = tmp_path / f"arch_test_{i}.flax"
+            model_path = safe_tmp_path / f"arch_test_{i}.flax"
             with open(model_path, "wb") as f:
                 msgpack.pack(test_case["model"], f, use_bin_type=True)
 
@@ -310,10 +310,10 @@ class TestJaxFlaxIntegration:
             actual_arch = result.metadata.get("model_architecture")
             assert actual_arch in expected_archs, f"Expected one of {expected_archs}, got {actual_arch}"
 
-    def test_integration_with_cli(self, tmp_path):
+    def test_integration_with_cli(self, safe_tmp_path):
         """Test that enhanced JAX/Flax scanning works through CLI."""
         clean_model = self.create_clean_flax_model()
-        model_path = tmp_path / "integration_test.jax"
+        model_path = safe_tmp_path / "integration_test.jax"
 
         with open(model_path, "wb") as f:
             msgpack.pack(clean_model, f, use_bin_type=True)

@@ -4,13 +4,13 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
 
 
-def test_pmml_scanner_basic(tmp_path: Path) -> None:
+def test_pmml_scanner_basic(safe_tmp_path: Path) -> None:
     pmml = """<?xml version='1.0'?>
 <PMML version='4.4'>
   <Header/>
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
-    path = tmp_path / "model.pmml"
+    path = safe_tmp_path / "model.pmml"
     path.write_text(pmml, encoding="utf-8")
 
     scanner = PmmlScanner()
@@ -23,7 +23,7 @@ def test_pmml_scanner_basic(tmp_path: Path) -> None:
     assert result.metadata["pmml_version"] == "4.4"
 
 
-def test_pmml_scanner_xxe(tmp_path: Path) -> None:
+def test_pmml_scanner_xxe(safe_tmp_path: Path) -> None:
     pmml = """<?xml version='1.0'?>
 <!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///etc/passwd'> ]>
 <PMML version='4.4'>
@@ -31,7 +31,7 @@ def test_pmml_scanner_xxe(tmp_path: Path) -> None:
     <Extension>&xxe;</Extension>
   </Header>
 </PMML>"""
-    path = tmp_path / "evil.pmml"
+    path = safe_tmp_path / "evil.pmml"
     path.write_text(pmml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -40,7 +40,7 @@ def test_pmml_scanner_xxe(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
+def test_pmml_scanner_suspicious_extension_content(safe_tmp_path: Path) -> None:
     """Test detection of suspicious content in Extension elements."""
     pmml = """<?xml version='1.0'?>
 <PMML version='4.4'>
@@ -51,7 +51,7 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     </Extension>
   </Header>
 </PMML>"""
-    path = tmp_path / "suspicious.pmml"
+    path = safe_tmp_path / "suspicious.pmml"
     path.write_text(pmml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -63,7 +63,7 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
 
 
-def test_pmml_scanner_external_references(tmp_path: Path) -> None:
+def test_pmml_scanner_external_references(safe_tmp_path: Path) -> None:
     """Test detection of external resource references."""
     pmml = """<?xml version='1.0'?>
 <PMML version='4.4'>
@@ -76,7 +76,7 @@ def test_pmml_scanner_external_references(tmp_path: Path) -> None:
     </DataField>
   </DataDictionary>
 </PMML>"""
-    path = tmp_path / "external_refs.pmml"
+    path = safe_tmp_path / "external_refs.pmml"
     path.write_text(pmml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -88,7 +88,7 @@ def test_pmml_scanner_external_references(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.WARNING for i in external_issues)
 
 
-def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
+def test_pmml_scanner_malformed_xml(safe_tmp_path: Path) -> None:
     """Test handling of malformed XML."""
     malformed_xml = """<?xml version='1.0'?>
 <PMML version='4.4'>
@@ -96,7 +96,7 @@ def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     <Unclosed tag
   </Header>
 </PMML>"""
-    path = tmp_path / "malformed.pmml"
+    path = safe_tmp_path / "malformed.pmml"
     path.write_text(malformed_xml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -105,13 +105,13 @@ def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_pmml_scanner_invalid_root_element(tmp_path: Path) -> None:
+def test_pmml_scanner_invalid_root_element(safe_tmp_path: Path) -> None:
     """Test handling of files with wrong root element."""
     wrong_root = """<?xml version='1.0'?>
 <WrongRoot version='4.4'>
   <Header/>
 </WrongRoot>"""
-    path = tmp_path / "wrong_root.pmml"
+    path = safe_tmp_path / "wrong_root.pmml"
     path.write_text(wrong_root, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -120,13 +120,13 @@ def test_pmml_scanner_invalid_root_element(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
 
 
-def test_pmml_scanner_missing_version(tmp_path: Path) -> None:
+def test_pmml_scanner_missing_version(safe_tmp_path: Path) -> None:
     """Test handling of PMML without version attribute."""
     no_version = """<?xml version='1.0'?>
 <PMML>
   <Header/>
 </PMML>"""
-    path = tmp_path / "no_version.pmml"
+    path = safe_tmp_path / "no_version.pmml"
     path.write_text(no_version, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -135,10 +135,10 @@ def test_pmml_scanner_missing_version(tmp_path: Path) -> None:
     assert result.metadata.get("pmml_version") == ""
 
 
-def test_pmml_scanner_non_utf8_content(tmp_path: Path) -> None:
+def test_pmml_scanner_non_utf8_content(safe_tmp_path: Path) -> None:
     """Test handling of non-UTF8 content."""
     # Create file with non-UTF8 bytes that breaks XML parsing
-    path = tmp_path / "non_utf8.pmml"
+    path = safe_tmp_path / "non_utf8.pmml"
     with open(path, "wb") as f:
         f.write(b'<?xml version="1.0"?>\n<PMML>\xff\xfe\x00Invalid</PMML>')
 
@@ -149,10 +149,10 @@ def test_pmml_scanner_non_utf8_content(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_pmml_scanner_utf8_with_replacement(tmp_path: Path) -> None:
+def test_pmml_scanner_utf8_with_replacement(safe_tmp_path: Path) -> None:
     """Test handling of content that requires UTF-8 replacement characters."""
     # Create file with some invalid UTF-8 but valid XML structure
-    path = tmp_path / "utf8_replacement.pmml"
+    path = safe_tmp_path / "utf8_replacement.pmml"
     with open(path, "wb") as f:
         # Write valid XML with one invalid UTF-8 byte that can be replaced
         f.write(
@@ -166,7 +166,7 @@ def test_pmml_scanner_utf8_with_replacement(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
 
 
-def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
+def test_pmml_scanner_can_handle_detection(safe_tmp_path: Path) -> None:
     """Test file format detection beyond just extensions."""
     # Test PMML content without .pmml extension
     pmml_content = """<?xml version='1.0'?>
@@ -175,7 +175,7 @@ def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
 </PMML>"""
 
     # Test with different extension
-    path = tmp_path / "model.xml"
+    path = safe_tmp_path / "model.xml"
     path.write_text(pmml_content, encoding="utf-8")
 
     scanner = PmmlScanner()
@@ -186,13 +186,13 @@ def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
 <root>
   <data>not pmml</data>
 </root>"""
-    path2 = tmp_path / "other.xml"
+    path2 = safe_tmp_path / "other.xml"
     path2.write_text(non_pmml, encoding="utf-8")
 
     assert not scanner.can_handle(str(path2))  # Should not handle non-PMML
 
 
-def test_pmml_scanner_comprehensive_dangerous_entities(tmp_path: Path) -> None:
+def test_pmml_scanner_comprehensive_dangerous_entities(safe_tmp_path: Path) -> None:
     """Test detection of various dangerous XML constructs."""
     dangerous_xml = """<?xml version='1.0'?>
 <!DOCTYPE pmml [
@@ -203,7 +203,7 @@ def test_pmml_scanner_comprehensive_dangerous_entities(tmp_path: Path) -> None:
 <PMML version='4.4'>
   <Header/>
 </PMML>"""
-    path = tmp_path / "dangerous.pmml"
+    path = safe_tmp_path / "dangerous.pmml"
     path.write_text(dangerous_xml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))
@@ -217,13 +217,13 @@ def test_pmml_scanner_comprehensive_dangerous_entities(tmp_path: Path) -> None:
     assert expected_constructs.issubset(construct_types)
 
 
-def test_pmml_scanner_metadata_tracking(tmp_path: Path) -> None:
+def test_pmml_scanner_metadata_tracking(safe_tmp_path: Path) -> None:
     """Test that scanner properly tracks metadata."""
     pmml = """<?xml version='1.0'?>
 <PMML version='4.4'>
   <Header/>
 </PMML>"""
-    path = tmp_path / "metadata_test.pmml"
+    path = safe_tmp_path / "metadata_test.pmml"
     path.write_text(pmml, encoding="utf-8")
 
     result = PmmlScanner().scan(str(path))

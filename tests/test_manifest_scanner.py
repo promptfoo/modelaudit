@@ -8,10 +8,10 @@ from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
 
-def test_manifest_scanner_json(tmp_path):
+def test_manifest_scanner_json(safe_tmp_path):
     """Test the manifest scanner with a JSON file."""
     # Create a temporary JSON file with unique name
-    test_file = tmp_path / "config.json"
+    test_file = safe_tmp_path / "config.json"
     manifest_content = {
         "model_name": "test_model",
         "version": "1.0.0",
@@ -441,9 +441,9 @@ def test_non_ml_context_still_flags_suspicious_patterns():
             test_file_path.unlink()
 
 
-def test_imagenet_labels_not_flagged(tmp_path):
+def test_imagenet_labels_not_flagged(safe_tmp_path):
     """ImageNet label strings should not trigger critical issues."""
-    test_file = tmp_path / "vision_config.json"
+    test_file = safe_tmp_path / "vision_config.json"
     manifest_content = {
         "model_type": "vision",
         "labels": {"shell": 0, "cat": 1, "dog": 2},

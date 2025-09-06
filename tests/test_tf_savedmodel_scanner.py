@@ -19,19 +19,19 @@ except Exception:  # Catch all exceptions including system errors, mutex failure
 HAS_TENSORFLOW = False
 
 
-def test_tf_savedmodel_scanner_can_handle(tmp_path):
+def test_tf_savedmodel_scanner_can_handle(safe_tmp_path):
     """Test the can_handle method of TensorFlowSavedModelScanner."""
     # Create a directory with saved_model.pb
-    tf_dir = tmp_path / "tf_model"
+    tf_dir = safe_tmp_path / "tf_model"
     tf_dir.mkdir()
     (tf_dir / "saved_model.pb").write_bytes(b"dummy content")
 
     # Create a regular directory
-    regular_dir = tmp_path / "regular_dir"
+    regular_dir = safe_tmp_path / "regular_dir"
     regular_dir.mkdir()
 
     # Create a file
-    test_file = tmp_path / "test.pb"
+    test_file = safe_tmp_path / "test.pb"
     test_file.write_bytes(b"dummy content")
 
     if HAS_TENSORFLOW:
@@ -45,7 +45,7 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
 
 
-def create_tf_savedmodel(tmp_path, *, malicious=False):
+def create_tf_savedmodel(safe_tmp_path, *, malicious=False):
     """Create a mock TensorFlow SavedModel directory for testing."""
     try:
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
@@ -56,7 +56,7 @@ def create_tf_savedmodel(tmp_path, *, malicious=False):
         pytest.skip("TensorFlow not available or has system issues")
 
     # Create a directory that mimics a TensorFlow SavedModel
-    model_dir = tmp_path / "tf_model"
+    model_dir = safe_tmp_path / "tf_model"
     model_dir.mkdir()
 
     # Create a minimal valid SavedModel protobuf
@@ -112,9 +112,9 @@ def create_tf_savedmodel(tmp_path, *, malicious=False):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_safe_model(tmp_path):
+def test_tf_savedmodel_scanner_safe_model(safe_tmp_path):
     """Test scanning a safe TensorFlow SavedModel."""
-    model_dir = create_tf_savedmodel(tmp_path)
+    model_dir = create_tf_savedmodel(safe_tmp_path)
 
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
@@ -128,9 +128,9 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_malicious_model(tmp_path):
+def test_tf_savedmodel_scanner_malicious_model(safe_tmp_path):
     """Test scanning a malicious TensorFlow SavedModel."""
-    model_dir = create_tf_savedmodel(tmp_path, malicious=True)
+    model_dir = create_tf_savedmodel(safe_tmp_path, malicious=True)
 
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
@@ -153,10 +153,10 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path):
     assert any(issue.why is not None for issue in pyfunc_issues)
 
 
-def test_tf_savedmodel_scanner_invalid_model(tmp_path):
+def test_tf_savedmodel_scanner_invalid_model(safe_tmp_path):
     """Test scanning an invalid TensorFlow SavedModel."""
     # Create an invalid model directory (missing required files)
-    invalid_dir = tmp_path / "invalid_model"
+    invalid_dir = safe_tmp_path / "invalid_model"
     invalid_dir.mkdir()
     (invalid_dir / "saved_model.pb").write_bytes(b"dummy content")
     # Missing variables directory
@@ -176,9 +176,9 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_detect_readfile_operation(tmp_path):
+def test_detect_readfile_operation(safe_tmp_path):
     # Synthesize a SavedModel containing a ReadFile node
-    model_path = _create_test_savedmodel_with_op(tmp_path, "ReadFile", "readfile_test")
+    model_path = _create_test_savedmodel_with_op(safe_tmp_path, "ReadFile", "readfile_test")
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
@@ -190,8 +190,8 @@ def test_detect_readfile_operation(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_detect_pyfunc_operation(tmp_path):
-    model_path = _create_test_savedmodel_with_op(tmp_path, "PyFunc", "pyfunc_test")
+def test_detect_pyfunc_operation(safe_tmp_path):
+    model_path = _create_test_savedmodel_with_op(safe_tmp_path, "PyFunc", "pyfunc_test")
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
@@ -202,9 +202,9 @@ def test_detect_pyfunc_operation(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_detect_writefile_operation(tmp_path):
+def test_detect_writefile_operation(safe_tmp_path):
     # Synthesize a SavedModel containing a WriteFile node
-    model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
+    model_path = _create_test_savedmodel_with_op(safe_tmp_path, "WriteFile", "writefile_test")
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
@@ -216,9 +216,9 @@ def test_detect_writefile_operation(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
+def test_tf_savedmodel_scanner_with_blacklist(safe_tmp_path):
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
-    model_dir = create_tf_savedmodel(tmp_path)
+    model_dir = create_tf_savedmodel(safe_tmp_path)
 
     # Create a file with content that matches our blacklist
     (model_dir / "custom_file.txt").write_bytes(
@@ -236,10 +236,10 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
     assert len(blacklist_issues) > 0
 
 
-def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
+def test_tf_savedmodel_scanner_not_a_directory(safe_tmp_path):
     """Test scanning a file instead of a directory."""
     # Create a file
-    test_file = tmp_path / "model.pb"
+    test_file = safe_tmp_path / "model.pb"
     test_file.write_bytes(b"dummy content")
 
     scanner = TensorFlowSavedModelScanner()
@@ -256,9 +256,9 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_unreadable_file(tmp_path):
+def test_tf_savedmodel_scanner_unreadable_file(safe_tmp_path):
     """Scanner should report unreadable files instead of silently skipping."""
-    model_dir = create_tf_savedmodel(tmp_path)
+    model_dir = create_tf_savedmodel(safe_tmp_path)
 
     missing = model_dir / "missing.txt"
     missing.write_text("secret")
@@ -272,12 +272,12 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path):
     assert any("error reading file" in issue.message.lower() for issue in result.issues)
 
 
-def _create_test_savedmodel_with_op(tmp_path, op_name, model_name=None):
+def _create_test_savedmodel_with_op(safe_tmp_path, op_name, model_name=None):
     """Helper function to create a test SavedModel with a specific TensorFlow operation."""
-    return _create_test_savedmodel_with_ops(tmp_path, [op_name], model_name)
+    return _create_test_savedmodel_with_ops(safe_tmp_path, [op_name], model_name)
 
 
-def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
+def _create_test_savedmodel_with_ops(safe_tmp_path, op_names, model_name=None):
     """Helper function to create a test SavedModel with multiple TensorFlow operations."""
     try:
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
@@ -290,7 +290,7 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
     if model_name is None:
         model_name = f"test_model_{'_'.join(op.lower() for op in op_names[:2])}"
 
-    model_dir = tmp_path / model_name
+    model_dir = safe_tmp_path / model_name
     model_dir.mkdir()
 
     # Create SavedModel with the specified operations
@@ -317,7 +317,7 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
+def test_tf_scanner_explanations_for_all_suspicious_ops(safe_tmp_path):
     """Test that all suspicious TensorFlow operations generate explanations."""
     from modelaudit.explanations import get_tf_op_explanation
     from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
@@ -325,7 +325,7 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
     # Test each suspicious operation individually
     for op_name in SUSPICIOUS_OPS:
         # Create a SavedModel with the specific suspicious operation
-        model_path = _create_test_savedmodel_with_op(tmp_path, op_name)
+        model_path = _create_test_savedmodel_with_op(safe_tmp_path, op_name)
 
         # Scan the model
         scanner = TensorFlowSavedModelScanner()
@@ -359,12 +359,12 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_scanner_explanation_categories(tmp_path):
+def test_tf_scanner_explanation_categories(safe_tmp_path):
     """Test that TensorFlow scanner provides appropriate explanations by operation category."""
     # Test critical risk operations (code execution)
     critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute"]
     for op_name in critical_ops:
-        model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"critical_test_{op_name.lower()}")
+        model_path = _create_test_savedmodel_with_op(safe_tmp_path, op_name, f"critical_test_{op_name.lower()}")
 
         scanner = TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
@@ -383,11 +383,11 @@ def test_tf_scanner_explanation_categories(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_tf_scanner_no_explanation_for_safe_ops(tmp_path):
+def test_tf_scanner_no_explanation_for_safe_ops(safe_tmp_path):
     """Test that safe TensorFlow operations don't generate unnecessary explanations."""
     # Create a model with only safe operations
     safe_ops = ["MatMul", "Add", "Relu", "Conv2D", "MaxPool"]
-    model_path = _create_test_savedmodel_with_ops(tmp_path, safe_ops, "safe_model")
+    model_path = _create_test_savedmodel_with_ops(safe_tmp_path, safe_ops, "safe_model")
 
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)

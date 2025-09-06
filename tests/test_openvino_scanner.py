@@ -13,8 +13,8 @@ def create_basic_model(dir_path: Path) -> Path:
     return xml_path
 
 
-def test_openvino_scanner_basic(tmp_path: Path) -> None:
-    xml_path = create_basic_model(tmp_path)
+def test_openvino_scanner_basic(safe_tmp_path: Path) -> None:
+    xml_path = create_basic_model(safe_tmp_path)
 
     scanner = OpenVinoScanner()
     assert scanner.can_handle(str(xml_path))
@@ -22,12 +22,12 @@ def test_openvino_scanner_basic(tmp_path: Path) -> None:
     result = scanner.scan(str(xml_path))
     assert result.success
     assert result.metadata["xml_size"] == xml_path.stat().st_size
-    assert result.metadata.get("bin_size") == (tmp_path / "model.bin").stat().st_size
+    assert result.metadata.get("bin_size") == (safe_tmp_path / "model.bin").stat().st_size
     assert not result.issues
 
 
-def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
-    xml_path = tmp_path / "model.xml"
+def test_openvino_scanner_missing_bin(safe_tmp_path: Path) -> None:
+    xml_path = safe_tmp_path / "model.xml"
     xml_path.write_text("<net version='10'></net>", encoding="utf-8")
 
     result = OpenVinoScanner().scan(str(xml_path))
@@ -36,9 +36,9 @@ def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
 
 
-def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
-    xml_path = tmp_path / "model.xml"
-    bin_path = tmp_path / "model.bin"
+def test_openvino_scanner_custom_layer(safe_tmp_path: Path) -> None:
+    xml_path = safe_tmp_path / "model.xml"
+    bin_path = safe_tmp_path / "model.bin"
     xml_path.write_text(
         "<net version='10'><layers><layer id='1' name='evil' type='Python' library='evil.so'/></layers></net>",
         encoding="utf-8",

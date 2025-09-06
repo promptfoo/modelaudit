@@ -13,9 +13,9 @@ except ImportError:
     HAS_TFLITE = False
 
 
-def test_tflite_scanner_can_handle(tmp_path):
+def test_tflite_scanner_can_handle(safe_tmp_path):
     """Test the can_handle method when tflite is available."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some content")
 
     if HAS_TFLITE:
@@ -24,9 +24,9 @@ def test_tflite_scanner_can_handle(tmp_path):
         assert TFLiteScanner.can_handle(str(path)) is False
 
 
-def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path):
+def test_tflite_scanner_cannot_handle_wrong_extension(safe_tmp_path):
     """Test the can_handle method with wrong file extension."""
-    path = tmp_path / "model.pb"
+    path = safe_tmp_path / "model.pb"
     path.write_bytes(b"some content")
     assert TFLiteScanner.can_handle(str(path)) is False
 
@@ -39,9 +39,9 @@ def test_tflite_scanner_file_not_found():
     assert "Path does not exist" in result.issues[0].message
 
 
-def test_tflite_scanner_no_tflite_installed(tmp_path):
+def test_tflite_scanner_no_tflite_installed(safe_tmp_path):
     """Test scanner behavior when tflite package is not installed."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.touch()
 
     with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
@@ -52,9 +52,9 @@ def test_tflite_scanner_no_tflite_installed(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_parsing_error(tmp_path):
+def test_tflite_scanner_parsing_error(safe_tmp_path):
     """Test scanner behavior with invalid tflite data."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"invalid tflite data")
 
     # Mock the tflite module to simulate parsing error
@@ -67,9 +67,9 @@ def test_tflite_scanner_parsing_error(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_large_subgraph_count(tmp_path):
+def test_tflite_scanner_large_subgraph_count(safe_tmp_path):
     """Test scanner behavior with excessive subgraph count."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
@@ -106,9 +106,9 @@ def test_tflite_scanner_large_subgraph_count(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_large_tensor_count(tmp_path):
+def test_tflite_scanner_large_tensor_count(safe_tmp_path):
     """Test scanner behavior with excessive tensor count."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
@@ -127,9 +127,9 @@ def test_tflite_scanner_large_tensor_count(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_large_tensor_dimension(tmp_path):
+def test_tflite_scanner_large_tensor_dimension(safe_tmp_path):
     """Test scanner behavior with excessive tensor dimensions."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
@@ -152,9 +152,9 @@ def test_tflite_scanner_large_tensor_dimension(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_custom_operator(tmp_path):
+def test_tflite_scanner_custom_operator(safe_tmp_path):
     """Test scanner behavior with custom operators."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
@@ -185,9 +185,9 @@ def test_tflite_scanner_custom_operator(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_safe_model(tmp_path):
+def test_tflite_scanner_safe_model(safe_tmp_path):
     """Test scanner behavior with safe model."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
@@ -215,9 +215,9 @@ def test_tflite_scanner_safe_model(tmp_path):
         assert not result.issues
 
 
-def test_tflite_scanner_metadata_collection(tmp_path):
+def test_tflite_scanner_metadata_collection(safe_tmp_path):
     """Test that scanner collects appropriate metadata."""
-    path = tmp_path / "model.tflite"
+    path = safe_tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
     if HAS_TFLITE:

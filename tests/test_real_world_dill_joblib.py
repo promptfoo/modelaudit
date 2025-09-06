@@ -28,9 +28,9 @@ class TestRealDillFiles:
     """Tests with actual dill serialized objects."""
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_real_dill_lambda_function(self, tmp_path):
+    def test_real_dill_lambda_function(self, safe_tmp_path):
         """Test scanning actual dill files with lambda functions."""
-        dill_file = tmp_path / "lambda.dill"
+        dill_file = safe_tmp_path / "lambda.dill"
 
         # Create a lambda function (pickle can't handle this, dill can)
         def lambda_func(x):
@@ -53,9 +53,9 @@ class TestRealDillFiles:
             assert dill_related, "Critical issues should be dill-related if present"
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_real_dill_complex_object(self, tmp_path):
+    def test_real_dill_complex_object(self, safe_tmp_path):
         """Test scanning dill files with complex objects."""
-        dill_file = tmp_path / "complex.dill"
+        dill_file = safe_tmp_path / "complex.dill"
 
         # Create a complex object that standard pickle can't handle
         class ComplexClass:
@@ -76,9 +76,9 @@ class TestRealDillFiles:
         assert result.bytes_scanned > 0
 
     @pytest.mark.skipif(not HAS_DILL, reason="dill not available")
-    def test_dill_malicious_detection_still_works(self, tmp_path):
+    def test_dill_malicious_detection_still_works(self, safe_tmp_path):
         """Ensure dill files with malicious content are still detected."""
-        malicious_dill = tmp_path / "malicious.dill"
+        malicious_dill = safe_tmp_path / "malicious.dill"
 
         # Create a dill file with os.system call
         import os
@@ -113,9 +113,9 @@ class TestRealJoblibFiles:
     """Tests with actual joblib serialized objects."""
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
-    def test_real_joblib_simple_object(self, tmp_path):
+    def test_real_joblib_simple_object(self, safe_tmp_path):
         """Test scanning actual joblib files."""
-        joblib_file = tmp_path / "simple.joblib"
+        joblib_file = safe_tmp_path / "simple.joblib"
 
         # Create a simple object
         data = {"model_params": [1, 2, 3], "metadata": {"version": "1.0"}}
@@ -133,9 +133,9 @@ class TestRealJoblibFiles:
         assert len(critical_issues) == 0
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
-    def test_real_joblib_compressed(self, tmp_path):
+    def test_real_joblib_compressed(self, safe_tmp_path):
         """Test scanning compressed joblib files."""
-        compressed_file = tmp_path / "compressed.joblib"
+        compressed_file = safe_tmp_path / "compressed.joblib"
 
         # Create compressed joblib file
         large_data = {"data": list(range(1000)), "metadata": "test"}
@@ -156,9 +156,9 @@ class TestRealJoblibFiles:
             assert len(format_issues) > 0, "Should report format/opcode issues for compressed files"
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
-    def test_joblib_with_numpy_arrays(self, tmp_path):
+    def test_joblib_with_numpy_arrays(self, safe_tmp_path):
         """Test joblib files containing numpy arrays."""
-        numpy_file = tmp_path / "numpy.joblib"
+        numpy_file = safe_tmp_path / "numpy.joblib"
 
         import numpy as np
 
@@ -197,9 +197,9 @@ class TestRealJoblibFiles:
 class TestPerformanceBenchmarks:
     """Performance benchmarks for A+ level testing."""
 
-    def test_large_file_scanning_performance(self, tmp_path):
+    def test_large_file_scanning_performance(self, safe_tmp_path):
         """Benchmark scanning performance on large files."""
-        large_file = tmp_path / "large_test.joblib"
+        large_file = safe_tmp_path / "large_test.joblib"
 
         # Create a reasonably large joblib file
         import pickle
@@ -227,7 +227,7 @@ class TestPerformanceBenchmarks:
         # Log performance metrics
         print(f"Large file scan: {scan_duration:.3f}s, {result.bytes_scanned} bytes")
 
-    def test_multiple_files_scanning_performance(self, tmp_path):
+    def test_multiple_files_scanning_performance(self, safe_tmp_path):
         """Benchmark scanning multiple files."""
         files = []
 
@@ -236,7 +236,7 @@ class TestPerformanceBenchmarks:
 
         count = 6 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 10
         for i in range(count):
-            file_path = tmp_path / f"file_{i}.joblib"
+            file_path = safe_tmp_path / f"file_{i}.joblib"
             with open(file_path, "wb") as f:
                 f.write(b"joblib")
                 import pickle
@@ -261,9 +261,9 @@ class TestPerformanceBenchmarks:
         avg_time = total_duration / len(files)
         print(f"Average scan time: {avg_time:.3f}s per file")
 
-    def test_validation_performance_impact(self, tmp_path):
+    def test_validation_performance_impact(self, safe_tmp_path):
         """Test performance impact of file validation."""
-        test_file = tmp_path / "validation_test.joblib"
+        test_file = safe_tmp_path / "validation_test.joblib"
 
         with open(test_file, "wb") as f:
             f.write(b"joblib" * 200)  # Larger content
@@ -292,9 +292,9 @@ class TestPerformanceBenchmarks:
 class TestErrorScenarios:
     """Test various error scenarios for robustness."""
 
-    def test_corrupted_file_handling(self, tmp_path):
+    def test_corrupted_file_handling(self, safe_tmp_path):
         """Test handling of corrupted files."""
-        corrupted_file = tmp_path / "corrupted.joblib"
+        corrupted_file = safe_tmp_path / "corrupted.joblib"
 
         # Create partially corrupted file
         with open(corrupted_file, "wb") as f:
@@ -309,12 +309,12 @@ class TestErrorScenarios:
         assert isinstance(result.success, bool)
         assert len(result.issues) > 0  # Should report issues
 
-    def test_permission_denied_handling(self, tmp_path):
+    def test_permission_denied_handling(self, safe_tmp_path):
         """Test handling of files with permission issues."""
         if hasattr(os, "chmod"):  # Unix-like systems
             if os.geteuid() == 0:
                 pytest.skip("Running as root, permission errors won't trigger")
-            restricted_file = tmp_path / "restricted.joblib"
+            restricted_file = safe_tmp_path / "restricted.joblib"
             restricted_file.write_bytes(b"joblib test")
 
             # Remove read permissions
@@ -331,9 +331,9 @@ class TestErrorScenarios:
                 # Restore permissions for cleanup
                 os.chmod(str(restricted_file), 0o644)
 
-    def test_network_file_timeout_simulation(self, tmp_path):
+    def test_network_file_timeout_simulation(self, safe_tmp_path):
         """Test timeout handling for slow file operations."""
-        slow_file = tmp_path / "slow.joblib"
+        slow_file = safe_tmp_path / "slow.joblib"
 
         with open(slow_file, "wb") as f:
             f.write(b"joblib")

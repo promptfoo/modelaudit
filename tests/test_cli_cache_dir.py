@@ -62,7 +62,7 @@ class TestCacheDirOption:
         import tempfile
         import contextlib
 
-        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        # Use tempfile.TemporaryDirectory to avoid pytest safe_tmp_path fixture issues
         with tempfile.TemporaryDirectory() as temp_dir:
             # Setup mocks
             mock_is_hf_url.return_value = True
@@ -93,7 +93,7 @@ class TestCacheDirOption:
         import os
         import tempfile
 
-        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        # Use tempfile.TemporaryDirectory to avoid pytest safe_tmp_path fixture issues
         with tempfile.TemporaryDirectory() as temp_dir:
             # Setup mocks
             mock_is_cloud_url.return_value = True
@@ -122,7 +122,7 @@ class TestCacheDirOption:
         import os
         import tempfile
 
-        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        # Use tempfile.TemporaryDirectory to avoid pytest safe_tmp_path fixture issues
         with tempfile.TemporaryDirectory() as temp_dir:
             # Setup mocks
             mock_is_hf_url.return_value = True
@@ -150,7 +150,7 @@ class TestCacheDirOption:
         import os
         import tempfile
 
-        # Use tempfile.TemporaryDirectory to avoid pytest tmp_path fixture issues
+        # Use tempfile.TemporaryDirectory to avoid pytest safe_tmp_path fixture issues
         with tempfile.TemporaryDirectory() as temp_dir:
             # Setup mocks
             mock_is_hf_url.return_value = True

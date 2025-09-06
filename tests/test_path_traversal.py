@@ -2,10 +2,10 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 
 
-def test_symlink_outside_directory(tmp_path):
-    base_dir = tmp_path / "base"
+def test_symlink_outside_directory(safe_tmp_path):
+    base_dir = safe_tmp_path / "base"
     base_dir.mkdir()
-    outside_dir = tmp_path / "outside"
+    outside_dir = safe_tmp_path / "outside"
     outside_dir.mkdir()
 
     (outside_dir / "secret.txt").write_text("secret")

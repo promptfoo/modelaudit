@@ -23,9 +23,9 @@ def create_malicious_msgpack_file(path):
     create_msgpack_file(path, malicious_data)
 
 
-def test_flax_msgpack_valid_checkpoint(tmp_path):
+def test_flax_msgpack_valid_checkpoint(safe_tmp_path):
     """Test scanning a valid Flax checkpoint."""
-    path = tmp_path / "model.msgpack"
+    path = safe_tmp_path / "model.msgpack"
     # Create realistic Flax checkpoint structure
     data = {
         "params": {
@@ -51,9 +51,9 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
     )
 
 
-def test_flax_msgpack_suspicious_content(tmp_path):
+def test_flax_msgpack_suspicious_content(safe_tmp_path):
     """Test detection of suspicious patterns in msgpack content."""
-    path = tmp_path / "suspicious.msgpack"
+    path = safe_tmp_path / "suspicious.msgpack"
     create_malicious_msgpack_file(path)
 
     scanner = FlaxMsgpackScanner()
@@ -73,9 +73,9 @@ def test_flax_msgpack_suspicious_content(tmp_path):
     assert any("os.system" in msg or "import\\s+os" in msg for msg in issue_messages)
 
 
-def test_flax_msgpack_large_containers(tmp_path):
+def test_flax_msgpack_large_containers(safe_tmp_path):
     """Test detection of containers with excessive items."""
-    path = tmp_path / "large.msgpack"
+    path = safe_tmp_path / "large.msgpack"
     # Create oversized containers (default limit is 50000)
     # Use smaller sizes in CI to avoid memory issues
     is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
@@ -98,9 +98,9 @@ def test_flax_msgpack_large_containers(tmp_path):
     assert any("excessive items" in msg for msg in issue_messages)
 
 
-def test_flax_msgpack_deep_nesting(tmp_path):
+def test_flax_msgpack_deep_nesting(safe_tmp_path):
     """Test detection of excessive recursion depth."""
-    path = tmp_path / "deep.msgpack"
+    path = safe_tmp_path / "deep.msgpack"
 
     # Create deeply nested structure
     deep_data = {"level": 0}
@@ -118,9 +118,9 @@ def test_flax_msgpack_deep_nesting(tmp_path):
     assert any("recursion depth exceeded" in issue.message for issue in critical_issues)
 
 
-def test_flax_msgpack_non_standard_structure(tmp_path):
+def test_flax_msgpack_non_standard_structure(safe_tmp_path):
     """Test detection of non-standard Flax structures using structural analysis."""
-    path = tmp_path / "nonstandard.msgpack"
+    path = safe_tmp_path / "nonstandard.msgpack"
     # Create structure that doesn't look like a Flax checkpoint
     data = {
         "random_key": "random_value",
@@ -138,9 +138,9 @@ def test_flax_msgpack_non_standard_structure(tmp_path):
     assert any("Suspicious data structure" in issue.message for issue in warning_issues)
 
 
-def test_flax_msgpack_corrupted(tmp_path):
+def test_flax_msgpack_corrupted(safe_tmp_path):
     """Test handling of corrupted msgpack files."""
-    path = tmp_path / "corrupt.msgpack"
+    path = safe_tmp_path / "corrupt.msgpack"
     data = {"params": {"w": list(range(5))}}
     create_msgpack_file(path, data)
 
@@ -159,9 +159,9 @@ def test_flax_msgpack_corrupted(tmp_path):
     )
 
 
-def test_flax_msgpack_enhanced_jax_support(tmp_path):
+def test_flax_msgpack_enhanced_jax_support(safe_tmp_path):
     """Test enhanced JAX-specific functionality."""
-    path = tmp_path / "jax_model.flax"
+    path = safe_tmp_path / "jax_model.flax"
 
     # Create JAX model with transformer architecture
     data = {
@@ -188,9 +188,9 @@ def test_flax_msgpack_enhanced_jax_support(tmp_path):
     assert jax_metadata.get("has_optimizer_state") is True
 
 
-def test_flax_msgpack_orbax_format_detection(tmp_path):
+def test_flax_msgpack_orbax_format_detection(safe_tmp_path):
     """Test detection of Orbax checkpoint format."""
-    path = tmp_path / "orbax_checkpoint.orbax"
+    path = safe_tmp_path / "orbax_checkpoint.orbax"
 
     data = {
         "__orbax_metadata__": {"version": "0.1.0", "format": "flax"},
@@ -215,9 +215,9 @@ def test_flax_msgpack_orbax_format_detection(tmp_path):
     assert orbax_checks[0].status.value == "passed"
 
 
-def test_flax_msgpack_jax_specific_threats(tmp_path):
+def test_flax_msgpack_jax_specific_threats(safe_tmp_path):
     """Test detection of JAX-specific security threats."""
-    path = tmp_path / "malicious_jax.jax"
+    path = safe_tmp_path / "malicious_jax.jax"
 
     data = {
         "params": {"layer": b"\x00" * 100},
@@ -241,9 +241,9 @@ def test_flax_msgpack_jax_specific_threats(tmp_path):
     assert any("negative dimensions" in msg for msg in issues_messages)
 
 
-def test_flax_msgpack_large_model_support(tmp_path):
+def test_flax_msgpack_large_model_support(safe_tmp_path):
     """Test support for large transformer models."""
-    path = tmp_path / "large_model.msgpack"
+    path = safe_tmp_path / "large_model.msgpack"
 
     # Create scanner with lower blob limit for testing
     is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
@@ -273,20 +273,20 @@ def test_flax_msgpack_large_model_support(tmp_path):
     assert len(large_blob_issues) >= 1
 
 
-def test_flax_msgpack_can_handle_extensions(tmp_path):
+def test_flax_msgpack_can_handle_extensions(safe_tmp_path):
     """Test that scanner can handle all JAX/Flax file extensions."""
     extensions = [".msgpack", ".flax", ".orbax", ".jax"]
 
     for ext in extensions:
-        test_file = tmp_path / f"test{ext}"
+        test_file = safe_tmp_path / f"test{ext}"
         test_file.write_bytes(b"\x81\xa4test\xa5value")  # Simple msgpack
 
         assert FlaxMsgpackScanner.can_handle(str(test_file))
 
 
-def test_flax_msgpack_ml_context_confidence(tmp_path):
+def test_flax_msgpack_ml_context_confidence(safe_tmp_path):
     """Test ML context confidence scoring."""
-    path = tmp_path / "ml_model.msgpack"
+    path = safe_tmp_path / "ml_model.msgpack"
 
     # Create data that strongly indicates ML model
     data = {
@@ -314,9 +314,9 @@ def test_flax_msgpack_ml_context_confidence(tmp_path):
     assert "transformer" in result.metadata.get("model_architecture", "")
 
 
-def test_flax_msgpack_trailing_data(tmp_path):
+def test_flax_msgpack_trailing_data(safe_tmp_path):
     """Test detection of trailing data after msgpack content."""
-    path = tmp_path / "trailing.msgpack"
+    path = safe_tmp_path / "trailing.msgpack"
     data = {"params": {"w": [1, 2, 3]}}
     create_msgpack_file(path, data)
 
@@ -331,7 +331,7 @@ def test_flax_msgpack_trailing_data(tmp_path):
     assert any("trailing" in issue.message for issue in warning_issues)
 
 
-def test_flax_msgpack_large_binary_blob(tmp_path):
+def test_flax_msgpack_large_binary_blob(safe_tmp_path):
     """Test detection of suspiciously large binary blobs.
 
     Uses smaller sizes in CI environments for faster test execution.
@@ -349,7 +349,7 @@ def test_flax_msgpack_large_binary_blob(tmp_path):
         threshold_mb = 500
         blob_size_mb = 550
 
-    path = tmp_path / "large_blob.msgpack"
+    path = safe_tmp_path / "large_blob.msgpack"
     # Create large binary blob (exceeds threshold)
     large_blob = b"X" * (blob_size_mb * 1024 * 1024)
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
@@ -364,9 +364,9 @@ def test_flax_msgpack_large_binary_blob(tmp_path):
     assert any("Suspiciously large binary blob" in issue.message for issue in info_issues)
 
 
-def test_flax_msgpack_custom_config(tmp_path):
+def test_flax_msgpack_custom_config(safe_tmp_path):
     """Test scanner with custom configuration parameters."""
-    path = tmp_path / "test.msgpack"
+    path = safe_tmp_path / "test.msgpack"
     create_malicious_msgpack_file(path)
 
     # Test with custom config

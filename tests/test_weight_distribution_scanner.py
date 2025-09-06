@@ -251,7 +251,7 @@ class TestWeightDistributionScanner:
             os.unlink(temp_path)
 
     @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-    def test_tensorflow_savedmodel_scan(self, tmp_path):
+    def test_tensorflow_savedmodel_scan(self, safe_tmp_path):
         """Test scanning a TensorFlow SavedModel directory."""
         import sys
 
@@ -262,7 +262,7 @@ class TestWeightDistributionScanner:
         scanner = WeightDistributionScanner()
 
         model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])
-        saved_path = tmp_path / "tf_model"
+        saved_path = safe_tmp_path / "tf_model"
         tf.saved_model.save(model, str(saved_path))
 
         result = scanner.scan(str(saved_path))
@@ -287,11 +287,11 @@ class TestWeightDistributionScanner:
             os.unlink(temp_path)
 
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
-    def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
+    def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, safe_tmp_path):
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
         data_bytes = pickle.dumps(data, protocol=4)
-        zip_path = tmp_path / "model.pt"
+        zip_path = safe_tmp_path / "model.pt"
         with zipfile.ZipFile(zip_path, "w") as z:
             z.writestr("data.pkl", data_bytes)
 
@@ -306,10 +306,10 @@ class TestWeightDistributionScanner:
         assert weights["layer.weight"].shape == (2, 2)
 
     @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
-    def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
+    def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, safe_tmp_path):
         """Unsafe pickle opcodes should be flagged"""
         model = torch.nn.Linear(2, 2)
-        zip_path = tmp_path / "model.pt"
+        zip_path = safe_tmp_path / "model.pt"
         torch.save(model.state_dict(), zip_path)
 
         def fail_load(*_args, **_kwargs):

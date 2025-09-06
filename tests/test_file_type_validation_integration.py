@@ -41,10 +41,10 @@ class TestFileTypeValidationIntegration:
         return Path(__file__).parent / "assets/scenarios/license_scenarios"
 
     @pytest.fixture
-    def temp_test_dir(self, tmp_path):
+    def temp_test_dir(self, safe_tmp_path):
         """Create a temporary directory with copies of test data for modification."""
         test_data_dir = Path(__file__).parent / "assets/scenarios/license_scenarios"
-        temp_dir = tmp_path / "file_type_tests"
+        temp_dir = safe_tmp_path / "file_type_tests"
         temp_dir.mkdir()
 
         # Copy test data to temp directory
@@ -315,7 +315,7 @@ class TestFileTypeValidationIntegration:
         print(f"Security threat detections: {total_detections}")
         print(f"Undetected threats: {security_threats}")
 
-    def test_format_compatibility_matrix(self, tmp_path):
+    def test_format_compatibility_matrix(self, safe_tmp_path):
         """Test the file format compatibility matrix systematically."""
         test_cases = []
 
@@ -325,34 +325,34 @@ class TestFileTypeValidationIntegration:
         # Valid cases (should pass)
         if HAS_SAFETENSORS:
             # SafeTensors file
-            st_file = tmp_path / "valid.safetensors"
+            st_file = safe_tmp_path / "valid.safetensors"
             weights = {"test": np.array([1, 2, 3], dtype=np.float32)}
             save_file(weights, st_file)
             test_files.append((st_file, True, "Valid SafeTensors"))
 
         # NumPy file
-        npy_file = tmp_path / "valid.npy"
+        npy_file = safe_tmp_path / "valid.npy"
         np.save(npy_file, np.array([1, 2, 3]))
         test_files.append((npy_file, True, "Valid NumPy"))
 
         # ZIP file
-        zip_file = tmp_path / "valid.zip"
+        zip_file = safe_tmp_path / "valid.zip"
         with zipfile.ZipFile(zip_file, "w") as zipf:
             zipf.writestr("test.txt", "data")
         test_files.append((zip_file, True, "Valid ZIP"))
 
         # PyTorch ZIP (legitimate cross-format)
-        pt_zip = tmp_path / "model.pt"
+        pt_zip = safe_tmp_path / "model.pt"
         with zipfile.ZipFile(pt_zip, "w") as zipf:
             zipf.writestr("data.pkl", "tensor")
         test_files.append((pt_zip, True, "PyTorch ZIP"))
 
         # Invalid cases (should fail)
-        fake_npy = tmp_path / "fake.npy"
+        fake_npy = safe_tmp_path / "fake.npy"
         fake_npy.write_bytes(b"not numpy data")
         test_files.append((fake_npy, False, "Fake NumPy"))
 
-        fake_zip = tmp_path / "fake.zip"
+        fake_zip = safe_tmp_path / "fake.zip"
         fake_zip.write_bytes(b"not zip data")
         test_files.append((fake_zip, False, "Fake ZIP"))
 
@@ -366,33 +366,33 @@ class TestFileTypeValidationIntegration:
 
         assert len(test_cases) == 0, f"Format compatibility test failures: {test_cases}"
 
-    def test_edge_cases_and_corner_scenarios(self, tmp_path):
+    def test_edge_cases_and_corner_scenarios(self, safe_tmp_path):
         """Test edge cases and corner scenarios for file type validation."""
         edge_cases = []
 
         # Empty file
-        empty_file = tmp_path / "empty.pkl"
+        empty_file = safe_tmp_path / "empty.pkl"
         empty_file.touch()
         # Empty files should be valid (can't determine type)
         if not validate_file_type(str(empty_file)):
             edge_cases.append("Empty file validation failed")
 
         # Very small file
-        tiny_file = tmp_path / "tiny.h5"
+        tiny_file = safe_tmp_path / "tiny.h5"
         tiny_file.write_bytes(b"hi")
         # Small files should be valid (insufficient data for magic bytes)
         if not validate_file_type(str(tiny_file)):
             edge_cases.append("Tiny file validation failed")
 
         # File with unknown extension
-        unknown_file = tmp_path / "unknown.xyz"
+        unknown_file = safe_tmp_path / "unknown.xyz"
         unknown_file.write_bytes(b"some data")
         # Unknown extensions should be valid (can't validate)
         if not validate_file_type(str(unknown_file)):
             edge_cases.append("Unknown extension validation failed")
 
         # File with no extension
-        no_ext_file = tmp_path / "noextension"
+        no_ext_file = safe_tmp_path / "noextension"
         no_ext_file.write_bytes(b"some data")
         # No extension should be valid
         if not validate_file_type(str(no_ext_file)):

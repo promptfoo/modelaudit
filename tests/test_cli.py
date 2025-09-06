@@ -106,10 +106,10 @@ def test_scan_nonexistent_file():
     assert "not exist" in result.output.lower() or "not found" in result.output.lower()
 
 
-def test_scan_file(tmp_path):
+def test_scan_file(safe_tmp_path):
     """Test scanning a file."""
     # Create a test file
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     runner = CliRunner()
@@ -122,10 +122,10 @@ def test_scan_file(tmp_path):
     assert result.exit_code == 0
 
 
-def test_scan_directory(tmp_path):
+def test_scan_directory(safe_tmp_path):
     """Test scanning a directory."""
     # Create a test directory with files
-    test_dir = tmp_path / "test_dir"
+    test_dir = safe_tmp_path / "test_dir"
     test_dir.mkdir()
     (test_dir / "file1.pkl").write_bytes(b"test content 1")
     (test_dir / "file2.bin").write_bytes(b"test content 2")
@@ -138,13 +138,13 @@ def test_scan_directory(tmp_path):
     assert str(test_dir) in result.output  # Should mention the directory path
 
 
-def test_scan_multiple_paths(tmp_path):
+def test_scan_multiple_paths(safe_tmp_path):
     """Test scanning multiple paths."""
     # Create test files
-    file1 = tmp_path / "file1.dat"
+    file1 = safe_tmp_path / "file1.dat"
     file1.write_bytes(b"test content 1")
 
-    file2 = tmp_path / "file2.dat"
+    file2 = safe_tmp_path / "file2.dat"
     file2.write_bytes(b"test content 2")
 
     runner = CliRunner()
@@ -155,9 +155,9 @@ def test_scan_multiple_paths(tmp_path):
     assert str(file1) in result.output or str(file2) in result.output  # Should mention at least one file path
 
 
-def test_scan_with_blacklist(tmp_path):
+def test_scan_with_blacklist(safe_tmp_path):
     """Test scanning with blacklist patterns."""
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     runner = CliRunner()
@@ -173,9 +173,9 @@ def test_scan_with_blacklist(tmp_path):
     # With smart detection, the specific output format may vary
 
 
-def test_scan_json_output(tmp_path):
+def test_scan_json_output(safe_tmp_path):
     """Test scanning with JSON output format."""
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     runner = CliRunner()
@@ -192,12 +192,12 @@ def test_scan_json_output(tmp_path):
         pytest.fail("Output is not valid JSON")
 
 
-def test_scan_output_file(tmp_path):
+def test_scan_output_file(safe_tmp_path):
     """Test scanning with output to a file."""
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
-    output_file = tmp_path / "output.txt"
+    output_file = safe_tmp_path / "output.txt"
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
@@ -208,12 +208,12 @@ def test_scan_output_file(tmp_path):
     assert f"Results written to {output_file}" in result.output
 
 
-def test_scan_sbom_output(tmp_path):
+def test_scan_sbom_output(safe_tmp_path):
     """Test scanning with SBOM output."""
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
-    sbom_file = tmp_path / "sbom.json"
+    sbom_file = safe_tmp_path / "sbom.json"
 
     runner = CliRunner()
     runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file)])
@@ -225,12 +225,12 @@ def test_scan_sbom_output(tmp_path):
         pytest.fail("SBOM output is not valid JSON")
 
 
-def test_scan_output_utf8_locale(tmp_path):
+def test_scan_output_utf8_locale(safe_tmp_path):
     """Ensure output file is valid UTF-8 even with ASCII locale."""
-    test_file = tmp_path / "utf8_test.dat"
+    test_file = safe_tmp_path / "utf8_test.dat"
     test_file.write_bytes(b"test content")
 
-    output_file = tmp_path / "output.txt"
+    output_file = safe_tmp_path / "output.txt"
 
     runner = CliRunner()
     env = os.environ.copy()
@@ -244,12 +244,12 @@ def test_scan_output_utf8_locale(tmp_path):
         pytest.fail("Output file is not valid UTF-8")
 
 
-def test_scan_sbom_utf8_locale(tmp_path):
+def test_scan_sbom_utf8_locale(safe_tmp_path):
     """Ensure SBOM file is valid UTF-8 even with ASCII locale."""
-    test_file = tmp_path / "utf8_test.dat"
+    test_file = safe_tmp_path / "utf8_test.dat"
     test_file.write_bytes(b"test content")
 
-    sbom_file = tmp_path / "sbom.json"
+    sbom_file = safe_tmp_path / "sbom.json"
 
     runner = CliRunner()
     env = os.environ.copy()
@@ -263,9 +263,9 @@ def test_scan_sbom_utf8_locale(tmp_path):
         pytest.fail("SBOM file is not valid UTF-8")
 
 
-def test_scan_verbose_mode(tmp_path):
+def test_scan_verbose_mode(safe_tmp_path):
     """Test scanning in verbose mode."""
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     runner = CliRunner()
@@ -283,10 +283,10 @@ def test_scan_verbose_mode(tmp_path):
     # New output format may not contain "Scanning" text
 
 
-def test_scan_max_file_size(tmp_path):
+def test_scan_max_file_size(safe_tmp_path):
     """Test scanning with max file size limit."""
     # Create a file larger than our limit
-    test_file = tmp_path / "large_file.dat"
+    test_file = safe_tmp_path / "large_file.dat"
     test_file.write_bytes(b"x" * 1000)  # 1000 bytes
 
     runner = CliRunner()
@@ -451,12 +451,12 @@ def test_scan_mlflow_url_help():
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, safe_tmp_path):
     """Test successful scanning of a HuggingFace URL."""
     # Setup mocks
     mock_is_hf_url.return_value = True
     # Create a real temp directory for the test
-    test_model_dir = tmp_path / "test_model"
+    test_model_dir = safe_tmp_path / "test_model"
     test_model_dir.mkdir()
     # Create a dummy file inside to make it look like a real model
     (test_model_dir / "model.bin").write_text("dummy model")
@@ -513,12 +513,12 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_hf_url, safe_tmp_path):
     """Test scanning a HuggingFace URL that has security issues."""
     # Setup mocks
     mock_is_hf_url.return_value = True
     # Create a real temp directory for the test
-    test_model_dir = tmp_path / "test_model"
+    test_model_dir = safe_tmp_path / "test_model"
     test_model_dir.mkdir()
     # Create a dummy file inside to make it look like a real model
     (test_model_dir / "model.pkl").write_text("dummy model")
@@ -575,10 +575,10 @@ def test_scan_mixed_paths_and_urls(mock_scan):
 @patch("modelaudit.cli.download_pytorch_hub_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock_is_ph_url, tmp_path):
+def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock_is_ph_url, safe_tmp_path):
     """Test scanning a PyTorch Hub URL successfully."""
     mock_is_ph_url.return_value = True
-    test_dir = tmp_path / "hub"
+    test_dir = safe_tmp_path / "hub"
     test_dir.mkdir()
     (test_dir / "model.pt").write_text("dummy")
     mock_download.return_value = test_dir
@@ -613,10 +613,10 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, safe_tmp_path):
     """Test scanning a cloud storage URL successfully."""
     mock_is_cloud.return_value = True
-    test_dir = tmp_path / "cloud"
+    test_dir = safe_tmp_path / "cloud"
     test_dir.mkdir()
     (test_dir / "model.bin").write_text("dummy")
     mock_download.return_value = test_dir
@@ -649,10 +649,10 @@ def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, safe_tmp_path):
     """Test scanning a cloud storage URL that has issues."""
     mock_is_cloud.return_value = True
-    test_dir = tmp_path / "cloud"
+    test_dir = safe_tmp_path / "cloud"
     test_dir.mkdir()
     (test_dir / "model.pkl").write_text("dummy")
     mock_download.return_value = test_dir
@@ -989,7 +989,7 @@ def test_exit_code_clean_scan():
 
     from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
-    # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+    # Use tempfile.NamedTemporaryFile to avoid pytest safe_tmp_path fixture issues
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
         try:
             # Create a clean pickle file that should have no security issues
@@ -1026,7 +1026,7 @@ def test_exit_code_security_issues():
         def __reduce__(self):
             return (os.system, ('echo "This is a malicious pickle"',))
 
-    # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+    # Use tempfile.NamedTemporaryFile to avoid pytest safe_tmp_path fixture issues
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
         try:
             # Create a malicious pickle file

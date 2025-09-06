@@ -232,10 +232,10 @@ def malicious():
 class TestDetectJITScriptRisks:
     """Test the convenience function for file scanning."""
 
-    def test_scan_file(self, tmp_path):
+    def test_scan_file(self, safe_tmp_path):
         """Test scanning a file for JIT/Script risks."""
         # Create a test file with dangerous content
-        test_file = tmp_path / "model.pt"
+        test_file = safe_tmp_path / "model.pt"
         test_file.write_bytes(b"TorchScript\ntorch.ops.aten.system('evil')")
 
         findings = detect_jit_script_risks(str(test_file))
@@ -249,9 +249,9 @@ class TestDetectJITScriptRisks:
         assert findings[0].type == "error"
         assert "not found" in findings[0].message
 
-    def test_file_too_large(self, tmp_path):
+    def test_file_too_large(self, safe_tmp_path):
         """Test handling of files that are too large."""
-        large_file = tmp_path / "large.pt"
+        large_file = safe_tmp_path / "large.pt"
         large_file.write_bytes(b"x" * 100)
 
         # Test with very small max_size
@@ -260,24 +260,24 @@ class TestDetectJITScriptRisks:
         assert findings[0].type == "error"
         assert "too large" in findings[0].message
 
-    def test_model_type_detection_from_extension(self, tmp_path):
+    def test_model_type_detection_from_extension(self, safe_tmp_path):
         """Test that model type is detected from file extension."""
         # Test PyTorch extensions
         for ext in [".pt", ".pth", ".pts", ".torchscript"]:
-            test_file = tmp_path / f"model{ext}"
+            test_file = safe_tmp_path / f"model{ext}"
             test_file.write_bytes(b"torch.ops.aten.exec('bad')")
             findings = detect_jit_script_risks(str(test_file))
             assert any("torch.ops.aten.exec" in str(f) for f in findings)
 
         # Test TensorFlow extensions
         for ext in [".pb", ".h5", ".keras"]:
-            test_file = tmp_path / f"model{ext}"
+            test_file = safe_tmp_path / f"model{ext}"
             test_file.write_bytes(b"tf.py_func(evil)")
             findings = detect_jit_script_risks(str(test_file))
             assert any("tf.py_func" in str(f) for f in findings)
 
         # Test ONNX extension
-        test_file = tmp_path / "model.onnx"
+        test_file = safe_tmp_path / "model.onnx"
         test_file.write_bytes(b"PythonOp custom")
         findings = detect_jit_script_risks(str(test_file))
         assert any("Python operator" in str(f) for f in findings)

@@ -47,7 +47,7 @@ class TestFileTypeValidationDemo:
                 assert is_valid, f"Legitimate file {file_path.name} should be valid"
                 assert len(validation_issues) == 0, f"No validation issues expected for {file_path.name}"
 
-    def test_security_threat_detection_demo(self, tmp_path):
+    def test_security_threat_detection_demo(self, safe_tmp_path):
         """Demonstrate detection of file spoofing security threats."""
         print("\n=== File Type Validation Demo: Security Threats ===")
 
@@ -60,7 +60,7 @@ class TestFileTypeValidationDemo:
         ]
 
         for filename, content in attack_scenarios:
-            attack_file = tmp_path / filename
+            attack_file = safe_tmp_path / filename
             if isinstance(content, str):
                 attack_file.write_text(content)
             else:
@@ -79,18 +79,18 @@ class TestFileTypeValidationDemo:
             else:
                 print("   ⚠️  Threat not detected (may be due to permissive validation)")
 
-    def test_cross_format_compatibility_demo(self, tmp_path):
+    def test_cross_format_compatibility_demo(self, safe_tmp_path):
         """Demonstrate legitimate cross-format file compatibility."""
         print("\n=== File Type Validation Demo: Cross-Format Compatibility ===")
 
         # Create legitimate cross-format files
         # 1. PyTorch model saved as ZIP (common with torch.save())
-        pytorch_zip = tmp_path / "model.pt"
+        pytorch_zip = safe_tmp_path / "model.pt"
         with zipfile.ZipFile(pytorch_zip, "w") as zipf:
             zipf.writestr("data.pkl", "tensor data")
 
         # 2. PyTorch binary that contains pickle data
-        pytorch_pickle = tmp_path / "weights.bin"
+        pytorch_pickle = safe_tmp_path / "weights.bin"
         import pickle
 
         data = {"layer_weights": [1.0, 2.0, 3.0]}
@@ -135,12 +135,12 @@ class TestFileTypeValidationDemo:
             assert results["success"], "Directory scan should succeed"
             assert len(validation_warnings) == 0, "No validation warnings expected for legitimate directory"
 
-    def test_end_to_end_security_demo(self, test_data_dir, tmp_path):
+    def test_end_to_end_security_demo(self, test_data_dir, safe_tmp_path):
         """End-to-end demonstration of security validation in mixed directory."""
         print("\n=== File Type Validation Demo: End-to-End Security ===")
 
         # Create a mixed directory with legitimate and malicious files
-        mixed_dir = tmp_path / "security_test"
+        mixed_dir = safe_tmp_path / "security_test"
         mixed_dir.mkdir()
 
         # Copy a legitimate config file

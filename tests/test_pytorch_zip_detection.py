@@ -19,13 +19,13 @@ from modelaudit.utils.filetype import detect_file_format
 class TestPyTorchZipDetection:
     """Test PyTorch ZIP file detection and scanning."""
 
-    def test_detect_zip_bin_file(self, tmp_path):
+    def test_detect_zip_bin_file(self, safe_tmp_path):
         """Test that .bin files with ZIP format are detected correctly."""
         # Create a simple PyTorch model
         model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
 
         # Save as .bin file using torch.save (creates a ZIP)
-        bin_file = tmp_path / "pytorch_model.bin"
+        bin_file = safe_tmp_path / "pytorch_model.bin"
         torch.save(model_data, bin_file)
 
         # Verify file format detection
@@ -38,7 +38,7 @@ class TestPyTorchZipDetection:
         assert result.scanner_name == "pytorch_zip"
         assert result.bytes_scanned > 0
 
-    def test_scan_malicious_bin_file(self, tmp_path):
+    def test_scan_malicious_bin_file(self, safe_tmp_path):
         """Test detection of malicious code in .bin PyTorch files."""
 
         # Create a malicious pickle payload
@@ -49,7 +49,7 @@ class TestPyTorchZipDetection:
                 return (os.system, ("echo pwned",))
 
         # Create a ZIP file with the malicious pickle
-        bin_file = tmp_path / "malicious_model.bin"
+        bin_file = safe_tmp_path / "malicious_model.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # PyTorch models typically have data.pkl in archive/ directory
             pickle_data = io.BytesIO()
@@ -65,7 +65,7 @@ class TestPyTorchZipDetection:
             f"Expected CRITICAL issue but got: {[i.message for i in result.issues]}"
         )
 
-    def test_scan_safe_bin_file(self, tmp_path):
+    def test_scan_safe_bin_file(self, safe_tmp_path):
         """Test that safe .bin files don't trigger false positives."""
         # Create a safe PyTorch model
         model_data = {
@@ -75,7 +75,7 @@ class TestPyTorchZipDetection:
         }
 
         # Save as .bin file
-        bin_file = tmp_path / "safe_model.bin"
+        bin_file = safe_tmp_path / "safe_model.bin"
         torch.save(model_data, bin_file)
 
         # Scan the file
@@ -85,10 +85,10 @@ class TestPyTorchZipDetection:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0, f"Unexpected critical issues: {[i.message for i in critical_issues]}"
 
-    def test_scan_bin_with_multiple_pickles(self, tmp_path):
+    def test_scan_bin_with_multiple_pickles(self, safe_tmp_path):
         """Test scanning .bin files with multiple pickle files inside."""
         # Create a ZIP with multiple pickle files
-        bin_file = tmp_path / "multi_pickle.bin"
+        bin_file = safe_tmp_path / "multi_pickle.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # Add multiple pickle files
             safe_data = {"weights": [1, 2, 3]}
@@ -105,10 +105,10 @@ class TestPyTorchZipDetection:
         assert "pickle_files" in result.metadata
         assert len(result.metadata["pickle_files"]) >= 3
 
-    def test_scan_bin_without_pkl_extension(self, tmp_path):
+    def test_scan_bin_without_pkl_extension(self, safe_tmp_path):
         """Test scanning .bin files where pickle data doesn't have .pkl extension."""
         # Create a ZIP with pickle data in non-.pkl files
-        bin_file = tmp_path / "no_pkl_ext.bin"
+        bin_file = safe_tmp_path / "no_pkl_ext.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # PyTorch sometimes uses files without .pkl extension
             model_data = {"tensor": torch.tensor([1.0, 2.0])}
@@ -126,10 +126,10 @@ class TestPyTorchZipDetection:
         assert result.scanner_name == "pytorch_zip"
         assert result.bytes_scanned > 0
 
-    def test_bin_file_with_exec_pattern(self, tmp_path):
+    def test_bin_file_with_exec_pattern(self, safe_tmp_path):
         """Test detection of exec patterns in .bin files."""
         # Create a ZIP with exec pattern
-        bin_file = tmp_path / "exec_model.bin"
+        bin_file = safe_tmp_path / "exec_model.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # Create pickle with exec pattern in the data
             malicious_data = {"code": "exec('import os; os.system(\"ls\")')", "weights": [1, 2, 3]}
@@ -148,10 +148,10 @@ class TestPyTorchZipDetection:
 class TestPyTorchBinaryDetection:
     """Test that non-ZIP .bin files are handled correctly."""
 
-    def test_non_zip_bin_file(self, tmp_path):
+    def test_non_zip_bin_file(self, safe_tmp_path):
         """Test that non-ZIP .bin files are not handled by PyTorchZipScanner."""
         # Create a raw binary file (not ZIP)
-        bin_file = tmp_path / "raw_binary.bin"
+        bin_file = safe_tmp_path / "raw_binary.bin"
         bin_file.write_bytes(b"\x00\x01\x02\x03" * 100)
 
         # Verify file format detection
@@ -162,10 +162,10 @@ class TestPyTorchBinaryDetection:
         result = scan_file(str(bin_file))
         assert result.scanner_name == "pytorch_binary"
 
-    def test_pickle_bin_file(self, tmp_path):
+    def test_pickle_bin_file(self, safe_tmp_path):
         """Test that pickle .bin files are detected correctly."""
         # Create a .bin file that's actually a pickle (not ZIP)
-        bin_file = tmp_path / "pickle.bin"
+        bin_file = safe_tmp_path / "pickle.bin"
         data = {"weights": [1, 2, 3]}
         with open(bin_file, "wb") as f:
             pickle.dump(data, f)

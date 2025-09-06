@@ -5,25 +5,25 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 
 
-def test_pytorch_zip_scanner_can_handle(tmp_path):
+def test_pytorch_zip_scanner_can_handle(safe_tmp_path):
     """Test the can_handle method of PyTorchZipScanner."""
     # Test with actual PyTorch file
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_pytorch_zip(safe_tmp_path)
     assert PyTorchZipScanner.can_handle(str(model_path)) is True
 
     # Test with non-existent file
     assert PyTorchZipScanner.can_handle("nonexistent.pt") is False
 
     # Test with wrong extension
-    test_file = tmp_path / "model.h5"
+    test_file = safe_tmp_path / "model.h5"
     test_file.write_bytes(b"not a pytorch file")
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
-def create_pytorch_zip(tmp_path, *, malicious=False):
+def create_pytorch_zip(safe_tmp_path, *, malicious=False):
     """Create a mock PyTorch ZIP file for testing."""
     # Create a ZIP file that mimics a PyTorch model
-    zip_path = tmp_path / "model.pt"
+    zip_path = safe_tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         # Add a version file
@@ -50,9 +50,9 @@ def create_pytorch_zip(tmp_path, *, malicious=False):
     return zip_path
 
 
-def test_pytorch_zip_scanner_safe_model(tmp_path):
+def test_pytorch_zip_scanner_safe_model(safe_tmp_path):
     """Test scanning a safe PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_pytorch_zip(safe_tmp_path)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -65,9 +65,9 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
     assert len(error_issues) == 0
 
 
-def test_pytorch_zip_scanner_malicious_model(tmp_path):
+def test_pytorch_zip_scanner_malicious_model(safe_tmp_path):
     """Test scanning a malicious PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path, malicious=True)
+    model_path = create_pytorch_zip(safe_tmp_path, malicious=True)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -77,10 +77,10 @@ def test_pytorch_zip_scanner_malicious_model(tmp_path):
     assert any("eval" in issue.message.lower() for issue in result.issues)
 
 
-def test_pytorch_zip_scanner_invalid_zip(tmp_path):
+def test_pytorch_zip_scanner_invalid_zip(safe_tmp_path):
     """Test scanning an invalid ZIP file."""
     # Create an invalid ZIP file
-    invalid_path = tmp_path / "invalid.pt"
+    invalid_path = safe_tmp_path / "invalid.pt"
     invalid_path.write_bytes(b"This is not a valid ZIP file")
 
     scanner = PyTorchZipScanner()
@@ -94,10 +94,10 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     )
 
 
-def test_pytorch_zip_scanner_missing_data_pkl(tmp_path):
+def test_pytorch_zip_scanner_missing_data_pkl(safe_tmp_path):
     """Test scanning a PyTorch ZIP file without data.pkl."""
     # Create a ZIP file without data.pkl
-    zip_path = tmp_path / "model.pt"
+    zip_path = safe_tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
@@ -110,10 +110,10 @@ def test_pytorch_zip_scanner_missing_data_pkl(tmp_path):
     assert any("data.pkl" in issue.message for issue in result.issues)
 
 
-def test_pytorch_zip_scanner_with_blacklist(tmp_path):
+def test_pytorch_zip_scanner_with_blacklist(safe_tmp_path):
     """Test PyTorch ZIP scanner with custom blacklist patterns."""
     # Create a ZIP file with content that matches our blacklist
-    zip_path = tmp_path / "model.pt"
+    zip_path = safe_tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
@@ -132,11 +132,11 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
     assert len(blacklist_issues) > 0
 
 
-def test_pytorch_pickle_file_unsupported(tmp_path):
+def test_pytorch_pickle_file_unsupported(safe_tmp_path):
     """Raw pickle files with .pt extension should be unsupported."""
     from tests.assets.generators.generate_evil_pickle import EvilClass
 
-    file_path = tmp_path / "raw_pickle.pt"
+    file_path = safe_tmp_path / "raw_pickle.pt"
     with file_path.open("wb") as f:
         pickle.dump(EvilClass(), f)
 
@@ -147,7 +147,7 @@ def test_pytorch_pickle_file_unsupported(tmp_path):
     assert any("zip" in issue.message.lower() or "pytorch" in issue.message.lower() for issue in result.issues)
 
 
-def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
+def test_pytorch_zip_scanner_closes_bytesio(safe_tmp_path, monkeypatch):
     """Ensure BytesIO objects are properly closed after scanning."""
     import io
 
@@ -160,7 +160,7 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
 
     monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
 
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_pytorch_zip(safe_tmp_path)
     scanner = PyTorchZipScanner()
     scanner.scan(str(model_path))
 

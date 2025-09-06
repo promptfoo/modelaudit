@@ -5,8 +5,8 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 
 
-def create_executorch_archive(tmp_path, *, malicious: bool = False):
-    zip_path = tmp_path / "model.ptl"
+def create_executorch_archive(safe_tmp_path, *, malicious: bool = False):
+    zip_path = safe_tmp_path / "model.ptl"
     with zipfile.ZipFile(zip_path, "w") as z:
         z.writestr("version", "1")
         data: dict[str, object] = {"weights": [1, 2, 3]}
@@ -21,16 +21,16 @@ def create_executorch_archive(tmp_path, *, malicious: bool = False):
     return zip_path
 
 
-def test_executorch_scanner_can_handle(tmp_path):
-    path = create_executorch_archive(tmp_path)
+def test_executorch_scanner_can_handle(safe_tmp_path):
+    path = create_executorch_archive(safe_tmp_path)
     assert ExecuTorchScanner.can_handle(str(path))
-    other = tmp_path / "model.h5"
+    other = safe_tmp_path / "model.h5"
     other.write_bytes(b"data")
     assert not ExecuTorchScanner.can_handle(str(other))
 
 
-def test_executorch_scanner_safe_model(tmp_path):
-    path = create_executorch_archive(tmp_path)
+def test_executorch_scanner_safe_model(safe_tmp_path):
+    path = create_executorch_archive(safe_tmp_path)
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(path))
     assert result.success is True
@@ -39,16 +39,16 @@ def test_executorch_scanner_safe_model(tmp_path):
     assert not critical
 
 
-def test_executorch_scanner_malicious(tmp_path):
-    path = create_executorch_archive(tmp_path, malicious=True)
+def test_executorch_scanner_malicious(safe_tmp_path):
+    path = create_executorch_archive(safe_tmp_path, malicious=True)
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any("eval" in i.message.lower() for i in result.issues)
 
 
-def test_executorch_scanner_invalid_zip(tmp_path):
-    file_path = tmp_path / "bad.ptl"
+def test_executorch_scanner_invalid_zip(safe_tmp_path):
+    file_path = safe_tmp_path / "bad.ptl"
     file_path.write_bytes(b"not zip")
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(file_path))

@@ -43,14 +43,14 @@ except ImportError:
 class TestFalsePositiveFixes:
     """Test suite for verifying false positive fixes don't break legitimate model scanning."""
 
-    def test_gpt2_style_model_no_false_positives(self, tmp_path):
+    def test_gpt2_style_model_no_false_positives(self, safe_tmp_path):
         """Test that GPT-2 style models don't generate false positives."""
         # Create a GPT-2 style model structure
         test_files = []
 
         # 1. Create SafeTensors file with GPT-2 layer patterns
         if HAS_SAFETENSORS:
-            safetensors_path = tmp_path / "model.safetensors"
+            safetensors_path = safe_tmp_path / "model.safetensors"
             gpt2_weights = {
                 "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32) * 0.02,
                 "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32) * 0.02,
@@ -62,7 +62,7 @@ class TestFalsePositiveFixes:
             test_files.append(safetensors_path)
 
         # 2. Create HuggingFace config file
-        config_path = tmp_path / "config.json"
+        config_path = safe_tmp_path / "config.json"
         gpt2_config = {
             "_name_or_path": "openai-community/gpt2",
             "model_type": "gpt2",
@@ -81,7 +81,7 @@ class TestFalsePositiveFixes:
 
         # 3. Create TensorFlow H5 file (not Keras)
         if HAS_H5PY:
-            h5_path = tmp_path / "tf_model.h5"
+            h5_path = safe_tmp_path / "tf_model.h5"
             with h5py.File(h5_path, "w") as f:
                 model_weights = f.create_group("model_weights")
                 layer_group = model_weights.create_group("transformer/h_0/mlp/c_fc")
@@ -109,7 +109,7 @@ class TestFalsePositiveFixes:
             assert result["has_warnings"] is False, f"File {file_path.name} should not have warnings"
             assert result["has_errors"] is False, f"File {file_path.name} should not have errors"
 
-    def test_huggingface_patterns_not_flagged(self, tmp_path):
+    def test_huggingface_patterns_not_flagged(self, safe_tmp_path):
         """Test that common HuggingFace configuration patterns are not flagged."""
         test_configs = [
             # GPT-2 config
@@ -156,7 +156,7 @@ class TestFalsePositiveFixes:
         ]
 
         for config_info in test_configs:
-            config_path = tmp_path / config_info["filename"]
+            config_path = safe_tmp_path / config_info["filename"]
             with open(config_path, "w") as f:
                 json.dump(config_info["content"], f)
 
@@ -168,12 +168,12 @@ class TestFalsePositiveFixes:
                 f"HuggingFace config {config_info['filename']} should not have warnings"
             )
 
-    def test_tensorflow_h5_not_flagged_as_warning(self, tmp_path):
+    def test_tensorflow_h5_not_flagged_as_warning(self, safe_tmp_path):
         """Test that TensorFlow H5 files don't generate warnings."""
         if not HAS_H5PY:
             pytest.skip("h5py not installed")
 
-        tf_h5_path = tmp_path / "tensorflow_model.h5"
+        tf_h5_path = safe_tmp_path / "tensorflow_model.h5"
 
         with h5py.File(tf_h5_path, "w") as f:
             # Create clear TensorFlow structure
@@ -272,13 +272,13 @@ class TestFalsePositiveFixes:
         has_extreme = any("extremely large weight values" in a["description"] for a in anomalies)
         assert has_outlier or has_extreme, "Should detect the injected anomaly"
 
-    def test_bert_model_no_false_positive_executables(self, tmp_path):
+    def test_bert_model_no_false_positive_executables(self, safe_tmp_path):
         """Test that BERT models with random MZ bytes don't trigger false positives."""
         if not HAS_TORCH:
             pytest.skip("torch not installed")
 
         # Create a realistic BERT model binary file
-        bert_file = tmp_path / "bert-base-uncased-pytorch_model.bin"
+        bert_file = safe_tmp_path / "bert-base-uncased-pytorch_model.bin"
 
         # Create model weights with realistic sizes
         np.random.seed(42)
@@ -314,10 +314,10 @@ class TestFalsePositiveFixes:
             "Should not detect Windows executable in BERT model"
         )
 
-    def test_malicious_files_still_detected(self, tmp_path):
+    def test_malicious_files_still_detected(self, safe_tmp_path):
         """Regression test: ensure malicious files are still detected after false positive fixes."""
         # Test 1: Malicious pickle file
-        evil_pickle_path = tmp_path / "evil.pickle"
+        evil_pickle_path = safe_tmp_path / "evil.pickle"
         # Create a simple malicious pickle that tries to execute system commands
         import pickle
 
@@ -336,7 +336,7 @@ class TestFalsePositiveFixes:
 
         # Test 2: Malicious Keras model
         if HAS_H5PY:
-            evil_keras_path = tmp_path / "evil_model.h5"
+            evil_keras_path = safe_tmp_path / "evil_model.h5"
             with h5py.File(evil_keras_path, "w") as f:
                 malicious_config = {
                     "class_name": "Sequential",
@@ -359,7 +359,7 @@ class TestFalsePositiveFixes:
 
         # Test 3: Real executable at beginning of .bin file should still be detected
         if True:  # Always run this test
-            exe_bin_path = tmp_path / "malicious_model.bin"
+            exe_bin_path = safe_tmp_path / "malicious_model.bin"
             # Create a file that starts with a Windows executable
             # This simulates someone renaming an .exe to .bin
             with open(exe_bin_path, "wb") as f:
@@ -376,7 +376,7 @@ class TestFalsePositiveFixes:
             )
 
         # Test 4: Malicious manifest file (use ML-specific filename to ensure it's scanned)
-        evil_manifest_path = tmp_path / "config.json"  # Use standard config.json name
+        evil_manifest_path = safe_tmp_path / "config.json"  # Use standard config.json name
         malicious_manifest = {
             "model_name": "legitimate_model",
             "model_type": "bert",  # Add ML context to ensure scanning
@@ -405,10 +405,10 @@ class TestFalsePositiveFixes:
             f"{[str(issue) for issue in scan_result.issues]}"
         )
 
-    def test_comprehensive_gpt2_model_scan(self, tmp_path):
+    def test_comprehensive_gpt2_model_scan(self, safe_tmp_path):
         """Comprehensive test simulating a complete GPT-2 model directory scan."""
         # Create a realistic GPT-2 model directory structure
-        model_dir = tmp_path / "gpt2_model"
+        model_dir = safe_tmp_path / "gpt2_model"
         model_dir.mkdir()
 
         # Main model config

@@ -8,9 +8,9 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 
 
-def test_unknown_file(tmp_path):
+def test_unknown_file(safe_tmp_path):
     """Test scanning an unknown file format."""
-    unknown_file = tmp_path / "test.abc"
+    unknown_file = safe_tmp_path / "test.abc"
     unknown_file.write_bytes(b"abcdefg")
     results = scan_model_directory_or_file(str(unknown_file))
 
@@ -34,10 +34,10 @@ def test_nonexistent_file():
     assert any("not exist" in issue.message.lower() for issue in results.issues)
 
 
-def test_directory_scan(tmp_path):
+def test_directory_scan(safe_tmp_path):
     """Test scanning a directory with multiple files."""
     # Create a directory with multiple files
-    test_dir = tmp_path / "test_dir"
+    test_dir = safe_tmp_path / "test_dir"
     test_dir.mkdir()
 
     # Create a few test files with model-like extensions
@@ -71,10 +71,10 @@ def test_directory_scan(tmp_path):
     )
 
 
-def test_max_file_size(tmp_path):
+def test_max_file_size(safe_tmp_path):
     """Test max_file_size parameter."""
     # Create a test file
-    test_file = tmp_path / "large_file.dat"
+    test_file = safe_tmp_path / "large_file.dat"
     test_file.write_bytes(b"x" * 1000)  # 1000 bytes
 
     # Scan with max_file_size smaller than the file
@@ -100,23 +100,23 @@ def test_max_file_size(tmp_path):
     assert len(large_file_issues) == 0
 
 
-def test_max_total_size(tmp_path):
+def test_max_total_size(safe_tmp_path):
     """Test max_total_size parameter."""
     import pickle
 
-    file1 = tmp_path / "a.pkl"
+    file1 = safe_tmp_path / "a.pkl"
     with file1.open("wb") as f:
         pickle.dump({"data": "x" * 100}, f)
 
-    file2 = tmp_path / "b.pkl"
+    file2 = safe_tmp_path / "b.pkl"
     with file2.open("wb") as f:
         pickle.dump({"data": "y" * 100}, f)
 
-    file3 = tmp_path / "c.pkl"
+    file3 = safe_tmp_path / "c.pkl"
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
 
-    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+    results = scan_model_directory_or_file(str(safe_tmp_path), max_total_size=150)
 
     assert results.success is True
 
@@ -129,10 +129,10 @@ def test_max_total_size(tmp_path):
     assert len(termination_messages) == 1
 
 
-def test_timeout(tmp_path, monkeypatch):
+def test_timeout(safe_tmp_path, monkeypatch):
     """Test timeout parameter."""
     # Create a test file
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     # Instead of mocking time.time, let's check if the timeout parameter
@@ -152,10 +152,10 @@ def test_timeout(tmp_path, monkeypatch):
     assert results.duration >= 0
 
 
-def test_progress_callback(tmp_path):
+def test_progress_callback(safe_tmp_path):
     """Test progress callback functionality."""
     # Create a test file
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     # Create a callback to track progress
@@ -239,11 +239,11 @@ def test_merge_scan_results():
     assert any("Issue from scanner2" in issue.message for issue in result1.issues)
 
 
-def test_blacklist_patterns(tmp_path):
+def test_blacklist_patterns(safe_tmp_path):
     """Test blacklist patterns parameter."""
     # This test is a placeholder since we don't have the actual implementation
     # of how blacklist patterns are used in the scanners
-    test_file = tmp_path / "test_file.dat"
+    test_file = safe_tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
 
     # Scan with blacklist patterns
@@ -256,9 +256,9 @@ def test_blacklist_patterns(tmp_path):
     assert results.success is True
 
 
-def test_invalid_config_values(tmp_path):
+def test_invalid_config_values(safe_tmp_path):
     """Test validation of configuration parameters."""
-    test_file = tmp_path / "test_invalid.dat"
+    test_file = safe_tmp_path / "test_invalid.dat"
     test_file.write_bytes(b"data")
 
     with pytest.raises(ValueError):

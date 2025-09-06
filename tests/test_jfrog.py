@@ -27,14 +27,14 @@ class TestJFrogURLDetection:
 
 class TestJFrogDownload:
     @patch("modelaudit.utils.jfrog.requests.get")
-    def test_download_success(self, mock_get, tmp_path):
+    def test_download_success(self, mock_get, safe_tmp_path):
         # Mock successful response
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 
         result = download_artifact(
-            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path, api_token="test-token"
+            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path, api_token="test-token"
         )
         assert result.exists()
         assert result.read_bytes() == b"data"
@@ -60,7 +60,7 @@ class TestJFrogDownload:
         mock_rmtree.assert_called()
 
     @patch("modelaudit.utils.jfrog.requests.get")
-    def test_authentication_methods(self, mock_get, tmp_path):
+    def test_authentication_methods(self, mock_get, safe_tmp_path):
         """Test different authentication methods."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
@@ -68,20 +68,20 @@ class TestJFrogDownload:
 
         # Test API token
         download_artifact(
-            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path, api_token="test-api-token"
+            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path, api_token="test-api-token"
         )
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "test-api-token"
 
         # Test access token
         download_artifact(
-            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path, access_token="test-access-token"
+            "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path, access_token="test-access-token"
         )
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer test-access-token"
 
     @patch("modelaudit.utils.jfrog.requests.get")
-    def test_environment_variables(self, mock_get, tmp_path, monkeypatch):
+    def test_environment_variables(self, mock_get, safe_tmp_path, monkeypatch):
         """Test authentication via environment variables."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
@@ -89,26 +89,26 @@ class TestJFrogDownload:
 
         # Test JFROG_API_TOKEN
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
-        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path)
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "env-api-token"
 
         # Test JFROG_ACCESS_TOKEN (clear API token first)
         monkeypatch.delenv("JFROG_API_TOKEN", raising=False)
         monkeypatch.setenv("JFROG_ACCESS_TOKEN", "env-access-token")
-        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path)
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer env-access-token"
 
     @patch("modelaudit.utils.jfrog.requests.get")
-    def test_no_authentication(self, mock_get, tmp_path, caplog):
+    def test_no_authentication(self, mock_get, safe_tmp_path, caplog):
         """Test anonymous access when no authentication is provided."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 
         with caplog.at_level(logging.WARNING, logger="modelaudit.utils.jfrog"):
-            download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+            download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path)
 
         assert "No JFrog authentication provided. Attempting anonymous access." in caplog.text
 
@@ -117,7 +117,7 @@ class TestJFrogDownload:
         assert not call_args[1]["headers"]  # Empty headers dict
 
     @patch("modelaudit.utils.jfrog.requests.get")
-    def test_dotenv_file_support(self, mock_get, tmp_path, monkeypatch):
+    def test_dotenv_file_support(self, mock_get, safe_tmp_path, monkeypatch):
         """Test that .env file variables are loaded via python-dotenv."""
         # This test verifies that dotenv is loaded, but since we can't easily mock
         # the dotenv loading in tests, we verify the environment variable fallback works
@@ -127,7 +127,7 @@ class TestJFrogDownload:
 
         # Simulate .env file loaded environment variable
         monkeypatch.setenv("JFROG_API_TOKEN", "dotenv-token")
-        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=safe_tmp_path)
 
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "dotenv-token"

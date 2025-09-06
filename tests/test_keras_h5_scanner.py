@@ -11,24 +11,24 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 
-def test_keras_h5_scanner_can_handle(tmp_path):
+def test_keras_h5_scanner_can_handle(safe_tmp_path):
     """Test the can_handle method of KerasH5Scanner."""
     # Test with actual H5 file
-    model_path = create_mock_h5_file(tmp_path)
+    model_path = create_mock_h5_file(safe_tmp_path)
     assert KerasH5Scanner.can_handle(str(model_path)) is True
 
     # Test with non-existent file
     assert KerasH5Scanner.can_handle("nonexistent.h5") is False
 
     # Test with wrong extension
-    test_file = tmp_path / "model.pt"
+    test_file = safe_tmp_path / "model.pt"
     test_file.write_bytes(b"not an h5 file")
     assert KerasH5Scanner.can_handle(str(test_file)) is False
 
 
-def create_mock_h5_file(tmp_path, *, malicious=False):
+def create_mock_h5_file(safe_tmp_path, *, malicious=False):
     """Create a mock HDF5 file for testing."""
-    h5_path = tmp_path / "model.h5"
+    h5_path = safe_tmp_path / "model.h5"
 
     with h5py.File(h5_path, "w") as f:
         # Create a minimal Keras model structure
@@ -70,9 +70,9 @@ def create_mock_h5_file(tmp_path, *, malicious=False):
     return h5_path
 
 
-def test_keras_h5_scanner_safe_model(tmp_path):
+def test_keras_h5_scanner_safe_model(safe_tmp_path):
     """Test scanning a safe Keras H5 model."""
-    model_path = create_mock_h5_file(tmp_path)
+    model_path = create_mock_h5_file(safe_tmp_path)
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
@@ -85,9 +85,9 @@ def test_keras_h5_scanner_safe_model(tmp_path):
     assert len(error_issues) == 0
 
 
-def test_keras_h5_scanner_malicious_model(tmp_path):
+def test_keras_h5_scanner_malicious_model(safe_tmp_path):
     """Test scanning a malicious Keras H5 model."""
-    model_path = create_mock_h5_file(tmp_path, malicious=True)
+    model_path = create_mock_h5_file(safe_tmp_path, malicious=True)
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
@@ -100,10 +100,10 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
     )
 
 
-def test_keras_h5_scanner_invalid_h5(tmp_path):
+def test_keras_h5_scanner_invalid_h5(safe_tmp_path):
     """Test scanning an invalid H5 file."""
     # Create an invalid H5 file (without magic bytes)
-    invalid_path = tmp_path / "invalid.h5"
+    invalid_path = safe_tmp_path / "invalid.h5"
     invalid_path.write_bytes(b"This is not a valid HDF5 file")
 
     scanner = KerasH5Scanner()
@@ -117,10 +117,10 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     )
 
 
-def test_keras_h5_scanner_with_blacklist(tmp_path):
+def test_keras_h5_scanner_with_blacklist(safe_tmp_path):
     """Test Keras H5 scanner with custom blacklist patterns."""
     # Create a proper H5 file with malicious content
-    h5_path = tmp_path / "model.h5"
+    h5_path = safe_tmp_path / "model.h5"
 
     with h5py.File(h5_path, "w") as f:
         # Create model config with suspicious content
@@ -164,9 +164,9 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
     assert len(relevant_issues) > 0
 
 
-def test_keras_h5_scanner_empty_file(tmp_path):
+def test_keras_h5_scanner_empty_file(safe_tmp_path):
     """Test scanning an empty file."""
-    empty_path = tmp_path / "empty.h5"
+    empty_path = safe_tmp_path / "empty.h5"
     empty_path.write_bytes(b"")  # Create empty file
 
     scanner = KerasH5Scanner()
@@ -182,10 +182,10 @@ def test_keras_h5_scanner_empty_file(tmp_path):
     )
 
 
-def test_tensorflow_h5_file_detection(tmp_path):
+def test_tensorflow_h5_file_detection(safe_tmp_path):
     """Test that TensorFlow H5 files are properly detected and not flagged as warnings."""
     # Create a TensorFlow-style H5 file (without Keras model_config)
-    tf_h5_path = tmp_path / "tf_model.h5"
+    tf_h5_path = safe_tmp_path / "tf_model.h5"
 
     with h5py.File(tf_h5_path, "w") as f:
         # Create TensorFlow-style structure without model_config
@@ -225,10 +225,10 @@ def test_tensorflow_h5_file_detection(tmp_path):
     assert len(high_severity_issues) == 0, "TensorFlow H5 files should not generate warnings"
 
 
-def test_non_keras_h5_file_debug_only(tmp_path):
+def test_non_keras_h5_file_debug_only(safe_tmp_path):
     """Test that non-Keras H5 files generate DEBUG messages only."""
     # Create an H5 file that's neither Keras nor TensorFlow
-    generic_h5_path = tmp_path / "generic_data.h5"
+    generic_h5_path = safe_tmp_path / "generic_data.h5"
 
     with h5py.File(generic_h5_path, "w") as f:
         # Create generic data structure (not ML-related)
@@ -258,10 +258,10 @@ def test_non_keras_h5_file_debug_only(tmp_path):
     assert len(high_severity_issues) == 0, "Generic H5 files should not generate warnings"
 
 
-def test_actual_keras_model_still_scans_properly(tmp_path):
+def test_actual_keras_model_still_scans_properly(safe_tmp_path):
     """Test that actual Keras models are still scanned properly."""
     # Create a proper Keras model file
-    keras_path = create_mock_h5_file(tmp_path, malicious=False)
+    keras_path = create_mock_h5_file(safe_tmp_path, malicious=False)
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(keras_path))
@@ -280,10 +280,10 @@ def test_actual_keras_model_still_scans_properly(tmp_path):
     assert "layer_counts" in result.metadata
 
 
-def test_malicious_keras_model_still_detected(tmp_path):
+def test_malicious_keras_model_still_detected(safe_tmp_path):
     """Test that malicious Keras models are still properly detected."""
     # Create a malicious Keras model file
-    malicious_path = create_mock_h5_file(tmp_path, malicious=True)
+    malicious_path = create_mock_h5_file(safe_tmp_path, malicious=True)
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(malicious_path))
@@ -300,13 +300,13 @@ def test_malicious_keras_model_still_detected(tmp_path):
     assert len(malicious_issues) > 0, "Malicious Keras models should still be detected"
 
 
-def test_regression_no_false_positives_for_legitimate_files(tmp_path):
+def test_regression_no_false_positives_for_legitimate_files(safe_tmp_path):
     """Regression test to ensure legitimate ML H5 files don't generate false positives."""
     # Test multiple legitimate file types
     test_files = []
 
     # 1. TensorFlow SavedModel converted to H5
-    tf_path = tmp_path / "tf_model.h5"
+    tf_path = safe_tmp_path / "tf_model.h5"
     with h5py.File(tf_path, "w") as f:
         weights = f.create_group("model_weights")
         layer = weights.create_group("dense_1")
@@ -316,14 +316,14 @@ def test_regression_no_false_positives_for_legitimate_files(tmp_path):
     test_files.append(("TensorFlow H5", tf_path))
 
     # 2. Generic scientific data H5
-    science_path = tmp_path / "experiment.h5"
+    science_path = safe_tmp_path / "experiment.h5"
     with h5py.File(science_path, "w") as f:
         f.create_dataset("temperature_data", data=[20.1, 21.5, 22.0])
         f.create_dataset("pressure_data", data=[1013.25, 1012.8, 1014.1])
     test_files.append(("Scientific data H5", science_path))
 
     # 3. PyTorch model weights saved in H5 format
-    pytorch_path = tmp_path / "pytorch_weights.h5"
+    pytorch_path = safe_tmp_path / "pytorch_weights.h5"
     with h5py.File(pytorch_path, "w") as f:
         f.create_dataset("layer1.weight", data=[[0.5, -0.3], [0.7, 0.1]])
         f.create_dataset("layer1.bias", data=[0.01, -0.02])

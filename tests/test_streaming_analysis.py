@@ -6,8 +6,8 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils import streaming
 
 
-def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
-    file_path = tmp_path / "sample.pkl"
+def test_stream_analyze_file_uses_scanner(safe_tmp_path, monkeypatch):
+    file_path = safe_tmp_path / "sample.pkl"
     file_path.write_bytes(b"\x80\x04K*\x85q\x00.")
     url = f"file://{file_path}"
 
@@ -37,8 +37,8 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
     assert result.metadata.get("scanner_used") is True
 
 
-def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
-    file_path = tmp_path / "sample.pkl"
+def test_stream_analyze_file_falls_back_to_bytes_to_read(safe_tmp_path, monkeypatch):
+    file_path = safe_tmp_path / "sample.pkl"
     file_path.write_bytes(b"\x80\x04K*\x85q\x00." * 2)
     url = f"file://{file_path}"
 

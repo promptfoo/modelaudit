@@ -6,9 +6,9 @@ from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity
 
 
-def test_header_extension_mismatch_warning(tmp_path):
+def test_header_extension_mismatch_warning(safe_tmp_path):
     """A .bin file containing pickle data should NOT trigger a warning (common for PyTorch/HF models)."""
-    file_path = tmp_path / "model.bin"
+    file_path = safe_tmp_path / "model.bin"
     with file_path.open("wb") as f:
         pickle.dump({"a": 1}, f)
 

@@ -29,14 +29,14 @@ class TestAssetInventoryIntegration:
     """Comprehensive tests for asset inventory functionality."""
 
     @pytest.fixture
-    def complex_model_dir(self, tmp_path: Path) -> Path:
+    def complex_model_dir(self, safe_tmp_path: Path) -> Path:
         """Create a complex model directory with multiple file types."""
-        model_dir = tmp_path / "complex_model"
+        model_dir = safe_tmp_path / "complex_model"
         model_dir.mkdir()
 
         # Create SafeTensors model with multiple tensors
         safetensors_file = model_dir / "model.safetensors"
-        # Parent dir already exists via model_dir.mkdir(); tmp_path isolation guarantees a clean path.
+        # Parent dir already exists via model_dir.mkdir(); safe_tmp_path isolation guarantees a clean path.
 
         # Keep arrays tiny and deterministic to ensure fast, reliable tests
         safetensors_data = {
@@ -136,7 +136,7 @@ class TestAssetInventoryIntegration:
 
         # Verify nested contents have correct paths
         nested_paths = {c["path"] for c in zip_asset.contents}
-        zip_path = str(Path(complex_model_dir) / "weights.zip")
+        zip_path = str((Path(complex_model_dir) / "weights.zip").resolve())
         expected_nested = {
             f"{zip_path}:model_state.pkl",
             f"{zip_path}:optimizer.safetensors",
@@ -163,7 +163,7 @@ class TestAssetInventoryIntegration:
 
         # Should include files from subdirectories
         tokenizer_config_path = str(
-            complex_model_dir / "tokenizer" / "tokenizer_config.json",
+            (complex_model_dir / "tokenizer" / "tokenizer_config.json").resolve(),
         )
         assert tokenizer_config_path in asset_paths
 
@@ -227,10 +227,10 @@ class TestAssetInventoryIntegration:
             if "size" in asset:
                 assert isinstance(asset["size"], int)
 
-    def test_asset_inventory_nested_archives(self, tmp_path: Path):
+    def test_asset_inventory_nested_archives(self, safe_tmp_path: Path):
         """Test asset inventory with deeply nested archives."""
         # Create a ZIP containing another ZIP containing a model
-        inner_zip = tmp_path / "inner.zip"
+        inner_zip = safe_tmp_path / "inner.zip"
         with zipfile.ZipFile(inner_zip, "w") as inner_zf:
             # Add SafeTensors file to inner ZIP
             safetensors_data = {"weight": np.array([1, 2, 3, 4]).astype(np.float32)}
@@ -243,7 +243,7 @@ class TestAssetInventoryIntegration:
                     inner_zf.writestr("model.safetensors", f.read())
                 os.unlink(tmp.name)
 
-        outer_zip = tmp_path / "outer.zip"
+        outer_zip = safe_tmp_path / "outer.zip"
         with zipfile.ZipFile(outer_zip, "w") as outer_zf, open(inner_zip, "rb") as f:
             outer_zf.writestr("models/inner.zip", f.read())
 
@@ -279,17 +279,17 @@ class TestAssetInventoryIntegration:
         assert "tensors" in nested_st
         assert "weight" in nested_st["tensors"]
 
-    def test_asset_inventory_error_handling(self, tmp_path: Path):
+    def test_asset_inventory_error_handling(self, safe_tmp_path: Path):
         """Test asset inventory with files that cause scan errors."""
         # Create a corrupted file that will be treated as unknown (no specific scanner handles .xyz files)
-        corrupted_file = tmp_path / "corrupted.xyz"
+        corrupted_file = safe_tmp_path / "corrupted.xyz"
         corrupted_file.write_bytes(b"invalid data")
 
         # Create a valid file alongside it - use recognized filename for ManifestScanner
-        valid_file = tmp_path / "config.json"
+        valid_file = safe_tmp_path / "config.json"
         valid_file.write_text('{"model_type": "transformer", "hidden_size": 768}')
 
-        results = scan_model_directory_or_file(str(tmp_path))
+        results = scan_model_directory_or_file(str(safe_tmp_path))
 
         # Should still have assets even with errors
         assert hasattr(results, "assets")
@@ -305,10 +305,10 @@ class TestAssetInventoryIntegration:
         assert len(valid_assets) == 1
         assert valid_assets[0].type == "manifest"
 
-    def test_asset_inventory_single_file_scan(self, tmp_path: Path):
+    def test_asset_inventory_single_file_scan(self, safe_tmp_path: Path):
         """Test asset inventory when scanning a single file."""
         # Create a single SafeTensors file
-        single_file = tmp_path / "single_model.safetensors"
+        single_file = safe_tmp_path / "single_model.safetensors"
         data = {
             "layer1.weight": np.random.randn(100, 50).astype(np.float32),
             "layer1.bias": np.random.randn(100).astype(np.float32),
@@ -330,9 +330,9 @@ class TestAssetInventoryIntegration:
         assert "layer1.bias" in asset.tensors
         assert hasattr(asset, "size") and asset.size is not None
 
-    def test_asset_inventory_empty_directory(self, tmp_path: Path):
+    def test_asset_inventory_empty_directory(self, safe_tmp_path: Path):
         """Test asset inventory with empty directory."""
-        empty_dir = tmp_path / "empty"
+        empty_dir = safe_tmp_path / "empty"
         empty_dir.mkdir()
 
         results = scan_model_directory_or_file(str(empty_dir))
@@ -370,10 +370,10 @@ class TestAssetInventoryIntegration:
                 assert asset.path.startswith(str(mit_dir))
                 assert Path(asset.path).exists()
 
-    def test_asset_inventory_large_tensor_metadata(self, tmp_path: Path):
+    def test_asset_inventory_large_tensor_metadata(self, safe_tmp_path: Path):
         """Test asset inventory with models containing many tensors."""
         # Create SafeTensors file with many tensors (like a real transformer)
-        large_model = tmp_path / "large_transformer.safetensors"
+        large_model = safe_tmp_path / "large_transformer.safetensors"
 
         # Simulate a transformer model structure
         tensors = {}
@@ -405,10 +405,10 @@ class TestAssetInventoryIntegration:
         assert "transformer.layer.0.attention.self.query.weight" in tensor_names
         assert "transformer.layer.11.output.dense.weight" in tensor_names
 
-    def test_asset_inventory_cli_output_formatting(self, tmp_path: Path):
+    def test_asset_inventory_cli_output_formatting(self, safe_tmp_path: Path):
         """Test that CLI output formatting is readable and well-structured."""
         # Create a model with various asset types
-        model_dir = tmp_path / "formatting_test"
+        model_dir = safe_tmp_path / "formatting_test"
         model_dir.mkdir()
 
         # SafeTensors with tensors
@@ -439,10 +439,10 @@ class TestAssetInventoryIntegration:
         # Users can use --format json to see detailed asset information
 
     @pytest.mark.performance
-    def test_asset_inventory_performance_large_directory(self, tmp_path: Path):
+    def test_asset_inventory_performance_large_directory(self, safe_tmp_path: Path):
         """Test asset inventory performance with many files."""
         # Create directory with many small files
-        large_dir = tmp_path / "large_dir"
+        large_dir = safe_tmp_path / "large_dir"
         large_dir.mkdir()
 
         # Create 50 small JSON files

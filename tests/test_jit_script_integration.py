@@ -17,7 +17,7 @@ except ImportError:
 class TestJITScriptIntegration:
     """Test that JIT/Script detection is integrated with scanners."""
 
-    def test_pickle_scanner_with_torchscript(self, tmp_path):
+    def test_pickle_scanner_with_torchscript(self, safe_tmp_path):
         """Test that pickle scanner detects TorchScript patterns."""
         # Create a pickle file with TorchScript-like content
         data = {
@@ -26,7 +26,7 @@ class TestJITScriptIntegration:
             "weights": [1.0, 2.0, 3.0],
         }
 
-        pickle_file = tmp_path / "model_with_jit.pkl"
+        pickle_file = safe_tmp_path / "model_with_jit.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -43,7 +43,7 @@ class TestJITScriptIntegration:
         if failed_checks:
             assert any("torch.ops.aten.system" in str(c.details) for c in failed_checks)
 
-    def test_pickle_scanner_without_jit(self, tmp_path):
+    def test_pickle_scanner_without_jit(self, safe_tmp_path):
         """Test that clean pickle files pass JIT/Script check."""
         # Create a clean pickle file
         data = {
@@ -52,7 +52,7 @@ class TestJITScriptIntegration:
             "config": {"learning_rate": 0.001},
         }
 
-        pickle_file = tmp_path / "clean_model.pkl"
+        pickle_file = safe_tmp_path / "clean_model.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -66,12 +66,12 @@ class TestJITScriptIntegration:
             # Should have a passing check
             assert any(c.status.value == "passed" for c in jit_checks), "Should pass JIT/Script check"
 
-    def test_jit_check_disabled(self, tmp_path):
+    def test_jit_check_disabled(self, safe_tmp_path):
         """Test that JIT/Script check can be disabled."""
         # Create a pickle file with JIT code
         data = {"code": b"torch.jit.script"}
 
-        pickle_file = tmp_path / "model_with_jit.pkl"
+        pickle_file = safe_tmp_path / "model_with_jit.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -88,7 +88,7 @@ class TestJITScriptIntegration:
 class TestONNXScannerJITIntegration:
     """Test JIT/Script detection in ONNX scanner."""
 
-    def test_onnx_scanner_with_python_op(self, tmp_path):
+    def test_onnx_scanner_with_python_op(self, safe_tmp_path):
         """Test that ONNX scanner detects Python operators as JIT risks."""
         import onnx
         from onnx import TensorProto, helper
@@ -115,7 +115,7 @@ class TestONNXScannerJITIntegration:
         model = helper.make_model(graph)
 
         # Save the model
-        model_path = tmp_path / "model_with_python_op.onnx"
+        model_path = safe_tmp_path / "model_with_python_op.onnx"
         onnx.save(model, str(model_path))
 
         # Scan the model

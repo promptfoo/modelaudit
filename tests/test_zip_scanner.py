@@ -19,14 +19,14 @@ class TestZipScanner:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             with zipfile.ZipFile(tmp.name, "w") as z:
                 z.writestr("test.txt", "Hello World")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            assert ZipScanner.can_handle(tmp_path) is True
+            assert ZipScanner.can_handle(safe_tmp_path) is True
             assert ZipScanner.can_handle("/path/to/file.txt") is False
             assert ZipScanner.can_handle("/path/to/file.pkl") is False
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_symlink_outside_extraction_root(self):
         """Symlinks resolving outside the extraction root should be flagged."""
@@ -38,14 +38,14 @@ class TestZipScanner:
                 info.create_system = 3
                 info.external_attr = (stat.S_IFLNK | 0o777) << 16
                 z.writestr(info, "../evil.txt")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert any("outside" in i.message.lower() for i in symlink_issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_symlink_to_critical_path(self):
         """Symlinks targeting critical system paths should be flagged."""
@@ -57,14 +57,14 @@ class TestZipScanner:
                 info.create_system = 3
                 info.external_attr = (stat.S_IFLNK | 0o777) << 16
                 z.writestr(info, "/etc/passwd")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert any("critical system" in i.message.lower() for i in symlink_issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_zip_bytes_scanned_single_count(self):
         """Ensure bytes scanned equals the sum of embedded files once."""
@@ -76,15 +76,15 @@ class TestZipScanner:
                 data2 = pickle.dumps({"b": 2})
                 z.writestr("one.pkl", data1)
                 z.writestr("two.pkl", data2)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
             expected = len(data1) + len(data2)
             assert result.bytes_scanned == expected
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_simple_zip(self):
         """Test scanning a simple ZIP file with text files"""
@@ -92,17 +92,17 @@ class TestZipScanner:
             with zipfile.ZipFile(tmp.name, "w") as z:
                 z.writestr("readme.txt", "This is a readme file")
                 z.writestr("data.json", '{"key": "value"}')
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
             assert result.bytes_scanned > 0
             # May have some debug/info issues about unknown formats
             error_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert len(error_issues) == 0
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_zip_with_pickle(self):
         """Test scanning a ZIP file containing a pickle file"""
@@ -113,17 +113,17 @@ class TestZipScanner:
 
                 pickle_data = pickle.dumps({"safe": "data"})
                 z.writestr("model.pkl", pickle_data)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
             assert result.bytes_scanned > 0
             # The pickle scanner was run on the embedded file
             # Check that we scanned the pickle data
             assert result.bytes_scanned >= len(pickle_data)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_nested_zip(self):
         """Test scanning nested ZIP files"""
@@ -159,10 +159,10 @@ class TestZipScanner:
                 z.writestr("../../../etc/passwd", "malicious content")
                 z.writestr("/etc/passwd", "malicious content")
                 z.writestr("safe.txt", "safe content")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
 
             # Should have detected directory traversal attempts
@@ -177,7 +177,7 @@ class TestZipScanner:
             for issue in traversal_issues:
                 assert issue.severity == IssueSeverity.CRITICAL
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_windows_traversal_detection(self):
         """Ensure Windows-style path traversal is caught"""
@@ -185,16 +185,16 @@ class TestZipScanner:
             with zipfile.ZipFile(tmp.name, "w") as z:
                 z.writestr("..\\evil.txt", "malicious")
                 z.writestr("safe.txt", "ok")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
             assert len(traversal_issues) >= 1
             for issue in traversal_issues:
                 assert issue.severity == IssueSeverity.CRITICAL
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_zip_bomb_detection(self):
         """Test detection of potential zip bombs (high compression ratio)"""
@@ -204,17 +204,17 @@ class TestZipScanner:
                 # Keep highly compressible but smaller to speed CI
                 large_content = "A" * 300000  # 300KB of repeated 'A's
                 z.writestr("suspicious.txt", large_content)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
 
             # Should detect high compression ratio
             compression_issues = [i for i in result.issues if "compression ratio" in i.message.lower()]
             assert len(compression_issues) >= 1
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
@@ -254,19 +254,19 @@ class TestZipScanner:
                 # Create many entries
                 for i in range(100):
                     z.writestr(f"file{i}.txt", f"Content {i}")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
             # Configure scanner with low max entries
             scanner = ZipScanner(config={"max_zip_entries": 50})
-            result = scanner.scan(tmp_path)
+            result = scanner.scan(safe_tmp_path)
 
             assert result.success is True
             # Should have a warning about too many entries
             entries_issues = [i for i in result.issues if "too many entries" in i.message.lower()]
             assert len(entries_issues) >= 1
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""
@@ -283,10 +283,10 @@ class TestZipScanner:
                 dangerous_obj = DangerousClass()
                 pickle_data = pickle.dumps(dangerous_obj)
                 z.writestr("dangerous.pkl", pickle_data)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             # The scan should complete even if there are errors in the pickle scanner
             assert result.success is True
 
@@ -297,7 +297,7 @@ class TestZipScanner:
             # or it may detect the dangerous content
             # Either way, it should have scanned the file
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_nonexistent_file(self):
         """Test scanning a file that doesn't exist"""
@@ -310,12 +310,12 @@ class TestZipScanner:
         """Test scanning a file that's not a valid ZIP"""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp.write(b"This is not a zip file")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is False
             assert len(result.issues) > 0
             assert any("not a valid zip" in issue.message.lower() for issue in result.issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)

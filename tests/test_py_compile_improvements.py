@@ -17,7 +17,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 class TestPyCompileImprovements:
     """Test that py_compile validation reduces false positives."""
 
-    def test_pickle_false_positive_reduction(self, tmp_path):
+    def test_pickle_false_positive_reduction(self, safe_tmp_path):
         """Test that strings containing 'eval(' but not actual code aren't flagged."""
         # Create a pickle with a string that looks suspicious but isn't code
         data = {
@@ -26,7 +26,7 @@ class TestPyCompileImprovements:
             "actual_code": "import os; os.system('ls')",  # This IS dangerous code
         }
 
-        pickle_path = tmp_path / "test.pkl"
+        pickle_path = safe_tmp_path / "test.pkl"
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
@@ -38,7 +38,7 @@ class TestPyCompileImprovements:
         assert len(dangerous_issues) == 1
         assert "validated as executable code" in dangerous_issues[0].message
 
-    def test_pickle_base64_validation(self, tmp_path):
+    def test_pickle_base64_validation(self, safe_tmp_path):
         """Test that base64 strings are checked for Python code."""
         # Create Python code and encode it
         dangerous_code = "import subprocess; subprocess.call(['rm', '-rf', '/'])"
@@ -53,7 +53,7 @@ class TestPyCompileImprovements:
             "safe": encoded_benign,
         }
 
-        pickle_path = tmp_path / "encoded.pkl"
+        pickle_path = safe_tmp_path / "encoded.pkl"
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
@@ -65,9 +65,9 @@ class TestPyCompileImprovements:
         assert len(encoded_issues) >= 1
         assert "subprocess" in str(encoded_issues[0].details)
 
-    def test_keras_lambda_layer_validation(self, tmp_path):
+    def test_keras_lambda_layer_validation(self, safe_tmp_path):
         """Test Lambda layer code validation in Keras models."""
-        h5_path = tmp_path / "lambda_test.h5"
+        h5_path = safe_tmp_path / "lambda_test.h5"
 
         with h5py.File(h5_path, "w") as f:
             # Model with actual dangerous Lambda code
@@ -94,9 +94,9 @@ class TestPyCompileImprovements:
         assert len(lambda_issues) == 1
         assert "Dynamic code execution" in lambda_issues[0].details.get("code_analysis", "")
 
-    def test_keras_lambda_false_positive_reduction(self, tmp_path):
+    def test_keras_lambda_false_positive_reduction(self, safe_tmp_path):
         """Test that Lambda layers with non-code strings aren't flagged as dangerous."""
-        h5_path = tmp_path / "lambda_safe.h5"
+        h5_path = safe_tmp_path / "lambda_safe.h5"
 
         with h5py.File(h5_path, "w") as f:
             # Model with Lambda that has a string that's not valid Python
@@ -170,7 +170,7 @@ def process_data(x):
 class TestFalsePositiveMetrics:
     """Measure false positive reduction with py_compile validation."""
 
-    def test_measure_false_positive_reduction(self, tmp_path):
+    def test_measure_false_positive_reduction(self, safe_tmp_path):
         """Quantify how py_compile reduces false positives."""
         # Test cases that would be false positives without validation
         false_positive_cases = [
@@ -215,7 +215,7 @@ class TestFalsePositiveMetrics:
         scanner = PickleScanner()
 
         for case in false_positive_cases:
-            pickle_path = tmp_path / f"fp_{case['type']}.pkl"
+            pickle_path = safe_tmp_path / f"fp_{case['type']}.pkl"
             with open(pickle_path, "wb") as f:
                 pickle.dump(case, f)
 
@@ -226,7 +226,7 @@ class TestFalsePositiveMetrics:
                 new_false_positives += 1
 
         for case in true_positive_cases:
-            pickle_path = tmp_path / f"tp_{case['type']}.pkl"
+            pickle_path = safe_tmp_path / f"tp_{case['type']}.pkl"
             with open(pickle_path, "wb") as f:
                 pickle.dump(case, f)
 
@@ -271,13 +271,13 @@ class TestFalsePositiveMetrics:
 class TestEdgeCases:
     """Test edge cases for py_compile validation."""
 
-    def test_obfuscated_code_detection(self, tmp_path):
+    def test_obfuscated_code_detection(self, safe_tmp_path):
         """Test that obfuscated code is still flagged as suspicious."""
         # Create obfuscated but valid Python code
         obfuscated = "exec(chr(95)+chr(95)+chr(105)+chr(109)+chr(112)+chr(111)+chr(114)+chr(116)+chr(95)+chr(95))"
 
         data = {"obfuscated": obfuscated}
-        pickle_path = tmp_path / "obfuscated.pkl"
+        pickle_path = safe_tmp_path / "obfuscated.pkl"
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 
@@ -288,7 +288,7 @@ class TestEdgeCases:
         exec_issues = [i for i in result.issues if "exec" in i.message.lower()]
         assert len(exec_issues) > 0
 
-    def test_multiline_code_validation(self, tmp_path):
+    def test_multiline_code_validation(self, safe_tmp_path):
         """Test validation of multiline Python code."""
         multiline_code = """
 import os
@@ -302,7 +302,7 @@ malicious()
 """
 
         data = {"code": multiline_code}
-        pickle_path = tmp_path / "multiline.pkl"
+        pickle_path = safe_tmp_path / "multiline.pkl"
         with open(pickle_path, "wb") as f:
             pickle.dump(data, f)
 

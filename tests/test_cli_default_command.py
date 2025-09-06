@@ -36,19 +36,19 @@ class TestDefaultCommandGroup:
         """Test that providing a file path without command defaults to scan."""
         runner = CliRunner()
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+            safe_tmp_path = Path(tmp.name)
             tmp.write(b"test content")
 
         try:
             # Test without explicit scan command
-            result = runner.invoke(cli, [str(tmp_path)])
+            result = runner.invoke(cli, [str(safe_tmp_path)])
 
             # Should not fail due to unknown command
             assert "No such command" not in result.output
             assert "Usage:" not in result.output or "error" not in result.output.lower()
 
         finally:
-            tmp_path.unlink(missing_ok=True)
+            safe_tmp_path.unlink(missing_ok=True)
 
     def test_default_scan_command_with_multiple_paths(self):
         """Test that providing multiple paths without command defaults to scan."""
@@ -57,39 +57,39 @@ class TestDefaultCommandGroup:
             tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp1,
             tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp2,
         ):
-            tmp_path1 = Path(tmp1.name)
-            tmp_path2 = Path(tmp2.name)
+            safe_tmp_path1 = Path(tmp1.name)
+            safe_tmp_path2 = Path(tmp2.name)
             tmp1.write(b"test content 1")
             tmp2.write(b"test content 2")
 
         try:
             # Test without explicit scan command
-            result = runner.invoke(cli, [str(tmp_path1), str(tmp_path2)])
+            result = runner.invoke(cli, [str(safe_tmp_path1), str(safe_tmp_path2)])
 
             # Should not fail due to unknown command
             assert "No such command" not in result.output
             assert result.exit_code != 2  # Exit code 2 typically indicates command not found
 
         finally:
-            tmp_path1.unlink(missing_ok=True)
-            tmp_path2.unlink(missing_ok=True)
+            safe_tmp_path1.unlink(missing_ok=True)
+            safe_tmp_path2.unlink(missing_ok=True)
 
     def test_explicit_scan_command_still_works(self):
         """Test that explicit scan command still works as expected."""
         runner = CliRunner()
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+            safe_tmp_path = Path(tmp.name)
             tmp.write(b"test content")
 
         try:
             # Test with explicit scan command
-            result = runner.invoke(cli, ["scan", str(tmp_path)])
+            result = runner.invoke(cli, ["scan", str(safe_tmp_path)])
 
             # Should work normally
             assert "No such command" not in result.output
 
         finally:
-            tmp_path.unlink(missing_ok=True)
+            safe_tmp_path.unlink(missing_ok=True)
 
     def test_other_commands_work_normally(self):
         """Test that other commands like 'doctor' work without issues."""
@@ -126,18 +126,18 @@ class TestDefaultCommandGroup:
         """Test that options work correctly with default command."""
         runner = CliRunner()
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+            safe_tmp_path = Path(tmp.name)
             tmp.write(b"test content")
 
         try:
             # Test with options before path
-            result = runner.invoke(cli, ["--format", "json", str(tmp_path)])
+            result = runner.invoke(cli, ["--format", "json", str(safe_tmp_path)])
 
             # Should work with default scan command
             assert "No such command" not in result.output
 
         finally:
-            tmp_path.unlink(missing_ok=True)
+            safe_tmp_path.unlink(missing_ok=True)
 
     def test_urls_as_default_arguments(self):
         """Test that URLs work with default command."""

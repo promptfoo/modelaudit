@@ -9,10 +9,10 @@ from modelaudit.sbom import generate_sbom
 class TestSBOMLicenseIntegration:
     """Test SBOM generation with license metadata."""
 
-    def test_sbom_includes_license_metadata(self, tmp_path):
+    def test_sbom_includes_license_metadata(self, safe_tmp_path):
         """Test that SBOM includes license metadata."""
         # Create a file with license
-        test_file = tmp_path / "licensed_file.py"
+        test_file = safe_tmp_path / "licensed_file.py"
         content = """# Copyright 2024 Test Corp
 # SPDX-License-Identifier: Apache-2.0
 
@@ -39,9 +39,9 @@ def test():
         assert "expression" in license_expr
         assert "Apache-2.0" in license_expr["expression"]
 
-    def test_sbom_includes_copyright_properties(self, tmp_path):
+    def test_sbom_includes_copyright_properties(self, safe_tmp_path):
         """Test that SBOM includes copyright information as properties."""
-        test_file = tmp_path / "copyrighted_file.py"
+        test_file = safe_tmp_path / "copyrighted_file.py"
         content = """# Copyright 2024 Example Corp
 # Copyright (c) 2023 Another Corp
 # Licensed under MIT License
@@ -67,18 +67,18 @@ def example():
         assert "Example Corp" in copyright_prop["value"]
         assert "Another Corp" in copyright_prop["value"]
 
-    def test_sbom_includes_file_type_properties(self, tmp_path):
+    def test_sbom_includes_file_type_properties(self, safe_tmp_path):
         """Test that SBOM includes file type properties."""
         # Create dataset file
-        dataset_file = tmp_path / "data.csv"
+        dataset_file = safe_tmp_path / "data.csv"
         dataset_file.write_text("name,age\nAlice,25\nBob,30")
 
         # Create model file
-        model_file = tmp_path / "model.pkl"
+        model_file = safe_tmp_path / "model.pkl"
         model_file.write_bytes(b"dummy model content")
 
-        results = scan_model_directory_or_file(str(tmp_path))
-        sbom_json = generate_sbom([str(tmp_path)], results)
+        results = scan_model_directory_or_file(str(safe_tmp_path))
+        sbom_json = generate_sbom([str(safe_tmp_path)], results)
         sbom_data = json.loads(sbom_json)
 
         components = sbom_data["components"]
@@ -113,10 +113,10 @@ def example():
         assert is_model_prop is not None
         assert is_model_prop["value"] == "true"
 
-    def test_sbom_includes_risk_score_with_license_issues(self, tmp_path):
+    def test_sbom_includes_risk_score_with_license_issues(self, safe_tmp_path):
         """Test that SBOM includes updated risk scores based on license issues."""
         # Create a file with non-commercial license (should generate warning)
-        test_file = tmp_path / "nc_file.csv"
+        test_file = safe_tmp_path / "nc_file.csv"
         content = """# Creative Commons Attribution NonCommercial
 # This dataset cannot be used commercially
 name,value
@@ -143,9 +143,9 @@ name,value
         risk_score = int(risk_score_prop["value"])
         assert risk_score >= 0  # Should have some risk score
 
-    def test_sbom_risk_score_with_critical_issue(self, tmp_path):
+    def test_sbom_risk_score_with_critical_issue(self, safe_tmp_path):
         """Critical issues should increase SBOM risk score."""
-        malicious_file = tmp_path / "malicious.pkl"
+        malicious_file = safe_tmp_path / "malicious.pkl"
         malicious_file.write_bytes(b"subprocess.call('ls')")
 
         results = scan_model_directory_or_file(str(malicious_file))
@@ -162,9 +162,9 @@ name,value
         assert risk_score_prop is not None
         assert int(risk_score_prop["value"]) >= 5
 
-    def test_sbom_handles_files_without_license_metadata(self, tmp_path):
+    def test_sbom_handles_files_without_license_metadata(self, safe_tmp_path):
         """Test that SBOM handles files without license metadata gracefully."""
-        test_file = tmp_path / "no_license.py"
+        test_file = safe_tmp_path / "no_license.py"
         content = """# Just some code without license info
 
 def function():
@@ -185,18 +185,18 @@ def function():
         # Should handle gracefully even if no licenses
         assert "licenses" in component or "licenses" not in component  # Either is valid
 
-    def test_sbom_with_license_files_detected(self, tmp_path):
+    def test_sbom_with_license_files_detected(self, safe_tmp_path):
         """Test SBOM when license files are detected in directory."""
         # Create a code file
-        code_file = tmp_path / "code.py"
+        code_file = safe_tmp_path / "code.py"
         code_file.write_text("def function(): pass")
 
         # Create license file
-        license_file = tmp_path / "LICENSE"
+        license_file = safe_tmp_path / "LICENSE"
         license_file.write_text("MIT License")
 
-        results = scan_model_directory_or_file(str(tmp_path))
-        sbom_json = generate_sbom([str(tmp_path)], results)
+        results = scan_model_directory_or_file(str(safe_tmp_path))
+        sbom_json = generate_sbom([str(safe_tmp_path)], results)
         sbom_data = json.loads(sbom_json)
 
         # Find the code component
@@ -216,9 +216,9 @@ def function():
             if license_files_prop:
                 assert int(license_files_prop["value"]) >= 1
 
-    def test_sbom_multiple_licenses(self, tmp_path):
+    def test_sbom_multiple_licenses(self, safe_tmp_path):
         """Test SBOM generation with multiple licenses in one file."""
-        test_file = tmp_path / "dual_license.py"
+        test_file = safe_tmp_path / "dual_license.py"
         content = """# Licensed under MIT License
 # Also available under Apache-2.0
 # SPDX-License-Identifier: MIT
@@ -239,11 +239,11 @@ def dual_licensed():
         # Note: The actual number depends on how many patterns match
         assert len(licenses) >= 1
 
-    def test_sbom_legacy_license_field_compatibility(self, tmp_path):
+    def test_sbom_legacy_license_field_compatibility(self, safe_tmp_path):
         """Test SBOM generation with legacy license field for backward compatibility."""
         # This test ensures that if there's a legacy license field in metadata,
         # it gets included in the SBOM
-        test_file = tmp_path / "legacy.py"
+        test_file = safe_tmp_path / "legacy.py"
         test_file.write_text("def legacy(): pass")
 
         # Mock the scan to include legacy license field
@@ -274,9 +274,9 @@ def dual_licensed():
                 license_expressions = [lic.get("expression", "") for lic in licenses]
                 assert any("GPL-3.0" in expr for expr in license_expressions)
 
-    def test_sbom_validates_as_cyclonedx(self, tmp_path):
+    def test_sbom_validates_as_cyclonedx(self, safe_tmp_path):
         """Test that generated SBOM is valid CycloneDX format."""
-        test_file = tmp_path / "valid_test.py"
+        test_file = safe_tmp_path / "valid_test.py"
         content = """# SPDX-License-Identifier: MIT
 def test(): pass
 """

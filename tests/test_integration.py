@@ -185,13 +185,13 @@ def test_scan_multiple_paths_combined_results(temp_model_dir):
     assert len(combined_results["issues"]) >= len(results1_issues) + len(results2_issues)
 
 
-def test_file_type_validation_integration(tmp_path):
+def test_file_type_validation_integration(safe_tmp_path):
     """Test that file type validation is integrated into the main scanning workflow."""
     from modelaudit.core import scan_file
     from modelaudit.scanners.base import IssueSeverity
 
     # Create a file with mismatched extension and content
-    fake_h5 = tmp_path / "malicious.h5"
+    fake_h5 = safe_tmp_path / "malicious.h5"
     fake_h5.write_bytes(b"this is not hdf5 data" + b"\x00" * 100)
 
     result = scan_file(str(fake_h5))
@@ -208,14 +208,14 @@ def test_file_type_validation_integration(tmp_path):
     assert "spoofing" in validation_issue.message or "security" in validation_issue.message
 
 
-def test_valid_file_type_no_warnings(tmp_path):
+def test_valid_file_type_no_warnings(safe_tmp_path):
     """Test that valid file types don't generate false positive warnings."""
     import zipfile
 
     from modelaudit.core import scan_file
 
     # Create a valid ZIP file with .zip extension
-    zip_file = tmp_path / "valid.zip"
+    zip_file = safe_tmp_path / "valid.zip"
     with zipfile.ZipFile(zip_file, "w") as zipf:
         zipf.writestr("test.txt", "data")
 
@@ -227,14 +227,14 @@ def test_valid_file_type_no_warnings(tmp_path):
     assert len(validation_issues) == 0
 
 
-def test_pytorch_zip_file_valid(tmp_path):
+def test_pytorch_zip_file_valid(safe_tmp_path):
     """Test that PyTorch files saved as ZIP are properly validated."""
     import zipfile
 
     from modelaudit.core import scan_file
 
     # Create a PyTorch file that's actually a ZIP (common with torch.save())
-    pt_file = tmp_path / "model.pt"
+    pt_file = safe_tmp_path / "model.pt"
     with zipfile.ZipFile(pt_file, "w") as zipf:
         zipf.writestr("data.pkl", "tensor data")
 
@@ -246,12 +246,12 @@ def test_pytorch_zip_file_valid(tmp_path):
     assert len(validation_issues) == 0
 
 
-def test_small_file_no_false_positives(tmp_path):
+def test_small_file_no_false_positives(safe_tmp_path):
     """Test that very small files don't trigger false validation warnings."""
     from modelaudit.core import scan_file
 
     # Create a very small file
-    small_file = tmp_path / "tiny.h5"
+    small_file = safe_tmp_path / "tiny.h5"
     small_file.write_bytes(b"hi")
 
     result = scan_file(str(small_file))
@@ -262,7 +262,7 @@ def test_small_file_no_false_positives(tmp_path):
     assert len(validation_issues) == 0
 
 
-def test_tensorflow_savedmodel_integration(tmp_path):
+def test_tensorflow_savedmodel_integration(safe_tmp_path):
     """Test integration of TensorFlow SavedModel scanning with the main workflow."""
     import pytest
 
@@ -289,7 +289,7 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
 
     # Save the model to the test directory
-    savedmodel_path = tmp_path / "test_tensorflow_model"
+    savedmodel_path = safe_tmp_path / "test_tensorflow_model"
     tf.saved_model.save(model, str(savedmodel_path))
 
     # Test using the core scanning functionality
@@ -334,18 +334,18 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     # The important thing is that the scanning completed successfully
 
     # Test scanning the parent directory containing the SavedModel
-    parent_results = scan_model_directory_or_file(str(tmp_path))
+    parent_results = scan_model_directory_or_file(str(safe_tmp_path))
     assert parent_results.success is True
     assert parent_results.files_scanned >= 1
 
     # Test CLI scanning of parent directory
-    parent_result = runner.invoke(cli, ["scan", str(tmp_path), "--format", "json"])
+    parent_result = runner.invoke(cli, ["scan", str(safe_tmp_path), "--format", "json"])
     assert parent_result.exit_code in [0, 1]
     parent_output = json.loads(parent_result.output)
     assert parent_output["files_scanned"] >= 1
 
 
-def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
+def test_tensorflow_savedmodel_with_anomalous_weights_integration(safe_tmp_path):
     """Test TensorFlow SavedModel scanning with artificially anomalous weights."""
     import pytest
 
@@ -374,7 +374,7 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
         model.get_layer("anomalous_layer").set_weights(weights)
 
     # Save the model
-    savedmodel_path = tmp_path / "anomalous_tensorflow_model"
+    savedmodel_path = safe_tmp_path / "anomalous_tensorflow_model"
     tf.saved_model.save(model, str(savedmodel_path))
 
     # Scan the model

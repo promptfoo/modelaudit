@@ -26,7 +26,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 class TestCVE202013092Detection:
     """Test detection of CVE-2020-13092 (scikit-learn joblib.load vulnerability)."""
 
-    def test_detect_cve_2020_13092_basic_pattern(self, tmp_path):
+    def test_detect_cve_2020_13092_basic_pattern(self, safe_tmp_path):
         """Test basic detection of CVE-2020-13092 patterns."""
         # Create a malicious pickle that simulates sklearn model with os.system
         malicious_content = b"""
@@ -36,7 +36,7 @@ class TestCVE202013092Detection:
         os.system
         """
 
-        test_file = tmp_path / "malicious_sklearn.pkl"
+        test_file = safe_tmp_path / "malicious_sklearn.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))
@@ -57,7 +57,7 @@ class TestCVE202013092Detection:
         assert cve_issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
         assert "sklearn" in cve_issue.message.lower() or "sklearn" in str(cve_issue.details).lower()
 
-    def test_detect_cve_2020_13092_joblib_with_system_call(self, tmp_path):
+    def test_detect_cve_2020_13092_joblib_with_system_call(self, safe_tmp_path):
         """Test detection of joblib.load combined with system calls."""
         # Create a pickle that contains joblib.load and os.system patterns
         malicious_code = """
@@ -69,7 +69,7 @@ class TestCVE202013092Detection:
 
         pickle_data = pickle.dumps({"code": malicious_code})
 
-        test_file = tmp_path / "joblib_system.pkl"
+        test_file = safe_tmp_path / "joblib_system.pkl"
         test_file.write_bytes(pickle_data)
 
         result = scan_file(str(test_file))
@@ -83,7 +83,7 @@ class TestCVE202013092Detection:
             "os.system" in issue.message.lower() or "system" in issue.message.lower() for issue in result.issues
         ), "Should detect system call patterns"
 
-    def test_detect_cve_2020_13092_sklearn_pipeline_attack(self, tmp_path):
+    def test_detect_cve_2020_13092_sklearn_pipeline_attack(self, safe_tmp_path):
         """Test detection of malicious sklearn Pipeline with __reduce__ method."""
         # Simulate a malicious sklearn Pipeline with __reduce__ calling os.system
         malicious_content = b"""
@@ -93,7 +93,7 @@ class TestCVE202013092Detection:
         subprocess.call
         """
 
-        test_file = tmp_path / "malicious_pipeline.pkl"
+        test_file = safe_tmp_path / "malicious_pipeline.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))
@@ -117,7 +117,7 @@ class TestCVE202013092Detection:
 class TestCVE202434997Detection:
     """Test detection of CVE-2024-34997 (joblib NumpyArrayWrapper vulnerability)."""
 
-    def test_detect_cve_2024_34997_basic_pattern(self, tmp_path):
+    def test_detect_cve_2024_34997_basic_pattern(self, safe_tmp_path):
         """Test basic detection of CVE-2024-34997 patterns."""
         # Create content with NumpyArrayWrapper and pickle.load
         malicious_content = b"""
@@ -127,7 +127,7 @@ class TestCVE202434997Detection:
         numpy_pickle
         """
 
-        test_file = tmp_path / "numpy_wrapper_attack.pkl"
+        test_file = safe_tmp_path / "numpy_wrapper_attack.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))
@@ -143,7 +143,7 @@ class TestCVE202434997Detection:
             f"Should detect CVE-2024-34997. Issues found: {[i.message for i in result.issues]}"
         )
 
-    def test_detect_cve_2024_34997_cache_exploitation(self, tmp_path):
+    def test_detect_cve_2024_34997_cache_exploitation(self, safe_tmp_path):
         """Test detection of NumpyArrayWrapper cache exploitation."""
         malicious_content = b"""
         joblib.cache
@@ -153,7 +153,7 @@ class TestCVE202434997Detection:
         os.system
         """
 
-        test_file = tmp_path / "cache_exploit.pkl"
+        test_file = safe_tmp_path / "cache_exploit.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))
@@ -168,7 +168,7 @@ class TestCVE202434997Detection:
             for issue in result.issues
         ), "Should flag as high severity"
 
-    def test_detect_cve_2024_34997_numpy_pickle_exploitation(self, tmp_path):
+    def test_detect_cve_2024_34997_numpy_pickle_exploitation(self, safe_tmp_path):
         """Test detection of numpy_pickle module exploitation."""
         # Create a pickle with numpy_pickle and dangerous operations
         malicious_content = b"""
@@ -178,7 +178,7 @@ class TestCVE202434997Detection:
         subprocess.Popen
         """
 
-        test_file = tmp_path / "numpy_pickle_exploit.pkl"
+        test_file = safe_tmp_path / "numpy_pickle_exploit.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))
@@ -196,7 +196,7 @@ class TestCVE202434997Detection:
 class TestCVEFalsePositivePrevention:
     """Test that legitimate sklearn models don't trigger false positives."""
 
-    def test_legitimate_sklearn_model_no_false_positive(self, tmp_path):
+    def test_legitimate_sklearn_model_no_false_positive(self, safe_tmp_path):
         """Test that a normal sklearn model doesn't trigger CVE alerts."""
         # Create a benign sklearn-like pickle content (simulated)
         benign_content = b"""
@@ -208,7 +208,7 @@ class TestCVEFalsePositivePrevention:
         score
         """
 
-        test_file = tmp_path / "legitimate_model.pkl"
+        test_file = safe_tmp_path / "legitimate_model.pkl"
         test_file.write_bytes(benign_content)
 
         result = scan_file(str(test_file))
@@ -228,7 +228,7 @@ class TestCVEFalsePositivePrevention:
             f"Found: {[i.message for i in critical_cve_detections]}"
         )
 
-    def test_legitimate_joblib_usage_no_false_positive(self, tmp_path):
+    def test_legitimate_joblib_usage_no_false_positive(self, safe_tmp_path):
         """Test that normal joblib usage doesn't trigger false positives."""
         # Create benign joblib content
         benign_content = b"""
@@ -238,7 +238,7 @@ class TestCVEFalsePositivePrevention:
         numpy.ndarray
         """
 
-        test_file = tmp_path / "legitimate_joblib.pkl"
+        test_file = safe_tmp_path / "legitimate_joblib.pkl"
         test_file.write_bytes(benign_content)
 
         result = scan_file(str(test_file))
@@ -310,7 +310,7 @@ class TestCVEPatternAnalysis:
 class TestCVEIntegration:
     """Integration tests for end-to-end CVE detection."""
 
-    def test_joblib_scanner_cve_detection(self, tmp_path):
+    def test_joblib_scanner_cve_detection(self, safe_tmp_path):
         """Test that JoblibScanner properly detects CVE patterns."""
         # Create a malicious joblib file content with multiple CVE indicators
         malicious_content = b"""
@@ -320,7 +320,7 @@ class TestCVEIntegration:
         NumpyArrayWrapper pickle.load
         """
 
-        test_file = tmp_path / "malicious.joblib"
+        test_file = safe_tmp_path / "malicious.joblib"
         test_file.write_bytes(malicious_content)
 
         scanner = JoblibScanner()
@@ -345,7 +345,7 @@ class TestCVEIntegration:
             f"JoblibScanner should detect dangerous patterns. Found checks: {[c.name for c in result.checks]}"
         )
 
-    def test_pickle_scanner_cve_detection(self, tmp_path):
+    def test_pickle_scanner_cve_detection(self, safe_tmp_path):
         """Test that PickleScanner properly detects CVE patterns."""
         # Create raw malicious content (not valid pickle, but with CVE indicators)
         malicious_content = b"""
@@ -355,7 +355,7 @@ class TestCVEIntegration:
         NumpyArrayWrapper pickle.load
         """
 
-        test_file = tmp_path / "malicious.pkl"
+        test_file = safe_tmp_path / "malicious.pkl"
         test_file.write_bytes(malicious_content)
 
         scanner = PickleScanner()
@@ -372,7 +372,7 @@ class TestCVEIntegration:
             f"PickleScanner should detect dangerous patterns. Found checks: {[c.name for c in result.checks]}"
         )
 
-    def test_end_to_end_cve_reporting(self, tmp_path):
+    def test_end_to_end_cve_reporting(self, safe_tmp_path):
         """Test end-to-end CVE detection and reporting."""
         # Create a file with multiple CVE indicators
         malicious_content = b"""
@@ -385,7 +385,7 @@ class TestCVEIntegration:
         pickle.load
         """
 
-        test_file = tmp_path / "multi_cve.pkl"
+        test_file = safe_tmp_path / "multi_cve.pkl"
         test_file.write_bytes(malicious_content)
 
         result = scan_file(str(test_file))

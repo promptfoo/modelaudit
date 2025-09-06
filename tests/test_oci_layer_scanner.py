@@ -9,26 +9,26 @@ from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 class TestOciLayerScanner:
     """Comprehensive tests for OCI Layer Scanner."""
 
-    def test_can_handle_valid_manifest_with_tar_gz(self, tmp_path):
+    def test_can_handle_valid_manifest_with_tar_gz(self, safe_tmp_path):
         """Test can_handle correctly identifies valid manifest files."""
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_content = {"layers": ["layer1.tar.gz", "layer2.tar.gz"]}
         manifest_path.write_text(json.dumps(manifest_content))
 
         scanner = OciLayerScanner()
         assert scanner.can_handle(str(manifest_path)) is True
 
-    def test_can_handle_rejects_non_manifest_extension(self, tmp_path):
+    def test_can_handle_rejects_non_manifest_extension(self, safe_tmp_path):
         """Test can_handle rejects files without .manifest extension."""
-        json_path = tmp_path / "test.json"
+        json_path = safe_tmp_path / "test.json"
         json_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
 
         scanner = OciLayerScanner()
         assert scanner.can_handle(str(json_path)) is False
 
-    def test_can_handle_rejects_manifest_without_tar_gz(self, tmp_path):
+    def test_can_handle_rejects_manifest_without_tar_gz(self, safe_tmp_path):
         """Test can_handle rejects manifest files without .tar.gz references."""
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_content = {"config": "config.json", "layers": ["layer1.json"]}
         manifest_path.write_text(json.dumps(manifest_content))
 
@@ -40,34 +40,34 @@ class TestOciLayerScanner:
         scanner = OciLayerScanner()
         assert scanner.can_handle("/nonexistent/file.manifest") is False
 
-    def test_can_handle_rejects_directory(self, tmp_path):
+    def test_can_handle_rejects_directory(self, safe_tmp_path):
         """Test can_handle rejects directories."""
-        dir_path = tmp_path / "test.manifest"
+        dir_path = safe_tmp_path / "test.manifest"
         dir_path.mkdir()
 
         scanner = OciLayerScanner()
         assert scanner.can_handle(str(dir_path)) is False
 
-    def test_can_handle_with_unreadable_file(self, tmp_path):
+    def test_can_handle_with_unreadable_file(self, safe_tmp_path):
         """Test can_handle handles unreadable files gracefully."""
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text("invalid content")
 
         scanner = OciLayerScanner()
         # Should return False for files that can't be read or don't contain .tar.gz
         assert scanner.can_handle(str(manifest_path)) is False
 
-    def test_scan_valid_json_manifest_with_malicious_pickle(self, tmp_path):
+    def test_scan_valid_json_manifest_with_malicious_pickle(self, safe_tmp_path):
         """Test scanning a valid JSON manifest with malicious content."""
         # Create malicious pickle
         evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="malicious.pkl")
 
         # Create JSON manifest
         manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "image.manifest"
+        manifest_path = safe_tmp_path / "image.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -79,7 +79,7 @@ class TestOciLayerScanner:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert any("image.manifest:layer.tar.gz:malicious.pkl" in issue.location for issue in critical_issues)
 
-    def test_scan_yaml_manifest(self, tmp_path):
+    def test_scan_yaml_manifest(self, safe_tmp_path):
         """Test scanning a YAML manifest file."""
         import importlib.util
 
@@ -89,10 +89,10 @@ class TestOciLayerScanner:
             pytest.skip("YAML support not available")
 
         # Create safe content for YAML test
-        safe_file = tmp_path / "safe.txt"
+        safe_file = safe_tmp_path / "safe.txt"
         safe_file.write_text("Hello, world!")
 
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(safe_file, arcname="safe.txt")
 
@@ -102,7 +102,7 @@ class TestOciLayerScanner:
           - layer.tar.gz
         config: config.json
         """
-        manifest_path = tmp_path / "image.manifest"
+        manifest_path = safe_tmp_path / "image.manifest"
         manifest_path.write_text(manifest_content)
 
         scanner = OciLayerScanner()
@@ -110,9 +110,9 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_invalid_json_manifest(self, tmp_path):
+    def test_scan_invalid_json_manifest(self, safe_tmp_path):
         """Test scanning an invalid JSON manifest."""
-        manifest_path = tmp_path / "invalid.manifest"
+        manifest_path = safe_tmp_path / "invalid.manifest"
         manifest_path.write_text("{ invalid json content")
 
         scanner = OciLayerScanner()
@@ -122,9 +122,9 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert any("Error parsing manifest" in issue.message for issue in result.issues)
 
-    def test_scan_empty_manifest(self, tmp_path):
+    def test_scan_empty_manifest(self, safe_tmp_path):
         """Test scanning an empty manifest."""
-        manifest_path = tmp_path / "empty.manifest"
+        manifest_path = safe_tmp_path / "empty.manifest"
         manifest_path.write_text("{}")
 
         scanner = OciLayerScanner()
@@ -133,10 +133,10 @@ class TestOciLayerScanner:
         assert result.success is True
         assert len(result.issues) == 0  # No layers to process
 
-    def test_scan_manifest_with_missing_layer(self, tmp_path):
+    def test_scan_manifest_with_missing_layer(self, safe_tmp_path):
         """Test scanning manifest with reference to non-existent layer."""
         manifest = {"layers": ["nonexistent.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -146,16 +146,16 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
         assert any("Layer not found: nonexistent.tar.gz" in issue.message for issue in result.issues)
 
-    def test_scan_manifest_with_multiple_layers(self, tmp_path):
+    def test_scan_manifest_with_multiple_layers(self, safe_tmp_path):
         """Test scanning manifest with multiple layers."""
         # Create two layers with different content
-        layer1_path = tmp_path / "layer1.tar.gz"
-        layer2_path = tmp_path / "layer2.tar.gz"
+        layer1_path = safe_tmp_path / "layer1.tar.gz"
+        layer2_path = safe_tmp_path / "layer2.tar.gz"
 
         # Create safe files
-        safe_file1 = tmp_path / "safe1.txt"
+        safe_file1 = safe_tmp_path / "safe1.txt"
         safe_file1.write_text("Safe content 1")
-        safe_file2 = tmp_path / "safe2.txt"
+        safe_file2 = safe_tmp_path / "safe2.txt"
         safe_file2.write_text("Safe content 2")
 
         with tarfile.open(layer1_path, "w:gz") as tar:
@@ -165,7 +165,7 @@ class TestOciLayerScanner:
             tar.add(safe_file2, arcname="safe2.txt")
 
         manifest = {"layers": ["layer1.tar.gz", "layer2.tar.gz"]}
-        manifest_path = tmp_path / "multi.manifest"
+        manifest_path = safe_tmp_path / "multi.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -173,18 +173,18 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_manifest_with_absolute_layer_path(self, tmp_path):
+    def test_scan_manifest_with_absolute_layer_path(self, safe_tmp_path):
         """Test scanning manifest with absolute layer paths."""
-        safe_file = tmp_path / "safe.txt"
+        safe_file = safe_tmp_path / "safe.txt"
         safe_file.write_text("Safe content")
 
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(safe_file, arcname="safe.txt")
 
         # Use absolute path in manifest
         manifest = {"layers": [str(layer_path)]}
-        manifest_path = tmp_path / "abs.manifest"
+        manifest_path = safe_tmp_path / "abs.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -192,9 +192,9 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_manifest_with_traversal_layer_path(self, tmp_path):
+    def test_scan_manifest_with_traversal_layer_path(self, safe_tmp_path):
         """Test detection of path traversal in layer references."""
-        outside_dir = tmp_path / "outside"
+        outside_dir = safe_tmp_path / "outside"
         outside_dir.mkdir()
 
         evil_file = outside_dir / "evil.txt"
@@ -205,7 +205,7 @@ class TestOciLayerScanner:
             tar.add(evil_file, arcname="evil.txt")
 
         manifest = {"layers": ["../outside/evil.tar.gz"]}
-        manifest_path = tmp_path / "traversal.manifest"
+        manifest_path = safe_tmp_path / "traversal.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -213,12 +213,12 @@ class TestOciLayerScanner:
 
         assert any("path traversal" in i.message.lower() for i in result.issues)
 
-    def test_scan_manifest_with_nested_layer_references(self, tmp_path):
+    def test_scan_manifest_with_nested_layer_references(self, safe_tmp_path):
         """Test scanning manifest with nested layer references."""
-        safe_file = tmp_path / "safe.txt"
+        safe_file = safe_tmp_path / "safe.txt"
         safe_file.write_text("Safe content")
 
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(safe_file, arcname="safe.txt")
 
@@ -235,7 +235,7 @@ class TestOciLayerScanner:
                 },
             ],
         }
-        manifest_path = tmp_path / "nested.manifest"
+        manifest_path = safe_tmp_path / "nested.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -243,18 +243,18 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_layer_with_non_scannable_files(self, tmp_path):
+    def test_scan_layer_with_non_scannable_files(self, safe_tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
         # Create a random binary file
-        random_file = tmp_path / "random.bin"
+        random_file = safe_tmp_path / "random.bin"
         random_file.write_bytes(b"random binary content that doesn't match any scanner")
 
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(random_file, arcname="random.bin")
 
         manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -263,12 +263,12 @@ class TestOciLayerScanner:
         assert result.success is True
         # Should have no issues since the file doesn't match any scanner
 
-    def test_scan_layer_with_directory_entries(self, tmp_path):
+    def test_scan_layer_with_directory_entries(self, safe_tmp_path):
         """Test scanning layer with directory entries (should be skipped)."""
-        safe_file = tmp_path / "safe.txt"
+        safe_file = safe_tmp_path / "safe.txt"
         safe_file.write_text("Safe content")
 
-        layer_path = tmp_path / "layer.tar.gz"
+        layer_path = safe_tmp_path / "layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(safe_file, arcname="safe.txt")
             # Add a directory entry manually
@@ -277,7 +277,7 @@ class TestOciLayerScanner:
             tar.addfile(tarinfo)
 
         manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -285,14 +285,14 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_corrupted_tar_layer(self, tmp_path):
+    def test_scan_corrupted_tar_layer(self, safe_tmp_path):
         """Test scanning corrupted tar layer."""
         # Create a file that looks like tar.gz but is corrupted
-        layer_path = tmp_path / "corrupted.tar.gz"
+        layer_path = safe_tmp_path / "corrupted.tar.gz"
         layer_path.write_bytes(b"corrupted tar.gz content")
 
         manifest = {"layers": ["corrupted.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -318,15 +318,15 @@ class TestOciLayerScanner:
         assert "container manifests" in scanner.description.lower()
         assert ".manifest" in scanner.supported_extensions
 
-    def test_issue_location_format(self, tmp_path):
+    def test_issue_location_format(self, safe_tmp_path):
         """Test that issues have correct location format."""
         evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
-        layer_path = tmp_path / "test_layer.tar.gz"
+        layer_path = safe_tmp_path / "test_layer.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="model/evil.pkl")
 
         manifest = {"layers": ["test_layer.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -341,17 +341,17 @@ class TestOciLayerScanner:
         assert issue.details is not None
         assert issue.details.get("layer") == "test_layer.tar.gz"
 
-    def test_layer_with_multiple_model_files(self, tmp_path):
+    def test_layer_with_multiple_model_files(self, safe_tmp_path):
         """Test layer containing multiple model files."""
         evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
 
-        layer_path = tmp_path / "multi_model.tar.gz"
+        layer_path = safe_tmp_path / "multi_model.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="model1.pkl")
             tar.add(evil_pickle, arcname="model2.pkl")
 
         manifest = {"layers": ["multi_model.tar.gz"]}
-        manifest_path = tmp_path / "test.manifest"
+        manifest_path = safe_tmp_path / "test.manifest"
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
@@ -368,15 +368,15 @@ class TestOciLayerScanner:
 
 
 # Keep the original test for backward compatibility
-def test_oci_layer_scanner_with_malicious_pickle(tmp_path):
+def test_oci_layer_scanner_with_malicious_pickle(safe_tmp_path):
     """Original test for backward compatibility."""
     evil_pickle = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
-    layer_path = tmp_path / "layer.tar.gz"
+    layer_path = safe_tmp_path / "layer.tar.gz"
     with tarfile.open(layer_path, "w:gz") as tar:
         tar.add(evil_pickle, arcname="malicious.pkl")
 
     manifest = {"layers": ["layer.tar.gz"]}
-    manifest_path = tmp_path / "image.manifest"
+    manifest_path = safe_tmp_path / "image.manifest"
     manifest_path.write_text(json.dumps(manifest))
 
     scanner = OciLayerScanner()

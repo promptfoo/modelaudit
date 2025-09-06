@@ -350,9 +350,9 @@ class TestNetworkCommDetector:
 class TestDetectNetworkCommunication:
     """Test the convenience function."""
 
-    def test_scan_file(self, tmp_path):
+    def test_scan_file(self, safe_tmp_path):
         """Test scanning a file for network patterns."""
-        test_file = tmp_path / "model.pkl"
+        test_file = safe_tmp_path / "model.pkl"
         test_file.write_bytes(b"http://malicious.com/payload")
 
         findings = detect_network_communication(str(test_file))
@@ -366,9 +366,9 @@ class TestDetectNetworkCommunication:
         assert findings[0]["type"] == "error"
         assert "not found" in findings[0]["message"]
 
-    def test_with_config(self, tmp_path):
+    def test_with_config(self, safe_tmp_path):
         """Test scanning with custom configuration."""
-        test_file = tmp_path / "model.pkl"
+        test_file = safe_tmp_path / "model.pkl"
         test_file.write_bytes(b"my_custom_pattern")
 
         config = {"custom_cc_patterns": [b"my_custom_pattern"]}

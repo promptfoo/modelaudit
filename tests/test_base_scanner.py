@@ -85,11 +85,11 @@ def test_base_scanner_check_path_nonexistent():
     assert check_names["Path Exists"].status == CheckStatus.FAILED
 
 
-def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
+def test_base_scanner_check_path_unreadable(safe_tmp_path, monkeypatch):
     """Test _check_path with unreadable file."""
 
     # Create a test file
-    test_file = tmp_path / "test.test"
+    test_file = safe_tmp_path / "test.test"
     test_file.write_bytes(b"test content")
 
     # Mock os.access to simulate unreadable file
@@ -112,10 +112,10 @@ def test_base_scanner_check_path_unreadable(tmp_path, monkeypatch):
     assert check_map["Path Readable"].status == CheckStatus.FAILED
 
 
-def test_base_scanner_check_path_directory(tmp_path):
+def test_base_scanner_check_path_directory(safe_tmp_path):
     """Test _check_path with a directory."""
     # Create a test directory
-    test_dir = tmp_path / "test_dir"
+    test_dir = safe_tmp_path / "test_dir"
     test_dir.mkdir()
 
     # The BaseScanner implementation might handle directories differently
@@ -134,10 +134,10 @@ def test_base_scanner_check_path_directory(tmp_path):
         assert "directory" in result.issues[0].message.lower()
 
 
-def test_base_scanner_check_path_valid(tmp_path):
+def test_base_scanner_check_path_valid(safe_tmp_path):
     """Test _check_path with a valid file."""
     # Create a test file
-    test_file = tmp_path / "test.test"
+    test_file = safe_tmp_path / "test.test"
     test_file.write_bytes(b"test content")
 
     scanner = MockScanner()
@@ -151,10 +151,10 @@ def test_base_scanner_check_path_valid(tmp_path):
     assert {"Path Exists", "Path Readable", "File Type Validation"}.issubset(check_names)
 
 
-def test_base_scanner_get_file_size(tmp_path):
+def test_base_scanner_get_file_size(safe_tmp_path):
     """Test the get_file_size method."""
     # Create a test file with known size
-    test_file = tmp_path / "test.test"
+    test_file = safe_tmp_path / "test.test"
     content = b"test content"
     test_file.write_bytes(content)
 
@@ -164,10 +164,10 @@ def test_base_scanner_get_file_size(tmp_path):
     assert size == len(content)
 
 
-def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
+def test_base_scanner_get_file_size_oserror(safe_tmp_path, monkeypatch):
     """get_file_size should handle OS errors gracefully."""
 
-    test_file = tmp_path / "test.test"
+    test_file = safe_tmp_path / "test.test"
     test_file.write_bytes(b"data")
 
     def mock_getsize(_path):  # pragma: no cover - error simulation
@@ -181,10 +181,10 @@ def test_base_scanner_get_file_size_oserror(tmp_path, monkeypatch):
     assert size == 0
 
 
-def test_scanner_implementation(tmp_path):
+def test_scanner_implementation(safe_tmp_path):
     """Test a complete scan with the test scanner implementation."""
     # Create a test file
-    test_file = tmp_path / "test.test"
+    test_file = safe_tmp_path / "test.test"
     test_file.write_bytes(b"test content")
 
     scanner = MockScanner()
@@ -230,12 +230,12 @@ def test_issue_class():
     assert "Test issue" in issue_str
 
 
-def test_base_scanner_file_type_validation(tmp_path):
+def test_base_scanner_file_type_validation(safe_tmp_path):
     """Test that BaseScanner performs file type validation in _check_path."""
     scanner = MockScanner()
 
     # Create a file with mismatched extension and magic bytes
-    invalid_h5 = tmp_path / "fake.h5"
+    invalid_h5 = safe_tmp_path / "fake.h5"
     invalid_h5.write_bytes(b"not real hdf5 data")
 
     result = scanner._check_path(str(invalid_h5))
@@ -261,14 +261,14 @@ def test_base_scanner_file_type_validation(tmp_path):
     assert "extension_format" in validation_issues[0].details
 
 
-def test_base_scanner_valid_file_type(tmp_path):
+def test_base_scanner_valid_file_type(safe_tmp_path):
     """Test that BaseScanner doesn't warn for valid file types."""
     import zipfile
 
     scanner = MockScanner()
 
     # Create a valid ZIP file with .zip extension
-    zip_file = tmp_path / "archive.zip"
+    zip_file = safe_tmp_path / "archive.zip"
     with zipfile.ZipFile(zip_file, "w") as zipf:
         zipf.writestr("test.txt", "data")
 
@@ -282,12 +282,12 @@ def test_base_scanner_valid_file_type(tmp_path):
     assert scan_result is not None
 
 
-def test_base_scanner_small_file_handling(tmp_path):
+def test_base_scanner_small_file_handling(safe_tmp_path):
     """Test that BaseScanner handles small files properly in validation."""
     scanner = MockScanner()
 
     # Create a very small file (< 4 bytes)
-    small_file = tmp_path / "tiny.h5"
+    small_file = safe_tmp_path / "tiny.h5"
     small_file.write_bytes(b"hi")
 
     result = scanner._check_path(str(small_file))
@@ -296,11 +296,11 @@ def test_base_scanner_small_file_handling(tmp_path):
     assert result is None
 
 
-def test_base_scanner_read_file_safely(tmp_path):
+def test_base_scanner_read_file_safely(safe_tmp_path):
     """_read_file_safely should return bytes with chunking."""
     scanner = MockScanner(config={"chunk_size": 4})
 
-    file_path = tmp_path / "data.test"
+    file_path = safe_tmp_path / "data.test"
     content = b"0123456789"
     file_path.write_bytes(content)
 
@@ -310,10 +310,10 @@ def test_base_scanner_read_file_safely(tmp_path):
     assert data == content
 
 
-def test_base_scanner_size_limit_pass(tmp_path):
+def test_base_scanner_size_limit_pass(safe_tmp_path):
     """_check_size_limit should record a passing check when within limits."""
     scanner = MockScanner(config={"max_file_read_size": 100})
-    file_path = tmp_path / "small.test"
+    file_path = safe_tmp_path / "small.test"
     content = b"small"
     file_path.write_bytes(content)
 
@@ -325,10 +325,10 @@ def test_base_scanner_size_limit_pass(tmp_path):
     assert checks["File Size Limit"].status == CheckStatus.PASSED
 
 
-def test_base_scanner_size_limit_fail(tmp_path):
+def test_base_scanner_size_limit_fail(safe_tmp_path):
     """_check_size_limit should return a result when file is too large."""
     scanner = MockScanner(config={"max_file_read_size": 5})
-    file_path = tmp_path / "large.test"
+    file_path = safe_tmp_path / "large.test"
     file_path.write_bytes(b"this is too long")
 
     result = scanner._check_size_limit(str(file_path))

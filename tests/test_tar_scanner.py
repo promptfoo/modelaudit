@@ -19,14 +19,14 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
                 t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            assert TarScanner.can_handle(tmp_path) is True
+            assert TarScanner.can_handle(safe_tmp_path) is True
             assert TarScanner.can_handle("/path/to/file.txt") is False
             assert TarScanner.can_handle("/path/to/file.pkl") is False
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_can_handle_compressed_tar_files(self):
         """Test that the scanner correctly identifies compressed TAR files"""
@@ -34,20 +34,20 @@ class TestTarScanner:
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             with tarfile.open(tmp.name, "w:gz") as t:
                 t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
-            tmp_path_gz = tmp.name
+            safe_tmp_path_gz = tmp.name
 
         # Test tar.bz2
         with tempfile.NamedTemporaryFile(suffix=".tar.bz2", delete=False) as tmp:
             with tarfile.open(tmp.name, "w:bz2") as t:
                 t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
-            tmp_path_bz2 = tmp.name
+            safe_tmp_path_bz2 = tmp.name
 
         try:
-            assert TarScanner.can_handle(tmp_path_gz) is True
-            assert TarScanner.can_handle(tmp_path_bz2) is True
+            assert TarScanner.can_handle(safe_tmp_path_gz) is True
+            assert TarScanner.can_handle(safe_tmp_path_bz2) is True
         finally:
-            os.unlink(tmp_path_gz)
-            os.unlink(tmp_path_bz2)
+            os.unlink(safe_tmp_path_gz)
+            os.unlink(safe_tmp_path_bz2)
 
     def test_scan_simple_tar(self):
         """Test scanning a simple TAR file with text files"""
@@ -64,10 +64,10 @@ class TestTarScanner:
                 data_content = b'{"key": "value"}'
                 data_info.size = len(data_content)
                 t.addfile(data_info, tarfile.io.BytesIO(data_content))
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             # Debug: print issues if any
             if result.issues:
                 for issue in result.issues:
@@ -78,7 +78,7 @@ class TestTarScanner:
             non_debug_issues = [i for i in result.issues if i.severity != IssueSeverity.DEBUG]
             assert len(non_debug_issues) == 0
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_path_traversal_detection(self):
         """Test detection of path traversal attempts"""
@@ -89,15 +89,15 @@ class TestTarScanner:
                 content = b"malicious content"
                 info.size = len(content)
                 t.addfile(info, tarfile.io.BytesIO(content))
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             path_traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
             assert len(path_traversal_issues) > 0
             assert any(i.severity == IssueSeverity.CRITICAL for i in path_traversal_issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_symlink_outside_extraction_root(self):
         """Symlinks resolving outside the extraction root should be flagged"""
@@ -108,15 +108,15 @@ class TestTarScanner:
                 info.type = tarfile.SYMTYPE
                 info.linkname = "../../../etc/passwd"
                 t.addfile(info)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert len(symlink_issues) > 0
             assert any("outside" in i.message.lower() for i in symlink_issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_symlink_to_critical_path(self):
         """Symlinks targeting critical system paths should be flagged"""
@@ -127,14 +127,14 @@ class TestTarScanner:
                 info.type = tarfile.SYMTYPE
                 info.linkname = "/etc/passwd"
                 t.addfile(info)
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert any("critical system" in i.message.lower() for i in symlink_issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_nested_tar_scanning(self):
         """Test scanning TAR files containing other TAR files"""
@@ -203,14 +203,14 @@ class TestTarScanner:
                     content = f"Content {i}".encode()
                     info.size = len(content)
                     t.addfile(info, tarfile.io.BytesIO(content))
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = scanner.scan(tmp_path)
+            result = scanner.scan(safe_tmp_path)
             entries_issues = [i for i in result.issues if "too many entries" in i.message.lower()]
             assert len(entries_issues) > 0
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_scan_tar_with_pickle_file(self):
         """Test scanning TAR containing pickle files"""
@@ -223,29 +223,29 @@ class TestTarScanner:
                 info = tarfile.TarInfo("data.pkl")
                 info.size = len(data)
                 t.addfile(info, tarfile.io.BytesIO(data))
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
             # Should have scanned the pickle file inside
             assert result.bytes_scanned > 0
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_invalid_tar_file(self):
         """Test handling of invalid TAR files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             # Write invalid data
             tmp.write(b"This is not a valid tar file")
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is False
             assert any("not a valid tar file" in i.message.lower() for i in result.issues)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)
 
     def test_nested_compressed_tar_scanning(self):
         """Test scanning TAR files containing compressed TAR files"""
@@ -293,12 +293,12 @@ class TestTarScanner:
                 info2 = tarfile.TarInfo("two.pkl")
                 info2.size = len(data2)
                 t.addfile(info2, tarfile.io.BytesIO(data2))
-            tmp_path = tmp.name
+            safe_tmp_path = tmp.name
 
         try:
-            result = self.scanner.scan(tmp_path)
+            result = self.scanner.scan(safe_tmp_path)
             assert result.success is True
             expected = len(data1) + len(data2)
             assert result.bytes_scanned == expected
         finally:
-            os.unlink(tmp_path)
+            os.unlink(safe_tmp_path)

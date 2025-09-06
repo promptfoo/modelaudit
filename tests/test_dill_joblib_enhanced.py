@@ -18,10 +18,10 @@ from modelaudit.scanners.pickle_scanner import (
 class TestDillJoblibSecurity:
     """Security-focused tests for dill/joblib support."""
 
-    def test_security_bypass_prevention_malicious_joblib_extension(self, tmp_path):
+    def test_security_bypass_prevention_malicious_joblib_extension(self, safe_tmp_path):
         """Ensure malicious pickle files can't bypass security via .joblib extension."""
         # Create a malicious pickle with dangerous imports
-        malicious_file = tmp_path / "evil.joblib"
+        malicious_file = safe_tmp_path / "evil.joblib"
 
         # Create a pickle file that contains os.system reference but no joblib markers
         with open(malicious_file, "wb") as f:
@@ -43,9 +43,9 @@ class TestDillJoblibSecurity:
         os_issues = [i for i in result.issues if "os" in str(i.message).lower()]
         assert len(os_issues) > 0
 
-    def test_security_bypass_prevention_malicious_dill_extension(self, tmp_path):
+    def test_security_bypass_prevention_malicious_dill_extension(self, safe_tmp_path):
         """Ensure malicious pickle files can't bypass security via .dill extension."""
-        malicious_file = tmp_path / "evil.dill"
+        malicious_file = safe_tmp_path / "evil.dill"
 
         # Create a suspicious pickle that would normally trigger alerts
         with open(malicious_file, "wb") as f:
@@ -89,9 +89,9 @@ class TestDillJoblibSecurity:
 class TestFileValidation:
     """Tests for the file format validation logic."""
 
-    def test_legitimate_joblib_file_validation(self, tmp_path):
+    def test_legitimate_joblib_file_validation(self, safe_tmp_path):
         """Test validation of legitimate joblib files."""
-        joblib_file = tmp_path / "model.joblib"
+        joblib_file = safe_tmp_path / "model.joblib"
 
         # Create mock joblib file with proper markers
         with open(joblib_file, "wb") as f:
@@ -103,9 +103,9 @@ class TestFileValidation:
         is_valid = _is_legitimate_serialization_file(str(joblib_file))
         assert is_valid is True
 
-    def test_legitimate_dill_file_validation(self, tmp_path):
+    def test_legitimate_dill_file_validation(self, safe_tmp_path):
         """Test validation of legitimate dill files."""
-        dill_file = tmp_path / "object.dill"
+        dill_file = safe_tmp_path / "object.dill"
 
         # Create basic pickle file (dill uses pickle format)
         with open(dill_file, "wb") as f:
@@ -115,24 +115,24 @@ class TestFileValidation:
         is_valid = _is_legitimate_serialization_file(str(dill_file))
         assert is_valid is True
 
-    def test_invalid_file_validation(self, tmp_path):
+    def test_invalid_file_validation(self, safe_tmp_path):
         """Test validation rejects invalid files."""
         # Empty file
-        empty_file = tmp_path / "empty.joblib"
+        empty_file = safe_tmp_path / "empty.joblib"
         empty_file.touch()
         assert _is_legitimate_serialization_file(str(empty_file)) is False
 
         # Non-pickle file
-        text_file = tmp_path / "text.joblib"
+        text_file = safe_tmp_path / "text.joblib"
         text_file.write_text("this is not pickle")
         assert _is_legitimate_serialization_file(str(text_file)) is False
 
         # File that doesn't exist
         assert _is_legitimate_serialization_file("nonexistent.joblib") is False
 
-    def test_joblib_file_without_markers(self, tmp_path):
+    def test_joblib_file_without_markers(self, safe_tmp_path):
         """Test joblib file without proper markers fails validation."""
-        fake_joblib = tmp_path / "fake.joblib"
+        fake_joblib = safe_tmp_path / "fake.joblib"
 
         # Valid pickle but no joblib markers
         with open(fake_joblib, "wb") as f:
@@ -145,9 +145,9 @@ class TestFileValidation:
 class TestErrorHandling:
     """Tests for improved error handling."""
 
-    def test_truncated_scan_metadata_details(self, tmp_path):
+    def test_truncated_scan_metadata_details(self, safe_tmp_path):
         """Test that truncated scans provide detailed metadata."""
-        problematic_file = tmp_path / "problem.joblib"
+        problematic_file = safe_tmp_path / "problem.joblib"
 
         # Create file that will trigger truncation
         with open(problematic_file, "wb") as f:
@@ -174,9 +174,9 @@ class TestErrorHandling:
             assert result.metadata.get("validated_format") is True
             assert "exception_message" in result.metadata
 
-    def test_non_benign_errors_still_reported(self, tmp_path):
+    def test_non_benign_errors_still_reported(self, safe_tmp_path):
         """Test that non-benign errors are still reported as warnings."""
-        suspicious_file = tmp_path / "suspicious.pkl"  # Note: .pkl extension
+        suspicious_file = safe_tmp_path / "suspicious.pkl"  # Note: .pkl extension
 
         with open(suspicious_file, "wb") as f:
             f.write(b"invalid pickle data")
@@ -203,13 +203,13 @@ class TestErrorHandling:
             )
             assert runtime_issue is not None
 
-    def test_logging_for_truncated_scans(self, tmp_path, caplog):
+    def test_logging_for_truncated_scans(self, safe_tmp_path, caplog):
         """Test that error scans are properly handled and logged."""
         import logging
 
         caplog.set_level(logging.WARNING)
 
-        joblib_file = tmp_path / "logged.joblib"
+        joblib_file = safe_tmp_path / "logged.joblib"
 
         # Create valid joblib file that will pass validation
         with open(joblib_file, "wb") as f:
@@ -245,9 +245,9 @@ class TestErrorHandling:
 class TestPerformanceAndEdgeCases:
     """Performance and edge case tests."""
 
-    def test_large_file_validation_performance(self, tmp_path):
+    def test_large_file_validation_performance(self, safe_tmp_path):
         """Test that file validation is performant on large files."""
-        large_file = tmp_path / "large.joblib"
+        large_file = safe_tmp_path / "large.joblib"
 
         # Create a file larger than 1KB but with joblib marker early
         with open(large_file, "wb") as f:
@@ -263,11 +263,11 @@ class TestPerformanceAndEdgeCases:
         assert duration < 0.01
         assert is_valid is True
 
-    def test_concurrent_scanning_safety(self, tmp_path):
+    def test_concurrent_scanning_safety(self, safe_tmp_path):
         """Test that scanner is safe for concurrent use."""
         files = []
         for i in range(5):
-            file_path = tmp_path / f"test_{i}.joblib"
+            file_path = safe_tmp_path / f"test_{i}.joblib"
             with open(file_path, "wb") as f:
                 f.write(b"joblib")
                 pickle.dump({"id": i}, f)
@@ -285,9 +285,9 @@ class TestPerformanceAndEdgeCases:
         # All should succeed
         assert all(result.success for result in results)
 
-    def test_edge_case_empty_file(self, tmp_path):
+    def test_edge_case_empty_file(self, safe_tmp_path):
         """Test handling of empty files."""
-        empty_file = tmp_path / "empty.joblib"
+        empty_file = safe_tmp_path / "empty.joblib"
         empty_file.touch()
 
         scanner = PickleScanner()
@@ -299,9 +299,9 @@ class TestPerformanceAndEdgeCases:
         # Check that it reported a pickle parsing error
         assert any("pickle" in str(issue.message).lower() for issue in result.issues)
 
-    def test_edge_case_very_small_file(self, tmp_path):
+    def test_edge_case_very_small_file(self, safe_tmp_path):
         """Test handling of very small files."""
-        tiny_file = tmp_path / "tiny.joblib"
+        tiny_file = safe_tmp_path / "tiny.joblib"
         tiny_file.write_bytes(b"hi")
 
         scanner = PickleScanner()
@@ -314,9 +314,9 @@ class TestPerformanceAndEdgeCases:
 class TestIntegration:
     """Integration tests with real-world scenarios."""
 
-    def test_info_level_transparency_issue(self, tmp_path):
+    def test_info_level_transparency_issue(self, safe_tmp_path):
         """Test that truncated scans still create INFO-level issues for transparency."""
-        transparent_file = tmp_path / "transparent.joblib"
+        transparent_file = safe_tmp_path / "transparent.joblib"
 
         with open(transparent_file, "wb") as f:
             f.write(b"\x80\x03")  # Pickle protocol
@@ -353,7 +353,7 @@ class TestIntegration:
         import os
         import tempfile
 
-        # Use tempfile.NamedTemporaryFile to avoid pytest tmp_path fixture issues
+        # Use tempfile.NamedTemporaryFile to avoid pytest safe_tmp_path fixture issues
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_file:
             try:
                 pickle.dump({"normal": "data"}, temp_file)
@@ -370,9 +370,9 @@ class TestIntegration:
                 with contextlib.suppress(OSError):
                     os.unlink(temp_file.name)
 
-    def test_multiple_exception_types_handling(self, tmp_path):
+    def test_multiple_exception_types_handling(self, safe_tmp_path):
         """Test handling of different exception types."""
-        test_file = tmp_path / "multi.joblib"
+        test_file = safe_tmp_path / "multi.joblib"
 
         with open(test_file, "wb") as f:
             f.write(b"\x80\x03")  # Pickle protocol

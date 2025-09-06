@@ -117,12 +117,12 @@ class TestModelDownload:
         assert result == Path(mock_path)
 
     @patch("huggingface_hub.snapshot_download")
-    def test_download_model_with_cache_dir(self, mock_snapshot_download, tmp_path):
+    def test_download_model_with_cache_dir(self, mock_snapshot_download, safe_tmp_path):
         """Test model download with custom cache directory."""
-        mock_path = str(tmp_path / "test" / "model")
+        mock_path = str(safe_tmp_path / "test" / "model")
         mock_snapshot_download.return_value = mock_path
 
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         download_model("hf://test/model", cache_dir=cache_dir)
 
         # Verify cache directory was used (we now use local_dir instead of cache_dir for safety)
@@ -226,7 +226,7 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_insufficient_disk_space(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, safe_tmp_path
     ):
         """Test download fails gracefully when disk space is insufficient (with custom cache)."""
         # Mock model size
@@ -236,7 +236,7 @@ class TestModelSizeAndDiskSpace:
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
         # Test download failure with custom cache directory (this enables disk space checking)
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
             download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
@@ -247,7 +247,7 @@ class TestModelSizeAndDiskSpace:
     @patch("modelaudit.utils.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_disk_space_check(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
+        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, safe_tmp_path
     ):
         """Test successful download with disk space check when using custom cache."""
         # Mock model size
@@ -257,11 +257,11 @@ class TestModelSizeAndDiskSpace:
         mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
 
         # Mock snapshot download
-        mock_path = str(tmp_path / "test_model")
+        mock_path = str(safe_tmp_path / "test_model")
         mock_snapshot_download.return_value = mock_path
 
         # Test download with custom cache directory (this enables disk space checking)
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         result = download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify disk space was checked
@@ -393,12 +393,12 @@ class TestHuggingFaceFileURLs:
         assert result == Path(mock_path)
 
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_file_with_cache_dir(self, mock_hf_hub_download, tmp_path):
+    def test_download_file_with_cache_dir(self, mock_hf_hub_download, safe_tmp_path):
         """Test file download with custom cache directory."""
-        mock_path = str(tmp_path / "downloaded_file.bin")
+        mock_path = str(safe_tmp_path / "downloaded_file.bin")
         mock_hf_hub_download.return_value = mock_path
 
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         url = "https://huggingface.co/test/model/resolve/main/config.json"
         download_file_from_hf(url, cache_dir=cache_dir)
 

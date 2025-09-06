@@ -4,23 +4,23 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.paddle_scanner import PaddleScanner
 
 
-def test_paddle_scanner_can_handle(tmp_path):
-    path = tmp_path / "model.pdmodel"
+def test_paddle_scanner_can_handle(safe_tmp_path):
+    path = safe_tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         assert PaddleScanner.can_handle(str(path))
 
 
-def test_paddle_scanner_cannot_handle_without_paddle(tmp_path):
-    path = tmp_path / "model.pdmodel"
+def test_paddle_scanner_cannot_handle_without_paddle(safe_tmp_path):
+    path = safe_tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", False):
         assert not PaddleScanner.can_handle(str(path))
 
 
-def test_paddle_scanner_detects_suspicious_pattern(tmp_path):
+def test_paddle_scanner_detects_suspicious_pattern(safe_tmp_path):
     content = b"os.system('ls')"
-    path = tmp_path / "model.pdmodel"
+    path = safe_tmp_path / "model.pdmodel"
     path.write_bytes(content)
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         scanner = PaddleScanner()
@@ -28,8 +28,8 @@ def test_paddle_scanner_detects_suspicious_pattern(tmp_path):
         assert any("suspicious" in i.message.lower() for i in result.issues)
 
 
-def test_paddle_scanner_missing_dependency(tmp_path):
-    path = tmp_path / "model.pdmodel"
+def test_paddle_scanner_missing_dependency(safe_tmp_path):
+    path = safe_tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", False):
         scanner = PaddleScanner()

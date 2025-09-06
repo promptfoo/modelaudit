@@ -16,8 +16,8 @@ def create_safetensors_file(path: Path) -> None:
     save_file(data, str(path))
 
 
-def test_valid_safetensors_file(tmp_path: Path) -> None:
-    file_path = tmp_path / "model.safetensors"
+def test_valid_safetensors_file(safe_tmp_path: Path) -> None:
+    file_path = safe_tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
 
     scanner = SafeTensorsScanner()
@@ -28,11 +28,11 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert result.metadata.get("tensor_count") == 2
 
 
-def test_corrupted_header(tmp_path: Path) -> None:
-    file_path = tmp_path / "model.safetensors"
+def test_corrupted_header(safe_tmp_path: Path) -> None:
+    file_path = safe_tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
 
-    corrupt_path = tmp_path / "corrupt.safetensors"
+    corrupt_path = safe_tmp_path / "corrupt.safetensors"
     with open(file_path, "rb") as f:
         data = bytearray(f.read())
 
@@ -49,11 +49,11 @@ def test_corrupted_header(tmp_path: Path) -> None:
     assert any("json" in issue.message.lower() or "header" in issue.message.lower() for issue in result.issues)
 
 
-def test_bad_offsets(tmp_path: Path) -> None:
-    file_path = tmp_path / "model.safetensors"
+def test_bad_offsets(safe_tmp_path: Path) -> None:
+    file_path = safe_tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
 
-    bad_path = tmp_path / "bad_offsets.safetensors"
+    bad_path = safe_tmp_path / "bad_offsets.safetensors"
     with open(file_path, "rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
         header_bytes = f.read(header_len)
@@ -73,7 +73,7 @@ def test_bad_offsets(tmp_path: Path) -> None:
     assert any("offset" in issue.message.lower() for issue in result.issues)
 
 
-def test_deeply_nested_header(tmp_path: Path) -> None:
+def test_deeply_nested_header(safe_tmp_path: Path) -> None:
     """Ensure deeply nested headers are handled gracefully."""
     import sys
 
@@ -87,7 +87,7 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
     header_str = '{"a":' * depth + "{}" + "}" * depth
     header_bytes = header_str.encode("utf-8")
 
-    file_path = tmp_path / "deep.safetensors"
+    file_path = safe_tmp_path / "deep.safetensors"
     with open(file_path, "wb") as f:
         f.write(struct.pack("<Q", len(header_bytes)))
         f.write(header_bytes)
@@ -111,8 +111,8 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
     )
 
 
-def test_suspicious_metadata(tmp_path: Path) -> None:
-    file_path = tmp_path / "model.safetensors"
+def test_suspicious_metadata(safe_tmp_path: Path) -> None:
+    file_path = safe_tmp_path / "model.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
     metadata = {"info": "wget http://malicious"}
     save_file(data, str(file_path), metadata=metadata)
@@ -123,9 +123,9 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
 
 
-def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
+def test_mixed_suspicious_patterns(safe_tmp_path: Path) -> None:
     """Test that both simple patterns and regex patterns are detected from the same metadata value."""
-    file_path = tmp_path / "model.safetensors"
+    file_path = safe_tmp_path / "model.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
 
     # Metadata containing both simple pattern (import) and regex pattern (URL)
@@ -154,9 +154,9 @@ def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
     assert has_regex_pattern, "Should detect URL as regex-based suspicious pattern"
 
 
-def test_multiple_distinct_patterns(tmp_path: Path) -> None:
+def test_multiple_distinct_patterns(safe_tmp_path: Path) -> None:
     """Test detection of multiple different types of suspicious patterns."""
-    file_path = tmp_path / "model.safetensors"
+    file_path = safe_tmp_path / "model.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
 
     # Multiple metadata fields with different suspicious patterns

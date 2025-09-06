@@ -74,39 +74,39 @@ def _write_ggml_variant_file(path, magic):
         f.write(b"\0" * 24)
 
 
-def test_gguf_scanner_can_handle_gguf(tmp_path):
+def test_gguf_scanner_can_handle_gguf(safe_tmp_path):
     """Test that scanner can handle GGUF files."""
-    path = tmp_path / "model.gguf"
+    path = safe_tmp_path / "model.gguf"
     _write_minimal_gguf(path)
     assert GgufScanner.can_handle(str(path))
 
 
-def test_gguf_scanner_can_handle_ggml(tmp_path):
+def test_gguf_scanner_can_handle_ggml(safe_tmp_path):
     """Test that scanner can handle GGML files."""
-    path = tmp_path / "model.ggml"
+    path = safe_tmp_path / "model.ggml"
     _write_ggml_file(path)
     assert GgufScanner.can_handle(str(path))
 
 
-def test_gguf_scanner_can_handle_ggml_variants(tmp_path):
+def test_gguf_scanner_can_handle_ggml_variants(safe_tmp_path):
     """Scanner handles GGML variant magic codes."""
     for magic in [b"GGMF", b"GGJT"]:
-        path = tmp_path / f"model_{magic.decode().lower()}.ggml"
+        path = safe_tmp_path / f"model_{magic.decode().lower()}.ggml"
         _write_ggml_variant_file(path, magic)
         assert GgufScanner.can_handle(str(path))
 
 
-def test_gguf_scanner_rejects_invalid_files(tmp_path):
+def test_gguf_scanner_rejects_invalid_files(safe_tmp_path):
     """Test that scanner rejects invalid files."""
-    path = tmp_path / "invalid.gguf"
+    path = safe_tmp_path / "invalid.gguf"
     with open(path, "wb") as f:
         f.write(b"INVALID")
     assert not GgufScanner.can_handle(str(path))
 
 
-def test_gguf_scanner_basic_scan(tmp_path):
+def test_gguf_scanner_basic_scan(safe_tmp_path):
     """Test basic GGUF scanning functionality."""
-    path = tmp_path / "model.gguf"
+    path = safe_tmp_path / "model.gguf"
     _write_minimal_gguf(path)
     result = GgufScanner().scan(str(path))
     assert result.success
@@ -115,9 +115,9 @@ def test_gguf_scanner_basic_scan(tmp_path):
     assert result.metadata["n_tensors"] == 0
 
 
-def test_gguf_scanner_comprehensive_scan(tmp_path):
+def test_gguf_scanner_comprehensive_scan(safe_tmp_path):
     """Test comprehensive GGUF scanning with tensors."""
-    path = tmp_path / "model.gguf"
+    path = safe_tmp_path / "model.gguf"
     _write_comprehensive_gguf(path)
     scanner = GgufScanner()
     result = scanner.scan(str(path))
@@ -127,18 +127,18 @@ def test_gguf_scanner_comprehensive_scan(tmp_path):
     assert result.metadata["tensors"][0]["name"] == "weight"
 
 
-def test_gguf_scanner_large_kv_count(tmp_path):
+def test_gguf_scanner_large_kv_count(safe_tmp_path):
     """Test detection of suspiciously large KV counts."""
-    path = tmp_path / "bad.gguf"
+    path = safe_tmp_path / "bad.gguf"
     _write_minimal_gguf(path, n_kv=2**31)
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert "invalid" in str(result.issues[0].message).lower()
 
 
-def test_gguf_scanner_large_tensor_count(tmp_path):
+def test_gguf_scanner_large_tensor_count(safe_tmp_path):
     """Test detection of suspiciously large tensor counts."""
-    path = tmp_path / "bad.gguf"
+    path = safe_tmp_path / "bad.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))  # version
@@ -149,9 +149,9 @@ def test_gguf_scanner_large_tensor_count(tmp_path):
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_gguf_scanner_truncated_file(tmp_path):
+def test_gguf_scanner_truncated_file(safe_tmp_path):
     """Test handling of truncated GGUF files."""
-    path = tmp_path / "trunc.gguf"
+    path = safe_tmp_path / "trunc.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -162,27 +162,27 @@ def test_gguf_scanner_truncated_file(tmp_path):
     assert not result.success or any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_gguf_scanner_suspicious_key_paths(tmp_path):
+def test_gguf_scanner_suspicious_key_paths(safe_tmp_path):
     """Test detection of suspicious key names with path traversal."""
-    path = tmp_path / "suspicious.gguf"
+    path = safe_tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"../../../etc/passwd", kv_value=b"root")
 
     result = GgufScanner().scan(str(path))
     assert any("path traversal" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_suspicious_values(tmp_path):
+def test_gguf_scanner_suspicious_values(safe_tmp_path):
     """Test detection of suspicious metadata values."""
-    path = tmp_path / "suspicious.gguf"
+    path = safe_tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"command", kv_value=b"rm -rf /")
 
     result = GgufScanner().scan(str(path))
     assert any("suspicious" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_string_length_security(tmp_path):
+def test_gguf_scanner_string_length_security(safe_tmp_path):
     """Test security checks for string lengths."""
-    path = tmp_path / "long_string.gguf"
+    path = safe_tmp_path / "long_string.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -195,9 +195,9 @@ def test_gguf_scanner_string_length_security(tmp_path):
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_ggml_scanner_basic(tmp_path):
+def test_ggml_scanner_basic(safe_tmp_path):
     """Test basic GGML file scanning."""
-    path = tmp_path / "model.ggml"
+    path = safe_tmp_path / "model.ggml"
     _write_ggml_file(path)
 
     result = GgufScanner().scan(str(path))
@@ -206,9 +206,9 @@ def test_ggml_scanner_basic(tmp_path):
     assert result.metadata["version"] == 1
 
 
-def test_ggml_variant_scanner_basic(tmp_path):
+def test_ggml_variant_scanner_basic(safe_tmp_path):
     """Ensure GGML variants are scanned correctly."""
-    path = tmp_path / "model.ggmf"
+    path = safe_tmp_path / "model.ggmf"
     _write_ggml_variant_file(path, b"GGMF")
     result = GgufScanner().scan(str(path))
     assert result.success
@@ -216,9 +216,9 @@ def test_ggml_variant_scanner_basic(tmp_path):
     assert result.metadata.get("magic") == "GGMF"
 
 
-def test_ggml_scanner_suspicious_version(tmp_path):
+def test_ggml_scanner_suspicious_version(safe_tmp_path):
     """Test detection of suspicious GGML versions."""
-    path = tmp_path / "suspicious.ggml"
+    path = safe_tmp_path / "suspicious.ggml"
     with open(path, "wb") as f:
         f.write(b"GGML")
         f.write(struct.pack("<I", 99999))  # suspicious version
@@ -228,9 +228,9 @@ def test_ggml_scanner_suspicious_version(tmp_path):
     assert any("suspicious" in i.message.lower() for i in result.issues)
 
 
-def test_ggml_scanner_truncated(tmp_path):
+def test_ggml_scanner_truncated(safe_tmp_path):
     """Test handling of truncated GGML files."""
-    path = tmp_path / "trunc.ggml"
+    path = safe_tmp_path / "trunc.ggml"
     with open(path, "wb") as f:
         f.write(b"GGML")
         f.write(b"\0" * 10)  # Too short
@@ -239,9 +239,9 @@ def test_ggml_scanner_truncated(tmp_path):
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_gguf_scanner_invalid_alignment(tmp_path):
+def test_gguf_scanner_invalid_alignment(safe_tmp_path):
     """Test detection of invalid alignment values."""
-    path = tmp_path / "bad_align.gguf"
+    path = safe_tmp_path / "bad_align.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -259,9 +259,9 @@ def test_gguf_scanner_invalid_alignment(tmp_path):
     assert any("alignment" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_tensor_dimension_limits(tmp_path):
+def test_gguf_scanner_tensor_dimension_limits(safe_tmp_path):
     """Test detection of tensors with too many dimensions."""
-    path = tmp_path / "many_dims.gguf"
+    path = safe_tmp_path / "many_dims.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -291,9 +291,9 @@ def test_gguf_scanner_tensor_dimension_limits(tmp_path):
     assert any("suspicious" in i.message.lower() and "dimensions" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
+def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(safe_tmp_path):
     """Test DoS protection against tensors with excessive dimensions."""
-    path = tmp_path / "dos_dimensions.gguf"
+    path = safe_tmp_path / "dos_dimensions.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -335,28 +335,28 @@ def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
     assert any("skipping for security" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_file_extensions(tmp_path):
+def test_gguf_scanner_file_extensions(safe_tmp_path):
     """Test that scanner handles different file extensions correctly."""
     # Test .gguf extension
-    gguf_path = tmp_path / "model.gguf"
+    gguf_path = safe_tmp_path / "model.gguf"
     _write_minimal_gguf(gguf_path)
     assert GgufScanner.can_handle(str(gguf_path))
 
     # Test .ggml extension
-    ggml_path = tmp_path / "model.ggml"
+    ggml_path = safe_tmp_path / "model.ggml"
     _write_ggml_file(ggml_path)
     assert GgufScanner.can_handle(str(ggml_path))
 
     # Test unsupported extension
-    txt_path = tmp_path / "model.txt"
+    txt_path = safe_tmp_path / "model.txt"
     with open(txt_path, "w") as f:
         f.write("not a model")
     assert not GgufScanner.can_handle(str(txt_path))
 
 
-def test_gguf_scanner_metadata_types(tmp_path):
+def test_gguf_scanner_metadata_types(safe_tmp_path):
     """Test handling of different metadata value types."""
-    path = tmp_path / "types.gguf"
+    path = safe_tmp_path / "types.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
@@ -393,7 +393,7 @@ def test_gguf_scanner_metadata_types(tmp_path):
     assert "float_key" in result.metadata["metadata"]
 
 
-def test_gguf_scanner_error_handling(tmp_path):
+def test_gguf_scanner_error_handling(safe_tmp_path):
     """Test various error conditions."""
     scanner = GgufScanner()
 
@@ -402,15 +402,15 @@ def test_gguf_scanner_error_handling(tmp_path):
     assert not result.success
 
     # Test directory instead of file
-    dir_path = tmp_path / "not_a_file"
+    dir_path = safe_tmp_path / "not_a_file"
     dir_path.mkdir()
     result = scanner.scan(str(dir_path))
     assert not result.success
 
 
-def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
+def test_gguf_scanner_invalid_tensor_dimensions(safe_tmp_path):
     """Test handling of tensors with invalid dimensions (regression test for dimension bug)."""
-    path = tmp_path / "invalid_dims.gguf"
+    path = safe_tmp_path / "invalid_dims.gguf"
     with open(path, "wb") as f:
         # Header
         f.write(b"GGUF")

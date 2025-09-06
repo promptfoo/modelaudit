@@ -171,7 +171,7 @@ class TestSecretsDetector:
 class TestPickleScannerWithSecrets:
     """Test the PickleScanner with embedded secrets detection."""
 
-    def test_pickle_with_embedded_secret(self, tmp_path):
+    def test_pickle_with_embedded_secret(self, safe_tmp_path):
         """Test that secrets are detected in pickle files."""
         # Create a pickle file with an embedded secret
         data = {
@@ -182,7 +182,7 @@ class TestPickleScannerWithSecrets:
             },
         }
 
-        pickle_file = tmp_path / "model_with_secret.pkl"
+        pickle_file = safe_tmp_path / "model_with_secret.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -198,7 +198,7 @@ class TestPickleScannerWithSecrets:
         failed_checks = [c for c in secret_checks if c.status.value == "failed"]
         assert any("OpenAI" in str(c.details) for c in failed_checks)
 
-    def test_pickle_without_secrets(self, tmp_path):
+    def test_pickle_without_secrets(self, safe_tmp_path):
         """Test that clean pickle files pass secrets check."""
         # Create a clean pickle file
         data = {
@@ -209,7 +209,7 @@ class TestPickleScannerWithSecrets:
             },
         }
 
-        pickle_file = tmp_path / "clean_model.pkl"
+        pickle_file = safe_tmp_path / "clean_model.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -223,12 +223,12 @@ class TestPickleScannerWithSecrets:
             # Should have a passing check
             assert any(c.status.value == "passed" for c in secret_checks), "Should pass secrets check"
 
-    def test_secrets_check_disabled(self, tmp_path):
+    def test_secrets_check_disabled(self, safe_tmp_path):
         """Test that secrets check can be disabled."""
         # Create a pickle file with a secret
         data = {"api_key": "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"}
 
-        pickle_file = tmp_path / "model_with_secret.pkl"
+        pickle_file = safe_tmp_path / "model_with_secret.pkl"
         with open(pickle_file, "wb") as f:
             pickle.dump(data, f)
 
@@ -244,10 +244,10 @@ class TestPickleScannerWithSecrets:
 class TestDetectSecretsInFile:
     """Test the convenience function for file scanning."""
 
-    def test_detect_secrets_in_file(self, tmp_path):
+    def test_detect_secrets_in_file(self, safe_tmp_path):
         """Test the detect_secrets_in_file convenience function."""
         # Create a test file with secrets
-        test_file = tmp_path / "test_file.txt"
+        test_file = safe_tmp_path / "test_file.txt"
         test_file.write_text("aws_access_key_id=AKIAIOSFODNN7EXAMPLE\npassword=super_secret_password_123\n")
 
         findings = detect_secrets_in_file(str(test_file))
@@ -263,10 +263,10 @@ class TestDetectSecretsInFile:
         assert findings[0]["type"] == "error"
         assert "not found" in findings[0]["message"]
 
-    def test_file_too_large(self, tmp_path):
+    def test_file_too_large(self, safe_tmp_path):
         """Test handling of files that are too large."""
         # Create a dummy large file
-        large_file = tmp_path / "large_file.bin"
+        large_file = safe_tmp_path / "large_file.bin"
         large_file.write_bytes(b"x" * 100)
 
         # Test with very small max_size

@@ -20,9 +20,9 @@ class DummyScanner:
         return result
 
 
-def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch) -> None:
+def test_chunked_scan_populates_end_time_and_success(safe_tmp_path: Path, monkeypatch) -> None:
     """Ensure chunked scans set end_time and success."""
-    test_file = tmp_path / "model.bin"
+    test_file = safe_tmp_path / "model.bin"
     test_file.write_bytes(b"0" * 50)
 
     monkeypatch.setattr(large_file_handler, "SMALL_FILE_THRESHOLD", 1)

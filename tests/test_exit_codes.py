@@ -175,9 +175,9 @@ def test_exit_code_files_scanned_with_issues():
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_file_scan_failure(tmp_path):
+def test_exit_code_file_scan_failure(safe_tmp_path):
     """Return exit code 2 when an exception occurs during file scan."""
-    test_file = tmp_path / "bad.pkl"
+    test_file = safe_tmp_path / "bad.pkl"
     test_file.write_text("data")
 
     with patch("modelaudit.core.scan_file", side_effect=RuntimeError("boom")):

@@ -11,10 +11,10 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 class TestNetworkCommIntegration:
     """Test network communication detection integration with scanners."""
 
-    def test_pickle_scanner_integration(self, tmp_path):
+    def test_pickle_scanner_integration(self, safe_tmp_path):
         """Test network communication detection in pickle scanner."""
         # Create a pickle file with network patterns
-        test_file = tmp_path / "model_with_network.pkl"
+        test_file = safe_tmp_path / "model_with_network.pkl"
 
         data = {
             "model_weights": [1.0, 2.0, 3.0],
@@ -53,10 +53,10 @@ def exfiltrate(data):
         assert any("socket" in msg for msg in messages)
         assert any("requests" in msg or "http" in msg for msg in messages)
 
-    def test_pytorch_zip_scanner_integration(self, tmp_path):
+    def test_pytorch_zip_scanner_integration(self, safe_tmp_path):
         """Test network communication detection in PyTorch ZIP scanner."""
         # Create a PyTorch ZIP file with network patterns
-        test_file = tmp_path / "model_with_network.pt"
+        test_file = safe_tmp_path / "model_with_network.pt"
 
         with zipfile.ZipFile(test_file, "w") as zf:
             # Add model data
@@ -103,10 +103,10 @@ class NetworkExfiltrator:
         # Check for backdoor detection (the scanner detects port 1337 as a common backdoor)
         assert "backdoor" in all_messages.lower() or "1337" in all_messages
 
-    def test_network_detection_can_be_disabled(self, tmp_path):
+    def test_network_detection_can_be_disabled(self, safe_tmp_path):
         """Test that network detection can be disabled via config."""
         # Create a pickle file with network patterns
-        test_file = tmp_path / "model.pkl"
+        test_file = safe_tmp_path / "model.pkl"
 
         data = {
             "url": "http://malicious.com",
@@ -125,10 +125,10 @@ class NetworkExfiltrator:
 
         assert len(network_checks) == 0
 
-    def test_network_detection_severity_levels(self, tmp_path):
+    def test_network_detection_severity_levels(self, safe_tmp_path):
         """Test that different patterns have appropriate severity levels."""
         # Create a pickle with various severity patterns
-        test_file = tmp_path / "severity_test.pkl"
+        test_file = safe_tmp_path / "severity_test.pkl"
 
         data = {
             # Critical: malware/backdoor patterns
@@ -153,10 +153,10 @@ class NetworkExfiltrator:
         severities = [c.severity.value for c in network_checks]
         assert "critical" in severities  # malware/backdoor
 
-    def test_combined_detections(self, tmp_path):
+    def test_combined_detections(self, safe_tmp_path):
         """Test that network detection works alongside other detections."""
         # Create a pickle with multiple security issues
-        test_file = tmp_path / "multi_issue.pkl"
+        test_file = safe_tmp_path / "multi_issue.pkl"
 
         data = {
             # Network communication
@@ -187,10 +187,10 @@ class NetworkExfiltrator:
         assert any("socket" in msg for msg in network_messages)
         assert any("c2" in msg.lower() for msg in network_messages)
 
-    def test_no_false_positives(self, tmp_path):
+    def test_no_false_positives(self, safe_tmp_path):
         """Test that clean models don't trigger false positives."""
         # Create a clean model file
-        test_file = tmp_path / "clean_model.pkl"
+        test_file = safe_tmp_path / "clean_model.pkl"
 
         data = {
             "model_state": {

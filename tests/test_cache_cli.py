@@ -79,9 +79,9 @@ class TestCacheCLI:
         # Should either report removed count or no entries found
         assert ("Removed" in result.output) or ("No old cache entries found" in result.output)
 
-    def test_cache_clear_with_custom_dir(self, tmp_path):
+    def test_cache_clear_with_custom_dir(self, safe_tmp_path):
         """Test cache clear with custom cache directory."""
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         cache_dir.mkdir()
 
         runner = CliRunner()
@@ -90,9 +90,9 @@ class TestCacheCLI:
         assert result.exit_code == 0
         assert "Cleared" in result.output
 
-    def test_cache_stats_with_custom_dir(self, tmp_path):
+    def test_cache_stats_with_custom_dir(self, safe_tmp_path):
         """Test cache stats with custom cache directory."""
-        cache_dir = tmp_path / "custom_cache"
+        cache_dir = safe_tmp_path / "custom_cache"
         cache_dir.mkdir()
 
         runner = CliRunner()
