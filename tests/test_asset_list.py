@@ -127,6 +127,16 @@ def test_assets_nested_zip_with_models(safe_tmp_path: Path) -> None:
     # Clean up temp file
     inner_st_path.unlink()
 
+    # Ensure zip file is fully written to disk before scanning
+    import time
+
+    # Verify zip file exists and has content
+    assert zip_path.exists(), f"Zip file {zip_path} does not exist"
+    assert zip_path.stat().st_size > 0, f"Zip file {zip_path} is empty"
+
+    # Small delay to ensure filesystem operations complete
+    time.sleep(0.1)
+
     results = scan_model_directory_or_file(str(zip_path))
     zip_asset = results.assets[0]
 
