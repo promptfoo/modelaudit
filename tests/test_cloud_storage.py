@@ -43,7 +43,7 @@ class TestCloudURLDetection:
 
 
 @patch("fsspec.filesystem")
-def test_download_from_cloud(mock_fs, tmp_path):
+def test_download_from_cloud(mock_fs, safe_tmp_path):
     fs_meta = make_fs_mock()
     fs_meta.info.return_value = {"type": "file", "size": 1024}
 
@@ -53,7 +53,7 @@ def test_download_from_cloud(mock_fs, tmp_path):
     mock_fs.side_effect = [fs_meta, fs]
 
     url = "s3://bucket/model.pt"
-    result = download_from_cloud(url, cache_dir=tmp_path)
+    result = download_from_cloud(url, cache_dir=safe_tmp_path)
 
     # Verify fs.get was called (path will include cache subdirectories)
     fs.get.assert_called_once()
@@ -71,7 +71,7 @@ def test_download_from_cloud(mock_fs, tmp_path):
 
 @patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("fsspec.filesystem")
-def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
+def test_download_from_cloud_async_context(mock_fs, mock_analyze, safe_tmp_path):
     fs = MagicMock()
     mock_fs.return_value = fs
 
@@ -89,7 +89,7 @@ def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
     url = "s3://bucket/model.pt"
 
     # Test that the function works in a synchronous context
-    result = download_from_cloud(url, cache_dir=tmp_path)
+    result = download_from_cloud(url, cache_dir=safe_tmp_path)
 
     # With context managers, fs.get is called but then fs is closed
     # Just verify the result is correct since the mock behavior changes with context managers
@@ -219,7 +219,7 @@ class TestDiskSpaceCheckingForCloud:
     @patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
     def test_download_with_disk_space_check(
-        self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size, tmp_path
+        self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size, safe_tmp_path
     ):
         """Test successful download with disk space check."""
         fs_meta = make_fs_mock()
@@ -246,7 +246,7 @@ class TestDiskSpaceCheckingForCloud:
         mock_check_disk_space.return_value = (True, "Sufficient disk space available (10.0 GB)")
 
         # Test download
-        result = download_from_cloud("s3://bucket/model.bin", cache_dir=tmp_path)
+        result = download_from_cloud("s3://bucket/model.bin", cache_dir=safe_tmp_path)
 
         # Verify disk space was checked
         mock_check_disk_space.assert_called_once()
@@ -254,7 +254,7 @@ class TestDiskSpaceCheckingForCloud:
         # Verify download proceeded - with context managers, fs.get is called but then fs is closed
         # Just verify the result is correct since the mock behavior changes with context managers
         assert result.name == "model.bin"
-        assert str(tmp_path) in str(result)  # Should be within the cache dir
+        assert str(safe_tmp_path) in str(result)  # Should be within the cache dir
 
 
 def test_filter_scannable_files_recognizes_pdiparams():
