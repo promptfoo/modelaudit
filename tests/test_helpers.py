@@ -135,6 +135,8 @@ def prepare_test_scenario_nested_zip(base_path: Path) -> Path:
     Prepare the test scenario for nested zip test.
     Returns path to zip file when it's guaranteed to be complete.
     """
+    temp_st_path = base_path / "temp.safetensors"
+    
     try:
         import numpy as np
         from safetensors.numpy import save_file
@@ -143,23 +145,22 @@ def prepare_test_scenario_nested_zip(base_path: Path) -> Path:
         safetensors_data = {"weight": np.array([1.0, 2.0, 3.0]).astype(np.float32)}
 
         # Create temporary SafeTensors file atomically
-        temp_st_path = base_path / "temp.safetensors"
         save_file(safetensors_data, str(temp_st_path))
     except ImportError:
         # Fallback if safetensors not available
-        temp_st_path = base_path / "temp.safetensors"
         create_generic_file_atomically(temp_st_path, b"fake safetensors content", "wb")
 
-    # Create zip file atomically
-    zip_path = base_path / "models.zip"
+    try:
+        # Create zip file atomically
+        zip_path = base_path / "models.zip"
 
-    def add_zip_content(zf: zipfile.ZipFile) -> None:
-        zf.write(temp_st_path, "model.safetensors")
-        zf.writestr("config.json", '{"model_type": "test", "hidden_size": 768}')
+        def add_zip_content(zf: zipfile.ZipFile) -> None:
+            zf.write(temp_st_path, "model.safetensors")
+            zf.writestr("config.json", '{"model_type": "test", "hidden_size": 768}')
 
-    create_zip_file_atomically(zip_path, add_zip_content)
-
-    # Clean up temp file
-    temp_st_path.unlink()
-
-    return zip_path
+        create_zip_file_atomically(zip_path, add_zip_content)
+        return zip_path
+    
+    finally:
+        # Always clean up temp file, regardless of what happens
+        temp_st_path.unlink(missing_ok=True)
