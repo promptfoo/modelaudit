@@ -150,7 +150,7 @@ ty is a modern Python type checker that provides more advanced analysis than myp
 # Basic type checking
 rye run ty check                         # Check all configured files
 
-# Specific file or directory checking  
+# Specific file or directory checking
 rye run ty check modelaudit/cli.py       # Check specific file
 rye run ty check modelaudit/scanners/    # Check specific directory
 
@@ -173,8 +173,9 @@ rye run ty check --error-on-warning      # Treat warnings as errors (stricter CI
 ### ty Configuration
 
 Configuration is in `[tool.ty]` section of `pyproject.toml`:
+
 - Includes both `modelaudit/` and `tests/` directories
-- Excludes test assets and generated files  
+- Excludes test assets and generated files
 - Conservative rule configuration to avoid overwhelming output
 - Test files have more permissive rules than source code
 
