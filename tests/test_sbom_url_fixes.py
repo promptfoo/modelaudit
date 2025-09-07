@@ -5,20 +5,18 @@ downloaded from URLs (HuggingFace, cloud storage, etc.).
 """
 
 import json
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
-from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import ModelAuditResultModel
-from modelaudit.sbom import generate_sbom, generate_sbom_pydantic
+from modelaudit.sbom import generate_sbom_pydantic
 
 
-def create_mock_scan_result(bytes_scanned=1024, issues=None, files_scanned=1, assets=None, has_errors=False, scanners=None):
+def create_mock_scan_result(
+    bytes_scanned=1024, issues=None, files_scanned=1, assets=None, has_errors=False, scanners=None
+):
     """Create a mock scan result for testing."""
     from modelaudit.models import create_initial_audit_result
 
@@ -49,7 +47,7 @@ class TestSBOMURLFixes:
             bytes_scanned=len(b"dummy model content for SBOM test"),
             files_scanned=1,
             has_errors=False,
-            scanners=["test_scanner"]
+            scanners=["test_scanner"],
         )
 
         # Test SBOM generation with the downloaded file path (not the URL)
@@ -79,10 +77,7 @@ class TestSBOMURLFixes:
 
         # Create mock scan result for directory
         scan_result = create_mock_scan_result(
-            bytes_scanned=100,
-            files_scanned=3,
-            has_errors=False,
-            scanners=["test_scanner"]
+            bytes_scanned=100, files_scanned=3, has_errors=False, scanners=["test_scanner"]
         )
 
         # Test SBOM generation with the downloaded directory path
@@ -105,9 +100,7 @@ class TestSBOMURLFixes:
         downloaded_file.write_bytes(b"pickled model data")
 
         scan_result = create_mock_scan_result(
-            bytes_scanned=len(b"pickled model data"),
-            files_scanned=1,
-            has_errors=False
+            bytes_scanned=len(b"pickled model data"), files_scanned=1, has_errors=False
         )
 
         # Test SBOM generation
@@ -129,11 +122,7 @@ class TestSBOMURLFixes:
         downloaded_file = tmp_path / "downloaded_model.safetensors"
         downloaded_file.write_bytes(b"downloaded model")
 
-        scan_result = create_mock_scan_result(
-            bytes_scanned=200,
-            files_scanned=2,
-            has_errors=False
-        )
+        scan_result = create_mock_scan_result(bytes_scanned=200, files_scanned=2, has_errors=False)
 
         # Test SBOM generation with both paths
         paths = [str(local_file), str(downloaded_file)]
@@ -148,9 +137,7 @@ class TestSBOMURLFixes:
     @patch("modelaudit.cli.is_huggingface_file_url")
     @patch("modelaudit.cli.download_file_from_hf")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_huggingface_file_url(
-        self, mock_scan, mock_download, mock_is_hf_file_url, tmp_path
-    ):
+    def test_cli_sbom_with_huggingface_file_url(self, mock_scan, mock_download, mock_is_hf_file_url, tmp_path):
         """Test CLI SBOM generation with HuggingFace file URL."""
         # Setup mocks
         mock_is_hf_file_url.return_value = True
@@ -158,26 +145,28 @@ class TestSBOMURLFixes:
         downloaded_file.write_bytes(b"test model content")
         mock_download.return_value = downloaded_file
 
-        mock_scan.return_value = create_mock_scan_result(
-            bytes_scanned=100, files_scanned=1, has_errors=False
-        )
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100, files_scanned=1, has_errors=False)
 
         # Test CLI with SBOM output
         sbom_output = tmp_path / "test.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "scan", 
-            "--no-cache", 
-            "--sbom", str(sbom_output),
-            "https://huggingface.co/test/model/resolve/main/model.bin"
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--no-cache",
+                "--sbom",
+                str(sbom_output),
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+            ],
+        )
 
         # Should succeed
         assert result.exit_code == 0
-        
+
         # SBOM file should be created
         assert sbom_output.exists()
-        
+
         # Verify SBOM content
         sbom_data = json.loads(sbom_output.read_text())
         assert sbom_data["bomFormat"] == "CycloneDX"
@@ -193,9 +182,7 @@ class TestSBOMURLFixes:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_huggingface_model_url(
-        self, mock_scan, mock_download, mock_is_hf_url, tmp_path
-    ):
+    def test_cli_sbom_with_huggingface_model_url(self, mock_scan, mock_download, mock_is_hf_url, tmp_path):
         """Test CLI SBOM generation with HuggingFace model URL."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -205,24 +192,17 @@ class TestSBOMURLFixes:
         (downloaded_dir / "model.bin").write_bytes(b"model")
         mock_download.return_value = downloaded_dir
 
-        mock_scan.return_value = create_mock_scan_result(
-            bytes_scanned=200, files_scanned=2, has_errors=False
-        )
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=200, files_scanned=2, has_errors=False)
 
         # Test CLI with SBOM output
         sbom_output = tmp_path / "model.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "scan", 
-            "--no-cache", 
-            "--sbom", str(sbom_output),
-            "hf://test/model"
-        ])
+        result = runner.invoke(cli, ["scan", "--no-cache", "--sbom", str(sbom_output), "hf://test/model"])
 
         # Should succeed
         assert result.exit_code == 0
         assert sbom_output.exists()
-        
+
         # Verify SBOM content has components from directory
         sbom_data = json.loads(sbom_output.read_text())
         assert len(sbom_data["components"]) == 2
@@ -233,9 +213,7 @@ class TestSBOMURLFixes:
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_cloud_url(
-        self, mock_scan, mock_download, mock_is_cloud_url, tmp_path
-    ):
+    def test_cli_sbom_with_cloud_url(self, mock_scan, mock_download, mock_is_cloud_url, tmp_path):
         """Test CLI SBOM generation with cloud storage URL."""
         # Setup mocks
         mock_is_cloud_url.return_value = True
@@ -243,22 +221,16 @@ class TestSBOMURLFixes:
         downloaded_file.write_bytes(b"cloud model data")
         mock_download.return_value = downloaded_file
 
-        mock_scan.return_value = create_mock_scan_result(
-            bytes_scanned=150, files_scanned=1, has_errors=False
-        )
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=150, files_scanned=1, has_errors=False)
 
         # Test CLI with SBOM
         sbom_output = tmp_path / "cloud.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "scan", 
-            "--sbom", str(sbom_output),
-            "s3://bucket/model.pkl"
-        ])
+        result = runner.invoke(cli, ["scan", "--sbom", str(sbom_output), "s3://bucket/model.pkl"])
 
         assert result.exit_code == 0
         assert sbom_output.exists()
-        
+
         sbom_data = json.loads(sbom_output.read_text())
         assert len(sbom_data["components"]) == 1
         assert sbom_data["components"][0]["name"] == "cloud_model.pkl"
@@ -267,10 +239,10 @@ class TestSBOMURLFixes:
         """Test that SBOM generation doesn't fail with FileNotFoundError for URLs."""
         # This test verifies the fix prevents the original error
         url = "https://huggingface.co/test/model/resolve/main/file.bin"
-        
+
         # Create a mock scan result
         scan_result = create_mock_scan_result()
-        
+
         # This should NOT raise FileNotFoundError when given a URL
         # (The fix ensures only valid file paths are passed to SBOM generation)
         with pytest.raises(FileNotFoundError):
@@ -281,13 +253,13 @@ class TestSBOMURLFixes:
         """Test SBOM generation gracefully handles nonexistent files."""
         nonexistent_file = tmp_path / "missing.pkl"
         # Note: file doesn't exist
-        
+
         scan_result = create_mock_scan_result()
-        
+
         # Should not crash, but may have empty hashes
         sbom_json = generate_sbom_pydantic([str(nonexistent_file)], scan_result)
         sbom_data = json.loads(sbom_json)
-        
+
         assert len(sbom_data["components"]) == 1
         component = sbom_data["components"][0]
         # For nonexistent files, hashes may be empty
@@ -296,9 +268,7 @@ class TestSBOMURLFixes:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_download_failure(
-        self, mock_scan, mock_download, mock_is_hf_url, tmp_path
-    ):
+    def test_cli_sbom_with_download_failure(self, mock_scan, mock_download, mock_is_hf_url, tmp_path):
         """Test CLI behavior when download fails but SBOM is requested."""
         # Setup mocks for download failure
         mock_is_hf_url.return_value = True
@@ -306,11 +276,7 @@ class TestSBOMURLFixes:
 
         sbom_output = tmp_path / "failed.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "scan", 
-            "--sbom", str(sbom_output),
-            "hf://test/failing-model"
-        ])
+        result = runner.invoke(cli, ["scan", "--sbom", str(sbom_output), "hf://test/failing-model"])
 
         # Should handle the error gracefully
         assert result.exit_code != 0  # Should fail due to download error
@@ -322,22 +288,22 @@ class TestSBOMURLFixes:
         # Create test files with different path characteristics
         files = [
             tmp_path / "simple.pkl",
-            tmp_path / "file with spaces.bin", 
+            tmp_path / "file with spaces.bin",
             tmp_path / "unicode_文件.onnx",
         ]
-        
+
         for file_path in files:
             file_path.write_bytes(b"test content")
 
         scan_result = create_mock_scan_result(files_scanned=len(files))
-        
+
         # Test SBOM generation with all file types
         file_paths = [str(f) for f in files]
         sbom_json = generate_sbom_pydantic(file_paths, scan_result)
         sbom_data = json.loads(sbom_json)
-        
+
         assert len(sbom_data["components"]) == len(files)
-        
+
         # Verify all components have valid hashes (indicating successful file access)
         for component in sbom_data["components"]:
             assert "hashes" in component
@@ -351,13 +317,13 @@ class TestSBOMURLFixes:
         # This is more of a smoke test - actual version testing happens in CI
         test_file = tmp_path / f"model_py{python_version.replace('.', '_')}.pkl"
         test_file.write_bytes(b"version test content")
-        
+
         scan_result = create_mock_scan_result()
-        
+
         # Should work regardless of Python version
         sbom_json = generate_sbom_pydantic([str(test_file)], scan_result)
         sbom_data = json.loads(sbom_json)
-        
+
         assert sbom_data["bomFormat"] == "CycloneDX"
         assert sbom_data["specVersion"] == "1.6"
         assert len(sbom_data["components"]) == 1
@@ -368,19 +334,16 @@ class TestSBOMURLFixes:
         large_file = tmp_path / "large_model.bin"
         large_content = b"x" * (1024 * 1024)  # 1MB of data
         large_file.write_bytes(large_content)
-        
-        scan_result = create_mock_scan_result(
-            bytes_scanned=len(large_content),
-            files_scanned=1
-        )
-        
+
+        scan_result = create_mock_scan_result(bytes_scanned=len(large_content), files_scanned=1)
+
         # Should handle large files without issues
         sbom_json = generate_sbom_pydantic([str(large_file)], scan_result)
         sbom_data = json.loads(sbom_json)
-        
+
         assert len(sbom_data["components"]) == 1
         component = sbom_data["components"][0]
-        
+
         # Verify file size is recorded correctly
         properties = {prop["name"]: prop["value"] for prop in component.get("properties", [])}
         assert "size" in properties
