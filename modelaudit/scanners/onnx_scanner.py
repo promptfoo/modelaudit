@@ -94,6 +94,7 @@ class OnnxScanner(BaseScanner):
 
         try:
             import onnx
+
             # Check for interrupts before starting the potentially long-running load
             self.check_interrupted()
             model = onnx.load(path, load_external_data=False)
@@ -233,6 +234,7 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts during external data processing
             self.check_interrupted()
             import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
@@ -283,6 +285,7 @@ class OnnxScanner(BaseScanner):
     ) -> None:
         try:
             import numpy as np
+
             if mapping is None:
                 return  # Skip if mapping is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
@@ -329,11 +332,13 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts during tensor size validation
             self.check_interrupted()
             import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
                 try:
                     import numpy as np
+
                     if mapping is None:
                         continue  # Skip if mapping is not available
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
