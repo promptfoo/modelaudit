@@ -145,10 +145,10 @@ class FastScannerMocks:
 def fast_tempfile_mock() -> tuple[Any, Any]:
     """Mock tempfile operations with in-memory paths."""
 
-    def mock_mkdtemp(*args, **kwargs) -> str:
+    def mock_mkdtemp(*args: Any, **kwargs: Any) -> str:
         return f"/tmp/mock_temp_{id(args)}"
 
-    def mock_mkstemp(*args, **kwargs) -> tuple[int, str]:
+    def mock_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
         fd = 123
         path = f"/tmp/mock_temp_file_{id(args)}"
         return fd, path
