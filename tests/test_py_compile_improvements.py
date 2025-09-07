@@ -2,6 +2,7 @@
 
 import json
 import pickle
+from typing import Any
 
 import pytest
 
@@ -173,7 +174,7 @@ class TestFalsePositiveMetrics:
     def test_measure_false_positive_reduction(self, tmp_path):
         """Quantify how py_compile reduces false positives."""
         # Test cases that would be false positives without validation
-        false_positive_cases = [
+        false_positive_cases: list[dict[str, Any]] = [
             # Documentation mentioning dangerous functions
             {"doc": "Use eval() to evaluate expressions", "type": "documentation"},
             # Variable names containing keywords
@@ -187,7 +188,7 @@ class TestFalsePositiveMetrics:
         ]
 
         # Actual dangerous code that should be detected
-        true_positive_cases = [
+        true_positive_cases: list[dict[str, Any]] = [
             {"code": 'eval(\'__import__("os").system("ls")\')', "type": "eval"},
             {"code": "exec(compile('import os', '<string>', 'exec'))", "type": "exec"},
             {"code": "__import__('subprocess').call(['rm', '-rf', '/'])", "type": "import"},

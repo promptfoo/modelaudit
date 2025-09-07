@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 class ModelArchitecture(Enum):
@@ -55,8 +55,8 @@ class UnifiedMLContext:
 
     # ML Framework detection
     frameworks: dict[str, float] = field(default_factory=dict)  # framework -> confidence
-    primary_framework: Optional[str] = None
-    framework_version: Optional[str] = None
+    primary_framework: str | None = None
+    framework_version: str | None = None
 
     # Architecture analysis
     architecture: ModelArchitecture = ModelArchitecture.UNKNOWN
@@ -121,7 +121,7 @@ class UnifiedMLContext:
 
         return False
 
-    def add_tensor_info(self, tensor: TensorInfo):
+    def add_tensor_info(self, tensor: TensorInfo) -> None:
         """Add tensor information and update statistics."""
         self.tensors.append(tensor)
         self.total_parameters += tensor.parameter_count
@@ -136,7 +136,7 @@ class UnifiedMLContext:
     def analyze_architecture_patterns(self):
         """Analyze layer patterns to determine architecture."""
         # Count layer types
-        layer_type_counts = {}
+        layer_type_counts: dict[str, int] = {}
         for pattern in self.layer_patterns:
             layer_type_counts[pattern.layer_type] = layer_type_counts.get(pattern.layer_type, 0) + 1
 

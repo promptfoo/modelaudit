@@ -1,6 +1,6 @@
 # ModelAudit
 
-Static security scanner for AI/ML model files. It detects malicious code, dangerous deserialization, risky module usage, and embedded secrets—all without loading or executing the model.
+**Secure your AI models before deployment.** Detects malicious code, backdoors, and security vulnerabilities in ML model files.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
@@ -9,12 +9,14 @@ Static security scanner for AI/ML model files. It detects malicious code, danger
 
 <img width="989" alt="image" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
-**[Documentation](https://www.promptfoo.dev/docs/model-audit/)** | **[Usage Examples](https://www.promptfoo.dev/docs/model-audit/usage/)** | **[Supported Formats](https://www.promptfoo.dev/docs/model-audit/scanners/)**
+📖 **[Full Documentation](https://www.promptfoo.dev/docs/model-audit/)** | 🎯 **[Usage Examples](https://www.promptfoo.dev/docs/model-audit/usage/)** | 🔍 **[Supported Formats](https://www.promptfoo.dev/docs/model-audit/scanners/)**
 
-## Quick Start
+## 🚀 Quick Start
+
+**Install and scan in 30 seconds:**
 
 ```bash
-# Install with all supported ML framework dependencies
+# Install ModelAudit with all ML framework support
 pip install modelaudit[all]
 
 # Scan a model file
@@ -23,13 +25,13 @@ modelaudit model.pkl
 # Scan a directory
 modelaudit ./models/
 
-# Export results for automation
+# Export results for CI/CD
 modelaudit model.pkl --format json --output results.json
 ```
 
 **Example output:**
 
-```text
+```bash
 $ modelaudit suspicious_model.pkl
 
 ✓ Scanning suspicious_model.pkl
@@ -41,12 +43,205 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 2. suspicious_model.pkl (pos 52): [WARNING] Dangerous pickle deserialization
    Why: Could execute code when the model loads
 
-✗ 2 security issues found. See details above.
+✗ Security issues found - DO NOT deploy this model
 ```
 
-## Installation
+## 🛡️ What Problems It Solves
 
-**Recommended (includes common ML frameworks):**
+### **Prevents Code Execution Attacks**
+
+Stops malicious models that run arbitrary commands when loaded (common in PyTorch .pt files)
+
+### **Detects Model Backdoors**
+
+Identifies trojaned models with hidden functionality or suspicious weight patterns
+
+### **Ensures Supply Chain Security**
+
+Validates model integrity and prevents tampering in your ML pipeline
+
+### **Enforces License Compliance**
+
+Checks for license violations that could expose your company to legal risk
+
+### **Finds Embedded Secrets**
+
+Detects API keys, tokens, and other credentials hidden in model weights or metadata
+
+### **Flags Network Communication**
+
+Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2 channels
+
+### **Detects Hidden JIT/Script Execution**
+
+Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
+
+## 📊 Supported Model Formats
+
+ModelAudit scans **all major ML model formats** with specialized security analysis for each:
+
+| Format          | Extensions                            | Risk Level | Notes                                        |
+| --------------- | ------------------------------------- | ---------- | -------------------------------------------- |
+| **PyTorch**     | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Contains pickle serialization - always scan  |
+| **Pickle**      | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
+| **Joblib**      | `.joblib`                             | 🔴 HIGH    | Can contain pickled objects                  |
+| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`  | 🔴 HIGH    | Can contain malicious payloads               |
+| **SafeTensors** | `.safetensors`                        | 🟢 SAFE    | Preferred secure format                      |
+| **GGUF/GGML**   | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard, binary format                  |
+| **ONNX**        | `.onnx`                               | 🟢 SAFE    | Industry standard, good interoperability     |
+| **TensorFlow**  | `.pb`, SavedModel                     | 🟠 MEDIUM  | Scan for dangerous operations                |
+| **Keras**       | `.h5`, `.keras`, `.hdf5`              | 🟠 MEDIUM  | Check for executable layers                  |
+| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟡 LOW     | Validate transforms                          |
+
+Plus 10+ additional formats including ExecuTorch, TensorFlow Lite, Core ML, and more.
+
+[View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
+
+## 🎯 Common Use Cases
+
+### **Pre-Deployment Security Checks**
+
+```bash
+modelaudit production_model.safetensors --format json --output security_report.json
+```
+
+### **CI/CD Pipeline Integration**
+
+ModelAudit automatically detects CI environments and adjusts output accordingly:
+
+```bash
+# Recommended: Use JSON format for machine-readable output
+modelaudit models/ --format json --output results.json
+
+# Text output automatically adapts to CI (no spinners, plain text)
+modelaudit models/ --timeout 300
+
+# Disable colors explicitly with NO_COLOR environment variable
+NO_COLOR=1 modelaudit models/
+```
+
+**CI-Friendly Features:**
+
+- 🚫 Spinners automatically disabled when output is piped or in CI
+- 🎨 Colors disabled when `NO_COLOR` environment variable is set
+- 📊 JSON output recommended for parsing in CI pipelines
+- 🔍 Exit codes: 0 (clean), 1 (issues found), 2 (errors)
+
+### **Third-Party Model Validation**
+
+```bash
+# Scan models from HuggingFace, PyTorch Hub, MLflow, JFrog, or cloud storage
+modelaudit https://huggingface.co/gpt2
+modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
+modelaudit models:/MyModel/Production
+modelaudit model.dvc
+modelaudit s3://my-bucket/downloaded-model.pt
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
+    --jfrog-api-token YOUR_TOKEN
+```
+
+### **Compliance & Audit Reporting**
+
+```bash
+modelaudit model_package.zip --sbom compliance_report.json --strict --verbose
+```
+
+### 🧠 Smart Detection Examples
+
+ModelAudit automatically adapts to your input - **no configuration needed for most cases:**
+
+```bash
+# Local file - fast scan, no progress bars
+modelaudit model.pkl
+
+# Cloud directory - auto enables caching + progress bars
+modelaudit s3://my-bucket/models/
+
+# HuggingFace model - selective download + caching
+modelaudit hf://microsoft/DialoGPT-medium
+
+# Large local file - enables progress + optimizations
+modelaudit 15GB-model.bin
+
+# CI environment - auto detects and uses JSON output
+CI=true modelaudit model.pkl
+```
+
+**Override smart detection when needed:**
+
+```bash
+# Force strict mode for security-critical scans
+modelaudit model.pkl --strict --format json --output report.json
+
+# Override size limits for huge models
+modelaudit huge-model.pt --max-size 50GB --timeout 7200
+
+# Preview mode without downloading
+modelaudit s3://bucket/model.pt --dry-run
+```
+
+[View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+### ⚙️ Smart Detection & CLI Options
+
+ModelAudit uses **smart detection** to automatically configure optimal settings based on your input:
+
+**✨ Smart Detection Features:**
+
+- **Input type** (local/cloud/registry) → optimal download & caching strategies
+- **File size** (>1GB) → large model optimizations + progress bars
+- **Terminal type** (TTY/CI) → appropriate UI (progress vs quiet mode)
+- **Cloud operations** → automatic caching, size limits, timeouts
+
+**🎛️ Override Controls (13 focused flags):**
+
+- `--strict` – scan all file types, strict license validation, fail on warnings
+- `--max-size SIZE` – unified size limit (e.g., `10GB`, `500MB`)
+- `--timeout SECONDS` – override auto-detected timeout
+- `--dry-run` – preview what would be scanned/downloaded
+- `--progress` – force enable progress reporting
+- `--no-cache` – disable caching (overrides smart detection)
+- `--format json` / `--output file.json` – structured output for CI/CD
+- `--sbom file.json` – generate CycloneDX v1.6 SBOM with enhanced ML-BOM support
+- `--verbose` / `--quiet` – control output detail level
+- `--blacklist PATTERN` – additional security patterns
+
+**🔐 Authentication (via environment variables):**
+
+- Set `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- Set `MLFLOW_TRACKING_URI` for MLflow registry access
+
+### 🚀 Large Model Support (Up to 1 TB)
+
+ModelAudit automatically optimizes scanning strategies for different model sizes:
+
+- **< 100 GB**: Full in-memory analysis for comprehensive scanning
+- **100 GB - 1 TB**: Chunked processing with 50 GB chunks for memory efficiency
+- **1 TB - 5 TB**: Streaming analysis with intelligent sampling
+- **> 5 TB**: Advanced distributed scanning techniques
+
+Large models are supported with automatic timeout increases and memory-optimized processing.
+
+### Static Scanning vs. Promptfoo Redteaming
+
+ModelAudit performs **static** analysis only. It examines model files for risky patterns
+without ever loading or executing them. Promptfoo's redteaming module is
+**dynamic**—it loads the model (locally or via API) and sends crafted prompts to
+probe runtime behavior. Use ModelAudit first to verify the model file itself,
+then run redteaming if you need to test how the model responds when invoked.
+
+## ⚙️ Installation Options
+
+**Requirements:**
+
+- Python 3.10 or higher
+- Compatible with Python 3.10, 3.11, 3.12, and 3.13
+
+**Basic installation (recommended for most users):**
+
+### Quick Install Decision Guide
+
+**🚀 Just want everything to work?**
 
 ```bash
 pip install modelaudit[all]

@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
@@ -26,7 +26,7 @@ class KerasZipScanner(BaseScanner):
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
     supported_extensions: ClassVar[list[str]] = [".keras"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)

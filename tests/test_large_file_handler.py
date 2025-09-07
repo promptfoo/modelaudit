@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import ScanResult
 from modelaudit.utils import large_file_handler
 
@@ -20,7 +22,7 @@ class DummyScanner:
         return result
 
 
-def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch) -> None:
+def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure chunked scans set end_time and success."""
     test_file = tmp_path / "model.bin"
     test_file.write_bytes(b"0" * 50)

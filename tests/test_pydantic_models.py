@@ -2,11 +2,13 @@
 
 import json
 import time
+from typing import cast
 
 import pytest
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import (
+    AssetModel,
     ModelAuditResultModel,
     create_audit_result_model,
     rebuild_models,
@@ -29,6 +31,7 @@ class TestPydanticModels:
             details={"key": "value"},
             timestamp=timestamp,
             why="This is why it's a problem",
+            type=None,
         )
 
         assert issue.message == "Test issue"
@@ -142,10 +145,29 @@ class TestPydanticModels:
         # Create a realistic model
         model = ModelAuditResultModel(
             bytes_scanned=100,
-            issues=[Issue(message="Test issue", severity=IssueSeverity.WARNING, timestamp=time.time())],
-            checks=[Check(name="Test Check", status=CheckStatus.PASSED, message="Check passed", timestamp=time.time())],
+            issues=[
+                Issue(
+                    message="Test issue",
+                    severity=IssueSeverity.WARNING,
+                    timestamp=time.time(),
+                    location=None,
+                    why=None,
+                    type=None,
+                )
+            ],
+            checks=[
+                Check(
+                    name="Test Check",
+                    status=CheckStatus.PASSED,
+                    message="Check passed",
+                    timestamp=time.time(),
+                    severity=None,
+                    location=None,
+                    why=None,
+                )
+            ],
             files_scanned=1,
-            assets=[{"path": "test.pkl", "type": "pickle"}],
+            assets=[AssetModel(path="test.pkl", type="pickle", size=None, tensors=None, keys=None, contents=None)],
             has_errors=False,
             scanner_names=["pickle"],
             file_metadata={},
@@ -187,7 +209,15 @@ class TestPydanticModels:
 
     def test_pydantic_v2_features(self):
         """Test Pydantic v2 specific features."""
-        check = Check(name="Test Check", status=CheckStatus.PASSED, message="Test message", timestamp=time.time())
+        check = Check(
+            name="Test Check",
+            status=CheckStatus.PASSED,
+            message="Test message",
+            timestamp=time.time(),
+            severity=None,
+            location=None,
+            why=None,
+        )
 
         # Test model_dump() method (v2 syntax)
         data = check.model_dump()
@@ -210,13 +240,16 @@ class TestPydanticModels:
 
         # Test that required fields are enforced
         with pytest.raises(ValidationError):
-            ModelAuditResultModel()  # Missing required fields
+            ModelAuditResultModel()  # type: ignore[call-arg]  # Missing required fields - intentionally testing validation
 
         # Test that invalid data is caught
         with pytest.raises(ValidationError):
             Check(
                 name="Test",
-                status="invalid_status",  # Should be passed/failed/skipped  # type: ignore[arg-type]
+                status=cast(CheckStatus, "invalid_status"),  # Invalid status - should fail validation
                 message="Test",
-                timestamp="not_a_number",  # Should be float  # type: ignore[arg-type]
+                timestamp=cast(float, "not_a_number"),  # Invalid timestamp - should fail validation
+                severity=None,
+                location=None,
+                why=None,
             )

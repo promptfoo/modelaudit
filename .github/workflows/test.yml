@@ -186,7 +186,7 @@ jobs:
       matrix:
         # For PRs, only test min and max Python versions to save time
         # For main branch, test all versions
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
@@ -252,7 +252,7 @@ jobs:
     strategy:
       matrix:
         # Reduced matrix for PRs
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.9", "3.11", "3.12"]') }}
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
         numpy-mode: ["1.x", "2.x"]
     steps:
       - name: Checkout repo

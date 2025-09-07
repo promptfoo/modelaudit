@@ -253,7 +253,7 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
     return artifacts
 
 
-def _get_rule_id(issue) -> str:
+def _get_rule_id(issue: Any) -> str:
     """Generate a rule ID from an issue."""
     if hasattr(issue, "type") and issue.type:
         return f"MA{str(issue.type).replace(' ', '-').upper()}"
@@ -265,7 +265,7 @@ def _get_rule_id(issue) -> str:
     return f"MA-{base}"
 
 
-def _get_rule_name(issue) -> str:
+def _get_rule_name(issue: Any) -> str:
     """Get a human-readable rule name from an issue."""
     if hasattr(issue, "type") and issue.type:
         return str(issue.type).replace("_", " ").title()
@@ -274,7 +274,7 @@ def _get_rule_name(issue) -> str:
     return str(issue.message.split(":")[0] if ":" in issue.message else issue.message[:50])
 
 
-def _get_rule_short_description(issue) -> str:
+def _get_rule_short_description(issue: Any) -> str:
     """Get a short description for a rule."""
     if "pickle" in issue.message.lower():
         return "Potentially unsafe pickle operation detected"
@@ -294,7 +294,7 @@ def _get_rule_short_description(issue) -> str:
         return str(issue.message[:100])
 
 
-def _get_rule_full_description(issue) -> str:
+def _get_rule_full_description(issue: Any) -> str:
     """Get a full description for a rule."""
     desc = _get_rule_short_description(issue)
 
@@ -326,7 +326,7 @@ def _severity_to_rank(severity: IssueSeverity) -> float:
     return mapping.get(severity, 50.0)
 
 
-def _get_tags_for_issue(issue) -> list[str]:
+def _get_tags_for_issue(issue: Any) -> list[str]:
     """Get relevant tags for an issue."""
     tags = ["security", "ml-model"]
 

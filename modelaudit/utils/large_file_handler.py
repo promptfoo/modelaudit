@@ -8,8 +8,9 @@ with chunked reading, progress reporting, and memory management.
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..scanners.base import IssueSeverity, ScanResult
 
@@ -34,7 +35,7 @@ class LargeFileHandler:
         self,
         file_path: str,
         scanner: Any,
-        progress_callback: Optional[Callable[[str, float], None]] = None,
+        progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 3600,
     ):
         """
@@ -211,7 +212,7 @@ def should_use_large_file_handler(file_path: str) -> bool:
 def scan_large_file(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 3600,
 ) -> ScanResult:
     """
@@ -263,7 +264,7 @@ def scan_large_file(
 def _scan_large_file_internal(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 3600,
 ) -> ScanResult:
     """

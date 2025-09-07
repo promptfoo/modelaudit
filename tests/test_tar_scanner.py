@@ -18,7 +18,10 @@ class TestTarScanner:
         # Test uncompressed tar
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
             with tarfile.open(tmp.name, "w") as t:
-                t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
+                info = tarfile.TarInfo("test.txt")
+                content = b"Hello World"
+                info.size = len(content)
+                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:
@@ -33,13 +36,19 @@ class TestTarScanner:
         # Test tar.gz
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             with tarfile.open(tmp.name, "w:gz") as t:
-                t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
+                info = tarfile.TarInfo("test.txt")
+                content = b"Hello World"
+                info.size = len(content)
+                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path_gz = tmp.name
 
         # Test tar.bz2
         with tempfile.NamedTemporaryFile(suffix=".tar.bz2", delete=False) as tmp:
             with tarfile.open(tmp.name, "w:bz2") as t:
-                t.addfile(tarfile.TarInfo("test.txt"), b"Hello World")
+                info = tarfile.TarInfo("test.txt")
+                content = b"Hello World"
+                info.size = len(content)
+                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path_bz2 = tmp.name
 
         try:
@@ -166,7 +175,7 @@ class TestTarScanner:
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
         # Create deeply nested tars
-        tar_paths = []
+        tar_paths: list[str] = []
         content = b"Deep content"
 
         for i in range(7):  # Create 7 levels of nesting (exceeds default max of 5)

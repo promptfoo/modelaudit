@@ -2,7 +2,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
 from .core import scan_model_directory_or_file
 from .models import ModelAuditResultModel
@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 def scan_mlflow_model(
     model_uri: str,
     *,
-    registry_uri: Optional[str] = None,
+    registry_uri: str | None = None,
     timeout: int = 3600,
-    blacklist_patterns: Optional[list[str]] = None,
+    blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
     **kwargs: Any,

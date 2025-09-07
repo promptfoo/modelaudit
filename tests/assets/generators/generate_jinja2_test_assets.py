@@ -272,7 +272,7 @@ def generate_yaml_configs() -> dict[str, dict[str, Any]]:
     }
 
 
-def save_json_files(base_dir: Path, templates: dict[str, dict[str, Any]], subdir: str = ""):
+def save_json_files(base_dir: Path, templates: dict[str, dict[str, Any]], subdir: str = "") -> None:
     """Save JSON template files"""
     if subdir:
         target_dir = base_dir / subdir
@@ -287,7 +287,7 @@ def save_json_files(base_dir: Path, templates: dict[str, dict[str, Any]], subdir
         print(f"Created: {filepath}")
 
 
-def save_text_files(base_dir: Path, templates: dict[str, str], subdir: str = ""):
+def save_text_files(base_dir: Path, templates: dict[str, str], subdir: str = "") -> None:
     """Save standalone template files"""
     if subdir:
         target_dir = base_dir / subdir
@@ -302,7 +302,7 @@ def save_text_files(base_dir: Path, templates: dict[str, str], subdir: str = "")
         print(f"Created: {filepath}")
 
 
-def save_yaml_files(base_dir: Path, configs: dict[str, dict[str, Any]], subdir: str = ""):
+def save_yaml_files(base_dir: Path, configs: dict[str, dict[str, Any]], subdir: str = "") -> None:
     """Save YAML configuration files"""
     try:
         import yaml

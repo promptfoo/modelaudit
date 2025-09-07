@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.explanations import get_tf_op_explanation
 from modelaudit.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
@@ -50,7 +50,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     description = "Scans TensorFlow SavedModel for suspicious operations"
     supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_ops = set(self.config.get("suspicious_ops", SUSPICIOUS_OPS))

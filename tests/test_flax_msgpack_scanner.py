@@ -1,4 +1,5 @@
 import os
+from typing import Any
 
 import msgpack
 
@@ -103,8 +104,8 @@ def test_flax_msgpack_deep_nesting(tmp_path):
     path = tmp_path / "deep.msgpack"
 
     # Create deeply nested structure
-    deep_data = {"level": 0}
-    current = deep_data
+    deep_data: dict[str, Any] = {"level": 0}
+    current: dict[str, Any] = deep_data
     for i in range(1, 150):  # Deeper than default limit
         current["nested"] = {"level": i}
         current = current["nested"]
