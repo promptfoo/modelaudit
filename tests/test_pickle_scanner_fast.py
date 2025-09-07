@@ -48,7 +48,7 @@ class TestFastDillFiles:
         scanner = PickleScanner()
         result = scanner.scan("/tmp/complex.dill")
 
-        # Should handle the mock complex object  
+        # Should handle the mock complex object
         assert result.success is True
 
     def test_dill_malicious_detection_fast(self, mock_heavy_ml_libs, fast_file_operations):
