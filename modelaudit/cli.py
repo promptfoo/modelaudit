@@ -697,6 +697,7 @@ def scan_command(
             temp_dir = None
             actual_path = path
             should_break = False
+            url_handled = False  # Track if we handled a URL download
 
             try:
                 # Check if this is a direct HuggingFace file URL
@@ -738,8 +739,10 @@ def scan_command(
                         elif final_format == "text" and not output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
-                        # Track the downloaded file path for SBOM generation
-                        scanned_paths.append(actual_path)
+                        # The downloaded file should continue through normal scanning flow
+                        # actual_path is already set to the downloaded file path
+                        # Let it fall through to normal scanning (don't continue here)
+                        url_handled = True
 
                     except Exception as e:
                         if download_spinner:
@@ -1070,7 +1073,7 @@ def scan_command(
                         audit_result.has_errors = True
                         continue
 
-                else:
+                elif not url_handled:
                     # For local paths, check if they exist
                     if not os.path.exists(path):
                         click.echo(f"Error: Path does not exist: {path}", err=True)
@@ -1079,8 +1082,10 @@ def scan_command(
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml, .md as they can be model config/documentation files
-                if os.path.isfile(path):
-                    _, ext = os.path.splitext(path)
+                # Use actual_path (which may be a downloaded file) instead of original path
+                scan_path = actual_path if url_handled else path
+                if os.path.isfile(scan_path):
+                    _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
                         ".txt",
@@ -1090,8 +1095,8 @@ def scan_command(
                         ".css",
                     ):
                         if verbose:
-                            logger.debug(f"Skipped: {path} (non-model file)")
-                        click.echo(f"Skipping non-model file: {path}")
+                            logger.debug(f"Skipped: {scan_path} (non-model file)")
+                        click.echo(f"Skipping non-model file: {scan_path}")
                         continue
 
                 # Show progress indicator if in text mode and not writing to a file
@@ -1333,12 +1338,12 @@ def scan_command(
 
     # Generate SBOM if requested
     if sbom:
-        from .sbom import generate_sbom
+        from .sbom import generate_sbom_pydantic
 
         # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
         # to prevent FileNotFoundError when generating SBOM for downloaded content
         paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
-        sbom_text = generate_sbom(paths_for_sbom, audit_result.model_dump())
+        sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
