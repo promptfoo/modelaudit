@@ -522,18 +522,15 @@ def scan_command(
     scan_options = {
         "format": format,
         "timeout": timeout,
-        "max_file_size": max_file_size,
-        "max_total_size": max_total_size,
+        "max_size": max_size,
         "blacklist_patterns": list(blacklist) if blacklist else [],
-        "large_model_support": large_model_support,
         "progress": progress,
         "has_output_file": bool(output),
         "has_sbom": bool(sbom),
         "verbose": verbose,
-        "cache_enabled": cache,
-        "strict_license": strict_license,
-        "stream_mode": stream,
-        "skip_file_types": not no_skip_files,
+        "cache_enabled": not no_cache,
+        "strict": strict,
+        "dry_run": dry_run,
     }
 
     record_command_used("scan", duration=None, **scan_options)
@@ -897,7 +894,7 @@ def scan_command(
                     try:
                         # Record download start and feature usage
                         record_download_started("pytorch_hub", path)
-                        record_feature_used("pytorch_hub_download", cache_enabled=bool(cache_dir))
+                        record_feature_used("pytorch_hub_download", cache_enabled=final_cache)
                         download_start = time.time()
 
                         download_path = download_pytorch_hub_model(
@@ -1239,8 +1236,8 @@ def scan_command(
                         "cache_dir": final_cache_dir,
                     }
 
-                    # Record feature usage for large model support
-                    if large_model_support:
+                    # Record feature usage for large model support (based on smart detection)
+                    if final_max_file_size > 0 or final_max_total_size > 0:
                         record_feature_used("large_model_support", path=actual_path)
 
                     scan_results: ModelAuditResultModel = scan_model_directory_or_file(

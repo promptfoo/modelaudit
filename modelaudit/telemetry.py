@@ -17,7 +17,7 @@ from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar, Union, cast
+from typing import Any, Callable, TypeVar, Union, cast
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -149,13 +149,13 @@ class UserConfig:
         return str(self._config["user_id"])
 
     @property
-    def email(self) -> Optional[str]:
+    def email(self) -> str | None:
         """Get user email if available."""
         email = self._config.get("email")
         return str(email) if email is not None else None
 
     @email.setter
-    def email(self, value: Optional[str]) -> None:
+    def email(self, value: str | None) -> None:
         """Set user email."""
         if value:
             self._config["email"] = value
@@ -324,7 +324,7 @@ class TelemetryClient:
         except (URLError, OSError) as e:
             logger.debug(f"Failed to send event to R endpoint: {e}")
 
-    def record_event(self, event: TelemetryEvent, properties: Optional[dict[str, Any]] = None) -> None:
+    def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
         if properties is None:
             properties = {}
@@ -421,7 +421,7 @@ class TelemetryClient:
             },
         )
 
-    def record_command_used(self, command: str, duration: Optional[float] = None, **kwargs) -> None:
+    def record_command_used(self, command: str, duration: float | None = None, **kwargs) -> None:
         """Record usage of a CLI command."""
         properties = {"command": command, **kwargs}
         if duration is not None:
@@ -433,7 +433,7 @@ class TelemetryClient:
         """Record usage of a specific feature."""
         self.record_event(TelemetryEvent.FEATURE_USED, {"feature": feature, **kwargs})
 
-    def record_error(self, error: Exception, context: Optional[str] = None) -> None:
+    def record_error(self, error: Exception, context: str | None = None) -> None:
         """Record an error occurrence."""
         self.record_event(
             TelemetryEvent.ERROR_OCCURRED,
@@ -455,7 +455,7 @@ class TelemetryClient:
             },
         )
 
-    def record_download_started(self, source_type: str, url: str, size_bytes: Optional[int] = None) -> None:
+    def record_download_started(self, source_type: str, url: str, size_bytes: int | None = None) -> None:
         """Record that a download has started."""
         self.record_event(
             TelemetryEvent.DOWNLOAD_STARTED,
@@ -557,7 +557,7 @@ class TelemetryClient:
 _telemetry_client = None
 
 
-def get_telemetry_client() -> Optional[TelemetryClient]:
+def get_telemetry_client() -> TelemetryClient | None:
     """Get the global telemetry client instance."""
     global _telemetry_client
     try:
@@ -571,7 +571,7 @@ def get_telemetry_client() -> Optional[TelemetryClient]:
 
 # Convenience functions for common telemetry operations - all wrapped for safety
 @safe_telemetry
-def record_event(event: TelemetryEvent, properties: Optional[dict[str, Any]] = None) -> None:
+def record_event(event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
     """Record a telemetry event using the global client."""
     client = get_telemetry_client()
     if client is not None:
@@ -603,7 +603,7 @@ def record_scan_failed(duration: float, error: str) -> None:
 
 
 @safe_telemetry
-def record_command_used(command: str, duration: Optional[float] = None, **kwargs) -> None:
+def record_command_used(command: str, duration: float | None = None, **kwargs) -> None:
     """Record usage of a CLI command."""
     client = get_telemetry_client()
     if client is not None:
@@ -643,7 +643,7 @@ def record_issue_found(issue_type: str, severity: str, scanner: str) -> None:
 
 
 @safe_telemetry
-def record_download_started(source_type: str, url: str, size_bytes: Optional[int] = None) -> None:
+def record_download_started(source_type: str, url: str, size_bytes: int | None = None) -> None:
     """Record that a download has started."""
     client = get_telemetry_client()
     if client is not None:

@@ -263,13 +263,9 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
-<<<<<<< HEAD
-            dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
-=======
             if mapping is None:
                 return  # Skip if mapping is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
->>>>>>> main
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
@@ -316,13 +312,9 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
-<<<<<<< HEAD
-                    dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
-=======
                     if mapping is None:
                         continue  # Skip if mapping is not available
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
->>>>>>> main
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d
