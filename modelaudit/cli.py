@@ -683,6 +683,10 @@ def scan_command(
 
     audit_result = create_initial_audit_result()
 
+    # Track actual paths that were successfully scanned for SBOM generation
+    # This prevents FileNotFoundError when URLs are downloaded to local paths
+    scanned_paths: list[str] = []
+
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
         for path in expanded_paths:
@@ -1179,6 +1183,9 @@ def scan_command(
                     # scan_results is a ModelAuditResultModel, convert to dict for aggregation
                     audit_result.aggregate_scan_result(scan_results.model_dump())
 
+                    # Track the actual scanned path for SBOM generation
+                    scanned_paths.append(actual_path)
+
                     # Show completion status if in text mode and not writing to a file
                     result_issues = scan_results.issues
                     if result_issues:
@@ -1326,7 +1333,10 @@ def scan_command(
     if sbom:
         from .sbom import generate_sbom
 
-        sbom_text = generate_sbom(expanded_paths, audit_result.model_dump())
+        # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
+        # to prevent FileNotFoundError when generating SBOM for downloaded content
+        paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
+        sbom_text = generate_sbom(paths_for_sbom, audit_result.model_dump())
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
