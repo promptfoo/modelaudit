@@ -375,6 +375,7 @@ class TestWeightDistributionScanner:
 
         # Mock torch.load directly since torch is now a lazy import
         import torch
+
         monkeypatch.setattr(torch, "load", fail_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -399,6 +400,7 @@ class TestWeightDistributionScanner:
 
         # Mock torch.load directly since torch is now a lazy import
         import torch
+
         monkeypatch.setattr(torch, "load", fail_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
