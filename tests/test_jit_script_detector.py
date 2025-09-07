@@ -26,7 +26,7 @@ class TestJITScriptDetector:
         assert all(
             getattr(f, "severity", getattr(f, "severity", "")) == "CRITICAL"
             for f in findings
-            if hasattr(f, "pattern") or "operation" in f
+            if hasattr(f, "pattern") or hasattr(f, "operation")
         )
 
     def test_detect_torch_jit_compilation(self):
