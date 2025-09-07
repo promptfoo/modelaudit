@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2025-09-05
+
 ### Added
 
 - **feat**: upgrade to CycloneDX v1.6 (ECMA-424) with enhanced ML-BOM support (#364)
 - **feat**: add 7-Zip archive scanning support (#344)
 - **feat**: re-enable check consolidation system (#353)
+- **feat**: integrate ty type checker and enhance type safety (#372)
 
 ### Changed
 
@@ -21,14 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat**: enhance pickle static analysis with ML context awareness (#358)
 - **feat**: enhance check consolidation system with PII sanitization and performance improvements (#356)
 - **docs**: update AGENTS.md with exact CI compliance instructions (#357)
+- **docs**: rewrite README with professional technical content (#370)
 - **feat**: improve logging standards and consistency (#355)
 - **chore(deps)**: bump the github-actions group with 2 updates (#362)
 - **chore**: update dependencies and modernize type annotations (#360)
+- **chore**: remove unnecessary files from root directory (#369)
 
 ### Fixed
 
 - **fix**: handle GGUF tensor dictionaries in SBOM asset creation (#363)
 - **fix**: correct release dates in CHANGELOG.md (#354)
+- **fix**: resolve SBOM generation FileNotFoundError with URLs (#373)
 
 ## [0.2.4] - 2025-08-28
 
@@ -352,7 +358,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/promptfoo/modelaudit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/promptfoo/modelaudit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/promptfoo/modelaudit/compare/v0.2.0...v0.2.1
