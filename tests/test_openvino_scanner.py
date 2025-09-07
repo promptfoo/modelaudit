@@ -23,7 +23,11 @@ def test_openvino_scanner_basic(tmp_path: Path) -> None:
     assert result.success
     assert result.metadata["xml_size"] == xml_path.stat().st_size
     assert result.metadata.get("bin_size") == (tmp_path / "model.bin").stat().st_size
-    assert not result.issues
+    
+    # Should have file type validation warning for minimal XML
+    file_type_issues = [i for i in result.issues if "File type validation failed" in i.message]
+    assert len(file_type_issues) == 1
+    assert file_type_issues[0].severity.value == "warning"
 
 
 def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
