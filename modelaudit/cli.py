@@ -661,7 +661,7 @@ def scan_command(
             if progress_tracker and final_format == "text" and not output:
                 if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
-                    console_reporter = ConsoleProgressReporter(
+                    console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
                         update_interval=2.0,  # Smart default
                         disable_on_non_tty=True,
                         show_bytes=True,
@@ -686,6 +686,13 @@ def scan_command(
 
     audit_result = create_initial_audit_result()
 
+    # Track actual paths that were successfully scanned for SBOM generation
+    # This prevents FileNotFoundError when URLs are downloaded to local paths
+    scanned_paths: list[str] = []
+
+    # Track temporary directories to clean up after SBOM generation
+    temp_dirs_to_cleanup: list[str] = []
+
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
         for path in expanded_paths:
@@ -693,6 +700,7 @@ def scan_command(
             temp_dir = None
             actual_path = path
             should_break = False
+            url_handled = False  # Track if we handled a URL download
 
             try:
                 # Check if this is a direct HuggingFace file URL
@@ -735,6 +743,11 @@ def scan_command(
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
                         elif final_format == "text" and not output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
+
+                        # The downloaded file should continue through normal scanning flow
+                        # actual_path is already set to the downloaded file path
+                        # Let it fall through to normal scanning (don't continue here)
+                        url_handled = True
 
                     except Exception as e:
                         if download_spinner:
@@ -1071,7 +1084,7 @@ def scan_command(
                         audit_result.has_errors = True
                         continue
 
-                else:
+                elif not url_handled:
                     # For local paths, check if they exist
                     if not os.path.exists(path):
                         click.echo(f"Error: Path does not exist: {path}", err=True)
@@ -1080,8 +1093,10 @@ def scan_command(
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml, .md as they can be model config/documentation files
-                if os.path.isfile(path):
-                    _, ext = os.path.splitext(path)
+                # Use actual_path (which may be a downloaded file) instead of original path
+                scan_path = actual_path if url_handled else path
+                if os.path.isfile(scan_path):
+                    _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
                         ".txt",
@@ -1091,8 +1106,8 @@ def scan_command(
                         ".css",
                     ):
                         if verbose:
-                            logger.debug(f"Skipped: {path} (non-model file)")
-                        click.echo(f"Skipping non-model file: {path}")
+                            logger.debug(f"Skipped: {scan_path} (non-model file)")
+                        click.echo(f"Skipping non-model file: {scan_path}")
                         continue
 
                 # Show progress indicator if in text mode and not writing to a file
@@ -1164,7 +1179,7 @@ def scan_command(
 
                             return enhanced_progress_callback
 
-                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[possibly-unresolved-reference]
 
                     # Run the scan with progress reporting
                     config_overrides = {
@@ -1189,6 +1204,9 @@ def scan_command(
                     # Core now returns ModelAuditResultModel, so merge it directly
                     # scan_results is a ModelAuditResultModel, convert to dict for aggregation
                     audit_result.aggregate_scan_result(scan_results.model_dump())
+
+                    # Track the actual scanned path for SBOM generation
+                    scanned_paths.append(actual_path)
 
                     # Show completion status if in text mode and not writing to a file
                     result_issues = scan_results.issues
@@ -1255,6 +1273,10 @@ def scan_command(
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
                     audit_result.has_errors = True
 
+                    # Track the actual path for SBOM generation even if scanning failed
+                    # This prevents FileNotFoundError when SBOM tries to access original URLs
+                    scanned_paths.append(actual_path)
+
                     # Report error to progress tracker
                     if progress_tracker:
                         progress_tracker.report_error(e)
@@ -1263,6 +1285,10 @@ def scan_command(
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
+
+                # Track the actual path for SBOM generation even if processing failed
+                # This prevents FileNotFoundError when SBOM tries to access original URLs
+                scanned_paths.append(actual_path)
                 audit_result.has_errors = True
 
                 # Report error to progress tracker
@@ -1270,15 +1296,11 @@ def scan_command(
                     progress_tracker.report_error(e)
 
             finally:
-                # Clean up temporary directory if we downloaded a model
-                # Only clean up if we didn't use a user-specified cache directory
+                # Defer cleanup until after SBOM generation to avoid FileNotFoundError
                 if temp_dir and os.path.exists(temp_dir) and not final_cache_dir:
-                    try:
-                        shutil.rmtree(temp_dir)
-                        if verbose:
-                            logger.debug(f"Temporary directory removed: {temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                    temp_dirs_to_cleanup.append(temp_dir)
+                    if verbose:
+                        logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -1335,12 +1357,24 @@ def scan_command(
 
     # Generate SBOM if requested
     if sbom:
-        from .sbom import generate_sbom_with_path_mapping
+        from .sbom import generate_sbom_pydantic
 
-        # Use path mappings to resolve downloaded file paths for SBOM generation
-        sbom_text = generate_sbom_with_path_mapping(expanded_paths, audit_result.model_dump(), path_mappings)
+        # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
+        # to prevent FileNotFoundError when generating SBOM for downloaded content
+        paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
+        sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
+
+    # Clean up temporary directories after SBOM generation
+    for temp_dir in temp_dirs_to_cleanup:
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                if verbose:
+                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
     # Format the output
     if final_format == "json":

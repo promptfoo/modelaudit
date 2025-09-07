@@ -216,7 +216,7 @@ class TestPydanticModels:
         with pytest.raises(ValidationError):
             Check(
                 name="Test",
-                status="invalid_status",  # Should be passed/failed/skipped
+                status="invalid_status",  # Should be passed/failed/skipped  # type: ignore[arg-type]
                 message="Test",
-                timestamp="not_a_number",  # Should be float
+                timestamp="not_a_number",  # Should be float  # type: ignore[arg-type]
             )

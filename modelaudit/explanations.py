@@ -268,13 +268,13 @@ def get_explanation(category: str, specific_item: Optional[str] = None) -> Optio
     Returns:
         A security-team-friendly explanation, or None if not found
     """
-    if category == "import" and specific_item in DANGEROUS_IMPORTS:
+    if category == "import" and specific_item is not None and specific_item in DANGEROUS_IMPORTS:
         return DANGEROUS_IMPORTS[specific_item]
-    if category == "opcode" and specific_item in DANGEROUS_OPCODES:
+    if category == "opcode" and specific_item is not None and specific_item in DANGEROUS_OPCODES:
         return DANGEROUS_OPCODES[specific_item]
-    if category == "pattern" and specific_item in PATTERN_EXPLANATIONS:
+    if category == "pattern" and specific_item is not None and specific_item in PATTERN_EXPLANATIONS:
         return PATTERN_EXPLANATIONS[specific_item]
-    if category == "tf_op" and specific_item in TF_OP_EXPLANATIONS:
+    if category == "tf_op" and specific_item is not None and specific_item in TF_OP_EXPLANATIONS:
         return TF_OP_EXPLANATIONS[specific_item]
 
     return None

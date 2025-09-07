@@ -5,11 +5,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
-
-np: Any
 
 try:
     import numpy as np
@@ -17,7 +15,10 @@ try:
     HAS_NUMPY = True
 except ImportError:  # pragma: no cover
     HAS_NUMPY = False
-    np = None
+    if TYPE_CHECKING:
+        import numpy as np  # type: ignore[no-redef]
+    else:
+        np = None  # type: ignore[assignment]
 
 
 class JaxCheckpointScanner(BaseScanner):

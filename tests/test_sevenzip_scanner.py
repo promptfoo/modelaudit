@@ -124,7 +124,7 @@ class TestSevenZipScanner:
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_empty_archive(self, scanner, temp_7z_file):
         """Test scanning an empty 7z archive"""
-        import py7zr
+        import py7zr  # type: ignore[import-untyped]
 
         # Create empty 7z archive
         with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
@@ -143,7 +143,7 @@ class TestSevenZipScanner:
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_safe_archive(self, scanner, temp_7z_file):
         """Test scanning a 7z archive with safe content"""
-        import py7zr
+        import py7zr  # type: ignore[import-untyped]
 
         # Create safe pickle content
         safe_data = {"safe": True, "data": [1, 2, 3]}
@@ -180,7 +180,7 @@ class TestSevenZipScanner:
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_malicious_archive(self, scanner, temp_7z_file):
         """Test scanning a 7z archive with malicious content"""
-        import py7zr
+        import py7zr  # type: ignore[import-untyped]
 
         # Create malicious pickle that would execute code if unpickled
         class MaliciousClass:
@@ -246,7 +246,7 @@ class TestSevenZipScanner:
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_path_traversal_detection(self, scanner, temp_7z_file):
         """Test detection of path traversal attempts in archive"""
-        import py7zr
+        import py7zr  # type: ignore[import-untyped]
 
         # Create safe content but with dangerous path
         safe_data = {"safe": True}
@@ -301,7 +301,7 @@ class TestSevenZipScanner:
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_with_mixed_content(self, scanner, temp_7z_file):
         """Test scanning archive with mixed scannable and non-scannable content"""
-        import py7zr
+        import py7zr  # type: ignore[import-untyped]
 
         # Create multiple temporary files
         temp_files = []

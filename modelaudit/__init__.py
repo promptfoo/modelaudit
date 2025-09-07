@@ -24,7 +24,7 @@ try:
 except RecursionError:
     # Should be very rare now with higher recursion limit
     __version__ = "unknown"
-except PackageNotFoundError:
+except PackageNotFoundError:  # type: ignore[possibly-unresolved-reference]
     # Package is not installed or in development mode
     __version__ = "unknown"
 

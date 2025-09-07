@@ -244,7 +244,7 @@ class TestLicenseIntegration:
         # Should detect AGPL license
         assert len(agpl_licenses) > 0, "Should detect AGPL license in header"
         agpl_license = agpl_licenses[0]
-        assert "AGPL" in agpl_license.spdx_id
+        assert agpl_license.spdx_id is not None and "AGPL" in agpl_license.spdx_id
         assert agpl_license.commercial_allowed is True  # AGPL allows commercial use but with obligations
 
     def test_end_to_end_cli_integration(self, test_data_dir):
@@ -281,7 +281,7 @@ class TestLicenseIntegration:
         # Should detect copyright notice
         assert len(copyrights) > 0, "Should detect copyright notice"
         copyright_info = copyrights[0]
-        assert "2024" in copyright_info.year
+        assert copyright_info.year is not None and "2024" in copyright_info.year
         assert "Test Model Company" in copyright_info.holder
 
     @pytest.mark.integration
