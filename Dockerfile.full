@@ -5,9 +5,9 @@ WORKDIR /app
 # Copy source code first
 COPY . .
 
-# Install all dependencies from requirements.lock
+# Install dependencies optimized for CI (excludes platform-specific CUDA libraries)
 # The lock file includes the current project as editable, so we need the source first
-RUN pip install --no-cache-dir -r requirements.lock
+RUN pip install --no-cache-dir .[all-ci]
 
 # Create a non-root user
 ARG UID=10001
