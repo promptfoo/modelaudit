@@ -55,7 +55,6 @@ def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
 
     # Check that the security issues are critical (ignoring file type validation warnings)
     security_issues = [
-        i for i in result.issues
-        if "python layer" in i.message.lower() or "external library" in i.message.lower()
+        i for i in result.issues if "python layer" in i.message.lower() or "external library" in i.message.lower()
     ]
     assert all(i.severity == IssueSeverity.CRITICAL for i in security_issues)
