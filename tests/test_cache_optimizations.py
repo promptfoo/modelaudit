@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -94,7 +95,7 @@ class TestCacheOptimizationPerformance:
 
             # Create test files
             test_files = []
-            test_results = []
+            test_results: list[tuple[str, dict[str, Any], int | None]] = []
 
             for i in range(10):  # Reduced number for faster test
                 file_path = Path(temp_dir) / f"test_file_{i}.bin"
@@ -181,7 +182,10 @@ class TestCacheOptimizationPerformance:
             results = []
             for args, kwargs in test_cases:
                 cache_config, file_path = config_extractor.extract_fast(args, kwargs)
-                results.append((cache_config.enabled, file_path))
+                if cache_config is not None:
+                    results.append((cache_config.enabled, file_path))
+                else:
+                    results.append((False, file_path))
             return results
 
         def traditional_extraction():
@@ -400,10 +404,10 @@ class TestCacheOptimizationCorrectness:
             batch_results = batch_ops.batch_lookup(test_files)
 
             # Individual lookups
-            individual_results = {}
-            for file_path in test_files:
-                result = cache_manager.get_cached_result(file_path)
-                individual_results[file_path] = result
+            individual_results: dict[str, dict[str, Any] | None] = {}
+            for file_path_str in test_files:
+                result = cache_manager.get_cached_result(file_path_str)
+                individual_results[file_path_str] = result
 
             # Should match
             assert batch_results == individual_results
@@ -428,6 +432,7 @@ class TestCacheOptimizationCorrectness:
         for args, kwargs in test_cases:
             cache_config, file_path = extractor.extract_fast(args, kwargs)
 
+            assert cache_config is not None, "cache_config should not be None"
             assert cache_config.enabled == test_config["cache_enabled"]
             assert cache_config.cache_dir == test_config["cache_dir"]
             assert cache_config.max_file_size == test_config["max_cache_file_size"]

@@ -162,9 +162,7 @@ class BatchCacheOperations:
         logger.debug(f"Batch store complete: {stored_count}/{len(scan_results)} results stored")
         return stored_count
 
-    def _store_single_result(
-        self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None
-    ) -> bool:
+    def _store_single_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None) -> bool:
         """Store a single result and return success status."""
         try:
             self.cache_manager.store_result(file_path, scan_result, scan_duration_ms)
