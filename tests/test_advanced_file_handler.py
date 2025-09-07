@@ -3,6 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from modelaudit.scanners.base import BaseScanner, ScanResult
@@ -18,7 +19,7 @@ from modelaudit.utils.advanced_file_handler import (
 class TestShardedModelDetector:
     """Test sharded model detection."""
 
-    def test_detect_pytorch_shards(self):
+    def test_detect_pytorch_shards(self) -> None:
         """Test detection of PyTorch sharded models."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create sharded model files
@@ -39,7 +40,7 @@ class TestShardedModelDetector:
             assert shard_info["total_shards"] == 3
             assert len(shard_info["shards"]) == 3
 
-    def test_detect_safetensors_shards(self):
+    def test_detect_safetensors_shards(self) -> None:
         """Test detection of SafeTensors sharded models."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create sharded model files
@@ -58,7 +59,7 @@ class TestShardedModelDetector:
             assert shard_info is not None
             assert shard_info["total_shards"] == 2
 
-    def test_no_shards_detected(self):
+    def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
             f.write(b"test")
@@ -67,7 +68,7 @@ class TestShardedModelDetector:
             shard_info = ShardedModelDetector.detect_shards(f.name)
             assert shard_info is None
 
-    def test_find_model_config(self):
+    def test_find_model_config(self) -> None:
         """Test finding model configuration file."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create config file
@@ -86,7 +87,7 @@ class TestShardedModelDetector:
 class TestMemoryMappedScanner:
     """Test memory-mapped scanning."""
 
-    def test_mmap_scanning(self):
+    def test_mmap_scanning(self) -> None:
         """Test basic memory-mapped scanning."""
         # Create a test file with suspicious content
         with tempfile.NamedTemporaryFile(delete=False) as f:
@@ -113,7 +114,7 @@ class TestMemoryMappedScanner:
         finally:
             os.unlink(temp_path)
 
-    def test_mmap_with_large_file(self):
+    def test_mmap_with_large_file(self) -> None:
         """Test memory mapping with larger file."""
         # Create a larger test file
         with tempfile.NamedTemporaryFile(delete=False) as f:
@@ -141,7 +142,7 @@ class TestMemoryMappedScanner:
 class TestParallelShardScanner:
     """Test parallel shard scanning."""
 
-    def test_parallel_shard_scanning(self):
+    def test_parallel_shard_scanning(self) -> None:
         """Test scanning shards in parallel."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create test shards
@@ -175,7 +176,7 @@ class TestAdvancedFileHandler:
 
     @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
-    def test_sharded_model_handling(self, mock_detect, mock_getsize):
+    def test_sharded_model_handling(self, mock_detect: Any, mock_getsize: Any) -> None:
         """Test handling of sharded models."""
         mock_detect.return_value = {
             "shards": ["shard1.bin", "shard2.bin"],
@@ -185,14 +186,14 @@ class TestAdvancedFileHandler:
 
         mock_scanner = MagicMock()
         mock_scanner.name = "test_scanner"
-        mock_scanner.__class__ = BaseScanner
+        mock_scanner.__class__ = BaseScanner  # type: ignore[misc]
 
         handler = AdvancedFileHandler("model.bin", mock_scanner)
         assert handler.is_sharded
         assert handler.total_size == 100 * 1024 * 1024 * 1024
 
     @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
-    def test_extreme_file_detection(self, mock_getsize):
+    def test_extreme_file_detection(self, mock_getsize: Any) -> None:
         """Test detection of extreme large files."""
         # Test file over 200GB threshold
         mock_getsize.return_value = 300 * 1024 * 1024 * 1024  # 300GB
@@ -206,7 +207,7 @@ class TestAdvancedFileHandler:
 
     @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
     @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
-    def test_massive_file_handling(self, mock_detect, mock_getsize):
+    def test_massive_file_handling(self, mock_detect: Any, mock_getsize: Any) -> None:
         """Test handling of massive files (>200GB)."""
         mock_detect.return_value = None  # Not sharded
         mock_getsize.return_value = 250 * 1024 * 1024 * 1024  # 250GB

@@ -11,9 +11,11 @@ from modelaudit.scanners.base import Issue, IssueSeverity
 rebuild_models()
 
 
-def _create_result_model(**kwargs):
+def _create_result_model(**kwargs: Any) -> ModelAuditResultModel:
     """Helper function to create ModelAuditResultModel with sensible defaults."""
-    defaults = {
+    from typing import Any, cast
+    
+    defaults: dict[str, Any] = {
         "bytes_scanned": 100,
         "issues": [],
         "checks": [],
@@ -78,7 +80,12 @@ def test_exit_code_security_errors():
     results = _create_result_model(
         issues=[
             Issue(
-                message="Malicious code detected", severity=IssueSeverity.CRITICAL, location="test.pkl", timestamp=0.0
+                message="Malicious code detected",
+                severity=IssueSeverity.CRITICAL,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
             ),
         ]
     )
@@ -96,6 +103,8 @@ def test_exit_code_operational_errors():
                 severity=IssueSeverity.CRITICAL,
                 location="test.pkl",
                 timestamp=0.0,
+                why=None,
+                type=None,
             ),
         ],
     )
@@ -113,12 +122,16 @@ def test_exit_code_mixed_issues():
                 severity=IssueSeverity.CRITICAL,
                 location="test.pkl",
                 timestamp=0.0,
+                why=None,
+                type=None,
             ),
             Issue(
                 message="Also found suspicious code",
                 severity=IssueSeverity.WARNING,
                 location="test2.pkl",
                 timestamp=0.0,
+                why=None,
+                type=None,
             ),
         ],
     )
@@ -139,9 +152,21 @@ def test_exit_code_mixed_severity():
                 why=None,
                 type=None,
             ),
-            Issue(message="Info message", severity=IssueSeverity.INFO, location="test.pkl", timestamp=0.0),
             Issue(
-                message="Warning about something", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0
+                message="Info message",
+                severity=IssueSeverity.INFO,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+            Issue(
+                message="Warning about something",
+                severity=IssueSeverity.WARNING,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
             ),
         ]
     )
@@ -153,7 +178,14 @@ def test_exit_code_info_level_issues():
     """Test exit code 0 for info level issues (INFO is not a security problem)."""
     results = _create_result_model(
         issues=[
-            Issue(message="Information about model", severity=IssueSeverity.INFO, location="test.pkl", timestamp=0.0),
+            Issue(
+                message="Information about model",
+                severity=IssueSeverity.INFO,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
         ]
     )
     assert determine_exit_code(results) == 0  # INFO level should not trigger exit code 1
@@ -176,7 +208,14 @@ def test_exit_code_no_files_scanned_with_issues():
     results = _create_result_model(
         files_scanned=0,
         issues=[
-            Issue(message="Some issue", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0),
+            Issue(
+                message="Some issue",
+                severity=IssueSeverity.WARNING,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
         ],
     )
     assert determine_exit_code(results) == 2
@@ -193,7 +232,14 @@ def test_exit_code_files_scanned_with_issues():
     results = _create_result_model(
         files_scanned=5,
         issues=[
-            Issue(message="Security issue", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0),
+            Issue(
+                message="Security issue",
+                severity=IssueSeverity.WARNING,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
         ],
     )
     assert determine_exit_code(results) == 1

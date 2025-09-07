@@ -27,7 +27,7 @@ from modelaudit.scanners.base import BaseScanner, ScanResult
 class TestProgressStats:
     """Test ProgressStats functionality."""
 
-    def test_init_and_defaults(self):
+    def test_init_and_defaults(self) -> None:
         """Test ProgressStats initialization and defaults."""
         stats = ProgressStats()
 
@@ -41,7 +41,7 @@ class TestProgressStats:
         assert stats.bytes_per_second >= 0
         assert stats.items_per_second >= 0
 
-    def test_performance_metrics_update(self):
+    def test_performance_metrics_update(self) -> None:
         """Test performance metrics calculation."""
         stats = ProgressStats(total_bytes=1000, total_items=10)
 
@@ -55,7 +55,7 @@ class TestProgressStats:
         assert stats.items_percentage == 50.0
         assert stats.elapsed_time > 0
 
-    def test_format_bytes(self):
+    def test_format_bytes(self) -> None:
         """Test byte formatting."""
         stats = ProgressStats()
 
@@ -64,7 +64,7 @@ class TestProgressStats:
         assert stats.format_bytes(2048 * 1024) == "2.0 MB"
         assert stats.format_bytes(3 * 1024 * 1024 * 1024) == "3.0 GB"
 
-    def test_format_time(self):
+    def test_format_time(self) -> None:
         """Test time formatting."""
         stats = ProgressStats()
 
@@ -76,7 +76,7 @@ class TestProgressStats:
 class TestProgressTracker:
     """Test ProgressTracker functionality."""
 
-    def test_init(self):
+    def test_init(self) -> None:
         """Test ProgressTracker initialization."""
         tracker = ProgressTracker(total_bytes=1000, total_items=10)
 
@@ -85,7 +85,7 @@ class TestProgressTracker:
         assert len(tracker.reporters) == 0
         assert len(tracker._callbacks) == 0
 
-    def test_update_bytes(self):
+    def test_update_bytes(self) -> None:
         """Test byte progress updates."""
         tracker = ProgressTracker(total_bytes=1000)
 
@@ -93,7 +93,7 @@ class TestProgressTracker:
         assert tracker.stats.bytes_processed == 500
         assert tracker.stats.current_item == "file.txt"
 
-    def test_increment_bytes(self):
+    def test_increment_bytes(self) -> None:
         """Test byte progress increments."""
         tracker = ProgressTracker(total_bytes=1000)
 
@@ -104,7 +104,7 @@ class TestProgressTracker:
         assert tracker.stats.bytes_processed == 500
         assert tracker.stats.current_item == "file2.txt"
 
-    def test_update_items(self):
+    def test_update_items(self) -> None:
         """Test item progress updates."""
         tracker = ProgressTracker(total_items=10)
 
@@ -112,7 +112,7 @@ class TestProgressTracker:
         assert tracker.stats.items_processed == 5
         assert tracker.stats.current_item == "layer_5"
 
-    def test_increment_items(self):
+    def test_increment_items(self) -> None:
         """Test item progress increments."""
         tracker = ProgressTracker(total_items=10)
 
@@ -122,7 +122,7 @@ class TestProgressTracker:
         tracker.increment_items(3, "layers_3_5")
         assert tracker.stats.items_processed == 5
 
-    def test_set_phase(self):
+    def test_set_phase(self) -> None:
         """Test phase changes."""
         mock_reporter = Mock(spec=ProgressReporter)
         mock_reporter.should_update.return_value = True
@@ -136,7 +136,7 @@ class TestProgressTracker:
         assert tracker.stats.status_message == "Loading model"
         mock_reporter.report_phase_change.assert_called_once()
 
-    def test_callbacks(self):
+    def test_callbacks(self) -> None:
         """Test progress callbacks."""
         callback_calls = []
 
@@ -152,7 +152,7 @@ class TestProgressTracker:
         # Should have at least some callback calls
         assert len(callback_calls) >= 1
 
-    def test_completion(self):
+    def test_completion(self) -> None:
         """Test scan completion."""
         mock_reporter = Mock(spec=ProgressReporter)
 
@@ -163,7 +163,7 @@ class TestProgressTracker:
 
         mock_reporter.report_completion.assert_called_once()
 
-    def test_error_reporting(self):
+    def test_error_reporting(self) -> None:
         """Test error reporting."""
         mock_reporter = Mock(spec=ProgressReporter)
 
@@ -179,7 +179,7 @@ class TestProgressTracker:
 class TestMultiPhaseProgressTracker:
     """Test MultiPhaseProgressTracker functionality."""
 
-    def test_init_with_phases(self):
+    def test_init_with_phases(self) -> None:
         """Test initialization with phases."""
         phases = [ProgressPhase.LOADING, ProgressPhase.ANALYZING, ProgressPhase.CHECKING]
         tracker = MultiPhaseProgressTracker(phases, total_bytes=1000)
@@ -188,7 +188,7 @@ class TestMultiPhaseProgressTracker:
         assert tracker.stats.current_phase == ProgressPhase.LOADING
         assert len(tracker._phase_stats) == 3
 
-    def test_next_phase(self):
+    def test_next_phase(self) -> None:
         """Test phase progression."""
         phases = [ProgressPhase.LOADING, ProgressPhase.ANALYZING, ProgressPhase.CHECKING]
         tracker = MultiPhaseProgressTracker(phases)
@@ -211,7 +211,7 @@ class TestMultiPhaseProgressTracker:
         result = tracker.next_phase()
         assert result is False
 
-    def test_overall_progress(self):
+    def test_overall_progress(self) -> None:
         """Test overall progress calculation."""
         phases = [ProgressPhase.LOADING, ProgressPhase.ANALYZING]
         weights = {ProgressPhase.LOADING: 0.3, ProgressPhase.ANALYZING: 0.7}
@@ -233,7 +233,7 @@ class TestMultiPhaseProgressTracker:
         progress = tracker.get_overall_progress()
         assert 25 <= progress <= 35  # Allow some tolerance
 
-    def test_phase_stats(self):
+    def test_phase_stats(self) -> None:
         """Test phase statistics tracking."""
         phases = [ProgressPhase.LOADING, ProgressPhase.ANALYZING]
         tracker = MultiPhaseProgressTracker(phases)
@@ -279,14 +279,14 @@ class MockReporter(ProgressReporter):
 class TestProgressReporters:
     """Test progress reporters."""
 
-    def test_console_reporter_creation(self):
+    def test_console_reporter_creation(self) -> None:
         """Test console reporter creation."""
         reporter = ConsoleProgressReporter()
         # Note: tqdm might be disabled on non-TTY environments (CI)
         assert reporter.show_bytes
         assert reporter.show_items
 
-    def test_simple_console_reporter(self):
+    def test_simple_console_reporter(self) -> None:
         """Test simple console reporter."""
         reporter = SimpleConsoleReporter()
 
@@ -302,7 +302,7 @@ class TestProgressReporters:
         reporter.report_completion(stats)
         reporter.report_error(Exception("Test error"), stats)
 
-    def test_file_reporter(self):
+    def test_file_reporter(self) -> None:
         """Test file progress reporter."""
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".log") as f:
             log_file = f.name
@@ -340,7 +340,7 @@ class TestProgressReporters:
 class TestProgressHooks:
     """Test progress hooks system."""
 
-    def test_custom_function_hook(self):
+    def test_custom_function_hook(self) -> None:
         """Test custom function hook."""
         start_calls = []
         progress_calls = []
@@ -373,7 +373,7 @@ class TestProgressHooks:
         hook.on_complete(stats)
         assert len(complete_calls) == 1
 
-    def test_hook_manager(self):
+    def test_hook_manager(self) -> None:
         """Test progress hook manager."""
         manager = ProgressHookManager()
 
@@ -397,7 +397,7 @@ class TestProgressHooks:
         manager.clear_hooks()
         assert len(manager.list_hooks()) == 0
 
-    def test_hook_enable_disable(self):
+    def test_hook_enable_disable(self) -> None:
         """Test hook enable/disable functionality."""
         calls = []
 
@@ -429,7 +429,7 @@ class TestProgressHooks:
 class TestProgressIntegration:
     """Integration tests for progress tracking."""
 
-    def test_progress_with_mock_scanner(self):
+    def test_progress_with_mock_scanner(self) -> None:
         """Test progress tracking with a mock scanner."""
 
         class MockScanner(BaseScanner):

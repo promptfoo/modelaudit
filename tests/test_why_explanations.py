@@ -21,7 +21,9 @@ def test_issue_with_why_field():
         message="Test security issue",
         severity=IssueSeverity.CRITICAL,
         location="test.pkl",
+        timestamp=0.0,
         why="This is dangerous because it can execute arbitrary code.",
+        type=None,
     )
 
     # Test that the why field is stored
@@ -39,6 +41,9 @@ def test_issue_without_why_field():
         message="Test security issue",
         severity=IssueSeverity.WARNING,
         location="test.pkl",
+        timestamp=0.0,
+        why=None,
+        type=None,
     )
 
     # Test that why field is None

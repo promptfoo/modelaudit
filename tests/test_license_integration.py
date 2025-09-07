@@ -13,6 +13,7 @@ These tests verify the full end-to-end license detection pipeline including:
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,7 +36,7 @@ class TestLicenseIntegration:
         """Return path to integration test data."""
         return Path(__file__).parent / "assets/scenarios/license_scenarios"
 
-    def test_mit_model_clean_license_detection(self, test_data_dir):
+    def test_mit_model_clean_license_detection(self, test_data_dir: Any) -> None:
         """Test that MIT licensed model is properly detected without warnings."""
         mit_dir = test_data_dir / "mit_model"
 
@@ -71,7 +72,7 @@ class TestLicenseIntegration:
         print(f"MIT license detected: {license_detected}")
         print(f"File metadata: {json.dumps(file_metadata, indent=2, default=str)}")
 
-    def test_agpl_component_triggers_warnings(self, test_data_dir):
+    def test_agpl_component_triggers_warnings(self, test_data_dir: Any) -> None:
         """Test that AGPL component triggers proper warnings."""
         agpl_dir = test_data_dir / "agpl_component"
 
@@ -94,7 +95,7 @@ class TestLicenseIntegration:
         copyleft_warnings = [w for w in license_warnings if "copyleft" in w.get("message", "")]
         assert len(copyleft_warnings) >= 1, "AGPL should trigger copyleft warnings"
 
-    def test_unlicensed_dataset_detection(self, test_data_dir):
+    def test_unlicensed_dataset_detection(self, test_data_dir: Any) -> None:
         """Test detection of unlicensed datasets."""
         unlicensed_dir = test_data_dir / "unlicensed_dataset"
 
@@ -111,7 +112,7 @@ class TestLicenseIntegration:
         assert dataset_warning["severity"] == "warning"
         assert "Verify data usage rights" in dataset_warning["message"]
 
-    def test_mixed_licenses_detection(self, test_data_dir):
+    def test_mixed_licenses_detection(self, test_data_dir: Any) -> None:
         """Test detection of mixed license scenarios."""
         mixed_dir = test_data_dir / "mixed_licenses"
 
@@ -134,7 +135,7 @@ class TestLicenseIntegration:
         print(f"Non-commercial warnings: {len(nc_warnings)}")
         print(f"Copyleft warnings: {len(copyleft_warnings)}")
 
-    def test_sbom_generation_with_license_metadata(self, test_data_dir):
+    def test_sbom_generation_with_license_metadata(self, test_data_dir: Any) -> None:
         """Test SBOM generation includes license metadata."""
         mit_dir = test_data_dir / "mit_model"
 
@@ -170,7 +171,7 @@ class TestLicenseIntegration:
             f"Sample component: {json.dumps(components[0] if components else {}, indent=2)}",
         )
 
-    def test_license_file_detection(self, test_data_dir):
+    def test_license_file_detection(self, test_data_dir: Any) -> None:
         """Test detection of LICENSE files in directories."""
         mixed_dir = test_data_dir / "mixed_licenses"
 
@@ -186,7 +187,7 @@ class TestLicenseIntegration:
         assert metadata.get("is_model") is True, "Should detect .pkl as model file"
         assert metadata.get("is_dataset") is True, "Should also detect .pkl as potential dataset"
 
-    def test_agpl_component_detection_function(self, test_data_dir):
+    def test_agpl_component_detection_function(self, test_data_dir: Any) -> None:
         """Test the specific AGPL detection function."""
         agpl_dir = test_data_dir / "agpl_component"
 
@@ -202,7 +203,7 @@ class TestLicenseIntegration:
 
         print(f"AGPL files detected: {agpl_files}")
 
-    def test_unlicensed_dataset_detection_function(self, test_data_dir):
+    def test_unlicensed_dataset_detection_function(self, test_data_dir: Any) -> None:
         """Test the specific unlicensed dataset detection function."""
         unlicensed_dir = test_data_dir / "unlicensed_dataset"
 
@@ -225,7 +226,7 @@ class TestLicenseIntegration:
 
         print(f"Unlicensed datasets: {unlicensed}")
 
-    def test_license_header_scanning(self, test_data_dir):
+    def test_license_header_scanning(self, test_data_dir: Any) -> None:
         """Test license header scanning on individual files."""
         # Test MIT license detection
         mit_file = test_data_dir / "mit_model" / "model.py"
@@ -247,7 +248,7 @@ class TestLicenseIntegration:
         assert agpl_license.spdx_id is not None and "AGPL" in agpl_license.spdx_id
         assert agpl_license.commercial_allowed is True  # AGPL allows commercial use but with obligations
 
-    def test_end_to_end_cli_integration(self, test_data_dir):
+    def test_end_to_end_cli_integration(self, test_data_dir: Any) -> None:
         """Test the full CLI integration with license warnings."""
 
         # Test with AGPL component (should trigger warnings and exit code 1)
@@ -270,7 +271,7 @@ class TestLicenseIntegration:
         agpl_issues = [issue for issue in license_issues if "AGPL" in getattr(issue, "message", "")]
         assert len(agpl_issues) > 0, "Should have AGPL warning issues"
 
-    def test_copyright_detection(self, test_data_dir):
+    def test_copyright_detection(self, test_data_dir: Any) -> None:
         """Test copyright notice detection."""
         from modelaudit.license_checker import extract_copyright_notices
 
@@ -285,7 +286,7 @@ class TestLicenseIntegration:
         assert "Test Model Company" in copyright_info.holder
 
     @pytest.mark.integration
-    def test_large_file_license_scanning(self, test_data_dir):
+    def test_large_file_license_scanning(self, test_data_dir: Any) -> None:
         """Test license scanning on larger files (like the numpy array)."""
         # The embeddings.npy file we created should be substantial
         embeddings_file = test_data_dir / "unlicensed_dataset" / "embeddings.npy"
@@ -303,7 +304,7 @@ class TestLicenseIntegration:
 class TestLicenseScenarios:
     """Test specific license scenarios and edge cases."""
 
-    def test_license_pattern_recognition(self):
+    def test_license_pattern_recognition(self) -> None:
         """Test license pattern recognition with various formats."""
         import re
 
@@ -328,7 +329,7 @@ class TestLicenseScenarios:
         assert "Apache-2.0" in detected_licenses
         assert "AGPL-3.0" in detected_licenses
 
-    def test_commercial_use_classification(self):
+    def test_commercial_use_classification(self) -> None:
         """Test commercial use classification for different licenses."""
         from modelaudit.license_checker import LICENSE_PATTERNS
 
@@ -344,7 +345,7 @@ class TestLicenseScenarios:
             if any(nc in info["spdx_id"] for nc in nc_patterns):
                 assert info["commercial_allowed"] is False, f"{info['spdx_id']} should not allow commercial use"
 
-    def test_ml_model_directory_detection(self):
+    def test_ml_model_directory_detection(self) -> None:
         """Test ML model directory detection logic."""
         from modelaudit.license_checker import _is_ml_model_directory
 
