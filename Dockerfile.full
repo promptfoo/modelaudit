@@ -5,6 +5,10 @@ WORKDIR /app
 # Copy source code first
 COPY . .
 
+# Copy and make entrypoint script executable
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # Install core dependencies first (lightweight)
 RUN pip install --no-cache-dir .
 
@@ -34,6 +38,6 @@ RUN adduser \
 
 USER appuser
 
-# Set the entrypoint
-ENTRYPOINT ["modelaudit"]
+# Set the flexible entrypoint
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--help"] 
