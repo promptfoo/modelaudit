@@ -63,8 +63,8 @@ class TestAdvancedSizeLimits:
         mock_size.return_value = normal_large_size
 
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            # Config with a 1GB limit
-            config = {"max_file_size": 1024 * 1024 * 1024}  # 1GB limit
+            # Config with a 1GB limit and disabled cache to ensure proper size checking
+            config = {"max_file_size": 1024 * 1024 * 1024, "cache_enabled": False}  # 1GB limit
 
             with patch("modelaudit.core.os.path.getsize") as mock_core_size:
                 mock_core_size.return_value = normal_large_size
@@ -82,7 +82,8 @@ class TestAdvancedSizeLimits:
     def test_stat_error_sets_failure_and_end_time(self, mock_size):
         """Ensure stat errors mark result as failed and set end time."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            result = scan_file(f.name, {})
+            # Disable caching for error condition testing
+            result = scan_file(f.name, {"cache_enabled": False})
             assert any("Error checking file size" in issue.message for issue in result.issues)
             assert not result.success
             assert result.end_time is not None

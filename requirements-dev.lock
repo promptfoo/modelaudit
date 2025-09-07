@@ -92,6 +92,8 @@ execnet==2.1.1
     # via pytest-xdist
 fastapi==0.116.1
     # via mlflow-skinny
+fickling==0.1.4
+    # via modelaudit
 filelock==3.18.0
     # via huggingface-hub
     # via torch
@@ -407,6 +409,8 @@ sqlparse==0.5.3
     # via mlflow-skinny
 starlette==0.47.3
     # via fastapi
+stdlib-list==0.11.1
+    # via fickling
 sympy==1.14.0
     # via coremltools
     # via torch
