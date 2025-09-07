@@ -738,6 +738,9 @@ def scan_command(
                         elif final_format == "text" and not output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
+                        # Track the downloaded file path for SBOM generation
+                        scanned_paths.append(actual_path)
+
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
