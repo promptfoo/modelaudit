@@ -5,10 +5,12 @@ import pytest
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
+
 # Defer TensorFlow check to avoid module-level imports
 def has_tensorflow():
     try:
         import tensorflow  # noqa: F401
+
         return True
     except ImportError:
         return False

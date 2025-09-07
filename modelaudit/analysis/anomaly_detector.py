@@ -50,6 +50,7 @@ class StatisticalProfile:
         # Calculate composite anomaly score
         try:
             import numpy as np
+
             anomaly_score = np.mean(z_scores) if z_scores else 0.0
         except ImportError:
             anomaly_score = sum(z_scores) / len(z_scores) if z_scores else 0.0
@@ -145,14 +146,14 @@ class AnomalyDetector:
                 std=0.0,
                 min_val=0.0,
                 max_val=0.0,
-                percentiles={p: 0.0 for p in [1, 5, 25, 50, 75, 95, 99]},
+                percentiles=dict.fromkeys([1, 5, 25, 50, 75, 95, 99], 0.0),
                 skewness=0.0,
                 kurtosis=0.0,
                 entropy=0.0,
                 zero_ratio=1.0,
                 sparsity=1.0,
             )
-            
+
         if data.size == 0:
             return StatisticalProfile(
                 mean=0.0,
@@ -272,7 +273,7 @@ class AnomalyDetector:
             import numpy as np
         except ImportError:
             return []  # Return empty if numpy not available
-            
+
         suspicious = []
         flat_data = data.flatten()
 
@@ -320,7 +321,7 @@ class AnomalyDetector:
             import numpy as np
         except ImportError:
             return False
-            
+
         # Convert to bytes for pattern matching
         if data.dtype == np.float32:
             bytes_data = data.tobytes()
@@ -342,7 +343,7 @@ class AnomalyDetector:
             import numpy as np
         except ImportError:
             return False
-            
+
         # Look for ASCII-like patterns in float data
         if data.dtype == np.float32:
             # Check if values cluster around ASCII ranges when interpreted as bytes
@@ -362,7 +363,7 @@ class AnomalyDetector:
             import numpy as np
         except ImportError:
             return False
-            
+
         if len(data) < 1000:
             return False
 
@@ -388,7 +389,7 @@ class AnomalyDetector:
             import numpy as np
         except ImportError:
             return False
-            
+
         # Benford's Law check for first significant digit
         abs_data = np.abs(data[data != 0])
         if len(abs_data) > 1000:

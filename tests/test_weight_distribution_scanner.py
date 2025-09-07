@@ -8,38 +8,49 @@ import pytest
 from modelaudit.scanners import weight_distribution_scanner
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 
+
 # Skip tests if required libraries are not available
 def has_numpy():
     try:
         import numpy as np  # noqa: F401
+
         return True
     except ImportError:
         return False
+
 
 def has_torch():
     try:
         import torch  # noqa: F401
+
         return True
     except ImportError:
         return False
+
 
 def has_h5py():
     try:
         import h5py  # noqa: F401
+
         return True
     except ImportError:
         return False
 
+
 def has_tensorflow():
     try:
         import tensorflow as tf  # noqa: F401
+
         return True
     except Exception:
         return False
 
-# Use dynamic checks instead of module-level imports  
+
+# Use dynamic checks instead of module-level imports
 # Defer expensive checks to avoid module-level heavy imports
 HAS_NUMPY = has_numpy()  # numpy is lightweight
+
+
 # Defer heavy imports until actually needed in tests
 def _has_torch_cached():
     global _TORCH_CHECKED, _HAS_TORCH
@@ -48,6 +59,7 @@ def _has_torch_cached():
         _TORCH_CHECKED = True
     return _HAS_TORCH
 
+
 def _has_h5py_cached():
     global _H5PY_CHECKED, _HAS_H5PY
     if not _H5PY_CHECKED:
@@ -55,12 +67,14 @@ def _has_h5py_cached():
         _H5PY_CHECKED = True
     return _HAS_H5PY
 
+
 def _has_tensorflow_cached():
     global _TENSORFLOW_CHECKED, _HAS_TENSORFLOW
     if not _TENSORFLOW_CHECKED:
         _HAS_TENSORFLOW = has_tensorflow()
         _TENSORFLOW_CHECKED = True
     return _HAS_TENSORFLOW
+
 
 # Global caching variables
 _TORCH_CHECKED = False
@@ -226,9 +240,9 @@ class TestWeightDistributionScanner:
         """Test scanning a PyTorch model with anomalous weights"""
         if not has_torch():
             pytest.skip("PyTorch not installed")
-        
+
         import torch
-        
+
         scanner = WeightDistributionScanner()
 
         # Create a simple model with anomalous weights
@@ -274,10 +288,10 @@ class TestWeightDistributionScanner:
         """Test scanning a Keras model"""
         if not has_h5py():
             pytest.skip("h5py not installed")
-        
+
         import h5py
         import numpy as np
-        
+
         scanner = WeightDistributionScanner()
 
         # Create a simple H5 file with weights
@@ -305,7 +319,7 @@ class TestWeightDistributionScanner:
     def test_tensorflow_savedmodel_scan(self, tmp_path):
         """Test scanning a TensorFlow SavedModel directory."""
         import sys
-        
+
         if not has_tensorflow():
             pytest.skip("TensorFlow not installed")
 
@@ -314,7 +328,7 @@ class TestWeightDistributionScanner:
             pytest.skip("TensorFlow SavedModel has compatibility issues with Python 3.12+")
 
         import tensorflow as tf
-        
+
         scanner = WeightDistributionScanner()
 
         model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])  # type: ignore[call-arg]

@@ -27,21 +27,26 @@ PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 # Defer TensorFlow availability check to avoid module-level imports
 HAS_TENSORFLOW: bool | None = None
 
+
 def _check_tensorflow() -> bool:
     """Check if TensorFlow is available, with caching."""
     global HAS_TENSORFLOW
     if HAS_TENSORFLOW is None:
         try:
             import tensorflow as tf  # noqa: F401
+
             HAS_TENSORFLOW = True
         except ImportError:
             HAS_TENSORFLOW = False
     return HAS_TENSORFLOW
 
+
 # Create a placeholder for type hints when TensorFlow is not available
 class SavedModel:  # type: ignore[no-redef]
     """Placeholder for SavedModel when TensorFlow is not installed"""
+
     meta_graphs: ClassVar[list] = []
+
 
 SavedModelType = SavedModel
 

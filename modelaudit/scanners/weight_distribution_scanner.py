@@ -45,7 +45,8 @@ class WeightDistributionScanner(BaseScanner):
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
             try:
-                import tensorflow as tf  # noqa: F401
+                import tensorflow as tf
+
                 has_tensorflow = True
             except ImportError:
                 has_tensorflow = False
@@ -182,8 +183,8 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_pytorch_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from PyTorch model files"""
         try:
-            import torch
             import numpy as np
+            import torch
         except ImportError:
             return {}
 
@@ -319,8 +320,8 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_tensorflow_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from TensorFlow SavedModel files"""
         try:
-            import tensorflow as tf
             import numpy as np
+            import tensorflow as tf
         except ImportError:
             return {}
 
@@ -376,8 +377,8 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from ONNX model files"""
         try:
-            import onnx
             import numpy as np
+            import onnx
         except ImportError:
             return {}
 
@@ -401,8 +402,8 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_safetensors_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from SafeTensors files"""
         try:
-            from safetensors import safe_open
             import numpy as np
+            from safetensors import safe_open
         except ImportError:
             return {}
 
@@ -590,7 +591,7 @@ class WeightDistributionScanner(BaseScanner):
         except ImportError:
             # Skip analysis if numpy/scipy not available
             return []
-        
+
         anomalies: list[dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers
