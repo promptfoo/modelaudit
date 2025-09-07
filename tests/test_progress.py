@@ -198,7 +198,7 @@ class TestMultiPhaseProgressTracker:
         # Move to next phase
         result = tracker.next_phase("Starting analysis")
         assert result is True
-        assert tracker.stats.current_phase == ProgressPhase.ANALYZING  # type: ignore[comparison-overlap]
+        assert tracker.stats.current_phase == ProgressPhase.ANALYZING
         assert tracker.stats.status_message == "Starting analysis"
 
         # Move to last phase
@@ -442,7 +442,7 @@ class TestProgressIntegration:
             def can_handle(cls, path: str) -> bool:
                 return True
 
-            def scan(self, path: str):
+            def scan(self, path: str) -> ScanResult:
                 result = self._create_result()
 
                 # Simulate progress updates

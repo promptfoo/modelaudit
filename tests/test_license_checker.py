@@ -596,6 +596,7 @@ class TestEdgeCases:
             source="test",
             confidence=0.9,
             text="License text",
+            url="https://opensource.org/licenses/MIT",
         )
 
         assert license_info.spdx_id == "MIT"
@@ -606,6 +607,7 @@ class TestEdgeCases:
             holder="Test Corp",
             year="2024",
             text="Copyright 2024 Test Corp",
+            confidence=0.9,
         )
 
         assert copyright_info.holder == "Test Corp"
