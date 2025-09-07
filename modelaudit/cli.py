@@ -686,7 +686,7 @@ def scan_command(
     # Track actual paths that were successfully scanned for SBOM generation
     # This prevents FileNotFoundError when URLs are downloaded to local paths
     scanned_paths: list[str] = []
-    
+
     # Track temporary directories to clean up after SBOM generation
     temp_dirs_to_cleanup: list[str] = []
 
