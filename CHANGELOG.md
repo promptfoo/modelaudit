@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **feat**: integrate ty type checker and enhance type safety (#372)
+
+### Changed
+
+- **docs**: rewrite README with professional technical content (#370)
+- **chore**: remove unnecessary files from root directory (#369)
+
+### Fixed
+
+- **fix**: resolve SBOM generation FileNotFoundError with URLs (#373)
+
 ## [0.2.5] - 2025-09-05
 
 ### Added

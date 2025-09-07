@@ -523,9 +523,6 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
-    # Track mapping from original URLs to downloaded file paths for SBOM generation
-    path_mappings: dict[str, str] = {}
-
     # Generate smart defaults based on input analysis
     smart_defaults = generate_smart_defaults(expanded_paths)
 
@@ -734,8 +731,6 @@ def scan_command(
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
-                        # Track path mapping for SBOM generation
-                        path_mappings[path] = actual_path
                         # Only track for cleanup if we created an ephemeral cache above
                         temp_dir = str(hf_cache_dir) if not final_cache else None
 
@@ -808,8 +803,6 @@ def scan_command(
                         show_progress = final_format == "text" and not output and should_show_spinner()
                         download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                         actual_path = str(download_path)
-                        # Track path mapping for SBOM generation
-                        path_mappings[path] = actual_path
                         # Only track for cleanup if not using cache
                         temp_dir = str(download_path) if not final_cache else None
 
@@ -859,8 +852,6 @@ def scan_command(
                             cache_dir=Path(final_cache_dir) if final_cache_dir else None,
                         )
                         actual_path = str(download_path)
-                        # Track path mapping for SBOM generation
-                        path_mappings[path] = actual_path
                         temp_dir = str(download_path)
 
                         if download_spinner:
@@ -958,8 +949,6 @@ def scan_command(
                             stream_analyze=final_stream,
                         )
                         actual_path = str(download_path)
-                        # Track path mapping for SBOM generation
-                        path_mappings[path] = actual_path
                         temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
 
                         if download_spinner:
