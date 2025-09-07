@@ -10,6 +10,7 @@ def _get_onnx_mapping() -> Any:
     try:
         # Try ONNX 1.12+ location
         import onnx
+
         if hasattr(onnx, "mapping"):
             return onnx.mapping
     except (ImportError, AttributeError):
@@ -18,6 +19,7 @@ def _get_onnx_mapping() -> Any:
     try:
         # Try older ONNX location
         from onnx.onnx_cpp2py_export import mapping as mapping_export  # type: ignore[attr-defined]
+
         return mapping_export
     except (ImportError, AttributeError):
         pass

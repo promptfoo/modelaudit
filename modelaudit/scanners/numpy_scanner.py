@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
