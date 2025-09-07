@@ -1,6 +1,6 @@
 import os
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -21,7 +21,7 @@ class WeightDistributionScanner(BaseScanner):
         # Note: .safetensors removed - handled exclusively by SafeTensorsScanner
     ]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Configuration parameters
         self.z_score_threshold = self.config.get("z_score_threshold", 3.0)

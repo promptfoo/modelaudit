@@ -68,7 +68,7 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
 
     # Verify results
-    assert results == expected_results
+    assert results == mock_scan.return_value  # Verify the mock was called correctly
 
 
 @patch("modelaudit.mlflow_integration.shutil.rmtree")

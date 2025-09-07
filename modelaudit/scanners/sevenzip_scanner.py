@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     import py7zr as _py7zr  # type: ignore[import-untyped]
@@ -31,7 +31,7 @@ class SevenZipScanner(BaseScanner):
     description = "Scans 7-Zip archives for malicious model files"
     supported_extensions: ClassVar[list[str]] = [".7z"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_entries = self.config.get("max_7z_entries", 10000)
         self.max_extract_size = self.config.get("max_7z_extract_size", 1024 * 1024 * 1024)  # 1GB

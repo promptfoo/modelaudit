@@ -17,11 +17,11 @@ from modelaudit.scanners.onnx_scanner import OnnxScanner
 def create_onnx_model(
     tmp_path: Path,
     *,
-    custom=False,
-    external=False,
-    external_path="weights.bin",
-    missing_external=False,
-):
+    custom: bool = False,
+    external: bool = False,
+    external_path: str = "weights.bin",
+    missing_external: bool = False,
+) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
     node = (

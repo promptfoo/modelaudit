@@ -77,7 +77,7 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         # Check that location includes manifest:layer:file format
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert any("image.manifest:layer.tar.gz:malicious.pkl" in issue.location for issue in critical_issues)
+        assert any("image.manifest:layer.tar.gz:malicious.pkl" in (issue.location or "") for issue in critical_issues)
 
     def test_scan_yaml_manifest(self, tmp_path):
         """Test scanning a YAML manifest file."""
@@ -337,7 +337,7 @@ class TestOciLayerScanner:
         assert len(critical_issues) > 0
 
         issue = critical_issues[0]
-        assert "test.manifest:test_layer.tar.gz:model/evil.pkl" in issue.location
+        assert "test.manifest:test_layer.tar.gz:model/evil.pkl" in (issue.location or "")
         assert issue.details is not None
         assert issue.details.get("layer") == "test_layer.tar.gz"
 
@@ -363,8 +363,8 @@ class TestOciLayerScanner:
         assert len(critical_issues) >= 2
 
         locations = [issue.location for issue in critical_issues]
-        assert any("model1.pkl" in loc for loc in locations)
-        assert any("model2.pkl" in loc for loc in locations)
+        assert any("model1.pkl" in (loc or "") for loc in locations)
+        assert any("model2.pkl" in (loc or "") for loc in locations)
 
 
 # Keep the original test for backward compatibility

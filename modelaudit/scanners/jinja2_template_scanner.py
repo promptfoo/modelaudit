@@ -22,7 +22,7 @@ import json
 import os
 import re
 import warnings
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
@@ -95,7 +95,7 @@ class Jinja2TemplateScanner(BaseScanner):
     description = "Scans for Jinja2 template injection vulnerabilities in ML model templates"
     supported_extensions: ClassVar[list[str]] = [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
 
         # Configuration options
@@ -346,7 +346,7 @@ class Jinja2TemplateScanner(BaseScanner):
             for key, field in reader.fields.items():
                 if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
                     value = field.parts[field.data[0]]
-                    if isinstance(value, (list, tuple)):
+                    if isinstance(value, list | tuple):
                         # Convert list of integers to string
                         template_str = "".join(chr(i) for i in value if isinstance(i, int) and 0 <= i <= 1114111)
                     else:
@@ -392,7 +392,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     templates[current_path] = value
 
                 # Recursively check nested structures
-                elif isinstance(value, (dict, list)):
+                elif isinstance(value, dict | list):
                     self._find_json_templates(value, templates, current_path)
 
                 # Check for template-like strings (contain Jinja2 syntax)

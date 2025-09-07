@@ -11,13 +11,13 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from modelaudit.models import JITScriptFinding
 
 
-def create_jit_finding(**kwargs) -> "JITScriptFinding":
+def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
     """Helper to create JITScriptFinding with proper field handling."""
     from modelaudit.models import JITScriptFinding
 
@@ -140,7 +140,7 @@ CODE_EXECUTION_PATTERNS = [
 class JITScriptDetector:
     """Detects dangerous JIT/Script code execution patterns in ML models."""
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the JIT/Script detector.
 
         Args:

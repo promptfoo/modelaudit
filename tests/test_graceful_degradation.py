@@ -244,8 +244,8 @@ class TestErrorHandlingSpecificity:
         assert _is_numpy_compatibility_error(test_error)
 
         # Should not misidentify regular errors
-        test_error = ImportError("No module named 'some_module'")
-        assert not _is_numpy_compatibility_error(test_error)
+        different_error = ImportError("No module named 'some_module'")
+        assert not _is_numpy_compatibility_error(different_error)
 
 
 class TestDoctorCommand:
