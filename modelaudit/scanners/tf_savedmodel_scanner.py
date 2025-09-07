@@ -141,11 +141,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
+            # Import the actual SavedModel from TensorFlow
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+            
             with open(path, "rb") as f:
                 content = f.read()
                 result.bytes_scanned = len(content)
 
-                saved_model = SavedModelType()
+                saved_model = SavedModel()
                 saved_model.ParseFromString(content)
                 for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(

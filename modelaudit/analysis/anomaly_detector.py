@@ -275,6 +275,9 @@ class AnomalyDetector:
             return []  # Return empty if numpy not available
 
         suspicious = []
+        # Ensure data is a numpy array and flatten it
+        if not isinstance(data, np.ndarray):
+            data = np.asarray(data)
         flat_data = data.flatten()
 
         # Check for hidden executable signatures

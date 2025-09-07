@@ -159,6 +159,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_outlier_detection(self):
         """Test detection of outlier weight vectors"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create normal weights with one outlier
@@ -189,6 +191,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_dissimilar_vectors(self):
         """Test detection of dissimilar weight vectors"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create similar weight vectors
@@ -215,6 +219,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_extreme_values(self):
         """Test detection of extreme weight values"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create normal weights
@@ -378,6 +384,11 @@ class TestWeightDistributionScanner:
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
         """Unsafe pickle opcodes should be flagged"""
+        if not has_torch():
+            pytest.skip("PyTorch not installed")
+
+        import torch
+
         model = torch.nn.Linear(2, 2)
         zip_path = tmp_path / "model.pt"
         torch.save(model.state_dict(), zip_path)
@@ -393,6 +404,8 @@ class TestWeightDistributionScanner:
 
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create weights with multiple issues
@@ -420,6 +433,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_vocabulary_layer_handling(self):
         """Test that LLM vocabulary layers don't produce false positives"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create a large vocabulary layer like in LLMs (e.g., 32k vocab)
@@ -447,6 +462,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_checks_disabled_by_default(self):
         """Test that LLM checks are disabled by default"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create LLM-like weights
@@ -460,6 +477,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_checks_can_be_enabled(self):
         """Test that LLM checks can be explicitly enabled via config"""
+        import numpy as np
+
         config = {"enable_llm_checks": True}
         scanner = WeightDistributionScanner(config)
 
@@ -484,6 +503,8 @@ class TestWeightDistributionScanner:
 
     def test_gpt2_layer_pattern_detection(self):
         """Test that GPT-2 style layer patterns are detected as LLM layers"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test GPT-2 style layer names
@@ -510,6 +531,8 @@ class TestWeightDistributionScanner:
 
     def test_transformer_layer_pattern_detection(self):
         """Test that transformer-related layers use structural analysis instead of name-based detection."""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test transformer-related layer names
@@ -549,6 +572,8 @@ class TestWeightDistributionScanner:
 
     def test_large_hidden_dimension_detection(self):
         """Test that layers with large hidden dimensions are detected as LLM layers"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test various large hidden dimensions typical of LLMs
@@ -566,6 +591,8 @@ class TestWeightDistributionScanner:
 
     def test_non_llm_layers_still_analyzed(self):
         """Test that non-LLM layers are still properly analyzed for anomalies"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create small classification layer (typical for image classification)
@@ -588,6 +615,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_enabled_with_extreme_outliers(self):
         """Test LLM analysis with extremely suspicious outliers when enabled"""
+        import numpy as np
+
         config = {"enable_llm_checks": True}
         scanner = WeightDistributionScanner(config)
 

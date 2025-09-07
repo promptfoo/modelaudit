@@ -377,7 +377,6 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from ONNX model files"""
         try:
-            import numpy as np
             import onnx
         except ImportError:
             return {}
@@ -402,7 +401,6 @@ class WeightDistributionScanner(BaseScanner):
     def _extract_safetensors_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from SafeTensors files"""
         try:
-            import numpy as np
             from safetensors import safe_open
         except ImportError:
             return {}
