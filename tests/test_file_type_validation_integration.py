@@ -103,7 +103,7 @@ class TestFileTypeValidationIntegration:
                             validation_failures.append(
                                 {
                                     "file": str(file_path.relative_to(test_data_dir)),
-                                    "scan_issues": [i.message for i in validation_issues],
+                                    "issues": "; ".join(i.message for i in validation_issues),
                                 },
                             )
 

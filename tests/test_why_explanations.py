@@ -116,7 +116,7 @@ def test_pickle_scanner_includes_why():
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system
-        assert any("system" in issue.why.lower() for issue in system_issues)
+        assert any("system" in (issue.why or "").lower() for issue in system_issues)
 
     finally:
         import os

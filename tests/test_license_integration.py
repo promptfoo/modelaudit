@@ -342,7 +342,7 @@ class TestLicenseScenarios:
         # Non-commercial licenses should not allow commercial use
         nc_patterns = ["CC-BY-NC"]
         for _pattern_key, info in LICENSE_PATTERNS.items():
-            if any(nc in info["spdx_id"] for nc in nc_patterns):
+            if info["spdx_id"] and isinstance(info["spdx_id"], str) and any(nc in info["spdx_id"] for nc in nc_patterns):
                 assert info["commercial_allowed"] is False, f"{info['spdx_id']} should not allow commercial use"
 
     def test_ml_model_directory_detection(self) -> None:

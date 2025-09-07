@@ -435,7 +435,7 @@ class TestCVEPatternValidation:
                 assert cve_info[field], f"Field '{field}' should not be empty in {cve_id}"
 
             # Validate CVSS score range
-            assert 0.0 <= cve_info["cvss"] <= 10.0, f"CVSS score should be 0-10 for {cve_id}"
+            assert isinstance(cve_info["cvss"], (int, float)) and 0.0 <= cve_info["cvss"] <= 10.0, f"CVSS score should be 0-10 for {cve_id}"
 
             # Validate severity values
             assert cve_info["severity"] in ["LOW", "MEDIUM", "HIGH", "CRITICAL"], (

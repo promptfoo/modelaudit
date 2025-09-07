@@ -1,5 +1,6 @@
 """Tests specifically for exit code logic."""
 
+from typing import Any
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
