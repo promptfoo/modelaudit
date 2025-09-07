@@ -37,11 +37,38 @@ def has_tensorflow():
     except Exception:
         return False
 
-# Use dynamic checks instead of module-level imports
-HAS_NUMPY = has_numpy()
-HAS_TORCH = has_torch()
-HAS_H5PY = has_h5py()
-HAS_TENSORFLOW = has_tensorflow()
+# Use dynamic checks instead of module-level imports  
+# Defer expensive checks to avoid module-level heavy imports
+HAS_NUMPY = has_numpy()  # numpy is lightweight
+# Defer heavy imports until actually needed in tests
+def _has_torch_cached():
+    global _TORCH_CHECKED, _HAS_TORCH
+    if not _TORCH_CHECKED:
+        _HAS_TORCH = has_torch()
+        _TORCH_CHECKED = True
+    return _HAS_TORCH
+
+def _has_h5py_cached():
+    global _H5PY_CHECKED, _HAS_H5PY
+    if not _H5PY_CHECKED:
+        _HAS_H5PY = has_h5py()
+        _H5PY_CHECKED = True
+    return _HAS_H5PY
+
+def _has_tensorflow_cached():
+    global _TENSORFLOW_CHECKED, _HAS_TENSORFLOW
+    if not _TENSORFLOW_CHECKED:
+        _HAS_TENSORFLOW = has_tensorflow()
+        _TENSORFLOW_CHECKED = True
+    return _HAS_TENSORFLOW
+
+# Global caching variables
+_TORCH_CHECKED = False
+_HAS_TORCH = False
+_H5PY_CHECKED = False
+_HAS_H5PY = False
+_TENSORFLOW_CHECKED = False
+_HAS_TENSORFLOW = False
 
 
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")
@@ -96,14 +123,14 @@ class TestWeightDistributionScanner:
 
         try:
             # Should handle PyTorch files if torch is available
-            if HAS_TORCH:
+            if _has_torch_cached():
                 assert WeightDistributionScanner.can_handle(pt_path)
 
             # Should handle Keras files if h5py is available
-            if HAS_H5PY:
+            if _has_h5py_cached():
                 assert WeightDistributionScanner.can_handle(h5_path)
 
-            if HAS_TENSORFLOW:
+            if _has_tensorflow_cached():
                 assert WeightDistributionScanner.can_handle(tf_dir)
 
             # Should not handle unsupported extensions
@@ -194,9 +221,14 @@ class TestWeightDistributionScanner:
         assert extreme_anomaly is not None
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_model_scan(self):
         """Test scanning a PyTorch model with anomalous weights"""
+        if not has_torch():
+            pytest.skip("PyTorch not installed")
+        
+        import torch
+        
         scanner = WeightDistributionScanner()
 
         # Create a simple model with anomalous weights
@@ -237,9 +269,15 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_H5PY, reason="h5py not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_keras_model_scan(self):
         """Test scanning a Keras model"""
+        if not has_h5py():
+            pytest.skip("h5py not installed")
+        
+        import h5py
+        import numpy as np
+        
         scanner = WeightDistributionScanner()
 
         # Create a simple H5 file with weights
@@ -263,15 +301,20 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_tensorflow_savedmodel_scan(self, tmp_path):
         """Test scanning a TensorFlow SavedModel directory."""
         import sys
+        
+        if not has_tensorflow():
+            pytest.skip("TensorFlow not installed")
 
         # Skip on Python 3.12+ due to TensorFlow/typing compatibility issues
         if sys.version_info >= (3, 12):
             pytest.skip("TensorFlow SavedModel has compatibility issues with Python 3.12+")
 
+        import tensorflow as tf
+        
         scanner = WeightDistributionScanner()
 
         model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])  # type: ignore[call-arg]
@@ -299,7 +342,7 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
@@ -318,7 +361,7 @@ class TestWeightDistributionScanner:
         assert "layer.weight" in weights
         assert weights["layer.weight"].shape == (2, 2)
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
         """Unsafe pickle opcodes should be flagged"""
         model = torch.nn.Linear(2, 2)
