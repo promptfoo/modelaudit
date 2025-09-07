@@ -27,15 +27,23 @@ def _get_onnx_mapping() -> Any:
     return None
 
 
-try:
-    import numpy as np
-    import onnx
+# Defer ONNX availability check to avoid module-level imports
+HAS_ONNX: bool | None = None
+mapping = None
 
-    mapping = _get_onnx_mapping()
-    HAS_ONNX = True
-except Exception:
-    HAS_ONNX = False
-    mapping = None
+def _check_onnx() -> bool:
+    """Check if ONNX is available, with caching."""
+    global HAS_ONNX, mapping
+    if HAS_ONNX is None:
+        try:
+            import numpy as np  # noqa: F401
+            import onnx  # noqa: F401
+            mapping = _get_onnx_mapping()
+            HAS_ONNX = True
+        except Exception:
+            HAS_ONNX = False
+            mapping = None
+    return HAS_ONNX
 
 
 class OnnxScanner(BaseScanner):
@@ -47,7 +55,7 @@ class OnnxScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_ONNX:
+        if not _check_onnx():
             return False
         if not os.path.isfile(path):
             return False
@@ -70,7 +78,7 @@ class OnnxScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
-        if not HAS_ONNX:
+        if not _check_onnx():
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
