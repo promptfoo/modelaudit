@@ -1,13 +1,13 @@
 """Optimized configuration handling for cache operations."""
 
 import functools
-from typing import Any, Optional
+from typing import Any
 
 
 class CacheConfiguration:
     """Pre-computed cache configuration to avoid repeated extraction overhead."""
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         if config is None:
             config = {}
 
@@ -78,7 +78,7 @@ class ConfigurationExtractor:
         self._config_cache = {}  # Cache parsed configurations briefly
         self._cache_expiry = 30.0  # 30 seconds
 
-    def extract_fast(self, args: tuple, kwargs: dict) -> tuple[Optional[CacheConfiguration], Optional[str]]:
+    def extract_fast(self, args: tuple, kwargs: dict) -> tuple[CacheConfiguration | None, str | None]:
         """
         Fast configuration extraction with caching.
 

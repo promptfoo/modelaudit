@@ -8,7 +8,6 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from ..utils.secure_hasher import SecureFileHasher
 
@@ -21,7 +20,7 @@ class FileFingerprint:
     size: int
     mtime: float
     inode: int
-    content_hash: Optional[str] = None  # Lazy-loaded for large files
+    content_hash: str | None = None  # Lazy-loaded for large files
 
     @classmethod
     def from_stat(cls, file_path: str, stat_result: os.stat_result) -> "FileFingerprint":
@@ -41,7 +40,7 @@ class FileFingerprint:
         """Generate fast cache key without content hash (for small files)."""
         return f"{self.path_hash}_{self.size}_{int(self.mtime)}_{self.inode}"
 
-    def secure_key(self, file_path: str, hasher: Optional[SecureFileHasher] = None) -> str:
+    def secure_key(self, file_path: str, hasher: SecureFileHasher | None = None) -> str:
         """Generate secure cache key with content hash (lazy-loaded)."""
         if self.content_hash is None:
             if hasher is None:

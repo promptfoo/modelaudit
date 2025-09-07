@@ -402,7 +402,7 @@ class BaseScanner(ABC):
 
         # Create cached version of the scan method
         @cached_scan()
-        def cached_scan_method(scanner_self, file_path: str) -> ScanResult:
+        def cached_scan_method(scanner_self: "BaseScanner", file_path: str) -> ScanResult:
             return scanner_self.scan(file_path)
 
         return cached_scan_method(self, path)

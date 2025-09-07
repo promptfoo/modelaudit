@@ -4,7 +4,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .cache_manager import CacheManager
 from .smart_cache_keys import SmartCacheKeyGenerator
@@ -19,7 +19,7 @@ class BatchCacheOperations:
         self.cache_manager = cache_manager
         self.key_generator = cache_manager.key_generator or SmartCacheKeyGenerator()
 
-    def batch_lookup(self, file_paths: list[str], max_workers: int = 4) -> dict[str, Optional[dict[str, Any]]]:
+    def batch_lookup(self, file_paths: list[str], max_workers: int = 4) -> dict[str, dict[str, Any] | None]:
         """
         Perform batch cache lookups with I/O optimization.
 
@@ -36,7 +36,7 @@ class BatchCacheOperations:
         if not self.cache_manager.enabled or not self.cache_manager.cache:
             return dict.fromkeys(file_paths)
 
-        results: dict[str, Optional[dict[str, Any]]] = {}
+        results: dict[str, dict[str, Any] | None] = {}
         cache_lookups = []
 
         # Prepare cache lookups with stat collection
@@ -100,9 +100,9 @@ class BatchCacheOperations:
 
     def _process_cache_directory_group(
         self, group_files: list[tuple[str, str, os.stat_result]]
-    ) -> dict[str, Optional[dict[str, Any]]]:
+    ) -> dict[str, dict[str, Any] | None]:
         """Process all cache files in a single directory efficiently."""
-        results: dict[str, Optional[dict[str, Any]]] = {}
+        results: dict[str, dict[str, Any] | None] = {}
 
         for file_path, cache_key, _stat_result in group_files:
             try:
@@ -124,7 +124,7 @@ class BatchCacheOperations:
 
         return results
 
-    def batch_store(self, scan_results: list[tuple[str, dict[str, Any], Optional[int]]], max_workers: int = 2) -> int:
+    def batch_store(self, scan_results: list[tuple[str, dict[str, Any], int | None]], max_workers: int = 2) -> int:
         """
         Store multiple scan results in cache with batch optimization.
 
@@ -163,7 +163,7 @@ class BatchCacheOperations:
         return stored_count
 
     def _store_single_result(
-        self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int]
+        self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None
     ) -> bool:
         """Store a single result and return success status."""
         try:

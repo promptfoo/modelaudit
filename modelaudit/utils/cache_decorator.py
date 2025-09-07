@@ -7,7 +7,8 @@ duplicate caching logic between core.py and scanners/base.py.
 import functools
 import logging
 import os
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from ..cache.optimized_config import get_config_extractor
 
@@ -48,8 +49,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             # Use optimized configuration extraction
             cache_config, file_path = config_extractor.extract_fast(args, kwargs)
 
-            # Fast path for disabled caching
-            if not cache_config.enabled:
+            # Fast path for disabled caching or no config
+            if not cache_config or not cache_config.enabled:
                 logger.debug(f"Cache disabled for {file_path}, calling function directly")
                 return func(*args, **kwargs)
 
@@ -125,7 +126,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
     return decorator
 
 
-def _extract_config_and_path(args: tuple, kwargs: dict) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+def _extract_config_and_path(args: tuple, kwargs: dict) -> tuple[dict[str, Any] | None, str | None]:
     """
     Extract config dict and file path from function arguments.
 
