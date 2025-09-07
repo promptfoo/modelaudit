@@ -25,21 +25,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
-# Create a non-root user with a proper shell for Docker testing
-ARG UID=10001
-RUN adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "/nonexistent" \
-    --shell "/bin/bash" \
-    --no-create-home \
-    --uid "${UID}" \
-    appuser
-
-# Create a data directory that appuser can write to
-RUN mkdir -p /data && chown appuser:appuser /data
-
-USER appuser
+# For CI testing purposes, we'll run as root to avoid volume mount permission issues
+# In production, users can override with --user flag if needed
 
 # Set the flexible entrypoint
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
