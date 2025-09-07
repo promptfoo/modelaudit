@@ -4,8 +4,11 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+
+# Mock utilities for heavy dependencies
 
 
 @pytest.fixture(autouse=True)
@@ -166,6 +169,83 @@ def pytest_collection_modifyitems(config, items):
         # Mark slow tests
         if "large" in item.name.lower() or "multiple" in item.name.lower():
             item.add_marker(pytest.mark.slow)
+
+
+@pytest.fixture
+def mock_scanner_registry():
+    """Mock scanner registry to avoid loading heavy ML dependencies."""
+    with patch("modelaudit.scanners.SCANNER_REGISTRY") as mock_registry:
+        # Create lightweight mock scanners
+        mock_pickle_scanner = Mock()
+        mock_pickle_scanner.can_handle.return_value = True
+        mock_pickle_scanner.scan.return_value = Mock(issues=[], files_scanned=1)
+
+        mock_registry.__iter__.return_value = [mock_pickle_scanner]
+        yield mock_registry
+
+
+@pytest.fixture
+def mock_ml_dependencies():
+    """Mock heavy ML dependencies to prevent imports during unit tests."""
+    mocks = {}
+
+    # Mock TensorFlow
+    mock_tf = MagicMock()
+    mock_tf.__version__ = "2.13.0"
+    mocks["tensorflow"] = mock_tf
+
+    # Mock Keras
+    mock_keras = MagicMock()
+    mock_keras.__version__ = "2.13.0"
+    mocks["keras"] = mock_keras
+
+    # Mock PyTorch
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.6.0"
+    mocks["torch"] = mock_torch
+
+    # Mock pandas/pyarrow that causes the crash
+    mock_pandas = MagicMock()
+    mocks["pandas"] = mock_pandas
+
+    with patch.dict("sys.modules", mocks):
+        yield mocks
+
+
+@pytest.fixture
+def mock_cli_scan_command():
+    """Mock the CLI scan command to avoid heavy dependency loading."""
+    # Mock the core scan function that the CLI actually uses
+    # Create complete mock data matching ModelAuditResultModel structure
+    import time
+
+    current_time = time.time()
+
+    mock_result_dict = {
+        "files_scanned": 1,
+        "bytes_scanned": 1024,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Test issue", "severity": "warning", "location": "test.pkl", "details": {"test": "value"}}
+        ],
+        "checks": [],  # Required field
+        "assets": [],  # Required field
+        "has_errors": False,
+        "scanner_names": ["test_scanner"],  # Required field
+        "file_metadata": {},  # Required field
+        "start_time": current_time,  # Required field
+        "total_checks": 1,  # Required field
+        "passed_checks": 1,  # Required field
+        "failed_checks": 0,  # Required field
+        "success": True,
+    }
+
+    with patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan:
+        # Create a mock ModelAuditResultModel that has model_dump() method
+        mock_model = Mock()
+        mock_model.model_dump.return_value = mock_result_dict
+        mock_scan.return_value = mock_model
+        yield mock_scan
 
 
 @pytest.fixture(autouse=True)
