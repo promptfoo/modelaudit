@@ -11,12 +11,12 @@ RUN pip install --no-cache-dir .
 # Install ML frameworks with minimal dependencies to avoid disk space issues
 # Skip CUDA/GPU dependencies that cause disk space problems in Docker
 RUN pip install --no-cache-dir \
-    tensorflow-cpu>=2.13.0,<3.0 \
-    torch>=2.6.0,<3.0 --index-url https://download.pytorch.org/whl/cpu \
-    h5py>=3.1,<4.0 \
-    onnx>=1.12.0,<2.0 \
-    scikit-learn>=1.0.0,<2.0 \
-    coremltools>=8.0
+    "tensorflow-cpu>=2.13.0,<3.0" \
+    "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu \
+    "h5py>=3.1,<4.0" \
+    "onnx>=1.12.0,<2.0" \
+    "scikit-learn>=1.0.0,<2.0" \
+    "coremltools>=8.0"
 
 # Create a non-root user
 ARG UID=10001
