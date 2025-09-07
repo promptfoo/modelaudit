@@ -116,7 +116,7 @@ def test_max_total_size(tmp_path):
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
 
-    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150, cache_enabled=False)
 
     assert results.success is True
 
