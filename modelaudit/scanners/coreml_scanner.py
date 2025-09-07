@@ -3,16 +3,22 @@ from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+# Declare global variables for mypy
+HAS_COREML = False
+Model_pb2 = None
+
+
 def _import_coreml():
     """Lazy import of coreml library to avoid loading at module level."""
     global HAS_COREML, Model_pb2
-    if 'HAS_COREML' not in globals():
+    if "HAS_COREML" not in globals() or not globals()["HAS_COREML"]:
         try:  # pragma: no cover - optional dependency
-            from coremltools.proto import Model_pb2 as Model_pb2_temp  # type: ignore[possibly-unbound-import]
-            globals()['Model_pb2'] = Model_pb2_temp
-            globals()['HAS_COREML'] = True
+            from coremltools.proto import Model_pb2 as Model_pb2_temp  # type: ignore[import-untyped]
+
+            globals()["Model_pb2"] = Model_pb2_temp
+            globals()["HAS_COREML"] = True
         except Exception:  # pragma: no cover - optional dependency
-            globals()['HAS_COREML'] = False
+            globals()["HAS_COREML"] = False
 
 
 class CoreMLScanner(BaseScanner):
@@ -30,7 +36,7 @@ class CoreMLScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
-        
+
         # Only import coreml if file extension matches
         _import_coreml()
         return HAS_COREML
@@ -49,7 +55,7 @@ class CoreMLScanner(BaseScanner):
 
         # Ensure coreml is imported
         _import_coreml()
-        
+
         if not HAS_COREML:
             result.add_check(
                 name="CoreML Library Check",
@@ -61,6 +67,9 @@ class CoreMLScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        # Type guard: ensure Model_pb2 is available
+        assert Model_pb2 is not None, "Model_pb2 should be available when HAS_COREML is True"
 
         try:
             with open(path, "rb") as f:

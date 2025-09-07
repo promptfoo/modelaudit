@@ -3,16 +3,23 @@ from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+# Declare global variables for mypy
+HAS_TFLITE = False
+tflite = None
+
+
 def _import_tflite():
     """Lazy import of tflite library to avoid loading at module level."""
     global HAS_TFLITE, tflite
-    if 'HAS_TFLITE' not in globals():
+    if "HAS_TFLITE" not in globals() or not globals()["HAS_TFLITE"]:
         try:
-            import tflite as tflite_temp
-            globals()['tflite'] = tflite_temp
-            globals()['HAS_TFLITE'] = True
+            import tflite as tflite_temp  # type: ignore[import-untyped]
+
+            globals()["tflite"] = tflite_temp
+            globals()["HAS_TFLITE"] = True
         except Exception:  # pragma: no cover - optional dependency
-            globals()['HAS_TFLITE'] = False
+            globals()["HAS_TFLITE"] = False
+
 
 # Thresholds to detect potential overflow or malicious sizes
 _MAX_COUNT = 1_000_000
@@ -34,7 +41,7 @@ class TFLiteScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
-        
+
         # Only import tflite if file extension matches
         _import_tflite()
         return HAS_TFLITE
@@ -49,7 +56,7 @@ class TFLiteScanner(BaseScanner):
 
         # Ensure tflite is imported
         _import_tflite()
-        
+
         if not HAS_TFLITE:
             result.add_check(
                 name="TFLite Library Check",
@@ -61,6 +68,9 @@ class TFLiteScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        # Type guard: ensure tflite is available
+        assert tflite is not None, "tflite should be available when HAS_TFLITE is True"
 
         try:
             with open(path, "rb") as f:
@@ -126,6 +136,8 @@ class TFLiteScanner(BaseScanner):
                 op = subgraph.Operators(o_index)
                 opcode = model.OperatorCodes(op.OpcodeIndex())
                 builtin = opcode.BuiltinCode()
+                # tflite is guaranteed to be available here due to earlier type guard
+                assert tflite is not None
                 if builtin == tflite.BuiltinOperator.CUSTOM:
                     custom = opcode.CustomCode()
                     name = custom.decode("utf-8", "ignore") if custom else "unknown"

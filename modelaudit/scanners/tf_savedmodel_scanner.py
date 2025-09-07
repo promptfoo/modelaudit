@@ -80,7 +80,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 return False
         else:
             return False
-        
+
         # Only import TensorFlow if file looks like it could be a TF model
         _import_tensorflow()  # Lazy import
         return HAS_TENSORFLOW

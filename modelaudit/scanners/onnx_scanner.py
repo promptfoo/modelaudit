@@ -1,9 +1,15 @@
 import contextlib
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+# Declare global variables for mypy
+HAS_ONNX = False
+np: Optional[Any] = None
+onnx: Optional[Any] = None
+mapping: Optional[Any] = None
 
 
 def _get_onnx_mapping() -> Any:
@@ -23,18 +29,18 @@ def _get_onnx_mapping() -> Any:
 def _import_onnx():
     """Lazy import of ONNX libraries to avoid loading at module level."""
     global HAS_ONNX, np, onnx, mapping
-    if 'HAS_ONNX' not in globals():
+    if "HAS_ONNX" not in globals() or not globals()["HAS_ONNX"]:
         try:
-            import numpy as np_temp
-            import onnx as onnx_temp
-            
-            globals()['np'] = np_temp
-            globals()['onnx'] = onnx_temp
-            globals()['mapping'] = _get_onnx_mapping()
-            globals()['HAS_ONNX'] = True
+            import numpy as np_temp  # type: ignore[import-untyped]
+            import onnx as onnx_temp  # type: ignore[import-untyped]
+
+            globals()["np"] = np_temp
+            globals()["onnx"] = onnx_temp
+            globals()["mapping"] = _get_onnx_mapping()
+            globals()["HAS_ONNX"] = True
         except Exception:
-            globals()['HAS_ONNX'] = False
-            globals()['mapping'] = None
+            globals()["HAS_ONNX"] = False
+            globals()["mapping"] = None
 
 
 class OnnxScanner(BaseScanner):
@@ -52,7 +58,7 @@ class OnnxScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
-        
+
         # Only import ONNX if file extension matches
         _import_onnx()
         return HAS_ONNX
@@ -76,7 +82,7 @@ class OnnxScanner(BaseScanner):
 
         # Ensure ONNX libraries are imported
         _import_onnx()
-        
+
         if not HAS_ONNX:
             result.add_check(
                 name="ONNX Library Check",
@@ -88,6 +94,10 @@ class OnnxScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        # Type guards: ensure ONNX libraries are available
+        assert onnx is not None, "onnx should be available when HAS_ONNX is True"
+        assert np is not None, "numpy should be available when HAS_ONNX is True"
 
         try:
             # Check for interrupts before starting the potentially long-running load
@@ -228,6 +238,8 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during external data processing
             self.check_interrupted()
+            # Type guard for onnx
+            assert onnx is not None
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
@@ -279,6 +291,8 @@ class OnnxScanner(BaseScanner):
         try:
             if mapping is None:
                 return  # Skip if mapping is not available
+            # Type guard for np
+            assert np is not None
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
@@ -322,12 +336,16 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during tensor size validation
             self.check_interrupted()
+            # Type guard for onnx
+            assert onnx is not None
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
                 try:
                     if mapping is None:
                         continue  # Skip if mapping is not available
+                    # Type guard for np
+                    assert np is not None
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:

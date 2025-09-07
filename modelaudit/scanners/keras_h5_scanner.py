@@ -14,16 +14,22 @@ from modelaudit.utils.code_validation import (
 from ..explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+# Declare global variables for mypy
+HAS_H5PY = False
+h5py = None
+
+
 def _import_h5py():
     """Lazy import of h5py library to avoid loading at module level."""
     global HAS_H5PY, h5py
-    if 'HAS_H5PY' not in globals():
+    if "HAS_H5PY" not in globals() or not globals()["HAS_H5PY"]:
         try:
-            import h5py as h5py_temp
-            globals()['h5py'] = h5py_temp
-            globals()['HAS_H5PY'] = True
+            import h5py as h5py_temp  # type: ignore[import-untyped]
+
+            globals()["h5py"] = h5py_temp
+            globals()["HAS_H5PY"] = True
         except ImportError:
-            globals()['HAS_H5PY'] = False
+            globals()["HAS_H5PY"] = False
 
 
 class KerasH5Scanner(BaseScanner):
@@ -60,6 +66,9 @@ class KerasH5Scanner(BaseScanner):
         if not HAS_H5PY:
             return False
 
+        # Type guard: ensure h5py is available
+        assert h5py is not None, "h5py should be available when HAS_H5PY is True"
+
         # Try to open as HDF5 file
         try:
             with h5py.File(path, "r") as _:
@@ -83,7 +92,7 @@ class KerasH5Scanner(BaseScanner):
 
         # Ensure h5py is imported
         _import_h5py()
-        
+
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
@@ -104,6 +113,23 @@ class KerasH5Scanner(BaseScanner):
 
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
+
+        # Ensure h5py is imported
+        _import_h5py()
+        if not HAS_H5PY:
+            result.add_check(
+                name="H5PY Library Check",
+                passed=False,
+                message="h5py package not installed. Install with 'pip install modelaudit[tensorflow]'",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={"required_package": "h5py"},
+            )
+            result.finish(success=False)
+            return result
+
+        # Type guard: ensure h5py is available
+        assert h5py is not None, "h5py should be available when HAS_H5PY is True"
 
         try:
             # Store the file path for use in issue locations
