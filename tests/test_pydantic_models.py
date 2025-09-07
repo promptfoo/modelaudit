@@ -145,8 +145,27 @@ class TestPydanticModels:
         # Create a realistic model
         model = ModelAuditResultModel(
             bytes_scanned=100,
-            issues=[Issue(message="Test issue", severity=IssueSeverity.WARNING, timestamp=time.time(), location=None, why=None, type=None)],
-            checks=[Check(name="Test Check", status=CheckStatus.PASSED, message="Check passed", timestamp=time.time(), severity=None, location=None, why=None)],
+            issues=[
+                Issue(
+                    message="Test issue",
+                    severity=IssueSeverity.WARNING,
+                    timestamp=time.time(),
+                    location=None,
+                    why=None,
+                    type=None,
+                )
+            ],
+            checks=[
+                Check(
+                    name="Test Check",
+                    status=CheckStatus.PASSED,
+                    message="Check passed",
+                    timestamp=time.time(),
+                    severity=None,
+                    location=None,
+                    why=None,
+                )
+            ],
             files_scanned=1,
             assets=[AssetModel(path="test.pkl", type="pickle", size=None, tensors=None, keys=None, contents=None)],
             has_errors=False,
@@ -190,7 +209,15 @@ class TestPydanticModels:
 
     def test_pydantic_v2_features(self):
         """Test Pydantic v2 specific features."""
-        check = Check(name="Test Check", status=CheckStatus.PASSED, message="Test message", timestamp=time.time(), severity=None, location=None, why=None)
+        check = Check(
+            name="Test Check",
+            status=CheckStatus.PASSED,
+            message="Test message",
+            timestamp=time.time(),
+            severity=None,
+            location=None,
+            why=None,
+        )
 
         # Test model_dump() method (v2 syntax)
         data = check.model_dump()
