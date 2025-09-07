@@ -21,13 +21,13 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
-# Create a non-root user
+# Create a non-root user with a proper shell for Docker testing
 ARG UID=10001
 RUN adduser \
     --disabled-password \
     --gecos "" \
     --home "/nonexistent" \
-    --shell "/sbin/nologin" \
+    --shell "/bin/bash" \
     --no-create-home \
     --uid "${UID}" \
     appuser
