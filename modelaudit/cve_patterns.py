@@ -25,7 +25,7 @@ Usage:
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 from .suspicious_symbols import CVE_COMBINED_PATTERNS
 
@@ -43,7 +43,7 @@ class CVEAttribution:
         affected_versions: str,
         remediation: str,
         confidence: float = 1.0,
-        patterns_matched: Optional[list[str]] = None,
+        patterns_matched: list[str] | None = None,
     ):
         self.cve_id = cve_id
         self.description = description
@@ -259,7 +259,7 @@ def _create_cve_2024_34997_attribution(matches: list[str]) -> CVEAttribution:
     )
 
 
-def get_cve_attribution(patterns: list[str], binary_patterns: Optional[list[bytes]] = None) -> list[CVEAttribution]:
+def get_cve_attribution(patterns: list[str], binary_patterns: list[bytes] | None = None) -> list[CVEAttribution]:
     """
     Get CVE attribution for a list of detected patterns.
 
@@ -350,7 +350,7 @@ def get_all_cve_ids() -> list[str]:
     return list(CVE_COMBINED_PATTERNS.keys())
 
 
-def get_cve_info(cve_id: str) -> Optional[dict[str, Any]]:
+def get_cve_info(cve_id: str) -> dict[str, Any] | None:
     """
     Get complete information for a specific CVE.
 

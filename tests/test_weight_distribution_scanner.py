@@ -261,7 +261,7 @@ class TestWeightDistributionScanner:
 
         scanner = WeightDistributionScanner()
 
-        model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])
+        model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])  # type: ignore[call-arg]
         saved_path = tmp_path / "tf_model"
         tf.saved_model.save(model, str(saved_path))
 

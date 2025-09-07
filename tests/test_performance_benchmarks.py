@@ -190,7 +190,7 @@ class TestPerformanceBenchmarks:
         try:
             import os
 
-            import psutil
+            import psutil  # type: ignore[import-untyped]
         except ImportError:
             pytest.skip("psutil not available for memory testing")
 

@@ -1,6 +1,6 @@
 import os
 import re
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -10,7 +10,10 @@ try:
     HAS_DEFUSEDXML = True
 except ImportError:  # pragma: no cover - defusedxml may not be installed
     HAS_DEFUSEDXML = False
-    DefusedET = None
+    if TYPE_CHECKING:
+        from defusedxml import ElementTree as DefusedET  # type: ignore[no-redef]
+    else:
+        DefusedET = None  # type: ignore[assignment]
 
 # Only import unsafe XML as fallback
 if not HAS_DEFUSEDXML:
