@@ -24,23 +24,26 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Try to import TensorFlow, but handle the case where it's not installed
-try:
-    import tensorflow as tf  # noqa: F401
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+# Defer TensorFlow availability check to avoid module-level imports
+HAS_TENSORFLOW: bool | None = None
 
-    HAS_TENSORFLOW = True
-    SavedModelType: type = SavedModel
-except ImportError:
-    HAS_TENSORFLOW = False
+def _check_tensorflow() -> bool:
+    """Check if TensorFlow is available, with caching."""
+    global HAS_TENSORFLOW
+    if HAS_TENSORFLOW is None:
+        try:
+            import tensorflow as tf  # noqa: F401
+            HAS_TENSORFLOW = True
+        except ImportError:
+            HAS_TENSORFLOW = False
+    return HAS_TENSORFLOW
 
-    # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModel:  # type: ignore[no-redef]
-        """Placeholder for SavedModel when TensorFlow is not installed"""
+# Create a placeholder for type hints when TensorFlow is not available
+class SavedModel:  # type: ignore[no-redef]
+    """Placeholder for SavedModel when TensorFlow is not installed"""
+    meta_graphs: ClassVar[list] = []
 
-        meta_graphs: ClassVar[list] = []
-
-    SavedModelType = SavedModel
+SavedModelType = SavedModel
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -58,7 +61,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             return False
 
         if os.path.isfile(path):
@@ -85,7 +88,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.current_file_path = path
 
         # Check if TensorFlow is installed
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             result = self._create_result()
             result.add_check(
                 name="TensorFlow Library Check",

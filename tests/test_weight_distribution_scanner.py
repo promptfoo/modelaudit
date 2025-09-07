@@ -3,35 +3,48 @@ import pickle
 import tempfile
 import zipfile
 
-import numpy as np
 import pytest
 
 from modelaudit.scanners import weight_distribution_scanner
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 
 # Skip tests if required libraries are not available
-try:
-    import torch
+def has_numpy():
+    try:
+        import numpy as np  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+def has_torch():
+    try:
+        import torch  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-try:
-    import h5py
+def has_h5py():
+    try:
+        import h5py  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
+def has_tensorflow():
+    try:
+        import tensorflow as tf  # noqa: F401
+        return True
+    except Exception:
+        return False
 
-try:
-    import tensorflow as tf
+# Use dynamic checks instead of module-level imports
+HAS_NUMPY = has_numpy()
+HAS_TORCH = has_torch()
+HAS_H5PY = has_h5py()
+HAS_TENSORFLOW = has_tensorflow()
 
-    HAS_TENSORFLOW = True
-except Exception:
-    HAS_TENSORFLOW = False
 
-
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")
 class TestWeightDistributionScanner:
     """Test suite for weight distribution anomaly detection"""
 
