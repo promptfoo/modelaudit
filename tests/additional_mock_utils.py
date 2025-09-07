@@ -36,7 +36,7 @@ class FastCryptoMocks:
             mock_hasher = Mock()
             mock_hasher.update = Mock()
             mock_hasher.digest = Mock(return_value=b"fake_digest")
-            
+
             # Generate hex digest of appropriate length
             if algorithm == "blake2b" and digest_size:
                 hex_length = digest_size * 2  # Each byte becomes 2 hex chars
@@ -47,7 +47,7 @@ class FastCryptoMocks:
                 hex_digest = "a" * 32  # 16 bytes = 32 hex chars
             else:
                 hex_digest = "fake_hex_digest"
-            
+
             mock_hasher.hexdigest = Mock(return_value=hex_digest)
             return mock_hasher
 
