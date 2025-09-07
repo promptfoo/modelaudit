@@ -200,7 +200,7 @@ class TestMultiPhaseProgressTracker:
         result = tracker.next_phase("Starting analysis")
         assert result is True
         assert tracker.stats.current_phase == ProgressPhase.ANALYZING  # type: ignore[comparison-overlap]
-        assert tracker.stats.status_message == "Starting analysis"
+        assert tracker.stats.status_message == "Starting analysis"  # type: ignore[unreachable]
 
         # Move to last phase
         result = tracker.next_phase("Final checks")
