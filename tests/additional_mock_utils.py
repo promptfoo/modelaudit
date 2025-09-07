@@ -14,7 +14,7 @@ class FastCryptoMocks:
     """Fast mocks for cryptographic operations that are CPU intensive."""
 
     @staticmethod
-    def fast_hash(data: bytes, algorithm="sha256") -> str:
+    def fast_hash(data: bytes, algorithm: str = "sha256") -> str:
         """Return a fast fake hash without actual computation."""
         # Use first 8 bytes of data + algorithm name to create a deterministic fake hash
         sample = data[:8] + data[-8:] if len(data) > 8 else data

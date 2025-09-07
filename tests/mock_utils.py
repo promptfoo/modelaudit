@@ -8,6 +8,7 @@ network calls, and heavy dependency operations with fast in-memory mocks.
 import io
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 
@@ -46,7 +47,7 @@ class FastFileSystem:
         """Check if path is a directory."""
         return str(Path(path)) in self._dirs
 
-    def stat(self, path: str):
+    def stat(self, path: str) -> Mock:
         """Mock stat result."""
         content = self._files.get(str(Path(path)), b"")
         mock_stat = Mock()
@@ -60,7 +61,7 @@ class FastNetworkMock:
     """Fast network operation mocks."""
 
     @staticmethod
-    def mock_requests_get(url: str, **kwargs) -> Mock:
+    def mock_requests_get(url: str, **kwargs: Any) -> Mock:
         """Mock requests.get with instant response."""
         response = Mock()
         response.status_code = 200
@@ -72,7 +73,7 @@ class FastNetworkMock:
         return response
 
     @staticmethod
-    def mock_download(url: str, path: str, **kwargs) -> Path:
+    def mock_download(url: str, path: str, **kwargs: Any) -> Path:
         """Mock file download operation."""
         # Just return the target path without actually downloading
         return Path(path)
@@ -114,7 +115,7 @@ class FastScannerMocks:
     @staticmethod
     def create_scan_result(
         issues: list | None = None, files_scanned: int = 1, bytes_scanned: int = 1024, success: bool = True
-    ):
+    ) -> Mock:
         """Create a mock scan result."""
         result = Mock()
         result.issues = issues or []
@@ -314,7 +315,7 @@ def setup_fast_test_environment():
             for p in reversed(self.patches):
                 p.stop()
 
-        def add_file(self, path: str, content: str | bytes):
+        def add_file(self, path: str, content: str | bytes) -> None:
             """Add a file to the mock filesystem."""
             self.filesystem.add_file(path, content)
 

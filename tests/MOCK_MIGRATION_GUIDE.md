@@ -11,15 +11,15 @@ The fastest way to speed up tests is to use the provided fixtures:
 def test_scanner(tmp_path):
     model_file = tmp_path / "model.pkl"
     model_file.write_bytes(pickle.dumps({"data": "test"}))
-    
+
     scanner = MyScanner()
     result = scanner.scan(str(model_file))
     assert result.success
 
-# After: Fast test with mocked I/O  
+# After: Fast test with mocked I/O
 def test_scanner(fast_file_operations):
     fast_file_operations.add_file('/tmp/model.pkl', pickle.dumps({"data": "test"}))
-    
+
     scanner = MyScanner()
     result = scanner.scan('/tmp/model.pkl')
     assert result.success
@@ -36,7 +36,7 @@ def test_scanner(fast_file_operations):
 - `mock_subprocess` - Mock subprocess calls
 - `fast_network_calls` - Mock all network requests
 
-### ML-Specific Fixtures  
+### ML-Specific Fixtures
 
 - `mock_heavy_ml_libs` - Mock PyTorch, TensorFlow, NumPy, etc.
 - `fast_scanner_result` - Pre-built mock scanner results
@@ -57,18 +57,18 @@ def test_scanner(fast_file_operations):
 ```python
 # BEFORE: Real file operations
 def test_pickle_scanning(tmp_path):
-    pickle_file = tmp_path / "test.pkl" 
+    pickle_file = tmp_path / "test.pkl"
     with open(pickle_file, 'wb') as f:
         pickle.dump(malicious_data, f)
-    
+
     scanner = PickleScanner()
     result = scanner.scan(str(pickle_file))
 
 # AFTER: Fast mocked file operations
 def test_pickle_scanning(fast_file_operations):
     fast_file_operations.add_file('/tmp/test.pkl', pickle.dumps(malicious_data))
-    
-    scanner = PickleScanner() 
+
+    scanner = PickleScanner()
     result = scanner.scan('/tmp/test.pkl')
 ```
 
@@ -82,10 +82,10 @@ def test_download(mock_get):
     mock_response.status_code = 200
     mock_response.content = b'model data'
     mock_get.return_value = mock_response
-    
+
     result = download_model('https://example.com/model.pt')
 
-# AFTER: Fast network mocking 
+# AFTER: Fast network mocking
 def test_download(fast_network_calls):
     # Network calls are automatically mocked with sensible defaults
     result = download_model('https://example.com/model.pt')
@@ -121,7 +121,7 @@ def test_timeout_handling():
 
 # AFTER: No delays
 def test_timeout_handling(no_sleep):
-    start = time.time() 
+    start = time.time()
     with pytest.raises(TimeoutError):
         slow_operation(timeout=0.1)
     # Test completes instantly
@@ -161,7 +161,7 @@ def test_zip_scanning(fast_compression):
         files = zf.namelist()  # Instant, returns mock file list
 ```
 
-### 7. Cache Operations  
+### 7. Cache Operations
 
 ```python
 # BEFORE: Real cache with potential I/O
@@ -190,14 +190,14 @@ def test_complex_workflow(ultra_fast_env):
     with ultra_fast_env as env:
         # ALL operations are now ultra-fast:
         # - File I/O uses in-memory filesystem
-        # - Network calls return instant responses  
+        # - Network calls return instant responses
         # - ML library imports are mocked
         # - Crypto operations are instant
         # - Compression operations are mocked
         # - Logging is disabled
         # - time.sleep is disabled
         # - Subprocess calls are mocked
-        
+
         env.add_file('/tmp/model.pkl', b'model data')
         result = complex_model_processing_workflow('/tmp/model.pkl')
         assert result.success
@@ -221,12 +221,14 @@ def test_standard_workflow():
 Expected speedups with the new mocking:
 
 ### Core Operations
+
 - **File I/O**: 5-50x faster (depends on file size)
-- **Network calls**: 100-1000x faster  
+- **Network calls**: 100-1000x faster
 - **ML library imports**: 10-100x faster
 - **Time-based operations**: Instant vs real delays
 
-### Specialized Operations  
+### Specialized Operations
+
 - **Cryptographic hashing**: 50-500x faster (depends on data size)
 - **Compression operations**: 20-100x faster (no real compression/decompression)
 - **Cache operations**: 10-50x faster (in-memory vs disk-based)
@@ -234,6 +236,7 @@ Expected speedups with the new mocking:
 - **Serialization**: 10-100x faster (mocked vs real JSON/YAML parsing)
 
 ### Combined Impact
+
 - **Individual tests**: 2-50x faster (depending on operations used)
 - **Overall test suite**: 3-15x faster (compound effect)
 - **CI/CD pipelines**: 2-10x faster (reduced I/O wait times)
@@ -243,7 +246,7 @@ Expected speedups with the new mocking:
 ### Use the Right Fixture
 
 - `fast_file_operations` - For tests with file I/O
-- `mock_heavy_ml_libs` - For tests importing ML libraries  
+- `mock_heavy_ml_libs` - For tests importing ML libraries
 - `fast_network_calls` - For tests with HTTP requests
 - `fast_test_env` - For integration tests needing everything
 
@@ -281,7 +284,7 @@ def test_real_file_behavior(tmp_path):
     # Use real file operations for integration testing
     pass
 
-@pytest.mark.unit  # Use fast mocking for unit tests  
+@pytest.mark.unit  # Use fast mocking for unit tests
 def test_scanner_logic(fast_file_operations):
     # Use mocked operations for fast unit testing
     pass
@@ -297,7 +300,7 @@ rye run pytest tests/test_my_module.py --durations=0
 
 # Migrate tests using this guide
 
-# Measure after migration  
+# Measure after migration
 rye run pytest tests/test_my_module.py --durations=0
 
 # Compare results - should see significant speedup
@@ -313,7 +316,7 @@ Make sure fixture is used correctly:
 # WRONG: Fixture not used
 def test_something():
     fast_filesystem = FastFileSystem()  # Won't affect test
-    
+
 # RIGHT: Fixture injected
 def test_something(fast_filesystem):
     # Fixture is active during test
@@ -340,7 +343,7 @@ def test_file_stats(tmp_path):
     file_path.write_text("content")
     stat = file_path.stat()
     assert stat.st_size == 7  # Real stat
-    
+
 # Solution: Use real files for tests that need real stat behavior
 # Or mock stat() to return expected values
 ```
