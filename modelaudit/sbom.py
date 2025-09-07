@@ -1,6 +1,7 @@
 import hashlib
 import os
 from collections.abc import Iterable
+from importlib.metadata import version as _pkg_version
 from typing import Any, Optional, Union
 
 from cyclonedx.model import HashType, Property
@@ -11,6 +12,8 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from .models import FileMetadataModel, ModelAuditResultModel
 from .scanners.base import Issue, IssueSeverity
+
+SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 
 
 def _file_sha256(path: str) -> str:
@@ -165,7 +168,7 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     # Security and compliance properties
     props.append(Property(name="security:scanned", value="true"))
     props.append(Property(name="security:scanner", value="ModelAudit"))
-    props.append(Property(name="security:scanner_version", value="v0.2.4"))
+    props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     return props
 
@@ -309,7 +312,7 @@ def _component_for_file(
     # Security and compliance properties (added for all files)
     props.append(Property(name="security:scanned", value="true"))
     props.append(Property(name="security:scanner", value="ModelAudit"))
-    props.append(Property(name="security:scanner_version", value="v0.2.4"))
+    props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
