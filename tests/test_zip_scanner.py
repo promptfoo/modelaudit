@@ -235,6 +235,7 @@ class TestZipScanner:
                     current_path = tmp.name
 
             # Scan the outermost zip
+            assert current_path is not None  # Should be set by the loop above
             scanner = ZipScanner(config={"max_zip_depth": 3})
             result = scanner.scan(current_path)
 

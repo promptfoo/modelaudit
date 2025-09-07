@@ -181,7 +181,8 @@ def test_flax_msgpack_enhanced_jax_support(safe_tmp_path):
     assert result.success
     # Should detect transformer architecture
     assert result.metadata.get("model_architecture") == "transformer"
-    assert result.metadata.get("estimated_parameters") > 0
+    estimated_params = result.metadata.get("estimated_parameters")
+    assert estimated_params is not None and estimated_params > 0
 
     # Should detect optimizer state
     jax_metadata = result.metadata.get("jax_metadata", {})

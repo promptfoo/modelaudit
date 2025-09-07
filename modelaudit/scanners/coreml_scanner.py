@@ -8,7 +8,7 @@ def _import_coreml():
     global HAS_COREML, Model_pb2
     if 'HAS_COREML' not in globals():
         try:  # pragma: no cover - optional dependency
-            from coremltools.proto import Model_pb2 as Model_pb2_temp
+            from coremltools.proto import Model_pb2 as Model_pb2_temp  # type: ignore[possibly-unbound-import]
             globals()['Model_pb2'] = Model_pb2_temp
             globals()['HAS_COREML'] = True
         except Exception:  # pragma: no cover - optional dependency

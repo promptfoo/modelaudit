@@ -91,7 +91,7 @@ def test_pytorch_binary_scanner_executable_signatures_at_start(safe_tmp_path):
     # Should find the Windows executable at offset 0
     found_pe = False
     for issue in result.issues:
-        if "Windows executable" in issue.message and "(offset: 0)" in issue.location:
+        if "Windows executable" in issue.message and issue.location is not None and "(offset: 0)" in issue.location:
             found_pe = True
 
     assert found_pe, "Should detect Windows executable at offset 0"

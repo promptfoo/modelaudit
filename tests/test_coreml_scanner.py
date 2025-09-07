@@ -5,7 +5,7 @@ from modelaudit.scanners.coreml_scanner import CoreMLScanner
 
 pytest.importorskip("coremltools")
 
-from coremltools.proto import Model_pb2
+from coremltools.proto import Model_pb2  # type: ignore[possibly-unbound-import]
 
 
 def create_coreml_model(safe_tmp_path, *, custom=False):

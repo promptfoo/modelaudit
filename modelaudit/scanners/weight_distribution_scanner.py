@@ -409,12 +409,12 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, np.ndarray] = {}
 
         try:
-            model = onnx.load(path)
+            model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
 
             # Extract initializers (weights)
             for initializer in model.graph.initializer:
                 if "weight" in initializer.name.lower():
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(
+                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )
 
@@ -438,7 +438,7 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, np.ndarray] = {}
 
         try:
-            with safe_open(path, framework="numpy") as f:
+            with safe_open(path, framework="numpy") as f:  # type: ignore[possibly-unresolved-reference]
                 for key in f:
                     if "weight" in key.lower():
                         weights_info[key] = f.get_tensor(key)

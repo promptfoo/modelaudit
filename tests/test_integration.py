@@ -279,7 +279,7 @@ def test_tensorflow_savedmodel_integration(safe_tmp_path):
     # Create a simple TensorFlow model with some weights that might trigger analysis
     model = tf.keras.Sequential(
         [
-            tf.keras.layers.Dense(64, activation="relu", input_shape=(10,)),
+            tf.keras.layers.Dense(64, activation="relu", input_shape=(10,)),  # type: ignore[call-arg]
             tf.keras.layers.Dense(32, activation="relu"),
             tf.keras.layers.Dense(1, activation="sigmoid"),
         ]
@@ -360,7 +360,7 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(safe_tmp_path)
     # Create a model with potentially anomalous weights
     model = tf.keras.Sequential(
         [
-            tf.keras.layers.Dense(10, input_shape=(5,), name="anomalous_layer"),
+            tf.keras.layers.Dense(10, input_shape=(5,), name="anomalous_layer"),  # type: ignore[call-arg]
             tf.keras.layers.Dense(1, activation="sigmoid", name="output_layer"),
         ]
     )

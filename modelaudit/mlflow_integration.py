@@ -60,12 +60,12 @@ def scan_mlflow_model(
         raise ImportError("mlflow is not installed, cannot scan MLflow models") from e
 
     if registry_uri:
-        mlflow.set_registry_uri(registry_uri)
+        mlflow.set_registry_uri(registry_uri)  # type: ignore[possibly-unbound-attribute]
 
     tmp_dir = tempfile.mkdtemp(prefix="modelaudit_mlflow_")
     try:
         logger.debug(f"Downloading MLflow model {model_uri} to {tmp_dir}")
-        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)
+        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)  # type: ignore[possibly-unbound-attribute]
         # mlflow may return a file within tmp_dir; ensure directory path
         download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
         # Ensure cache configuration is passed through from kwargs

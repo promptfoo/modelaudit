@@ -104,7 +104,8 @@ class TestJaxFlaxIntegration:
 
         # Architecture should be detected
         assert result.metadata.get("model_architecture") == "transformer"
-        assert result.metadata.get("estimated_parameters") > 300000
+        estimated_params = result.metadata.get("estimated_parameters")
+        assert estimated_params is not None and estimated_params > 300000
 
     def test_malicious_jax_model_detection(self, safe_tmp_path):
         """Test that malicious JAX models trigger security warnings."""
@@ -175,7 +176,8 @@ class TestJaxFlaxIntegration:
         # Large embedding model may be detected as transformer due to size
         assert result.metadata.get("model_architecture") in ["embedding", "transformer"]
         # With smaller synthetic data, still ensure parameter estimation is non-trivial
-        assert result.metadata.get("estimated_parameters") > 1000000
+        estimated_params = result.metadata.get("estimated_parameters")
+        assert estimated_params is not None and estimated_params > 1000000
 
     def test_clean_orbax_checkpoint(self, safe_tmp_path):
         """Test scanning of clean Orbax checkpoint directories."""

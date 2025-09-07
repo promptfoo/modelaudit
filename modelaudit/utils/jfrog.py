@@ -121,7 +121,7 @@ def download_artifact(
 
         return dest_path
 
-    except requests.exceptions.HTTPError as e:
+    except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
         if cache_dir is None and temp_dir.exists():
             shutil.rmtree(temp_dir)
         if e.response.status_code == 401:
@@ -134,7 +134,7 @@ def download_artifact(
             raise Exception(f"Artifact not found at {url}") from e
 
         raise Exception(f"HTTP error {e.response.status_code} downloading from {url}: {e}") from e
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
         if cache_dir is None and temp_dir.exists():
             shutil.rmtree(temp_dir)
         raise Exception(f"Network error downloading from {url}: {e}") from e
