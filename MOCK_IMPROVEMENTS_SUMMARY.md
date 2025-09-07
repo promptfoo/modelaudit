@@ -2,7 +2,8 @@
 
 ## Overview
 
-I've created a comprehensive mocking system to significantly speed up your test suite by replacing slow operations with fast in-memory alternatives.
+I've created a comprehensive mocking system to significantly speed up your test
+suite by replacing slow operations with fast in-memory alternatives.
 
 ## What Was Created
 
@@ -207,4 +208,5 @@ def test_dill_lambda_function_fast(self, mock_heavy_ml_libs, fast_file_operation
 
 4. **Iterate**: Gradually apply mocking to more tests as needed
 
-The mocking system is designed to provide significant performance improvements while maintaining test correctness and being easy to adopt incrementally.
+The mocking system is designed to provide significant performance improvements
+while maintaining test correctness and being easy to adopt incrementally.
