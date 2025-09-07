@@ -27,15 +27,25 @@ def _get_onnx_mapping() -> Any:
     return None
 
 
-try:
-    import numpy as np
-    import onnx
+# Defer ONNX availability check to avoid module-level imports
+HAS_ONNX: bool | None = None
+mapping = None
 
-    mapping = _get_onnx_mapping()
-    HAS_ONNX = True
-except Exception:
-    HAS_ONNX = False
-    mapping = None
+
+def _check_onnx() -> bool:
+    """Check if ONNX is available, with caching."""
+    global HAS_ONNX, mapping
+    if HAS_ONNX is None:
+        try:
+            import numpy as np  # noqa: F401
+            import onnx  # noqa: F401
+
+            mapping = _get_onnx_mapping()
+            HAS_ONNX = True
+        except Exception:
+            HAS_ONNX = False
+            mapping = None
+    return HAS_ONNX
 
 
 class OnnxScanner(BaseScanner):
@@ -47,7 +57,7 @@ class OnnxScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_ONNX:
+        if not _check_onnx():
             return False
         if not os.path.isfile(path):
             return False
@@ -70,7 +80,7 @@ class OnnxScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
-        if not HAS_ONNX:
+        if not _check_onnx():
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
@@ -83,6 +93,8 @@ class OnnxScanner(BaseScanner):
             return result
 
         try:
+            import onnx
+
             # Check for interrupts before starting the potentially long-running load
             self.check_interrupted()
             model = onnx.load(path, load_external_data=False)
@@ -221,6 +233,8 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during external data processing
             self.check_interrupted()
+            import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
@@ -270,6 +284,8 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
+            import numpy as np
+
             if mapping is None:
                 return  # Skip if mapping is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
@@ -315,10 +331,14 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during tensor size validation
             self.check_interrupted()
+            import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
                 try:
+                    import numpy as np
+
                     if mapping is None:
                         continue  # Skip if mapping is not available
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
