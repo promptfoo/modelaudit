@@ -21,7 +21,7 @@ class CacheConfiguration:
         self._small_file_extensions = {".txt", ".md", ".json", ".yaml", ".yml"}
         self._large_file_extensions = {".bin", ".pkl", ".h5", ".onnx", ".pb", ".pth", ".pt"}
 
-    @functools.lru_cache(maxsize=128)
+    @functools.lru_cache(maxsize=128)  # noqa: B019
     def should_cache_file(self, file_size: int, file_ext: str = "") -> bool:
         """
         Cached decision about whether to cache a specific file.
@@ -40,12 +40,9 @@ class CacheConfiguration:
             return False
 
         # Small text files - usually not worth caching
-        if file_ext.lower() in self._small_file_extensions and file_size < 10 * 1024:  # 10KB
-            return False
+        return not (file_ext.lower() in self._small_file_extensions and file_size < 10 * 1024)  # 10KB
 
-        return True
-
-    @functools.lru_cache(maxsize=64)
+    @functools.lru_cache(maxsize=64)  # noqa: B019
     def get_cache_strategy(self, file_size: int, file_ext: str = "") -> str:
         """
         Get optimal caching strategy for a file.

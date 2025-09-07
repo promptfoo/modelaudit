@@ -117,11 +117,8 @@ class SmartCacheKeyGenerator:
             return False
 
         # Large files: content hash (caching provides significant benefit)
-        if file_size > self.CONTENT_HASH_THRESHOLD:
-            return True
-
         # Medium files: quick key (balance between accuracy and performance)
-        return False
+        return file_size > self.CONTENT_HASH_THRESHOLD
 
     def _cleanup_fingerprint_cache(self, current_time: float) -> None:
         """Remove expired fingerprint cache entries."""

@@ -42,7 +42,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     else:
         result.end_time = time.time()
     result.metadata.update(result_dict.get("metadata", {}))
-    
+
     # Restore bytes_scanned from cache
     result.bytes_scanned = result_dict.get("bytes_scanned", 0)
     result.success = result_dict.get("success", True)

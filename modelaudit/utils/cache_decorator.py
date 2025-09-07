@@ -42,7 +42,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
     def decorator(func: F) -> F:
         # Initialize optimized config extractor once
         config_extractor = get_config_extractor()
-        
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Use optimized configuration extraction
@@ -57,16 +57,16 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             if not file_path:
                 logger.debug("No file path found, calling function directly")
                 return func(*args, **kwargs)
-            
+
             # Check if file should be cached based on characteristics
             try:
                 file_stat = os.stat(file_path)
                 file_ext = os.path.splitext(file_path)[1]
-                
+
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
                     return func(*args, **kwargs)
-                    
+
             except OSError:
                 # File doesn't exist or can't be accessed, call function directly
                 logger.debug(f"Cannot access {file_path}, calling function directly")
@@ -94,10 +94,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 # Use optimized cache lookup with stat reuse
                 logger.debug(f"Attempting cached scan for {file_path}")
-                
+
                 # Try cache first with optimized lookup
                 cached_result = cache_manager.get_cached_result_with_stat(file_path, file_stat)
-                
+
                 if cached_result is not None:
                     logger.debug(f"Cache hit for {os.path.basename(file_path)}")
                     result_dict = cached_result
