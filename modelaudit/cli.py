@@ -1185,7 +1185,7 @@ def scan_command(
                         # Filter out DEBUG severity issues when not in verbose mode
                         # scan_results is ModelAuditResultModel
                         # Ensure result_issues is iterable (defensive check for tests)
-                        issues_list = list(result_issues) if hasattr(result_issues, '__iter__') else []
+                        issues_list = list(result_issues) if hasattr(result_issues, "__iter__") else []
                         visible_issues = [
                             issue for issue in issues_list if verbose or issue.severity != IssueSeverity.DEBUG
                         ]
