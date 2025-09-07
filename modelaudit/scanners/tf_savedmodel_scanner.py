@@ -143,7 +143,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         try:
             # Import the actual SavedModel from TensorFlow
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
-            
+
             with open(path, "rb") as f:
                 content = f.read()
                 result.bytes_scanned = len(content)
