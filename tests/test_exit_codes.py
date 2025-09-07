@@ -14,8 +14,8 @@ rebuild_models()
 
 def _create_result_model(**kwargs: Any) -> ModelAuditResultModel:
     """Helper function to create ModelAuditResultModel with sensible defaults."""
-    from typing import Any, cast
-    
+    from typing import Any
+
     defaults: dict[str, Any] = {
         "bytes_scanned": 100,
         "issues": [],
