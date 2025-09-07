@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from pydantic import HttpUrl
+
 from modelaudit.license_checker import (
     CopyrightInfo,
     LicenseInfo,
@@ -596,7 +598,7 @@ class TestEdgeCases:
             source="test",
             confidence=0.9,
             text="License text",
-            url="https://opensource.org/licenses/MIT",
+            url=HttpUrl("https://opensource.org/licenses/MIT"),
         )
 
         assert license_info.spdx_id == "MIT"

@@ -21,6 +21,7 @@ from modelaudit.progress.hooks import (
     ProgressHookManager,
 )
 from modelaudit.progress.multi_phase import MultiPhaseProgressTracker
+from modelaudit.scanners.base import BaseScanner, ScanResult
 
 
 class TestProgressStats:
@@ -198,7 +199,7 @@ class TestMultiPhaseProgressTracker:
         # Move to next phase
         result = tracker.next_phase("Starting analysis")
         assert result is True
-        assert tracker.stats.current_phase == ProgressPhase.ANALYZING
+        assert tracker.stats.current_phase == ProgressPhase.ANALYZING  # type: ignore[comparison-overlap]
         assert tracker.stats.status_message == "Starting analysis"
 
         # Move to last phase
@@ -430,7 +431,6 @@ class TestProgressIntegration:
 
     def test_progress_with_mock_scanner(self):
         """Test progress tracking with a mock scanner."""
-        from modelaudit.scanners.base import BaseScanner
 
         class MockScanner(BaseScanner):
             name = "mock"

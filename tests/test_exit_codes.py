@@ -43,7 +43,14 @@ def test_exit_code_clean_scan_with_debug_issues():
     """Test exit code 0 for scan with only debug issues."""
     results = _create_result_model(
         issues=[
-            Issue(message="Debug info", severity=IssueSeverity.DEBUG, location="test.pkl", timestamp=0.0, why=None, type=None),
+            Issue(
+                message="Debug info",
+                severity=IssueSeverity.DEBUG,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
         ]
     )
     assert determine_exit_code(results) == 0
@@ -53,7 +60,14 @@ def test_exit_code_security_issues():
     """Test exit code 1 for security issues found."""
     results = _create_result_model(
         issues=[
-            Issue(message="Suspicious operation", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0, why=None, type=None),
+            Issue(
+                message="Suspicious operation",
+                severity=IssueSeverity.WARNING,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
         ]
     )
     assert determine_exit_code(results) == 1
@@ -117,7 +131,14 @@ def test_exit_code_mixed_severity():
     """Test with mixed severity levels (no operational errors)."""
     results = _create_result_model(
         issues=[
-            Issue(message="Debug info", severity=IssueSeverity.DEBUG, location="test.pkl", timestamp=0.0, why=None, type=None),
+            Issue(
+                message="Debug info",
+                severity=IssueSeverity.DEBUG,
+                location="test.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
             Issue(message="Info message", severity=IssueSeverity.INFO, location="test.pkl", timestamp=0.0),
             Issue(
                 message="Warning about something", severity=IssueSeverity.WARNING, location="test.pkl", timestamp=0.0

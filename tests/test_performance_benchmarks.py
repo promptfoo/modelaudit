@@ -396,5 +396,3 @@ class TestPerformanceBenchmarks:
         output_path = Path(output_file)
         with open(output_path, "w") as f:
             json.dump(benchmark_results, f, indent=2)
-
-        return benchmark_results
