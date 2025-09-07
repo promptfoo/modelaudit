@@ -96,8 +96,16 @@ class OnnxScanner(BaseScanner):
             return result
 
         # Type guards: ensure ONNX libraries are available
-        assert onnx is not None, "onnx should be available when HAS_ONNX is True"
-        assert np is not None, "numpy should be available when HAS_ONNX is True"
+        if onnx is None or np is None:
+            result.add_check(
+                name="ONNX Library State Check",
+                passed=False,
+                message="ONNX libraries not properly initialized",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            result.finish(success=False)
+            return result
 
         try:
             # Check for interrupts before starting the potentially long-running load
@@ -239,8 +247,7 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts during external data processing
             self.check_interrupted()
             # Type guard for onnx
-            assert onnx is not None
-            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+            if onnx is not None and tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if location is None:
@@ -289,10 +296,8 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
-            if mapping is None:
-                return  # Skip if mapping is not available
-            # Type guard for np
-            assert np is not None
+            if mapping is None or np is None:
+                return  # Skip if mapping or numpy is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
@@ -337,7 +342,8 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts during tensor size validation
             self.check_interrupted()
             # Type guard for onnx
-            assert onnx is not None
+            if onnx is None:
+                continue
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
@@ -345,7 +351,8 @@ class OnnxScanner(BaseScanner):
                     if mapping is None:
                         continue  # Skip if mapping is not available
                     # Type guard for np
-                    assert np is not None
+                    if np is None:
+                        continue
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:

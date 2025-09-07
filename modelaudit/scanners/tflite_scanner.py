@@ -70,8 +70,19 @@ class TFLiteScanner(BaseScanner):
             return result
 
         # Type guard: ensure tflite is available
-        assert tflite is not None, "tflite should be available when HAS_TFLITE is True"
+        if tflite is None:
+            result.add_check(
+                name="TFLite Library State Check",
+                passed=False,
+                message="TFLite library not properly initialized",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            result.finish(success=False)
+            return result
 
+        # At this point, tflite is guaranteed to be available
+        assert tflite is not None  # type: ignore[unreachable]
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -137,8 +148,7 @@ class TFLiteScanner(BaseScanner):
                 opcode = model.OperatorCodes(op.OpcodeIndex())
                 builtin = opcode.BuiltinCode()
                 # tflite is guaranteed to be available here due to earlier type guard
-                assert tflite is not None
-                if builtin == tflite.BuiltinOperator.CUSTOM:
+                if tflite is not None and builtin == tflite.BuiltinOperator.CUSTOM:
                     custom = opcode.CustomCode()
                     name = custom.decode("utf-8", "ignore") if custom else "unknown"
                     result.add_check(

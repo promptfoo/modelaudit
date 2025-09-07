@@ -69,8 +69,19 @@ class CoreMLScanner(BaseScanner):
             return result
 
         # Type guard: ensure Model_pb2 is available
-        assert Model_pb2 is not None, "Model_pb2 should be available when HAS_COREML is True"
+        if Model_pb2 is None:
+            result.add_check(
+                name="CoreML Library State Check",
+                passed=False,
+                message="CoreML library not properly initialized",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            result.finish(success=False)
+            return result
 
+        # At this point, Model_pb2 is guaranteed to be available
+        assert Model_pb2 is not None  # type: ignore[unreachable]
         try:
             with open(path, "rb") as f:
                 data = f.read()

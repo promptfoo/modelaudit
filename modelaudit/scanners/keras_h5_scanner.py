@@ -67,9 +67,11 @@ class KerasH5Scanner(BaseScanner):
             return False
 
         # Type guard: ensure h5py is available
-        assert h5py is not None, "h5py should be available when HAS_H5PY is True"
+        if h5py is None:
+            return False
 
         # Try to open as HDF5 file
+        assert h5py is not None  # type: ignore[unreachable]
         try:
             with h5py.File(path, "r") as _:
                 return True
@@ -116,8 +118,8 @@ class KerasH5Scanner(BaseScanner):
 
         # Ensure h5py is imported
         _import_h5py()
-        if not HAS_H5PY:
-            result.add_check(
+        if not HAS_H5PY:  # type: ignore[unreachable]
+            result.add_check(  # type: ignore[unreachable]
                 name="H5PY Library Check",
                 passed=False,
                 message="h5py package not installed. Install with 'pip install modelaudit[tensorflow]'",
@@ -129,8 +131,19 @@ class KerasH5Scanner(BaseScanner):
             return result
 
         # Type guard: ensure h5py is available
-        assert h5py is not None, "h5py should be available when HAS_H5PY is True"
+        if h5py is None:
+            result.add_check(
+                name="H5PY Library State Check",
+                passed=False,
+                message="H5PY library not properly initialized",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            result.finish(success=False)
+            return result
 
+        # At this point, h5py is guaranteed to be available
+        assert h5py is not None  # type: ignore[unreachable]
         try:
             # Store the file path for use in issue locations
             self.current_file_path = path
