@@ -186,7 +186,7 @@ class TestAdvancedFileHandler:
 
         mock_scanner = MagicMock()
         mock_scanner.name = "test_scanner"
-        mock_scanner.__class__ = BaseScanner  # type: ignore[misc]
+        mock_scanner.__class__ = BaseScanner  # type: ignore[assignment]
 
         handler = AdvancedFileHandler("model.bin", mock_scanner)
         assert handler.is_sharded
