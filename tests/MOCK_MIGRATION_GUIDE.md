@@ -347,4 +347,3 @@ def test_file_stats(tmp_path):
 # Solution: Use real files for tests that need real stat behavior
 # Or mock stat() to return expected values
 ```
-

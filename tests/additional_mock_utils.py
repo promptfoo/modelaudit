@@ -32,16 +32,31 @@ class FastCryptoMocks:
     def mock_hashlib():
         """Mock hashlib operations for speed."""
 
-        def mock_hash_new(algorithm):
+        def mock_hash_new(algorithm, digest_size=None):
             mock_hasher = Mock()
             mock_hasher.update = Mock()
             mock_hasher.digest = Mock(return_value=b"fake_digest")
-            mock_hasher.hexdigest = Mock(return_value="fake_hex_digest")
+            
+            # Generate hex digest of appropriate length
+            if algorithm == "blake2b" and digest_size:
+                hex_length = digest_size * 2  # Each byte becomes 2 hex chars
+                hex_digest = "a" * hex_length  # Simple deterministic hex string
+            elif algorithm == "sha256":
+                hex_digest = "a" * 64  # 32 bytes = 64 hex chars
+            elif algorithm == "md5":
+                hex_digest = "a" * 32  # 16 bytes = 32 hex chars
+            else:
+                hex_digest = "fake_hex_digest"
+            
+            mock_hasher.hexdigest = Mock(return_value=hex_digest)
             return mock_hasher
+
+        def blake2b_factory(data=b"", digest_size=32):
+            return mock_hash_new("blake2b", digest_size)
 
         return {
             "sha256": Mock(side_effect=lambda: mock_hash_new("sha256")),
-            "blake2b": Mock(side_effect=lambda data=b"", digest_size=32: mock_hash_new("blake2b")),
+            "blake2b": Mock(side_effect=blake2b_factory),
             "md5": Mock(side_effect=lambda: mock_hash_new("md5")),
             "new": Mock(side_effect=mock_hash_new),
         }

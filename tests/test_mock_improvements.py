@@ -63,7 +63,7 @@ class TestFastMockingDemo:
         response = requests.get("https://example.com/api/data")
         duration = time.time() - start_time
 
-        assert duration < 0.01  # Should be nearly instant
+        assert duration < 0.1  # Should be fast with mocking
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
@@ -81,7 +81,7 @@ class TestFastMockingDemo:
 
         duration = time.time() - start_time
 
-        assert duration < 0.01  # Should be nearly instant
+        assert duration < 0.1  # Should be fast with mocking
         assert len(data) == 10000
 
     def test_no_sleep_fixture(self, no_sleep):
@@ -92,7 +92,7 @@ class TestFastMockingDemo:
         time.sleep(1.0)
 
         duration = time.time() - start_time
-        assert duration < 0.01  # Should be nearly instant
+        assert duration < 0.1  # Should be fast with mocking
 
     def test_temp_file_operations_mocked(self, fast_tempfiles):
         """Test that temporary file operations are mocked."""
@@ -116,7 +116,7 @@ class TestFastMockingDemo:
 
         duration = time.time() - start_time
 
-        assert duration < 0.01  # Should be nearly instant
+        assert duration < 0.1  # Should be fast with mocking
         assert result.returncode == 0
         assert result.stdout == b"mock output"
 

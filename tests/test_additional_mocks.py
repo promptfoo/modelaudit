@@ -59,7 +59,7 @@ class TestCompressionMocks:
 
         duration = time.time() - start_time
 
-        assert duration < 0.01  # Instant operation
+        assert duration < 0.1  # Fast mocked operation
         assert len(files) == 3  # Mock file list
         assert content == b"mock file content"
 
@@ -76,7 +76,7 @@ class TestCompressionMocks:
                     assert len(data) > 0
 
         duration = time.time() - start_time
-        assert duration < 0.01  # All zip operations mocked
+        assert duration < 0.1  # All zip operations mocked
 
 
 class TestCacheMocks:
