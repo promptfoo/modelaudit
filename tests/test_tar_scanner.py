@@ -57,13 +57,13 @@ class TestTarScanner:
                 readme_info = tarfile.TarInfo("readme.txt")
                 readme_content = b"This is a readme file"
                 readme_info.size = len(readme_content)
-                t.addfile(readme_info, tarfile.io.BytesIO(readme_content))
+                t.addfile(readme_info, tarfile.io.BytesIO(readme_content))  # type: ignore[attr-defined]
 
                 # Add another file
                 data_info = tarfile.TarInfo("data.json")
                 data_content = b'{"key": "value"}'
                 data_info.size = len(data_content)
-                t.addfile(data_info, tarfile.io.BytesIO(data_content))
+                t.addfile(data_info, tarfile.io.BytesIO(data_content))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:
@@ -88,7 +88,7 @@ class TestTarScanner:
                 info = tarfile.TarInfo("../../evil.txt")
                 content = b"malicious content"
                 info.size = len(content)
-                t.addfile(info, tarfile.io.BytesIO(content))
+                t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:
@@ -144,7 +144,7 @@ class TestTarScanner:
                 info = tarfile.TarInfo("inner.txt")
                 content = b"Inner content"
                 info.size = len(content)
-                inner_tar.addfile(info, tarfile.io.BytesIO(content))
+                inner_tar.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             inner_path = inner_tmp.name
 
         # Create outer tar containing inner tar
@@ -176,7 +176,7 @@ class TestTarScanner:
                         # Innermost tar
                         info = tarfile.TarInfo("deep.txt")
                         info.size = len(content)
-                        t.addfile(info, tarfile.io.BytesIO(content))
+                        t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
                     else:
                         # Add previous tar
                         t.add(tar_paths[-1], f"level{i}.tar")
@@ -202,7 +202,7 @@ class TestTarScanner:
                     info = tarfile.TarInfo(f"file{i}.txt")
                     content = f"Content {i}".encode()
                     info.size = len(content)
-                    t.addfile(info, tarfile.io.BytesIO(content))
+                    t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:
@@ -222,7 +222,7 @@ class TestTarScanner:
                 data = pickle.dumps({"key": "value"})
                 info = tarfile.TarInfo("data.pkl")
                 info.size = len(data)
-                t.addfile(info, tarfile.io.BytesIO(data))
+                t.addfile(info, tarfile.io.BytesIO(data))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:
@@ -255,7 +255,7 @@ class TestTarScanner:
                 info = tarfile.TarInfo("inner.txt")
                 content = b"Inner compressed content"
                 info.size = len(content)
-                inner_tar.addfile(info, tarfile.io.BytesIO(content))
+                inner_tar.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             inner_path = inner_tmp.name
 
         # Create outer tar containing inner tar.gz
@@ -288,11 +288,11 @@ class TestTarScanner:
 
                 info1 = tarfile.TarInfo("one.pkl")
                 info1.size = len(data1)
-                t.addfile(info1, tarfile.io.BytesIO(data1))
+                t.addfile(info1, tarfile.io.BytesIO(data1))  # type: ignore[attr-defined]
 
                 info2 = tarfile.TarInfo("two.pkl")
                 info2.size = len(data2)
-                t.addfile(info2, tarfile.io.BytesIO(data2))
+                t.addfile(info2, tarfile.io.BytesIO(data2))  # type: ignore[attr-defined]
             tmp_path = tmp.name
 
         try:

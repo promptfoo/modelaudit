@@ -34,6 +34,7 @@ from .utils.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.huggingface import download_file_from_hf, download_model, is_huggingface_file_url, is_huggingface_url
 from .utils.jfrog import is_jfrog_url
 from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
+from .utils.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
 
 logger = logging.getLogger("modelaudit")
 
@@ -402,18 +403,12 @@ def delegate_info() -> None:
 
 @cli.command("scan")
 @click.argument("paths", nargs=-1, type=str, required=True)
-@click.option(
-    "--blacklist",
-    "-b",
-    multiple=True,
-    help="Additional blacklist patterns to check against model names",
-)
+# Core output control (4 flags)
 @click.option(
     "--format",
     "-f",
     type=click.Choice(["text", "json", "sarif"]),
-    default="text",
-    help="Output format (text, json, or sarif) [default: text]",
+    help="Output format (text, json, or sarif) [default: auto-detected]",
 )
 @click.option(
     "--output",
@@ -421,177 +416,98 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Output file path (prints to stdout if not specified)",
 )
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option("--quiet", "-q", is_flag=True, help="Silence detection messages")
+# Security behavior (2 flags)
+@click.option(
+    "--blacklist",
+    "-b",
+    multiple=True,
+    help="Additional blacklist patterns to check against model names",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Strict mode: fail on warnings, scan all file types, strict license validation",
+)
+# Progress & reporting (2 flags)
+@click.option(
+    "--progress",
+    is_flag=True,
+    help="Force enable progress reporting (auto-detected by default)",
+)
 @click.option(
     "--sbom",
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
+# Override smart detection (2 flags)
 @click.option(
     "--timeout",
     "-t",
     type=int,
-    default=3600,
-    help="Scan timeout in seconds [default: 3600]",
-)
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
-@click.option(
-    "--max-file-size",
-    type=int,
-    default=0,
-    help="Maximum file size to scan in bytes [default: unlimited]",
+    help="Override auto-detected timeout in seconds",
 )
 @click.option(
-    "--max-total-size",
-    type=int,
-    default=0,
-    help="Maximum total bytes to scan before stopping [default: unlimited]",
-)
-@click.option(
-    "--registry-uri",
+    "--max-size",
     type=str,
-    help="MLflow registry URI (only used for MLflow model URIs)",
+    help="Override auto-detected size limits (e.g., 10GB, 500MB)",
 )
+# Preview/debugging (2 flags)
 @click.option(
-    "--jfrog-api-token",
-    type=str,
-    help="JFrog API token for authentication (can also use JFROG_API_TOKEN env var or .env file)",
-)
-@click.option(
-    "--jfrog-access-token",
-    type=str,
-    help="JFrog access token for authentication (can also use JFROG_ACCESS_TOKEN env var or .env file)",
-)
-@click.option(
-    "--max-download-size",
-    type=str,
-    help="Maximum download size for cloud storage (e.g., 500MB, 2GB)",
-)
-@click.option(
-    "--cache/--no-cache",
-    default=True,
-    help="Use cache for downloaded cloud storage files [default: cache]",
-)
-@click.option(
-    "--cache-dir",
-    type=click.Path(exists=False, file_okay=False, dir_okay=True, resolve_path=True),
-    help="Directory for caching downloaded files [default: ~/.modelaudit/cache]",
-)
-@click.option(
-    "--no-skip-files/--skip-files",
-    default=False,
-    help="Whether to skip non-model file types during directory scans (default: skip)",
-)
-@click.option(
-    "--strict-license",
+    "--dry-run",
     is_flag=True,
-    help="Fail scan when incompatible or deprecated licenses are detected",
+    help="Preview what would be scanned/downloaded without actually doing it",
 )
 @click.option(
-    "--preview",
+    "--no-cache",
     is_flag=True,
-    help="Preview what would be downloaded without actually downloading",
-)
-@click.option(
-    "--selective/--all-files",
-    default=True,
-    help="Download only scannable files from directories [default: selective]",
-)
-@click.option(
-    "--stream",
-    is_flag=True,
-    help="Use streaming analysis for large cloud files (experimental)",
-)
-@click.option(
-    "--large-model-support/--no-large-model-support",
-    default=True,
-    help="Enable optimized scanning for large models (≈10GB+) [default: enabled]",
-)
-@click.option(
-    "--progress/--no-progress",
-    default=True,
-    help="Enable progress reporting for large model scans [default: enabled]",
-)
-@click.option(
-    "--progress-log",
-    type=click.Path(exists=False, file_okay=True, dir_okay=False),
-    help="Write progress information to log file",
-)
-@click.option(
-    "--progress-format",
-    type=click.Choice(["tqdm", "simple", "json"]),
-    default="tqdm",
-    help="Progress display format [default: tqdm]",
-)
-@click.option(
-    "--progress-interval",
-    type=float,
-    default=2.0,
-    help="Progress update interval in seconds [default: 2.0]",
+    help="Force disable caching (overrides smart detection)",
 )
 def scan_command(
     paths: tuple[str, ...],
-    blacklist: tuple[str, ...],
-    format: str,
+    format: Optional[str],
     output: Optional[str],
-    sbom: Optional[str],
-    timeout: int,
     verbose: bool,
-    max_file_size: int,
-    max_total_size: int,
-    registry_uri: Optional[str],
-    jfrog_api_token: Optional[str],
-    jfrog_access_token: Optional[str],
-    max_download_size: Optional[str],
-    cache: bool,
-    cache_dir: Optional[str],
-    no_skip_files: bool,
-    strict_license: bool,
-    preview: bool,
-    selective: bool,
-    stream: bool,
-    large_model_support: bool,
+    quiet: bool,
+    blacklist: tuple[str, ...],
+    strict: bool,
     progress: bool,
-    progress_log: Optional[str],
-    progress_format: str,
-    progress_interval: float,
+    sbom: Optional[str],
+    timeout: Optional[int],
+    max_size: Optional[str],
+    dry_run: bool,
+    no_cache: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
 
-    \b
-    Usage:
-        modelaudit scan /path/to/model1 /path/to/model2 ...
-        modelaudit scan https://huggingface.co/user/model
-        modelaudit scan https://pytorch.org/hub/pytorch_vision_resnet/
-        modelaudit scan hf://user/model
-        modelaudit scan s3://my-bucket/models/
-        modelaudit scan gs://my-bucket/model.pt
-        modelaudit scan models:/MyModel/1
-        modelaudit scan models:/MyModel/Production
-        modelaudit scan https://mycompany.jfrog.io/artifactory/repo/model.pt
+    Uses smart detection to automatically configure optimal settings based on input type.
 
     \b
-    JFrog Authentication (choose one method):
-        --jfrog-api-token      API token (recommended)
-        --jfrog-access-token   Access token
+    Examples:
+        modelaudit scan model.pkl                    # Local file - fast scan
+        modelaudit scan s3://bucket/models/          # Cloud - auto caching + progress
+        modelaudit scan hf://user/llama              # HuggingFace - selective download
+        modelaudit scan models:/model/v1             # MLflow - registry integration
 
-    You can also set environment variables or create a .env file:
-        JFROG_API_TOKEN, JFROG_ACCESS_TOKEN
+        # Override smart detection when needed
+        modelaudit scan large-model.pt --max-size 20GB --timeout 7200
 
-    You can specify additional blacklist patterns with ``--blacklist`` or ``-b``:
-
-        modelaudit scan /path/to/model1 /path/to/model2 -b llama -b alpaca
+        # Strict mode for security-critical scans
+        modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Advanced options:
-        --format, -f       Output format (text, json, or sarif)
-        --output, -o       Write results to a file instead of stdout
-        --sbom             Write CycloneDX SBOM to file
-        --timeout, -t      Set scan timeout in seconds
-        --verbose, -v      Show detailed information during scanning
-        --max-file-size    Maximum file size to scan in bytes
-        --max-total-size   Maximum total bytes to scan before stopping
-        --registry-uri     MLflow registry URI (for MLflow models only)
+    Smart Detection:
+        • Input type (local/cloud/registry) → optimal download & caching
+        • File size (>1GB) → large model optimizations + progress bars
+        • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
+        • Cloud operations → automatic caching, size limits, timeouts
+
+    \b
+    Authentication:
+        • JFrog: Set JFROG_API_TOKEN or JFROG_ACCESS_TOKEN environment variables
+        • MLflow: Set MLFLOW_TRACKING_URI environment variable
 
     \b
     Exit codes:
@@ -641,8 +557,78 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
+    # Generate smart defaults based on input analysis
+    smart_defaults = generate_smart_defaults(expanded_paths)
+
+    # Prepare user overrides (only non-None values)
+    user_overrides: dict[str, Any] = {}
+    if format is not None:
+        user_overrides["format"] = format
+    if timeout is not None:
+        user_overrides["timeout"] = timeout
+    if max_size is not None:
+        try:
+            user_overrides["max_file_size"] = parse_size_string(max_size)
+            user_overrides["max_total_size"] = parse_size_string(max_size)
+        except ValueError as e:
+            click.echo(f"Error parsing --max-size: {e}", err=True)
+            import sys as sys_module
+
+            sys_module.exit(2)
+
+    # Override smart detection with explicit user flags
+    if progress:
+        user_overrides["show_progress"] = True
+    if no_cache:
+        user_overrides["use_cache"] = False
+    if strict:
+        user_overrides["skip_non_model_files"] = False
+        user_overrides["strict_license"] = True
+    if quiet:
+        user_overrides["verbose"] = False
+
+    # Apply smart defaults + user overrides
+    config = apply_smart_overrides(user_overrides, smart_defaults)
+
+    # Handle environment variables for removed flags
+    jfrog_api_token = os.getenv("JFROG_API_TOKEN")
+    jfrog_access_token = os.getenv("JFROG_ACCESS_TOKEN")
+    registry_uri = os.getenv("MLFLOW_TRACKING_URI")
+
+    # Extract final configuration values
+    final_timeout = config.get("timeout", 3600)
+    final_progress = config.get("show_progress", False)
+    final_cache = config.get("use_cache", True)
+    final_cache_dir = config.get("cache_dir")
+    final_format = config.get("format", "text")
+    # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
+    final_selective = config.get("selective_download", True)
+    final_stream = config.get("stream_analysis", False)
+    final_max_file_size = config.get("max_file_size", 0)
+    final_max_total_size = config.get("max_total_size", 0)
+    final_skip_files = config.get("skip_non_model_files", True)
+    final_strict_license = config.get("strict_license", False)
+
+    # Handle max download size from smart defaults or max_size override
+    max_download_bytes = None
+    if max_size is not None:
+        import contextlib
+
+        with contextlib.suppress(ValueError):
+            max_download_bytes = parse_size_string(max_size)
+
+    # Show smart detection info if not quiet
+    if not quiet and final_format == "text" and not output:
+        if verbose:
+            click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
+            for key, value in config.items():
+                if key != "cache_dir":  # Skip showing long paths
+                    click.echo(f"   • {key}: {value}")
+        elif not config.get("colors", True):  # In CI mode
+            pass  # No smart detection message needed
+
     # Print a nice header if not in structured format mode and not writing to a file
-    if format == "text" and not output:
+    if final_format == "text" and not output and not quiet:
         # Add delegation indicator if running via promptfoo
         delegation_note = ""
         if is_delegated_from_promptfoo():
@@ -681,8 +667,7 @@ def scan_command(
     progress_tracker = None
     progress_reporters: list[Any] = []
 
-    if progress and len(expanded_paths) > 0:
-        record_feature_used("progress_tracking", format=progress_format, interval=progress_interval)
+    if final_progress and len(expanded_paths) > 0:
         try:
             # Prevent circular imports during scanner loading
             import sys
@@ -690,57 +675,34 @@ def scan_command(
             if "modelaudit.scanners" in sys.modules:
                 if verbose:
                     click.echo("Progress tracking disabled during scanner initialization", err=True)
-                progress = False
                 progress_tracker = None
             else:
                 from .progress import (
                     ConsoleProgressReporter,
-                    FileProgressReporter,
                     ProgressPhase,
                     ProgressTracker,
-                    SimpleConsoleReporter,
                 )
 
                 # Create progress tracker
                 progress_tracker = ProgressTracker(
-                    update_interval=progress_interval,
+                    update_interval=2.0,  # Smart default
                 )
 
             # Add console reporter based on format preference
-            if progress_tracker and format == "text" and not output:
-                if progress_format == "tqdm":
+            if progress_tracker and final_format == "text" and not output:
+                if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
-                    console_reporter = ConsoleProgressReporter(
-                        update_interval=progress_interval,
+                    console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
+                        update_interval=2.0,  # Smart default
                         disable_on_non_tty=True,
                         show_bytes=True,
                         show_items=True,
                     )
-                else:
-                    # Use simple console reporter
-                    console_reporter = SimpleConsoleReporter(  # type: ignore[assignment]
-                        update_interval=progress_interval,
-                        show_percentage=True,
-                        show_speed=True,
-                        show_eta=True,
-                    )
+                # Removed else branch - always use tqdm format
                 progress_reporters.append(console_reporter)
                 progress_tracker.add_reporter(console_reporter)
 
-            # Add file logger if specified
-            if progress_tracker and progress_log:
-                log_format = "json" if progress_format == "json" else "text"
-                file_reporter = FileProgressReporter(
-                    log_file=progress_log,
-                    update_interval=progress_interval * 2,  # Less frequent for file logging
-                    format_type=log_format,
-                    append_mode=True,
-                )
-                progress_reporters.append(file_reporter)
-                progress_tracker.add_reporter(file_reporter)
-
-                if verbose:
-                    click.echo(f"Progress will be logged to: {progress_log}")
+            # File logging removed - use smart defaults only
 
         except (ImportError, RecursionError) as e:
             if verbose:
@@ -748,12 +710,19 @@ def scan_command(
                     click.echo("Progress tracking disabled due to import cycle", err=True)
                 else:
                     click.echo("Progress tracking not available (missing dependencies)", err=True)
-            progress = False
+            final_progress = False
 
     # Aggregated results using Pydantic model from the start
     from .models import create_initial_audit_result
 
     audit_result = create_initial_audit_result()
+
+    # Track actual paths that were successfully scanned for SBOM generation
+    # This prevents FileNotFoundError when URLs are downloaded to local paths
+    scanned_paths: list[str] = []
+
+    # Track temporary directories to clean up after SBOM generation
+    temp_dirs_to_cleanup: list[str] = []
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
@@ -762,27 +731,28 @@ def scan_command(
             temp_dir = None
             actual_path = path
             should_break = False
+            url_handled = False  # Track if we handled a URL download
 
             try:
                 # Check if this is a direct HuggingFace file URL
                 if is_huggingface_file_url(path):
                     # Handle direct file downloads
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(
                             Spinners.dots, text=f"Downloading file from {style_text(path, fg='cyan')}"
                         )
                         download_spinner.start()
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Downloading file from {path}...")
 
                     try:
                         # Determine cache directory behavior for single-file downloads
                         hf_cache_dir = None
                         tmp_dl_dir = None
-                        if cache and cache_dir:
-                            hf_cache_dir = Path(cache_dir) / "huggingface"
-                        elif cache:
+                        if final_cache and final_cache_dir:
+                            hf_cache_dir = Path(final_cache_dir) / "huggingface"
+                        elif final_cache:
                             # Use tool-scoped cache directory, not the global HF cache
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache" / "huggingface"
                         else:
@@ -796,17 +766,22 @@ def scan_command(
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
                         # Only track for cleanup if we created an ephemeral cache above
-                        temp_dir = str(hf_cache_dir) if not cache else None
+                        temp_dir = str(hf_cache_dir) if not final_cache else None
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
+
+                        # The downloaded file should continue through normal scanning flow
+                        # actual_path is already set to the downloaded file path
+                        # Let it fall through to normal scanning (don't continue here)
+                        url_handled = True
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
                         error_msg = str(e)
@@ -819,7 +794,7 @@ def scan_command(
                 # Check if this is a HuggingFace model URL
                 elif is_huggingface_url(path):
                     # Show initial message and get model info
-                    if format == "text" and not output:
+                    if final_format == "text" and not output:
                         click.echo(f"\n📥 Preparing to download from {style_text(path, fg='cyan')}")
 
                         # Get model info for size preview
@@ -845,16 +820,16 @@ def scan_command(
 
                     # Show download progress with spinner if appropriate
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
                         download_spinner.start()
 
                     try:
                         # Convert cache_dir string to Path if provided
                         hf_cache_dir = None
-                        if cache and cache_dir:
-                            hf_cache_dir = Path(cache_dir)
-                        elif cache:
+                        if final_cache and final_cache_dir:
+                            hf_cache_dir = Path(final_cache_dir)
+                        elif final_cache:
                             # Use default cache directory
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
 
@@ -864,7 +839,7 @@ def scan_command(
                         download_start = time.time()
 
                         # Download with caching support and progress bar
-                        show_progress = format == "text" and not output and should_show_spinner()
+                        show_progress = final_format == "text" and not output and should_show_spinner()
                         download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
 
                         # Record download completion
@@ -877,17 +852,17 @@ def scan_command(
                             record_download_completed("huggingface", download_duration, 0)
                         actual_path = str(download_path)
                         # Only track for cleanup if not using cache
-                        temp_dir = str(download_path) if not cache else None
+                        temp_dir = str(download_path) if not final_cache else None
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
                         error_msg = str(e)
@@ -913,10 +888,10 @@ def scan_command(
                 # Check if this is a PyTorch Hub URL
                 elif is_pytorch_hub_url(path):
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Downloading from {path}...")
 
                     try:
@@ -927,7 +902,7 @@ def scan_command(
 
                         download_path = download_pytorch_hub_model(
                             path,
-                            cache_dir=Path(cache_dir) if cache_dir else None,
+                            cache_dir=Path(final_cache_dir) if final_cache_dir else None,
                         )
 
                         # Record download completion
@@ -942,13 +917,13 @@ def scan_command(
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Download failed")
 
                         error_msg = str(e)
@@ -974,25 +949,12 @@ def scan_command(
 
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
-                    # Parse max download size if provided
-                    max_download_bytes = None
-                    if max_download_size:
-                        size_map = {"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}
-                        for unit, multiplier in size_map.items():
-                            if max_download_size.upper().endswith(unit):
-                                max_download_bytes = int(float(max_download_size[: -len(unit)]) * multiplier)
-                                break
-                        if max_download_bytes is None:
-                            # Try parsing as raw number
-                            try:
-                                max_download_bytes = int(max_download_size)
-                            except ValueError:
-                                click.echo(f"Invalid max download size: {max_download_size}", err=True)
-                                audit_result.has_errors = True
-                                continue
+                    # Max download size already handled above
+                    # max_download_bytes is already set from smart defaults
+                    # Max download size parsing removed - handled by smart defaults
 
-                    # Handle preview mode
-                    if preview:
+                    # Handle dry-run mode (replaces preview)
+                    if dry_run:
                         import asyncio
 
                         from .utils.cloud_storage import analyze_cloud_target
@@ -1010,7 +972,7 @@ def scan_command(
                                 click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}")
                                 click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
 
-                                if selective:
+                                if final_selective:
                                     from .utils.cloud_storage import filter_scannable_files
 
                                     scannable = filter_scannable_files(metadata.get("files", []))
@@ -1028,37 +990,37 @@ def scan_command(
 
                     # Normal download mode
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Downloading from {path}...")
 
                     try:
                         # Convert cache_dir string to Path if provided
-                        cache_path = Path(cache_dir) if cache_dir else None
+                        cache_path = Path(final_cache_dir) if final_cache_dir else None
 
                         download_path = download_from_cloud(
                             path,
                             cache_dir=cache_path,
                             max_size=max_download_bytes,
-                            use_cache=cache,
+                            use_cache=final_cache,
                             show_progress=verbose,
-                            selective=selective,
-                            stream_analyze=stream,
+                            selective=final_selective,
+                            stream_analyze=final_stream,
                         )
                         actual_path = str(download_path)
-                        temp_dir = str(download_path) if not cache else None  # Don't clean up cached files
+                        temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Download failed")
 
                         error_msg = str(e)
@@ -1085,10 +1047,10 @@ def scan_command(
                 elif is_mlflow_uri(path):
                     # Show download progress if in text mode
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Downloading from {path}...")
 
                     try:
@@ -1098,19 +1060,19 @@ def scan_command(
                         results: ModelAuditResultModel = scan_mlflow_model(
                             path,
                             registry_uri=registry_uri,
-                            timeout=timeout,
+                            timeout=final_timeout,
                             blacklist_patterns=list(blacklist) if blacklist else None,
-                            max_file_size=max_file_size,
-                            max_total_size=max_total_size,
+                            max_file_size=final_max_file_size,
+                            max_total_size=final_max_total_size,
                         )
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan using Pydantic model
-                        audit_result.aggregate_scan_result(results)
+                        audit_result.aggregate_scan_result(results.model_dump())
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -1118,7 +1080,7 @@ def scan_command(
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Download failed")
 
                         logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
@@ -1129,12 +1091,12 @@ def scan_command(
                 # Check if this is a JFrog URL
                 elif is_jfrog_url(path):
                     download_spinner = None
-                    if format == "text" and not output and should_show_spinner():
+                    if final_format == "text" and not output and should_show_spinner():
                         download_spinner = yaspin(
                             Spinners.dots, text=f"Downloading and scanning from {style_text(path, fg='cyan')}"
                         )
                         download_spinner.start()
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Downloading and scanning from {path}...")
 
                     try:
@@ -1143,17 +1105,17 @@ def scan_command(
                             path,
                             api_token=jfrog_api_token,
                             access_token=jfrog_access_token,
-                            timeout=timeout,
+                            timeout=final_timeout,
                             blacklist_patterns=list(blacklist) if blacklist else None,
-                            max_file_size=max_file_size,
-                            max_total_size=max_total_size,
-                            strict_license=strict_license,
-                            skip_file_types=not no_skip_files,
+                            max_file_size=final_max_file_size,
+                            max_total_size=final_max_total_size,
+                            strict_license=final_strict_license,
+                            skip_file_types=final_skip_files,
                         )
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded and scanned", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results using Pydantic model
@@ -1164,7 +1126,7 @@ def scan_command(
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download/scan failed", fg="red", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo("Download/scan failed")
 
                         logger.error(f"Failed to download/scan model from {path}: {e!s}", exc_info=verbose)
@@ -1172,7 +1134,7 @@ def scan_command(
                         audit_result.has_errors = True
                         continue
 
-                else:
+                elif not url_handled:
                     # For local paths, check if they exist
                     if not os.path.exists(path):
                         click.echo(f"Error: Path does not exist: {path}", err=True)
@@ -1181,8 +1143,10 @@ def scan_command(
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml, .md as they can be model config/documentation files
-                if os.path.isfile(path):
-                    _, ext = os.path.splitext(path)
+                # Use actual_path (which may be a downloaded file) instead of original path
+                scan_path = actual_path if url_handled else path
+                if os.path.isfile(scan_path):
+                    _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
                         ".txt",
@@ -1192,17 +1156,17 @@ def scan_command(
                         ".css",
                     ):
                         if verbose:
-                            logger.debug(f"Skipped: {path} (non-model file)")
-                        click.echo(f"Skipping non-model file: {path}")
+                            logger.debug(f"Skipped: {scan_path} (non-model file)")
+                        click.echo(f"Skipping non-model file: {scan_path}")
                         continue
 
                 # Show progress indicator if in text mode and not writing to a file
                 spinner = None
-                if format == "text" and not output and should_show_spinner():
+                if final_format == "text" and not output and should_show_spinner():
                     spinner_text = f"Scanning {style_text(path, fg='cyan')}"
                     spinner = yaspin(Spinners.dots, text=spinner_text)
                     spinner.start()
-                elif format == "text" and not output:
+                elif final_format == "text" and not output:
                     click.echo(f"Scanning {path}...")
 
                 # Perform the scan with the specified options
@@ -1265,14 +1229,14 @@ def scan_command(
 
                             return enhanced_progress_callback
 
-                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[possibly-unresolved-reference]
 
                     # Run the scan with progress reporting
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
-                        "progress_update_interval": progress_interval,
-                        "cache_enabled": cache,
-                        "cache_dir": cache_dir,
+                        "progress_update_interval": 2.0,  # Smart default
+                        "cache_enabled": final_cache,
+                        "cache_dir": final_cache_dir,
                     }
 
                     # Record feature usage for large model support
@@ -1282,18 +1246,21 @@ def scan_command(
                     scan_results: ModelAuditResultModel = scan_model_directory_or_file(
                         actual_path,
                         blacklist_patterns=list(blacklist) if blacklist else None,
-                        timeout=timeout,
-                        max_file_size=max_file_size,
-                        max_total_size=max_total_size,
-                        strict_license=strict_license,
+                        timeout=final_timeout,
+                        max_file_size=final_max_file_size,
+                        max_total_size=final_max_total_size,
+                        strict_license=final_strict_license,
                         progress_callback=progress_callback,
-                        skip_file_types=not no_skip_files,  # CLI flag is inverted (--no-skip-files)
+                        skip_file_types=final_skip_files,
                         **config_overrides,
                     )
 
                     # Core now returns ModelAuditResultModel, so merge it directly
                     # scan_results is a ModelAuditResultModel, convert to dict for aggregation
                     audit_result.aggregate_scan_result(scan_results.model_dump())
+
+                    # Track the actual scanned path for SBOM generation
+                    scanned_paths.append(actual_path)
 
                     # Show completion status if in text mode and not writing to a file
                     result_issues = scan_results.issues
@@ -1327,7 +1294,7 @@ def scan_command(
                                             bold=True,
                                         ),
                                     )
-                            elif format == "text" and not output:
+                            elif final_format == "text" and not output:
                                 issues_str = "issue" if issue_count == 1 else "issues"
                                 if has_critical:
                                     click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
@@ -1338,14 +1305,14 @@ def scan_command(
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
-                            elif format == "text" and not output:
+                            elif final_format == "text" and not output:
                                 click.echo(f"Scanned {path}: Clean")
                     else:
                         # No issues at all
                         if spinner:
                             spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                             spinner.ok(style_text("✅ Clean", fg="green", bold=True))
-                        elif format == "text" and not output:
+                        elif final_format == "text" and not output:
                             click.echo(f"Scanned {path}: Clean")
 
                 except Exception as e:
@@ -1353,12 +1320,16 @@ def scan_command(
                     if spinner:
                         spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
                         spinner.fail(style_text("❌ Error", fg="red", bold=True))
-                    elif format == "text" and not output:
+                    elif final_format == "text" and not output:
                         click.echo(f"Error scanning {path}")
 
                     logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
                     audit_result.has_errors = True
+
+                    # Track the actual path for SBOM generation even if scanning failed
+                    # This prevents FileNotFoundError when SBOM tries to access original URLs
+                    scanned_paths.append(actual_path)
 
                     # Report error to progress tracker
                     if progress_tracker:
@@ -1368,6 +1339,10 @@ def scan_command(
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
+
+                # Track the actual path for SBOM generation even if processing failed
+                # This prevents FileNotFoundError when SBOM tries to access original URLs
+                scanned_paths.append(actual_path)
                 audit_result.has_errors = True
 
                 # Report error to progress tracker
@@ -1375,15 +1350,11 @@ def scan_command(
                     progress_tracker.report_error(e)
 
             finally:
-                # Clean up temporary directory if we downloaded a model
-                # Only clean up if we didn't use a user-specified cache directory
-                if temp_dir and os.path.exists(temp_dir) and not cache_dir:
-                    try:
-                        shutil.rmtree(temp_dir)
-                        if verbose:
-                            logger.debug(f"Temporary directory removed: {temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                # Defer cleanup until after SBOM generation to avoid FileNotFoundError
+                if temp_dir and os.path.exists(temp_dir) and not final_cache_dir:
+                    temp_dirs_to_cleanup.append(temp_dir)
+                    if verbose:
+                        logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -1440,14 +1411,27 @@ def scan_command(
 
     # Generate SBOM if requested
     if sbom:
-        from .sbom import generate_sbom
+        from .sbom import generate_sbom_pydantic
 
-        sbom_text = generate_sbom(expanded_paths, audit_result.model_dump())
+        # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
+        # to prevent FileNotFoundError when generating SBOM for downloaded content
+        paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
+        sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
+    # Clean up temporary directories after SBOM generation
+    for temp_dir in temp_dirs_to_cleanup:
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                if verbose:
+                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+
     # Format the output
-    if format == "json":
+    if final_format == "json":
         # Filter out DEBUG issues and checks unless verbose mode is enabled
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
@@ -1455,7 +1439,7 @@ def scan_command(
 
         # Serialize Pydantic model directly to JSON
         output_text = audit_result.model_dump_json(indent=2, exclude_none=True)
-    elif format == "sarif":
+    elif final_format == "sarif":
         # SARIF format for integration with security tools
         output_text = format_sarif_output(audit_result, expanded_paths, verbose)
     else:
@@ -1486,7 +1470,7 @@ def scan_command(
                 click.echo("No security issues found")
     else:
         # Add a separator line between debug output and scan results (only for text format)
-        if format == "text":
+        if final_format == "text":
             click.echo("\n" + "─" * 80)
         click.echo(output_text)
 
@@ -1503,7 +1487,9 @@ def scan_command(
 
     # Exit with appropriate error code based on scan results
     exit_code = determine_exit_code(audit_result)
-    sys.exit(exit_code)
+    import sys as sys_module
+
+    sys_module.exit(exit_code)
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:

@@ -37,7 +37,8 @@ rye run pytest -n auto --cov=modelaudit # Full test suite with coverage
 # Linting and Formatting
 rye run ruff format modelaudit/ tests/   # Format code (ALWAYS run before committing)
 rye run ruff check --fix modelaudit/ tests/  # Fix linting issues
-rye run mypy modelaudit/                 # Type checking
+rye run mypy modelaudit/                 # Type checking (mypy)
+rye run ty check                         # Advanced type checking (ty - more strict than mypy)
 npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, JSON files
 
 # CI Checks - ALWAYS run these before committing:
@@ -45,8 +46,9 @@ npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, 
 # 2. rye run ruff check modelaudit/ tests/  # IMPORTANT: Check without --fix first!
 # 3. rye run ruff check --fix modelaudit/ tests/  # Then fix any issues
 # 4. rye run mypy modelaudit/
-# 5. rye run pytest -n auto -m "not slow and not integration"  # Fast tests first
-# 6. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+# 5. rye run ty check                       # Advanced type checking (optional but recommended)
+# 6. rye run pytest -n auto -m "not slow and not integration"  # Fast tests first
+# 7. npx prettier@latest --write "**/*.{md,yaml,yml,json}"
 ```
 
 ## Testing Requirements
@@ -142,6 +144,43 @@ modelaudit model.pkl | tee results.txt
 # Explicitly disable colors
 NO_COLOR=1 modelaudit model.pkl
 ```
+
+## Advanced Type Checking with ty
+
+ty is a modern Python type checker that provides more advanced analysis than mypy. It's integrated as an optional quality assurance tool.
+
+```bash
+# Basic type checking
+rye run ty check                         # Check all configured files
+
+# Specific file or directory checking
+rye run ty check modelaudit/cli.py       # Check specific file
+rye run ty check modelaudit/scanners/    # Check specific directory
+
+# Configuration and debugging
+rye run ty check --verbose               # Verbose output for debugging
+rye run ty check --output-format full    # Full diagnostic format (default is concise)
+rye run ty check --help                  # See all available options
+
+# Integration with development workflow
+rye run ty check --error-on-warning      # Treat warnings as errors (stricter CI)
+```
+
+### ty vs mypy
+
+- **mypy**: Established type checker, good for existing codebases, configurable strictness
+- **ty**: Modern, fast type checker with advanced analysis, catches subtle bugs mypy might miss
+- **Usage**: Run both - mypy for baseline type safety, ty for advanced quality assurance
+- **CI Integration**: ty is optional in CI (step 5) but recommended for high-quality code
+
+### ty Configuration
+
+Configuration is in `[tool.ty]` section of `pyproject.toml`:
+
+- Includes both `modelaudit/` and `tests/` directories
+- Excludes test assets and generated files
+- Conservative rule configuration to avoid overwhelming output
+- Test files have more permissive rules than source code
 
 ## Analytics and Telemetry
 
@@ -298,6 +337,10 @@ rye run pytest tests/test_pickle_scanner.py -v
 
 # Full fast test suite (when unsure)
 rye run pytest -n auto -m "not slow and not integration and not performance" -v
+
+# Type checking validation (after code changes)
+rye run mypy modelaudit/                 # Essential type checking
+rye run ty check modelaudit/scanners/    # Advanced type checking for specific area
 ```
 
 ### Branch Hygiene

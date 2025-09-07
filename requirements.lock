@@ -10,27 +10,27 @@
 #   universal: false
 
 -e file:.
-absl-py==2.3.0
+absl-py==2.3.1
     # via keras
     # via tensorboard
     # via tensorflow
-aiobotocore==2.23.0
+aiobotocore==2.24.1
     # via s3fs
 aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.12.13
+aiohttp==3.12.15
     # via aiobotocore
     # via gcsfs
     # via s3fs
 aioitertools==0.12.0
     # via aiobotocore
-aiosignal==1.3.2
+aiosignal==1.4.0
     # via aiohttp
-alembic==1.16.2
+alembic==1.16.5
     # via mlflow
 annotated-types==0.7.0
     # via pydantic
-anyio==4.9.0
+anyio==4.10.0
     # via starlette
 astunparse==1.6.3
     # via tensorflow
@@ -42,15 +42,18 @@ blinker==1.9.0
     # via flask
 boolean-py==5.0
     # via license-expression
-botocore==1.38.27
+botocore==1.39.11
     # via aiobotocore
 cachetools==5.5.2
     # via google-auth
     # via mlflow-skinny
-cattrs==25.1.1
+    # via mlflow-tracing
+cattrs==25.2.0
     # via coremltools
 certifi==2025.6.15
     # via requests
+cffi==1.17.1
+    # via cryptography
 charset-normalizer==3.4.2
     # via requests
 click==8.2.1
@@ -60,16 +63,19 @@ click==8.2.1
     # via uvicorn
 cloudpickle==3.1.1
     # via mlflow-skinny
-contourpy==1.3.2
+contourpy==1.3.3
     # via matplotlib
 coremltools==8.3.0
     # via modelaudit
+cryptography==45.0.7
+    # via mlflow
 cycler==0.12.1
     # via matplotlib
-cyclonedx-python-lib==10.2.0
+cyclonedx-python-lib==11.0.0
     # via modelaudit
-databricks-sdk==0.57.0
+databricks-sdk==0.65.0
     # via mlflow-skinny
+    # via mlflow-tracing
 decorator==5.2.1
     # via gcsfs
 defusedxml==0.7.1
@@ -79,17 +85,17 @@ dill==0.4.0
     # via modelaudit
 docker==7.1.0
     # via mlflow
-fastapi==0.115.14
+fastapi==0.116.1
     # via mlflow-skinny
 filelock==3.18.0
     # via huggingface-hub
     # via torch
-flask==3.1.1
+flask==3.1.2
     # via mlflow
 flatbuffers==25.2.10
     # via tensorflow
     # via tflite
-fonttools==4.58.4
+fonttools==4.59.2
     # via matplotlib
 frozenlist==1.7.0
     # via aiohttp
@@ -106,7 +112,7 @@ gcsfs==2025.5.1
     # via modelaudit
 gitdb==4.0.12
     # via gitpython
-gitpython==3.1.44
+gitpython==3.1.45
     # via mlflow-skinny
 google-api-core==2.25.1
     # via google-cloud-core
@@ -122,7 +128,7 @@ google-auth-oauthlib==1.2.2
     # via gcsfs
 google-cloud-core==2.4.3
     # via google-cloud-storage
-google-cloud-storage==3.1.1
+google-cloud-storage==3.3.1
     # via gcsfs
 google-crc32c==1.7.1
     # via google-cloud-storage
@@ -140,7 +146,7 @@ graphql-core==3.2.6
     # via graphql-relay
 graphql-relay==3.2.0
     # via graphene
-grpcio==1.73.1
+grpcio==1.74.0
     # via tensorboard
     # via tensorflow
 gunicorn==23.0.0
@@ -170,12 +176,12 @@ jinja2==3.1.6
 jmespath==1.0.1
     # via aiobotocore
     # via botocore
-joblib==1.5.1
+joblib==1.5.2
     # via modelaudit
     # via scikit-learn
-keras==3.10.0
+keras==3.11.3
     # via tensorflow
-kiwisolver==1.4.8
+kiwisolver==1.4.9
     # via matplotlib
 libclang==18.1.1
     # via tensorflow
@@ -183,31 +189,34 @@ license-expression==30.4.3
     # via cyclonedx-python-lib
 mako==1.3.10
     # via alembic
-markdown==3.8.2
+markdown==3.9
     # via tensorboard
-markdown-it-py==3.0.0
+markdown-it-py==4.0.0
     # via rich
 markupsafe==3.0.2
     # via flask
     # via jinja2
     # via mako
     # via werkzeug
-matplotlib==3.10.3
+matplotlib==3.10.6
     # via mlflow
 mdurl==0.1.2
     # via markdown-it-py
-ml-dtypes==0.5.1
+ml-dtypes==0.5.3
     # via keras
+    # via onnx
     # via tensorflow
-mlflow==3.1.1
+mlflow==3.3.2
     # via modelaudit
-mlflow-skinny==3.1.1
+mlflow-skinny==3.3.2
+    # via mlflow
+mlflow-tracing==3.3.2
     # via mlflow
 mpmath==1.3.0
     # via sympy
 msgpack==1.1.1
     # via modelaudit
-multidict==6.6.0
+multidict==6.6.4
     # via aiobotocore
     # via aiohttp
     # via yarl
@@ -233,19 +242,21 @@ numpy==2.1.3
     # via tflite
 oauthlib==3.3.1
     # via requests-oauthlib
-onnx==1.18.0
+onnx==1.19.0
     # via modelaudit
-opentelemetry-api==1.34.1
+opentelemetry-api==1.36.0
     # via mlflow-skinny
+    # via mlflow-tracing
     # via opentelemetry-sdk
     # via opentelemetry-semantic-conventions
-opentelemetry-sdk==1.34.1
+opentelemetry-sdk==1.36.0
     # via mlflow-skinny
-opentelemetry-semantic-conventions==0.55b1
+    # via mlflow-tracing
+opentelemetry-semantic-conventions==0.57b0
     # via opentelemetry-sdk
 opt-einsum==3.4.0
     # via tensorflow
-optree==0.16.0
+optree==0.17.0
     # via keras
 packageurl-python==0.17.1
     # via cyclonedx-python-lib
@@ -256,12 +267,14 @@ packaging==25.0
     # via keras
     # via matplotlib
     # via mlflow-skinny
+    # via mlflow-tracing
     # via tensorboard
     # via tensorflow
-pandas==2.3.0
+pandas==2.3.2
     # via mlflow
-pillow==11.2.1
+pillow==11.3.0
     # via matplotlib
+    # via tensorboard
 platformdirs==4.3.8
     # via modelaudit
 propcache==0.3.2
@@ -269,29 +282,34 @@ propcache==0.3.2
     # via yarl
 proto-plus==1.26.1
     # via google-api-core
-protobuf==5.29.5
+protobuf==6.32.0
     # via coremltools
     # via google-api-core
     # via googleapis-common-protos
     # via mlflow-skinny
+    # via mlflow-tracing
     # via onnx
     # via proto-plus
     # via tensorboard
     # via tensorflow
-py-serializable==2.0.0
+py-serializable==2.1.0
     # via cyclonedx-python-lib
 pyaml==25.7.0
     # via coremltools
-pyarrow==20.0.0
+pyarrow==21.0.0
     # via mlflow
 pyasn1==0.6.1
     # via pyasn1-modules
     # via rsa
 pyasn1-modules==0.4.2
     # via google-auth
+pycparser==2.22
+    # via cffi
 pydantic==2.11.7
     # via fastapi
     # via mlflow-skinny
+    # via mlflow-tracing
+    # via modelaudit
 pydantic-core==2.33.2
     # via pydantic
 pygments==2.19.2
@@ -326,15 +344,15 @@ requests==2.32.4
     # via tensorflow
 requests-oauthlib==2.0.0
     # via google-auth-oauthlib
-rich==14.0.0
+rich==14.1.0
     # via keras
 rsa==4.9.1
     # via google-auth
 s3fs==2025.5.1
     # via modelaudit
-safetensors==0.5.3
+safetensors==0.6.2
     # via modelaudit
-scikit-learn==1.7.0
+scikit-learn==1.7.1
     # via mlflow
     # via modelaudit
 scipy==1.16.0
@@ -348,7 +366,6 @@ six==1.17.0
     # via astunparse
     # via google-pasta
     # via python-dateutil
-    # via tensorboard
     # via tensorflow
 smmap==5.0.2
     # via gitdb
@@ -356,24 +373,22 @@ sniffio==1.3.1
     # via anyio
 sortedcontainers==2.4.0
     # via cyclonedx-python-lib
-sqlalchemy==2.0.41
+sqlalchemy==2.0.43
     # via alembic
     # via mlflow
 sqlparse==0.5.3
     # via mlflow-skinny
-starlette==0.46.2
+starlette==0.47.3
     # via fastapi
 sympy==1.14.0
     # via coremltools
     # via torch
-tensorboard==2.19.0
+tensorboard==2.20.0
     # via tensorflow
 tensorboard-data-server==0.7.2
     # via tensorboard
-tensorflow==2.19.0
+tensorflow==2.20.0
     # via modelaudit
-tensorflow-io-gcs-filesystem==0.37.1
-    # via tensorflow
 termcolor==2.3.0
     # via tensorflow
     # via yaspin
@@ -381,15 +396,17 @@ tflite==2.18.0
     # via modelaudit
 threadpoolctl==3.6.0
     # via scikit-learn
-torch==2.7.1
+torch==2.8.0
     # via modelaudit
 tqdm==4.67.1
     # via coremltools
     # via huggingface-hub
 typing-extensions==4.14.0
+    # via aiosignal
     # via alembic
     # via anyio
     # via cattrs
+    # via cyclonedx-python-lib
     # via fastapi
     # via graphene
     # via huggingface-hub
@@ -402,6 +419,7 @@ typing-extensions==4.14.0
     # via pydantic
     # via pydantic-core
     # via sqlalchemy
+    # via starlette
     # via tensorflow
     # via torch
     # via typing-inspection
@@ -413,14 +431,14 @@ urllib3==2.5.0
     # via botocore
     # via docker
     # via requests
-uvicorn==0.34.3
+uvicorn==0.35.0
     # via mlflow-skinny
 werkzeug==3.1.3
     # via flask
     # via tensorboard
 wheel==0.45.1
     # via astunparse
-wrapt==1.17.2
+wrapt==1.17.3
     # via aiobotocore
     # via tensorflow
 yarl==1.20.1

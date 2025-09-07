@@ -293,10 +293,10 @@ def download_model(url: str, cache_dir: Optional[Path] = None, show_progress: bo
         # If we found specific model files, download them
         if model_files:
             download_kwargs["allow_patterns"] = model_files
-            local_path = snapshot_download(**download_kwargs)
+            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
         else:
             # Fallback: download everything if no model files identified
-            local_path = snapshot_download(**download_kwargs)
+            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)

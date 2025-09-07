@@ -57,7 +57,7 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
 def test_cli_scan_directory(temp_model_dir):
     """Test scanning a directory with multiple models using the CLI."""
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(temp_model_dir)])
+    result = runner.invoke(cli, ["scan", "--format", "text", str(temp_model_dir)])
 
     # Exit code should be deterministic based on content
     # The temp_model_dir contains real models that should be clean
@@ -135,7 +135,7 @@ def test_cli_with_all_options(temp_model_dir):
             str(output_file),
             "--timeout",
             "60",
-            "--max-file-size",
+            "--max-size",
             "1000000",
             "--verbose",
         ],
@@ -279,7 +279,7 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     # Create a simple TensorFlow model with some weights that might trigger analysis
     model = tf.keras.Sequential(
         [
-            tf.keras.layers.Dense(64, activation="relu", input_shape=(10,)),
+            tf.keras.layers.Dense(64, activation="relu", input_shape=(10,)),  # type: ignore[call-arg]
             tf.keras.layers.Dense(32, activation="relu"),
             tf.keras.layers.Dense(1, activation="sigmoid"),
         ]
@@ -360,7 +360,7 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
     # Create a model with potentially anomalous weights
     model = tf.keras.Sequential(
         [
-            tf.keras.layers.Dense(10, input_shape=(5,), name="anomalous_layer"),
+            tf.keras.layers.Dense(10, input_shape=(5,), name="anomalous_layer"),  # type: ignore[call-arg]
             tf.keras.layers.Dense(1, activation="sigmoid", name="output_layer"),
         ]
     )

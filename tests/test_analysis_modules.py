@@ -1,5 +1,7 @@
 """Basic tests for analysis modules."""
 
+from pathlib import Path
+
 
 class TestAnalysisModules:
     """Test that analysis modules can be imported and instantiated."""
@@ -33,7 +35,7 @@ class TestAnalysisModules:
         anomaly = AnomalyDetector()
         integrated = IntegratedAnalyzer()
         # UnifiedMLContext requires file info
-        context = UnifiedMLContext("test.pkl", 1024, "pickle")
+        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
         kb = FrameworkKnowledgeBase()
 
         # Basic sanity checks
@@ -93,7 +95,7 @@ class TestAnalysisModules:
         analyzer = IntegratedAnalyzer()
 
         # Create a context for the analysis
-        context = UnifiedMLContext("test.pkl", 1024, "pickle")
+        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
 
         # Test with simple analysis
         result = analyzer.analyze_suspicious_pattern(

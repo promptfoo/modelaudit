@@ -1,27 +1,34 @@
+import contextlib
 import os
 from pathlib import Path
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+
+def _get_onnx_mapping() -> Any:
+    """Get ONNX mapping module from different locations depending on version."""
+    try:
+        from onnx import mapping  # type: ignore[attr-defined]
+
+        return mapping
+    except ImportError:
+        with contextlib.suppress(ImportError):
+            from onnx.onnx_cpp2py_export import mapping  # type: ignore[attr-defined]
+
+            return mapping
+    return None
+
+
 try:
     import numpy as np
     import onnx
 
-    # Try to import mapping, but fall back if not available in newer versions
-    try:
-        from onnx import mapping
-        TENSOR_TYPE_TO_NP_TYPE = mapping.TENSOR_TYPE_TO_NP_TYPE
-    except (ImportError, AttributeError):
-        # Fallback for newer ONNX versions - define basic mapping manually
-        TENSOR_TYPE_TO_NP_TYPE = {  # type: ignore[assignment]
-            1: np.float32, 2: np.uint8, 3: np.int8, 6: np.int32, 7: np.int64,
-            9: bool, 10: np.float16, 11: np.float64, 12: np.uint32, 13: np.uint64,
-        }
-
+    mapping = _get_onnx_mapping()
     HAS_ONNX = True
 except Exception:
     HAS_ONNX = False
+    mapping = None
 
 
 class OnnxScanner(BaseScanner):
@@ -256,7 +263,13 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
+<<<<<<< HEAD
             dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+=======
+            if mapping is None:
+                return  # Skip if mapping is not available
+            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+>>>>>>> main
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
@@ -303,7 +316,13 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
+<<<<<<< HEAD
                     dtype = np.dtype(TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+=======
+                    if mapping is None:
+                        continue  # Skip if mapping is not available
+                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+>>>>>>> main
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d

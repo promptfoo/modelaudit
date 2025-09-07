@@ -136,16 +136,16 @@ class AnomalyDetector:
         """Compute statistical profile of data."""
         if data.size == 0:
             return StatisticalProfile(
-                mean=0,
-                std=0,
-                min_val=0,
-                max_val=0,
-                percentiles=dict.fromkeys([1, 5, 25, 50, 75, 95, 99], 0),
-                skewness=0,
-                kurtosis=0,
-                entropy=0,
-                zero_ratio=1,
-                sparsity=1,
+                mean=0.0,
+                std=0.0,
+                min_val=0.0,
+                max_val=0.0,
+                percentiles={p: 0.0 for p in [1, 5, 25, 50, 75, 95, 99]},  # noqa: C420
+                skewness=0.0,
+                kurtosis=0.0,
+                entropy=0.0,
+                zero_ratio=1.0,
+                sparsity=1.0,
             )
 
         # Flatten if multidimensional

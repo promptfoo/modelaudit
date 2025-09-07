@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling==1.26.3"]  # Without a version spec, hatchling==1.27.0 is used which fails to publish. Ref: https://github.com/astral-sh/rye/issues/1446#issuecomment-2545154562
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.4"
+version = "0.2.5"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -30,7 +30,7 @@ dependencies = [
     "yaspin>=2.5.0",
     "numpy>=1.19.0",
     "scipy>=1.7.0",
-    "cyclonedx-python-lib>=10.2.0",
+    "cyclonedx-python-lib>=11.0.0",
     "defusedxml>=0.7.1",
     "huggingface-hub>=0.23.0",
     "requests>=2.28.0",
@@ -59,6 +59,7 @@ tensorrt = ["tensorrt>=8.6.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
+sevenzip = ["py7zr>=0.20.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
     "numpy>=1.19.0,<2.0",
@@ -131,10 +132,10 @@ Homepage = "https://github.com/promptfoo/modelaudit"
 [tool.rye]
 managed = true
 dev-dependencies = [
-    "pytest>=8.0.0",
-    "coverage>=7.4.0",
-    "mypy>=1.8.0",
-    "ruff>=0.10.0",
+    "pytest>=8.4.0",
+    "coverage>=7.9.0",
+    "mypy>=1.16.0",
+    "ruff>=0.12.0",
     "types-PyYAML>=6.0.12.20250516",
     "types-tensorflow>=2.18.0.20250516",
     "types-requests>=2.31.0",
@@ -143,6 +144,7 @@ dev-dependencies = [
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
     "pytest-asyncio>=1.1.0",
+    "ty>=0.0.1a20",
 ]
 
 [tool.ruff]
@@ -164,10 +166,9 @@ extend-select = [
     "RUF",  # Ruff-specific rules
 ]
 
-# Ignore rules that conflict with the formatter or Python 3.9 compatibility
+# Ignore rules that conflict with the formatter
 ignore = [
     "COM812",  # Trailing comma (conflicts with formatter)
-    "UP045",   # Use `X | None` for type annotations (not supported in Python 3.9)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -208,12 +209,12 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
 warn_unused_configs = true     # Warn about unused config options
-warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_unused_ignores = false    # Allow type: ignore comments for multiple tools (ty, mypy)
 warn_redundant_casts = true    # Remove unnecessary casts
 warn_unreachable = true        # Detect unreachable code
 no_implicit_optional = true    # Require Optional[] for None defaults
@@ -234,6 +235,10 @@ pretty = true
 
 # Continue ignoring missing imports for now
 ignore_missing_imports = true
+
+# Temporary workaround for numpy/tensorflow/cyclonedx type compatibility issues
+# See: https://github.com/python/mypy/issues/15238
+follow_imports = "silent"
 
 # Per-module overrides for gradual adoption
 [[tool.mypy.overrides]]
@@ -256,3 +261,64 @@ warn_unreachable = false
 module = "modelaudit.scanners.oci_layer_scanner"
 # Runtime validation needs to check types even with annotations
 warn_unreachable = false
+
+[tool.ty]
+# ty configuration for advanced type checking
+
+[tool.ty.environment]
+# Use the minimum Python version from requires-python
+python-version = "3.9"
+# Include both main source and test directories
+root = [".", "./modelaudit", "./tests"]
+
+[tool.ty.src]
+# Include main source and tests for type checking
+include = ["modelaudit", "tests"]
+# Exclude generated files, assets, and cache directories
+exclude = [
+    "tests/assets/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**", 
+    "**/build/**",
+    "**/dist/**",
+    "picklescan/**",      # Legacy code that might be removed
+    "modelscan/**",       # Legacy code that might be removed
+]
+
+[tool.ty.rules]
+# Start with conservative configuration to avoid overwhelming output
+# Error level rules (will cause ty to exit with non-zero code)
+"unresolved-import" = "error"
+"unresolved-reference" = "error"
+"invalid-argument-type" = "error"
+"invalid-assignment" = "error"
+"invalid-return-type" = "error"
+"call-non-callable" = "error"
+"missing-argument" = "error"
+"too-many-positional-arguments" = "error"
+"unknown-argument" = "error"
+"parameter-already-assigned" = "error"
+"no-matching-overload" = "error"
+
+# Warning level rules (useful feedback but don't fail CI)
+"possibly-unresolved-reference" = "warn"
+"possibly-unbound-attribute" = "warn" 
+"deprecated" = "warn"
+"redundant-cast" = "warn"
+
+# Ignore rules that may be too noisy initially
+"division-by-zero" = "ignore"
+"unused-ignore-comment" = "ignore"
+
+[tool.ty.terminal]
+# Use concise output format for better readability in CI
+output-format = "concise"
+# Don't fail on warnings initially - focus on errors first
+error-on-warning = false
+
+# Override configuration for test files - be more permissive
+[[tool.ty.overrides]]
+include = ["tests/**"]
+[tool.ty.overrides.rules]
+"possibly-unresolved-reference" = "ignore"
+"invalid-argument-type" = "warn"  # Tests often use dynamic fixtures
