@@ -53,22 +53,27 @@ def test_explanations_for_dangerous_imports():
     """Test that we have explanations for dangerous imports."""
     # Test some critical imports
     assert get_import_explanation("os") is not None
-    assert "system commands" in get_import_explanation("os").lower()
+    import_explanation = get_import_explanation("os")
+    assert import_explanation is not None and "system commands" in import_explanation.lower()
 
     assert get_import_explanation("subprocess") is not None
-    assert "arbitrary command execution" in get_import_explanation("subprocess").lower()
+    subprocess_explanation = get_import_explanation("subprocess")
+    assert subprocess_explanation is not None and "arbitrary command execution" in subprocess_explanation.lower()
 
     assert get_import_explanation("eval") is not None
-    assert "arbitrary" in get_import_explanation("eval").lower()
+    eval_explanation = get_import_explanation("eval")
+    assert eval_explanation is not None and "arbitrary" in eval_explanation.lower()
 
 
 def test_explanations_for_opcodes():
     """Test that we have explanations for dangerous opcodes."""
     assert get_opcode_explanation("REDUCE") is not None
-    assert "__reduce__" in get_opcode_explanation("REDUCE")
+    reduce_explanation = get_opcode_explanation("REDUCE")
+    assert reduce_explanation is not None and "__reduce__" in reduce_explanation
 
     assert get_opcode_explanation("INST") is not None
-    assert "execute code" in get_opcode_explanation("INST").lower()
+    inst_explanation = get_opcode_explanation("INST")
+    assert inst_explanation is not None and "execute code" in inst_explanation.lower()
 
 
 def test_pickle_scanner_includes_why():

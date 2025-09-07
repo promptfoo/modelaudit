@@ -3,7 +3,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 if TYPE_CHECKING:
-    import py7zr as _py7zr
+    import py7zr as _py7zr  # type: ignore[import-untyped]
 else:
     _py7zr = None
 
@@ -12,7 +12,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import py7zr with graceful fallback
 try:
-    import py7zr
+    import py7zr  # type: ignore[import-untyped]
 
     HAS_PY7ZR = True
 except ImportError:

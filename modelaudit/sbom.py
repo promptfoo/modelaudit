@@ -137,9 +137,9 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     if hasattr(metadata, "ml_context") and metadata.ml_context:
         ml_ctx = metadata.ml_context
         if hasattr(ml_ctx, "framework") and ml_ctx.framework:
-            props.append(Property(name="ml:framework", value=ml_ctx.framework))
+            props.append(Property(name="ml:framework", value=str(ml_ctx.framework)))
         if hasattr(ml_ctx, "model_type") and ml_ctx.model_type:
-            props.append(Property(name="ml:model_type", value=ml_ctx.model_type))
+            props.append(Property(name="ml:model_type", value=str(ml_ctx.model_type)))
         if hasattr(ml_ctx, "confidence") and ml_ctx.confidence is not None:
             props.append(Property(name="ml:confidence_score", value=str(ml_ctx.confidence)))
 

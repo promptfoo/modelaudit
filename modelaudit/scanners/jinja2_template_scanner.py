@@ -30,7 +30,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Optional GGUF support with graceful fallback
 try:
-    from gguf.gguf_reader import GGUFReader
+    from gguf.gguf_reader import GGUFReader  # type: ignore[import-untyped]
 
     HAS_GGUF = True
 except ImportError:

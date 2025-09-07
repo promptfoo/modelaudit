@@ -658,7 +658,7 @@ def scan_command(
             if progress_tracker and final_format == "text" and not output:
                 if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
-                    console_reporter = ConsoleProgressReporter(
+                    console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
                         update_interval=2.0,  # Smart default
                         disable_on_non_tty=True,
                         show_bytes=True,
@@ -1153,7 +1153,7 @@ def scan_command(
 
                             return enhanced_progress_callback
 
-                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)
+                        progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[possibly-unresolved-reference]
 
                     # Run the scan with progress reporting
                     config_overrides = {
