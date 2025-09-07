@@ -36,6 +36,9 @@ RUN adduser \
     --uid "${UID}" \
     appuser
 
+# Create a data directory that appuser can write to
+RUN mkdir -p /data && chown appuser:appuser /data
+
 USER appuser
 
 # Set the flexible entrypoint
