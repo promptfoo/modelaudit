@@ -8,6 +8,17 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from tests.additional_mock_utils import (
+    FastCacheMocks,
+    FastCompressionMocks,
+    FastCryptoMocks,
+    FastLoggingMocks,
+    setup_ultra_fast_environment,
+)
+
+# Import our optimized mock utilities
+from tests.mock_utils import FastFileSystem, FastMLMocks, FastNetworkMock, FastScannerMocks, setup_fast_test_environment
+
 # Mock utilities for heavy dependencies
 
 
@@ -267,3 +278,233 @@ def cleanup_test_files():
                     shutil.rmtree(file)
             except (OSError, PermissionError):
                 pass  # Ignore cleanup errors
+
+
+# Enhanced fixtures using fast mocking utilities
+
+
+@pytest.fixture
+def fast_filesystem():
+    """Provide a fast in-memory filesystem for tests."""
+    return FastFileSystem()
+
+
+@pytest.fixture
+def fast_test_env():
+    """Complete fast test environment with all mocks enabled."""
+    return setup_fast_test_environment()
+
+
+@pytest.fixture
+def fast_scanner_result():
+    """Fast mock scanner result for testing."""
+    return FastScannerMocks.create_scan_result()
+
+
+@pytest.fixture
+def fast_network():
+    """Fast network mocks for testing."""
+    return FastNetworkMock()
+
+
+@pytest.fixture
+def mock_heavy_ml_libs():
+    """Mock heavy ML libraries to prevent slow imports."""
+    ml_mocks = FastMLMocks()
+
+    # Create sklearn mock with proper structure
+    sklearn_mock = MagicMock()
+    sklearn_mock.__version__ = "1.3.0"
+    sklearn_mock.linear_model = MagicMock()
+
+    # Create dill mock with required methods
+    dill_mock = MagicMock()
+    dill_mock.dump = MagicMock()
+    dill_mock.load = MagicMock()
+    dill_mock.__version__ = "0.3.7"
+
+    # Create joblib mock
+    joblib_mock = MagicMock()
+    joblib_mock.load = MagicMock()
+    joblib_mock.dump = MagicMock()
+    joblib_mock.__version__ = "1.3.0"
+
+    mocks = {
+        "torch": ml_mocks.create_torch_mock(),
+        "tensorflow": ml_mocks.create_tensorflow_mock(),
+        "tf": ml_mocks.create_tensorflow_mock(),
+        "numpy": ml_mocks.create_numpy_mock(),
+        "pandas": MagicMock(),
+        "joblib": joblib_mock,
+        "dill": dill_mock,
+        "scipy": MagicMock(),
+        "sklearn": sklearn_mock,
+        "transformers": MagicMock(),
+        "onnx": MagicMock(),
+        "onnxruntime": MagicMock(),
+    }
+
+    with patch.dict("sys.modules", mocks):
+        yield mocks
+
+
+@pytest.fixture
+def fast_file_operations():
+    """Mock file operations for faster I/O."""
+    filesystem = FastFileSystem()
+
+    # Add common test files
+    filesystem.add_file("/tmp/test.pkl", b"mock pickle content")
+    filesystem.add_file("/tmp/test.pt", b"mock pytorch content")
+    filesystem.add_file("/tmp/test.h5", b"mock keras content")
+
+    def mock_open(file, mode="r", **kwargs):
+        path_str = str(Path(file))
+        if "w" in mode or "a" in mode:
+            mock_file = Mock()
+            mock_file.write = Mock()
+            mock_file.__enter__ = Mock(return_value=mock_file)
+            mock_file.__exit__ = Mock(return_value=None)
+            return mock_file
+        else:
+            content = filesystem.get_file(path_str)
+            if "b" in mode:
+                import io
+
+                return io.BytesIO(content)
+            else:
+                import io
+
+                return io.StringIO(content.decode("utf-8"))
+
+    # Mock path checking functions
+    def mock_path_exists(path):
+        return filesystem.exists(str(path))
+
+    def mock_path_isfile(path):
+        return filesystem.is_file(str(path))
+
+    def mock_access(path, mode):
+        # Always return True for readable files in our mock filesystem
+        return filesystem.exists(str(path))
+
+    with (
+        patch("builtins.open", side_effect=mock_open),
+        patch("os.path.exists", side_effect=mock_path_exists),
+        patch("os.path.isfile", side_effect=mock_path_isfile),
+        patch("os.access", side_effect=mock_access),
+        patch.object(Path, "exists", lambda self: filesystem.exists(str(self))),
+        patch.object(Path, "is_file", lambda self: filesystem.is_file(str(self))),
+    ):
+        yield filesystem
+
+
+@pytest.fixture
+def no_sleep():
+    """Mock time.sleep to prevent delays in tests."""
+    with patch("time.sleep"):
+        yield
+
+
+@pytest.fixture
+def fast_tempfiles():
+    """Mock temporary file creation for faster tests."""
+
+    def mock_mkdtemp(*args, **kwargs):
+        return f"/tmp/mock_temp_{id(args)}"
+
+    def mock_mkstemp(*args, **kwargs):
+        fd = 123
+        path = f"/tmp/mock_temp_file_{id(args)}"
+        return fd, path
+
+    with patch("tempfile.mkdtemp", side_effect=mock_mkdtemp), patch("tempfile.mkstemp", side_effect=mock_mkstemp):
+        yield
+
+
+@pytest.fixture
+def mock_subprocess():
+    """Mock subprocess calls to avoid external process execution."""
+    mock_result = Mock()
+    mock_result.returncode = 0
+    mock_result.stdout = b"mock output"
+    mock_result.stderr = b""
+
+    with (
+        patch("subprocess.run", return_value=mock_result),
+        patch("subprocess.call", return_value=0),
+        patch("subprocess.check_output", return_value=b"mock output"),
+    ):
+        yield mock_result
+
+
+@pytest.fixture
+def fast_network_calls():
+    """Mock all network calls for faster tests."""
+    network = FastNetworkMock()
+
+    with (
+        patch("requests.get", side_effect=network.mock_requests_get),
+        patch("requests.post", side_effect=network.mock_requests_get),
+        patch("urllib.request.urlopen") as mock_urlopen,
+    ):
+        mock_response = Mock()
+        mock_response.read.return_value = b'{"status": "ok"}'
+        mock_response.status = 200
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        yield network
+
+
+# Additional specialized mocking fixtures
+
+
+@pytest.fixture
+def fast_crypto():
+    """Mock cryptographic operations for speed."""
+    crypto_mocks = FastCryptoMocks()
+
+    with patch.dict("sys.modules", {"hashlib": Mock(**crypto_mocks.mock_hashlib())}):
+        yield crypto_mocks
+
+
+@pytest.fixture
+def fast_compression():
+    """Mock compression operations for speed."""
+    compression_mocks = FastCompressionMocks()
+
+    with (
+        patch("zipfile.ZipFile", side_effect=lambda *a, **k: compression_mocks.create_mock_zipfile()),
+        patch("tarfile.open", side_effect=lambda *a, **k: compression_mocks.create_mock_tarfile()),
+    ):
+        yield compression_mocks
+
+
+@pytest.fixture
+def fast_cache():
+    """Provide fast in-memory cache mock."""
+    return FastCacheMocks()
+
+
+@pytest.fixture
+def no_logging():
+    """Disable logging for performance."""
+    logging_mocks = FastLoggingMocks()
+
+    with patch.dict("sys.modules", {"logging": Mock(**logging_mocks.mock_logging_module())}):
+        yield
+
+
+@pytest.fixture
+def ultra_fast_env():
+    """Complete ultra-fast environment with ALL performance mocks enabled."""
+    return setup_ultra_fast_environment()
+
+
+@pytest.fixture
+def fast_secure_hasher():
+    """Mock the SecureFileHasher for instant hashing."""
+    from tests.additional_mock_utils import FastSecureHasherMock
+
+    with patch("modelaudit.utils.secure_hasher.SecureFileHasher", FastSecureHasherMock):
+        yield FastSecureHasherMock()
