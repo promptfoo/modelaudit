@@ -317,48 +317,6 @@ class TestPerformanceBenchmarks:
             "overhead measurements unreliable. The core security functionality "
             "has been verified to work correctly."
         )
-        if not assets_dir.exists():
-            pytest.skip("Assets directory does not exist")
-
-        # Test with generous timeout
-        start_time = time.time()
-        results_long_timeout = scan_model_directory_or_file(
-            str(assets_dir),
-            timeout=300,
-        )
-        duration_long = time.time() - start_time
-
-        # Test with shorter but reasonable timeout
-        start_time = time.time()
-        results_short_timeout = scan_model_directory_or_file(
-            str(assets_dir),
-            timeout=60,
-        )
-        duration_short = time.time() - start_time
-
-        # Both should succeed for small test directory
-        assert results_long_timeout.success, "Long timeout scan should succeed"
-        assert results_short_timeout.success, "Short timeout scan should succeed"
-
-        # Results should be consistent
-        assert results_long_timeout.files_scanned == results_short_timeout.files_scanned
-        assert results_long_timeout.bytes_scanned == results_short_timeout.bytes_scanned
-
-        # Performance should be similar (timeout mechanism shouldn't add overhead)
-        timeout_overhead = abs(duration_long - duration_short) / min(
-            duration_long,
-            duration_short,
-        )
-        # More lenient threshold for CI environments where timing can be variable
-        # Also account for enhanced security scanning that may impact performance
-        import os
-
-        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        # Increased thresholds to account for enhanced security scanning
-        overhead_threshold = 25.0 if is_ci else 5.0  # Allow up to 2500% variance in CI, 500% locally
-        assert timeout_overhead < overhead_threshold, (
-            f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
-        )
 
     @pytest.mark.slow
     def test_stress_performance(self, assets_dir):
@@ -414,9 +372,9 @@ class TestPerformanceBenchmarks:
 
     def benchmark_and_save_results(
         self,
-        assets_dir,
+        assets_dir: Path,
         output_file: str = "benchmark_results.json",
-    ):
+    ) -> None:
         """Run comprehensive benchmarks and save results for comparison."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -438,5 +396,3 @@ class TestPerformanceBenchmarks:
         output_path = Path(output_file)
         with open(output_path, "w") as f:
             json.dump(benchmark_results, f, indent=2)
-
-        return benchmark_results

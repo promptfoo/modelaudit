@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from ..utils.secure_hasher import SecureFileHasher
 
@@ -36,7 +36,7 @@ class ScanResultsCache:
     └── xy/zw/xyzw...gh.json
     """
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: str | None = None):
         """
         Initialize the scan results cache.
 
@@ -51,7 +51,7 @@ class ScanResultsCache:
 
         self._ensure_metadata_exists()
 
-    def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
+    def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
         """
         Get cached scan result if available and valid with optimized file system calls.
 
@@ -105,7 +105,7 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-    def get_cached_result_by_key(self, cache_key: str) -> Optional[dict[str, Any]]:
+    def get_cached_result_by_key(self, cache_key: str) -> dict[str, Any] | None:
         """
         Get cached scan result by pre-generated cache key (for performance optimization).
 
@@ -143,7 +143,7 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
+    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
         """
         Store scan result in cache with optimized file system calls.
 
@@ -195,7 +195,7 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
 
-    def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result] = None) -> Optional[str]:
+    def _generate_cache_key(self, file_path: str, file_stat: os.stat_result | None = None) -> str | None:
         """
         Generate cache key from file hash and version info.
 
@@ -504,7 +504,7 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to record cache hit: {e}")
 
-    def _record_cache_miss(self, reason: str = "unknown"):
+    def _record_cache_miss(self, reason: str = "unknown") -> None:
         """Record a cache miss in statistics."""
         try:
             metadata = self._load_cache_metadata()

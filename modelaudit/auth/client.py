@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 import requests
 
@@ -11,7 +11,7 @@ from .config import cloud_config, get_user_email
 logger = logging.getLogger("modelaudit.auth")
 
 
-def fetch_with_proxy(url: str, **kwargs) -> requests.Response:
+def fetch_with_proxy(url: str, **kwargs: Any) -> requests.Response:
     """Fetch with proxy support, mirroring promptfoo's fetchWithProxy."""
     # Set default timeout
     kwargs.setdefault("timeout", 30)
@@ -61,7 +61,7 @@ class CloudApp:
 class AuthClient:
     """Handles authentication API calls - mirrors promptfoo's CloudConfig methods."""
 
-    def validate_and_set_api_token(self, token: str, api_host: Optional[str] = None) -> dict[str, Any]:
+    def validate_and_set_api_token(self, token: str, api_host: str | None = None) -> dict[str, Any]:
         """
         Validate API token and set configuration - mirrors promptfoo's validateAndSetApiToken.
 

@@ -6,7 +6,7 @@ that could be used for data exfiltration or command & control operations.
 
 import ipaddress
 import re
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, ClassVar
 
 
 class NetworkCommDetector:
@@ -158,7 +158,7 @@ class NetworkCommDetector:
     # via config parameter if they have specific domains to block
     BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = []
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the detector with optional configuration."""
         self.config = config or {}
         self.findings: list[dict[str, Any]] = []
@@ -167,7 +167,7 @@ class NetworkCommDetector:
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
         self.blacklisted_domains: list[bytes] = self.BLACKLISTED_DOMAINS.copy()
 
-        def _to_lower_bytes(value: Union[bytes, str]) -> bytes:
+        def _to_lower_bytes(value: bytes | str) -> bytes:
             return value.lower() if isinstance(value, bytes) else value.encode().lower()
 
         # Add custom patterns from config, normalizing to lowercase bytes
@@ -664,7 +664,7 @@ class NetworkCommDetector:
         return port_names.get(port, "Unknown")
 
 
-def detect_network_communication(file_path: str, config: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+def detect_network_communication(file_path: str, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Convenience function to scan a file for network communication patterns.
 
     Args:

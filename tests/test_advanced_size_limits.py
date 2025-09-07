@@ -1,6 +1,7 @@
 """Test that advanced file handler bypasses size limits for large files."""
 
 import tempfile
+from typing import Any
 from unittest.mock import patch
 
 from modelaudit.core import scan_file
@@ -108,7 +109,7 @@ class TestAdvancedSizeLimits:
 
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
             # Default config (no size limit)
-            config = {}
+            config: dict[str, Any] = {}
 
             with patch("modelaudit.core.os.path.getsize") as mock_core_size:
                 mock_core_size.return_value = huge_size

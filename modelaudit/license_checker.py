@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import requests
 
@@ -112,7 +112,7 @@ UNLICENSED_INDICATORS = [
 # SPDX license metadata
 SPDX_LICENSE_PATH = Path(__file__).with_name("spdx_licenses.json")
 SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
-_SPDX_LICENSES: Optional[dict[str, Any]] = None
+_SPDX_LICENSES: dict[str, Any] | None = None
 
 
 def load_spdx_license_data(download: bool = False) -> dict[str, Any]:
@@ -420,7 +420,7 @@ def _is_ml_model_directory(file_paths: list[str]) -> bool:
     return has_ml_files or (has_weight_files and has_config_files)
 
 
-def detect_agpl_components(scan_results: Union[dict[str, Any], Any]) -> list[str]:
+def detect_agpl_components(scan_results: dict[str, Any] | Any) -> list[str]:
     """
     Detect components that use AGPL licensing.
 
@@ -447,7 +447,7 @@ def detect_agpl_components(scan_results: Union[dict[str, Any], Any]) -> list[str
     return agpl_files
 
 
-def _get_spdx_info(spdx_id: str) -> Optional[dict[str, Any]]:
+def _get_spdx_info(spdx_id: str) -> dict[str, Any] | None:
     """Return SPDX metadata for a license ID if available."""
     licenses = load_spdx_license_data()
     return licenses.get(spdx_id)
@@ -510,9 +510,7 @@ def check_spdx_license_issues(scan_results: dict[str, Any], strict: bool = False
     return warnings
 
 
-def check_commercial_use_warnings(
-    scan_results: Union[dict[str, Any], Any], *, strict: bool = False
-) -> list[dict[str, Any]]:
+def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict: bool = False) -> list[dict[str, Any]]:
     """
     Check for common license warnings related to commercial use.
 

@@ -1,6 +1,6 @@
 import os
 import struct
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
@@ -17,7 +17,7 @@ class PyTorchBinaryScanner(BaseScanner):
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])

@@ -13,9 +13,11 @@ def test_check_class():
     check = Check(
         name="Test Check",
         status=CheckStatus.PASSED,
+        severity=IssueSeverity.INFO,
         message="Check passed successfully",
         location="/path/to/file",
         details={"test": "data"},
+        why=None,
     )
 
     assert check.name == "Test Check"

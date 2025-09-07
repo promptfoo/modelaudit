@@ -387,8 +387,8 @@ class TestFalsePositiveFixes:
                 "malicious_code": 'eval(\'__import__("os").system("malicious")\')',
             },
         }
-        with open(evil_manifest_path, "w") as f:
-            json.dump(malicious_manifest, f)
+        with open(evil_manifest_path, "w") as manifest_file:
+            json.dump(malicious_manifest, manifest_file)
 
         # Test directly with the scanner instead of CLI
         from modelaudit.scanners.manifest_scanner import ManifestScanner
@@ -503,10 +503,11 @@ class TestFalsePositiveFixes:
             sys.stdout = StringIO()
             sys.stderr = StringIO()
 
+            exit_code = 0
             try:
-                exit_code = cli_main()
+                cli_main()
             except SystemExit as e:
-                exit_code = e.code
+                exit_code = int(e.code or 0)
 
             stdout_content = sys.stdout.getvalue()
             stderr_content = sys.stderr.getvalue()

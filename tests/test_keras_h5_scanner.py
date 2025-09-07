@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 
@@ -32,7 +33,7 @@ def create_mock_h5_file(tmp_path, *, malicious=False):
 
     with h5py.File(h5_path, "w") as f:
         # Create a minimal Keras model structure
-        model_config = {
+        model_config: dict[str, Any] = {
             "class_name": "Sequential",
             "config": {
                 "name": "sequential",
