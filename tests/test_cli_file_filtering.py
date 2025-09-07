@@ -28,7 +28,7 @@ def test_cli_skip_files_default(mock_cli_scan_command):
         output_text = result.output
         start_idx = output_text.find("{")
         assert start_idx != -1, f"No JSON found in output: {result.output}"
-        
+
         # Find the matching closing brace
         brace_count = 0
         end_idx = start_idx
@@ -40,7 +40,7 @@ def test_cli_skip_files_default(mock_cli_scan_command):
                 if brace_count == 0:
                     end_idx = i + 1
                     break
-        
+
         json_text = output_text[start_idx:end_idx]
         output = json.loads(json_text)
 
@@ -66,7 +66,7 @@ def test_cli_strict_mode(mock_cli_scan_command):
         output_text = result.output
         start_idx = output_text.find("{")
         assert start_idx != -1, f"No JSON found in output: {result.output}"
-        
+
         # Find the matching closing brace
         brace_count = 0
         end_idx = start_idx
@@ -78,7 +78,7 @@ def test_cli_strict_mode(mock_cli_scan_command):
                 if brace_count == 0:
                     end_idx = i + 1
                     break
-        
+
         json_text = output_text[start_idx:end_idx]
         output = json.loads(json_text)
 
@@ -103,7 +103,7 @@ def test_cli_smart_default_skip_files(mock_cli_scan_command):
         output_text = result.output
         start_idx = output_text.find("{")
         assert start_idx != -1, f"No JSON found in output: {result.output}"
-        
+
         # Find the matching closing brace
         brace_count = 0
         end_idx = start_idx
@@ -115,7 +115,7 @@ def test_cli_smart_default_skip_files(mock_cli_scan_command):
                 if brace_count == 0:
                     end_idx = i + 1
                     break
-        
+
         json_text = output_text[start_idx:end_idx]
         output = json.loads(json_text)
 
