@@ -2701,7 +2701,7 @@ class PickleScanner(BaseScanner):
             import contextlib
 
             with contextlib.suppress(NameError):
-                sys.setrecursionlimit(original_recursion_limit)
+                sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
         return result
 

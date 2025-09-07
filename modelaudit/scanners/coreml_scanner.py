@@ -4,7 +4,7 @@ from typing import ClassVar
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:  # pragma: no cover - optional dependency
-    from coremltools.proto import Model_pb2
+    from coremltools.proto import Model_pb2  # type: ignore[possibly-unbound-import]
 
     HAS_COREML = True
 except Exception:  # pragma: no cover - optional dependency
