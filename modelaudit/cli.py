@@ -1262,6 +1262,10 @@ def scan_command(
                     click.echo(f"Error scanning {path}: {e!s}", err=True)
                     audit_result.has_errors = True
 
+                    # Track the actual path for SBOM generation even if scanning failed
+                    # This prevents FileNotFoundError when SBOM tries to access original URLs
+                    scanned_paths.append(actual_path)
+
                     # Report error to progress tracker
                     if progress_tracker:
                         progress_tracker.report_error(e)
@@ -1270,6 +1274,10 @@ def scan_command(
                 # Catch any other exceptions from the outer try block
                 logger.error(f"Unexpected error processing {path}: {e!s}", exc_info=verbose)
                 click.echo(f"Unexpected error processing {path}: {e!s}", err=True)
+
+                # Track the actual path for SBOM generation even if processing failed
+                # This prevents FileNotFoundError when SBOM tries to access original URLs
+                scanned_paths.append(actual_path)
                 audit_result.has_errors = True
 
                 # Report error to progress tracker
