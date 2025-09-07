@@ -4,7 +4,8 @@ import functools
 import logging
 import random
 import time
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import click
 
@@ -16,7 +17,7 @@ T = TypeVar("T")
 class RetryError(Exception):
     """Raised when all retry attempts fail."""
 
-    def __init__(self, message: str, last_error: Optional[Exception] = None):
+    def __init__(self, message: str, last_error: Exception | None = None):
         super().__init__(message)
         self.last_error = last_error
 
@@ -28,7 +29,7 @@ def exponential_backoff(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
-    retry_on: Optional[tuple[type[Exception], ...]] = None,
+    retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
 ) -> Callable[..., T]:
     """
@@ -102,7 +103,7 @@ def retry_with_backoff(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
-    retry_on: Optional[tuple[type[Exception], ...]] = None,
+    retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """

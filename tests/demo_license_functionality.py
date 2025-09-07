@@ -177,7 +177,7 @@ def demonstrate_license_features():
     print(f"   ⚠️  License issues detected: {len(license_issues)}")
 
     # Categorize license issues
-    issue_types = {}
+    issue_types: dict[str, int] = {}
     for issue in license_issues:
         message = issue.get("message", "")
         if "AGPL" in message:

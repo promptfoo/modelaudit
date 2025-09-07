@@ -21,7 +21,9 @@ def test_issue_with_why_field():
         message="Test security issue",
         severity=IssueSeverity.CRITICAL,
         location="test.pkl",
+        timestamp=0.0,
         why="This is dangerous because it can execute arbitrary code.",
+        type=None,
     )
 
     # Test that the why field is stored
@@ -39,6 +41,9 @@ def test_issue_without_why_field():
         message="Test security issue",
         severity=IssueSeverity.WARNING,
         location="test.pkl",
+        timestamp=0.0,
+        why=None,
+        type=None,
     )
 
     # Test that why field is None
@@ -111,7 +116,7 @@ def test_pickle_scanner_includes_why():
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system
-        assert any("system" in issue.why.lower() for issue in system_issues)
+        assert any("system" in (issue.why or "").lower() for issue in system_issues)
 
     finally:
         import os

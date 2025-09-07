@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
@@ -30,7 +30,7 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
@@ -168,7 +168,7 @@ class KerasH5Scanner(BaseScanner):
                     training_config = json.loads(f.attrs["training_config"])
                     if "metrics" in training_config and training_config["metrics"] is not None:
                         metrics_list = training_config["metrics"]
-                        if not isinstance(metrics_list, (list, tuple)):
+                        if not isinstance(metrics_list, list | tuple):
                             metrics_list = []
                         for metric in metrics_list:
                             if isinstance(metric, dict) and metric.get(

@@ -30,6 +30,8 @@ def create_mock_scan_result(**kwargs):
                 location=issue_dict.get("location"),
                 timestamp=time.time(),
                 details=issue_dict.get("details", {}),
+                why=None,
+                type=None,
             )
             issues.append(issue)
         result.issues = issues

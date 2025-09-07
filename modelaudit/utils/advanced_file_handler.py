@@ -10,9 +10,10 @@ import mmap
 import os
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..scanners.base import IssueSeverity, ScanResult
 
@@ -46,7 +47,7 @@ class ShardedModelDetector:
     ]
 
     @classmethod
-    def detect_shards(cls, file_path: str) -> Optional[dict[str, Any]]:
+    def detect_shards(cls, file_path: str) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
 
@@ -82,7 +83,7 @@ class ShardedModelDetector:
         return None
 
     @classmethod
-    def find_model_config(cls, file_path: str) -> Optional[str]:
+    def find_model_config(cls, file_path: str) -> str | None:
         """Find the configuration file for a sharded model."""
         dir_path = Path(file_path).parent
 
@@ -118,7 +119,7 @@ class MemoryMappedScanner:
         self.scanner = scanner
         self.file_size = os.path.getsize(file_path)
 
-    def scan_with_mmap(self, progress_callback: Optional[Callable[[str, float], None]] = None) -> ScanResult:
+    def scan_with_mmap(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         """
         Scan file using memory mapping.
 
@@ -238,7 +239,7 @@ class ParallelShardScanner:
         self.shard_info = shard_info
         self.scanner_class = scanner_class
 
-    def scan_shards(self, progress_callback: Optional[Callable[[str, float], None]] = None) -> ScanResult:
+    def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         """
         Scan all shards in parallel.
 
@@ -306,7 +307,7 @@ class AdvancedFileHandler:
         self,
         file_path: str,
         scanner: Any,
-        progress_callback: Optional[Callable[[str, float], None]] = None,
+        progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 7200,  # 2 hours for large models
     ):
         """
@@ -489,7 +490,7 @@ def should_use_advanced_handler(file_path: str) -> bool:
 def scan_advanced_large_file(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
 ) -> ScanResult:
     """
@@ -541,7 +542,7 @@ def scan_advanced_large_file(
 def _scan_advanced_large_file_internal(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
 ) -> ScanResult:
     """

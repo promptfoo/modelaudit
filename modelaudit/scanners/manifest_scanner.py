@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
 
@@ -19,7 +19,7 @@ except ImportError:
     # Create a placeholder function when the module is not available
     def check_model_name_policies(
         model_name: str,
-        additional_patterns: Optional[list[str]] = None,
+        additional_patterns: list[str] | None = None,
     ) -> tuple[bool, str]:
         return False, ""
 
@@ -71,7 +71,7 @@ class ManifestScanner(BaseScanner):
     description = "Scans model manifest and configuration files for suspicious content and blacklisted names"
     supported_extensions = MANIFEST_EXTENSIONS
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])
@@ -278,8 +278,8 @@ class ManifestScanner(BaseScanner):
         self,
         path: str,
         ext: str,
-        result: Optional[ScanResult] = None,
-    ) -> Optional[dict[str, Any]]:
+        result: ScanResult | None = None,
+    ) -> dict[str, Any] | None:
         """Parse the file based on its extension"""
         try:
             with open(path, encoding="utf-8") as f:
@@ -323,7 +323,7 @@ class ManifestScanner(BaseScanner):
 
         return None
 
-    def _extract_license_info(self, content: dict[str, Any]) -> Optional[str]:
+    def _extract_license_info(self, content: dict[str, Any]) -> str | None:
         """Return license string if found in manifest content"""
 
         potential_keys = ["license", "licence", "licenses"]
@@ -349,7 +349,7 @@ class ManifestScanner(BaseScanner):
         # STEP 1: Detect ML context for smart filtering
         ml_context = self._detect_ml_context(content)
 
-        def check_dict(d, prefix: str = "") -> None:
+        def check_dict(d: Any, prefix: str = "") -> None:
             if not isinstance(d, dict):
                 return
 
@@ -495,7 +495,7 @@ class ManifestScanner(BaseScanner):
 
     def _detect_ml_context(self, content: dict[str, Any]) -> dict[str, Any]:
         """Detect ML model context to adjust sensitivity"""
-        indicators = {
+        indicators: dict[str, Any] = {
             "framework": None,
             "model_type": None,
             "confidence": 0,

@@ -10,7 +10,7 @@ import os
 import pickle
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import py7zr as _py7zr
@@ -200,7 +200,7 @@ def generate_empty_7z(assets_dir: Path) -> None:
     print(f"Created {empty_7z}")
 
 
-def generate_all_7z_assets(assets_dir: Optional[Path] = None) -> None:
+def generate_all_7z_assets(assets_dir: Path | None = None) -> None:
     """Generate all 7z test assets"""
     if assets_dir is None:
         # Default to tests/assets directory

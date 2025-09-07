@@ -207,6 +207,8 @@ def test_issue_class():
         severity=IssueSeverity.WARNING,
         location="test.pkl",
         details={"key": "value"},
+        why=None,
+        type=None,
     )
 
     # Test properties
