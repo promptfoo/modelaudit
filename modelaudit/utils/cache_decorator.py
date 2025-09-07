@@ -6,7 +6,10 @@ duplicate caching logic between core.py and scanners/base.py.
 
 import functools
 import logging
+import os
 from typing import Any, Callable, Optional, TypeVar
+
+from ..cache.optimized_config import get_config_extractor
 
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
@@ -37,17 +40,16 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
     """
 
     def decorator(func: F) -> F:
+        # Initialize optimized config extractor once
+        config_extractor = get_config_extractor()
+        
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            # Extract config and path from arguments
-            config, file_path = _extract_config_and_path(args, kwargs)
+            # Use optimized configuration extraction
+            cache_config, file_path = config_extractor.extract_fast(args, kwargs)
 
-            # Check cache configuration
-            cache_enabled = config.get(cache_enabled_key, True) if config else True
-            cache_dir = config.get(cache_dir_key) if config else None
-
-            # If caching is disabled, call function directly
-            if not cache_enabled:
+            # Fast path for disabled caching
+            if not cache_config.enabled:
                 logger.debug(f"Cache disabled for {file_path}, calling function directly")
                 return func(*args, **kwargs)
 
@@ -55,12 +57,26 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             if not file_path:
                 logger.debug("No file path found, calling function directly")
                 return func(*args, **kwargs)
+            
+            # Check if file should be cached based on characteristics
+            try:
+                file_stat = os.stat(file_path)
+                file_ext = os.path.splitext(file_path)[1]
+                
+                if not cache_config.should_cache_file(file_stat.st_size, file_ext):
+                    logger.debug(f"File {file_path} not suitable for caching, calling function directly")
+                    return func(*args, **kwargs)
+                    
+            except OSError:
+                # File doesn't exist or can't be accessed, call function directly
+                logger.debug(f"Cannot access {file_path}, calling function directly")
+                return func(*args, **kwargs)
 
             # Use cache manager for cache-enabled operations
             try:
                 from ..cache import get_cache_manager
 
-                cache_manager = get_cache_manager(cache_dir, enabled=True)
+                cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
 
                 def cached_func_wrapper(fpath: str) -> dict:
                     """Wrapper function for cache manager"""
@@ -76,9 +92,19 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         logger.warning(f"Unexpected result type {type(result)} for caching")
                         return {"result": str(result), "success": True}
 
-                # Get cached result or perform scan
+                # Use optimized cache lookup with stat reuse
                 logger.debug(f"Attempting cached scan for {file_path}")
-                result_dict = cache_manager.cached_scan(file_path, cached_func_wrapper)
+                
+                # Try cache first with optimized lookup
+                cached_result = cache_manager.get_cached_result_with_stat(file_path, file_stat)
+                
+                if cached_result is not None:
+                    logger.debug(f"Cache hit for {os.path.basename(file_path)}")
+                    result_dict = cached_result
+                else:
+                    # Cache miss - perform scan
+                    logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
+                    result_dict = cached_func_wrapper(file_path)
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:
