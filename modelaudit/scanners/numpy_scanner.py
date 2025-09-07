@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Import NumPy with compatibility handling
-np: Any
-fmt: Any
 try:
     import numpy as np
 
@@ -20,7 +18,10 @@ try:
     except (ImportError, AttributeError):
         # Fallback for potential import issues
         NUMPY_FORMAT_AVAILABLE = False
-        fmt = None
+        if TYPE_CHECKING:
+            import numpy.lib.format as fmt  # type: ignore[no-redef]
+        else:
+            fmt = None  # type: ignore[assignment]
 
     NUMPY_AVAILABLE = True
     NUMPY_VERSION = getattr(np, "__version__", "unknown")
@@ -30,8 +31,12 @@ except ImportError:
     NUMPY_FORMAT_AVAILABLE = False
     NUMPY_VERSION = "not available"
     NUMPY_MAJOR_VERSION = 0
-    np = None
-    fmt = None
+    if TYPE_CHECKING:
+        import numpy as np  # type: ignore[no-redef]
+        import numpy.lib.format as fmt  # type: ignore[no-redef]
+    else:
+        np = None  # type: ignore[assignment]
+        fmt = None  # type: ignore[assignment]
 
 
 class NumPyScanner(BaseScanner):

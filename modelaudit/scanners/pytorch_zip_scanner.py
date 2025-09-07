@@ -705,7 +705,7 @@ class PyTorchZipScanner(BaseScanner):
                                 version_info["pytorch_framework_version"] = meta_data[key]
                                 version_info["pytorch_version_source"] = f"metadata:{meta_file}"
                                 break
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                    except (json.JSONDecodeError, UnicodeDecodeError):  # type: ignore[possibly-unresolved-reference]
                         continue
 
         except Exception:

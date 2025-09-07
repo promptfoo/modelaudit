@@ -7,9 +7,20 @@ from typing import Any, ClassVar
 try:
     import msgpack
 
+    # Try to import exceptions module - not available in all msgpack versions
+    try:
+        from msgpack import exceptions as msgpack_exceptions
+
+        HAS_MSGPACK_EXCEPTIONS = True
+    except (ImportError, AttributeError):
+        msgpack_exceptions = None  # type: ignore[assignment]
+        HAS_MSGPACK_EXCEPTIONS = False
+
     HAS_MSGPACK = True
 except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK = False
+    HAS_MSGPACK_EXCEPTIONS = False
+    msgpack_exceptions = None  # type: ignore[assignment]
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -826,34 +837,54 @@ class FlaxMsgpackScanner(BaseScanner):
             try:
                 obj = msgpack.unpackb(file_data, raw=False, strict_map_key=False)
                 # If we get here, the entire file was valid msgpack - no trailing data
-            except msgpack.exceptions.ExtraData:
-                # This means there's extra data after valid msgpack
-                result.add_check(
-                    name="Msgpack Stream Integrity Check",
-                    passed=False,
-                    message="Extra trailing data found after msgpack content",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"has_trailing_data": True},
-                )
-                # Unpack just the first object
-                unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
-                unpacker.feed(file_data)
-                obj = unpacker.unpack()
-            except (
-                msgpack.exceptions.UnpackException,
-                msgpack.exceptions.OutOfData,
-            ) as e:
-                result.add_check(
-                    name="Msgpack Format Validation",
-                    passed=False,
-                    message=f"Invalid msgpack format: {e!s}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"msgpack_error": str(e)},
-                )
-                result.finish(success=False)
-                return result
+            except Exception as e:
+                # Check if this is the specific ExtraData exception we're looking for
+                extra_data_detected = False
+                if (
+                    HAS_MSGPACK_EXCEPTIONS
+                    and msgpack_exceptions
+                    and hasattr(msgpack_exceptions, "ExtraData")
+                    and isinstance(e, msgpack_exceptions.ExtraData)
+                ):
+                    extra_data_detected = True
+
+                if extra_data_detected:
+                    # This means there's extra data after valid msgpack
+                    result.add_check(
+                        name="Msgpack Stream Integrity Check",
+                        passed=False,
+                        message="Extra trailing data found after msgpack content",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={"has_trailing_data": True},
+                    )
+                    # Unpack just the first object
+                    unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
+                    unpacker.feed(file_data)
+                    try:
+                        obj = unpacker.unpack()
+                    except Exception as unpack_e:
+                        result.add_check(
+                            name="Msgpack Parse Check",
+                            passed=False,
+                            message=f"Failed to parse msgpack data: {unpack_e}",
+                            severity=IssueSeverity.WARNING,
+                            location=path,
+                            details={"parse_error": str(unpack_e)},
+                        )
+                        return result
+                else:
+                    # Handle other msgpack exceptions
+                    result.add_check(
+                        name="Msgpack Format Validation",
+                        passed=False,
+                        message=f"Invalid msgpack format: {e!s}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"msgpack_error": str(e)},
+                    )
+                    result.finish(success=False)
+                    return result
 
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__

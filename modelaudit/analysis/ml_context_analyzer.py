@@ -235,7 +235,7 @@ class MLContextAnalyzer:
         self, function_call: str, stack_context: list[str], file_context: str | None = None
     ) -> MLFramework:
         """Detect ML framework from context."""
-        framework_scores: dict[MLFramework, float] = dict.fromkeys(MLFramework, 0.0)
+        framework_scores: dict[MLFramework, float] = {framework: 0.0 for framework in MLFramework}  # noqa: C420
 
         # Analyze function call
         for framework, patterns in self.framework_patterns.items():

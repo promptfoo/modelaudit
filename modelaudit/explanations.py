@@ -266,7 +266,7 @@ def get_explanation(category: str, specific_item: str | None = None) -> str | No
     Returns:
         A security-team-friendly explanation, or None if not found
     """
-    # Use pattern matching for cleaner category-based lookups
+    # Use pattern matching for cleaner category-based lookups (Python 3.10+)
     match category:
         case "import" if specific_item in DANGEROUS_IMPORTS:
             return DANGEROUS_IMPORTS[specific_item]

@@ -444,7 +444,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         This is more efficient than converting to dict first and provides better type safety.
         """
         # Import here to avoid circular import
-        from ..scanners.base import Check, Issue, ScanResult
+        from ..scanners.base import Check, Issue, ScanResult  # type: ignore[import-untyped]
 
         if not isinstance(scan_result, ScanResult):
             raise TypeError(f"Expected ScanResult, got {type(scan_result)}")

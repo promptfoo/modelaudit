@@ -429,6 +429,7 @@ torch==2.8.0
 tqdm==4.67.1
     # via coremltools
     # via huggingface-hub
+ty==0.0.1a20
 types-click==7.1.8
 types-protobuf==6.30.2.20250516
     # via types-tensorflow

@@ -300,10 +300,14 @@ def benchmark_hashing_performance(test_file_path: str, iterations: int = 3) -> d
     if not os.path.isfile(test_file_path):
         raise ValueError(f"Test file does not exist: {test_file_path}")
 
+    if iterations <= 0:
+        raise ValueError("Iterations must be greater than 0")
+
     hasher = SecureFileHasher()
     file_size = os.path.getsize(test_file_path)
 
     times = []
+    first_hash = None
     for i in range(iterations):
         start_time = time.time()
         hash_result = hasher.hash_file(test_file_path)
@@ -318,6 +322,9 @@ def benchmark_hashing_performance(test_file_path: str, iterations: int = 3) -> d
 
     avg_time = sum(times) / len(times)
     throughput_mbps = (file_size / (1024 * 1024)) / avg_time
+
+    # At this point first_hash is guaranteed to be set since iterations > 0
+    assert first_hash is not None, "Internal error: first_hash should be set"
 
     return {
         "file_size_mb": file_size / (1024 * 1024),

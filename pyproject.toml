@@ -145,6 +145,7 @@ dev-dependencies = [
     "pytest-xdist>=3.7.0",
     "pytest-asyncio>=1.1.0",
     "pyupgrade>=3.20.0",
+    "ty>=0.0.1a20",
 ]
 
 [tool.ruff]
@@ -214,7 +215,7 @@ python_version = "3.10"
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
 warn_unused_configs = true     # Warn about unused config options
-warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_unused_ignores = false    # Allow type: ignore comments for multiple tools (ty, mypy)
 warn_redundant_casts = true    # Remove unnecessary casts
 warn_unreachable = true        # Detect unreachable code
 no_implicit_optional = true    # Require Optional[] for None defaults
@@ -261,3 +262,64 @@ warn_unreachable = false
 module = "modelaudit.scanners.oci_layer_scanner"
 # Runtime validation needs to check types even with annotations
 warn_unreachable = false
+
+[tool.ty]
+# ty configuration for advanced type checking
+
+[tool.ty.environment]
+# Use the minimum Python version from requires-python
+python-version = "3.10"
+# Include both main source and test directories
+root = [".", "./modelaudit", "./tests"]
+
+[tool.ty.src]
+# Include main source and tests for type checking
+include = ["modelaudit", "tests"]
+# Exclude generated files, assets, and cache directories
+exclude = [
+    "tests/assets/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**", 
+    "**/build/**",
+    "**/dist/**",
+    "picklescan/**",      # Legacy code that might be removed
+    "modelscan/**",       # Legacy code that might be removed
+]
+
+[tool.ty.rules]
+# Start with conservative configuration to avoid overwhelming output
+# Error level rules (will cause ty to exit with non-zero code)
+"unresolved-import" = "error"
+"unresolved-reference" = "error"
+"invalid-argument-type" = "error"
+"invalid-assignment" = "error"
+"invalid-return-type" = "error"
+"call-non-callable" = "error"
+"missing-argument" = "error"
+"too-many-positional-arguments" = "error"
+"unknown-argument" = "error"
+"parameter-already-assigned" = "error"
+"no-matching-overload" = "error"
+
+# Warning level rules (useful feedback but don't fail CI)
+"possibly-unresolved-reference" = "warn"
+"possibly-unbound-attribute" = "warn" 
+"deprecated" = "warn"
+"redundant-cast" = "warn"
+
+# Ignore rules that may be too noisy initially
+"division-by-zero" = "ignore"
+"unused-ignore-comment" = "ignore"
+
+[tool.ty.terminal]
+# Use concise output format for better readability in CI
+output-format = "concise"
+# Don't fail on warnings initially - focus on errors first
+error-on-warning = false
+
+# Override configuration for test files - be more permissive
+[[tool.ty.overrides]]
+include = ["tests/**"]
+[tool.ty.overrides.rules]
+"possibly-unresolved-reference" = "ignore"
+"invalid-argument-type" = "warn"  # Tests often use dynamic fixtures

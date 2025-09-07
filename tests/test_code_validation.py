@@ -26,20 +26,20 @@ def hello():
         invalid_code = "def broken(:\n    pass"
         is_valid, error = validate_python_syntax(invalid_code)
         assert is_valid is False
-        assert "Syntax error" in error
-        assert "line 1" in error
+        assert error is not None and "Syntax error" in error
+        assert error is not None and "line 1" in error
 
     def test_empty_code(self):
         """Test validation of empty code."""
         is_valid, error = validate_python_syntax("")
         assert is_valid is False
-        assert "Empty" in error
+        assert error is not None and "Empty" in error
 
     def test_none_code(self):
         """Test validation of None input."""
-        is_valid, error = validate_python_syntax(None)
+        is_valid, error = validate_python_syntax(None)  # type: ignore[arg-type]
         assert is_valid is False
-        assert "invalid" in error
+        assert error is not None and "invalid" in error
 
     def test_complex_valid_code(self):
         """Test validation of complex valid code."""
