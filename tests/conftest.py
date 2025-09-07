@@ -13,6 +13,7 @@ from tests.additional_mock_utils import (
     FastCompressionMocks,
     FastCryptoMocks,
     FastLoggingMocks,
+    FastSecureHasherMock,
     setup_ultra_fast_environment,
 )
 
@@ -504,7 +505,5 @@ def ultra_fast_env():
 @pytest.fixture
 def fast_secure_hasher():
     """Mock the SecureFileHasher for instant hashing."""
-    from tests.additional_mock_utils import FastSecureHasherMock
-
     with patch("modelaudit.utils.secure_hasher.SecureFileHasher", FastSecureHasherMock):
         yield FastSecureHasherMock()

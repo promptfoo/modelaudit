@@ -49,11 +49,15 @@ class FastFileSystem:
 
     def stat(self, path: str) -> Mock:
         """Mock stat result."""
-        content = self._files.get(str(Path(path)), b"")
+        path_str = str(Path(path))
+        if not self.exists(path_str):
+            raise FileNotFoundError(path_str)
+        is_dir = self.is_dir(path_str)
+        content = b"" if is_dir else self._files[path_str]
         mock_stat = Mock()
-        mock_stat.st_size = len(content)
+        mock_stat.st_size = 0 if is_dir else len(content)
         mock_stat.st_mtime = time.time()
-        mock_stat.st_mode = 0o100644  # Regular file
+        mock_stat.st_mode = 0o040755 if is_dir else 0o100644
         return mock_stat
 
 
@@ -89,6 +93,8 @@ class FastMLMocks:
         torch_mock.__version__ = "2.0.0"
         torch_mock.load.return_value = {"model": "data"}
         torch_mock.jit.load.return_value = Mock()
+        torch_mock.cuda = MagicMock()
+        torch_mock.cuda.is_available.return_value = False
         return torch_mock
 
     @staticmethod
@@ -122,7 +128,8 @@ class FastScannerMocks:
         result.files_scanned = files_scanned
         result.bytes_scanned = bytes_scanned
         result.success = success
-        result.has_errors = len(result.issues) > 0 if issues else False
+        has_err = bool(result.issues)
+        result.has_errors = Mock(return_value=has_err)
         result.duration = 0.001  # Very fast mock scan
         result.scanner_names = ["mock_scanner"]
         result.assets = []
@@ -135,13 +142,13 @@ class FastScannerMocks:
         return result
 
 
-def fast_tempfile_mock():
+def fast_tempfile_mock() -> tuple[Any, Any]:
     """Mock tempfile operations with in-memory paths."""
 
-    def mock_mkdtemp(*args, **kwargs):
+    def mock_mkdtemp(*args, **kwargs) -> str:
         return f"/tmp/mock_temp_{id(args)}"
 
-    def mock_mkstemp(*args, **kwargs):
+    def mock_mkstemp(*args, **kwargs) -> tuple[int, str]:
         fd = 123
         path = f"/tmp/mock_temp_file_{id(args)}"
         return fd, path
@@ -149,14 +156,14 @@ def fast_tempfile_mock():
     return patch("tempfile.mkdtemp", side_effect=mock_mkdtemp), patch("tempfile.mkstemp", side_effect=mock_mkstemp)
 
 
-def fast_time_mock():
+def fast_time_mock() -> tuple[Any, Any]:
     """Mock time operations to avoid actual delays."""
     mock_time = 1000.0
 
-    def mock_time_func():
+    def mock_time_func() -> float:
         return mock_time
 
-    def mock_sleep(duration):
+    def mock_sleep(duration: float) -> None:
         nonlocal mock_time
         mock_time += duration
 
@@ -237,7 +244,7 @@ def mock_heavy_file_operations():
     return FileOpMocks()
 
 
-def mock_all_network_calls():
+def mock_all_network_calls() -> Any:
     """Mock all common network operations."""
     network_mock = FastNetworkMock()
 
