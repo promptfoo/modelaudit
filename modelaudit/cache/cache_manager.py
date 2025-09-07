@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .scan_results_cache import ScanResultsCache
+from .smart_cache_keys import SmartCacheKeyGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class CacheManager:
         """
         self.enabled = enabled
         self.cache = ScanResultsCache(cache_dir) if enabled else None
+        self.key_generator = SmartCacheKeyGenerator() if enabled else None
 
     def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
         """
@@ -43,6 +45,24 @@ class CacheManager:
             return None
 
         return self.cache.get_cached_result(file_path)
+
+    def get_cached_result_with_stat(self, file_path: str, stat_result: os.stat_result) -> dict[str, Any] | None:
+        """
+        Get cached scan result using existing stat result for optimized performance.
+
+        Args:
+            file_path: Path to file to check cache for
+            stat_result: Existing stat result to reuse
+
+        Returns:
+            Cached scan result or None if not found/disabled
+        """
+        if not self.enabled or not self.cache or not self.key_generator:
+            return None
+
+        # Use optimized key generation with stat reuse
+        cache_key = self.key_generator.generate_key_with_stat_reuse(file_path, stat_result)
+        return self.cache.get_cached_result_by_key(cache_key)
 
     def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
         """
