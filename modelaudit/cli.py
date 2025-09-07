@@ -686,6 +686,9 @@ def scan_command(
     # Track actual paths that were successfully scanned for SBOM generation
     # This prevents FileNotFoundError when URLs are downloaded to local paths
     scanned_paths: list[str] = []
+    
+    # Track temporary directories to clean up after SBOM generation
+    temp_dirs_to_cleanup: list[str] = []
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
@@ -1266,15 +1269,11 @@ def scan_command(
                     progress_tracker.report_error(e)
 
             finally:
-                # Clean up temporary directory if we downloaded a model
-                # Only clean up if we didn't use a user-specified cache directory
+                # Defer cleanup until after SBOM generation to avoid FileNotFoundError
                 if temp_dir and os.path.exists(temp_dir) and not final_cache_dir:
-                    try:
-                        shutil.rmtree(temp_dir)
-                        if verbose:
-                            logger.debug(f"Temporary directory removed: {temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                    temp_dirs_to_cleanup.append(temp_dir)
+                    if verbose:
+                        logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -1339,6 +1338,16 @@ def scan_command(
         sbom_text = generate_sbom(paths_for_sbom, audit_result.model_dump())
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
+
+    # Clean up temporary directories after SBOM generation
+    for temp_dir in temp_dirs_to_cleanup:
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                if verbose:
+                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
 
     # Format the output
     if final_format == "json":
