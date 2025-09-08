@@ -404,7 +404,6 @@ class XGBoostScanner(BaseScanner):
     def _validate_tree_structures(self, trees: list[dict], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
         for i, tree in enumerate(trees):
-
             # Check tree depth
             if "tree_param" in tree:
                 tree_param = tree["tree_param"]
