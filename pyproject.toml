@@ -102,6 +102,17 @@ all-ci = [
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
 ]
+# Lightweight profile for fast CI testing - only includes deps needed for mocked tests
+test-only = [
+    # Core testing framework
+    "pytest>=7.0.0",
+    "pytest-xdist>=3.0.0", 
+    "pytest-cov>=4.0.0",
+    "pytest-randomly>=3.12.0",
+    # Lightweight analysis libs (already in base deps, listed for clarity)
+    # numpy, scipy, pyyaml, requests, etc. come from base dependencies
+    # Skip heavy ML frameworks - our mocks handle TensorFlow, PyTorch, etc.
+]
 all = [
     "tensorflow>=2.13.0,<3.0",
     "h5py>=3.1,<4.0",

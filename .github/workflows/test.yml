@@ -77,9 +77,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rye-
 
-      - name: Sync dependencies
+      - name: Sync dependencies (lint only needs base)
         run: |
-          rye sync --features all-ci
+          rye sync
 
       - name: Lint with Ruff
         run: |
@@ -120,9 +120,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rye-
 
-      - name: Sync dependencies
+      - name: Sync dependencies (type checking only needs base)
         run: |
-          rye sync --features all-ci
+          rye sync
 
       - name: Type checking
         run: |
@@ -162,14 +162,15 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/rye
-          key: ${{ runner.os }}-rye-py3.12-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-rye-py3.12-test-only-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
           restore-keys: |
+            ${{ runner.os }}-rye-py3.12-test-only-
             ${{ runner.os }}-rye-py3.12-
             ${{ runner.os }}-rye-
 
-      - name: Sync dependencies
+      - name: Sync dependencies (fast test profile)
         run: |
-          rye sync --features all-ci
+          rye sync --features test-only
 
       - name: Run fast tests with fail-fast
         run: |
@@ -208,14 +209,15 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/rye
-          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-test-only-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
           restore-keys: |
+            ${{ runner.os }}-rye-py${{ matrix.python-version }}-test-only-
             ${{ runner.os }}-rye-py${{ matrix.python-version }}-
             ${{ runner.os }}-rye-
 
-      - name: Sync dependencies
+      - name: Sync dependencies (fast test profile)
         run: |
-          rye sync --features all-ci
+          rye sync --features test-only
 
       - name: Run fast tests with fail-fast (no coverage on PRs)
         if: github.event_name == 'pull_request'
@@ -231,6 +233,11 @@ jobs:
         if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
         run: |
           rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+
+      - name: Install full dependencies for integration tests
+        if: github.ref == 'refs/heads/main'
+        run: |
+          rye sync --features all-ci
 
       - name: Run slow/integration tests (if main branch)
         if: github.ref == 'refs/heads/main'
