@@ -109,9 +109,13 @@ test-only = [
     "pytest-xdist>=3.0.0", 
     "pytest-cov>=4.0.0",
     "pytest-randomly>=3.12.0",
-    # Lightweight analysis libs (already in base deps, listed for clarity)
+    # Lightweight ML libs that tests import directly (small and fast to install)
+    "safetensors>=0.4.0",     # Used by many tests, lightweight
+    "dill>=0.3.0,<1.0",       # Used by pickle tests, small
+    "joblib>=1.0.0,<2.0",     # Used by joblib tests, relatively small
+    "msgpack>=1.0.0,<2.0",    # Used by flax tests, small
+    # Skip heavy frameworks (TensorFlow ~500MB, PyTorch ~2GB) - our mocks handle these
     # numpy, scipy, pyyaml, requests, etc. come from base dependencies
-    # Skip heavy ML frameworks - our mocks handle TensorFlow, PyTorch, etc.
 ]
 all = [
     "tensorflow>=2.13.0,<3.0",
