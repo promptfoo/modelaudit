@@ -132,6 +132,20 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "patterns": [r"transformers\..*", r"tokenizers\..*"],
         "confidence_boost": 0.8,
     },
+    "xgboost": {
+        "modules": ["xgboost", "xgboost.core", "xgboost.sklearn"],
+        "classes": [
+            "Booster",
+            "DMatrix", 
+            "XGBClassifier",
+            "XGBRegressor",
+            "XGBRanker",
+            "XGBRFClassifier",
+            "XGBRFRegressor",
+        ],
+        "patterns": [r"xgboost\..*"],
+        "confidence_boost": 0.9,
+    },
 }
 
 # Safe ML-specific global patterns
@@ -166,6 +180,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "dill": ["dump", "dumps", "load", "loads", "copy"],
     "tensorflow": ["*"],
     "keras": ["*"],
+    # XGBoost safe patterns
+    "xgboost": ["*"],  # XGBoost operations are generally safe
+    "xgboost.core": ["*"],
+    "xgboost.sklearn": ["*"],
 }
 
 # Dangerous actual code execution patterns in strings
