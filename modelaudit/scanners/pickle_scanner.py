@@ -136,7 +136,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "modules": ["xgboost", "xgboost.core", "xgboost.sklearn"],
         "classes": [
             "Booster",
-            "DMatrix", 
+            "DMatrix",
             "XGBClassifier",
             "XGBRegressor",
             "XGBRanker",
@@ -150,7 +150,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "modules": ["mxnet", "mxnet.ndarray", "mxnet.gluon", "mxnet.symbol"],
         "classes": [
             "NDArray",
-            "Symbol", 
+            "Symbol",
             "Block",
             "HybridBlock",
             "Sequential",

@@ -31,12 +31,13 @@ This document details the implementation of MXNet model security scanning capabi
 **Background**: MXNet < 1.9.1 contains a Regular Expression Denial of Service (ReDoS) vulnerability where maliciously crafted operator names can cause catastrophic backtracking in regex processing, leading to CPU exhaustion.
 
 **Detection Approach**:
+
 ```python
 # Length-based detection
 if len(operator_name) > self.max_op_name_length:  # Default: 200 chars
     # Flag as potential CVE-2022-24294 exploit
 
-# Pattern-based detection  
+# Pattern-based detection
 redos_patterns = [
     r'.*(\(+.*\)+.*){10,}',      # Nested parentheses
     r'.*(\[+.*\]+.*){10,}',      # Nested brackets
@@ -48,6 +49,7 @@ redos_patterns = [
 ```
 
 **Pattern Refinement**: Initial implementation had false positives on legitimate operators like "FullyConnected". Fixed by:
+
 - Increasing thresholds (30+ underscores vs 20+)
 - More specific regex patterns targeting actual attack vectors
 - Focus on truly catastrophic patterns rather than simple repetition
@@ -55,6 +57,7 @@ redos_patterns = [
 ### Binary Format Security
 
 **MXNet NDArray Format Structure**:
+
 ```
 [16 bytes] Magic signature: \x12MXNET\x00\x00\x00\x89
 [4 bytes]  Reserved
@@ -68,6 +71,7 @@ redos_patterns = [
 ```
 
 **Security Validations**:
+
 - Magic signature verification to prevent format spoofing
 - Bounds checking on array count (max: 10,000 arrays)
 - Dimension validation (max: 8 dimensions per tensor)
@@ -79,6 +83,7 @@ redos_patterns = [
 **Risk Assessment**: Custom operators may require external code execution, posing security risks.
 
 **Detection Methods**:
+
 1. Explicit custom operator detection (`"op": "custom"`)
 2. Unknown operator identification (not in built-in MXNet operator set)
 3. Severity classification:
@@ -86,17 +91,19 @@ redos_patterns = [
    - **INFO**: Unknown operators (may be legitimate, newer versions, or typos)
 
 **Built-in Operator Whitelist**: 50+ known MXNet operators including:
+
 - Core: Convolution, FullyConnected, Activation, Pooling
 - Normalization: BatchNorm, Dropout
 - RNN: LSTM, RNN, GRU
 - Utility: Reshape, Transpose, Concat, Flatten
-- Special: null, Variable, _copy, _zeros, _ones
+- Special: null, Variable, \_copy, \_zeros, \_ones
 
 ## Implementation Details
 
 ### File Format Detection
 
 **MXNet Symbol JSON Detection**:
+
 ```python
 def can_handle(cls, path: str) -> bool:
     # 1. Extension check (.json)
@@ -111,6 +118,7 @@ def can_handle(cls, path: str) -> bool:
 ```
 
 **MXNet Binary Detection**:
+
 - Magic signature validation: `\x12MXNET\x00\x00\x00\x89`
 - File extension patterns: `.params`, `.nd`, `.ndarray`
 - Binary structure validation before processing
@@ -118,10 +126,11 @@ def can_handle(cls, path: str) -> bool:
 ### Integration with Existing Architecture
 
 **Scanner Registration** (`modelaudit/scanners/__init__.py`):
+
 ```python
 "mxnet_symbol": {
     "module": "modelaudit.scanners.mxnet_symbol_scanner",
-    "class": "MXNetSymbolScanner", 
+    "class": "MXNetSymbolScanner",
     "priority": 8,
     "dependencies": ["mxnet"],  # Optional - graceful degradation
 }
@@ -134,6 +143,7 @@ def can_handle(cls, path: str) -> bool:
 ```
 
 **Pickle Scanner Enhancement**:
+
 ```python
 ML_FRAMEWORK_PATTERNS["mxnet"] = {
     "modules": ["mxnet", "mxnet.ndarray", "mxnet.gluon", "mxnet.symbol"],
@@ -175,6 +185,7 @@ ML_SAFE_GLOBALS["mxnet"] = ["*"]  # MXNet classes generally safe
 ### Sample Attack Vectors Tested
 
 **CVE-2022-24294 Samples**:
+
 ```python
 # Length-based attack
 malicious_op = "a" * 500 + "b" * 500
@@ -185,6 +196,7 @@ redos_pattern = "a" + "a+" * 100  # Causes exponential backtracking
 ```
 
 **Binary Format Attacks**:
+
 ```python
 # Oversized tensor (1TB)
 fake_shape = struct.pack('<Q', 2**40)
@@ -199,20 +211,23 @@ fake_mxnet = pickle_payload + mxnet_magic  # Detected and flagged
 ## Performance Considerations
 
 ### Static Analysis Approach
+
 - **No Code Execution**: All analysis performed through static parsing
 - **Safe Processing**: No loading of actual MXNet models or execution of operators
 - **Memory Efficient**: Streaming binary analysis for large parameter files
 
 ### Scalability Features
+
 - **Size Limits**: Configurable maximum file sizes (default: 50MB JSON, 100MB binary)
-- **Complexity Limits**: Graph node count (100k max) and depth (1000 max) validation  
+- **Complexity Limits**: Graph node count (100k max) and depth (1000 max) validation
 - **Early Termination**: Fast-fail on critical issues to avoid unnecessary processing
 
 ### Configuration Options
+
 ```python
 config = {
     "max_json_size": 50 * 1024 * 1024,     # 50MB
-    "max_binary_size": 100 * 1024 * 1024,  # 100MB  
+    "max_binary_size": 100 * 1024 * 1024,  # 100MB
     "max_nodes": 100000,                    # Graph complexity
     "max_graph_depth": 1000,                # Recursion limits
     "max_op_name_length": 200,              # CVE-2022-24294 threshold
@@ -239,7 +254,7 @@ config = {
 
 ### Potential Improvements
 
-1. **Advanced Graph Analysis**: 
+1. **Advanced Graph Analysis**:
    - Control flow detection in computational graphs
    - Suspicious operation sequences
    - Resource consumption estimation
@@ -264,8 +279,9 @@ config = {
 The MXNet security scanner implementation provides comprehensive protection against known vulnerabilities and attack vectors specific to MXNet model files. The approach balances security thoroughness with performance, using static analysis to safely examine potentially malicious models without execution risks.
 
 Key achievements:
+
 - ✅ CVE-2022-24294 ReDoS vulnerability detection with zero false positives on legitimate operators
-- ✅ Binary format validation preventing format spoofing and oversized tensor attacks  
+- ✅ Binary format validation preventing format spoofing and oversized tensor attacks
 - ✅ Custom operator detection for external code requirement awareness
 - ✅ Seamless integration with existing ModelAudit architecture
 - ✅ Comprehensive test coverage with realistic attack vectors
