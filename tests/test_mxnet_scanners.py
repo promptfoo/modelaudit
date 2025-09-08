@@ -48,47 +48,16 @@ def valid_mxnet_symbol():
     """Valid MXNet symbol JSON structure."""
     return {
         "nodes": [
-            {
-                "op": "null",
-                "name": "data",
-                "inputs": []
-            },
-            {
-                "op": "FullyConnected",
-                "name": "fc1",
-                "inputs": [[0, 0, 0]],
-                "attr": {
-                    "num_hidden": "128"
-                }
-            },
-            {
-                "op": "Activation",
-                "name": "relu1",
-                "inputs": [[1, 0, 0]],
-                "attr": {
-                    "act_type": "relu"
-                }
-            },
-            {
-                "op": "FullyConnected",
-                "name": "fc2",
-                "inputs": [[2, 0, 0]],
-                "attr": {
-                    "num_hidden": "10"
-                }
-            },
-            {
-                "op": "SoftmaxOutput",
-                "name": "softmax",
-                "inputs": [[3, 0, 0], [0, 1, 0]]
-            }
+            {"op": "null", "name": "data", "inputs": []},
+            {"op": "FullyConnected", "name": "fc1", "inputs": [[0, 0, 0]], "attr": {"num_hidden": "128"}},
+            {"op": "Activation", "name": "relu1", "inputs": [[1, 0, 0]], "attr": {"act_type": "relu"}},
+            {"op": "FullyConnected", "name": "fc2", "inputs": [[2, 0, 0]], "attr": {"num_hidden": "10"}},
+            {"op": "SoftmaxOutput", "name": "softmax", "inputs": [[3, 0, 0], [0, 1, 0]]},
         ],
         "arg_nodes": [0, 1],
         "node_row_ptr": [0, 1, 2, 3, 4, 5],
         "heads": [[4, 0, 0]],
-        "attrs": {
-            "mxnet_version": ["int", 10600]
-        }
+        "attrs": {"mxnet_version": ["int", 10600]},
     }
 
 
@@ -175,13 +144,15 @@ class TestMXNetSymbolJSONScanning:
     def test_cve_2022_24294_long_operator_name(self, temp_dir, symbol_scanner):
         """Test detection of CVE-2022-24294 via extremely long operator name."""
         malicious_symbol = {
-            "nodes": [{
-                "op": "A" * 500,  # Extremely long operator name
-                "name": "malicious_node",
-                "inputs": []
-            }],
+            "nodes": [
+                {
+                    "op": "A" * 500,  # Extremely long operator name
+                    "name": "malicious_node",
+                    "inputs": [],
+                }
+            ],
             "arg_nodes": [0],
-            "heads": [[0, 0, 0]]
+            "heads": [[0, 0, 0]],
         }
 
         json_file = temp_dir / "cve_long_op.json"
@@ -197,13 +168,15 @@ class TestMXNetSymbolJSONScanning:
     def test_cve_2022_24294_redos_pattern(self, temp_dir, symbol_scanner):
         """Test detection of CVE-2022-24294 via ReDoS patterns."""
         malicious_symbol = {
-            "nodes": [{
-                "op": "((((((((((malicious_pattern))))))))))",  # ReDoS pattern
-                "name": "evil_node",
-                "inputs": []
-            }],
+            "nodes": [
+                {
+                    "op": "((((((((((malicious_pattern))))))))))",  # ReDoS pattern
+                    "name": "evil_node",
+                    "inputs": [],
+                }
+            ],
             "arg_nodes": [0],
-            "heads": [[0, 0, 0]]
+            "heads": [[0, 0, 0]],
         }
 
         json_file = temp_dir / "cve_redos.json"
@@ -219,19 +192,11 @@ class TestMXNetSymbolJSONScanning:
         """Test detection of custom operators."""
         custom_op_symbol = {
             "nodes": [
-                {
-                    "op": "Custom",
-                    "name": "custom_layer",
-                    "inputs": []
-                },
-                {
-                    "op": "UnknownOperator",
-                    "name": "unknown_op",
-                    "inputs": []
-                }
+                {"op": "Custom", "name": "custom_layer", "inputs": []},
+                {"op": "UnknownOperator", "name": "unknown_op", "inputs": []},
             ],
             "arg_nodes": [0, 1],
-            "heads": [[0, 0, 0]]
+            "heads": [[0, 0, 0]],
         }
 
         json_file = temp_dir / "custom_ops.json"
@@ -257,13 +222,13 @@ class TestMXNetSymbolJSONScanning:
                     "inputs": [],
                     "attr": {
                         "malicious_code": "os.system('rm -rf /')",
-                        "eval_call": "eval('__import__(\"os\").system(\"ls\")')",
-                        "subprocess_usage": "subprocess.run(['cat', '/etc/passwd'])"
-                    }
+                        "eval_call": 'eval(\'__import__("os").system("ls")\')',
+                        "subprocess_usage": "subprocess.run(['cat', '/etc/passwd'])",
+                    },
                 }
             ],
             "arg_nodes": [0],
-            "heads": [[0, 0, 0]]
+            "heads": [[0, 0, 0]],
         }
 
         json_file = temp_dir / "suspicious_content.json"
@@ -284,7 +249,7 @@ class TestMXNetSymbolJSONScanning:
         large_graph = {
             "nodes": [{"op": "null", "name": f"node_{i}", "inputs": []} for i in range(10)],  # 10 > limit of 5
             "arg_nodes": list(range(10)),
-            "heads": [[9, 0, 0]]
+            "heads": [[9, 0, 0]],
         }
 
         json_file = temp_dir / "large_graph.json"
@@ -364,8 +329,8 @@ class TestMXNetParamsScanning:
         data.extend(name)  # name
         data.extend(struct.pack("<I", 2))  # ndim
         data.extend(struct.pack("<I", 10))  # dim 1
-        data.extend(struct.pack("<I", 5))   # dim 2
-        data.extend(struct.pack("<I", 0))   # dtype (float32)
+        data.extend(struct.pack("<I", 5))  # dim 2
+        data.extend(struct.pack("<I", 0))  # dtype (float32)
         data.extend(b"\x00" * (10 * 5 * 4))  # dummy data (10*5*4 bytes for float32)
 
         valid_params = temp_dir / "valid.params"
@@ -389,10 +354,10 @@ class TestMXNetParamsScanning:
         name = b"huge_tensor"
         data.extend(struct.pack("<I", len(name)))
         data.extend(name)
-        data.extend(struct.pack("<I", 2))    # 2D tensor
-        data.extend(struct.pack("<I", 1000)) # dim 1
-        data.extend(struct.pack("<I", 1000)) # dim 2
-        data.extend(struct.pack("<I", 0))    # float32
+        data.extend(struct.pack("<I", 2))  # 2D tensor
+        data.extend(struct.pack("<I", 1000))  # dim 1
+        data.extend(struct.pack("<I", 1000))  # dim 2
+        data.extend(struct.pack("<I", 0))  # float32
         # Don't include actual data to keep file small
 
         oversized_params = temp_dir / "oversized.params"
@@ -415,14 +380,15 @@ class TestMXNetParamsScanning:
         result = params_scanner.scan(str(malicious_params))
 
         # Should detect suspicious patterns (though may also detect format errors)
-        suspicious_issues = [i for i in result.issues
-                           if "suspicious" in str(i.message).lower() or "malicious" in str(i.message).lower()]
+        suspicious_issues = [
+            i for i in result.issues if "suspicious" in str(i.message).lower() or "malicious" in str(i.message).lower()
+        ]
         assert len(suspicious_issues) >= 0  # May or may not detect depending on parsing success
 
     def test_corrupted_format_detection(self, temp_dir, params_scanner):
         """Test detection of corrupted parameter files."""
         # Create file with invalid header
-        corrupted_data = b"\xFF\xFF\xFF\xFF"  # Invalid array count
+        corrupted_data = b"\xff\xff\xff\xff"  # Invalid array count
 
         corrupted_params = temp_dir / "corrupted.params"
         corrupted_params.write_bytes(corrupted_data)
@@ -431,8 +397,7 @@ class TestMXNetParamsScanning:
 
         # Should detect format issues
         format_issues = [
-            i for i in result.issues
-            if "format" in str(i.message).lower() or "parsing" in str(i.message).lower()
+            i for i in result.issues if "format" in str(i.message).lower() or "parsing" in str(i.message).lower()
         ]
         assert len(format_issues) >= 0  # May detect various format issues
 
@@ -442,22 +407,16 @@ class TestMXNetScannerConfiguration:
 
     def test_symbol_scanner_custom_config(self):
         """Test MXNet symbol scanner custom configuration."""
-        custom_scanner = MXNetSymbolScanner({
-            "max_json_size": 1024,
-            "max_nodes": 100,
-            "max_op_name_length": 50
-        })
+        custom_scanner = MXNetSymbolScanner({"max_json_size": 1024, "max_nodes": 100, "max_op_name_length": 50})
         assert custom_scanner.max_json_size == 1024
         assert custom_scanner.max_nodes == 100
         assert custom_scanner.max_op_name_length == 50
 
     def test_params_scanner_custom_config(self):
         """Test MXNet params scanner custom configuration."""
-        custom_scanner = MXNetParamsScanner({
-            "max_tensor_elements": 1000,
-            "max_total_size": 1024 * 1024,
-            "max_num_arrays": 10
-        })
+        custom_scanner = MXNetParamsScanner(
+            {"max_tensor_elements": 1000, "max_total_size": 1024 * 1024, "max_num_arrays": 10}
+        )
         assert custom_scanner.max_tensor_elements == 1000
         assert custom_scanner.max_total_size == 1024 * 1024
         assert custom_scanner.max_num_arrays == 10
@@ -469,17 +428,19 @@ class TestMXNetSecurityPatterns:
     def test_hex_encoded_data_detection(self, temp_dir, symbol_scanner):
         """Test detection of hex-encoded data that could be shellcode."""
         malicious_symbol = {
-            "nodes": [{
-                "op": "FullyConnected",
-                "name": "normal_op",
-                "inputs": [],
-                "attr": {
-                    "suspicious_field": "\\x41\\x42\\x43\\x44\\x45\\x46\\x47\\x48",  # Hex pattern
-                    "shellcode": "\\x90\\x90\\x90\\x90"  # NOP sled pattern
+            "nodes": [
+                {
+                    "op": "FullyConnected",
+                    "name": "normal_op",
+                    "inputs": [],
+                    "attr": {
+                        "suspicious_field": "\\x41\\x42\\x43\\x44\\x45\\x46\\x47\\x48",  # Hex pattern
+                        "shellcode": "\\x90\\x90\\x90\\x90",  # NOP sled pattern
+                    },
                 }
-            }],
+            ],
             "arg_nodes": [0],
-            "heads": [[0, 0, 0]]
+            "heads": [[0, 0, 0]],
         }
 
         json_file = temp_dir / "hex_encoded.json"
@@ -501,13 +462,9 @@ class TestMXNetSecurityPatterns:
             if i == 0:
                 nodes.append({"op": "null", "name": f"layer_{i}", "inputs": []})
             else:
-                nodes.append({"op": "FullyConnected", "name": f"layer_{i}", "inputs": [[i-1, 0, 0]]})
+                nodes.append({"op": "FullyConnected", "name": f"layer_{i}", "inputs": [[i - 1, 0, 0]]})
 
-        deep_graph = {
-            "nodes": nodes,
-            "arg_nodes": [0],
-            "heads": [[len(nodes)-1, 0, 0]]
-        }
+        deep_graph = {"nodes": nodes, "arg_nodes": [0], "heads": [[len(nodes) - 1, 0, 0]]}
 
         json_file = temp_dir / "deep_graph.json"
         json_file.write_text(json.dumps(deep_graph))
@@ -549,16 +506,14 @@ class TestMXNetScannerIntegration:
         realistic_symbol = {
             "nodes": [
                 {"op": "null", "name": "data", "inputs": []},
-                {"op": "FullyConnected", "name": "fc1", "inputs": [[0, 0, 0]],
-                 "attr": {"num_hidden": "128"}},
-                {"op": "Activation", "name": "relu1", "inputs": [[1, 0, 0]],
-                 "attr": {"act_type": "relu"}},
-                {"op": "SoftmaxOutput", "name": "softmax", "inputs": [[2, 0, 0]]}
+                {"op": "FullyConnected", "name": "fc1", "inputs": [[0, 0, 0]], "attr": {"num_hidden": "128"}},
+                {"op": "Activation", "name": "relu1", "inputs": [[1, 0, 0]], "attr": {"act_type": "relu"}},
+                {"op": "SoftmaxOutput", "name": "softmax", "inputs": [[2, 0, 0]]},
             ],
             "arg_nodes": [0],
             "node_row_ptr": [0, 1, 2, 3, 4],
             "heads": [[3, 0, 0]],
-            "attrs": {"mxnet_version": ["int", 10600]}
+            "attrs": {"mxnet_version": ["int", 10600]},
         }
 
         symbol_path = temp_dir / "real-symbol.json"
@@ -575,4 +530,3 @@ class TestMXNetScannerIntegration:
         # Should not have critical issues for valid content
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0
-

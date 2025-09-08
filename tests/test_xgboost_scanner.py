@@ -275,9 +275,9 @@ class TestXGBoostUBJScanning:
             patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
             patch("modelaudit.scanners.xgboost_scanner.ubjson") as mock_ubjson,
         ):
-                mock_ubjson.loadb.side_effect = Exception("Invalid UBJ format")
+            mock_ubjson.loadb.side_effect = Exception("Invalid UBJ format")
 
-                result = xgboost_scanner.scan(str(ubj_file))
+            result = xgboost_scanner.scan(str(ubj_file))
 
         assert any("Error analyzing XGBoost UBJ model" in str(issue.message) for issue in result.issues)
 

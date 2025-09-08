@@ -82,6 +82,7 @@ class XGBoostScanner(BaseScanner):
                 # Parse as JSON to check structure
                 try:
                     import json
+
                     data = json.loads(content)
 
                     # XGBoost JSON must have these key indicators
@@ -403,8 +404,6 @@ class XGBoostScanner(BaseScanner):
     def _validate_tree_structures(self, trees: list[dict], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
         for i, tree in enumerate(trees):
-            if not isinstance(tree, dict):
-                continue
 
             # Check tree depth
             if "tree_param" in tree:

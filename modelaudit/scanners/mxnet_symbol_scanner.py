@@ -472,8 +472,6 @@ class MXNetSymbolScanner(BaseScanner):
             # Build adjacency list
             graph = {}
             for i, node in enumerate(nodes):
-                if not isinstance(node, dict):
-                    continue
                 inputs = node.get("inputs", [])
                 if isinstance(inputs, list):
                     graph[i] = [inp[0] if isinstance(inp, list) and inp else inp for inp in inputs if inp is not None]

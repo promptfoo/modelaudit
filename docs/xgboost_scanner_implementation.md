@@ -18,6 +18,7 @@ The XGBoost scanner supports scanning the following model file formats:
 ### 1. Insecure Deserialization (Pickle/Joblib RCE)
 
 The scanner detects malicious patterns in pickled XGBoost models, including:
+
 - References to `os.system`, `subprocess.Popen`, `eval`, `exec`
 - Unusual global imports beyond standard XGBoost modules
 - Embedded code execution patterns
@@ -28,6 +29,7 @@ The scanner detects malicious patterns in pickled XGBoost models, including:
 ### 2. Malformed JSON/UBJ Structure Validation
 
 For JSON and UBJ models, the scanner validates:
+
 - Required XGBoost JSON schema keys (`version`, `learner`)
 - Learner parameter consistency and sanity checks
 - Tree structure integrity (depth, count validation)
@@ -38,6 +40,7 @@ For JSON and UBJ models, the scanner validates:
 ### 3. Binary .bst Model Exploits
 
 Binary model scanning includes:
+
 - File integrity and structure validation
 - Detection of pickle files masquerading as .bst files
 - Basic header pattern recognition for valid XGBoost models
@@ -48,6 +51,7 @@ Binary model scanning includes:
 ### 4. Malicious Content Patterns
 
 The scanner detects suspicious patterns across all formats:
+
 - Hex-encoded data that could be shellcode (`\\x41\\x42...`)
 - Dynamic imports and eval statements in JSON
 - System commands and subprocess calls
@@ -67,7 +71,7 @@ class XGBoostScanner(BaseScanner):
 ### Configuration Options
 
 - `max_json_size`: Maximum JSON file size (default: 100MB)
-- `max_tree_depth`: Maximum allowed tree depth (default: 1000)  
+- `max_tree_depth`: Maximum allowed tree depth (default: 1000)
 - `max_num_trees`: Maximum number of trees (default: 100,000)
 - `enable_xgb_loading`: Enable safe XGBoost model loading (default: False)
 
@@ -85,6 +89,7 @@ class XGBoostScanner(BaseScanner):
 ### Registry Integration
 
 The scanner is registered in ModelAudit's scanner registry with:
+
 - Priority 7 (after GGUF scanner, before joblib)
 - Dependencies: `["xgboost", "ubjson"]` (optional)
 - NumPy sensitivity: `True`
@@ -92,6 +97,7 @@ The scanner is registered in ModelAudit's scanner registry with:
 ### Pickle Scanner Enhancement
 
 Enhanced the existing pickle scanner with XGBoost-specific patterns:
+
 - Added XGBoost modules as safe patterns (`xgboost`, `xgboost.core`, `xgboost.sklearn`)
 - Added XGBoost classes (`Booster`, `DMatrix`, `XGBClassifier`, etc.)
 - Improved ML framework detection for better context awareness
@@ -99,6 +105,7 @@ Enhanced the existing pickle scanner with XGBoost-specific patterns:
 ### File Type Detection
 
 The scanner can handle XGBoost files through:
+
 - Extension-based detection (`.bst`, `.model`, `.json`, `.ubj`)
 - Magic byte detection for files without extensions
 - Content-based validation for ambiguous cases
@@ -120,8 +127,9 @@ The implementation includes comprehensive tests covering:
 ### Malicious Sample Detection
 
 Test cases include detection of:
+
 - Pickle files with OS command execution
-- JSON files with embedded eval/exec statements  
+- JSON files with embedded eval/exec statements
 - Hex-encoded shellcode patterns
 - Parameter value attacks (extreme tree counts, memory exhaustion)
 - File format spoofing attempts
@@ -134,7 +142,7 @@ Test cases include detection of:
 # Scan XGBoost JSON model
 rye run modelaudit model.json
 
-# Scan binary XGBoost model  
+# Scan binary XGBoost model
 rye run modelaudit model.bst
 
 # Scan with JSON output
@@ -162,6 +170,7 @@ result = scanner.scan("suspicious_model.bst")
 ### Static Analysis Approach
 
 The scanner uses static analysis to avoid executing potentially malicious code:
+
 - JSON/UBJ files are parsed but not executed
 - Binary files are structurally validated without loading
 - Pickle files are analyzed using `pickletools` without deserialization
@@ -177,8 +186,9 @@ The scanner uses static analysis to avoid executing potentially malicious code:
 ### Threat Model
 
 The scanner addresses the following attack vectors:
+
 - **Supply Chain Attacks**: Malicious models distributed as legitimate XGBoost files
-- **File Format Exploits**: Crafted models targeting XGBoost parser vulnerabilities  
+- **File Format Exploits**: Crafted models targeting XGBoost parser vulnerabilities
 - **Deserialization Attacks**: RCE through malicious pickle payloads
 - **Memory Exhaustion**: Models designed to consume excessive resources
 - **Format Spoofing**: Malicious files disguised with legitimate extensions
@@ -196,9 +206,10 @@ The scanner addresses the following attack vectors:
 ### Extensibility
 
 The scanner architecture supports easy extension for:
+
 - New XGBoost file formats
 - Additional security patterns
-- Custom validation rules  
+- Custom validation rules
 - Integration with threat intelligence feeds
 
 ## Conclusion
