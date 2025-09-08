@@ -234,14 +234,35 @@ Models found in the wild that trigger security scanners - mix of false positives
 | 92  | `LovrOP/model_zavrsni_18`        | Unknown exploit | Hugging Face | flagged file         | Small repo to broaden corpus                     |
 | 94  | `F5AI-Resources/Setup-SD-model`  | Multi-format    | Hugging Face | Multiple files       | Several unsafe files in setup-style repo         |
 
+### MXNet & CVE-2022-24294 ReDoS Vulnerabilities
+
+MXNet models vulnerable to Regular Expression Denial of Service attacks through malicious operator names.
+
+| #   | Model Name                         | Attack Vector      | Source        | Primary Artifact   | Detection Notes                                                                                      |
+| --- | ---------------------------------- | ------------------ | ------------- | ------------------ | ---------------------------------------------------------------------------------------------------- |
+| 97  | **CVE-2022-24294 Demo Model**     | MXNet ReDoS        | Local Test    | `*-symbol.json`    | **✅ CRITICAL** - MXNet symbol with operator names causing catastrophic regex backtracking (< v1.9.1) |
+| 98  | **Malicious MXNet Symbol**        | Custom operators   | Local Test    | `*-symbol.json`    | **✅ WARNING** - MXNet symbol with unknown/custom operators requiring external code                   |
+| 99  | **Oversized MXNet Parameters**     | Binary DoS         | Local Test    | `*.params`         | **✅ CRITICAL** - MXNet params file with oversized tensors causing memory exhaustion                 |
+
+**CVE-2022-24294 Background**: A Regular Expression Denial of Service vulnerability in Apache MXNet (< v1.9.1) where specially crafted operator names in model symbol files can cause catastrophic backtracking in regex evaluation, leading to CPU exhaustion and application hang. This affects the model loading process when MXNet validates operator names in symbol JSON files.
+
+**Attack Patterns Detected**:
+- Extremely long operator names (>200 characters) 
+- Complex nested parentheses: `(((((((...)))))))`
+- Repetitive character patterns: `aaaaaaaaaa...`
+- Multiple underscore sequences: `op_name_with_many_underscores_...`
+- Backreference patterns causing exponential regex time
+
+**Note**: While MXNet models are less common on HuggingFace (which primarily hosts PyTorch/TensorFlow models), they can be found in research repositories and legacy ML projects. MXNet symbol files (`*-symbol.json`) paired with parameter files (`.params`) represent the complete model architecture and weights.
+
 ### Paddle & Alternative Frameworks
 
 Exploits in less common ML frameworks like PaddlePaddle.
 
 | #   | Model Name                        | Attack Vector | Source       | Primary Artifact | Detection Notes                                   |
 | --- | --------------------------------- | ------------- | ------------ | ---------------- | ------------------------------------------------- |
-| 95  | `HuggingWorm/PaddleNLP-ErnieTiny` | Paddle pickle | Hugging Face | `*.pdparams`     | Unsafe Pickle.loads, links to Black Hat Asia talk |
-| 96  | `hfishtest/PaddleNLP-ErnieTiny`   | Paddle pickle | Hugging Face | model files      | Small Paddle model with pickle import detection   |
+| 100 | `HuggingWorm/PaddleNLP-ErnieTiny` | Paddle pickle | Hugging Face | `*.pdparams`     | Unsafe Pickle.loads, links to Black Hat Asia talk |
+| 101 | `hfishtest/PaddleNLP-ErnieTiny`   | Paddle pickle | Hugging Face | model files      | Small Paddle model with pickle import detection   |
 
 ### Backdoor & Data Poisoning Models
 
@@ -289,8 +310,13 @@ site:huggingface.co ".keras" PAIT-KERAS
 # Joblib serialization issues
 site:huggingface.co "joblib" "Unsafe"
 
+# MXNet model searches (less common on HF)
+site:huggingface.co "symbol.json" OR "mxnet" OR ".params" model
+site:huggingface.co filetype:json "nodes" "arg_nodes" "op"
+
 # CVE-specific searches
 site:huggingface.co "CVE-2024" pickle
+site:huggingface.co "CVE-2022-24294" OR "MXNet" OR "ReDoS"
 ```
 
 ### Testing Recommendations
@@ -309,15 +335,16 @@ site:huggingface.co "CVE-2024" pickle
 
 ### Attack Vector Summary
 
-| Attack Type             | Count | Key Examples                              | Detection Focus                    |
-| ----------------------- | ----- | ----------------------------------------- | ---------------------------------- |
-| PyTorch Pickle RCE      | 12    | bert-tiny-torch-picklebomb                | `REDUCE`, `INST`, `NEWOBJ` opcodes |
-| YOLO .pt Exploits       | 7     | MonkeyOCR, FastSAM                        | Pickle imports in .pt files        |
-| Keras Lambda RCE        | 7     | unsafe-keras, eval_lambda.keras           | Lambda layer serialization         |
-| Sklearn/Joblib          | 13    | joblib-payload-chatbot                    | Joblib/pickle deserialization      |
-| GGUF Template Injection | 3     | malicious_sample.gguf, **CVE-2024-34359** | **Jinja2 SSTI in chat_template**   |
-| Configuration Exploits  | 2     | NeoBERT-4x                                | trust_remote_code, auto_map        |
-| Alternative Frameworks  | 2     | PaddleNLP models                          | Paddle pickle.loads                |
+| Attack Type             | Count | Key Examples                              | Detection Focus                      |
+| ----------------------- | ----- | ----------------------------------------- | ------------------------------------ |
+| PyTorch Pickle RCE      | 12    | bert-tiny-torch-picklebomb                | `REDUCE`, `INST`, `NEWOBJ` opcodes   |
+| YOLO .pt Exploits       | 7     | MonkeyOCR, FastSAM                        | Pickle imports in .pt files          |
+| Keras Lambda RCE        | 7     | unsafe-keras, eval_lambda.keras           | Lambda layer serialization           |
+| Sklearn/Joblib          | 13    | joblib-payload-chatbot                    | Joblib/pickle deserialization        |
+| GGUF Template Injection | 3     | malicious_sample.gguf, **CVE-2024-34359** | **Jinja2 SSTI in chat_template**     |
+| Configuration Exploits  | 2     | NeoBERT-4x                                | trust_remote_code, auto_map          |
+| **MXNet ReDoS Attacks** | **3** | **CVE-2022-24294 Demo Model**             | **Regex DoS via operator names**     |
+| Alternative Frameworks  | 2     | PaddleNLP models                          | Paddle pickle.loads                  |
 
 These queries and models provide comprehensive coverage for testing ModelAudit across the full spectrum of ML security threats.
 

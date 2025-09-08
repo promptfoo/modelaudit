@@ -68,8 +68,44 @@ class XGBoostScanner(BaseScanner):
             return False
 
         file_ext = os.path.splitext(path)[1].lower()
-        if file_ext in cls.supported_extensions:
+        
+        # Binary formats are definitively XGBoost
+        if file_ext in [".bst", ".model", ".ubj"]:
             return True
+            
+        # For JSON files, check content to ensure it's actually XGBoost
+        if file_ext == ".json":
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read(8192)  # Read first 8KB
+                
+                # Parse as JSON to check structure
+                try:
+                    import json
+                    data = json.loads(content)
+                    
+                    # XGBoost JSON must have these key indicators
+                    if isinstance(data, dict):
+                        # Primary XGBoost indicators
+                        has_learner = "learner" in data
+                        has_version = "version" in data
+                        has_gradient_booster = "gradient_booster" in str(data)
+                        has_objective = "objective" in str(data)
+                        has_gbtree = "gbtree" in content or "gblinear" in content
+                        
+                        # Must have learner AND version, OR strong XGBoost patterns
+                        if has_learner and has_version:
+                            return True
+                        elif (has_learner or has_gradient_booster) and (has_objective or has_gbtree):
+                            return True
+                    
+                    return False
+                    
+                except json.JSONDecodeError:
+                    return False
+                    
+            except (OSError, UnicodeDecodeError):
+                return False
 
         # Check for XGBoost files that might not have the right extension
         if file_ext == "":

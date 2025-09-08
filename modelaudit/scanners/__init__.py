@@ -390,6 +390,24 @@ class ScannerRegistry:
                 "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
                 "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
             },
+            "mxnet_symbol": {
+                "module": "modelaudit.scanners.mxnet_symbol_scanner",
+                "class": "MXNetSymbolScanner",
+                "description": "Scans MXNet symbol files for security vulnerabilities including CVE-2022-24294",
+                "extensions": [".json"],
+                "priority": 6,  # Higher priority than XGBoost for MXNet-specific files
+                "dependencies": ["mxnet"],  # MXNet for full functionality
+                "numpy_sensitive": True,  # MXNet can be sensitive to NumPy version
+            },
+            "mxnet_params": {
+                "module": "modelaudit.scanners.mxnet_params_scanner",
+                "class": "MXNetParamsScanner",
+                "description": "Scans MXNet parameter files for security vulnerabilities and format validation",
+                "extensions": [".params", ".nd"],
+                "priority": 6,  # Higher priority than XGBoost for MXNet-specific files
+                "dependencies": ["mxnet"],  # MXNet for full functionality
+                "numpy_sensitive": True,  # MXNet can be sensitive to NumPy version
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -683,6 +701,8 @@ def __getattr__(name: str) -> Any:
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
         "XGBoostScanner": "xgboost",
+        "MXNetSymbolScanner": "mxnet_symbol",
+        "MXNetParamsScanner": "mxnet_params",
         "ZipScanner": "zip",
     }
 

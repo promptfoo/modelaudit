@@ -146,6 +146,23 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "patterns": [r"xgboost\..*"],
         "confidence_boost": 0.9,
     },
+    "mxnet": {
+        "modules": ["mxnet", "mxnet.ndarray", "mxnet.gluon", "mxnet.symbol"],
+        "classes": [
+            "NDArray",
+            "Symbol", 
+            "Block",
+            "HybridBlock",
+            "Sequential",
+            "Dense",
+            "Conv2D",
+            "BatchNorm",
+            "Dropout",
+            "Context",
+        ],
+        "patterns": [r"mxnet\..*"],
+        "confidence_boost": 0.9,
+    },
 }
 
 # Safe ML-specific global patterns
@@ -184,6 +201,11 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "xgboost": ["*"],  # XGBoost operations are generally safe
     "xgboost.core": ["*"],
     "xgboost.sklearn": ["*"],
+    # MXNet safe patterns
+    "mxnet": ["*"],  # MXNet operations are generally safe
+    "mxnet.ndarray": ["*"],
+    "mxnet.gluon": ["*"],
+    "mxnet.symbol": ["*"],
 }
 
 # Dangerous actual code execution patterns in strings
