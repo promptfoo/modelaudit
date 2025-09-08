@@ -114,6 +114,7 @@ test-only = [
     "dill>=0.3.0,<1.0",       # Used by pickle tests, small
     "joblib>=1.0.0,<2.0",     # Used by joblib tests, relatively small
     "msgpack>=1.0.0,<2.0",    # Used by flax tests, small
+    "h5py>=3.1,<4.0",         # Used by H5/Keras tests, needed for security tests
     # Skip heavy frameworks (TensorFlow ~500MB, PyTorch ~2GB) - our mocks handle these
     # numpy, scipy, pyyaml, requests, etc. come from base dependencies
 ]

@@ -112,6 +112,7 @@ class TestSecurityAssetIntegration:
         # Get failed scanners to handle compatibility issues
         failed_scanners = _registry.get_failed_scanners()
         tensorflow_available = not any("tf_savedmodel" in scanner_id for scanner_id in failed_scanners)
+        h5py_available = not any("keras_h5" in scanner_id for scanner_id in failed_scanners)
 
         # Track files that were tested vs skipped
         tested_files = []
@@ -120,9 +121,14 @@ class TestSecurityAssetIntegration:
         for malicious_file in malicious_files:
             # Skip TensorFlow-specific malicious files if TensorFlow scanner is not available
             if not tensorflow_available and (
-                "pyfunc" in malicious_file.name.lower() or "tensorflow" in str(malicious_file.parent).lower()
+                "pyfunc" in malicious_file.name.lower() or "tensorflow" in str(malicious_file).lower()
             ):
                 skipped_files.append(f"{malicious_file.name} (TensorFlow scanner unavailable)")
+                continue
+                
+            # Skip h5-specific malicious files if h5py scanner is not available
+            if not h5py_available and malicious_file.suffix.lower() == ".h5":
+                skipped_files.append(f"{malicious_file.name} (h5py scanner unavailable)")
                 continue
 
             # Scan the malicious file
@@ -138,6 +144,9 @@ class TestSecurityAssetIntegration:
                 file_ext = malicious_file.suffix.lower()
                 if file_ext in [".pb"] and not tensorflow_available:
                     skipped_files.append(f"{malicious_file.name} (required .pb scanner unavailable)")
+                    continue
+                if file_ext in [".h5"] and not h5py_available:
+                    skipped_files.append(f"{malicious_file.name} (required .h5 scanner unavailable)")
                     continue
 
             # Should detect security issues for files that can be properly scanned
