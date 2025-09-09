@@ -15,16 +15,17 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-
-class FakeBooster:
-    """A simple class that can be pickled for testing."""
-    def __init__(self):
-        self.__class__.__name__ = "Booster"
-
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
+
+
+class FakeBooster:
+    """A simple class that can be pickled for testing."""
+
+    def __init__(self):
+        self.__class__.__name__ = "Booster"
 
 
 @pytest.fixture
@@ -587,5 +588,7 @@ class TestXGBoostScannerIntegration:
         assert any("decoded successfully" in str(check.message) for check in result.checks)
 
         # Should not have critical issues for valid content (except analysis errors which are acceptable)
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL and "Error analyzing" not in str(i.message)]
+        critical_issues = [
+            i for i in result.issues if i.severity == IssueSeverity.CRITICAL and "Error analyzing" not in str(i.message)
+        ]
         assert len(critical_issues) == 0
