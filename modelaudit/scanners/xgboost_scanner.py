@@ -345,7 +345,7 @@ class XGBoostScanner(BaseScanner):
 
         # Validate version
         version = data.get("version")
-        if not isinstance(version, (list, tuple)) or len(version) < 2:
+        if not isinstance(version, list | tuple) or len(version) < 2:
             result.add_check(
                 name="XGBoost Version Validation",
                 passed=False,
