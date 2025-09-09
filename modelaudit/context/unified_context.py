@@ -133,7 +133,7 @@ class UnifiedMLContext:
                     self.weight_statistics[key] = []
                 self.weight_statistics[key].append(value)
 
-    def analyze_architecture_patterns(self):
+    def analyze_architecture_patterns(self) -> None:
         """Analyze layer patterns to determine architecture."""
         # Count layer types
         layer_type_counts: dict[str, int] = {}

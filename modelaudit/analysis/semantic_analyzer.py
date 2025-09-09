@@ -33,7 +33,7 @@ class CodeContext:
 class SemanticAnalyzer:
     """Performs semantic analysis of Python code."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Define safe operations by context
         self.safe_contexts = {
             # ML operations that look dangerous but are safe

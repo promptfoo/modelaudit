@@ -36,10 +36,10 @@ class FrameworkPattern:
 class FrameworkKnowledgeBase:
     """Knowledge base of framework-specific patterns."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._build_knowledge_base()
 
-    def _build_knowledge_base(self):
+    def _build_knowledge_base(self) -> None:
         """Build comprehensive framework-specific patterns."""
         self.patterns = {
             FrameworkType.PYTORCH: self._build_pytorch_patterns(),
