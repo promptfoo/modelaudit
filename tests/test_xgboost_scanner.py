@@ -532,9 +532,9 @@ class TestXGBoostPickleIntegration:
 class TestXGBoostScannerIntegration:
     """Integration tests requiring actual XGBoost/ubjson libraries."""
 
-    @pytest.mark.skipif(not pytest.importorskip("xgboost", minversion="1.0"), reason="XGBoost not available")
     def test_real_xgboost_model_creation_and_scan(self, temp_dir):
         """Test scanning of a real XGBoost model."""
+        xgboost = pytest.importorskip("xgboost", minversion="1.0")
         import numpy as np
         import xgboost as xgb
 
@@ -569,10 +569,9 @@ class TestXGBoostScannerIntegration:
         assert len(json_critical) == 0, f"JSON model had critical issues: {json_critical}"
         assert len(bst_critical) == 0, f"BST model had critical issues: {bst_critical}"
 
-    @pytest.mark.skipif(not pytest.importorskip("ubjson"), reason="ubjson not available")
     def test_real_ubj_format_scan(self, temp_dir, valid_xgboost_json):
         """Test scanning of real UBJ format."""
-        import ubjson
+        ubjson = pytest.importorskip("ubjson")
 
         # Create UBJ file
         ubj_path = temp_dir / "model.ubj"
