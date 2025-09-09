@@ -466,7 +466,7 @@ class MXNetSymbolScanner(BaseScanner):
                 details={"num_nodes": num_nodes},
             )
 
-    def _calculate_graph_depth(self, nodes: list[dict]) -> int:
+    def _calculate_graph_depth(self, nodes: list[dict[str, Any]]) -> int:
         """Calculate maximum depth of the computation graph."""
         try:
             # Build adjacency list
@@ -481,7 +481,7 @@ class MXNetSymbolScanner(BaseScanner):
             # DFS to find maximum depth
             visited = set()
 
-            def dfs(node_id, depth=0):
+            def dfs(node_id: int, depth: int = 0) -> int:
                 if node_id in visited or node_id not in graph:
                     return depth
                 visited.add(node_id)
