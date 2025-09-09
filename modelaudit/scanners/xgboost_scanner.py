@@ -20,12 +20,25 @@ Security Focus:
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+# Precompiled regex patterns for performance
+SUSPICIOUS_JSON_PATTERNS = [
+    (re.compile(r"__reduce__", re.IGNORECASE), "Pickle-like reduction pattern in JSON"),
+    (re.compile(r"eval\s*\(", re.IGNORECASE), "Eval function call in JSON"),
+    (re.compile(r"exec\s*\(", re.IGNORECASE), "Exec function call in JSON"),
+    (re.compile(r"import\s+os", re.IGNORECASE), "OS module import in JSON"),
+    (re.compile(r"subprocess\.", re.IGNORECASE), "Subprocess usage in JSON"),
+    (re.compile(r"system\s*\(", re.IGNORECASE), "System call in JSON"),
+    (re.compile(r"__import__", re.IGNORECASE), "Dynamic import in JSON"),
+    (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
+]
 
 def _check_xgboost_available() -> bool:
     """Check if XGBoost package is available."""
@@ -68,45 +81,8 @@ class XGBoostScanner(BaseScanner):
             return False
 
         file_ext = os.path.splitext(path)[1].lower()
-
-        # Binary formats are definitively XGBoost
-        if file_ext in [".bst", ".model", ".ubj"]:
+        if file_ext in cls.supported_extensions:
             return True
-
-        # For JSON files, check content to ensure it's actually XGBoost
-        if file_ext == ".json":
-            try:
-                with open(path, encoding="utf-8") as f:
-                    content = f.read(8192)  # Read first 8KB
-
-                # Parse as JSON to check structure
-                try:
-                    import json
-
-                    data = json.loads(content)
-
-                    # XGBoost JSON must have these key indicators
-                    if isinstance(data, dict):
-                        # Primary XGBoost indicators
-                        has_learner = "learner" in data
-                        has_version = "version" in data
-                        has_gradient_booster = "gradient_booster" in str(data)
-                        has_objective = "objective" in str(data)
-                        has_gbtree = "gbtree" in content or "gblinear" in content
-
-                        # Must have learner AND version, OR strong XGBoost patterns
-                        strong_xgb_patterns = (has_learner or has_gradient_booster) and (has_objective or has_gbtree)
-                        if (has_learner and has_version) or strong_xgb_patterns:
-                            return True
-
-                    return False
-
-                except json.JSONDecodeError:
-                    return False
-
-            except (OSError, UnicodeDecodeError):
-                return False
-
         # Check for XGBoost files that might not have the right extension
         if file_ext == "":
             try:
@@ -242,6 +218,19 @@ class XGBoostScanner(BaseScanner):
         try:
             import ubjson
 
+            # Check file size before attempting to read
+            file_size = os.path.getsize(path)
+            if file_size > self.max_json_size:
+                result.add_check(
+                    name="UBJ File Size",
+                    passed=False,
+                    message=f"UBJ file too large: {file_size} bytes (max: {self.max_json_size})",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"file_size": file_size, "max_size": self.max_json_size},
+                    why="Extremely large UBJ files may indicate malicious content or cause resource exhaustion",
+                )
+                return
             with open(path, "rb") as f:
                 model_data = ubjson.loadb(f.read())
 
@@ -283,6 +272,18 @@ class XGBoostScanner(BaseScanner):
             )
             return
 
+        # Check for extremely large binary files (using JSON size limit as reasonable bound)
+        if file_size > self.max_json_size:
+            result.add_check(
+                name="Binary File Size Check",
+                passed=False,
+                message=f"XGBoost binary file too large: {file_size} bytes (max: {self.max_json_size})",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"file_size": file_size, "max_size": self.max_json_size},
+                why="Extremely large binary files may cause resource exhaustion or contain malicious padding",
+            )
+            return
         try:
             # Check if it's actually a pickle file masquerading as .bst
             if self._is_pickle_file(path):
@@ -458,22 +459,9 @@ class XGBoostScanner(BaseScanner):
         # Convert to string for pattern matching
         json_str = json.dumps(data, separators=(",", ":"))
 
-        # Check for suspicious patterns
-        suspicious_patterns = [
-            (r"__reduce__", "Pickle-like reduction pattern in JSON"),
-            (r"eval\s*\(", "Eval function call in JSON"),
-            (r"exec\s*\(", "Exec function call in JSON"),
-            (r"import\s+os", "OS module import in JSON"),
-            (r"subprocess\.", "Subprocess usage in JSON"),
-            (r"system\s*\(", "System call in JSON"),
-            (r"__import__", "Dynamic import in JSON"),
-            (r"\\x[0-9a-fA-F]{2}", "Hex-encoded data (potential shellcode)"),
-        ]
-
-        for pattern, description in suspicious_patterns:
-            import re
-
-            if re.search(pattern, json_str, re.IGNORECASE):
+        # Check for suspicious patterns using precompiled regex
+        for pattern, description in SUSPICIOUS_JSON_PATTERNS:
+            if pattern.search(json_str):
                 result.add_check(
                     name="JSON Content Analysis",
                     passed=False,
@@ -576,6 +564,8 @@ class XGBoostScanner(BaseScanner):
         try:
             # Use subprocess for isolation
             timeout = min(self.timeout, 30)  # Max 30 seconds for model loading
+            # Safely escape the path for subprocess
+            escaped_path = shlex.quote(path)
             cmd = [
                 sys.executable,
                 "-c",
@@ -584,7 +574,7 @@ import sys
 import xgboost as xgb
 try:
     booster = xgb.Booster()
-    booster.load_model('{path}')
+    booster.load_model({escaped_path})
     print("SUCCESS: Model loaded successfully")
 except Exception as e:
     print(f"ERROR: {{e}}")
