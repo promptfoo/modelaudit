@@ -106,10 +106,29 @@ class TestSecurityAssetIntegration:
 
         def has_tensorflow():
             try:
-                import tensorflow  # noqa: F401
+                # Use a timeout to prevent hanging in CI environments
+                import signal
+                import sys
 
-                return True
-            except ImportError:
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("TensorFlow import timeout")
+
+                # Set a 10-second timeout for TensorFlow import (only on Unix-like systems)
+                if hasattr(signal, "SIGALRM"):
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(10)
+
+                try:
+                    import tensorflow  # noqa: F401
+
+                    return True
+                except (ImportError, TimeoutError):
+                    return False
+                finally:
+                    # Reset the alarm
+                    if hasattr(signal, "SIGALRM"):
+                        signal.alarm(0)
+            except Exception:
                 return False
 
         malicious_files = self.get_malicious_samples(samples_dir)
