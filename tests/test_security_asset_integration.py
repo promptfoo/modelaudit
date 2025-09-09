@@ -104,6 +104,14 @@ class TestSecurityAssetIntegration:
         """Test that all malicious samples are properly detected."""
         from modelaudit.scanners import _registry
 
+        def has_tensorflow():
+            try:
+                import tensorflow  # noqa: F401
+
+                return True
+            except ImportError:
+                return False
+
         malicious_files = self.get_malicious_samples(samples_dir)
 
         if not malicious_files:
@@ -111,7 +119,9 @@ class TestSecurityAssetIntegration:
 
         # Get failed scanners to handle compatibility issues
         failed_scanners = _registry.get_failed_scanners()
-        tensorflow_available = not any("tf_savedmodel" in scanner_id for scanner_id in failed_scanners)
+        tensorflow_available = has_tensorflow() and not any(
+            "tf_savedmodel" in scanner_id for scanner_id in failed_scanners
+        )
 
         # Track files that were tested vs skipped
         tested_files = []

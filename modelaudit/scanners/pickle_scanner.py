@@ -136,7 +136,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "modules": ["xgboost", "xgboost.core", "xgboost.sklearn"],
         "classes": [
             "Booster",
-            "DMatrix", 
+            "DMatrix",
             "XGBClassifier",
             "XGBRegressor",
             "XGBRanker",
