@@ -381,6 +381,15 @@ class ScannerRegistry:
                 "dependencies": ["py7zr"],
                 "numpy_sensitive": False,
             },
+            "xgboost": {
+                "module": "modelaudit.scanners.xgboost_scanner",
+                "class": "XGBoostScanner",
+                "description": "Scans XGBoost model files for security vulnerabilities",
+                "extensions": [".bst", ".model", ".json", ".ubj"],
+                "priority": 7,  # After GGUF scanner, before joblib
+                "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
+                "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -673,6 +682,7 @@ def __getattr__(name: str) -> Any:
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
+        "XGBoostScanner": "xgboost",
         "ZipScanner": "zip",
     }
 
