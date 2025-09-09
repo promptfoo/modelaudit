@@ -22,7 +22,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -54,7 +54,7 @@ class XGBoostScanner(BaseScanner):
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
         self.max_json_size = self.config.get("max_json_size", 100 * 1024 * 1024)  # 100MB
