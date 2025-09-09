@@ -105,28 +105,27 @@ class TestSecurityAssetIntegration:
         from modelaudit.scanners import _registry
 
         def has_tensorflow():
+            """Check if TensorFlow is available with timeout protection."""
             try:
-                # Use a timeout to prevent hanging in CI environments
-                import signal
+                # Use subprocess for maximum isolation and cross-platform timeout
+                import subprocess
+                import sys
 
-                def timeout_handler(signum, frame):
-                    raise TimeoutError("TensorFlow import timeout")
+                # Try to import TensorFlow in a separate process with strict timeout
+                cmd = [sys.executable, "-c", "import tensorflow; print('SUCCESS')"]
 
-                # Set a 10-second timeout for TensorFlow import (only on Unix-like systems)
-                if hasattr(signal, "SIGALRM"):
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(10)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,  # 5 second timeout
+                    cwd=None,
+                )
 
-                try:
-                    import tensorflow  # noqa: F401
+                return result.returncode == 0 and "SUCCESS" in result.stdout
 
-                    return True
-                except (ImportError, TimeoutError):
-                    return False
-                finally:
-                    # Reset the alarm
-                    if hasattr(signal, "SIGALRM"):
-                        signal.alarm(0)
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, OSError):
+                return False
             except Exception:
                 return False
 
