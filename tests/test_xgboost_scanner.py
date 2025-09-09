@@ -27,6 +27,7 @@ class FakeBooster:
     def __init__(self):
         self.__class__.__name__ = "Booster"
 
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for test files."""

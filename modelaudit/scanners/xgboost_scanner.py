@@ -40,6 +40,7 @@ SUSPICIOUS_JSON_PATTERNS = [
     (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
 ]
 
+
 def _check_xgboost_available() -> bool:
     """Check if XGBoost package is available."""
     try:

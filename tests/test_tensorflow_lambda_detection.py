@@ -20,6 +20,7 @@ from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanne
 def has_tensorflow():
     try:
         import tensorflow  # noqa: F401
+
         return True
     except ImportError:
         return False

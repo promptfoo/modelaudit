@@ -160,10 +160,11 @@ class TestSecurityAssetIntegration:
             def has_tensorflow():
                 try:
                     import tensorflow  # noqa: F401
+
                     return True
                 except ImportError:
                     return False
-            
+
             if not has_tensorflow() and (
                 "pyfunc" in malicious_file.name.lower() or "tensorflow" in str(malicious_file.parent).lower()
             ):

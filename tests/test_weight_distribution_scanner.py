@@ -366,7 +366,7 @@ class TestWeightDistributionScanner:
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
         if not has_torch():
             pytest.skip("PyTorch not installed")
-            
+
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
         data_bytes = pickle.dumps(data, protocol=4)
         zip_path = tmp_path / "model.pt"
