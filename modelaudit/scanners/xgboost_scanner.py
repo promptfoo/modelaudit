@@ -22,7 +22,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional, Union
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -54,7 +54,7 @@ class XGBoostScanner(BaseScanner):
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
         self.max_json_size = self.config.get("max_json_size", 100 * 1024 * 1024)  # 100MB
@@ -206,6 +206,20 @@ class XGBoostScanner(BaseScanner):
         try:
             import ubjson
 
+            # Check file size before attempting to read
+            file_size = os.path.getsize(path)
+            if file_size > self.max_json_size:
+                result.add_check(
+                    name="UBJ File Size",
+                    passed=False,
+                    message=f"UBJ file too large: {file_size} bytes (max: {self.max_json_size})",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"file_size": file_size, "max_size": self.max_json_size},
+                    why="Extremely large UBJ files may indicate malicious content or cause resource exhaustion",
+                )
+                return
+
             with open(path, "rb") as f:
                 model_data = ubjson.loadb(f.read())
 
@@ -244,6 +258,19 @@ class XGBoostScanner(BaseScanner):
                 location=path,
                 details={"file_size": 0},
                 why="Empty model files are invalid and may indicate corruption or attack",
+            )
+            return
+
+        # Check for extremely large binary files (using JSON size limit as reasonable bound)
+        if file_size > self.max_json_size:
+            result.add_check(
+                name="Binary File Size Check",
+                passed=False,
+                message=f"XGBoost binary file too large: {file_size} bytes (max: {self.max_json_size})",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"file_size": file_size, "max_size": self.max_json_size},
+                why="Extremely large binary files may cause resource exhaustion or contain malicious padding",
             )
             return
 
