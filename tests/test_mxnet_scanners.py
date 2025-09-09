@@ -485,8 +485,10 @@ class TestMXNetPickleIntegration:
         # Check if MXNet patterns were added to framework patterns
         assert "mxnet" in ML_FRAMEWORK_PATTERNS
         mxnet_patterns = ML_FRAMEWORK_PATTERNS["mxnet"]
-        assert "mxnet" in mxnet_patterns["modules"]
-        assert "NDArray" in mxnet_patterns["classes"]
+        modules = mxnet_patterns["modules"]
+        classes = mxnet_patterns["classes"]
+        assert isinstance(modules, list) and "mxnet" in modules
+        assert isinstance(classes, list) and "NDArray" in classes
 
         # Check if MXNet safe globals were added
         assert "mxnet" in ML_SAFE_GLOBALS

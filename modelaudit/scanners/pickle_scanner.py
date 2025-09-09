@@ -330,7 +330,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if framework_score > 5.0:  # Much lower threshold - any ML module presence
             # Normalize confidence to 0-1 range
             confidence_boost = patterns["confidence_boost"]
-            if isinstance(confidence_boost, int | float):
+            if isinstance(confidence_boost, (int, float)):
                 confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
                 context["frameworks"][framework] = {
                     "confidence": confidence,

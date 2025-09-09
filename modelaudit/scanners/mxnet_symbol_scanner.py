@@ -102,8 +102,6 @@ class MXNetSymbolScanner(BaseScanner):
 
             # Parse as JSON to check structure
             try:
-                import json
-
                 data = json.loads(content)
 
                 # Must have 'nodes' array as primary indicator

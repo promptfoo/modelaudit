@@ -345,7 +345,7 @@ class XGBoostScanner(BaseScanner):
 
         # Validate version
         version = data.get("version")
-        if not isinstance(version, list | tuple) or len(version) < 2:
+        if not isinstance(version, (list, tuple)) or len(version) < 2:
             result.add_check(
                 name="XGBoost Version Validation",
                 passed=False,
@@ -562,9 +562,9 @@ class XGBoostScanner(BaseScanner):
             )
             return
 
+        timeout = min(self.timeout, 30)  # Max 30 seconds for model loading
         try:
             # Use subprocess for isolation
-            timeout = min(self.timeout, 30)  # Max 30 seconds for model loading
             # Safely escape the path for subprocess
             escaped_path = shlex.quote(path)
             cmd = [
