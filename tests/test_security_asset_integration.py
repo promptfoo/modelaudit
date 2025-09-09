@@ -118,11 +118,18 @@ class TestSecurityAssetIntegration:
         skipped_files = []
 
         for malicious_file in malicious_files:
-            # Skip TensorFlow-specific malicious files if TensorFlow scanner is not available
-            if not tensorflow_available and (
+            # Skip TensorFlow-specific malicious files if TensorFlow is not actually installed
+            def has_tensorflow():
+                try:
+                    import tensorflow  # noqa: F401
+                    return True
+                except ImportError:
+                    return False
+            
+            if not has_tensorflow() and (
                 "pyfunc" in malicious_file.name.lower() or "tensorflow" in str(malicious_file.parent).lower()
             ):
-                skipped_files.append(f"{malicious_file.name} (TensorFlow scanner unavailable)")
+                skipped_files.append(f"{malicious_file.name} (TensorFlow not installed)")
                 continue
 
             # Scan the malicious file

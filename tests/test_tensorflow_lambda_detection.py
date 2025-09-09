@@ -16,6 +16,15 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
 
+# Defer TensorFlow check to avoid module-level imports
+def has_tensorflow():
+    try:
+        import tensorflow  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class TestTensorFlowLambdaDetection:
     """Test detection of Lambda layers and unsafe operations."""
 
@@ -25,6 +34,7 @@ class TestTensorFlowLambdaDetection:
         assert scanner is not None
         assert scanner.name == "tf_savedmodel"
 
+    @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
     def test_keras_metadata_lambda_detection(self):
         """Test detection of Lambda layers in keras_metadata.pb."""
         scanner = TensorFlowSavedModelScanner()
@@ -149,6 +159,7 @@ __import__('pickle').loads(data)
         source = inspect.getsource(scanner._analyze_saved_model)
         assert "StatefulPartitionedCall" in source
 
+    @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
     def test_savedmodel_directory_structure(self):
         """Test scanning a SavedModel directory structure."""
         scanner = TensorFlowSavedModelScanner()

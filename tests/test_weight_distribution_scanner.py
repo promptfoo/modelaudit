@@ -364,6 +364,9 @@ class TestWeightDistributionScanner:
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
+        if not has_torch():
+            pytest.skip("PyTorch not installed")
+            
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
         data_bytes = pickle.dumps(data, protocol=4)
         zip_path = tmp_path / "model.pt"
