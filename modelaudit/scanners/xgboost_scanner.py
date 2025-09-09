@@ -20,11 +20,25 @@ Security Focus:
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+# Precompiled regex patterns for performance
+SUSPICIOUS_JSON_PATTERNS = [
+    (re.compile(r"__reduce__", re.IGNORECASE), "Pickle-like reduction pattern in JSON"),
+    (re.compile(r"eval\s*\(", re.IGNORECASE), "Eval function call in JSON"),
+    (re.compile(r"exec\s*\(", re.IGNORECASE), "Exec function call in JSON"),
+    (re.compile(r"import\s+os", re.IGNORECASE), "OS module import in JSON"),
+    (re.compile(r"subprocess\.", re.IGNORECASE), "Subprocess usage in JSON"),
+    (re.compile(r"system\s*\(", re.IGNORECASE), "System call in JSON"),
+    (re.compile(r"__import__", re.IGNORECASE), "Dynamic import in JSON"),
+    (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
+]
 
 
 def _check_xgboost_available() -> bool:
@@ -449,22 +463,9 @@ class XGBoostScanner(BaseScanner):
         # Convert to string for pattern matching
         json_str = json.dumps(data, separators=(",", ":"))
 
-        # Check for suspicious patterns
-        suspicious_patterns = [
-            (r"__reduce__", "Pickle-like reduction pattern in JSON"),
-            (r"eval\s*\(", "Eval function call in JSON"),
-            (r"exec\s*\(", "Exec function call in JSON"),
-            (r"import\s+os", "OS module import in JSON"),
-            (r"subprocess\.", "Subprocess usage in JSON"),
-            (r"system\s*\(", "System call in JSON"),
-            (r"__import__", "Dynamic import in JSON"),
-            (r"\\x[0-9a-fA-F]{2}", "Hex-encoded data (potential shellcode)"),
-        ]
-
-        for pattern, description in suspicious_patterns:
-            import re
-
-            if re.search(pattern, json_str, re.IGNORECASE):
+        # Check for suspicious patterns using precompiled regex
+        for pattern, description in SUSPICIOUS_JSON_PATTERNS:
+            if pattern.search(json_str):
                 result.add_check(
                     name="JSON Content Analysis",
                     passed=False,
@@ -567,6 +568,8 @@ class XGBoostScanner(BaseScanner):
         try:
             # Use subprocess for isolation
             timeout = min(self.timeout, 30)  # Max 30 seconds for model loading
+            # Safely escape the path for subprocess
+            escaped_path = shlex.quote(path)
             cmd = [
                 sys.executable,
                 "-c",
@@ -575,7 +578,7 @@ import sys
 import xgboost as xgb
 try:
     booster = xgb.Booster()
-    booster.load_model('{path}')
+    booster.load_model({escaped_path})
     print("SUCCESS: Model loaded successfully")
 except Exception as e:
     print(f"ERROR: {{e}}")

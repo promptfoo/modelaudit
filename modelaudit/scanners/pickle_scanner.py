@@ -181,9 +181,31 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "tensorflow": ["*"],
     "keras": ["*"],
     # XGBoost safe patterns
-    "xgboost": ["*"],  # XGBoost operations are generally safe
-    "xgboost.core": ["*"],
-    "xgboost.sklearn": ["*"],
+    "xgboost": [
+        "Booster",
+        "DMatrix",
+        "XGBClassifier",
+        "XGBRegressor",
+        "XGBRanker",
+        "XGBRFClassifier",
+        "XGBRFRegressor",
+        "train",
+        "cv",
+        "plot_importance",
+        "plot_tree",
+    ],
+    "xgboost.core": [
+        "Booster",
+        "DMatrix",
+        "DataIter",
+    ],
+    "xgboost.sklearn": [
+        "XGBClassifier",
+        "XGBRegressor",
+        "XGBRanker",
+        "XGBRFClassifier",
+        "XGBRFRegressor",
+    ],
 }
 
 # Dangerous actual code execution patterns in strings
