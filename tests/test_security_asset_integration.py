@@ -108,7 +108,6 @@ class TestSecurityAssetIntegration:
             try:
                 # Use a timeout to prevent hanging in CI environments
                 import signal
-                import sys
 
                 def timeout_handler(signum, frame):
                     raise TimeoutError("TensorFlow import timeout")
