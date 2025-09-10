@@ -10,6 +10,8 @@ import requests
 from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
 from modelaudit.models import LicenseInfoModel as LicenseInfo
 
+from .constants import COMMON_MODEL_EXTENSIONS
+
 # Common license patterns with SPDX IDs and commercial use status
 LICENSE_PATTERNS = {
     # Permissive licenses (commercial-friendly)
@@ -171,18 +173,8 @@ DATASET_EXTENSIONS = {
     ".npz",
 }
 
-# Model file patterns
-MODEL_EXTENSIONS = {
-    ".pkl",
-    ".joblib",
-    ".pt",
-    ".pth",
-    ".onnx",
-    ".pb",
-    ".h5",
-    ".keras",
-    ".safetensors",
-}
+# Model file patterns (using shared constants)
+MODEL_EXTENSIONS = COMMON_MODEL_EXTENSIONS
 
 
 def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[LicenseInfo]:
