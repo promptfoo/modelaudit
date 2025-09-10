@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import click
@@ -21,6 +21,25 @@ load_dotenv()
 
 # Constants
 MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
+
+
+# TypedDict definitions for JFrog API responses
+class JFrogFileInfo(TypedDict):
+    """Type definition for JFrog file response."""
+
+    type: Literal["file"]
+    size: int
+    path: str
+    repo: str
+
+
+class JFrogFolderInfo(TypedDict):
+    """Type definition for JFrog folder response."""
+
+    type: Literal["folder"]
+    children: list[dict[str, Any]]
+    path: str
+    repo: str
 
 
 def is_jfrog_url(url: str) -> bool:
@@ -193,7 +212,18 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
     scannable = []
     for file in files:
-        path = Path(file["path"])
+        file_path = file["path"]
+
+        # Handle URLs safely on Windows by extracting URL path component
+        if file_path.startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+
+            parsed_url = urlparse(file_path)
+            # Use the URL path component for suffix detection
+            path = Path(parsed_url.path)
+        else:
+            path = Path(file_path)
+
         suffixes = [s.lower() for s in path.suffixes]
         for i in range(1, len(suffixes) + 1):
             if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
@@ -204,7 +234,7 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def detect_jfrog_target_type(
     url: str, api_token: str | None = None, access_token: str | None = None, timeout: int = 30
-) -> dict[str, Any]:
+) -> JFrogFileInfo | JFrogFolderInfo:
     """Detect if a JFrog URL points to a file or folder using Storage API.
 
     Args:
@@ -214,7 +244,7 @@ def detect_jfrog_target_type(
         timeout: Request timeout in seconds
 
     Returns:
-        Dictionary with target info: {"type": "file"|"folder", "children": [...]}
+        JFrogFileInfo for files or JFrogFolderInfo for folders
 
     Raises:
         ValueError: If URL is not a valid JFrog URL
@@ -249,20 +279,20 @@ def detect_jfrog_target_type(
 
         # If it has children, it's a folder
         if "children" in data:
-            return {
-                "type": "folder",
-                "children": data["children"],
-                "path": data.get("path", ""),
-                "repo": data.get("repo", ""),
-            }
+            return JFrogFolderInfo(
+                type="folder",
+                children=data["children"],
+                path=data.get("path", ""),
+                repo=data.get("repo", ""),
+            )
         else:
             # It's a file
-            return {
-                "type": "file",
-                "size": data.get("size", 0),
-                "path": data.get("path", ""),
-                "repo": data.get("repo", ""),
-            }
+            return JFrogFileInfo(
+                type="file",
+                size=data.get("size", 0),
+                path=data.get("path", ""),
+                repo=data.get("repo", ""),
+            )
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
@@ -282,6 +312,7 @@ def list_jfrog_folder_contents(
     timeout: int = 30,
     recursive: bool = True,
     selective: bool = True,
+    fetch_sizes: bool = False,
 ) -> list[dict[str, Any]]:
     """Recursively list all files in a JFrog folder.
 
@@ -292,6 +323,7 @@ def list_jfrog_folder_contents(
         timeout: Request timeout in seconds
         recursive: Whether to traverse subfolders
         selective: Whether to filter only scannable model files
+        fetch_sizes: Whether to fetch accurate file sizes (slower but more accurate progress)
 
     Returns:
         List of file dictionaries with keys: name, path, size, human_size
@@ -331,12 +363,22 @@ def list_jfrog_folder_contents(
                 else:
                     # It's a file
                     size = child.get("size", 0)
+
+                    # Optionally fetch accurate size if requested
+                    if fetch_sizes and size == 0:
+                        try:
+                            file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
+                            if file_info["type"] == "file":
+                                size = file_info.get("size", 0)
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch size for {child_url}: {e}")
+
                     files.append(
                         {
                             "name": child_name,
                             "path": child_url,
                             "size": size,
-                            "human_size": format_size(size),
+                            "human_size": format_size(size) if size > 0 else "Unknown",
                         }
                     )
 
@@ -359,6 +401,7 @@ def download_jfrog_folder(
     timeout: int = 30,
     selective: bool = True,
     show_progress: bool = True,
+    fetch_sizes: bool = False,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -370,6 +413,7 @@ def download_jfrog_folder(
         timeout: Request timeout in seconds
         selective: Whether to filter only scannable model files
         show_progress: Whether to show download progress
+        fetch_sizes: Whether to fetch accurate file sizes for progress reporting
 
     Returns:
         Path to directory containing downloaded files
@@ -382,7 +426,9 @@ def download_jfrog_folder(
         raise ValueError(f"Not a JFrog URL: {url}")
 
     # List all files in the folder
-    files = list_jfrog_folder_contents(url, api_token, access_token, timeout, recursive=True, selective=selective)
+    files = list_jfrog_folder_contents(
+        url, api_token, access_token, timeout, recursive=True, selective=selective, fetch_sizes=fetch_sizes
+    )
 
     if not files:
         raise ValueError("No scannable model files found in JFrog folder")
@@ -396,7 +442,8 @@ def download_jfrog_folder(
 
     if show_progress:
         total_size = sum(f["size"] for f in files)
-        click.echo(f"Found {len(files)} scannable files ({format_size(total_size)}) in JFrog folder")
+        size_info = format_size(total_size) if total_size > 0 else "size unknown"
+        click.echo(f"Found {len(files)} scannable files ({size_info}) in JFrog folder")
 
     # Download each file
     base_url_parsed = urlparse(url)
@@ -408,10 +455,13 @@ def download_jfrog_folder(
     except (ValueError, IndexError):
         base_repo_path = ""
 
+    download_failures = []
+
     for file_info in files:
         try:
             if show_progress:
-                click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
+                size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
+                click.echo(f"Downloading {file_info['name']} ({size_display})")
 
             # Calculate relative path for local storage
             file_url_parsed = urlparse(file_info["path"])
@@ -450,7 +500,22 @@ def download_jfrog_folder(
                 downloaded_file.rename(local_file)
 
         except Exception as e:
-            logger.warning(f"Failed to download {file_info['name']}: {e}")
+            error_msg = f"Failed to download {file_info['name']}: {e}"
+            logger.warning(error_msg)
+            download_failures.append({"file": file_info["name"], "error": str(e)})
             continue
+
+    # Report download failures if any occurred
+    if download_failures:
+        failure_summary = f"{len(download_failures)} file(s) failed to download"
+        if show_progress:
+            click.echo(f"⚠️  {failure_summary}")
+
+        # If all files failed, raise an exception
+        if len(download_failures) == len(files):
+            failure_details = "; ".join([f"{f['file']}: {f['error']}" for f in download_failures[:3]])
+            if len(download_failures) > 3:
+                failure_details += f" (and {len(download_failures) - 3} more)"
+            raise Exception(f"All downloads failed. {failure_details}")
 
     return download_dir

@@ -54,15 +54,15 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
         access_token=None,
         timeout=200,
     )
-    mock_scan.assert_called_once_with(
-        f"{temp_dir}/model.pt",
-        blacklist_patterns=["bad"],
-        timeout=200,
-        max_file_size=1000,
-        max_total_size=2000,
-        cache_enabled=True,
-        cache_dir=None,
-    )
+    # Check that scan was called with adjusted timeout (should be slightly less than 200 due to download time)
+    scan_call = mock_scan.call_args
+    assert scan_call[0][0] == f"{temp_dir}/model.pt"
+    assert scan_call[1]["blacklist_patterns"] == ["bad"]
+    assert 195 <= scan_call[1]["timeout"] <= 200  # Should be close to 200 but slightly reduced
+    assert scan_call[1]["max_file_size"] == 1000
+    assert scan_call[1]["max_total_size"] == 2000
+    assert scan_call[1]["cache_enabled"] is True
+    assert scan_call[1]["cache_dir"] is None
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
     assert results == mock_result
 
@@ -148,16 +148,15 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
         show_progress=True,
     )
 
-    # Verify scan was called on the folder
-    mock_scan.assert_called_once_with(
-        f"{temp_dir}/models",
-        blacklist_patterns=["bad"],
-        timeout=200,
-        max_file_size=1000,
-        max_total_size=2000,
-        cache_enabled=True,
-        cache_dir=None,
-    )
+    # Verify scan was called on the folder with adjusted timeout
+    scan_call = mock_scan.call_args
+    assert scan_call[0][0] == f"{temp_dir}/models"
+    assert scan_call[1]["blacklist_patterns"] == ["bad"]
+    assert 195 <= scan_call[1]["timeout"] <= 200  # Should be close to 200 but slightly reduced
+    assert scan_call[1]["max_file_size"] == 1000
+    assert scan_call[1]["max_total_size"] == 2000
+    assert scan_call[1]["cache_enabled"] is True
+    assert scan_call[1]["cache_dir"] is None
 
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
 

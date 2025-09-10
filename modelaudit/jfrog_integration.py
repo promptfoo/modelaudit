@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,8 @@ def scan_jfrog_artifact(
     """
 
     tmp_dir = tempfile.mkdtemp(prefix="modelaudit_jfrog_")
+    start_time = time.time()
+
     try:
         # Detect if URL points to a file or folder
         logger.debug(f"Analyzing JFrog target {url}")
@@ -102,6 +105,11 @@ def scan_jfrog_artifact(
                 show_progress=True,
             )
 
+        # Calculate remaining timeout for scanning phase
+        elapsed_time = time.time() - start_time
+        remaining_timeout = max(timeout - elapsed_time, 30)  # Ensure at least 30 seconds for scanning
+        logger.debug(f"Spent {elapsed_time:.1f}s on download, {remaining_timeout:.1f}s remaining for scan")
+
         # Ensure cache configuration is passed through from kwargs
         # Remove cache config from kwargs to avoid conflicts
         scan_kwargs = kwargs.copy()
@@ -110,11 +118,11 @@ def scan_jfrog_artifact(
             "cache_dir": scan_kwargs.pop("cache_dir", None),
         }
 
-        # Scan the downloaded file or directory
+        # Scan the downloaded file or directory with remaining timeout
         result = scan_model_directory_or_file(
             str(download_path),
             blacklist_patterns=blacklist_patterns,
-            timeout=timeout,
+            timeout=int(remaining_timeout),
             max_file_size=max_file_size,
             max_total_size=max_total_size,
             **cache_config,
