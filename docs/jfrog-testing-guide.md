@@ -7,7 +7,7 @@ This guide covers testing the new JFrog folder support functionality in ModelAud
 The JFrog implementation now supports both individual files and entire folders/repositories, matching the functionality of S3/GCS implementations. This testing guide ensures comprehensive coverage of:
 
 - JFrog Storage API integration
-- Folder detection and listing 
+- Folder detection and listing
 - Recursive file traversal
 - Selective model file filtering
 - Batch downloading
@@ -24,7 +24,7 @@ Run fast unit tests during development:
 # Run only JFrog-related tests
 rye run pytest tests/test_jfrog.py tests/test_jfrog_integration.py -v
 
-# Run specific test classes  
+# Run specific test classes
 rye run pytest tests/test_jfrog.py::TestJFrogFolderDetection -v
 rye run pytest tests/test_jfrog.py::TestJFrogFolderListing -v
 ```
@@ -56,23 +56,27 @@ rye run pytest tests/test_jfrog_integration.py --run-integration-tests -v
 ### 1. Unit Tests (`tests/test_jfrog.py`)
 
 **Storage API Tests:**
+
 - URL conversion to Storage API endpoints
 - File size formatting
 - Scannable file filtering
 - Error handling for invalid URLs
 
 **Folder Detection Tests:**
+
 - File vs folder detection using Storage API
 - Authentication error handling (401, 403, 404)
 - JSON response parsing
 
 **Folder Listing Tests:**
+
 - Simple folder listing
 - Recursive traversal of nested folders
 - Selective filtering to model files only
 - Error handling for non-folder targets
 
 **Folder Download Tests:**
+
 - Batch downloading of multiple files
 - Progress reporting
 - Error handling for empty folders
@@ -81,12 +85,14 @@ rye run pytest tests/test_jfrog_integration.py --run-integration-tests -v
 ### 2. Integration Tests (`tests/test_jfrog_integration.py`)
 
 **Mocked Integration Tests:**
+
 - End-to-end scanning workflow for files
 - End-to-end scanning workflow for folders
 - Proper metadata attachment
 - Error propagation and cleanup
 
 **Real JFrog Integration Tests:**
+
 - Tests against live JFrog instances (optional)
 - Require authentication and test data setup
 - Skipped by default, enabled with `--run-integration-tests`
@@ -163,9 +169,9 @@ export JFROG_API_TOKEN="your-token"
 # Scan a single model file
 rye run modelaudit "https://your-jfrog.com/artifactory/repo/model.pkl"
 
-# Expected: 
+# Expected:
 # - File detected and downloaded
-# - Model scanned successfully  
+# - Model scanned successfully
 # - JFrog metadata in results
 ```
 
@@ -202,7 +208,7 @@ rye run modelaudit "https://your-jfrog.com/artifactory/private/model.pkl"
 # Test non-existent file
 rye run modelaudit "https://your-jfrog.com/artifactory/repo/nonexistent.pkl"
 
-# Test non-existent folder  
+# Test non-existent folder
 rye run modelaudit "https://your-jfrog.com/artifactory/repo/nonexistent-folder/"
 
 # Test folder with no model files
@@ -219,7 +225,7 @@ The JFrog implementation should behave identically to S3/GCS:
 # S3 folder scanning
 rye run modelaudit "s3://bucket/models/"
 
-# GCS folder scanning  
+# GCS folder scanning
 rye run modelaudit "gs://bucket/models/"
 
 # JFrog folder scanning (new)
@@ -252,12 +258,14 @@ mprof plot
 ### Common Issues
 
 **Tests Skip with "Integration tests disabled":**
+
 ```bash
 # Solution: Enable integration tests
 pytest --run-integration-tests tests/test_jfrog_integration.py
 ```
 
 **"JFrog integration test credentials not available":**
+
 ```bash
 # Solution: Set environment variables
 export JFROG_API_TOKEN="your-token"
@@ -265,6 +273,7 @@ export JFROG_TEST_FILE_URL="http://localhost:8082/artifactory/repo/test.pkl"
 ```
 
 **Authentication errors:**
+
 ```bash
 # Check token validity
 curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" \
@@ -272,6 +281,7 @@ curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" \
 ```
 
 **Storage API errors:**
+
 ```bash
 # Test Storage API access manually
 curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" \
@@ -295,7 +305,7 @@ MODELAUDIT_LOG_LEVEL=DEBUG pytest tests/test_jfrog_integration.py -v -s
 The test suite aims for:
 
 - **Unit Tests:** >90% coverage of `utils/jfrog.py` functions
-- **Integration Tests:** Cover all major user workflows  
+- **Integration Tests:** Cover all major user workflows
 - **Error Handling:** Test all authentication and network error cases
 - **Performance:** Ensure folder scanning scales to 100+ files
 - **Compatibility:** Verify feature parity with S3/GCS implementations
@@ -310,7 +320,7 @@ In CI/CD pipelines:
   run: |
     # Run unit tests (always)
     rye run pytest tests/test_jfrog.py -v
-    
+
     # Run integration tests only if JFrog is available
     if [ ! -z "$JFROG_API_TOKEN" ]; then
       rye run pytest tests/test_jfrog_integration.py --run-integration-tests -v

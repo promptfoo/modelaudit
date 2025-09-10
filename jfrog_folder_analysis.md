@@ -9,6 +9,7 @@ After analyzing the ModelAudit JFrog implementation, I've identified a **signifi
 ### Architecture Overview
 
 The JFrog implementation consists of two main files:
+
 - `modelaudit/jfrog_integration.py` - High-level integration function
 - `modelaudit/utils/jfrog.py` - Low-level download utilities
 
@@ -49,13 +50,14 @@ def download_from_cloud(url: str, ...):
         files = metadata.get("files", [])
         if selective:
             files = filter_scannable_files(files)  # Filter to model files
-        
+
         # Download all files in directory
         for file_info in files:
             fs.get(file_url, str(local_path))
 ```
 
 **Key S3/GCS Features:**
+
 - **Directory detection**: Uses `fs.info()` to determine if target is file/directory
 - **Recursive traversal**: Uses `fs.glob(f"{url}/**")` to find all files
 - **Selective downloading**: Filters to only scannable model files
@@ -75,6 +77,7 @@ def scan_model_directory_or_file(path: FilePath, ...):
 ### JFrog Implementation Gap
 
 **❌ No Folder Support:**
+
 - Only downloads single files via `requests.get()`
 - No directory detection or traversal
 - No batch file processing
@@ -87,9 +90,11 @@ def scan_model_directory_or_file(path: FilePath, ...):
 Based on research, JFrog Artifactory provides several APIs that **could** support folder operations:
 
 1. **Storage API** (`/api/storage/{repo}/{path}`)
+
    ```bash
    curl "https://artifactory.company.com/api/storage/repo/folder/?list&deep=1"
    ```
+
    - Returns JSON with file/folder listing
    - Supports recursive traversal with `deep` parameter
 
@@ -97,26 +102,30 @@ Based on research, JFrog Artifactory provides several APIs that **could** suppor
    ```bash
    curl -X POST -d 'items.find({"repo":"myrepo","path":{"$match":"folder/*"},"type":"file"})'
    ```
+
    - Complex queries for finding files
    - Supports filtering by file type, size, etc.
 
 ### Missing Implementation
 
 The current JFrog implementation **does not use** these APIs and therefore **cannot**:
-- List contents of JFrog folders/repositories  
+
+- List contents of JFrog folders/repositories
 - Download multiple files from a JFrog directory
 - Scan entire JFrog repositories like S3/GCS buckets
 
 ## Impact Assessment
 
 ### What Works
+
 ```bash
 # Single file scanning works
 modelaudit https://company.jfrog.io/artifactory/models/model.pkl
 ```
 
 ### What Doesn't Work
-```bash  
+
+```bash
 # Folder scanning fails - no implementation
 modelaudit https://company.jfrog.io/artifactory/models/
 modelaudit https://company.jfrog.io/artifactory/models/pytorch-models/
@@ -124,13 +133,13 @@ modelaudit https://company.jfrog.io/artifactory/models/pytorch-models/
 
 ### Comparison Table
 
-| Feature | Local | S3/GCS | JFrog |
-|---------|-------|---------|-------|
-| Single file scan | ✅ | ✅ | ✅ |
-| Folder scan | ✅ | ✅ | ❌ |
-| Recursive traversal | ✅ | ✅ | ❌ |
-| Selective file filtering | ✅ | ✅ | ❌ |
-| Batch operations | ✅ | ✅ | ❌ |
+| Feature                  | Local | S3/GCS | JFrog |
+| ------------------------ | ----- | ------ | ----- |
+| Single file scan         | ✅    | ✅     | ✅    |
+| Folder scan              | ✅    | ✅     | ❌    |
+| Recursive traversal      | ✅    | ✅     | ❌    |
+| Selective file filtering | ✅    | ✅     | ❌    |
+| Batch operations         | ✅    | ✅     | ❌    |
 
 ## Recommendations
 
@@ -141,10 +150,10 @@ The JFrog implementation needs to be enhanced to match the functionality of S3/G
 ```python
 def download_artifact_or_folder(url: str, ...):
     """Enhanced function to handle both files and folders."""
-    
+
     # 1. Check if URL points to file or folder using Storage API
     # 2. If folder: List all files using Storage API or AQL
-    # 3. Filter to scannable model files  
+    # 3. Filter to scannable model files
     # 4. Download all files to temp directory
     # 5. Return directory path for scanning
 ```
@@ -152,6 +161,7 @@ def download_artifact_or_folder(url: str, ...):
 ### 2. Implementation Approach
 
 Follow the same pattern as `cloud_storage.py`:
+
 - Add folder detection using JFrog Storage API
 - Add recursive file listing capability
 - Add selective file filtering (only download model files)
@@ -161,6 +171,7 @@ Follow the same pattern as `cloud_storage.py`:
 ### 3. API Integration
 
 Use JFrog Storage API for listing:
+
 ```python
 def list_jfrog_folder(base_url: str, auth_headers: dict) -> list[dict]:
     """List all files in a JFrog folder using Storage API."""
