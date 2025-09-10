@@ -136,8 +136,10 @@ modelaudit https://pytorch.org/hub/pytorch_vision_resnet/
 modelaudit models:/MyModel/Production
 modelaudit model.dvc
 modelaudit s3://my-bucket/downloaded-model.pt
-modelaudit https://company.jfrog.io/artifactory/repo/model.pt \
-    --jfrog-api-token YOUR_TOKEN
+
+# JFrog Artifactory - now supports both files AND folders
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt
+modelaudit https://company.jfrog.io/artifactory/repo/models/  # Scan entire folder!
 ```
 
 ### **Compliance & Audit Reporting**
@@ -393,8 +395,9 @@ modelaudit https://account.blob.core.windows.net/container/model.pt
 # MLflow registry
 modelaudit models:/MyModel/Production
 
-# JFrog Artifactory
-modelaudit https://company.jfrog.io/repo/model.pt
+# JFrog Artifactory (files and folders)
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt      # Single file
+modelaudit https://company.jfrog.io/artifactory/repo/models/       # Entire folder
 ```
 
 ### Command Options
