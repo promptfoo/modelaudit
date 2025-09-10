@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import click
 import requests
+import requests.exceptions
 from dotenv import load_dotenv
 
 from ..constants import SCANNABLE_MODEL_EXTENSIONS
@@ -352,7 +353,9 @@ def list_jfrog_folder_contents(
             if folder_info["type"] != "folder":
                 return
 
-            for child in folder_info["children"]:
+            # Type-safe access - we know it's a JFrogFolderInfo now
+            folder_data = folder_info  # type: ignore[misc]
+            for child in folder_data["children"]:
                 child_name = child["uri"].lstrip("/")
                 child_url = f"{folder_url.rstrip('/')}/{child_name}"
 

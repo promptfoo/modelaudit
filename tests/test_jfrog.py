@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 import requests
+import requests.exceptions
 
 from modelaudit.utils.jfrog import (
     detect_jfrog_target_type,
