@@ -111,7 +111,7 @@ ModelAudit supports multiple input sources:
 - HuggingFace direct files: `https://huggingface.co/username/model/resolve/<revision>/<path>` or `https://hf.co/username/model/resolve/<revision>/<path>`
 - Cloud storage: S3 (`s3://bucket/path`), GCS (`gs://bucket/path`)
 - MLflow models: `models://model-name/version`
-- JFrog Artifactory URLs
+- JFrog Artifactory URLs (files and folders): `https://company.jfrog.io/artifactory/repo/model.pt` or `https://company.jfrog.io/artifactory/repo/models/`
 - DVC pointer files (`.dvc`)
 
 ## Environment Variables
