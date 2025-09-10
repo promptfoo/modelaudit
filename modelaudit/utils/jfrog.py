@@ -12,48 +12,15 @@ import click
 import requests
 from dotenv import load_dotenv
 
+from ..constants import SCANNABLE_MODEL_EXTENSIONS
+
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file if it exists
 load_dotenv()
 
-# Scannable model file extensions - defined once at module level for efficiency
-SCANNABLE_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".pkl",
-        ".pickle",
-        ".joblib",
-        ".pt",
-        ".pth",
-        ".h5",
-        ".hdf5",
-        ".keras",
-        ".onnx",
-        ".pb",
-        ".pbtxt",
-        ".tflite",
-        ".lite",
-        ".safetensors",
-        ".msgpack",
-        ".bin",
-        ".ckpt",
-        ".pdmodel",
-        ".pdiparams",
-        ".pdopt",
-        ".ot",
-        ".ort",
-        ".gguf",
-        ".ggml",
-        ".pmml",
-        ".mar",
-        ".model",
-        ".mlmodel",
-        ".ov",
-        ".tar",
-        ".tar.gz",
-        ".tgz",
-    }
-)
+# Constants
+MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
 
 
 def is_jfrog_url(url: str) -> bool:
@@ -204,8 +171,8 @@ def get_storage_api_url(url: str) -> str:
 
     try:
         artifactory_index = path_parts.index("artifactory")
-        # Replace 'artifactory' with 'api/storage' in the path
-        api_parts = [*path_parts[:artifactory_index], "api", "storage", *path_parts[artifactory_index + 1 :]]
+        # Keep 'artifactory' and append 'api/storage' after it
+        api_parts = [*path_parts[: artifactory_index + 1], "api", "storage", *path_parts[artifactory_index + 1 :]]
         api_path = "/".join(api_parts)
         return f"{parsed.scheme}://{parsed.netloc}{api_path}"
     except (ValueError, IndexError) as e:
@@ -229,7 +196,7 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         path = Path(file["path"])
         suffixes = [s.lower() for s in path.suffixes]
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_EXTENSIONS:
+            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
                 scannable.append(file)
                 break
     return scannable
@@ -343,7 +310,7 @@ def list_jfrog_folder_contents(
 
     def _collect_files(folder_url: str, depth: int = 0) -> None:
         """Recursively collect files from folder."""
-        if depth > 10:  # Prevent infinite recursion
+        if depth > MAX_RECURSION_DEPTH:  # Prevent infinite recursion
             logger.warning(f"Maximum recursion depth reached for {folder_url}")
             return
 

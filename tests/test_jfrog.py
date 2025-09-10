@@ -152,15 +152,15 @@ class TestJFrogStorageAPI:
         test_cases = [
             (
                 "https://company.jfrog.io/artifactory/repo/model.pkl",
-                "https://company.jfrog.io/api/storage/repo/model.pkl",
+                "https://company.jfrog.io/artifactory/api/storage/repo/model.pkl",
             ),
             (
                 "https://my-jfrog.com/artifactory/libs-release/models/",
-                "https://my-jfrog.com/api/storage/libs-release/models/",
+                "https://my-jfrog.com/artifactory/api/storage/libs-release/models/",
             ),
             (
                 "http://localhost:8081/artifactory/local-repo/path/to/file.bin",
-                "http://localhost:8081/api/storage/local-repo/path/to/file.bin",
+                "http://localhost:8081/artifactory/api/storage/local-repo/path/to/file.bin",
             ),
         ]
 
@@ -266,10 +266,9 @@ class TestJFrogFolderDetection:
         mock_response = mock_get.return_value
         from unittest.mock import Mock
 
-        mock_error_response = Mock()
+        mock_error_response = Mock(spec=requests.Response)
         mock_error_response.status_code = 401
-        http_error = requests.exceptions.HTTPError()
-        http_error.response = mock_error_response
+        http_error = requests.exceptions.HTTPError(response=mock_error_response)
         mock_response.raise_for_status.side_effect = http_error
 
         with pytest.raises(Exception, match="Authentication failed"):
@@ -281,10 +280,9 @@ class TestJFrogFolderDetection:
         mock_response = mock_get.return_value
         from unittest.mock import Mock
 
-        mock_error_response = Mock()
+        mock_error_response = Mock(spec=requests.Response)
         mock_error_response.status_code = 404
-        http_error = requests.exceptions.HTTPError()
-        http_error.response = mock_error_response
+        http_error = requests.exceptions.HTTPError(response=mock_error_response)
         mock_response.raise_for_status.side_effect = http_error
 
         with pytest.raises(Exception, match="not found"):

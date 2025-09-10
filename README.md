@@ -140,6 +140,8 @@ modelaudit s3://my-bucket/downloaded-model.pt
 # JFrog Artifactory - now supports both files AND folders
 # Auth: export JFROG_API_TOKEN=... (or JFROG_ACCESS_TOKEN)
 modelaudit https://company.jfrog.io/artifactory/repo/model.pt
+# Or with explicit flag:
+modelaudit https://company.jfrog.io/artifactory/repo/model.pt --api-token "$JFROG_API_TOKEN"
 modelaudit https://company.jfrog.io/artifactory/repo/models/  # Scan entire folder!
 ```
 
