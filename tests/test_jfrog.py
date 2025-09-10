@@ -265,6 +265,7 @@ class TestJFrogFolderDetection:
         """Test handling of authentication errors."""
         mock_response = mock_get.return_value
         from unittest.mock import Mock
+
         mock_error_response = Mock()
         mock_error_response.status_code = 401
         http_error = requests.exceptions.HTTPError()
@@ -279,6 +280,7 @@ class TestJFrogFolderDetection:
         """Test handling of 404 errors."""
         mock_response = mock_get.return_value
         from unittest.mock import Mock
+
         mock_error_response = Mock()
         mock_error_response.status_code = 404
         http_error = requests.exceptions.HTTPError()
