@@ -122,14 +122,14 @@ def scan_jfrog_artifact(
         )
 
         # Add metadata about the JFrog source
-        # Note: Using setattr for dynamic field access since model has extra="allow"
+        # Note: Direct assignment works since model has extra="allow"
         jfrog_metadata = getattr(result, "metadata", None) or {}
         jfrog_metadata["jfrog_source"] = {
             "url": url,
             "type": target_info["type"],
             "repo": target_info.get("repo", ""),
         }
-        setattr(result, "metadata", jfrog_metadata)
+        result.metadata = jfrog_metadata  # type: ignore[attr-defined]
 
         return result
     finally:
