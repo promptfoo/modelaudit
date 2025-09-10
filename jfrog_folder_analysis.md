@@ -99,6 +99,7 @@ Based on research, JFrog Artifactory provides several APIs that **could** suppor
    - Supports recursive traversal with `deep` parameter
 
 2. **AQL (Artifactory Query Language)** (`/api/search/aql`)
+
    ```bash
    curl -X POST -d 'items.find({"repo":"myrepo","path":{"$match":"folder/*"},"type":"file"})'
    ```
