@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2025-09-10
+
+### Added
+
+- **feat**: add comprehensive JFrog folder scanning support (#380)
+- **feat**: add comprehensive XGBoost model scanner with security analysis (#378)
+- **feat**: consolidate duplicate caching logic into unified decorator (#347)
+- **test**: improve test architecture with dependency mocking (#374)
+
+### Fixed
+
+- **fix**: exclude Python 3.13 from NumPy 1.x compatibility tests (#375)
+
 ## [0.2.5] - 2025-09-05
 
 ### Added
@@ -358,7 +371,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/promptfoo/modelaudit/compare/v0.2.2...v0.2.3
