@@ -264,9 +264,12 @@ class TestJFrogFolderDetection:
     def test_detect_jfrog_target_type_auth_error(self, mock_get):
         """Test handling of authentication errors."""
         mock_response = mock_get.return_value
-        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
-            response=type("MockResponse", (), {"status_code": 401})()
-        )
+        from unittest.mock import Mock
+        mock_error_response = Mock()
+        mock_error_response.status_code = 401
+        http_error = requests.exceptions.HTTPError()
+        http_error.response = mock_error_response
+        mock_response.raise_for_status.side_effect = http_error
 
         with pytest.raises(Exception, match="Authentication failed"):
             detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl")
@@ -275,9 +278,12 @@ class TestJFrogFolderDetection:
     def test_detect_jfrog_target_type_not_found(self, mock_get):
         """Test handling of 404 errors."""
         mock_response = mock_get.return_value
-        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
-            response=type("MockResponse", (), {"status_code": 404})()
-        )
+        from unittest.mock import Mock
+        mock_error_response = Mock()
+        mock_error_response.status_code = 404
+        http_error = requests.exceptions.HTTPError()
+        http_error.response = mock_error_response
+        mock_response.raise_for_status.side_effect = http_error
 
         with pytest.raises(Exception, match="not found"):
             detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/nonexistent.pkl")

@@ -124,7 +124,8 @@ docker run -d \
   releases-docker.jfrog.io/jfrog/artifactory-oss:latest
 
 # Wait for startup (check http://localhost:8082/ui/)
-# Default credentials: admin/password
+# On first run, JFrog prompts to change the default admin password.
+# Do not use admin/password beyond initial setup.
 ```
 
 ### Environment Variables
@@ -132,6 +133,7 @@ docker run -d \
 ```bash
 # Required for integration tests
 export JFROG_API_TOKEN="your-api-token-here"
+export JFROG_ACCESS_TOKEN="your-access-token-here"  # alternative to API token
 
 # Optional: specific test URLs (replace with your paths)
 export JFROG_TEST_FILE_URL="http://localhost:8082/artifactory/generic-local/models/test-model.pkl"
@@ -143,17 +145,17 @@ export JFROG_TEST_FOLDER_URL="http://localhost:8082/artifactory/generic-local/mo
 Upload sample model files to your JFrog instance:
 
 ```bash
-# Upload individual files
-curl -u admin:password -X PUT \
+# Upload individual files (token-based)
+curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" -X PUT \
   "http://localhost:8082/artifactory/generic-local/models/test-model.pkl" \
   -T /path/to/your/test-model.pkl
 
 # Upload folder structure
-curl -u admin:password -X PUT \
+curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" -X PUT \
   "http://localhost:8082/artifactory/generic-local/models/pytorch/model1.pt" \
   -T /path/to/model1.pt
 
-curl -u admin:password -X PUT \
+curl -H "X-JFrog-Art-Api: $JFROG_API_TOKEN" -X PUT \
   "http://localhost:8082/artifactory/generic-local/models/tensorflow/model2.h5" \
   -T /path/to/model2.h5
 ```
@@ -322,7 +324,7 @@ In CI/CD pipelines:
     rye run pytest tests/test_jfrog.py -v
 
     # Run integration tests only if JFrog is available
-    if [ ! -z "$JFROG_API_TOKEN" ]; then
+    if [ -n "$JFROG_API_TOKEN" ]; then
       rye run pytest tests/test_jfrog_integration.py --run-integration-tests -v
     fi
   env:

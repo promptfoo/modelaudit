@@ -17,6 +17,42 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env file if it exists
 load_dotenv()
 
+# Scannable model file extensions - defined once at module level for efficiency
+SCANNABLE_EXTENSIONS: frozenset[str] = frozenset({
+    ".pkl",
+    ".pickle",
+    ".joblib",
+    ".pt",
+    ".pth",
+    ".h5",
+    ".hdf5",
+    ".keras",
+    ".onnx",
+    ".pb",
+    ".pbtxt",
+    ".tflite",
+    ".lite",
+    ".safetensors",
+    ".msgpack",
+    ".bin",
+    ".ckpt",
+    ".pdmodel",
+    ".pdiparams",
+    ".pdopt",
+    ".ot",
+    ".ort",
+    ".gguf",
+    ".ggml",
+    ".pmml",
+    ".mar",
+    ".model",
+    ".mlmodel",
+    ".ov",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+})
+
 
 def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
@@ -186,40 +222,6 @@ def format_size(size_bytes: int) -> str:
 
 def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
-    SCANNABLE_EXTENSIONS = {
-        ".pkl",
-        ".pickle",
-        ".joblib",
-        ".pt",
-        ".pth",
-        ".h5",
-        ".hdf5",
-        ".keras",
-        ".onnx",
-        ".pb",
-        ".pbtxt",
-        ".tflite",
-        ".lite",
-        ".safetensors",
-        ".msgpack",
-        ".bin",
-        ".ckpt",
-        ".pdmodel",
-        ".pdiparams",
-        ".pdopt",
-        ".ot",
-        ".ort",
-        ".gguf",
-        ".ggml",
-        ".pmml",
-        ".mar",
-        ".model",
-        ".mlmodel",
-        ".ov",
-        ".tar",
-        ".tar.gz",
-        ".tgz",
-    }
     scannable = []
     for file in files:
         path = Path(file["path"])
