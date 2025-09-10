@@ -462,7 +462,7 @@ class TestMXNetSecurityPatterns:
             if i == 0:
                 nodes.append({"op": "null", "name": f"layer_{i}", "inputs": []})
             else:
-                nodes.append({"op": "FullyConnected", "name": f"layer_{i}", "inputs": [[i - 1, 0, 0]]})
+                nodes.append({"op": "FullyConnected", "name": f"layer_{i}", "inputs": [[i - 1, 0, 0]]})  # type: ignore[list-item]
 
         deep_graph = {"nodes": nodes, "arg_nodes": [0], "heads": [[len(nodes) - 1, 0, 0]]}
 
