@@ -166,15 +166,18 @@ class TestLargeFileCache:
                 test_result.finish(success=True)
 
                 # Mock cache manager to raise exception
-                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")), patch(
-                    "modelaudit.utils.large_file_handler._scan_large_file_internal", return_value=test_result
-                ) as mock_internal:
-                        # Should fall back to direct scan
-                        result = scan_large_file(tmp_file.name, mock_scanner)
+                with (
+                    patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")),
+                    patch(
+                        "modelaudit.utils.large_file_handler._scan_large_file_internal", return_value=test_result
+                    ) as mock_internal,
+                ):
+                    # Should fall back to direct scan
+                    result = scan_large_file(tmp_file.name, mock_scanner)
 
-                        # Verify fallback was used
-                        assert result.scanner_name == "test"
-                        assert mock_internal.call_count == 1
+                    # Verify fallback was used
+                    assert result.scanner_name == "test"
+                    assert mock_internal.call_count == 1
 
             finally:
                 Path(tmp_file.name).unlink()  # Clean up
@@ -253,16 +256,19 @@ class TestAdvancedLargeFileCache:
                 test_result.finish(success=True)
 
                 # Mock cache manager to raise exception
-                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")), patch(
-                    "modelaudit.utils.advanced_file_handler._scan_advanced_large_file_internal",
-                    return_value=test_result,
-                ) as mock_internal:
-                        # Should fall back to direct scan
-                        result = scan_advanced_large_file(tmp_file.name, mock_scanner)
+                with (
+                    patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")),
+                    patch(
+                        "modelaudit.utils.advanced_file_handler._scan_advanced_large_file_internal",
+                        return_value=test_result,
+                    ) as mock_internal,
+                ):
+                    # Should fall back to direct scan
+                    result = scan_advanced_large_file(tmp_file.name, mock_scanner)
 
-                        # Verify fallback was used
-                        assert result.scanner_name == "advanced_test"
-                        assert mock_internal.call_count == 1
+                    # Verify fallback was used
+                    assert result.scanner_name == "advanced_test"
+                    assert mock_internal.call_count == 1
 
             finally:
                 Path(tmp_file.name).unlink()  # Clean up
