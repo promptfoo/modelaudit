@@ -528,10 +528,10 @@ def scan_advanced_large_file(
         # Get cached result or perform scan
         result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan_wrapper)
 
-        # Convert back to ScanResult
-        from .result_conversion import scan_result_from_dict
+        # Convert back to ScanResult using the new from_dict method
+        from ..scanners.base import ScanResult
 
-        return scan_result_from_dict(result_dict)
+        return ScanResult.from_dict(result_dict)
 
     except Exception as e:
         # If cache system fails, fall back to direct scanning

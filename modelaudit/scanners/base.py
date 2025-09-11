@@ -293,6 +293,70 @@ class ScanResult:
             "failed_checks": sum(1 for c in self.checks if c.status == CheckStatus.FAILED),
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
+        """
+        Create ScanResult from dictionary (for cache deserialization).
+
+        Args:
+            data: Dictionary containing serialized ScanResult data
+
+        Returns:
+            Reconstructed ScanResult object
+        """
+        # Create new ScanResult instance
+        result = cls(scanner_name=data.get("scanner", "unknown"))
+
+        # Restore basic properties
+        result.success = data.get("success", False)
+        result.bytes_scanned = data.get("bytes_scanned", 0)
+        result.metadata = data.get("metadata", {})
+
+        # Restore timing information if available
+        duration = data.get("duration")
+        if duration is not None:
+            result.end_time = result.start_time + duration
+
+        # Restore issues
+        issues_data = data.get("issues", [])
+        for issue_dict in issues_data:
+            issue = Issue(
+                message=issue_dict.get("message", ""),
+                severity=IssueSeverity(issue_dict.get("severity", "INFO")),
+                details=issue_dict.get("details", {}),
+                location=issue_dict.get("location"),
+                why=issue_dict.get("why"),
+                type=issue_dict.get("type"),
+            )
+            result.issues.append(issue)
+
+        # Restore checks
+        checks_data = data.get("checks", [])
+        for check_dict in checks_data:
+            # Map status string back to enum
+            status_str = check_dict.get("status", "passed")
+            if status_str.upper() == "PASSED" or status_str.lower() == "passed":
+                status = CheckStatus.PASSED
+            elif status_str.upper() == "FAILED" or status_str.lower() == "failed":
+                status = CheckStatus.FAILED
+            elif status_str.upper() == "SKIPPED" or status_str.lower() == "skipped":
+                status = CheckStatus.SKIPPED
+            else:
+                status = CheckStatus.PASSED  # Default to passed for unknown statuses
+
+            check = Check(
+                name=check_dict.get("name", ""),
+                status=status,
+                message=check_dict.get("message", ""),
+                severity=IssueSeverity(check_dict.get("severity", "INFO")) if check_dict.get("severity") else None,
+                location=check_dict.get("location"),
+                details=check_dict.get("details", {}),
+                why=check_dict.get("why"),
+            )
+            result.checks.append(check)
+
+        return result
+
     def to_json(self, indent: int = 2) -> str:
         """Convert the scan result to a JSON string"""
         return json.dumps(self.to_dict(), indent=indent)
