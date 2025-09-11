@@ -450,9 +450,14 @@ def delegate_info() -> None:
     help="Preview what would be scanned/downloaded without actually doing it",
 )
 @click.option(
-    "--no-cache",
-    is_flag=True,
-    help="Force disable caching (overrides smart detection)",
+    "--cache/--no-cache",
+    default=True,
+    help="Enable/disable scan result caching for faster repeated scans",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Custom cache directory (default: system cache dir)",
 )
 def scan_command(
     paths: tuple[str, ...],
@@ -467,7 +472,8 @@ def scan_command(
     timeout: int | None,
     max_size: str | None,
     dry_run: bool,
-    no_cache: bool,
+    cache: bool,
+    cache_dir: str | None,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -545,8 +551,10 @@ def scan_command(
     # Override smart detection with explicit user flags
     if progress:
         user_overrides["show_progress"] = True
-    if no_cache:
+    if not cache:
         user_overrides["use_cache"] = False
+    if cache_dir:
+        user_overrides["cache_dir"] = cache_dir
     if strict:
         user_overrides["skip_non_model_files"] = False
         user_overrides["strict_license"] = True
@@ -1914,6 +1922,67 @@ def doctor(show_failed: bool) -> None:
         click.echo("• Run 'modelaudit doctor --show-failed' for detailed error messages")
     else:
         click.secho("\n✓ All scanners loaded successfully!", fg="green")
+
+
+@cli.command("cache")
+@click.option("--clear", is_flag=True, help="Clear the scan cache")
+@click.option("--stats", is_flag=True, help="Show cache statistics")
+@click.option("--cache-dir", type=click.Path(), help="Cache directory to operate on")
+def cache_command(clear: bool, stats: bool, cache_dir: str | None) -> None:
+    """Manage scan result cache."""
+    from .cache import get_cache_manager
+
+    try:
+        cache_manager = get_cache_manager(cache_dir=cache_dir, enabled=True)
+
+        if clear:
+            if hasattr(cache_manager, "clear"):
+                cache_manager.clear()
+                click.secho("✓ Cache cleared successfully", fg="green")
+            else:
+                click.secho("Cache clearing not supported by current cache manager", fg="yellow")
+
+        if stats:
+            try:
+                if hasattr(cache_manager, "get_stats"):
+                    stats_data = cache_manager.get_stats() or {}
+
+                    click.echo("📊 Cache Statistics:")
+                    click.echo(f"   Enabled: {stats_data.get('enabled', 'unknown')}")
+                    click.echo(f"   Total entries: {stats_data.get('total_entries', 0):,}")
+                    click.echo(f"   Total size: {stats_data.get('total_size_mb', 0):.2f} MB")
+                    click.echo(f"   Cache hits: {stats_data.get('cache_hits', 0):,}")
+                    click.echo(f"   Cache misses: {stats_data.get('cache_misses', 0):,}")
+
+                    hit_rate = stats_data.get("hit_rate", 0.0)
+                    if hit_rate > 0:
+                        click.echo(f"   Hit rate: {hit_rate:.1%}")
+
+                    if hasattr(cache_manager, "cache_dir") and cache_manager.cache_dir:
+                        click.echo(f"   Cache directory: {cache_manager.cache_dir}")
+                else:
+                    click.echo("📊 Cache Statistics:")
+                    click.echo(f"   Manager: {type(cache_manager).__name__}")
+                    click.echo(f"   Enabled: {getattr(cache_manager, 'enabled', 'unknown')}")
+                    if hasattr(cache_manager, "cache_dir"):
+                        click.echo(f"   Directory: {cache_manager.cache_dir}")
+
+            except Exception as e:
+                click.secho(f"Error getting cache statistics: {e}", fg="red")
+
+        # If no flags specified, show basic info
+        if not clear and not stats:
+            click.echo("💾 ModelAudit Cache Management")
+            click.echo("")
+            click.echo("Available commands:")
+            click.echo("  --stats    Show cache statistics and usage")
+            click.echo("  --clear    Clear all cached scan results")
+            click.echo("  --cache-dir DIR  Operate on specific cache directory")
+            click.echo("")
+            click.echo("For more information: modelaudit cache --help")
+
+    except Exception as e:
+        click.secho(f"Cache management error: {e}", fg="red")
 
 
 def main() -> None:
