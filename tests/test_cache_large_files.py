@@ -37,7 +37,7 @@ class TestScanResultSerialization:
         # Verify issues - should have 2: one explicit + one from failed check
         assert len(reconstructed.issues) == len(original.issues)
         # Find the explicitly added issue
-        explicit_issue = [i for i in reconstructed.issues if i.message == "Test issue"][0]
+        explicit_issue = next(i for i in reconstructed.issues if i.message == "Test issue")
         assert explicit_issue.severity == IssueSeverity.CRITICAL
         assert explicit_issue.location == "test.py"
         assert explicit_issue.details == {"key": "value"}
@@ -57,7 +57,7 @@ class TestScanResultSerialization:
         assert len(failed_checks) == 2
 
         # Find the check that was explicitly added with add_check
-        explicit_check = [c for c in failed_checks if c.message == "Check failed"][0]
+        explicit_check = next(c for c in failed_checks if c.message == "Check failed")
         assert explicit_check.name == "Failed check"
 
     def test_scan_result_from_dict_empty(self):
@@ -166,10 +166,9 @@ class TestLargeFileCache:
                 test_result.finish(success=True)
 
                 # Mock cache manager to raise exception
-                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")):
-                    with patch(
-                        "modelaudit.utils.large_file_handler._scan_large_file_internal", return_value=test_result
-                    ) as mock_internal:
+                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")), patch(
+                    "modelaudit.utils.large_file_handler._scan_large_file_internal", return_value=test_result
+                ) as mock_internal:
                         # Should fall back to direct scan
                         result = scan_large_file(tmp_file.name, mock_scanner)
 
@@ -254,11 +253,10 @@ class TestAdvancedLargeFileCache:
                 test_result.finish(success=True)
 
                 # Mock cache manager to raise exception
-                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")):
-                    with patch(
-                        "modelaudit.utils.advanced_file_handler._scan_advanced_large_file_internal",
-                        return_value=test_result,
-                    ) as mock_internal:
+                with patch("modelaudit.cache.get_cache_manager", side_effect=Exception("Cache error")), patch(
+                    "modelaudit.utils.advanced_file_handler._scan_advanced_large_file_internal",
+                    return_value=test_result,
+                ) as mock_internal:
                         # Should fall back to direct scan
                         result = scan_advanced_large_file(tmp_file.name, mock_scanner)
 
