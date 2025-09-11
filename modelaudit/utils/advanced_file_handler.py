@@ -521,7 +521,7 @@ def scan_advanced_large_file(
         cache_manager = get_cache_manager(cache_dir, enabled=True)
 
         # Create wrapper function for cache manager
-        def cached_advanced_scan_wrapper(fpath: str) -> dict:
+        def cached_advanced_scan_wrapper(fpath: str) -> dict[str, Any]:
             result = _scan_advanced_large_file_internal(fpath, scanner, progress_callback, timeout)
             return result.to_dict()
 

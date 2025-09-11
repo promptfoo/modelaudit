@@ -317,12 +317,33 @@ class ScanResult:
         if duration is not None:
             result.end_time = result.start_time + duration
 
+        # Helpers: tolerant enum parsing
+        def _parse_issue_severity(value: Any, default: IssueSeverity = IssueSeverity.WARNING) -> IssueSeverity:
+            if isinstance(value, IssueSeverity):
+                return value
+            if not isinstance(value, str):
+                return default
+            v = value.strip().lower()
+            aliases = {"high": "critical", "error": "critical", "warn": "warning", "info": "info"}
+            v = aliases.get(v, v)
+            try:
+                return IssueSeverity(v)
+            except Exception:
+                return default
+
+        def _parse_check_status(value: Any, default: CheckStatus = CheckStatus.PASSED) -> CheckStatus:
+            if isinstance(value, CheckStatus):
+                return value
+            v = str(value).strip().lower()
+            status_map = {"passed": CheckStatus.PASSED, "failed": CheckStatus.FAILED, "skipped": CheckStatus.SKIPPED}
+            return status_map.get(v, default)
+
         # Restore issues
         issues_data = data.get("issues", [])
         for issue_dict in issues_data:
             issue = Issue(
                 message=issue_dict.get("message", ""),
-                severity=IssueSeverity(issue_dict.get("severity", "INFO")),
+                severity=_parse_issue_severity(issue_dict.get("severity"), IssueSeverity.WARNING),
                 details=issue_dict.get("details", {}),
                 location=issue_dict.get("location"),
                 why=issue_dict.get("why"),
@@ -334,21 +355,17 @@ class ScanResult:
         checks_data = data.get("checks", [])
         for check_dict in checks_data:
             # Map status string back to enum
-            status_str = check_dict.get("status", "passed")
-            if status_str.upper() == "PASSED" or status_str.lower() == "passed":
-                status = CheckStatus.PASSED
-            elif status_str.upper() == "FAILED" or status_str.lower() == "failed":
-                status = CheckStatus.FAILED
-            elif status_str.upper() == "SKIPPED" or status_str.lower() == "skipped":
-                status = CheckStatus.SKIPPED
-            else:
-                status = CheckStatus.PASSED  # Default to passed for unknown statuses
+            status = _parse_check_status(check_dict.get("status", "passed"))
 
             check = Check(
                 name=check_dict.get("name", ""),
                 status=status,
                 message=check_dict.get("message", ""),
-                severity=IssueSeverity(check_dict.get("severity", "INFO")) if check_dict.get("severity") else None,
+                severity=(
+                    _parse_issue_severity(check_dict.get("severity"), IssueSeverity.WARNING)
+                    if check_dict.get("severity") is not None
+                    else None
+                ),
                 location=check_dict.get("location"),
                 details=check_dict.get("details", {}),
                 why=check_dict.get("why"),

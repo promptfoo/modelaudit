@@ -5,6 +5,7 @@
 **MAJOR FINDING**: Cache integration is **95% complete** in ModelAudit. After thorough codebase analysis, only a few critical gaps remain for large file handling.
 
 ## ✅ **Already Implemented & Working**
+
 - ✅ Complete cache infrastructure (CacheManager, ScanResultsCache, SmartCacheKeyGenerator)
 - ✅ CLI cache options: `--no-cache`, `modelaudit cache clear/stats/cleanup`
 - ✅ Core scanning integration: `core.py:1288` calls `scanner.scan_with_cache(path)`
@@ -20,12 +21,14 @@
 
 **Priority**: 🔴 **CRITICAL** - Required for large file cache integration
 
-### **Problem**: 
+### **Problem**:
+
 Cache system stores results as dictionaries but needs to reconstruct `ScanResult` objects. The `ScanResult.from_dict()` method is missing.
 
 ### **Files to Edit**:
 
 **`modelaudit/models.py`**
+
 - **Add method**: `ScanResult.from_dict()` class method
 - **Location**: Add after existing `to_dict()` method
 
@@ -34,16 +37,16 @@ Cache system stores results as dictionaries but needs to reconstruct `ScanResult
 def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
     """
     Create ScanResult from dictionary (for cache deserialization).
-    
+
     Args:
         data: Dictionary containing serialized ScanResult data
-        
+
     Returns:
         Reconstructed ScanResult object
     """
     # Create new ScanResult instance
     result = cls(scanner_name=data.get("scanner_name", "unknown"))
-    
+
     # Restore basic properties
     result.success = data.get("success", False)
     result.errors = data.get("errors", [])
@@ -51,7 +54,7 @@ def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
     result.end_time = data.get("end_time")
     result.duration_ms = data.get("duration_ms")
     result.metadata = data.get("metadata", {})
-    
+
     # Restore issues
     issues_data = data.get("issues", [])
     for issue_dict in issues_data:
@@ -63,7 +66,7 @@ def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
             location=issue_dict.get("location")
         )
         result.issues.append(issue)
-    
+
     # Restore checks
     checks_data = data.get("checks", [])
     for check_dict in checks_data:
@@ -76,11 +79,12 @@ def from_dict(cls, data: dict[str, Any]) -> "ScanResult":
             details=check_dict.get("details", {})
         )
         result.checks.append(check)
-    
+
     return result
 ```
 
 ### **Testing**:
+
 ```python
 # Add to tests/test_models.py
 def test_scan_result_from_dict():
@@ -89,11 +93,11 @@ def test_scan_result_from_dict():
     original = ScanResult(scanner_name="test")
     original.add_issue("Test issue", IssueSeverity.HIGH)
     original.finish(success=True)
-    
+
     # Serialize and deserialize
     data = original.to_dict()
     reconstructed = ScanResult.from_dict(data)
-    
+
     # Verify reconstruction
     assert reconstructed.scanner_name == original.scanner_name
     assert reconstructed.success == original.success
@@ -107,7 +111,8 @@ def test_scan_result_from_dict():
 
 **Priority**: 🔴 **CRITICAL** - Only missing piece for complete cache coverage
 
-### **Problem**: 
+### **Problem**:
+
 Large file handlers (`scan_large_file()`, `scan_advanced_large_file()`) bypass the normal scanning flow and don't benefit from caching. These are critical for >1GB model performance.
 
 ### **Files to Edit**:
@@ -120,40 +125,40 @@ Large file handlers (`scan_large_file()`, `scan_advanced_large_file()`) bypass t
 def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
     """
     Scan large file with cache integration.
-    
+
     Args:
         file_path: Path to file to scan
         scanner: Scanner instance to use
         progress_callback: Optional progress callback
         timeout: Scan timeout in seconds
-        
+
     Returns:
         ScanResult from cache or fresh scan
     """
     from ..cache import get_cache_manager
     from ..models import ScanResult
-    
+
     # Check if caching enabled in scanner config
     config = getattr(scanner, 'config', {}) or {}
     cache_enabled = config.get('cache_enabled', True)
-    
+
     if not cache_enabled:
         return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
-    
+
     # Use cache manager for large files
     cache_manager = get_cache_manager(
         cache_dir=config.get('cache_dir'),
         enabled=True
     )
-    
+
     def cached_large_scan(path: str) -> dict[str, Any]:
         """Internal scan function that returns serializable dict."""
         result = _scan_large_file_internal(path, scanner, progress_callback, timeout)
         return result.to_dict()
-    
+
     # Get result from cache or perform scan
     result_dict = cache_manager.cached_scan(file_path, cached_large_scan)
-    
+
     # Reconstruct ScanResult from cached dict
     return ScanResult.from_dict(result_dict)
 
@@ -161,7 +166,7 @@ def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Ca
 def _scan_large_file_internal(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
     """
     Internal large file scanning implementation (cache-agnostic).
-    
+
     This contains the original scan_large_file implementation.
     """
     # Move the existing scan_large_file implementation here
@@ -176,40 +181,40 @@ def _scan_large_file_internal(file_path: str, scanner: Any, progress_callback: O
 def scan_advanced_large_file(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
     """
     Scan advanced large file with cache integration.
-    
+
     Args:
         file_path: Path to file to scan
         scanner: Scanner instance to use
         progress_callback: Optional progress callback
         timeout: Scan timeout in seconds
-        
+
     Returns:
         ScanResult from cache or fresh scan
     """
     from ..cache import get_cache_manager
     from ..models import ScanResult
-    
+
     # Check if caching enabled in scanner config
     config = getattr(scanner, 'config', {}) or {}
     cache_enabled = config.get('cache_enabled', True)
-    
+
     if not cache_enabled:
         return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
-    
+
     # Use cache manager for advanced large files
     cache_manager = get_cache_manager(
         cache_dir=config.get('cache_dir'),
         enabled=True
     )
-    
+
     def cached_advanced_scan(path: str) -> dict[str, Any]:
         """Internal scan function that returns serializable dict."""
         result = _scan_advanced_large_file_internal(path, scanner, progress_callback, timeout)
         return result.to_dict()
-    
+
     # Get result from cache or perform scan
     result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan)
-    
+
     # Reconstruct ScanResult from cached dict
     return ScanResult.from_dict(result_dict)
 
@@ -217,7 +222,7 @@ def scan_advanced_large_file(file_path: str, scanner: Any, progress_callback: Op
 def _scan_advanced_large_file_internal(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
     """
     Internal advanced large file scanning implementation (cache-agnostic).
-    
+
     This contains the original scan_advanced_large_file implementation.
     """
     # Move the existing scan_advanced_large_file implementation here
@@ -253,24 +258,24 @@ def test_large_file_cache_enabled():
     # Create mock scanner with cache enabled
     mock_scanner = Mock()
     mock_scanner.config = {'cache_enabled': True}
-    
+
     # Create temporary file
     with tempfile.NamedTemporaryFile(suffix='.bin') as tmp_file:
         tmp_file.write(b'test data' * 1000)  # 9KB file
         tmp_file.flush()
-        
+
         # Mock internal scan to return test result
         test_result = ScanResult(scanner_name="test")
         test_result.add_issue("Test issue", IssueSeverity.INFO)
         test_result.finish(success=True)
-        
+
         with patch('modelaudit.utils.large_file_handler._scan_large_file_internal', return_value=test_result):
             # First scan - cache miss
             result1 = scan_large_file(tmp_file.name, mock_scanner)
-            
+
             # Second scan - cache hit
             result2 = scan_large_file(tmp_file.name, mock_scanner)
-            
+
             # Verify results are equivalent
             assert result1.scanner_name == result2.scanner_name
             assert result1.success == result2.success
@@ -282,21 +287,21 @@ def test_large_file_cache_disabled():
     # Create mock scanner with cache disabled
     mock_scanner = Mock()
     mock_scanner.config = {'cache_enabled': False}
-    
+
     # Create temporary file
     with tempfile.NamedTemporaryFile(suffix='.bin') as tmp_file:
         tmp_file.write(b'test data' * 1000)
         tmp_file.flush()
-        
+
         # Mock internal scan
         test_result = ScanResult(scanner_name="test")
         test_result.finish(success=True)
-        
+
         with patch('modelaudit.utils.large_file_handler._scan_large_file_internal', return_value=test_result) as mock_internal:
             # Run scan twice
             scan_large_file(tmp_file.name, mock_scanner)
             scan_large_file(tmp_file.name, mock_scanner)
-            
+
             # Verify internal scan called twice (no caching)
             assert mock_internal.call_count == 2
 
@@ -306,14 +311,14 @@ def test_advanced_large_file_cache_integration():
     # Similar test for scan_advanced_large_file
     mock_scanner = Mock()
     mock_scanner.config = {'cache_enabled': True}
-    
+
     with tempfile.NamedTemporaryFile(suffix='.bin') as tmp_file:
         tmp_file.write(b'test data' * 1000)
         tmp_file.flush()
-        
+
         test_result = ScanResult(scanner_name="advanced_test")
         test_result.finish(success=True)
-        
+
         with patch('modelaudit.utils.advanced_file_handler._scan_advanced_large_file_internal', return_value=test_result):
             result = scan_advanced_large_file(tmp_file.name, mock_scanner)
             assert result.scanner_name == "advanced_test"
@@ -339,38 +344,38 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 @pytest.mark.performance
 def test_cache_performance_improvement():
     """Test that cache provides significant performance improvement."""
-    
+
     # Reset cache for clean test
     reset_cache_manager()
-    
+
     # Create test file (simulate model file)
     with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as tmp_file:
         # Write pickle-like data
         tmp_file.write(b'\x80\x03]q\x00X\x04\x00\x00\x00testq\x01a.')
         tmp_file.flush()
-        
+
         try:
             # First scan - cache miss
             start_time = time.time()
             result1 = scan_file(tmp_file.name, {'cache_enabled': True})
             first_scan_time = time.time() - start_time
-            
+
             # Second scan - cache hit
             start_time = time.time()
             result2 = scan_file(tmp_file.name, {'cache_enabled': True})
             second_scan_time = time.time() - start_time
-            
+
             # Verify cache hit is faster
             assert second_scan_time < first_scan_time
-            
+
             # Should be at least 2x faster (conservative expectation)
             speedup = first_scan_time / second_scan_time
             assert speedup >= 2.0, f"Cache speedup {speedup:.1f}x is less than expected 2x minimum"
-            
+
             # Verify results are identical
             assert result1.scanner_name == result2.scanner_name
             assert result1.success == result2.success
-            
+
         finally:
             Path(tmp_file.name).unlink()  # Clean up
 ```
@@ -392,26 +397,26 @@ from pathlib import Path
 
 def test_cache_with_real_file():
     """Test cache integration with a real model file."""
-    
+
     # Look for test files
     test_files = [
         "tests/assets/test_model.pkl",
-        "tests/assets/pytorch_model.bin", 
+        "tests/assets/pytorch_model.bin",
         "tests/assets/safe_model.safetensors"
     ]
-    
+
     test_file = None
     for file_path in test_files:
         if Path(file_path).exists():
             test_file = file_path
             break
-    
+
     if not test_file:
         print("❌ No test files found. Create a test model file first.")
         return False
-    
+
     print(f"🧪 Testing cache integration with: {test_file}")
-    
+
     # Test 1: Cache enabled (first run)
     print("\n1️⃣  First scan (cache miss expected)...")
     start = time.time()
@@ -420,13 +425,13 @@ def test_cache_with_real_file():
         "rye", "run", "modelaudit", "scan", test_file, "--format", "json"
     ], capture_output=True, text=True)
     first_time = time.time() - start
-    
+
     if result1.returncode != 0:
         print(f"❌ First scan failed: {result1.stderr}")
         return False
-    
+
     print(f"✅ First scan completed in {first_time:.2f}s")
-    
+
     # Test 2: Cache enabled (second run - should be cached)
     print("\n2️⃣  Second scan (cache hit expected)...")
     start = time.time()
@@ -434,23 +439,23 @@ def test_cache_with_real_file():
         "rye", "run", "modelaudit", "scan", test_file, "--format", "json"
     ], capture_output=True, text=True)
     second_time = time.time() - start
-    
+
     if result2.returncode != 0:
         print(f"❌ Second scan failed: {result2.stderr}")
         return False
-    
+
     print(f"✅ Second scan completed in {second_time:.2f}s")
-    
+
     # Calculate speedup
     if second_time > 0:
         speedup = first_time / second_time
         print(f"🚀 Cache speedup: {speedup:.1f}x")
-        
+
         if speedup >= 2.0:
             print("✅ Cache performance improvement confirmed!")
         else:
             print("⚠️  Cache speedup less than expected (2x minimum)")
-    
+
     # Test 3: Cache disabled
     print("\n3️⃣  No-cache scan (cache disabled)...")
     start = time.time()
@@ -458,20 +463,20 @@ def test_cache_with_real_file():
         "rye", "run", "modelaudit", "scan", test_file, "--no-cache", "--format", "json"
     ], capture_output=True, text=True)
     nocache_time = time.time() - start
-    
+
     if result3.returncode != 0:
         print(f"❌ No-cache scan failed: {result3.stderr}")
         return False
-    
+
     print(f"✅ No-cache scan completed in {nocache_time:.2f}s")
-    
+
     # Verify results are consistent
     if result1.stdout == result2.stdout == result3.stdout:
         print("✅ All scan results are identical (cache correctness confirmed)")
     else:
         print("❌ Scan results differ between cached/uncached runs")
         return False
-    
+
     print("\n🎉 Cache integration test completed successfully!")
     return True
 
@@ -489,7 +494,8 @@ if __name__ == "__main__":
 ### **Files to Update**:
 
 **`CLAUDE.md`** - Update cache status:
-```markdown
+
+````markdown
 ## Cache Integration Status
 
 ✅ **COMPLETE**: ModelAudit now includes comprehensive caching for all scanning operations:
@@ -500,11 +506,12 @@ if __name__ == "__main__":
 - **Performance**: Typical 4-20x speedup on repeated scans
 
 ### Cache Usage:
+
 ```bash
 # Enable cache (default)
 rye run modelaudit scan model.pkl
 
-# Disable cache  
+# Disable cache
 rye run modelaudit scan model.pkl --no-cache
 
 # Manage cache
@@ -512,27 +519,32 @@ rye run modelaudit cache stats
 rye run modelaudit cache clear
 rye run modelaudit cache cleanup --days 30
 ```
+````
 
 ---
 
 ## 📊 **Implementation Timeline**
 
 ### **Day 1**: Core Implementation
+
 - ✅ Implement `ScanResult.from_dict()` method
 - ✅ Add large file handler cache integration
 - ✅ Basic unit tests
 
-### **Day 2**: Testing & Validation  
+### **Day 2**: Testing & Validation
+
 - ✅ Comprehensive testing with real files
 - ✅ Performance validation
 - ✅ Memory usage verification
 
 ### **Day 3**: Polish & Integration
+
 - ✅ Integration testing script
 - ✅ Error handling improvements
 - ✅ Documentation updates
 
 ### **Day 4**: Final Validation
+
 - ✅ End-to-end testing
 - ✅ Performance benchmarking
 - ✅ Ready for production
@@ -543,7 +555,7 @@ rye run modelaudit cache cleanup --days 30
 
 1. **Large files (>1GB) benefit from caching** - 4-20x speedup on repeated scans
 2. **No functionality regression** - All existing features continue to work
-3. **Memory efficiency maintained** - Cache doesn't interfere with memory-mapped scanning  
+3. **Memory efficiency maintained** - Cache doesn't interfere with memory-mapped scanning
 4. **Comprehensive test coverage** - Unit tests + integration tests + performance tests
 5. **Complete cache coverage** - Every scanning path benefits from caching
 
@@ -552,11 +564,12 @@ rye run modelaudit cache cleanup --days 30
 ## ⚠️ **Risk Mitigation**
 
 ### **Potential Issues**:
+
 1. **Memory Usage**: Large model caching might increase memory usage
    - **Mitigation**: Cache only metadata and results, not full model data
    - **Monitoring**: Add memory usage tests
 
-2. **Cache Invalidation**: Stale results on model updates  
+2. **Cache Invalidation**: Stale results on model updates
    - **Mitigation**: File modification time already included in cache keys
    - **Verification**: Test cache invalidation
 
