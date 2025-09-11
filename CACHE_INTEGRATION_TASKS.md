@@ -5,6 +5,7 @@
 Complete the remaining cache integration work in ModelAudit. **80% of cache integration is already done** - core scanning flows use caching through `scanner.scan_with_cache()`. This document outlines the remaining critical integration points.
 
 ## ✅ **Already Completed**
+
 - ✅ Cache infrastructure (CacheManager, ScanResultsCache, SmartCacheKeyGenerator)
 - ✅ Cache decorator system (`utils/cache_decorator.py`)
 - ✅ BaseScanner integration (`scanners/base.py:scan_with_cache()`)
@@ -25,31 +26,32 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
    - **Function**: `scan_large_file()` (around line 211)
    - **Change**: Wrap with cache manager integration
    - **Specific edits**:
+
      ```python
      def scan_large_file(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
          from ..cache import get_cache_manager
          from ..models import ScanResult
-         
+
          # Check if caching enabled in scanner config
          config = getattr(scanner, 'config', {}) or {}
          cache_enabled = config.get('cache_enabled', True)
-         
+
          if not cache_enabled:
              return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
-             
+
          # Use cache manager for large files
          cache_manager = get_cache_manager(
              cache_dir=config.get('cache_dir'),
              enabled=True
          )
-         
+
          def cached_large_scan(path: str) -> dict:
              result = _scan_large_file_internal(path, scanner, progress_callback, timeout)
              return result.to_dict()
-             
+
          result_dict = cache_manager.cached_scan(file_path, cached_large_scan)
          return ScanResult.from_dict(result_dict)
-         
+
      def _scan_large_file_internal(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
          """Move current scan_large_file implementation here."""
          # ... existing implementation moves here ...
@@ -59,31 +61,32 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
    - **Function**: `scan_advanced_large_file()` (around line 489)
    - **Change**: Similar cache integration pattern
    - **Specific edits**:
+
      ```python
      def scan_advanced_large_file(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
          from ..cache import get_cache_manager
          from ..models import ScanResult
-         
+
          # Check if caching enabled in scanner config
          config = getattr(scanner, 'config', {}) or {}
          cache_enabled = config.get('cache_enabled', True)
-         
+
          if not cache_enabled:
              return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
-             
+
          # Use cache manager for advanced large files
          cache_manager = get_cache_manager(
              cache_dir=config.get('cache_dir'),
              enabled=True
          )
-         
+
          def cached_advanced_scan(path: str) -> dict:
              result = _scan_advanced_large_file_internal(path, scanner, progress_callback, timeout)
              return result.to_dict()
-             
+
          result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan)
          return ScanResult.from_dict(result_dict)
-         
+
      def _scan_advanced_large_file_internal(file_path: str, scanner: Any, progress_callback: Optional[Callable] = None, timeout: int = 3600) -> ScanResult:
          """Move current scan_advanced_large_file implementation here."""
          # ... existing implementation moves here ...
@@ -110,6 +113,7 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
    - **Function**: `scan_command()` (around line 511)
    - **Change**: Add cache CLI options
    - **Specific edits**:
+
      ```python
      @cli.command("scan")
      @click.argument("paths", nargs=-1, required=True)
@@ -124,19 +128,20 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
      ):
          """Scan model files for security issues."""
          # ... existing code ...
-         
+
          config = {
              # ... existing config ...
              'cache_enabled': cache,
              'cache_dir': cache_dir,
          }
-         
+
          # ... rest of existing implementation ...
      ```
 
 2. **`modelaudit/cli.py`**
    - **Add**: Cache status/stats command (optional)
    - **Specific edits**:
+
      ```python
      @cli.command("cache")
      @click.option("--clear", is_flag=True, help="Clear the scan cache")
@@ -145,13 +150,13 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
      def cache_command(clear: bool, stats: bool, cache_dir: str | None):
          """Manage scan result cache."""
          from .cache import get_cache_manager
-         
+
          cache_manager = get_cache_manager(cache_dir, enabled=True)
-         
+
          if clear:
              cache_manager.clear()
              click.echo("Cache cleared.")
-             
+
          if stats:
              stats_data = cache_manager.get_stats()
              click.echo(f"Cache enabled: {stats_data.get('enabled', False)}")
@@ -169,11 +174,12 @@ Complete the remaining cache integration work in ModelAudit. **80% of cache inte
    - **Line 1288**: Verify `scanner.scan_with_cache(path)` is called correctly
    - **Verify**: Config flows through properly
 
-2. **`modelaudit/scanners/base.py`**  
+2. **`modelaudit/scanners/base.py`**
    - **Line 388**: Verify `scan_with_cache()` implementation
    - **Test**: Ensure cache decorator works
 
 #### **Testing Steps:**
+
 ```bash
 # Test existing cache integration
 rye run modelaudit scan test_model.pkl --cache
@@ -193,11 +199,13 @@ rye run modelaudit cache --stats
 ### **Task 2.1: Performance Validation**
 
 #### **Test Files Needed:**
+
 - Small model (~10MB): `tests/assets/small_model.pkl`
-- Medium model (~100MB): `tests/assets/medium_model.pt`  
+- Medium model (~100MB): `tests/assets/medium_model.pt`
 - Large model (~1GB): Download for testing
 
 #### **Performance Tests:**
+
 ```bash
 # Measure cache performance
 time rye run modelaudit scan large_model.bin --no-cache
@@ -210,10 +218,12 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 ### **Task 2.2: Integration Function Testing**
 
 #### **Files to Test:**
+
 1. **`modelaudit/jfrog_integration.py`** - Should benefit from cache automatically
 2. **`modelaudit/mlflow_integration.py`** - Should benefit from cache automatically
 
 #### **Test Process:**
+
 - Test JFrog artifact scanning with cache enabled/disabled
 - Test MLflow model scanning with cache enabled/disabled
 - Verify download caching + scan caching work together
@@ -221,6 +231,7 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 ### **Task 2.3: Large File Handler Testing**
 
 #### **Test Process:**
+
 - Test >1GB model files with large file handlers
 - Verify cache integration doesn't break memory-mapped scanning
 - Test cache hit rates for sharded/memory-mapped files
@@ -253,11 +264,12 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 1. **`modelaudit/cli.py`**
    - **Enhancement**: Add cache cleanup command
    - **Specific edits**:
+
      ```python
      @click.option("--cleanup", type=int, help="Clean cache entries older than N days")
      def cache_command(..., cleanup: int | None):
          # ... existing cache command ...
-         
+
          if cleanup:
              removed = cache_manager.cleanup(max_age_days=cleanup)
              click.echo(f"Removed {removed} old cache entries.")
@@ -270,13 +282,14 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 ### **Unit Tests to Add:**
 
 1. **`tests/test_cache_integration.py`**
+
    ```python
    def test_large_file_handler_cache_integration():
        """Test large file handlers use cache correctly."""
-       
+
    def test_cli_cache_options():
        """Test CLI cache options work correctly."""
-       
+
    def test_cache_hit_performance():
        """Test cache provides expected speedup."""
    ```
@@ -294,6 +307,7 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 ## 📊 **Success Criteria**
 
 ### **Phase 1 Success Metrics:**
+
 - ✅ Large file handlers (>1GB models) benefit from caching
 - ✅ CLI `--cache/--no-cache` options work correctly
 - ✅ 4-10x speedup on cache hits with real models
@@ -301,12 +315,14 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 - ✅ No breaking changes to existing functionality
 
 ### **Phase 2 Success Metrics:**
+
 - ✅ Performance tests show expected speedup
-- ✅ Large model caching works without memory issues  
+- ✅ Large model caching works without memory issues
 - ✅ Integration functions benefit from caching
 - ✅ Cache invalidation works on model updates
 
 ### **Phase 3 Success Metrics:**
+
 - ✅ Cache statistics provide useful insights
 - ✅ Cache cleanup functionality works
 - ✅ User documentation is complete
@@ -330,6 +346,7 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
    - **Verification**: Test cache size management
 
 ### **Rollback Plan:**
+
 - All changes are additive and backwards-compatible
 - Cache can be disabled with `--no-cache` flag
 - Existing functionality continues to work without cache
@@ -339,7 +356,7 @@ time rye run modelaudit scan large_model.bin --cache  # Second run should be muc
 ## 🎯 **Implementation Order**
 
 1. **Start with Task 1.1** (Large file handlers) - Biggest performance impact
-2. **Then Task 1.2** (CLI options) - User-facing functionality  
+2. **Then Task 1.2** (CLI options) - User-facing functionality
 3. **Validate with Task 1.3** (Testing) - Ensure everything works
 4. **Proceed to Phase 2** (Performance validation)
 5. **Finish with Phase 3** (Polish features)
