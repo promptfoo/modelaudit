@@ -414,7 +414,7 @@ class ZipScanner(BaseScanner):
                     metadata["compression_ratio"] = metadata["compressed_size"] / metadata["uncompressed_size"]
 
                 # Analyze file types and structure
-                file_extensions = {}
+                file_extensions: dict[str, int] = {}
                 directories = set()
                 executable_files = []
 
