@@ -2243,7 +2243,7 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Show key metadata fields
         for key, value in metadata.items():
             if key not in ["file", "path", "format", "file_size"]:
-                if isinstance(value, (str, int, float, bool)):
+                if isinstance(value, str | int | float | bool):
                     output.append(f"{key.replace('_', ' ').title()}: {value}")
                 elif isinstance(value, dict) and len(value) <= 5:
                     output.append(f"{key.replace('_', ' ').title()}:")
