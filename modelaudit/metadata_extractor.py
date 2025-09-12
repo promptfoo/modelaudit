@@ -33,6 +33,7 @@ class ModelMetadataExtractor:
         if not scanner_class:
             return {
                 "file": os.path.basename(file_path),
+                "path": file_path,
                 "format": "unknown",
                 "error": "No scanner available for this file type",
             }
@@ -104,6 +105,16 @@ class ModelMetadataExtractor:
             "imports",
             "producer",
             "framework_version",
+            # ONNX security fields
+            "external_data_paths",
+            "model_producer",
+            "domain",
+            # SafeTensors security fields
+            "custom_metadata",
+            "tensor_count",
+            # Common security indicators
+            "has_custom_operators",
+            "has_external_data",
         ]
 
         filtered = {}
