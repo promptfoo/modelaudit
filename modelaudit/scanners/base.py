@@ -1304,3 +1304,13 @@ class BaseScanner(ABC):
 
         if self.progress_tracker:
             self.progress_tracker.add_callback(callback)
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract metadata from model file. Override in subclasses for format-specific extraction."""
+        return {
+            "format": getattr(self, "name", "unknown"),
+            "description": getattr(self, "description", ""),
+            "file_size": self.get_file_size(file_path)
+            if hasattr(self, "get_file_size")
+            else os.path.getsize(file_path),
+        }

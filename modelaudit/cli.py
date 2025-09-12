@@ -1840,6 +1840,83 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
             click.echo(f"     {error_msg}")
 
 
+@cli.command("metadata")
+@click.argument("path", type=click.Path(exists=True))
+@click.option(
+    "--format", "output_format", type=click.Choice(["json", "yaml", "table"]), default="table", help="Output format"
+)
+@click.option("--output", type=click.Path(), help="Output file path")
+@click.option("--security-only", is_flag=True, help="Show only security-relevant metadata")
+def metadata(path: str, output_format: str, output: str | None, security_only: bool) -> None:
+    """Extract and display model metadata."""
+    from .metadata_extractor import ModelMetadataExtractor
+
+    try:
+        extractor = ModelMetadataExtractor()
+        metadata = extractor.extract(path, security_only=security_only)
+
+        if output_format == "json":
+            output_text = json.dumps(metadata, indent=2)
+        elif output_format == "yaml":
+            try:
+                import yaml
+
+                output_text = yaml.dump(metadata, default_flow_style=False, sort_keys=False)
+            except ImportError:
+                click.secho("Warning: PyYAML not installed, falling back to JSON", fg="yellow")
+                output_text = json.dumps(metadata, indent=2)
+        else:  # table format
+            output_text = _format_metadata_table(metadata)
+
+        if output:
+            with open(output, "w") as f:
+                f.write(output_text)
+            click.secho(f"Metadata written to {output}", fg="green")
+        else:
+            click.echo(output_text)
+
+    except Exception as e:
+        click.secho(f"Error extracting metadata: {e}", fg="red")
+        sys.exit(1)
+
+
+def _format_metadata_table(metadata: dict[str, Any]) -> str:
+    """Format metadata as a readable table."""
+    output = []
+
+    if "directory" in metadata:
+        # Directory summary
+        output.append(f"Directory: {metadata['directory']}")
+        output.append(f"Total Files: {metadata['summary']['total_files']}")
+        output.append("\nFormats:")
+        for fmt, count in metadata["summary"]["formats"].items():
+            output.append(f"  {fmt}: {count}")
+        output.append("\nFiles:")
+        for file_meta in metadata["files"][:10]:  # Show first 10 files
+            output.append(f"  {file_meta.get('file', 'unknown')} ({file_meta.get('format', 'unknown')})")
+        if len(metadata["files"]) > 10:
+            output.append(f"  ... and {len(metadata['files']) - 10} more")
+    else:
+        # Single file
+        output.append(f"File: {metadata.get('file', 'unknown')}")
+        output.append(f"Format: {metadata.get('format', 'unknown')}")
+        output.append(f"Size: {metadata.get('file_size', 0):,} bytes")
+
+        # Show key metadata fields
+        for key, value in metadata.items():
+            if key not in ["file", "path", "format", "file_size"]:
+                if isinstance(value, str | int | float | bool):
+                    output.append(f"{key.replace('_', ' ').title()}: {value}")
+                elif isinstance(value, dict) and len(value) <= 5:
+                    output.append(f"{key.replace('_', ' ').title()}:")
+                    for k, v in value.items():
+                        output.append(f"  {k}: {v}")
+                elif isinstance(value, list) and len(value) <= 10:
+                    output.append(f"{key.replace('_', ' ').title()}: {', '.join(map(str, value))}")
+
+    return "\n".join(output)
+
+
 @cli.command()
 @click.option(
     "--show-failed",
