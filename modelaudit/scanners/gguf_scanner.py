@@ -489,3 +489,91 @@ class GgufScanner(BaseScanner):
             return struct.unpack("<d", f.read(8))[0]
 
         raise ValueError(f"Unknown metadata type {vtype}")
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract GGUF metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            with open(file_path, "rb") as f:
+                # Read GGUF header
+                magic = f.read(4)
+                if magic != b"GGUF":
+                    metadata["error"] = "Invalid GGUF magic bytes"
+                    return metadata
+
+                version = struct.unpack("<I", f.read(4))[0]
+                tensor_count = struct.unpack("<Q", f.read(8))[0]
+                metadata_count = struct.unpack("<Q", f.read(8))[0]
+
+                metadata.update(
+                    {
+                        "gguf_version": version,
+                        "tensor_count": tensor_count,
+                        "metadata_count": metadata_count,
+                    }
+                )
+
+                # Read metadata fields
+                gguf_metadata = {}
+                for _ in range(metadata_count):
+                    try:
+                        # Read key
+                        key = self._read_string(f)
+
+                        # Read value type
+                        vtype = struct.unpack("<I", f.read(4))[0]
+
+                        # Read value
+                        value = self._read_value(f, vtype)
+                        gguf_metadata[key] = value
+
+                    except Exception as e:
+                        gguf_metadata["error_reading_metadata"] = str(e)
+                        break
+
+                # Extract key model information
+                model_info = {}
+
+                # Common GGUF metadata keys
+                key_fields = [
+                    "general.name",
+                    "general.architecture",
+                    "general.quantization_version",
+                    "general.file_type",
+                    "general.parameter_count",
+                    "general.context_length",
+                    "tokenizer.ggml.model",
+                    "tokenizer.ggml.tokens",
+                    "tokenizer.chat_template",
+                ]
+
+                for field in key_fields:
+                    if field in gguf_metadata:
+                        model_info[field.replace(".", "_")] = gguf_metadata[field]
+
+                if model_info:
+                    metadata["model_info"] = model_info
+
+                # Summary info
+                metadata.update(
+                    {
+                        "has_model_name": "general.name" in gguf_metadata,
+                        "has_tokenizer": any(key.startswith("tokenizer.") for key in gguf_metadata),
+                        "has_chat_template": "tokenizer.chat_template" in gguf_metadata,
+                        "architecture": gguf_metadata.get("general.architecture", "unknown"),
+                        "parameter_count": gguf_metadata.get("general.parameter_count", "unknown"),
+                    }
+                )
+
+                # Security relevant info
+                if "tokenizer.chat_template" in gguf_metadata:
+                    template = gguf_metadata["tokenizer.chat_template"]
+                    if isinstance(template, str) and len(template) > 1000:
+                        metadata["large_chat_template"] = True
+                        metadata["chat_template_size"] = len(template)
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

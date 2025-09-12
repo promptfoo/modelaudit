@@ -465,3 +465,94 @@ class KerasH5Scanner(BaseScanner):
                             result,
                             f"{context}.{key}[{i}]",
                         )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract Keras H5 model metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            import h5py
+
+            with h5py.File(file_path, "r") as h5_file:
+                # Basic H5 structure
+                metadata.update(
+                    {
+                        "h5_keys": list(h5_file.keys()),
+                        "has_model_config": "model_config" in h5_file.attrs,
+                        "has_model_weights": "model_weights" in h5_file,
+                    }
+                )
+
+                # Try to extract model configuration
+                if "model_config" in h5_file.attrs:
+                    try:
+                        import json
+
+                        config_json = h5_file.attrs["model_config"]
+                        if isinstance(config_json, bytes):
+                            config_json = config_json.decode("utf-8")
+
+                        config = json.loads(config_json)
+
+                        metadata.update(
+                            {
+                                "model_class": config.get("class_name", "Unknown"),
+                                "keras_version": h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
+                                if isinstance(h5_file.attrs.get("keras_version"), bytes)
+                                else h5_file.attrs.get("keras_version", "unknown"),
+                            }
+                        )
+
+                        # Extract layer information
+                        if "config" in config:
+                            layers = config["config"].get("layers", [])
+                            metadata.update(
+                                {
+                                    "layer_count": len(layers),
+                                    "layer_types": list({layer.get("class_name", "Unknown") for layer in layers}),
+                                }
+                            )
+
+                    except Exception:
+                        pass
+
+                # Analyze model weights structure
+                if "model_weights" in h5_file:
+                    try:
+                        weights_group = h5_file["model_weights"]
+
+                        # Count parameters
+                        total_params = 0
+                        weight_layers = []
+
+                        def count_params(name, obj):
+                            nonlocal total_params
+                            if isinstance(obj, h5py.Dataset):
+                                param_count = obj.size
+                                total_params += param_count
+                                weight_layers.append(
+                                    {
+                                        "name": name,
+                                        "shape": list(obj.shape),
+                                        "dtype": str(obj.dtype),
+                                        "size": param_count,
+                                    }
+                                )
+
+                        weights_group.visititems(count_params)
+
+                        metadata.update(
+                            {
+                                "total_parameters": total_params,
+                                "weight_layers": len(weight_layers),
+                                "parameter_details": weight_layers[:10],  # First 10 layers
+                            }
+                        )
+
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
