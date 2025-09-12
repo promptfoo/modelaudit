@@ -609,3 +609,50 @@ class SafeTensorsScanner(BaseScanner):
 
         # For primitive types (str, int, float, bool, None)
         return current_depth
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract SafeTensors metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            with open(file_path, "rb") as f:
+                # Read header length
+                header_len_bytes = f.read(8)
+                if len(header_len_bytes) != 8:
+                    metadata["error"] = "Invalid SafeTensors header"
+                    return metadata
+
+                header_len = struct.unpack("<Q", header_len_bytes)[0]
+                header_bytes = f.read(header_len)
+                header = json.loads(header_bytes)
+
+                # Extract tensor info
+                tensors = {}
+                total_params = 0
+
+                for name, info in header.items():
+                    if name != "__metadata__":  # Skip metadata entry
+                        tensors[name] = {"dtype": info["dtype"], "shape": info["shape"]}
+                        # Calculate parameter count
+                        param_count = 1
+                        for dim in info["shape"]:
+                            param_count *= dim
+                        total_params += param_count
+
+                metadata.update(
+                    {
+                        "tensor_count": len(tensors),
+                        "total_parameters": total_params,
+                        "tensors": tensors,
+                        "dtypes": list({info["dtype"] for info in tensors.values()}),
+                    }
+                )
+
+                # Extract custom metadata if present
+                if "__metadata__" in header:
+                    metadata["custom_metadata"] = header["__metadata__"]
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
