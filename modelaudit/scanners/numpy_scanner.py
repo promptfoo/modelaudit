@@ -333,3 +333,57 @@ class NumPyScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract NumPy array metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            import numpy as np
+
+            # Load the numpy array
+            array = np.load(file_path, mmap_mode="r")  # Memory-map to avoid loading large arrays
+
+            metadata.update(
+                {
+                    "numpy_version": np.__version__,
+                    "array_shape": list(array.shape),
+                    "array_dtype": str(array.dtype),
+                    "array_size": array.size,
+                    "array_nbytes": array.nbytes,
+                    "array_ndim": array.ndim,
+                    "memory_usage_mb": array.nbytes / (1024 * 1024),
+                }
+            )
+
+            # Analyze array properties
+            if array.size > 0:
+                try:
+                    # For small arrays, get some statistics
+                    if array.nbytes < 10 * 1024 * 1024:  # Less than 10MB
+                        if np.issubdtype(array.dtype, np.number):
+                            metadata.update(
+                                {
+                                    "min_value": float(np.min(array)),
+                                    "max_value": float(np.max(array)),
+                                    "mean_value": float(np.mean(array)),
+                                    "std_value": float(np.std(array)),
+                                }
+                            )
+                    else:
+                        metadata["large_array_stats"] = "Skipped statistics for large array"
+
+                except Exception:
+                    pass  # Skip stats if not numeric
+
+            # Check for unusual patterns
+            if array.dtype.kind in ["U", "S", "O"]:  # String or object arrays
+                metadata["contains_objects"] = True
+                metadata["security_note"] = "Object arrays may contain arbitrary Python objects"
+            else:
+                metadata["contains_objects"] = False
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

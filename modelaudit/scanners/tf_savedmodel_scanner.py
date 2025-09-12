@@ -923,3 +923,67 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "attack_type": "protobuf_complexity_bomb",
                 },
             )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract TensorFlow SavedModel metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        if not _check_tensorflow():
+            metadata["error"] = "TensorFlow library not available"
+            return metadata
+
+        try:
+            import tensorflow as tf
+
+            # Load the SavedModel
+            model = tf.saved_model.load(file_path)
+
+            # Basic model info
+            metadata.update(
+                {
+                    "tensorflow_version": tf.__version__,
+                    "signatures": list(model.signatures.keys()) if hasattr(model, "signatures") else [],
+                    "trackable_objects": len(model._list_all_trackable_objects())
+                    if hasattr(model, "_list_all_trackable_objects")
+                    else 0,
+                }
+            )
+
+            # Try to get more detailed signature info
+            if hasattr(model, "signatures"):
+                signature_details = {}
+                for sig_name, signature in model.signatures.items():
+                    sig_info = {
+                        "inputs": list(signature.inputs.keys()) if hasattr(signature, "inputs") else [],
+                        "outputs": list(signature.outputs.keys()) if hasattr(signature, "outputs") else [],
+                    }
+                    signature_details[sig_name] = sig_info
+
+                if signature_details:
+                    metadata["signature_details"] = signature_details
+
+            # Check for variables
+            try:
+                variables = model.variables if hasattr(model, "variables") else []
+                if variables:
+                    metadata.update(
+                        {
+                            "variable_count": len(variables),
+                            "trainable_variables": sum(1 for v in variables if getattr(v, "trainable", True)),
+                        }
+                    )
+
+                    # Calculate total parameters
+                    total_params = sum(
+                        v.shape.num_elements() if hasattr(v.shape, "num_elements") else 0 for v in variables
+                    )
+                    if total_params > 0:
+                        metadata["total_parameters"] = total_params
+
+            except Exception:
+                pass  # Variables might not be accessible
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
