@@ -48,7 +48,7 @@ class NumPyScanner(BaseScanner):
     description = f"Scans NumPy .npy files for integrity issues (NumPy {NUMPY_VERSION})"
     supported_extensions: ClassVar[list[str]] = [".npy"]
 
-    def __init__(self, config=None):
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         # Security limits
         self.max_array_bytes = self.config.get(
@@ -66,7 +66,7 @@ class NumPyScanner(BaseScanner):
             return False
         return super().can_handle(path)
 
-    def _validate_array_dimensions(self, shape: tuple) -> None:
+    def _validate_array_dimensions(self, shape: tuple[int, ...]) -> None:
         """Validate array dimensions for security"""
         # Check number of dimensions
         if len(shape) > self.max_dimensions:
@@ -107,7 +107,7 @@ class NumPyScanner(BaseScanner):
                 f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
-    def _calculate_safe_array_size(self, shape: tuple, dtype: Any) -> int:
+    def _calculate_safe_array_size(self, shape: tuple[int, ...], dtype: Any) -> int:
         """Calculate array size with overflow protection"""
         total_elements = 1
         max_elements = sys.maxsize // max(dtype.itemsize, 1)
@@ -361,6 +361,8 @@ class NumPyScanner(BaseScanner):
                                 "dtype": str(dtype),
                             },
                         )
+                        result.finish(success=False)
+                        return result
                     else:
                         result.add_check(
                             name="File Integrity Check",
