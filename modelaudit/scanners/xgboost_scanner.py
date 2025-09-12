@@ -699,9 +699,7 @@ except Exception as e:
                         metadata.update(
                             {
                                 "feature_importance_available": True,
-                                "top_features": dict(
-                                    sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]
-                                ),
+                                "top_features": dict(sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]),
                             }
                         )
                 except Exception:
