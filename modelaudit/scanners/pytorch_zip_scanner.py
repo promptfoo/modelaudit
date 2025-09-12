@@ -967,3 +967,54 @@ class PyTorchZipScanner(BaseScanner):
                     ),
                 },
             )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract PyTorch ZIP (torch.save format) metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(file_path, "r") as zip_file:
+                file_list = zip_file.namelist()
+
+                # Analyze ZIP structure
+                metadata.update(
+                    {
+                        "total_files": len(file_list),
+                        "files": file_list,
+                        "has_data_pkl": "data.pkl" in file_list,
+                        "has_version": "version" in file_list,
+                    }
+                )
+
+                # Check for model structure indicators
+                pkl_files = [f for f in file_list if f.endswith(".pkl")]
+                storage_files = [f for f in file_list if f.startswith("data/")]
+
+                metadata.update(
+                    {
+                        "pickle_files": pkl_files,
+                        "storage_files": len(storage_files),
+                    }
+                )
+
+                # Try to read version if available
+                if "version" in file_list:
+                    try:
+                        version_data = zip_file.read("version")
+                        metadata["pytorch_version"] = version_data.decode("utf-8").strip()
+                    except Exception:
+                        pass
+
+                # Estimate model complexity from file count and names
+                param_indicators = sum(
+                    1 for f in file_list if any(term in f.lower() for term in ["weight", "bias", "param", "layer"])
+                )
+                if param_indicators > 0:
+                    metadata["estimated_parameters"] = param_indicators
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
