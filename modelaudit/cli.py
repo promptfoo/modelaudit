@@ -1841,7 +1841,7 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
 
 
 @cli.command("metadata")
-@click.argument("path", type=click.Path(exists=True))
+@click.argument("path", type=click.Path(exists=True, readable=True, dir_okay=True, file_okay=True))
 @click.option(
     "--format", "output_format", type=click.Choice(["json", "yaml", "table"]), default="table", help="Output format"
 )
@@ -1869,7 +1869,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             output_text = _format_metadata_table(metadata)
 
         if output:
-            with open(output, "w") as f:
+            with open(output, "w", encoding="utf-8") as f:
                 f.write(output_text)
             click.secho(f"Metadata written to {output}", fg="green")
         else:
@@ -1905,7 +1905,7 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Show key metadata fields
         for key, value in metadata.items():
             if key not in ["file", "path", "format", "file_size"]:
-                if isinstance(value, str | int | float | bool):
+                if isinstance(value, (str, int, float, bool)):
                     output.append(f"{key.replace('_', ' ').title()}: {value}")
                 elif isinstance(value, dict) and len(value) <= 5:
                     output.append(f"{key.replace('_', ' ').title()}:")
