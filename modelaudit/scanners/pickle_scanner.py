@@ -5759,7 +5759,7 @@ class PickleScanner(BaseScanner):
             # Analyze opcodes
             try:
                 # Count different opcode types
-                opcode_counts = {}
+                opcode_counts: dict[str, int] = {}
                 dangerous_opcodes = []
 
                 # Use pickletools to analyze opcodes
