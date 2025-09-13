@@ -372,6 +372,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "signature": {
+                "module": "modelaudit.scanners.signature_scanner",
+                "class": "SignatureScanner",
+                "description": "Verifies digital signatures and certificates for model authenticity",
+                "extensions": [".sig", ".asc", ".p7s", ".gpg", ".pem", ".crt", ".cer", ".p12", ".pfx"],
+                "priority": 2,  # High priority for security verification, after metadata
+                "dependencies": [],  # Uses system commands (gpg, openssl) when available
+                "numpy_sensitive": False,
+            },
             "sevenzip": {
                 "module": "modelaudit.scanners.sevenzip_scanner",
                 "class": "SevenZipScanner",
@@ -682,6 +691,7 @@ def __getattr__(name: str) -> Any:
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
+        "SignatureScanner": "signature",
         "XGBoostScanner": "xgboost",
         "ZipScanner": "zip",
     }

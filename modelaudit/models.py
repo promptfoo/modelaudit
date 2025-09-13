@@ -61,6 +61,20 @@ class SecretsFinding(DetectorFinding):
     masked_value: str | None = Field(None, description="Masked version of detected secret")
 
 
+class SignatureFinding(DetectorFinding):
+    """Pydantic model for signature verification findings"""
+
+    signature_type: str | None = Field(None, description="Type of signature (PGP, X.509, etc.)")
+    signer: str | None = Field(None, description="Identified signer or certificate subject")
+    signature_valid: bool | None = Field(None, description="Whether signature is cryptographically valid")
+    certificate_valid: bool | None = Field(None, description="Whether certificate chain is valid")
+    trusted_signer: bool | None = Field(None, description="Whether signer is in trusted keychain")
+    signature_timestamp: str | None = Field(None, description="Signature creation timestamp")
+    hash_algorithm: str | None = Field(None, description="Hash algorithm used (SHA-256, etc.)")
+    key_size: int | None = Field(None, description="Key size in bits")
+    fingerprint: str | None = Field(None, description="Key/certificate fingerprint")
+
+
 class DictCompatMixin:
     """Mixin providing dictionary-like access to Pydantic models for backward compatibility."""
 
