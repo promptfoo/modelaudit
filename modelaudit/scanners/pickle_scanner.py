@@ -33,6 +33,13 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 # Optional fickling integration for enhanced analysis
 try:
+    import sys
+
+    # Check Python version compatibility for fickling 0.1.4
+    # Disable fickling on Python 3.12+ due to compatibility issues causing test hangs
+    if sys.version_info >= (3, 12):
+        raise ImportError("Fickling 0.1.4 has compatibility issues with Python 3.12+")
+
     import fickling
     from fickling.analysis import AnalysisResults, Severity, check_safety
     from fickling.exception import UnsafeFileError
@@ -41,6 +48,7 @@ try:
     FICKLING_AVAILABLE = True
 except Exception:
     # Graceful degradation when fickling is not available or fails to import
+    # or when Python version is incompatible
     FICKLING_AVAILABLE = False
     AnalysisResults = None
     Severity = None
