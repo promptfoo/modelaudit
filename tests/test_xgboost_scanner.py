@@ -130,7 +130,7 @@ class TestXGBoostScannerBasic:
     def test_can_handle_supported_extensions(self, temp_dir):
         """Test that scanner handles supported XGBoost file extensions."""
         import json
-        
+
         # Test binary extensions (no content validation needed)
         binary_extensions = [".bst", ".model", ".ubj"]
         for ext in binary_extensions:
@@ -146,8 +146,7 @@ class TestXGBoostScannerBasic:
 
     def test_cannot_handle_unsupported_extensions(self, temp_dir):
         """Test that scanner rejects unsupported file extensions."""
-        import json
-        
+
         unsupported_extensions = [".txt", ".pkl", ".h5", ".onnx"]
 
         for ext in unsupported_extensions:
@@ -155,11 +154,11 @@ class TestXGBoostScannerBasic:
             test_file.write_text("dummy content")
 
             assert not XGBoostScanner.can_handle(str(test_file))
-            
+
     def test_cannot_handle_non_xgboost_json(self, temp_dir):
         """Test that scanner rejects JSON files without XGBoost structure."""
         import json
-        
+
         # Test regular config.json (should be rejected)
         test_file = temp_dir / "config.json"
         config_content = {"name": "test-model", "architecture": "transformer"}
