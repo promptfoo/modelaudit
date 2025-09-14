@@ -3392,4 +3392,3 @@ class PickleScanner(BaseScanner):
                 why="JIT/Script detection encountered an unexpected error",
             )
             return 0
-

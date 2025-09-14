@@ -64,7 +64,6 @@ class FicklingPickleScanner(BaseScanner):
         result = ScanResult(scanner_name=self.name)
         result.metadata["file_path"] = file_path
 
-
         # Check if file exists and is a regular file
         if not os.path.isfile(file_path):
             result.add_issue(
