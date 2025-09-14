@@ -100,7 +100,7 @@ class ScannerRegistry:
                 "description": "Scans pickle files using fickling's comprehensive security analysis",
                 "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt", ".joblib", ".bin", ".p", ".data"],
                 "priority": 1,
-                "dependencies": [],  # fickling is optional - graceful degradation when unavailable
+                "dependencies": ["fickling"],  # fickling is required - lightweight core dependency
                 "numpy_sensitive": False,
             },
             "pytorch_binary": {

@@ -120,6 +120,16 @@ ModelAudit supports multiple input sources:
 - `NO_COLOR` - Disable color output (follows https://no-color.org standard)
 - `.env` file is automatically loaded if present
 
+## Python Version Compatibility
+
+ModelAudit supports Python 3.10, 3.11, 3.12, and 3.13:
+
+- **Python 3.10-3.11**: Full functionality including fickling-enhanced pickle security analysis
+- **Python 3.12-3.13**: Fickling integration with compatibility checks - some edge cases may fall back to content-based analysis due to fickling 0.1.4 compatibility constraints
+- **All versions**: Core security detection, CVE pattern analysis, and comprehensive model scanning work reliably
+
+The scanner automatically detects Python version compatibility and provides appropriate fallbacks to ensure consistent security coverage across all supported versions.
+
 ## CI/CD Integration
 
 ModelAudit automatically adapts its output for CI environments:
