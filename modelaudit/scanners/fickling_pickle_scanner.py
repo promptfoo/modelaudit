@@ -7,25 +7,39 @@ while simplifying the codebase.
 """
 
 import os
+import sys
 import time
 from typing import Any, ClassVar
 
-try:
-    import sys
+from ..explanations import get_import_explanation, get_opcode_explanation
+from ..suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
+from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
-    # Check Python version compatibility for fickling 0.1.4
-    # Disable fickling on Python 3.12+ due to compatibility issues causing test hangs
-    if sys.version_info >= (3, 12):
-        raise ImportError("Fickling 0.1.4 has compatibility issues with Python 3.12+")
+# Check Python version compatibility first
+PYTHON_VERSION_COMPATIBLE = sys.version_info < (3, 12)
 
-    from fickling.analysis import AnalysisResults, Severity, check_safety
-    from fickling.exception import UnsafeFileError
-    from fickling.fickle import Pickled
+if PYTHON_VERSION_COMPATIBLE:
+    try:
+        from fickling.analysis import AnalysisResults, Severity, check_safety
+        from fickling.exception import UnsafeFileError
+        from fickling.fickle import Pickled
 
-    FICKLING_AVAILABLE = True
-except ImportError:
-    # Graceful degradation when fickling is not available (e.g., in Docker builds)
-    # or when Python version is incompatible
+        FICKLING_AVAILABLE = True
+    except ImportError:
+        # Graceful degradation when fickling is not available (e.g., in Docker builds)
+        FICKLING_AVAILABLE = False
+        # Create stub types for type compatibility
+        from typing import Any
+
+        AnalysisResults = Any
+        Severity = Any
+        UnsafeFileError = Exception
+        Pickled = Any
+
+        def check_safety(*args, **kwargs):
+            raise ImportError("Fickling is not available")
+else:
+    # Python 3.12+ - disable fickling due to compatibility issues
     FICKLING_AVAILABLE = False
     # Create stub types for type compatibility
     from typing import Any
@@ -36,12 +50,7 @@ except ImportError:
     Pickled = Any
 
     def check_safety(*args, **kwargs):
-        raise ImportError("Fickling is not available")
-
-
-from ..explanations import get_import_explanation, get_opcode_explanation
-from ..suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+        raise ImportError("Fickling is not available on Python 3.12+")
 
 
 class FicklingPickleScanner(BaseScanner):
