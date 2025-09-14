@@ -11,6 +11,13 @@ import time
 from typing import Any, ClassVar
 
 try:
+    import sys
+
+    # Check Python version compatibility for fickling 0.1.4
+    # Disable fickling on Python 3.12+ due to compatibility issues causing test hangs
+    if sys.version_info >= (3, 12):
+        raise ImportError("Fickling 0.1.4 has compatibility issues with Python 3.12+")
+
     from fickling.analysis import AnalysisResults, Severity, check_safety
     from fickling.exception import UnsafeFileError
     from fickling.fickle import Pickled
@@ -18,6 +25,7 @@ try:
     FICKLING_AVAILABLE = True
 except ImportError:
     # Graceful degradation when fickling is not available (e.g., in Docker builds)
+    # or when Python version is incompatible
     FICKLING_AVAILABLE = False
     # Create stub types for type compatibility
     from typing import Any
@@ -83,15 +91,39 @@ class FicklingPickleScanner(BaseScanner):
 
         # Check if fickling is available
         if not FICKLING_AVAILABLE:
-            result.add_issue(
-                message="Fickling dependency not available - falling back to basic pickle scanning",
-                severity=IssueSeverity.WARNING,
-                details={
+            import sys
+
+            python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+            if sys.version_info >= (3, 12):
+                message = f"Fickling disabled on Python {python_version} - using enhanced fallback analysis"
+                details = {
+                    "reason": f"Fickling 0.1.4 has compatibility issues with Python {python_version}+",
+                    "fallback": "Using enhanced content-based security analysis",
+                    "note": "Upgrade to fickling 0.2+ when available for Python 3.12+ support",
+                }
+                severity = IssueSeverity.INFO  # Less concerning since we have fallback
+            else:
+                message = "Fickling dependency not available - falling back to basic pickle scanning"
+                details = {
                     "recommendation": "Install fickling for enhanced pickle security analysis",
                     "fallback": "Using basic pickle validation only",
-                },
+                }
+                severity = IssueSeverity.WARNING
+
+            result.add_issue(
+                message=message,
+                severity=severity,
+                details=details,
             )
             result.metadata["fickling_available"] = False
+
+            # Run comprehensive fallback analysis when fickling is unavailable
+            self._analyze_content_patterns(file_path, result)
+
+            # Set bytes scanned for size limit enforcement
+            result.bytes_scanned = self._get_file_size(file_path)
+
             result.finish(success=True)
             return result
 
