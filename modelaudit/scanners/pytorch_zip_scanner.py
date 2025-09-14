@@ -705,7 +705,7 @@ class PyTorchZipScanner(BaseScanner):
                                 version_info["pytorch_framework_version"] = meta_data[key]
                                 version_info["pytorch_version_source"] = f"metadata:{meta_file}"
                                 break
-                    except (json.JSONDecodeError, UnicodeDecodeError):  # type: ignore[possibly-unresolved-reference]
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
 
         except Exception:
@@ -920,14 +920,14 @@ class PyTorchZipScanner(BaseScanner):
             ml_confidence = pickle_result.metadata.get("ml_confidence", 0)
             is_likely_ml_model = ml_confidence > 0.7
 
-            # For legitimate ML models, tensor operations are normal, so downgrade severity
+            # Keep CVE warning as WARNING minimum per security review, but adjust message for ML context
             if is_likely_ml_model:
-                severity = IssueSeverity.INFO
-                passed = True
+                severity = IssueSeverity.WARNING
+                passed = False
                 message = (
-                    f"PyTorch model uses tensor reconstruction opcodes ({opcode_list}) which are normal for ML models. "
-                    f"While these opcodes technically bypass weights_only=True safety checks, they are being used for "
-                    f"legitimate tensor deserialization rather than malicious code execution."
+                    f"PyTorch model contains tensor reconstruction opcodes ({opcode_list}) that bypass "
+                    f"weights_only=True safety. While this is likely legitimate ML tensor deserialization, "
+                    f"it still represents a security finding that should be reviewed."
                 )
             else:
                 severity = IssueSeverity.CRITICAL
@@ -961,6 +961,27 @@ class PyTorchZipScanner(BaseScanner):
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                 },
             )
+
+            # Add secondary informational note for ML context
+            if is_likely_ml_model:
+                pytorch_result.add_check(
+                    name="ML Model Context - Tensor Deserialization",
+                    passed=True,
+                    message=(
+                        f"Model appears to be a legitimate ML model (confidence: {ml_confidence:.1%}). "
+                        f"Tensor reconstruction opcodes are expected for normal model deserialization."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=f"{model_path}:{pickle_name}",
+                    details={
+                        "ml_confidence": ml_confidence,
+                        "context": (
+                            "This informational check acknowledges the ML model context "
+                            "while maintaining the security warning above."
+                        ),
+                        "note": "Even legitimate models should be from trusted sources due to CVE-2025-32434 risks.",
+                    },
+                )
         else:
             # No dangerous opcodes found - add informational check
             pytorch_result.add_check(
