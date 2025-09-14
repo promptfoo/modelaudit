@@ -8,7 +8,7 @@ while simplifying the codebase.
 
 import os
 import time
-from typing import ClassVar, Optional
+from typing import Any, ClassVar
 
 try:
     from fickling.analysis import AnalysisResults, Severity, check_safety
@@ -75,7 +75,7 @@ class FicklingPickleScanner(BaseScanner):
                 pass  # fall back to handling here
         return True
 
-    def scan(self, file_path: str, timeout: Optional[float] = None) -> ScanResult:
+    def scan(self, file_path: str, timeout: float | None = None) -> ScanResult:
         """Scan a pickle file using fickling's analysis engine"""
         start_time = time.time()
         result = ScanResult(scanner_name=self.name)
@@ -431,7 +431,7 @@ class FicklingPickleScanner(BaseScanner):
             # Add issue using the method's expected parameters
             result.add_issue(message=message, severity=severity, details=details)
 
-    def _is_ml_safe_pattern(self, fickling_result) -> bool:
+    def _is_ml_safe_pattern(self, fickling_result: AnalysisResults) -> bool:
         """Check if a fickling result represents a pattern that's safe in ML context"""
         analysis_name = fickling_result.analysis_name or ""
         trigger = str(fickling_result.trigger) if fickling_result.trigger else ""
@@ -495,7 +495,7 @@ class FicklingPickleScanner(BaseScanner):
         else:
             return IssueSeverity.WARNING
 
-    def _generate_issue_title(self, fickling_result) -> str:
+    def _generate_issue_title(self, fickling_result: AnalysisResults) -> str:
         """Generate descriptive issue titles based on fickling analysis"""
         analysis_name = fickling_result.analysis_name or "Unknown"
 
@@ -513,7 +513,7 @@ class FicklingPickleScanner(BaseScanner):
 
         return title_mapping.get(analysis_name, f"Pickle Security Issue ({analysis_name})")
 
-    def _generate_recommendation(self, fickling_result) -> str:
+    def _generate_recommendation(self, fickling_result: AnalysisResults) -> str:
         """Generate security recommendations based on fickling analysis"""
         analysis_name = fickling_result.analysis_name or ""
 
@@ -528,7 +528,7 @@ class FicklingPickleScanner(BaseScanner):
         else:
             return "Manual security review recommended before loading this pickle"
 
-    def _add_explanations(self, details: dict, fickling_result) -> None:
+    def _add_explanations(self, details: dict, fickling_result: AnalysisResults) -> None:
         """Add detailed explanations to issue details where available"""
         trigger = fickling_result.trigger
 
@@ -564,7 +564,7 @@ class FicklingPickleScanner(BaseScanner):
                 if explanation:
                     details["opcode_explanation"] = explanation
 
-    def _detect_ml_context(self, pickled) -> dict:
+    def _detect_ml_context(self, pickled: Pickled) -> dict:
         """Detect ML framework context for smart binary scanning"""
         try:
             # Simple heuristic: look for common PyTorch patterns
@@ -728,7 +728,7 @@ class FicklingPickleScanner(BaseScanner):
             pass
         return None
 
-    def _scan_for_nested_pickles(self, pickled, result: ScanResult) -> None:
+    def _scan_for_nested_pickles(self, pickled: Pickled, result: ScanResult) -> None:
         """Scan for nested pickle payloads in strings/bytes within the pickle."""
         try:
             import base64
@@ -840,7 +840,7 @@ class FicklingPickleScanner(BaseScanner):
         except Exception:
             pass  # Ignore errors in this heuristic check
 
-    def _scan_for_embedded_payloads(self, pickled, result: ScanResult) -> None:
+    def _scan_for_embedded_payloads(self, pickled: Pickled, result: ScanResult) -> None:
         """Scan serialized bytes for embedded base64-encoded Python payloads (no deserialization)."""
         try:
             logger.debug("Starting embedded payload scan")  # Changed to debug
@@ -1046,7 +1046,7 @@ class FicklingPickleScanner(BaseScanner):
         except Exception as e:
             logger.warning(f"Error during multiple stream scan: {e}")
 
-    def _analyze_dangerous_globals(self, pickled, result: ScanResult) -> None:
+    def _analyze_dangerous_globals(self, pickled: Pickled, result: ScanResult) -> None:
         """
         Analyze pickle for dangerous GLOBAL opcodes that fickling might miss.
 
@@ -1098,7 +1098,7 @@ class FicklingPickleScanner(BaseScanner):
         return False
 
     def _add_security_checks(
-        self, pickled, result: ScanResult, file_path: str, fickling_is_safe: bool, ml_context: dict
+        self, pickled: Pickled, result: ScanResult, file_path: str, fickling_is_safe: bool, ml_context: dict
     ) -> None:
         """Add Check objects for security validation reporting."""
 
@@ -1206,7 +1206,7 @@ class FicklingPickleScanner(BaseScanner):
             details={"dangerous_opcodes": dangerous_opcodes},
         )
 
-    def _check_for_dangerous_opcodes(self, pickled, file_path: str) -> list[str]:
+    def _check_for_dangerous_opcodes(self, pickled: Pickled, file_path: str) -> list[str]:
         """Check for dangerous pickle opcodes and return list of found opcodes."""
         dangerous_opcodes = []
 
@@ -1233,7 +1233,7 @@ class FicklingPickleScanner(BaseScanner):
 
         return dangerous_opcodes
 
-    def _scan_pickle_bytes(self, file_like, file_size: int) -> ScanResult:
+    def _scan_pickle_bytes(self, file_like: Any, file_size: int) -> ScanResult:
         """
         Legacy compatibility method for scanning pickle bytes from a file-like object.
 

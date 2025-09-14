@@ -3429,7 +3429,7 @@ class PickleScanner(BaseScanner):
             )
             return 0
 
-    def _run_fickling_analysis(self, path: str, result: ScanResult) -> Optional[bool]:
+    def _run_fickling_analysis(self, path: str, result: ScanResult) -> bool | None:
         """Run fickling analysis on the pickle file and integrate results."""
         if not FICKLING_AVAILABLE:
             return None
@@ -3522,7 +3522,7 @@ class PickleScanner(BaseScanner):
         else:
             return IssueSeverity.WARNING
 
-    def _generate_fickling_recommendation(self, fickling_result) -> str:
+    def _generate_fickling_recommendation(self, fickling_result: Any) -> str:
         """Generate security recommendations based on fickling analysis."""
         analysis_name = fickling_result.analysis_name or ""
 

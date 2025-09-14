@@ -32,7 +32,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
     Usage:
         @cached_scan()
-        def scan_file(path: str, config: Optional[dict] = None) -> ScanResult:
+        def scan_file(path: str, config: dict | None = None) -> ScanResult:
             return _scan_file_internal(path, config)
 
         @cached_scan()
