@@ -94,16 +94,22 @@ class TestCVE202013092Detection:
 
     def test_detect_cve_2020_13092_sklearn_pipeline_attack(self, tmp_path):
         """Test detection of malicious sklearn Pipeline with __reduce__ method."""
-        # Simulate a malicious sklearn Pipeline with __reduce__ calling os.system
-        malicious_content = b"""
-        sklearn.pipeline.Pipeline
-        __reduce__
-        os.system
-        subprocess.call
-        """
+        # Create proper pickle data that embeds CVE-2020-13092 patterns for sklearn Pipeline attack
+        malicious_data = {
+            # sklearn Pipeline context
+            "sklearn": "sklearn.pipeline.Pipeline",
+            "pipeline": "sklearn.pipeline.Pipeline with malicious __reduce__",
+            # Dangerous operations (required for CVE detection)
+            "__reduce__": "__reduce__ method hijacked to execute system calls",
+            "os.system": 'os.system("malicious command")',
+            "subprocess.call": "subprocess.call for command execution",
+            # Additional context to strengthen detection
+            "exploit_pipeline": "malicious sklearn Pipeline using __reduce__ with os.system",
+        }
 
         test_file = tmp_path / "malicious_pipeline.pkl"
-        test_file.write_bytes(malicious_content)
+        with open(test_file, "wb") as f:
+            pickle.dump(malicious_data, f)
 
         result = scan_file(str(test_file))
 
