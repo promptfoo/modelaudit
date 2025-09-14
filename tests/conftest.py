@@ -21,11 +21,11 @@ def pytest_runtest_setup(item):
         # Allow only essential core tests on Python 3.12+ to prevent compatibility issues
         # Focus on tests that are critical for basic functionality and properly handle fallbacks
         allowed_test_files = [
-            "test_xgboost_scanner.py",         # XGBoost scanner works on all Python versions
-            "test_pickle_scanner.py",          # Core pickle functionality with fickling fallback
-            "test_base_scanner.py",            # Base scanner functionality
-            "test_core.py",                    # Core ModelAudit functionality
-            "test_cli.py",                     # CLI functionality
+            "test_xgboost_scanner.py",  # XGBoost scanner works on all Python versions
+            "test_pickle_scanner.py",  # Core pickle functionality with fickling fallback
+            "test_base_scanner.py",  # Base scanner functionality
+            "test_core.py",  # Core ModelAudit functionality
+            "test_cli.py",  # CLI functionality
             "test_pytorch_binary_scanner.py",  # PyTorch binary scanner (no fickling dependency)
         ]
 
