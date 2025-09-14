@@ -7,50 +7,16 @@ while simplifying the codebase.
 """
 
 import os
-import sys
 import time
 from typing import Any, ClassVar
+
+from fickling.analysis import AnalysisResults, Severity, check_safety
+from fickling.exception import UnsafeFileError
+from fickling.fickle import Pickled
 
 from ..explanations import get_import_explanation, get_opcode_explanation
 from ..suspicious_symbols import BINARY_CODE_PATTERNS, EXECUTABLE_SIGNATURES
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
-
-# Check Python version compatibility first
-PYTHON_VERSION_COMPATIBLE = sys.version_info < (3, 12)
-
-if PYTHON_VERSION_COMPATIBLE:
-    try:
-        from fickling.analysis import AnalysisResults, Severity, check_safety
-        from fickling.exception import UnsafeFileError
-        from fickling.fickle import Pickled
-
-        FICKLING_AVAILABLE = True
-    except ImportError:
-        # Graceful degradation when fickling is not available (e.g., in Docker builds)
-        FICKLING_AVAILABLE = False
-        # Create stub types for type compatibility
-        from typing import Any
-
-        AnalysisResults = Any
-        Severity = Any
-        UnsafeFileError = Exception
-        Pickled = Any
-
-        def check_safety(*args, **kwargs):
-            raise ImportError("Fickling is not available")
-else:
-    # Python 3.12+ - disable fickling due to compatibility issues
-    FICKLING_AVAILABLE = False
-    # Create stub types for type compatibility
-    from typing import Any
-
-    AnalysisResults = Any
-    Severity = Any
-    UnsafeFileError = Exception
-    Pickled = Any
-
-    def check_safety(*args, **kwargs):
-        raise ImportError("Fickling is not available on Python 3.12+")
 
 
 class FicklingPickleScanner(BaseScanner):
@@ -98,43 +64,6 @@ class FicklingPickleScanner(BaseScanner):
         result = ScanResult(scanner_name=self.name)
         result.metadata["file_path"] = file_path
 
-        # Check if fickling is available
-        if not FICKLING_AVAILABLE:
-            import sys
-
-            python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-
-            if sys.version_info >= (3, 12):
-                message = f"Fickling disabled on Python {python_version} - using enhanced fallback analysis"
-                details = {
-                    "reason": f"Fickling 0.1.4 has compatibility issues with Python {python_version}+",
-                    "fallback": "Using enhanced content-based security analysis",
-                    "note": "Upgrade to fickling 0.2+ when available for Python 3.12+ support",
-                }
-                severity = IssueSeverity.INFO  # Less concerning since we have fallback
-            else:
-                message = "Fickling dependency not available - falling back to basic pickle scanning"
-                details = {
-                    "recommendation": "Install fickling for enhanced pickle security analysis",
-                    "fallback": "Using basic pickle validation only",
-                }
-                severity = IssueSeverity.WARNING
-
-            result.add_issue(
-                message=message,
-                severity=severity,
-                details=details,
-            )
-            result.metadata["fickling_available"] = False
-
-            # Run comprehensive fallback analysis when fickling is unavailable
-            self._analyze_content_patterns(file_path, result)
-
-            # Set bytes scanned for size limit enforcement
-            result.bytes_scanned = self._get_file_size(file_path)
-
-            result.finish(success=True)
-            return result
 
         # Check if file exists and is a regular file
         if not os.path.isfile(file_path):

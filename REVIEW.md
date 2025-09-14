@@ -82,4 +82,3 @@ Nice-to-haves (post-merge follow-ups)
 - Centralize shared helpers between pickle scanners to one module to avoid duplication.
 - Add lightweight magic sniffers for archive formats earlier in the pipeline to reduce misrouted scans and unnecessary work.
 - Consider a feature flag to force legacy vs fickling-based scan paths for troubleshooting.
-
