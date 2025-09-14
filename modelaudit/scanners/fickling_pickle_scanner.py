@@ -222,6 +222,9 @@ class FicklingPickleScanner(BaseScanner):
             # Check for multiple pickle streams in the file
             self._scan_for_multiple_streams(file_path, result)
 
+            # Scan for JIT/Script patterns if enabled
+            self._scan_for_jit_script_patterns(file_path, result)
+
         except UnsafeFileError as e:
             # Fickling detected unsafe content - but still run CVE analysis for comprehensive detection
             result.add_issue(
@@ -1349,3 +1352,28 @@ class FicklingPickleScanner(BaseScanner):
 
         except Exception as e:
             logger.warning(f"Error analyzing additional stream {stream_number}: {e}")
+
+    def _scan_for_jit_script_patterns(self, file_path: str, result: ScanResult) -> None:
+        """Scan for JIT/Script patterns in the pickle file if check is enabled."""
+        check_jit = self._get_bool_config("check_jit_script", True)
+        if not check_jit:
+            result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+            return
+
+        try:
+            # Read file content for analysis
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+
+            # Collect JIT/Script findings using inherited BaseScanner method
+            jit_findings = self.collect_jit_script_findings(
+                file_data,
+                model_type="pytorch",  # Most pickle files in ML are PyTorch
+                context=file_path,
+            )
+
+            # Create aggregated check for the file using inherited BaseScanner method
+            self.summarize_jit_script_findings(jit_findings, result, context=file_path)
+
+        except Exception as e:
+            logger.warning(f"Error scanning for JIT/Script patterns in {file_path}: {e}")

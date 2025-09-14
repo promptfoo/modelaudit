@@ -28,16 +28,25 @@ class TestCVE202013092Detection:
 
     def test_detect_cve_2020_13092_basic_pattern(self, tmp_path):
         """Test basic detection of CVE-2020-13092 patterns."""
-        # Create a malicious pickle that simulates sklearn model with os.system
-        malicious_content = b"""
-        joblib.load
-        sklearn.ensemble.RandomForestClassifier
-        __reduce__
-        os.system
-        """
+
+        # Create pickle data that embeds all required CVE-2020-13092 patterns in text form
+        # This ensures the CVE pattern analysis can detect them
+        malicious_data = {
+            # sklearn context
+            "sklearn": "sklearn.ensemble.RandomForestClassifier",
+            "joblib": "joblib library for model persistence",
+            # Loading operations (vulnerability trigger)
+            "joblib.load": 'joblib.load("malicious_model.pkl")',
+            # Dangerous operations (required for CVE detection)
+            "__reduce__": "__reduce__ method for pickling",
+            "os.system": 'os.system("dangerous command")',
+            # Additional context that makes this look like a real exploit
+            "exploit_code": "sklearn model with embedded os.system call via __reduce__",
+        }
 
         test_file = tmp_path / "malicious_sklearn.pkl"
-        test_file.write_bytes(malicious_content)
+        with open(test_file, "wb") as f:
+            pickle.dump(malicious_data, f)
 
         result = scan_file(str(test_file))
 
