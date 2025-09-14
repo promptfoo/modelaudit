@@ -160,5 +160,9 @@ mlruns/
 # Scan results output (temporary data)
 scan_results/
 
+# Generated analysis reports and comparison results
+comparison_results_*.json
+*_IMPLEMENTATION_TEST_REPORT.md
+
 # This comment forces a new CI run
 # CI status check

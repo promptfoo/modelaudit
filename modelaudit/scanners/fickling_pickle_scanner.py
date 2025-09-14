@@ -81,8 +81,8 @@ class FicklingPickleScanner(BaseScanner):
         ext = os.path.splitext(file_path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
-        # Defer ZIP-formatted .bin to the PyTorch ZIP scanner
-        if ext == ".bin":
+        # Defer ZIP-formatted files to the PyTorch ZIP scanner
+        if ext in [".bin", ".pt", ".pth"]:
             try:
                 from modelaudit.utils.filetype import detect_file_format
 
@@ -295,7 +295,7 @@ class FicklingPickleScanner(BaseScanner):
             self._scan_for_multiple_streams(file_path, result)
 
         except UnsafeFileError as e:
-            # Fickling detected unsafe content
+            # Fickling detected unsafe content - but still run CVE analysis for comprehensive detection
             result.add_issue(
                 message=f"Malicious Pickle Detected: Fickling detected unsafe content: {e}",
                 severity=IssueSeverity.CRITICAL,
@@ -305,8 +305,8 @@ class FicklingPickleScanner(BaseScanner):
                 },
             )
             result.metadata["fickling_unsafe"] = True
-            result.finish(success=True)
-            return result
+            # Continue to run CVE/pattern analysis for comprehensive security assessment
+            fickling_is_safe = False
 
         except Exception as e:
             logger.warning(f"Fickling analysis failed for {file_path}: {e}")
@@ -322,15 +322,13 @@ class FicklingPickleScanner(BaseScanner):
                 # If even the basic safety check fails, just continue
                 pass
 
-            # If fickling fails, fall back to content-based analysis for CVE detection
-            self._analyze_content_patterns(file_path, result)
+            # If fickling fails, note the failure but continue with comprehensive analysis
             result.add_issue(
                 message=f"Fickling analysis failed: {e}",
                 severity=IssueSeverity.WARNING,
-                details={"note": "Falling back to content-based analysis"},
+                details={"note": "Continuing with content-based analysis"},
             )
-            result.finish(success=True)
-            return result
+            fickling_is_safe = None  # Unknown safety status
 
         # Always run content-based analysis for comprehensive CVE detection
         # Fickling might miss some patterns that our CVE database catches

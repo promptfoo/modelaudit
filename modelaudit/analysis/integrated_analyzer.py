@@ -46,7 +46,7 @@ class IntegratedAnalyzer:
 
         # Confidence weights for different signals
         self.signal_weights = {
-            "ml_context": 0.25,
+            "ml_confidence": 0.25,
             "entropy_analysis": 0.15,
             "semantic_analysis": 0.20,
             "anomaly_detection": 0.15,
@@ -73,9 +73,9 @@ class IntegratedAnalyzer:
 
         # 1. ML Context Analysis
         ml_signal = self._analyze_ml_context(pattern, context)
-        signals["ml_context"] = ml_signal["confidence"]
+        signals["ml_confidence"] = ml_signal["confidence"]
         reasoning.extend(ml_signal["reasoning"])
-        detailed["ml_context"] = ml_signal
+        detailed["ml_confidence"] = ml_signal
 
         # 2. Entropy Analysis (if raw data available)
         if raw_data:
