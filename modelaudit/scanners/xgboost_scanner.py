@@ -82,8 +82,14 @@ class XGBoostScanner(BaseScanner):
             return False
 
         file_ext = os.path.splitext(path)[1].lower()
-        if file_ext in cls.supported_extensions:
+
+        # For binary extensions, accept directly
+        if file_ext in [".bst", ".model", ".ubj"]:
             return True
+
+        # For JSON files, check if they contain XGBoost model structure
+        if file_ext == ".json":
+            return cls._is_xgboost_json(path)
 
         # Check for XGBoost files that might not have the right extension
         if file_ext == "":
@@ -95,6 +101,33 @@ class XGBoostScanner(BaseScanner):
                         return True
             except OSError:
                 pass
+
+        return False
+
+    @classmethod
+    def _is_xgboost_json(cls, path: str) -> bool:
+        """Check if a JSON file contains XGBoost model structure."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                # Only read first part of file to check structure efficiently
+                content = f.read(1024)
+
+            # Quick heuristic check for XGBoost JSON structure
+            if '"version"' in content and '"learner"' in content:
+                # Do full JSON parsing for more thorough check
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f)
+
+                    # Check for required XGBoost keys
+                    if isinstance(data, dict):
+                        return "version" in data and "learner" in data
+
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        except (OSError, UnicodeDecodeError):
+            pass
 
         return False
 
