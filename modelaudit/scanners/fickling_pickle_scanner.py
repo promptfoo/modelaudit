@@ -105,11 +105,38 @@ class FicklingPickleScanner(BaseScanner):
             return result
 
         try:
-            # Load pickle file with fickling
+            # Load pickle file with fickling with additional error handling
             with open(file_path, "rb") as f:
-                pickled = Pickled.load(f)
-                pickle_bytes = f.tell()
-                trailing_bytes = f.read()
+                try:
+                    pickled = Pickled.load(f)
+                    pickle_bytes = f.tell()
+                    trailing_bytes = f.read()
+                except (UnsafeFileError, ValueError, EOFError, ImportError) as e:
+                    # Handle specific fickling/pickle parsing errors
+                    result.add_issue(
+                        message=f"Fickling failed to parse pickle file: {e}",
+                        severity=IssueSeverity.CRITICAL,
+                        details={
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "recommendation": "File may be corrupted or use unsupported pickle format",
+                        },
+                    )
+                    result.finish(success=False)
+                    return result
+                except Exception as e:
+                    # Handle any unexpected errors during fickling load
+                    result.add_issue(
+                        message=f"Unexpected error during fickling analysis: {e}",
+                        severity=IssueSeverity.WARNING,
+                        details={
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "fallback": "Skipping fickling analysis due to unexpected error",
+                        },
+                    )
+                    result.finish(success=True)  # Continue with basic validation
+                    return result
 
             # Single pre-analysis timeout fence (after load)
             if timeout and (time.time() - start_time) > timeout:
@@ -124,18 +151,50 @@ class FicklingPickleScanner(BaseScanner):
             # Store it internally for our logic but not in the result metadata
             result.metadata["ml_confidence"] = ml_context.get("overall_confidence", 0)
 
-            # Run fickling AST analysis and convert findings
-            analysis_results = check_safety(pickled)
-            self._convert_fickling_results(analysis_results, result, ml_context)
+            # Run fickling AST analysis and convert findings with error handling
+            try:
+                analysis_results = check_safety(pickled)
+                self._convert_fickling_results(analysis_results, result, ml_context)
+            except Exception as e:
+                # Handle fickling analysis errors gracefully
+                result.add_issue(
+                    message=f"Fickling safety analysis failed: {e}",
+                    severity=IssueSeverity.WARNING,
+                    details={
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                        "fallback": "Continuing with remaining security checks",
+                    },
+                )
+                # Continue with other analysis even if fickling fails
 
             # Quick signal for mismatch metadata
             import fickling
 
-            fickling_is_safe = fickling.is_likely_safe(file_path)
+            try:
+                fickling_is_safe = fickling.is_likely_safe(file_path)
+            except Exception as e:
+                # Handle is_likely_safe errors
+                result.add_issue(
+                    message=f"Fickling safety check failed: {e}",
+                    severity=IssueSeverity.DEBUG,
+                    details={"error_type": type(e).__name__},
+                )
+                fickling_is_safe = False  # Default to unsafe if we can't determine
 
-            # Additional fickling info
-            unsafe_imports = list(pickled.unsafe_imports())
-            non_standard_imports = list(pickled.non_standard_imports())
+            # Additional fickling info with error handling
+            try:
+                unsafe_imports = list(pickled.unsafe_imports())
+                non_standard_imports = list(pickled.non_standard_imports())
+            except Exception as e:
+                # Handle import analysis errors
+                unsafe_imports = []
+                non_standard_imports = []
+                result.add_issue(
+                    message=f"Fickling import analysis failed: {e}",
+                    severity=IssueSeverity.DEBUG,
+                    details={"error_type": type(e).__name__},
+                )
 
             # Compute opcode count safely
             opcode_count = None
