@@ -18,14 +18,25 @@ def pytest_runtest_setup(item):
         test_file = str(item.fspath)
         test_name = item.name
 
-        # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
+        # Allow only essential core tests on Python 3.12+ to prevent compatibility issues
+        # Focus on tests that are critical for basic functionality and properly handle fallbacks
         allowed_test_files = [
-            "test_xgboost_scanner.py",
-            "test_pickle_scanner.py",
-            "test_base_scanner.py",
-            "test_core.py",
-            "test_cli.py",
+            "test_xgboost_scanner.py",         # XGBoost scanner works on all Python versions
+            "test_pickle_scanner.py",          # Core pickle functionality with fickling fallback
+            "test_base_scanner.py",            # Base scanner functionality
+            "test_core.py",                    # Core ModelAudit functionality  
+            "test_cli.py",                     # CLI functionality
+            "test_pytorch_binary_scanner.py",  # PyTorch binary scanner (no fickling dependency)
         ]
+        
+        # Skip tests that check internal fickling registry details on Python 3.12+
+        # since fickling behavior differs when disabled for compatibility
+        skip_on_python_312_plus = [
+            "test_lazy_loading_integration.py",  # Tests fickling dependency assertions
+        ]
+        
+        if any(skip_file in test_file for skip_file in skip_on_python_312_plus):
+            pytest.skip(f"Skipping {test_name} on Python {sys.version_info[:2]} - fickling dependency test not applicable when fickling is disabled for compatibility")
 
         # Check if this is an allowed test file
         if any(allowed_file in test_file for allowed_file in allowed_test_files):
