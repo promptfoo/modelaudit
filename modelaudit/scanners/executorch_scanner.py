@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -16,7 +16,7 @@ class ExecuTorchScanner(BaseScanner):
     description = "Scans ExecuTorch mobile model files for suspicious content"
     supported_extensions: ClassVar[list[str]] = [".ptl", ".pte"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         self.pickle_scanner = PickleScanner(config)
 

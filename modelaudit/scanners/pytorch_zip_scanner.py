@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -21,7 +21,7 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
     CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner: PickleScanner = PickleScanner(config)
@@ -59,7 +59,7 @@ class PyTorchZipScanner(BaseScanner):
         # For .pt and .pth, always try to handle
         return True
 
-    def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
+    def scan(self, path: str, timeout: int | None = None) -> ScanResult:
         """Scan a PyTorch model file for suspicious code"""
         # Override timeout if provided
         if timeout is not None:
@@ -705,7 +705,7 @@ class PyTorchZipScanner(BaseScanner):
                                 version_info["pytorch_framework_version"] = meta_data[key]
                                 version_info["pytorch_version_source"] = f"metadata:{meta_file}"
                                 break
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                    except (json.JSONDecodeError, UnicodeDecodeError):  # type: ignore[possibly-unresolved-reference]
                         continue
 
         except Exception:
@@ -714,7 +714,7 @@ class PyTorchZipScanner(BaseScanner):
 
         return version_info
 
-    def _extract_framework_version_from_pickle(self, pickle_data: bytes) -> Optional[str]:
+    def _extract_framework_version_from_pickle(self, pickle_data: bytes) -> str | None:
         """Extract PyTorch framework version from pickle data by examining opcodes"""
         try:
             import io

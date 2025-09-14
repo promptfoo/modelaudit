@@ -40,6 +40,8 @@ def create_mock_scan_result(**kwargs):
                 location=issue_dict.get("location"),
                 timestamp=time.time(),
                 details=issue_dict.get("details", {}),
+                why=None,
+                type=None,
             )
             issues.append(issue)
         result.issues = issues
@@ -50,7 +52,14 @@ def create_mock_scan_result(**kwargs):
 
         assets = []
         for asset_dict in kwargs["assets"]:
-            asset = AssetModel(path=asset_dict.get("path", "/test/path"), type=asset_dict.get("type", "test"))
+            asset = AssetModel(
+                path=asset_dict.get("path", "/test/path"),
+                type=asset_dict.get("type", "test"),
+                size=asset_dict.get("size", 0),
+                tensors=asset_dict.get("tensors"),
+                keys=asset_dict.get("keys"),
+                contents=asset_dict.get("contents"),
+            )
             assets.append(asset)
         result.assets = assets
 

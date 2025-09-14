@@ -3,10 +3,9 @@
 import ast
 import py_compile
 import tempfile
-from typing import Optional
 
 
-def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool, Optional[str]]:
+def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool, str | None]:
     """
     Validate Python code syntax without executing it.
 

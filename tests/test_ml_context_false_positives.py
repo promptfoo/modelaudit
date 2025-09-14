@@ -24,7 +24,7 @@ class TestMLContextDetection(unittest.TestCase):
     def test_analyze_binary_for_ml_context_weights(self):
         """Test ML context detection on realistic weight data."""
         # Create realistic float32 weight data
-        weights = []
+        weights: list[int] = []
         for i in range(1000):
             # Typical neural network weights: small values around 0
             weight = (i % 200 - 100) / 100.0  # Range [-1, 1]

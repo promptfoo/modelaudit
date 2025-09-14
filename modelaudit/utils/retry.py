@@ -4,7 +4,8 @@ import functools
 import logging
 import random
 import time
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import click
 
@@ -16,7 +17,7 @@ T = TypeVar("T")
 class RetryError(Exception):
     """Raised when all retry attempts fail."""
 
-    def __init__(self, message: str, last_error: Optional[Exception] = None):
+    def __init__(self, message: str, last_error: Exception | None = None):
         super().__init__(message)
         self.last_error = last_error
 
@@ -28,7 +29,7 @@ def exponential_backoff(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
-    retry_on: Optional[tuple[type[Exception], ...]] = None,
+    retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
 ) -> Callable[..., T]:
     """
@@ -75,7 +76,8 @@ def exponential_backoff(
 
                 # Log retry attempt
                 logger.debug(
-                    f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {delay:.1f} seconds..."
+                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {e}. "
+                    f"Retrying in {delay:.1f} seconds..."
                 )
 
                 if verbose:
@@ -87,7 +89,10 @@ def exponential_backoff(
                 time.sleep(delay)
 
         # All retries exhausted
-        raise RetryError(f"Failed after {max_retries + 1} attempts: {func.__name__}", last_error=last_exception)
+        raise RetryError(
+            f"Failed after {max_retries + 1} attempts: {getattr(func, '__name__', 'unknown')}",
+            last_error=last_exception,
+        )
 
     return wrapper
 
@@ -98,7 +103,7 @@ def retry_with_backoff(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
-    retry_on: Optional[tuple[type[Exception], ...]] = None,
+    retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
@@ -179,7 +184,7 @@ def retry_cloud_operation(
     try:
         import fsspec
 
-        retry_exceptions = (*retry_exceptions, fsspec.exceptions.FSTimeoutError)
+        retry_exceptions = (*retry_exceptions, fsspec.exceptions.FSTimeoutError)  # type: ignore[attr-defined]
     except (ImportError, AttributeError):
         pass
 

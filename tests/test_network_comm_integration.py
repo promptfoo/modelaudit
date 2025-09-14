@@ -150,7 +150,7 @@ class NetworkExfiltrator:
         ]
 
         # Should have checks with different severities
-        severities = [c.severity.value for c in network_checks]
+        severities = [c.severity.value for c in network_checks if c.severity is not None]
         assert "critical" in severities  # malware/backdoor
 
     def test_combined_detections(self, tmp_path):

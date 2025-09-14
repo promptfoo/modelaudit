@@ -7,9 +7,20 @@ from typing import Any, ClassVar
 try:
     import msgpack
 
+    # Try to import exceptions module - not available in all msgpack versions
+    try:
+        from msgpack import exceptions as msgpack_exceptions
+
+        HAS_MSGPACK_EXCEPTIONS = True
+    except (ImportError, AttributeError):
+        msgpack_exceptions = None  # type: ignore[assignment]
+        HAS_MSGPACK_EXCEPTIONS = False
+
     HAS_MSGPACK = True
 except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK = False
+    HAS_MSGPACK_EXCEPTIONS = False
+    msgpack_exceptions = None  # type: ignore[assignment]
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -263,10 +274,10 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 for key, value in data.items():
                     count += count_parameters(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     count += count_parameters(value, f"{path}[{i}]")
-            elif isinstance(data, (bytes, bytearray)):
+            elif isinstance(data, bytes | bytearray):
                 # Estimate parameter count from byte arrays (assuming float32)
                 if len(data) >= 16 and len(data) % 4 == 0:
                     count += len(data) // 4
@@ -323,7 +334,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     check_jax_transforms(value, f"{path}[{i}]")
 
@@ -345,7 +356,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     )
 
                 # Check for unusual shape specifications that might indicate attacks
-                if "shape" in data and isinstance(data["shape"], (list, tuple)):
+                if "shape" in data and isinstance(data["shape"], list | tuple):
                     shape = data["shape"]
                     if any(dim < 0 for dim in shape if isinstance(dim, int)):
                         result.add_check(
@@ -429,7 +440,7 @@ class FlaxMsgpackScanner(BaseScanner):
             )
             return
 
-        if isinstance(value, (bytes, bytearray)):
+        if isinstance(value, bytes | bytearray):
             size = len(value)
             if size > self.max_blob_bytes:
                 result.add_check(
@@ -493,7 +504,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 self._analyze_content(v, f"{location}/{key_str}", result, depth + 1)
 
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             if len(value) > self.max_items_per_container:
                 result.add_check(
                     name="Array Size Check",
@@ -510,7 +521,7 @@ class FlaxMsgpackScanner(BaseScanner):
             for i, v in enumerate(value):
                 self._analyze_content(v, f"{location}[{i}]", result, depth + 1)
 
-        elif isinstance(value, (int, float)):
+        elif isinstance(value, int | float):
             # Check for suspicious numerical values that might indicate attacks
             if isinstance(value, int) and abs(value) > 2**63:
                 result.add_check(
@@ -545,12 +556,10 @@ class FlaxMsgpackScanner(BaseScanner):
             if isinstance(data, dict):
                 for key, value in data.items():
                     tensors.extend(collect_tensors(value, f"{path}/{key}" if path else key))
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     tensors.extend(collect_tensors(value, f"{path}[{i}]"))
-            elif (
-                isinstance(data, (bytes, bytearray)) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0)
-            ):
+            elif isinstance(data, bytes | bytearray) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0):
                 # Check if binary data could be a serialized tensor
                 tensors.append(
                     {
@@ -828,34 +837,54 @@ class FlaxMsgpackScanner(BaseScanner):
             try:
                 obj = msgpack.unpackb(file_data, raw=False, strict_map_key=False)
                 # If we get here, the entire file was valid msgpack - no trailing data
-            except msgpack.exceptions.ExtraData:
-                # This means there's extra data after valid msgpack
-                result.add_check(
-                    name="Msgpack Stream Integrity Check",
-                    passed=False,
-                    message="Extra trailing data found after msgpack content",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"has_trailing_data": True},
-                )
-                # Unpack just the first object
-                unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
-                unpacker.feed(file_data)
-                obj = unpacker.unpack()
-            except (
-                msgpack.exceptions.UnpackException,
-                msgpack.exceptions.OutOfData,
-            ) as e:
-                result.add_check(
-                    name="Msgpack Format Validation",
-                    passed=False,
-                    message=f"Invalid msgpack format: {e!s}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"msgpack_error": str(e)},
-                )
-                result.finish(success=False)
-                return result
+            except Exception as e:
+                # Check if this is the specific ExtraData exception we're looking for
+                extra_data_detected = False
+                if (
+                    HAS_MSGPACK_EXCEPTIONS
+                    and msgpack_exceptions
+                    and hasattr(msgpack_exceptions, "ExtraData")
+                    and isinstance(e, msgpack_exceptions.ExtraData)
+                ):
+                    extra_data_detected = True
+
+                if extra_data_detected:
+                    # This means there's extra data after valid msgpack
+                    result.add_check(
+                        name="Msgpack Stream Integrity Check",
+                        passed=False,
+                        message="Extra trailing data found after msgpack content",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={"has_trailing_data": True},
+                    )
+                    # Unpack just the first object
+                    unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
+                    unpacker.feed(file_data)
+                    try:
+                        obj = unpacker.unpack()
+                    except Exception as unpack_e:
+                        result.add_check(
+                            name="Msgpack Parse Check",
+                            passed=False,
+                            message=f"Failed to parse msgpack data: {unpack_e}",
+                            severity=IssueSeverity.WARNING,
+                            location=path,
+                            details={"parse_error": str(unpack_e)},
+                        )
+                        return result
+                else:
+                    # Handle other msgpack exceptions
+                    result.add_check(
+                        name="Msgpack Format Validation",
+                        passed=False,
+                        message=f"Invalid msgpack format: {e!s}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"msgpack_error": str(e)},
+                    )
+                    result.finish(success=False)
+                    return result
 
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__

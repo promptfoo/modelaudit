@@ -220,7 +220,7 @@ class TestFalsePositiveFixes:
         for layer_name, weight_shape in llm_test_cases:
             # Create weights with natural variation (not anomalous)
             np.random.seed(42)
-            weights = np.random.randn(*weight_shape).astype(np.float32) * 0.02
+            weights = np.random.randn(*weight_shape).astype(np.float32) * 0.02  # type: ignore[attr-defined]
 
             # Add some natural scaling variation
             if weight_shape[1] > 1000:  # Large output dimension
@@ -387,8 +387,8 @@ class TestFalsePositiveFixes:
                 "malicious_code": 'eval(\'__import__("os").system("malicious")\')',
             },
         }
-        with open(evil_manifest_path, "w") as f:
-            json.dump(malicious_manifest, f)
+        with open(evil_manifest_path, "w") as manifest_file:
+            json.dump(malicious_manifest, manifest_file)
 
         # Test directly with the scanner instead of CLI
         from modelaudit.scanners.manifest_scanner import ManifestScanner
@@ -503,10 +503,11 @@ class TestFalsePositiveFixes:
             sys.stdout = StringIO()
             sys.stderr = StringIO()
 
+            exit_code = 0
             try:
-                exit_code = cli_main()
+                cli_main()
             except SystemExit as e:
-                exit_code = e.code
+                exit_code = int(e.code or 0)
 
             stdout_content = sys.stdout.getvalue()
             stderr_content = sys.stderr.getvalue()

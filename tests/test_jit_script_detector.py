@@ -26,7 +26,7 @@ class TestJITScriptDetector:
         assert all(
             getattr(f, "severity", getattr(f, "severity", "")) == "CRITICAL"
             for f in findings
-            if hasattr(f, "pattern") or "operation" in f
+            if hasattr(f, "pattern") or hasattr(f, "operation")
         )
 
     def test_detect_torch_jit_compilation(self):
@@ -68,8 +68,8 @@ class TestJITScriptDetector:
 
         findings = detector.scan_tensorflow(data, "model.pb")
         assert len(findings) >= 2
-        assert any("tf.py_func" in f.operation for f in findings)
-        assert any("tf.numpy_function" in f.operation for f in findings)
+        assert any(f.operation is not None and "tf.py_func" in f.operation for f in findings)
+        assert any(f.operation is not None and "tf.numpy_function" in f.operation for f in findings)
 
     def test_detect_keras_lambda_layers(self):
         """Test detection of Keras Lambda layers."""

@@ -1,5 +1,3 @@
-from typing import Optional
-
 BLACKLIST_PATTERNS = [
     # Examples of patterns you might want to blacklist
     "malicious",
@@ -10,7 +8,7 @@ BLACKLIST_PATTERNS = [
 
 def check_model_name_policies(
     model_name: str,
-    additional_patterns: Optional[list[str]] = None,
+    additional_patterns: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Return (blocked:boolean, reason:str) if model_name matches any pattern in

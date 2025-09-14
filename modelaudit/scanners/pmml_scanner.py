@@ -1,6 +1,6 @@
 import os
 import re
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -10,7 +10,10 @@ try:
     HAS_DEFUSEDXML = True
 except ImportError:  # pragma: no cover - defusedxml may not be installed
     HAS_DEFUSEDXML = False
-    DefusedET = None
+    if TYPE_CHECKING:
+        from defusedxml import ElementTree as DefusedET  # type: ignore[no-redef]
+    else:
+        DefusedET = None  # type: ignore[assignment]
 
 # Only import unsafe XML as fallback
 if not HAS_DEFUSEDXML:
@@ -184,7 +187,7 @@ class PmmlScanner(BaseScanner):
                     "allowing attackers to read local files, perform SSRF attacks, or cause denial of service.",
                 )
 
-    def _validate_pmml_structure(self, root, result: ScanResult, path: str) -> None:
+    def _validate_pmml_structure(self, root: Any, result: ScanResult, path: str) -> None:
         """Validate basic PMML structure and extract metadata."""
         if root.tag.lower() != "pmml":
             result.add_check(
@@ -208,7 +211,7 @@ class PmmlScanner(BaseScanner):
                     why="PMML files should specify a version for compatibility.",
                 )
 
-    def _check_suspicious_content(self, root, result: ScanResult, path: str) -> None:
+    def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
         for elem in root.iter():
             # Combine element text content with attributes for comprehensive scanning
@@ -270,7 +273,7 @@ class PmmlScanner(BaseScanner):
                         )
                         break
 
-    def _get_all_text_content(self, element) -> str:
+    def _get_all_text_content(self, element: Any) -> str:
         """Recursively get all text content from an element and its children."""
         text_parts = []
 

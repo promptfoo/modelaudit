@@ -1,4 +1,9 @@
-"""Utilities for converting between ScanResult objects and dictionaries."""
+"""Utilities for converting between ScanResult objects and dictionaries.
+
+This module provides functions to convert ScanResult objects to/from dictionary
+representations for caching and serialization purposes. It helps break circular
+import dependencies between core.py and scanners/base.py.
+"""
 
 import logging
 import time
@@ -13,10 +18,12 @@ logger = logging.getLogger(__name__)
 def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     """
     Convert a dictionary representation back to a ScanResult object.
+
     This is used when retrieving cached scan results that were stored as dictionaries.
 
     Args:
         result_dict: Dictionary representation of a ScanResult
+
     Returns:
         Reconstructed ScanResult object
     """
@@ -26,10 +33,6 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     scanner_name = result_dict.get("scanner", "cached")
     result = ScanResult(scanner_name=scanner_name)
 
-    # Restore basic properties
-    result.success = result_dict.get("success", True)
-    result.bytes_scanned = result_dict.get("bytes_scanned", 0)
-    result.start_time = result_dict.get("start_time", time.time())
     # For end_time: preserve None only if it was explicitly stored as None
     # If missing entirely (common with current to_dict), set to start_time + duration
     if "end_time" in result_dict:
@@ -39,6 +42,10 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     else:
         result.end_time = time.time()
     result.metadata.update(result_dict.get("metadata", {}))
+
+    # Restore bytes_scanned from cache
+    result.bytes_scanned = result_dict.get("bytes_scanned", 0)
+    result.success = result_dict.get("success", True)
 
     # Helpers to normalize incoming cached values
     def _normalize_issue_severity(val: Any) -> IssueSeverity:
@@ -122,3 +129,58 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
             logger.debug(f"Could not reconstruct check from cache (name={check_dict.get('name', '')}): {e}")
 
     return result
+
+
+def scan_result_to_dict(scan_result: "ScanResult") -> dict[str, Any]:
+    """
+    Convert a ScanResult object to a dictionary representation.
+
+    This is used when storing scan results in cache.
+
+    Args:
+        scan_result: ScanResult object to convert
+
+    Returns:
+        Dictionary representation of the ScanResult
+    """
+    if hasattr(scan_result, "to_dict"):
+        return scan_result.to_dict()
+
+    # Fallback manual conversion if to_dict() method doesn't exist
+    result_dict: dict[str, Any] = {
+        "scanner": getattr(scan_result, "scanner_name", "unknown"),
+        "success": getattr(scan_result, "success", True),
+        "bytes_scanned": getattr(scan_result, "bytes_scanned", 0),
+        "start_time": getattr(scan_result, "start_time", time.time()),
+        "end_time": getattr(scan_result, "end_time", time.time()),
+        "metadata": getattr(scan_result, "metadata", {}),
+        "issues": [],
+        "checks": [],
+    }
+
+    # Convert issues
+    for issue in getattr(scan_result, "issues", []):
+        issue_dict = {
+            "message": getattr(issue, "message", ""),
+            "severity": getattr(issue, "severity", "warning"),
+            "location": getattr(issue, "location", ""),
+            "details": getattr(issue, "details", {}),
+            "why": getattr(issue, "why", ""),
+        }
+        result_dict["issues"].append(issue_dict)
+
+    # Convert checks
+    for check in getattr(scan_result, "checks", []):
+        check_dict = {
+            "name": getattr(check, "name", ""),
+            "status": getattr(check, "status", "passed"),
+            "message": getattr(check, "message", ""),
+            "severity": getattr(check, "severity", None),
+            "location": getattr(check, "location", ""),
+            "details": getattr(check, "details", {}),
+            "why": getattr(check, "why", ""),
+            "timestamp": getattr(check, "timestamp", time.time()),
+        }
+        result_dict["checks"].append(check_dict)
+
+    return result_dict

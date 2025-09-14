@@ -21,7 +21,9 @@ def test_issue_with_why_field():
         message="Test security issue",
         severity=IssueSeverity.CRITICAL,
         location="test.pkl",
+        timestamp=0.0,
         why="This is dangerous because it can execute arbitrary code.",
+        type=None,
     )
 
     # Test that the why field is stored
@@ -39,6 +41,9 @@ def test_issue_without_why_field():
         message="Test security issue",
         severity=IssueSeverity.WARNING,
         location="test.pkl",
+        timestamp=0.0,
+        why=None,
+        type=None,
     )
 
     # Test that why field is None
@@ -53,22 +58,27 @@ def test_explanations_for_dangerous_imports():
     """Test that we have explanations for dangerous imports."""
     # Test some critical imports
     assert get_import_explanation("os") is not None
-    assert "system commands" in get_import_explanation("os").lower()
+    import_explanation = get_import_explanation("os")
+    assert import_explanation is not None and "system commands" in import_explanation.lower()
 
     assert get_import_explanation("subprocess") is not None
-    assert "arbitrary command execution" in get_import_explanation("subprocess").lower()
+    subprocess_explanation = get_import_explanation("subprocess")
+    assert subprocess_explanation is not None and "arbitrary command execution" in subprocess_explanation.lower()
 
     assert get_import_explanation("eval") is not None
-    assert "arbitrary" in get_import_explanation("eval").lower()
+    eval_explanation = get_import_explanation("eval")
+    assert eval_explanation is not None and "arbitrary" in eval_explanation.lower()
 
 
 def test_explanations_for_opcodes():
     """Test that we have explanations for dangerous opcodes."""
     assert get_opcode_explanation("REDUCE") is not None
-    assert "__reduce__" in get_opcode_explanation("REDUCE")
+    reduce_explanation = get_opcode_explanation("REDUCE")
+    assert reduce_explanation is not None and "__reduce__" in reduce_explanation
 
     assert get_opcode_explanation("INST") is not None
-    assert "execute code" in get_opcode_explanation("INST").lower()
+    inst_explanation = get_opcode_explanation("INST")
+    assert inst_explanation is not None and "execute code" in inst_explanation.lower()
 
 
 def test_pickle_scanner_includes_why():
@@ -106,7 +116,7 @@ def test_pickle_scanner_includes_why():
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system
-        assert any("system" in issue.why.lower() for issue in system_issues)
+        assert any("system" in (issue.why or "").lower() for issue in system_issues)
 
     finally:
         import os

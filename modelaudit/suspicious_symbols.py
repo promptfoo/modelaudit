@@ -581,7 +581,7 @@ JINJA2_SSTI_PATTERNS = {
         r"getattr\s*\(",  # getattr(obj, '__class__')
         # String construction bypasses
         r"format\s*\(",  # String formatting
-        r"{}".format(r"|format\("),  # Template string formatting
+        r"|format\(",  # Template string formatting
         r"f['\"].*\{",  # f-string formatting
         # Base64 and other encoding
         r"base64\.",  # Base64 encoding/decoding

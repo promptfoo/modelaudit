@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from ..utils.secure_hasher import SecureFileHasher
 
@@ -36,7 +36,7 @@ class ScanResultsCache:
     └── xy/zw/xyzw...gh.json
     """
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: str | None = None):
         """
         Initialize the scan results cache.
 
@@ -51,7 +51,7 @@ class ScanResultsCache:
 
         self._ensure_metadata_exists()
 
-    def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
+    def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
         """
         Get cached scan result if available and valid with optimized file system calls.
 
@@ -105,7 +105,45 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
+    def get_cached_result_by_key(self, cache_key: str) -> dict[str, Any] | None:
+        """
+        Get cached scan result by pre-generated cache key (for performance optimization).
+
+        Args:
+            cache_key: Pre-generated cache key
+
+        Returns:
+            Cached scan result dictionary if found, None otherwise
+        """
+        try:
+            cache_file_path = self._get_cache_file_path(cache_key)
+
+            if not cache_file_path.exists():
+                self._record_cache_miss("not_found")
+                return None
+
+            # Load cache entry
+            with open(cache_file_path, encoding="utf-8") as f:
+                cache_entry = json.load(f)
+
+            # Update access statistics
+            cache_entry["cache_metadata"]["access_count"] += 1
+            cache_entry["cache_metadata"]["last_access"] = time.time()
+
+            # Write back updated entry (async write would be better but adds complexity)
+            with open(cache_file_path, "w", encoding="utf-8") as f:
+                json.dump(cache_entry, f, indent=2)
+
+            self._record_cache_hit()
+            logger.debug(f"Cache hit for key {cache_key[:8]}...")
+            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+
+        except Exception as e:
+            logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
+            self._record_cache_miss("error")
+            return None
+
+    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
         """
         Store scan result in cache with optimized file system calls.
 
@@ -157,7 +195,7 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
 
-    def _generate_cache_key(self, file_path: str, file_stat: Optional[os.stat_result] = None) -> Optional[str]:
+    def _generate_cache_key(self, file_path: str, file_stat: os.stat_result | None = None) -> str | None:
         """
         Generate cache key from file hash and version info.
 
@@ -466,7 +504,7 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to record cache hit: {e}")
 
-    def _record_cache_miss(self, reason: str = "unknown"):
+    def _record_cache_miss(self, reason: str = "unknown") -> None:
         """Record a cache miss in statistics."""
         try:
             metadata = self._load_cache_metadata()

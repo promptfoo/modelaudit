@@ -1,11 +1,12 @@
 import pickle
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 
 
-def create_executorch_archive(tmp_path, *, malicious: bool = False):
+def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Path:
     zip_path = tmp_path / "model.ptl"
     with zipfile.ZipFile(zip_path, "w") as z:
         z.writestr("version", "1")

@@ -9,7 +9,6 @@ import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,7 @@ class MLContextResult:
     """Result of ML context analysis."""
 
     framework: MLFramework
-    operation: Optional[MLOperation]
+    operation: MLOperation | None
     confidence: float
     risk_adjustment: float  # Multiplier for base risk (0.1 = 90% reduction)
     explanation: str
@@ -199,7 +198,7 @@ class MLContextAnalyzer:
         }
 
     def analyze_context(
-        self, function_call: str, stack_context: list[str], file_context: Optional[str] = None
+        self, function_call: str, stack_context: list[str], file_context: str | None = None
     ) -> MLContextResult:
         """Analyze ML context for a function call.
 
@@ -233,10 +232,10 @@ class MLContextAnalyzer:
         )
 
     def _detect_framework(
-        self, function_call: str, stack_context: list[str], file_context: Optional[str] = None
+        self, function_call: str, stack_context: list[str], file_context: str | None = None
     ) -> MLFramework:
         """Detect ML framework from context."""
-        framework_scores: dict[MLFramework, float] = dict.fromkeys(MLFramework, 0.0)
+        framework_scores: dict[MLFramework, float] = {framework: 0.0 for framework in MLFramework}  # noqa: C420
 
         # Analyze function call
         for framework, patterns in self.framework_patterns.items():
@@ -267,7 +266,7 @@ class MLContextAnalyzer:
 
         return MLFramework.UNKNOWN
 
-    def _identify_operation(self, function_call: str, framework: MLFramework) -> Optional[MLOperation]:
+    def _identify_operation(self, function_call: str, framework: MLFramework) -> MLOperation | None:
         """Identify specific ML operation."""
         # Direct function name match
         for operation in self.ml_operations:
@@ -291,7 +290,7 @@ class MLContextAnalyzer:
         return None
 
     def _calculate_confidence(
-        self, framework: MLFramework, operation: Optional[MLOperation], stack_context: list[str]
+        self, framework: MLFramework, operation: MLOperation | None, stack_context: list[str]
     ) -> float:
         """Calculate confidence in ML context detection."""
         if framework == MLFramework.UNKNOWN:
@@ -335,7 +334,7 @@ class MLContextAnalyzer:
 
         return min(base_confidence + confidence_boost, 1.0)
 
-    def _calculate_risk_adjustment(self, operation: Optional[MLOperation], confidence: float) -> float:
+    def _calculate_risk_adjustment(self, operation: MLOperation | None, confidence: float) -> float:
         """Calculate risk adjustment factor based on ML context."""
         if not operation or confidence < 0.3:
             return 1.0  # No adjustment for low confidence
@@ -354,9 +353,7 @@ class MLContextAnalyzer:
 
         return max(risk_adjustment, 0.05)  # Minimum 5% of original risk
 
-    def _generate_explanation(
-        self, framework: MLFramework, operation: Optional[MLOperation], function_call: str
-    ) -> str:
+    def _generate_explanation(self, framework: MLFramework, operation: MLOperation | None, function_call: str) -> str:
         """Generate human-readable explanation."""
         if framework == MLFramework.UNKNOWN:
             return f"Function '{function_call}' does not appear to be an ML framework operation"

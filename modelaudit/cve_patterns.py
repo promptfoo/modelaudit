@@ -366,7 +366,7 @@ def get_cve_info(cve_id: str) -> dict[str, Any] | None:
 # Utility functions for scanner integration
 
 
-def enhance_scan_result_with_cve(scan_result, detected_patterns: list[str], binary_content: bytes = b"") -> None:
+def enhance_scan_result_with_cve(scan_result: Any, detected_patterns: list[str], binary_content: bytes = b"") -> None:
     """
     Enhance a scan result with CVE attribution information.
 
@@ -409,7 +409,7 @@ def _get_cve_cvss(cve_id: str) -> float:
     """Get CVE CVSS score."""
     info = CVE_COMBINED_PATTERNS.get(cve_id, {})
     cvss_value = info.get("cvss", 0.0)
-    if isinstance(cvss_value, (int, float)):
+    if isinstance(cvss_value, int | float):
         return float(cvss_value)
     return 0.0
 

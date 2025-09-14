@@ -3,35 +3,88 @@ import pickle
 import tempfile
 import zipfile
 
-import numpy as np
 import pytest
 
-from modelaudit.scanners import weight_distribution_scanner
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 
+
 # Skip tests if required libraries are not available
-try:
-    import torch
+def has_numpy():
+    try:
+        import numpy as np  # noqa: F401
 
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-
-try:
-    import h5py
-
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
-
-try:
-    import tensorflow as tf
-
-    HAS_TENSORFLOW = True
-except Exception:
-    HAS_TENSORFLOW = False
+        return True
+    except ImportError:
+        return False
 
 
+def has_torch():
+    try:
+        import torch  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def has_h5py():
+    try:
+        import h5py  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def has_tensorflow():
+    try:
+        import tensorflow as tf  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+# Use dynamic checks instead of module-level imports
+# Defer expensive checks to avoid module-level heavy imports
+HAS_NUMPY = has_numpy()  # numpy is lightweight
+
+
+# Defer heavy imports until actually needed in tests
+def _has_torch_cached():
+    global _TORCH_CHECKED, _HAS_TORCH
+    if not _TORCH_CHECKED:
+        _HAS_TORCH = has_torch()
+        _TORCH_CHECKED = True
+    return _HAS_TORCH
+
+
+def _has_h5py_cached():
+    global _H5PY_CHECKED, _HAS_H5PY
+    if not _H5PY_CHECKED:
+        _HAS_H5PY = has_h5py()
+        _H5PY_CHECKED = True
+    return _HAS_H5PY
+
+
+def _has_tensorflow_cached():
+    global _TENSORFLOW_CHECKED, _HAS_TENSORFLOW
+    if not _TENSORFLOW_CHECKED:
+        _HAS_TENSORFLOW = has_tensorflow()
+        _TENSORFLOW_CHECKED = True
+    return _HAS_TENSORFLOW
+
+
+# Global caching variables
+_TORCH_CHECKED = False
+_HAS_TORCH = False
+_H5PY_CHECKED = False
+_HAS_H5PY = False
+_TENSORFLOW_CHECKED = False
+_HAS_TENSORFLOW = False
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")
 class TestWeightDistributionScanner:
     """Test suite for weight distribution anomaly detection"""
 
@@ -83,14 +136,14 @@ class TestWeightDistributionScanner:
 
         try:
             # Should handle PyTorch files if torch is available
-            if HAS_TORCH:
+            if _has_torch_cached():
                 assert WeightDistributionScanner.can_handle(pt_path)
 
             # Should handle Keras files if h5py is available
-            if HAS_H5PY:
+            if _has_h5py_cached():
                 assert WeightDistributionScanner.can_handle(h5_path)
 
-            if HAS_TENSORFLOW:
+            if _has_tensorflow_cached():
                 assert WeightDistributionScanner.can_handle(tf_dir)
 
             # Should not handle unsupported extensions
@@ -105,6 +158,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_outlier_detection(self):
         """Test detection of outlier weight vectors"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create normal weights with one outlier
@@ -135,6 +190,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_dissimilar_vectors(self):
         """Test detection of dissimilar weight vectors"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create similar weight vectors
@@ -161,6 +218,8 @@ class TestWeightDistributionScanner:
 
     def test_analyze_layer_weights_extreme_values(self):
         """Test detection of extreme weight values"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create normal weights
@@ -181,9 +240,14 @@ class TestWeightDistributionScanner:
         assert extreme_anomaly is not None
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_model_scan(self):
         """Test scanning a PyTorch model with anomalous weights"""
+        if not has_torch():
+            pytest.skip("PyTorch not installed")
+
+        import torch
+
         scanner = WeightDistributionScanner()
 
         # Create a simple model with anomalous weights
@@ -224,9 +288,15 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_H5PY, reason="h5py not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_keras_model_scan(self):
         """Test scanning a Keras model"""
+        if not has_h5py():
+            pytest.skip("h5py not installed")
+
+        import h5py
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create a simple H5 file with weights
@@ -250,18 +320,23 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_tensorflow_savedmodel_scan(self, tmp_path):
         """Test scanning a TensorFlow SavedModel directory."""
         import sys
+
+        if not has_tensorflow():
+            pytest.skip("TensorFlow not installed")
 
         # Skip on Python 3.12+ due to TensorFlow/typing compatibility issues
         if sys.version_info >= (3, 12):
             pytest.skip("TensorFlow SavedModel has compatibility issues with Python 3.12+")
 
+        import tensorflow as tf
+
         scanner = WeightDistributionScanner()
 
-        model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])
+        model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])  # type: ignore[call-arg]
         saved_path = tmp_path / "tf_model"
         tf.saved_model.save(model, str(saved_path))
 
@@ -286,7 +361,7 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
@@ -298,16 +373,24 @@ class TestWeightDistributionScanner:
         def fail_load(*_args, **_kwargs):
             raise RuntimeError("fail")
 
-        monkeypatch.setattr(weight_distribution_scanner.torch, "load", fail_load)
+        # Mock torch.load directly since torch is now a lazy import
+        import torch
+
+        monkeypatch.setattr(torch, "load", fail_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
         assert not scanner.extraction_unsafe
         assert "layer.weight" in weights
         assert weights["layer.weight"].shape == (2, 2)
 
-    @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+    @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
         """Unsafe pickle opcodes should be flagged"""
+        if not has_torch():
+            pytest.skip("PyTorch not installed")
+
+        import torch
+
         model = torch.nn.Linear(2, 2)
         zip_path = tmp_path / "model.pt"
         torch.save(model.state_dict(), zip_path)
@@ -315,7 +398,10 @@ class TestWeightDistributionScanner:
         def fail_load(*_args, **_kwargs):
             raise RuntimeError("fail")
 
-        monkeypatch.setattr(weight_distribution_scanner.torch, "load", fail_load)
+        # Mock torch.load directly since torch is now a lazy import
+        import torch
+
+        monkeypatch.setattr(torch, "load", fail_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
         assert weights == {}
@@ -323,6 +409,8 @@ class TestWeightDistributionScanner:
 
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create weights with multiple issues
@@ -350,6 +438,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_vocabulary_layer_handling(self):
         """Test that LLM vocabulary layers don't produce false positives"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create a large vocabulary layer like in LLMs (e.g., 32k vocab)
@@ -377,6 +467,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_checks_disabled_by_default(self):
         """Test that LLM checks are disabled by default"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create LLM-like weights
@@ -390,6 +482,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_checks_can_be_enabled(self):
         """Test that LLM checks can be explicitly enabled via config"""
+        import numpy as np
+
         config = {"enable_llm_checks": True}
         scanner = WeightDistributionScanner(config)
 
@@ -414,6 +508,8 @@ class TestWeightDistributionScanner:
 
     def test_gpt2_layer_pattern_detection(self):
         """Test that GPT-2 style layer patterns are detected as LLM layers"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test GPT-2 style layer names
@@ -440,6 +536,8 @@ class TestWeightDistributionScanner:
 
     def test_transformer_layer_pattern_detection(self):
         """Test that transformer-related layers use structural analysis instead of name-based detection."""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test transformer-related layer names
@@ -479,6 +577,8 @@ class TestWeightDistributionScanner:
 
     def test_large_hidden_dimension_detection(self):
         """Test that layers with large hidden dimensions are detected as LLM layers"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Test various large hidden dimensions typical of LLMs
@@ -496,6 +596,8 @@ class TestWeightDistributionScanner:
 
     def test_non_llm_layers_still_analyzed(self):
         """Test that non-LLM layers are still properly analyzed for anomalies"""
+        import numpy as np
+
         scanner = WeightDistributionScanner()
 
         # Create small classification layer (typical for image classification)
@@ -518,6 +620,8 @@ class TestWeightDistributionScanner:
 
     def test_llm_enabled_with_extreme_outliers(self):
         """Test LLM analysis with extremely suspicious outliers when enabled"""
+        import numpy as np
+
         config = {"enable_llm_checks": True}
         scanner = WeightDistributionScanner(config)
 

@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Import NumPy with compatibility handling
-np: Any
-fmt: Any
 try:
     import numpy as np
 
@@ -20,7 +18,10 @@ try:
     except (ImportError, AttributeError):
         # Fallback for potential import issues
         NUMPY_FORMAT_AVAILABLE = False
-        fmt = None
+        if TYPE_CHECKING:
+            import numpy.lib.format as fmt  # type: ignore[no-redef]
+        else:
+            fmt = None  # type: ignore[assignment]
 
     NUMPY_AVAILABLE = True
     NUMPY_VERSION = getattr(np, "__version__", "unknown")
@@ -30,8 +31,12 @@ except ImportError:
     NUMPY_FORMAT_AVAILABLE = False
     NUMPY_VERSION = "not available"
     NUMPY_MAJOR_VERSION = 0
-    np = None
-    fmt = None
+    if TYPE_CHECKING:
+        import numpy as np  # type: ignore[no-redef]
+        import numpy.lib.format as fmt  # type: ignore[no-redef]
+    else:
+        np = None  # type: ignore[assignment]
+        fmt = None  # type: ignore[assignment]
 
 
 class NumPyScanner(BaseScanner):
@@ -76,7 +81,7 @@ class NumPyScanner(BaseScanner):
                     f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
-    def _validate_dtype(self, dtype) -> None:
+    def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
         dangerous_names = ["object"]
@@ -93,7 +98,7 @@ class NumPyScanner(BaseScanner):
                 f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
-    def _calculate_safe_array_size(self, shape: tuple, dtype) -> int:
+    def _calculate_safe_array_size(self, shape: tuple, dtype: Any) -> int:
         """Calculate array size with overflow protection"""
         total_elements = 1
         max_elements = sys.maxsize // max(dtype.itemsize, 1)

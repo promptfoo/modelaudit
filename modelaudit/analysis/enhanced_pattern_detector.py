@@ -8,7 +8,7 @@ import base64
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any
 
 from .ml_context_analyzer import MLContextAnalyzer
 
@@ -25,7 +25,7 @@ class PatternMatch:
     severity: str
     confidence: float
     context: dict[str, Any]
-    deobfuscated_text: Optional[str] = None
+    deobfuscated_text: str | None = None
     ml_context_adjustment: float = 1.0
 
 
@@ -180,7 +180,7 @@ class EnhancedPatternDetector:
             ],
         }
 
-    def detect_patterns(self, data: Union[bytes, str], context: Optional[dict[str, Any]] = None) -> list[PatternMatch]:
+    def detect_patterns(self, data: bytes | str, context: dict[str, Any] | None = None) -> list[PatternMatch]:
         """Detect dangerous patterns in data with context awareness.
 
         Args:
@@ -252,7 +252,7 @@ class EnhancedPatternDetector:
         pattern_name: str,
         pattern_info: dict[str, Any],
         content_type: str,
-        context: Optional[dict[str, Any]],
+        context: dict[str, Any] | None,
     ) -> list[PatternMatch]:
         """Find pattern matches in content."""
         matches = []
@@ -323,7 +323,7 @@ class EnhancedPatternDetector:
         return content[start:end]
 
     def _apply_ml_context_analysis(
-        self, matches: list[PatternMatch], context: Optional[dict[str, Any]]
+        self, matches: list[PatternMatch], context: dict[str, Any] | None
     ) -> list[PatternMatch]:
         """Apply ML context analysis to reduce false positives."""
         if not matches:

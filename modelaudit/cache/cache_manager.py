@@ -4,9 +4,10 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .scan_results_cache import ScanResultsCache
+from .smart_cache_keys import SmartCacheKeyGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ class CacheManager:
     Provides a high-level interface for cache-aware scanning operations.
     """
 
-    def __init__(self, cache_dir: Optional[str] = None, enabled: bool = True):
+    def __init__(self, cache_dir: str | None = None, enabled: bool = True):
         """
         Initialize cache manager.
 
@@ -28,8 +29,9 @@ class CacheManager:
         """
         self.enabled = enabled
         self.cache = ScanResultsCache(cache_dir) if enabled else None
+        self.key_generator = SmartCacheKeyGenerator() if enabled else None
 
-    def get_cached_result(self, file_path: str) -> Optional[dict[str, Any]]:
+    def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
         """
         Get cached scan result if available.
 
@@ -44,7 +46,25 @@ class CacheManager:
 
         return self.cache.get_cached_result(file_path)
 
-    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: Optional[int] = None) -> None:
+    def get_cached_result_with_stat(self, file_path: str, stat_result: os.stat_result) -> dict[str, Any] | None:
+        """
+        Get cached scan result using existing stat result for optimized performance.
+
+        Args:
+            file_path: Path to file to check cache for
+            stat_result: Existing stat result to reuse
+
+        Returns:
+            Cached scan result or None if not found/disabled
+        """
+        if not self.enabled or not self.cache or not self.key_generator:
+            return None
+
+        # Use optimized key generation with stat reuse
+        cache_key = self.key_generator.generate_key_with_stat_reuse(file_path, stat_result)
+        return self.cache.get_cached_result_by_key(cache_key)
+
+    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
         """
         Store scan result in cache.
 
@@ -58,7 +78,7 @@ class CacheManager:
 
         self.cache.store_result(file_path, scan_result, scan_duration_ms)
 
-    def cached_scan(self, file_path: str, scanner_func, *args, **kwargs) -> dict[str, Any]:
+    def cached_scan(self, file_path: str, scanner_func: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """
         Perform a cache-aware scan operation.
 
@@ -137,7 +157,7 @@ class CacheManager:
         self.enabled = False
         logger.debug("Cache disabled")
 
-    def enable(self, cache_dir: Optional[str] = None) -> None:
+    def enable(self, cache_dir: str | None = None) -> None:
         """Enable caching."""
         self.enabled = True
         if not self.cache:
@@ -146,10 +166,10 @@ class CacheManager:
 
 
 # Global cache manager instance
-_global_cache_manager: Optional[CacheManager] = None
+_global_cache_manager: CacheManager | None = None
 
 
-def get_cache_manager(cache_dir: Optional[str] = None, enabled: bool = True) -> CacheManager:
+def get_cache_manager(cache_dir: str | None = None, enabled: bool = True) -> CacheManager:
     """
     Get global cache manager instance.
 

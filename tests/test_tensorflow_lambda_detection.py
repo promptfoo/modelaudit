@@ -44,7 +44,7 @@ class TestTensorFlowLambdaDetection:
         }
 
         # Create minimal protobuf-like content with the Lambda definition
-        encoded_func = lambda_config["config"]["function"]["items"][0]
+        encoded_func = lambda_config["config"]["function"]["items"][0]  # type: ignore[index]
         content = f'"class_name": "Lambda", "function": {{"items": ["{encoded_func}"]}}'.encode()
 
         with tempfile.NamedTemporaryFile(suffix="keras_metadata.pb", delete=False) as f:

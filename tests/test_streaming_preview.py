@@ -1,10 +1,11 @@
 import fsspec
+import pytest
 from fsspec.implementations.local import LocalFileSystem
 
 from modelaudit.utils import streaming
 
 
-def _setup_local(monkeypatch) -> None:
+def _setup_local(monkeypatch: pytest.MonkeyPatch) -> None:
     """Configure streaming helpers to use local file system."""
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())

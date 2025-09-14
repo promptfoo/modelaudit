@@ -4,9 +4,10 @@ import logging
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, Union
+from typing import IO, Any
 from unittest.mock import patch
 
 from modelaudit.interrupt_handler import check_interrupted
@@ -24,6 +25,7 @@ from modelaudit.utils.advanced_file_handler import (
     should_use_advanced_handler,
 )
 from modelaudit.utils.assets import asset_from_scan_result
+from modelaudit.utils.cache_decorator import cached_scan
 from modelaudit.utils.filetype import (
     detect_file_format,
     detect_file_format_from_magic,
@@ -35,6 +37,10 @@ from modelaudit.utils.large_file_handler import (
     should_use_large_file_handler,
 )
 from modelaudit.utils.streaming import stream_analyze_file
+from modelaudit.utils.types import (
+    FilePath,
+    ProgressCallback,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -112,9 +118,9 @@ def _add_issue_to_model(
     results: ModelAuditResultModel,
     message: str,
     severity: str = "warning",
-    location: Optional[str] = None,
-    details: Optional[dict] = None,
-    issue_type: Optional[str] = None,
+    location: str | None = None,
+    details: dict | None = None,
+    issue_type: str | None = None,
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
@@ -298,7 +304,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
     """Extract severity and explanation from failed checks.
 
     Args:
@@ -333,7 +339,7 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
     Returns:
         Most recent timestamp, or current time if none found
     """
-    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
+    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), int | float)]
     return max(timestamps) if timestamps else time.time()
 
 
@@ -459,15 +465,15 @@ def create_scan_config(**kwargs: Any) -> ScanConfigModel:
 
 
 def scan_model_directory_or_file(
-    path: str,
-    blacklist_patterns: Optional[list[str]] = None,
+    path: FilePath,
+    blacklist_patterns: list[str] | None = None,
     timeout: int = 3600,  # 1 hour for large models (up to 8GB+)
     max_file_size: int = 0,  # 0 means unlimited - support any size
     max_total_size: int = 0,  # 0 means unlimited
     strict_license: bool = False,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: ProgressCallback | None = None,
     skip_file_types: bool = True,
-    **kwargs,
+    **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
     Scan a model file or directory for malicious content.
@@ -874,7 +880,9 @@ def scan_model_directory_or_file(
 
                 if progress_callback is not None and file_size > 0:
 
-                    def create_progress_open(callback: Callable[[str, float], None], current_file_size: int):
+                    def create_progress_open(
+                        callback: Callable[[str, float], None], current_file_size: int
+                    ) -> Callable[..., IO[Any]]:
                         """Create a progress-aware file opener with properly bound variables."""
 
                         def progress_open(file_path: str, mode: str = "r", *args: Any, **kwargs: Any) -> IO[Any]:
@@ -889,7 +897,7 @@ def scan_model_directory_or_file(
                             def progress_read(size: int = -1) -> Any:
                                 nonlocal file_pos
                                 data = original_read(size)
-                                if isinstance(data, (str, bytes)):
+                                if isinstance(data, str | bytes):
                                     file_pos += len(data)
                                 callback(
                                     f"Reading file: {os.path.basename(file_path)}",
@@ -1112,7 +1120,8 @@ def _is_huggingface_cache_file(path: str) -> bool:
     return bool("/refs/" in path and filename in ["main", "HEAD"])
 
 
-def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+@cached_scan()
+def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -1127,40 +1136,11 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         config = {}
     validate_scan_config(config)
 
-    # Check cache configuration
-    cache_enabled = config.get("cache_enabled", True)
-    cache_dir = config.get("cache_dir")
-
-    # If caching is disabled, proceed with direct scan
-    if not cache_enabled:
-        return _scan_file_internal(path, config)
-
-    # Use cache manager for cache-enabled scans
-    try:
-        from .cache import get_cache_manager
-
-        cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-        # Create a wrapper function for the cache manager
-        def cached_scan_wrapper(file_path: str) -> dict:
-            result = _scan_file_internal(file_path, config)
-            return result.to_dict()
-
-        # Get cached result or perform scan
-        result_dict = cache_manager.cached_scan(path, cached_scan_wrapper)
-
-        # Convert back to ScanResult
-        from .utils.result_conversion import scan_result_from_dict
-
-        return scan_result_from_dict(result_dict)
-
-    except Exception as e:
-        # If cache system fails, fall back to direct scanning
-        logger.warning(f"Cache system error for {path}: {e}. Falling back to direct scan.")
-        return _scan_file_internal(path, config)
+    # Delegate to internal implementation - cache decorator handles caching
+    return _scan_file_internal(path, config)
 
 
-def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Internal implementation of file scanning (cache-agnostic).
 
@@ -1254,7 +1234,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
             logger.debug(discrepancy_msg)
 
     # Prefer scanner based on header format using lazy loading
-    preferred_scanner: Optional[type[BaseScanner]] = None
+    preferred_scanner: type[BaseScanner] | None = None
 
     # Special handling for PyTorch files that are ZIP-based
     if header_format == "zip" and ext in [".pt", ".pth"]:
@@ -1281,7 +1261,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
-    result: Optional[ScanResult]
+    result: ScanResult | None
 
     # We already checked use_extreme_handler above for size limit bypass
     # Now check if we should use regular large handler
@@ -1375,7 +1355,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
 
 def merge_scan_result(
     results: ModelAuditResultModel,
-    scan_result: Union[ScanResult, dict[str, Any]],
+    scan_result: ScanResult | dict[str, Any],
 ) -> None:
     """
     Merge a ScanResult object into the ModelAuditResultModel.
