@@ -203,15 +203,19 @@ class FicklingPickleScanner(BaseScanner):
 
             # Add fickling-specific metadata if analysis was successful
             if analysis_results is not None:
-                metadata_update.update({
-                    "fickling_severity": analysis_results.severity.name,
-                    "fickling_safe": analysis_results.severity.name == "LIKELY_SAFE",
-                })
+                metadata_update.update(
+                    {
+                        "fickling_severity": analysis_results.severity.name,
+                        "fickling_safe": analysis_results.severity.name == "LIKELY_SAFE",
+                    }
+                )
             else:
-                metadata_update.update({
-                    "fickling_severity": "LIKELY_UNSAFE",  # Default to unsafe when parsing fails
-                    "fickling_safe": False,
-                })
+                metadata_update.update(
+                    {
+                        "fickling_severity": "LIKELY_UNSAFE",  # Default to unsafe when parsing fails
+                        "fickling_safe": False,
+                    }
+                )
 
             result.metadata.update(metadata_update)
 
