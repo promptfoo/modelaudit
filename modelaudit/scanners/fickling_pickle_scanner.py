@@ -68,6 +68,7 @@ class FicklingPickleScanner(BaseScanner):
         pickled = None
         fickling_is_safe: bool | None = True
         ml_context = {}
+        analysis_results = None
 
         # Check if file exists and is a regular file
         if not os.path.isfile(file_path):
@@ -127,8 +128,16 @@ class FicklingPickleScanner(BaseScanner):
 
             # Run fickling AST analysis and convert findings with error handling
             try:
-                analysis_results = check_safety(pickled)
-                self._convert_fickling_results(analysis_results, result, ml_context)
+                if pickled is not None:
+                    analysis_results = check_safety(pickled)
+                    self._convert_fickling_results(analysis_results, result, ml_context)
+                else:
+                    # Skip fickling analysis if pickle parsing failed
+                    result.add_issue(
+                        message="Fickling analysis skipped due to parsing failure",
+                        severity=IssueSeverity.INFO,
+                        details={"reason": "File could not be parsed as valid pickle"},
+                    )
             except Exception as e:
                 # Handle fickling analysis errors gracefully
                 result.add_issue(
@@ -158,8 +167,12 @@ class FicklingPickleScanner(BaseScanner):
 
             # Additional fickling info with error handling
             try:
-                unsafe_imports = list(pickled.unsafe_imports())
-                non_standard_imports = list(pickled.non_standard_imports())
+                if pickled is not None:
+                    unsafe_imports = list(pickled.unsafe_imports())
+                    non_standard_imports = list(pickled.non_standard_imports())
+                else:
+                    unsafe_imports = []
+                    non_standard_imports = []
             except Exception as e:
                 # Handle import analysis errors
                 unsafe_imports = []
@@ -180,20 +193,31 @@ class FicklingPickleScanner(BaseScanner):
                 opcode_count = None
 
             # Add basic metadata
-            result.metadata.update(
-                {
+            metadata_update = {
+                "unsafe_imports": len(unsafe_imports),
+                "non_standard_imports": len(non_standard_imports),
+                "scan_time_seconds": time.time() - start_time,
+                "file_size": self._get_file_size(file_path),
+                "opcodes_analyzed": opcode_count,
+            }
+            
+            # Add fickling-specific metadata if analysis was successful
+            if analysis_results is not None:
+                metadata_update.update({
                     "fickling_severity": analysis_results.severity.name,
                     "fickling_safe": analysis_results.severity.name == "LIKELY_SAFE",
-                    "unsafe_imports": len(unsafe_imports),
-                    "non_standard_imports": len(non_standard_imports),
-                    "scan_time_seconds": time.time() - start_time,
-                    "file_size": self._get_file_size(file_path),
-                    "opcodes_analyzed": opcode_count,
-                }
-            )
+                })
+            else:
+                metadata_update.update({
+                    "fickling_severity": "UNKNOWN",
+                    "fickling_safe": False,
+                })
+                
+            result.metadata.update(metadata_update)
 
             # CRITICAL: Add supplementary security analysis for patterns fickling misses
-            self._analyze_dangerous_globals(pickled, result)
+            if pickled is not None:
+                self._analyze_dangerous_globals(pickled, result)
 
             # Optional: flag only when quick-signal conflicts with deep analysis
             if not fickling_is_safe and result.metadata.get("fickling_severity") == "LIKELY_SAFE":
@@ -1258,16 +1282,12 @@ class FicklingPickleScanner(BaseScanner):
             details={"dangerous_opcodes": dangerous_opcodes},
         )
         
-        # Check for embedded secrets in the pickle data
+        # Check for embedded secrets in the raw file data (safer than deserializing)
         try:
-            # Get the Python object from the pickle for secret detection
-            import pickle
             with open(file_path, "rb") as f:
-                unpickled_data = pickle.load(f)
-            self.check_for_embedded_secrets(unpickled_data, result, context=file_path)
+                file_data = f.read()
+            self.check_for_embedded_secrets(file_data, result, context=file_path)
         except Exception as e:
-            # If we can't safely load the pickle, skip secret detection
-            # This is safer than trying to extract data from fickling objects
             logger.debug(f"Skipping secret detection for {file_path}: {e}")
             pass
 
