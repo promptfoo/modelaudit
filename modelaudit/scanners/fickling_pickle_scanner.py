@@ -96,8 +96,8 @@ class FicklingPickleScanner(BaseScanner):
                             "recommendation": "File may be corrupted or use unsupported pickle format",
                         },
                     )
-                    result.finish(success=False)
-                    return result
+                    # Don't return early - continue with content pattern analysis
+                    pickled = None  # Ensure pickled is None so security checks are skipped
                 except Exception as e:
                     # Handle any unexpected errors during fickling load
                     result.add_issue(
@@ -109,8 +109,8 @@ class FicklingPickleScanner(BaseScanner):
                             "fallback": "Skipping fickling analysis due to unexpected error",
                         },
                     )
-                    result.finish(success=True)  # Continue with basic validation
-                    return result
+                    # Don't return early - continue with content pattern analysis
+                    pickled = None  # Ensure pickled is None so security checks are skipped
 
             # Single pre-analysis timeout fence (after load)
             if timeout and (time.time() - start_time) > timeout:
@@ -386,6 +386,8 @@ class FicklingPickleScanner(BaseScanner):
                 (b"importlib.machinery", IssueSeverity.CRITICAL, "importlib"),
                 (b"importlib.util", IssueSeverity.CRITICAL, "importlib"),
                 (b"importlib", IssueSeverity.WARNING, "importlib"),  # Generic catch-all
+                # Runpy module - dynamic execution
+                (b"runpy", IssueSeverity.CRITICAL, "runpy"),
                 # ML-specific patterns (lower severity as they're common in legit models)
                 (b"joblib.load", IssueSeverity.WARNING, "joblib.load"),
                 (b"sklearn", IssueSeverity.WARNING, "sklearn"),
@@ -1255,6 +1257,19 @@ class FicklingPickleScanner(BaseScanner):
             location=file_path,
             details={"dangerous_opcodes": dangerous_opcodes},
         )
+        
+        # Check for embedded secrets in the pickle data
+        try:
+            # Get the Python object from the pickle for secret detection
+            import pickle
+            with open(file_path, "rb") as f:
+                unpickled_data = pickle.load(f)
+            self.check_for_embedded_secrets(unpickled_data, result, context=file_path)
+        except Exception as e:
+            # If we can't safely load the pickle, skip secret detection
+            # This is safer than trying to extract data from fickling objects
+            logger.debug(f"Skipping secret detection for {file_path}: {e}")
+            pass
 
     def _check_for_dangerous_opcodes(self, pickled: Pickled, file_path: str) -> list[str]:
         """Check for dangerous pickle opcodes and return list of found opcodes."""
