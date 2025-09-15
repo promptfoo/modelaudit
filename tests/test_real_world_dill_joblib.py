@@ -150,10 +150,11 @@ class TestRealJoblibFiles:
         assert isinstance(result.success, bool)
         # May not scan bytes if compression format isn't recognized as pickle
         if result.bytes_scanned == 0:
-            # Should have reported format issues
+            # Should have reported format issues (either opcode issues or parse failures)
             assert len(result.issues) > 0
-            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower()]
-            assert len(format_issues) > 0, "Should report format/opcode issues for compressed files"
+            # FicklingPickleScanner reports parse failures instead of opcode issues
+            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower() or "failed to parse" in str(i.message).lower()]
+            assert len(format_issues) > 0, "Should report format/parse issues for compressed files"
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
     def test_joblib_with_numpy_arrays(self, tmp_path):
