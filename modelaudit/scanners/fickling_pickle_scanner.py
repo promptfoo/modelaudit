@@ -63,6 +63,11 @@ class FicklingPickleScanner(BaseScanner):
         start_time = time.time()
         result = ScanResult(scanner_name=self.name)
         result.metadata["file_path"] = file_path
+        
+        # Initialize variables to handle error cases
+        pickled = None
+        fickling_is_safe = True
+        ml_context = {}
 
         # Check if file exists and is a regular file
         if not os.path.isfile(file_path):
@@ -214,10 +219,12 @@ class FicklingPickleScanner(BaseScanner):
                     self._scan_trailing_binary(trailing_bytes, result)
 
             # Check for nested pickles (all file types)
-            self._scan_for_nested_pickles(pickled, result)
+            if pickled is not None:
+                self._scan_for_nested_pickles(pickled, result)
 
             # Check for embedded base64 payloads (V4 attack detection)
-            self._scan_for_embedded_payloads(pickled, result)
+            if pickled is not None:
+                self._scan_for_embedded_payloads(pickled, result)
 
             # Check for multiple pickle streams in the file
             self._scan_for_multiple_streams(file_path, result)
@@ -242,6 +249,16 @@ class FicklingPickleScanner(BaseScanner):
             # Continue to run CVE/pattern analysis for comprehensive security assessment
             fickling_is_safe = False
 
+        except PermissionError as e:
+            # Handle permission errors specifically - can't scan file, mark as failed
+            result.add_issue(
+                message=f"Permission denied: Cannot read file {file_path}",
+                severity=IssueSeverity.CRITICAL,
+                details={"error": str(e)},
+            )
+            result.finish(success=False)
+            return result
+            
         except Exception as e:
             logger.warning(f"Fickling analysis failed for {file_path}: {e}")
             # Fallback to basic safety check
@@ -269,7 +286,8 @@ class FicklingPickleScanner(BaseScanner):
         self._analyze_content_patterns(file_path, result)
 
         # Add basic security checks
-        self._add_security_checks(pickled, result, file_path, fickling_is_safe, ml_context)
+        if pickled is not None:
+            self._add_security_checks(pickled, result, file_path, fickling_is_safe, ml_context)
 
         # Set bytes scanned for size limit enforcement
         result.bytes_scanned = self._get_file_size(file_path)
