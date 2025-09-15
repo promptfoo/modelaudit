@@ -193,7 +193,7 @@ class FicklingPickleScanner(BaseScanner):
                 opcode_count = None
 
             # Add basic metadata
-            metadata_update = {
+            metadata_update: dict[str, Any] = {
                 "unsafe_imports": len(unsafe_imports),
                 "non_standard_imports": len(non_standard_imports),
                 "scan_time_seconds": time.time() - start_time,
@@ -209,7 +209,7 @@ class FicklingPickleScanner(BaseScanner):
                 })
             else:
                 metadata_update.update({
-                    "fickling_severity": "UNKNOWN",
+                    "fickling_severity": "LIKELY_UNSAFE",  # Default to unsafe when parsing fails
                     "fickling_safe": False,
                 })
 
