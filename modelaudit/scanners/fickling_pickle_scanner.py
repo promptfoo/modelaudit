@@ -1287,10 +1287,18 @@ class FicklingPickleScanner(BaseScanner):
         )
 
         # Check for embedded secrets in the raw file data (safer than deserializing)
+        # Limit file size to prevent memory issues and timeouts in CI
         try:
-            with open(file_path, "rb") as f:
-                file_data = f.read()
-            self.check_for_embedded_secrets(file_data, result, context=file_path)
+            file_size = os.path.getsize(file_path)
+            # Skip secrets detection for files larger than 50MB to prevent CI timeouts
+            if file_size > 50 * 1024 * 1024:
+                logger.debug(f"Skipping secret detection for large file {file_path}: {file_size} bytes")
+                result.metadata["secrets_scan_skipped"] = True
+                result.metadata["secrets_skip_reason"] = "File too large for secrets scanning"
+            else:
+                with open(file_path, "rb") as f:
+                    file_data = f.read()
+                self.check_for_embedded_secrets(file_data, result, context=file_path)
         except Exception as e:
             logger.debug(f"Skipping secret detection for {file_path}: {e}")
             pass
