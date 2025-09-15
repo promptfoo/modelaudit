@@ -200,7 +200,7 @@ class FicklingPickleScanner(BaseScanner):
                 "file_size": self._get_file_size(file_path),
                 "opcodes_analyzed": opcode_count,
             }
-            
+
             # Add fickling-specific metadata if analysis was successful
             if analysis_results is not None:
                 metadata_update.update({
@@ -212,7 +212,7 @@ class FicklingPickleScanner(BaseScanner):
                     "fickling_severity": "UNKNOWN",
                     "fickling_safe": False,
                 })
-                
+
             result.metadata.update(metadata_update)
 
             # CRITICAL: Add supplementary security analysis for patterns fickling misses
@@ -1281,7 +1281,7 @@ class FicklingPickleScanner(BaseScanner):
             location=file_path,
             details={"dangerous_opcodes": dangerous_opcodes},
         )
-        
+
         # Check for embedded secrets in the raw file data (safer than deserializing)
         try:
             with open(file_path, "rb") as f:
