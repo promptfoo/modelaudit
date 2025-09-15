@@ -225,6 +225,9 @@ class FicklingPickleScanner(BaseScanner):
             # Scan for JIT/Script patterns if enabled
             self._scan_for_jit_script_patterns(file_path, result)
 
+            # Scan for network communication patterns if enabled
+            self._scan_for_network_communication_patterns(file_path, result)
+
         except UnsafeFileError as e:
             # Fickling detected unsafe content - but still run CVE analysis for comprehensive detection
             result.add_issue(
@@ -1377,3 +1380,27 @@ class FicklingPickleScanner(BaseScanner):
 
         except Exception as e:
             logger.warning(f"Error scanning for JIT/Script patterns in {file_path}: {e}")
+
+    def _scan_for_network_communication_patterns(self, file_path: str, result: ScanResult) -> None:
+        """Scan for network communication patterns in the pickle file if check is enabled."""
+        check_net = self._get_bool_config("check_network_comm", True)
+        if not check_net:
+            result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+            return
+
+        try:
+            # Read file content for analysis
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+
+            # Collect network communication findings using inherited BaseScanner method
+            network_findings = self.collect_network_communication_findings(
+                file_data,
+                context=file_path,
+            )
+
+            # Create aggregated check for the file using inherited BaseScanner method
+            self.summarize_network_communication_findings(network_findings, result, context=file_path)
+
+        except Exception as e:
+            logger.warning(f"Error scanning for network communication patterns in {file_path}: {e}")
