@@ -63,10 +63,10 @@ class FicklingPickleScanner(BaseScanner):
         start_time = time.time()
         result = ScanResult(scanner_name=self.name)
         result.metadata["file_path"] = file_path
-        
+
         # Initialize variables to handle error cases
         pickled = None
-        fickling_is_safe = True
+        fickling_is_safe: bool | None = True
         ml_context = {}
 
         # Check if file exists and is a regular file
@@ -258,7 +258,7 @@ class FicklingPickleScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
-            
+
         except Exception as e:
             logger.warning(f"Fickling analysis failed for {file_path}: {e}")
             # Fallback to basic safety check
@@ -287,7 +287,7 @@ class FicklingPickleScanner(BaseScanner):
 
         # Add basic security checks
         if pickled is not None:
-            self._add_security_checks(pickled, result, file_path, fickling_is_safe, ml_context)
+            self._add_security_checks(pickled, result, file_path, fickling_is_safe or False, ml_context)
 
         # Set bytes scanned for size limit enforcement
         result.bytes_scanned = self._get_file_size(file_path)
