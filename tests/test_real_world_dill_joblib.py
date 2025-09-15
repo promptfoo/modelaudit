@@ -185,12 +185,18 @@ class TestRealJoblibFiles:
 
         # If bytes weren't scanned, it means the format wasn't recognized as standard pickle
         if result.bytes_scanned == 0:
-            # Should have issues about unknown format/opcodes (now as warnings)
-            assert len(warning_issues) > 0, "Should report issues when format isn't recognized"
-            opcode_issues = [
-                i for i in warning_issues if "opcode" in str(i.message).lower() or "format" in str(i.message).lower()
+            # Should have issues about unknown format/opcodes - fickling reports as critical
+            all_issues = critical_issues + warning_issues
+            assert len(all_issues) > 0, "Should report issues when format isn't recognized"
+            # FicklingPickleScanner reports parse failures instead of opcode issues
+            format_issues = [
+                i
+                for i in all_issues
+                if "opcode" in str(i.message).lower()
+                or "format" in str(i.message).lower()
+                or "failed to parse" in str(i.message).lower()
             ]
-            assert len(opcode_issues) > 0, "Should report opcode/format issues for numpy joblib files"
+            assert len(format_issues) > 0, "Should report format/parse issues for numpy joblib files"
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
