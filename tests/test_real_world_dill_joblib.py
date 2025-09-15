@@ -153,7 +153,11 @@ class TestRealJoblibFiles:
             # Should have reported format issues (either opcode issues or parse failures)
             assert len(result.issues) > 0
             # FicklingPickleScanner reports parse failures instead of opcode issues
-            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower() or "failed to parse" in str(i.message).lower()]
+            format_issues = [
+                i
+                for i in result.issues
+                if "opcode" in str(i.message).lower() or "failed to parse" in str(i.message).lower()
+            ]
             assert len(format_issues) > 0, "Should report format/parse issues for compressed files"
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
