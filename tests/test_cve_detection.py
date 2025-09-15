@@ -134,16 +134,22 @@ class TestCVE202434997Detection:
 
     def test_detect_cve_2024_34997_basic_pattern(self, tmp_path):
         """Test basic detection of CVE-2024-34997 patterns."""
-        # Create content with NumpyArrayWrapper and pickle.load
-        malicious_content = b"""
-        NumpyArrayWrapper
-        read_array
-        pickle.load
-        numpy_pickle
-        """
+        # Create proper pickle data that embeds CVE-2024-34997 patterns
+        malicious_data = {
+            # NumpyArrayWrapper context
+            "NumpyArrayWrapper": "NumpyArrayWrapper for numpy array serialization",
+            "read_array": "read_array method for loading arrays",
+            "numpy_pickle": "numpy_pickle module for array persistence",
+            # Dangerous operations (required for CVE detection)
+            "pickle.load": 'pickle.load("malicious_array.pkl")',
+            "joblib": "joblib library integration",
+            # Additional context for exploit scenario
+            "exploit_numpy": "NumpyArrayWrapper with dangerous pickle.load operations",
+        }
 
         test_file = tmp_path / "numpy_wrapper_attack.pkl"
-        test_file.write_bytes(malicious_content)
+        with open(test_file, "wb") as f:
+            pickle.dump(malicious_data, f)
 
         result = scan_file(str(test_file))
 
@@ -160,16 +166,22 @@ class TestCVE202434997Detection:
 
     def test_detect_cve_2024_34997_cache_exploitation(self, tmp_path):
         """Test detection of NumpyArrayWrapper cache exploitation."""
-        malicious_content = b"""
-        joblib.cache
-        NumpyArrayWrapper
-        read_array
-        pickle.load
-        os.system
-        """
+        # Create proper pickle data for cache exploitation scenario
+        malicious_data = {
+            # Cache exploitation context
+            "joblib.cache": "joblib.cache memory for array caching",
+            "NumpyArrayWrapper": "NumpyArrayWrapper for cached array serialization",
+            "read_array": "read_array method for cache loading",
+            # Dangerous operations
+            "pickle.load": 'pickle.load("cached_array.pkl")',
+            "os.system": 'os.system("malicious cache command")',
+            # Cache exploitation scenario
+            "cache_exploit": "joblib cache exploitation via NumpyArrayWrapper with os.system",
+        }
 
         test_file = tmp_path / "cache_exploit.pkl"
-        test_file.write_bytes(malicious_content)
+        with open(test_file, "wb") as f:
+            pickle.dump(malicious_data, f)
 
         result = scan_file(str(test_file))
 
@@ -185,16 +197,22 @@ class TestCVE202434997Detection:
 
     def test_detect_cve_2024_34997_numpy_pickle_exploitation(self, tmp_path):
         """Test detection of numpy_pickle module exploitation."""
-        # Create a pickle with numpy_pickle and dangerous operations
-        malicious_content = b"""
-        numpy_pickle.read_array
-        pickle.load
-        __reduce__
-        subprocess.Popen
-        """
+        # Create proper pickle data for numpy_pickle exploitation
+        malicious_data = {
+            # numpy_pickle context
+            "numpy_pickle": "numpy_pickle module for array serialization",
+            "read_array": "numpy_pickle.read_array for loading arrays",
+            # Dangerous operations
+            "pickle.load": 'pickle.load("numpy_data.pkl")',
+            "__reduce__": "__reduce__ method for custom deserialization",
+            "subprocess.Popen": "subprocess.Popen for command execution",
+            # Exploitation scenario
+            "numpy_exploit": "numpy_pickle exploitation via __reduce__ with subprocess.Popen",
+        }
 
         test_file = tmp_path / "numpy_pickle_exploit.pkl"
-        test_file.write_bytes(malicious_content)
+        with open(test_file, "wb") as f:
+            pickle.dump(malicious_data, f)
 
         result = scan_file(str(test_file))
 
