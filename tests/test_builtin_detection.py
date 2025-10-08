@@ -11,9 +11,9 @@ dangerous builtin functions, including:
 import os
 import tempfile
 
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
 
 class TestBuiltinDetection:

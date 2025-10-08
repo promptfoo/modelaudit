@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import ScanResult
-from modelaudit.utils.advanced_file_handler import (
+from modelaudit.utils.file.handlers import (
     COLOSSAL_MODEL_THRESHOLD,
     EXTREME_MODEL_THRESHOLD,
     LARGE_MODEL_THRESHOLD_200GB,

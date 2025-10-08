@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import HttpUrl
 
-from modelaudit.license_checker import (
+from modelaudit.integrations.license_checker import (
     CopyrightInfo,
     LicenseInfo,
     _is_ml_config_file,

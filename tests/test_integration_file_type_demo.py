@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.utils.filetype import validate_file_type
+from modelaudit.utils.file.detection import validate_file_type
 
 
 class TestFileTypeValidationDemo:

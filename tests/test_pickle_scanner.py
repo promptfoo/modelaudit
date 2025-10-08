@@ -5,12 +5,12 @@ from pathlib import Path
 
 import dill
 
-from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
+from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
     generate_multiple_pickle_attack,

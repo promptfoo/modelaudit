@@ -757,7 +757,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
     )
 
 
-@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_success(mock_scan_mlflow):
     """Test successful scanning of an MLflow URI."""
     # Setup mock
@@ -791,7 +791,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
     )
 
 
-@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
     """Test MLflow URI scanning with additional options."""
     # Setup mock
@@ -833,7 +833,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
     )
 
 
-@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_error(mock_scan_mlflow):
     """Test error handling for MLflow URI scanning."""
     # Setup mock to raise an error
@@ -848,7 +848,7 @@ def test_scan_mlflow_uri_error(mock_scan_mlflow):
     assert "MLflow connection failed" in result.output
 
 
-@patch("modelaudit.mlflow_integration.scan_mlflow_model")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
     """Test MLflow URI scanning with JSON output format."""
     # Setup mock

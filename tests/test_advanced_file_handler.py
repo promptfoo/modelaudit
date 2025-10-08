@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from modelaudit.scanners.base import BaseScanner, ScanResult
-from modelaudit.utils.advanced_file_handler import (
+from modelaudit.utils.file.handlers import (
     AdvancedFileHandler,
     MemoryMappedScanner,
     ParallelShardScanner,

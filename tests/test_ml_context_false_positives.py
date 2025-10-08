@@ -11,7 +11,7 @@ from unittest.mock import patch
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
-from modelaudit.utils.ml_context import (
+from modelaudit.utils.helpers.ml_context import (
     analyze_binary_for_ml_context,
     get_ml_context_explanation,
     should_ignore_executable_signature,

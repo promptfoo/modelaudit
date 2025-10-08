@@ -2,7 +2,7 @@ import os
 import re
 from typing import ClassVar
 
-from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
+from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 

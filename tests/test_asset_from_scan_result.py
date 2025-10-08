@@ -1,7 +1,7 @@
 """Tests for asset_from_scan_result function and tensor metadata handling."""
 
 from modelaudit.scanners.base import ScanResult
-from modelaudit.utils.assets import asset_from_scan_result
+from modelaudit.utils.helpers.assets import asset_from_scan_result
 
 
 class TestAssetFromScanResult:

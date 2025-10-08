@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from modelaudit.utils.jfrog import (
+from modelaudit.utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,

@@ -10,14 +10,14 @@ The handler supports:
 
 Usage:
     # In scanning loops:
-    from modelaudit.interrupt_handler import check_interrupted
+    from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 
     for file in files:
         check_interrupted()  # Raises KeyboardInterrupt if interrupted
         scan_file(file)
 
     # For main scanning context:
-    from modelaudit.interrupt_handler import interruptible_scan
+    from modelaudit.utils.helpers.interrupt_handler import interruptible_scan
 
     with interruptible_scan() as handler:
         # Signal handlers are installed

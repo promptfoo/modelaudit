@@ -138,7 +138,7 @@ class TestPyCompileImprovements:
         """Test PyFunc/PyCall validation in TensorFlow models."""
         # Note: This test is simplified since we can't easily create actual TF models in tests
         # But it demonstrates the validation logic
-        from modelaudit.utils.code_validation import is_code_potentially_dangerous, validate_python_syntax
+        from modelaudit.utils.helpers.code_validation import is_code_potentially_dangerous, validate_python_syntax
 
         # Test dangerous PyFunc code
         dangerous_func = """

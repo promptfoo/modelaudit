@@ -8,8 +8,8 @@ making it a critical security risk when found in pickle files.
 import os
 import tempfile
 
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS
 
 
 class TestRunpyDetection:

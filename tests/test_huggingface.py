@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.utils.huggingface import (
+from modelaudit.utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
     get_model_info,

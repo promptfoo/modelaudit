@@ -4,8 +4,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from .core import scan_model_directory_or_file
-from .models import ModelAuditResultModel
+from ..models import ModelAuditResultModel
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +72,9 @@ def scan_mlflow_model(
             "cache_enabled": scan_kwargs.pop("cache_enabled", True),
             "cache_dir": scan_kwargs.pop("cache_dir", None),
         }
+
+        # Import here to avoid circular dependency
+        from ..core import scan_model_directory_or_file
 
         return scan_model_directory_or_file(
             download_path,

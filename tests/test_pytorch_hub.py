@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.utils.pytorch_hub import (
+from modelaudit.utils.sources.pytorch_hub import (
     _extract_weight_urls,
     download_pytorch_hub_model,
     is_pytorch_hub_url,
@@ -28,9 +28,9 @@ class TestPytorchHubURLDetection:
             assert not is_pytorch_hub_url(url)
 
 
-@patch("modelaudit.utils.pytorch_hub.check_disk_space")
-@patch("modelaudit.utils.pytorch_hub.requests.head")
-@patch("modelaudit.utils.pytorch_hub.requests.get")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
 def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp_path):
     html_resp = MagicMock()
     html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'

@@ -12,7 +12,7 @@ import pytest
 
 def test_interrupt_handler_basic():
     """Test basic interrupt handler functionality."""
-    from modelaudit.interrupt_handler import (
+    from modelaudit.utils.helpers.interrupt_handler import (
         get_interrupt_handler,
         interruptible_scan,
         reset_interrupt,
@@ -31,7 +31,7 @@ def test_interrupt_handler_basic():
 
 def test_interrupt_check():
     """Test interrupt checking."""
-    from modelaudit.interrupt_handler import (
+    from modelaudit.utils.helpers.interrupt_handler import (
         check_interrupted,
         get_interrupt_handler,
         is_interrupted,

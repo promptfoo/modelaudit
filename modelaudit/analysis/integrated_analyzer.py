@@ -6,10 +6,10 @@ from typing import Any
 
 from modelaudit.analysis.anomaly_detector import AnomalyDetector
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase, FrameworkType
 from modelaudit.analysis.semantic_analyzer import CodeRiskLevel, SemanticAnalyzer
-from modelaudit.context.unified_context import ModelArchitecture, UnifiedMLContext
-from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase, FrameworkType
-from modelaudit.utils.code_validation import is_code_potentially_dangerous, validate_python_syntax
+from modelaudit.analysis.unified_context import ModelArchitecture, UnifiedMLContext
+from modelaudit.utils.helpers.code_validation import is_code_potentially_dangerous, validate_python_syntax
 
 
 class AnalysisConfidence(Enum):

@@ -2,8 +2,8 @@
 
 import pickle
 
+from modelaudit.detectors.secrets import SecretsDetector, detect_secrets_in_file
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.secrets_detector import SecretsDetector, detect_secrets_in_file
 
 
 class TestSecretsDetector:

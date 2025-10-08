@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from modelaudit.utils.cloud_storage import (
+from modelaudit.utils.sources.cloud_storage import (
     analyze_cloud_target,
     download_from_cloud,
     filter_scannable_files,

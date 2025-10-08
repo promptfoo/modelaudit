@@ -9,9 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .core import scan_model_directory_or_file
-from .models import ModelAuditResultModel
-from .utils.jfrog import detect_jfrog_target_type, download_artifact, download_jfrog_folder
+from ..models import ModelAuditResultModel
+from ..utils.sources.jfrog import detect_jfrog_target_type, download_artifact, download_jfrog_folder
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +116,9 @@ def scan_jfrog_artifact(
             "cache_enabled": scan_kwargs.pop("cache_enabled", True),
             "cache_dir": scan_kwargs.pop("cache_dir", None),
         }
+
+        # Import here to avoid circular dependency
+        from ..core import scan_model_directory_or_file
 
         # Scan the downloaded file or directory with remaining timeout
         result = scan_model_directory_or_file(

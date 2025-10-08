@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.mlflow_integration import scan_mlflow_model
+from modelaudit.integrations.mlflow import scan_mlflow_model
 
 
 def test_scan_mlflow_model_import_error(monkeypatch):
@@ -13,9 +13,9 @@ def test_scan_mlflow_model_import_error(monkeypatch):
         scan_mlflow_model("models:/dummy/1")
 
 
-@patch("modelaudit.mlflow_integration.shutil.rmtree")
-@patch("modelaudit.mlflow_integration.tempfile.mkdtemp")
-@patch("modelaudit.mlflow_integration.scan_model_directory_or_file")
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.integrations.mlflow.scan_model_directory_or_file")
 def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     """Test successful MLflow model scanning."""
     # Mock MLflow
@@ -71,9 +71,9 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     assert results == mock_scan.return_value  # Verify the mock was called correctly
 
 
-@patch("modelaudit.mlflow_integration.shutil.rmtree")
-@patch("modelaudit.mlflow_integration.tempfile.mkdtemp")
-@patch("modelaudit.mlflow_integration.scan_model_directory_or_file")
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.integrations.mlflow.scan_model_directory_or_file")
 def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
     """Test MLflow model scanning when download returns a file path."""
     # Mock MLflow
@@ -101,8 +101,8 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
         assert args[0] == temp_dir  # Should be directory, not file
 
 
-@patch("modelaudit.mlflow_integration.shutil.rmtree")
-@patch("modelaudit.mlflow_integration.tempfile.mkdtemp")
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
     """Test error handling when MLflow download fails."""
     # Mock MLflow with download error
@@ -129,9 +129,9 @@ def test_scan_mlflow_model_no_registry_uri():
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
-        patch("modelaudit.mlflow_integration.tempfile.mkdtemp", return_value="/tmp/test"),
-        patch("modelaudit.mlflow_integration.scan_model_directory_or_file", return_value={}),
-        patch("modelaudit.mlflow_integration.shutil.rmtree"),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value="/tmp/test"),
+        patch("modelaudit.integrations.mlflow.scan_model_directory_or_file", return_value={}),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
     ):
         scan_mlflow_model("models:/TestModel/1")
 

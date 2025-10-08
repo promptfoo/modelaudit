@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.sbom import generate_sbom_pydantic
+from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 
 
 def create_test_gguf(file_path: Path) -> None:

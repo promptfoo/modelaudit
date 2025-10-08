@@ -26,8 +26,8 @@ class TestAnalysisModules:
             IntegratedAnalyzer,
             SemanticAnalyzer,
         )
-        from modelaudit.context import UnifiedMLContext
-        from modelaudit.knowledge import FrameworkKnowledgeBase
+        from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase
+        from modelaudit.analysis.unified_context import UnifiedMLContext
 
         # These should instantiate without errors
         entropy = EntropyAnalyzer()
@@ -90,7 +90,7 @@ class TestAnalysisModules:
     def test_integrated_analyzer_basic(self):
         """Test basic integrated analyzer functionality."""
         from modelaudit.analysis import IntegratedAnalyzer
-        from modelaudit.context import UnifiedMLContext
+        from modelaudit.analysis.unified_context import UnifiedMLContext
 
         analyzer = IntegratedAnalyzer()
 

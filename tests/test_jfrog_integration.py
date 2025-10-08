@@ -3,14 +3,14 @@ from unittest.mock import patch
 
 import pytest
 
-from modelaudit.jfrog_integration import scan_jfrog_artifact
+from modelaudit.integrations.jfrog import scan_jfrog_artifact
 
 
-@patch("modelaudit.jfrog_integration.shutil.rmtree")
-@patch("modelaudit.jfrog_integration.tempfile.mkdtemp")
-@patch("modelaudit.jfrog_integration.detect_jfrog_target_type")
-@patch("modelaudit.jfrog_integration.download_artifact")
-@patch("modelaudit.jfrog_integration.scan_model_directory_or_file")
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.integrations.jfrog.scan_model_directory_or_file")
 def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock_mkdtemp, mock_rmtree):
     """Test successful JFrog artifact scanning."""
     temp_dir = "/tmp/modelaudit_jfrog_test"
@@ -74,10 +74,10 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     assert metadata["jfrog_source"]["repo"] == "test-repo"
 
 
-@patch("modelaudit.jfrog_integration.shutil.rmtree")
-@patch("modelaudit.jfrog_integration.tempfile.mkdtemp")
-@patch("modelaudit.jfrog_integration.detect_jfrog_target_type")
-@patch("modelaudit.jfrog_integration.download_artifact")
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
 def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkdtemp, mock_rmtree):
     """Test error handling when JFrog download fails."""
     temp_dir = "/tmp/modelaudit_jfrog_test"
@@ -95,11 +95,11 @@ def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkd
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
 
 
-@patch("modelaudit.jfrog_integration.shutil.rmtree")
-@patch("modelaudit.jfrog_integration.tempfile.mkdtemp")
-@patch("modelaudit.jfrog_integration.detect_jfrog_target_type")
-@patch("modelaudit.jfrog_integration.download_jfrog_folder")
-@patch("modelaudit.jfrog_integration.scan_model_directory_or_file")
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_jfrog_folder")
+@patch("modelaudit.integrations.jfrog.scan_model_directory_or_file")
 def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree):
     """Test successful JFrog folder scanning."""
     temp_dir = "/tmp/modelaudit_jfrog_test"
@@ -169,9 +169,9 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
     assert metadata["jfrog_source"]["repo"] == "test-repo"
 
 
-@patch("modelaudit.jfrog_integration.shutil.rmtree")
-@patch("modelaudit.jfrog_integration.tempfile.mkdtemp")
-@patch("modelaudit.jfrog_integration.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 def test_scan_jfrog_artifact_detection_error(mock_detect, mock_mkdtemp, mock_rmtree):
     """Test error handling when JFrog target detection fails."""
     temp_dir = "/tmp/modelaudit_jfrog_test"

@@ -13,7 +13,7 @@ Key Features:
 - Integration with existing scanners
 
 Usage:
-    from modelaudit.cve_patterns import get_cve_attribution, analyze_cve_risk
+    from modelaudit.detectors.cve_patterns import get_cve_attribution, analyze_cve_risk
 
     # Get CVE information for detected patterns
     cve_info = get_cve_attribution(detected_patterns)

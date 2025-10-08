@@ -17,7 +17,7 @@ import pickle
 import pytest
 
 from modelaudit.core import scan_file
-from modelaudit.cve_patterns import analyze_cve_patterns
+from modelaudit.detectors.cve_patterns import analyze_cve_patterns
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -411,7 +411,7 @@ class TestCVEPatternValidation:
         """Test that all CVE patterns are valid regex expressions."""
         import re
 
-        from modelaudit.suspicious_symbols import CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS
+        from modelaudit.detectors.suspicious_symbols import CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS
 
         all_patterns = CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
 
@@ -423,7 +423,7 @@ class TestCVEPatternValidation:
 
     def test_cve_attribution_data_completeness(self):
         """Test that CVE attribution data is complete."""
-        from modelaudit.suspicious_symbols import CVE_COMBINED_PATTERNS
+        from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 
         required_fields = ["patterns", "description", "severity", "cwe", "cvss", "affected_versions", "remediation"]
 

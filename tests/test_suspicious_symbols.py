@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     DANGEROUS_BUILTINS,
     DANGEROUS_OPCODES,

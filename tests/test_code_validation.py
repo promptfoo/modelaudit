@@ -1,6 +1,6 @@
 """Tests for code validation utilities."""
 
-from modelaudit.utils.code_validation import (
+from modelaudit.utils.helpers.code_validation import (
     extract_dangerous_constructs,
     is_code_potentially_dangerous,
     validate_python_syntax,

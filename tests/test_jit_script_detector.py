@@ -1,6 +1,6 @@
 """Tests for JIT/Script code execution detection."""
 
-from modelaudit.jit_script_detector import JITScriptDetector, detect_jit_script_risks
+from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
 
 
 class TestJITScriptDetector:

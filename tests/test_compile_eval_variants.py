@@ -9,9 +9,9 @@ import os
 import pickle
 import tempfile
 
+from modelaudit.detectors.suspicious_symbols import DANGEROUS_BUILTINS
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.suspicious_symbols import DANGEROUS_BUILTINS
 
 
 class TestCompileEvalVariants:

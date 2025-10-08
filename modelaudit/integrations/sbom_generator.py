@@ -10,8 +10,8 @@ from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
-from .models import FileMetadataModel, ModelAuditResultModel
-from .scanners.base import Issue, IssueSeverity
+from ..models import FileMetadataModel, ModelAuditResultModel
+from ..scanners.base import Issue, IssueSeverity
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 

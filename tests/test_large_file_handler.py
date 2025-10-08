@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.scanners.base import ScanResult
-from modelaudit.utils import large_file_handler
+from modelaudit.utils.file import large_file_handler
 
 
 class DummyScanner:

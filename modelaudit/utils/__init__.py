@@ -1,9 +1,17 @@
 # Utils package for ModelAudit
+"""Utilities for ModelAudit.
+
+Organized into subcategories:
+- file/ - File handling utilities (detection, filtering, streaming)
+- sources/ - Model source integrations (cloud, HuggingFace, JFrog, DVC)
+- helpers/ - Generic utilities (retry, caching, types)
+"""
+
 import os
 from pathlib import Path
 
-from .dvc_utils import resolve_dvc_file
-from .file_filter import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
+from .file.filtering import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
+from .sources.dvc import resolve_dvc_file
 
 
 def is_within_directory(base_dir: str, target: str) -> bool:

@@ -304,8 +304,8 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
 @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
 def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
     """Test that all suspicious TensorFlow operations generate explanations."""
-    from modelaudit.explanations import get_tf_op_explanation
-    from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+    from modelaudit.config.explanations import get_tf_op_explanation
+    from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS
 
     # Test each suspicious operation individually
     for op_name in SUSPICIOUS_OPS:

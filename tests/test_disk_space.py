@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from modelaudit.utils.disk_space import (
+from modelaudit.utils.helpers.disk_space import (
     check_disk_space,
     format_bytes,
     get_free_space_bytes,

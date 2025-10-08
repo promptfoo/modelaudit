@@ -18,14 +18,14 @@ from typing import Any
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.license_checker import (
+from modelaudit.integrations.license_checker import (
     check_commercial_use_warnings,
     collect_license_metadata,
     detect_agpl_components,
     detect_unlicensed_datasets,
     scan_for_license_headers,
 )
-from modelaudit.sbom import generate_sbom
+from modelaudit.integrations.sbom_generator import generate_sbom
 
 
 class TestLicenseIntegration:
@@ -273,7 +273,7 @@ class TestLicenseIntegration:
 
     def test_copyright_detection(self, test_data_dir: Any) -> None:
         """Test copyright notice detection."""
-        from modelaudit.license_checker import extract_copyright_notices
+        from modelaudit.integrations.license_checker import extract_copyright_notices
 
         # Test copyright detection in MIT file
         mit_file = test_data_dir / "mit_model" / "model.py"
@@ -308,7 +308,7 @@ class TestLicenseScenarios:
         """Test license pattern recognition with various formats."""
         import re
 
-        from modelaudit.license_checker import LICENSE_PATTERNS
+        from modelaudit.integrations.license_checker import LICENSE_PATTERNS
 
         test_texts = [
             "MIT License",
@@ -331,7 +331,7 @@ class TestLicenseScenarios:
 
     def test_commercial_use_classification(self) -> None:
         """Test commercial use classification for different licenses."""
-        from modelaudit.license_checker import LICENSE_PATTERNS
+        from modelaudit.integrations.license_checker import LICENSE_PATTERNS
 
         # Permissive licenses should allow commercial use
         permissive_patterns = ["MIT", "Apache-2.0", "BSD-3-Clause"]
@@ -348,7 +348,7 @@ class TestLicenseScenarios:
 
     def test_ml_model_directory_detection(self) -> None:
         """Test ML model directory detection logic."""
-        from modelaudit.license_checker import _is_ml_model_directory
+        from modelaudit.integrations.license_checker import _is_ml_model_directory
 
         # Should detect ML model directory
         ml_files = ["config.json", "pytorch_model.bin", "tokenizer_config.json"]

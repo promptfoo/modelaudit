@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.utils.filetype import (
+from modelaudit.utils.file.detection import (
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,

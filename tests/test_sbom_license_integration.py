@@ -3,7 +3,7 @@
 import json
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.sbom import generate_sbom
+from modelaudit.integrations.sbom_generator import generate_sbom
 
 
 class TestSBOMLicenseIntegration:

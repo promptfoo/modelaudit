@@ -1,7 +1,7 @@
 import pickle
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.utils import resolve_dvc_file
+from modelaudit.utils.sources.dvc import resolve_dvc_file
 
 
 class TestDvcIntegration:

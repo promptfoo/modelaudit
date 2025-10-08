@@ -15,7 +15,7 @@ Architecture Overview:
     4. **Performance**: Compiled regex patterns are shared across scanners
 
 Usage Examples:
-    >>> from modelaudit.suspicious_symbols import SUSPICIOUS_GLOBALS, SUSPICIOUS_OPS
+    >>> from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS, SUSPICIOUS_OPS
     >>>
     >>> # Check if a global reference is suspicious
     >>> if "os" in SUSPICIOUS_GLOBALS:
@@ -55,7 +55,7 @@ Version History:
 
 from typing import Any
 
-from .explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
+from ..config.explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 
 # OS module aliases that provide system access similar to the 'os' module
 OS_MODULE_ALIASES: dict[str, dict[str, Any]] = {
@@ -728,9 +728,9 @@ def validate_patterns() -> list[str]:
     # Validate CVE pattern structure
     for cve_id, cve_info in CVE_COMBINED_PATTERNS.items():
         if not isinstance(cve_id, str):
-            warnings.append(f"CVE ID must be string: {cve_id}")
+            warnings.append(f"CVE ID must be string: {cve_id}")  # type: ignore[unreachable]
         if not isinstance(cve_info, dict):
-            warnings.append(f"CVE info must be dict for {cve_id}")
+            warnings.append(f"CVE info must be dict for {cve_id}")  # type: ignore[unreachable]
         required_fields = ["patterns", "description", "severity", "cwe", "cvss"]
         for field in required_fields:
             if field not in cve_info:
@@ -739,24 +739,24 @@ def validate_patterns() -> list[str]:
     # Validate CVE binary patterns
     for binary_pattern in CVE_BINARY_PATTERNS:
         if not isinstance(binary_pattern, bytes):
-            warnings.append(f"CVE binary pattern must be bytes: {binary_pattern!r}")
+            warnings.append(f"CVE binary pattern must be bytes: {binary_pattern!r}")  # type: ignore[unreachable]
 
     # Validate global patterns structure
     for module, funcs in SUSPICIOUS_GLOBALS.items():
         if not isinstance(module, str):
-            warnings.append(f"Module name must be string: {module}")  # pragma: no cover
+            warnings.append(f"Module name must be string: {module}")  # type: ignore[unreachable]
         if not (funcs == "*" or isinstance(funcs, list)):
             warnings.append(f"Functions must be '*' or list for module {module}")
 
     # Validate dangerous builtins
     for builtin in DANGEROUS_BUILTINS:
         if not isinstance(builtin, str):
-            warnings.append(f"Builtin name must be string: {builtin}")  # pragma: no cover
+            warnings.append(f"Builtin name must be string: {builtin}")  # type: ignore[unreachable]
 
     # Validate dangerous opcodes
     for opcode in DANGEROUS_OPCODES:
         if not isinstance(opcode, str):
-            warnings.append(f"Opcode name must be string: {opcode}")  # pragma: no cover
+            warnings.append(f"Opcode name must be string: {opcode}")  # type: ignore[unreachable]
 
     # Validate TensorFlow dangerous ops mapping
     for op, desc in TENSORFLOW_DANGEROUS_OPS.items():
@@ -770,14 +770,14 @@ def validate_patterns() -> list[str]:
     # Validate binary code patterns
     for binary_pattern in BINARY_CODE_PATTERNS:
         if not isinstance(binary_pattern, bytes):
-            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")  # pragma: no cover
+            warnings.append(f"Binary code pattern must be bytes: {binary_pattern!r}")  # type: ignore[unreachable]
 
     # Validate executable signatures
     for signature, description in EXECUTABLE_SIGNATURES.items():
         if not isinstance(signature, bytes):
-            warnings.append(f"Signature must be bytes: {signature!r}")  # pragma: no cover
+            warnings.append(f"Signature must be bytes: {signature!r}")  # type: ignore[unreachable]
         if not isinstance(description, str):
-            warnings.append(f"Description must be string for signature {signature!r}")  # pragma: no cover
+            warnings.append(f"Description must be string for signature {signature!r}")  # type: ignore[unreachable]
         if not description:
             warnings.append(
                 f"Description must be non-empty for signature {signature!r}",

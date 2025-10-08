@@ -10,7 +10,7 @@ import requests
 from modelaudit.models import CopyrightNoticeModel as CopyrightInfo
 from modelaudit.models import LicenseInfoModel as LicenseInfo
 
-from .constants import COMMON_MODEL_EXTENSIONS
+from ..config.constants import COMMON_MODEL_EXTENSIONS
 
 # Common license patterns with SPDX IDs and commercial use status
 LICENSE_PATTERNS = {
@@ -112,7 +112,7 @@ UNLICENSED_INDICATORS = [
 ]
 
 # SPDX license metadata
-SPDX_LICENSE_PATH = Path(__file__).with_name("spdx_licenses.json")
+SPDX_LICENSE_PATH = Path(__file__).parent.parent / "config" / "data" / "spdx_licenses.json"
 SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
 _SPDX_LICENSES: dict[str, Any] | None = None
 

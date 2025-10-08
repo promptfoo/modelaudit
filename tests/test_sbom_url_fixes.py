@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
-from modelaudit.sbom import generate_sbom_pydantic
+from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 
 
 def create_mock_scan_result(

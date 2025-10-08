@@ -1,7 +1,7 @@
 import struct
 
+from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
-from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS
 
 
 def test_pytorch_binary_scanner_can_handle(tmp_path):
@@ -201,7 +201,7 @@ def test_pytorch_binary_scanner_small_file(tmp_path):
 
 def test_filetype_detection_for_bin_files(tmp_path):
     """Test that filetype detection correctly identifies different .bin formats."""
-    from modelaudit.utils.filetype import detect_file_format
+    from modelaudit.utils.file.detection import detect_file_format
 
     # Test pickle format .bin
     pickle_bin = tmp_path / "pickle.bin"

@@ -1,6 +1,6 @@
 """Tests for network communication detection."""
 
-from modelaudit.network_comm_detector import NetworkCommDetector, detect_network_communication
+from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
 class TestNetworkCommDetector:
