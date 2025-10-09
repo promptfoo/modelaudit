@@ -10,8 +10,7 @@ from threading import Lock
 from typing import IO, Any
 from unittest.mock import patch
 
-from modelaudit.interrupt_handler import check_interrupted
-from modelaudit.license_checker import (
+from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
@@ -20,24 +19,25 @@ from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_ini
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
-from modelaudit.utils.advanced_file_handler import (
-    scan_advanced_large_file,
-    should_use_advanced_handler,
-)
-from modelaudit.utils.assets import asset_from_scan_result
-from modelaudit.utils.cache_decorator import cached_scan
-from modelaudit.utils.filetype import (
+from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
 )
-from modelaudit.utils.large_file_handler import (
+from modelaudit.utils.file.handlers import (
+    scan_advanced_large_file,
+    should_use_advanced_handler,
+)
+from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.streaming import stream_analyze_file
-from modelaudit.utils.types import (
+from modelaudit.utils.file.streaming import stream_analyze_file
+from modelaudit.utils.helpers.assets import asset_from_scan_result
+from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.interrupt_handler import check_interrupted
+from modelaudit.utils.helpers.types import (
     FilePath,
     ProgressCallback,
 )

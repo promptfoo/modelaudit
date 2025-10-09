@@ -13,7 +13,7 @@ import torch
 
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.utils.filetype import detect_file_format
+from modelaudit.utils.file.detection import detect_file_format
 
 
 class TestPyTorchZipDetection:

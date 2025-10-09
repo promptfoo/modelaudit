@@ -6,29 +6,29 @@ from typing import IO, Any, BinaryIO, ClassVar
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.analysis.ml_context_analyzer import MLContextAnalyzer
 from modelaudit.analysis.opcode_sequence_analyzer import OpcodeSequenceAnalyzer
 from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
-from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     CVE_BINARY_PATTERNS,
     EXECUTABLE_SIGNATURES,
     SUSPICIOUS_GLOBALS,
     SUSPICIOUS_STRING_PATTERNS,
 )
-from modelaudit.utils.code_validation import (
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
-from ..cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
-from ..explanations import (
+from ..config.explanations import (
     get_import_explanation,
     get_opcode_explanation,
     get_pattern_explanation,
 )
-from ..suspicious_symbols import DANGEROUS_OPCODES
+from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
+from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 
@@ -875,7 +875,7 @@ class PickleScanner(BaseScanner):
         if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
             try:
                 # Import here to avoid circular dependency
-                from modelaudit.utils.filetype import (
+                from modelaudit.utils.file.detection import (
                     detect_file_format,
                     validate_file_type,
                 )
@@ -2794,7 +2794,7 @@ class PickleScanner(BaseScanner):
         result = self._create_result()
 
         try:
-            from modelaudit.utils.ml_context import (
+            from modelaudit.utils.helpers.ml_context import (
                 analyze_binary_for_ml_context,
                 should_ignore_executable_signature,
             )
@@ -3296,7 +3296,7 @@ class PickleScanner(BaseScanner):
             return 0
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
             # from modelaudit.models import JITScriptFinding  # Imported but not used directly
 
             # Create JIT script detector
