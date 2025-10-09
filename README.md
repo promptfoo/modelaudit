@@ -46,6 +46,56 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 ✗ Security issues found - DO NOT deploy this model
 ```
 
+## 📁 Project Structure
+
+ModelAudit is organized by conceptual purpose for clarity and maintainability:
+
+```
+modelaudit/
+├── scanners/         # 29 specialized file format scanners
+│   ├── pickle_scanner.py, pytorch_*.py, onnx_scanner.py, etc.
+│   └── base.py - BaseScanner class with shared functionality
+│
+├── detectors/        # Security threat detection modules
+│   ├── cve_patterns.py - Known CVE patterns (CVE-2025-32434, etc.)
+│   ├── secrets.py - API keys, tokens, credentials
+│   ├── jit_script.py - JIT/TorchScript malicious code
+│   ├── network_comm.py - URLs, IPs, sockets
+│   └── suspicious_symbols.py - Dangerous function calls
+│
+├── integrations/     # External system integrations
+│   ├── jfrog.py - JFrog Artifactory support
+│   ├── mlflow.py - MLflow registry support
+│   ├── sbom_generator.py - CycloneDX SBOM generation
+│   ├── sarif_formatter.py - SARIF output format
+│   └── license_checker.py - License compliance
+│
+├── analysis/         # Advanced analysis algorithms
+│   ├── anomaly_detector.py, entropy_analyzer.py
+│   └── ml_context_analyzer.py - Context-aware analysis
+│
+├── utils/
+│   ├── file/         # File handling (detection, filtering, streaming)
+│   ├── sources/      # Model sources (HuggingFace, cloud, JFrog, DVC)
+│   └── helpers/      # Generic utilities (retry, caching, etc.)
+│
+├── cache/            # Caching system for scan results
+├── auth/             # Authentication for remote sources
+├── progress/         # Progress tracking and UI
+│
+├── core.py           # Main scanning orchestration
+└── cli.py            # Command-line interface
+```
+
+**Navigation guide**:
+
+- **"What formats can we scan?"** → `scanners/`
+- **"What threats do we detect?"** → `detectors/`
+- **"What systems do we integrate with?"** → `integrations/`
+- **"Where can models come from?"** → `utils/sources/`
+
+[View detailed refactoring plan →](docs/REFACTORING_PLAN.md)
+
 ## 🛡️ What Problems It Solves
 
 ### **Prevents Code Execution Attacks**
@@ -78,22 +128,60 @@ Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
 
 ## 📊 Supported Model Formats
 
-ModelAudit scans **all major ML model formats** with specialized security analysis for each:
+ModelAudit supports **29 specialized file format scanners** with comprehensive security analysis:
 
-| Format          | Extensions                            | Risk Level | Notes                                        |
-| --------------- | ------------------------------------- | ---------- | -------------------------------------------- |
-| **PyTorch**     | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Contains pickle serialization - always scan  |
-| **Pickle**      | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Avoid in production - convert to SafeTensors |
-| **Joblib**      | `.joblib`                             | 🔴 HIGH    | Can contain pickled objects                  |
-| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`  | 🔴 HIGH    | Can contain malicious payloads               |
-| **SafeTensors** | `.safetensors`                        | 🟢 SAFE    | Preferred secure format                      |
-| **GGUF/GGML**   | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard, binary format                  |
-| **ONNX**        | `.onnx`                               | 🟢 SAFE    | Industry standard, good interoperability     |
-| **TensorFlow**  | `.pb`, SavedModel                     | 🟠 MEDIUM  | Scan for dangerous operations                |
-| **Keras**       | `.h5`, `.keras`, `.hdf5`              | 🟠 MEDIUM  | Check for executable layers                  |
-| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟡 LOW     | Validate transforms                          |
+### 🔴 High Risk Formats (Pickle-based serialization)
 
-Plus 10+ additional formats including ExecuTorch, TensorFlow Lite, Core ML, and more.
+| Format             | Extensions                        | Security Focus                    |
+| ------------------ | --------------------------------- | --------------------------------- |
+| **Pickle**         | `.pkl`, `.pickle`, `.dill`        | Dangerous opcodes, code execution |
+| **PyTorch**        | `.pt`, `.pth`, `.ckpt`, `.bin`    | Pickle payloads, embedded malware |
+| **Joblib**         | `.joblib`                         | Pickled scikit-learn objects      |
+| **NumPy**          | `.npy`, `.npz`                    | Array metadata, pickle objects    |
+| **JAX Checkpoint** | `.ckpt`, `.checkpoint`, `.pickle` | Serialized transforms             |
+
+### 🟠 Medium Risk Formats (Complex with custom operations)
+
+| Format              | Extensions               | Security Focus                |
+| ------------------- | ------------------------ | ----------------------------- |
+| **TensorFlow**      | `.pb`, SavedModel dirs   | PyFunc operations, custom ops |
+| **Keras H5**        | `.h5`, `.hdf5`           | Unsafe Lambda layers          |
+| **Keras ZIP**       | `.keras`                 | ZIP-based Keras archives      |
+| **ONNX**            | `.onnx`                  | Custom operators, metadata    |
+| **TensorFlow Lite** | `.tflite`                | Mobile model validation       |
+| **PaddlePaddle**    | `.pdmodel`, `.pdiparams` | Custom operations             |
+| **XGBoost**         | `.bst`, `.model`, `.ubj` | Serialized boosting models    |
+| **Core ML**         | `.mlmodel`               | Apple custom layers           |
+
+### 🟡 Lower Risk Formats (Safer serialization)
+
+| Format               | Extensions                            | Security Focus                  |
+| -------------------- | ------------------------------------- | ------------------------------- |
+| **SafeTensors**      | `.safetensors`                        | Header validation (recommended) |
+| **GGUF/GGML**        | `.gguf`, `.ggml`                      | LLM standard format             |
+| **JAX/Flax Msgpack** | `.msgpack`, `.flax`, `.orbax`, `.jax` | Msgpack serialization           |
+| **ExecuTorch**       | `.ptl`, `.pte`                        | PyTorch mobile archives         |
+| **TensorRT**         | `.engine`, `.plan`                    | NVIDIA inference engines        |
+| **OpenVINO**         | `.xml`                                | Intel IR format                 |
+| **PMML**             | `.pmml`                               | XML predictive models           |
+| **OCI Layers**       | `.manifest`                           | Container layer analysis        |
+
+### 📦 Archive & Container Formats
+
+| Format    | Extensions                                                        | Security Focus                  |
+| --------- | ----------------------------------------------------------------- | ------------------------------- |
+| **ZIP**   | `.zip`                                                            | Path traversal, malicious files |
+| **TAR**   | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz` | Archive exploits                |
+| **7-Zip** | `.7z`                                                             | Archive security                |
+
+### 📄 Configuration & Metadata Formats
+
+| Format               | Extensions                                        | Security Focus            |
+| -------------------- | ------------------------------------------------- | ------------------------- |
+| **Metadata**         | `.json`, `.md`, `.yml`, `.yaml`, `.rst`           | Embedded secrets, URLs    |
+| **Manifest**         | `.json`, `.yaml`, `.xml`, `.toml`, `.ini`, `.cfg` | Config vulnerabilities    |
+| **Text**             | `.txt`, `.md`, `.markdown`, `.rst`                | ML-related text analysis  |
+| **Jinja2 Templates** | `.jinja`, `.j2`, `.template`                      | Template injection (SSTI) |
 
 [View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
@@ -334,24 +422,44 @@ docker run --rm -v "%cd%":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 
 ## Supported Formats
 
-ModelAudit includes 29 specialized scanners for ML model formats ([see complete list](https://www.promptfoo.dev/docs/model-audit/scanners/)):
+ModelAudit includes **29 specialized file format scanners** ([see complete list](https://www.promptfoo.dev/docs/model-audit/scanners/)):
 
-| Format          | Extensions                                | Security Focus                                     |
-| --------------- | ----------------------------------------- | -------------------------------------------------- |
-| **Pickle**      | `.pkl`, `.pickle`, `.dill`, `.pt`, `.pth` | Code execution, malicious opcodes, deserialization |
-| **Archives**    | `.zip`, `.tar`, `.gz`, `.7z`, `.bz2`      | Path traversal, embedded executables               |
-| **TensorFlow**  | `.pb`, SavedModel directories             | Dangerous operations, custom ops                   |
-| **Keras**       | `.h5`, `.keras`, `.hdf5`                  | Unsafe layers, custom objects                      |
-| **ONNX**        | `.onnx`                                   | Custom operators, metadata                         |
-| **SafeTensors** | `.safetensors`                            | Header validation, metadata                        |
-| **GGUF/GGML**   | `.gguf`, `.ggml`                          | Header validation, metadata                        |
-| **Joblib**      | `.joblib`                                 | Pickled objects, scikit-learn                      |
-| **JAX/Flax**    | `.msgpack`, `.flax`, `.orbax`             | Serialized transforms                              |
-| **NumPy**       | `.npy`, `.npz`                            | Array metadata, pickle objects                     |
-| **Core ML**     | `.mlmodel`                                | Custom layers, metadata                            |
-| **ExecuTorch**  | `.ptl`, `.pte`                            | Mobile model validation                            |
+### Model Formats
 
-Plus scanners for TensorFlow Lite, TensorRT, PaddlePaddle, OpenVINO, text files, and configuration formats.
+| Format              | Extensions                            | Risk Level | Security Focus                    |
+| ------------------- | ------------------------------------- | ---------- | --------------------------------- |
+| **Pickle**          | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Code execution, dangerous opcodes |
+| **PyTorch**         | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Pickle payloads, embedded malware |
+| **Joblib**          | `.joblib`                             | 🔴 HIGH    | Pickled scikit-learn objects      |
+| **NumPy**           | `.npy`, `.npz`                        | 🔴 HIGH    | Array metadata, pickle objects    |
+| **TensorFlow**      | `.pb`, SavedModel directories         | 🟠 MEDIUM  | PyFunc operations, custom ops     |
+| **Keras**           | `.h5`, `.hdf5`, `.keras`              | 🟠 MEDIUM  | Unsafe layers, custom objects     |
+| **ONNX**            | `.onnx`                               | 🟠 MEDIUM  | Custom operators, metadata        |
+| **XGBoost**         | `.bst`, `.model`, `.ubj`              | 🟠 MEDIUM  | Serialized boosting models        |
+| **SafeTensors**     | `.safetensors`                        | 🟢 SAFE    | Header validation (recommended)   |
+| **GGUF/GGML**       | `.gguf`, `.ggml`                      | 🟢 SAFE    | LLM standard format               |
+| **JAX/Flax**        | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟡 LOW     | Msgpack serialization             |
+| **JAX Checkpoint**  | `.ckpt`, `.checkpoint`, `.pickle`     | 🟡 LOW     | JAX checkpoint formats            |
+| **TensorFlow Lite** | `.tflite`                             | 🟡 LOW     | Mobile model validation           |
+| **ExecuTorch**      | `.ptl`, `.pte`                        | 🟡 LOW     | PyTorch mobile archives           |
+| **Core ML**         | `.mlmodel`                            | 🟡 LOW     | Apple custom layers               |
+| **TensorRT**        | `.engine`, `.plan`                    | 🟡 LOW     | NVIDIA inference engines          |
+| **PaddlePaddle**    | `.pdmodel`, `.pdiparams`              | 🟡 LOW     | Custom operations                 |
+| **OpenVINO**        | `.xml`                                | 🟡 LOW     | Intel IR format                   |
+| **PMML**            | `.pmml`                               | 🟡 LOW     | XML predictive models             |
+
+### Archive & Configuration Formats
+
+| Format               | Extensions                                  | Security Focus                  |
+| -------------------- | ------------------------------------------- | ------------------------------- |
+| **ZIP**              | `.zip`                                      | Path traversal, malicious files |
+| **TAR**              | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, etc. | Archive exploits                |
+| **7-Zip**            | `.7z`                                       | Archive security                |
+| **OCI Layers**       | `.manifest`                                 | Container layer analysis        |
+| **Metadata**         | `.json`, `.md`, `.yml`, `.yaml`, `.rst`     | Embedded secrets, URLs          |
+| **Manifest**         | `.json`, `.yaml`, `.xml`, `.toml`, `.ini`   | Configuration vulnerabilities   |
+| **Text**             | `.txt`, `.md`, `.markdown`, `.rst`          | ML-related text analysis        |
+| **Jinja2 Templates** | `.jinja`, `.j2`, `.template`                | Template injection (SSTI)       |
 
 [Complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 

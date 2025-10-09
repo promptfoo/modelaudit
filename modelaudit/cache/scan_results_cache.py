@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ..utils.secure_hasher import SecureFileHasher
+from ..utils.helpers.secure_hasher import SecureFileHasher
 
 logger = logging.getLogger(__name__)
 

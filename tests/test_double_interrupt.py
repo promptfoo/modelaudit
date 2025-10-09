@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from modelaudit.interrupt_handler import InterruptHandler, get_interrupt_handler, interruptible_scan
+from modelaudit.utils.helpers.interrupt_handler import InterruptHandler, get_interrupt_handler, interruptible_scan
 
 
 class TestDoubleInterrupt(unittest.TestCase):

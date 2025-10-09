@@ -24,7 +24,7 @@ import re
 import warnings
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
