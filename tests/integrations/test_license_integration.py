@@ -34,7 +34,7 @@ class TestLicenseIntegration:
     @pytest.fixture
     def test_data_dir(self):
         """Return path to integration test data."""
-        return Path(__file__).parent / "assets/scenarios/license_scenarios"
+        return Path(__file__).parent.parent / "assets/scenarios/license_scenarios"
 
     def test_mit_model_clean_license_detection(self, test_data_dir: Any) -> None:
         """Test that MIT licensed model is properly detected without warnings."""

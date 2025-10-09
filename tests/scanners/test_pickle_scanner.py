@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
-        self.evil_pickle_path = Path(__file__).parent / "assets/samples/pickles/evil.pickle"
+        self.evil_pickle_path = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
 
         # Create the evil pickle if it doesn't exist
         if not self.evil_pickle_path.exists():
@@ -68,7 +68,7 @@ class TestPickleScanner(unittest.TestCase):
 
     def test_scan_dill_pickle(self):
         """Scanner should flag suspicious dill references"""
-        dill_pickle_path = Path(__file__).parent / "assets/samples/pickles/dill_func.pkl"
+        dill_pickle_path = Path(__file__).parent.parent / "assets/samples/pickles/dill_func.pkl"
         if not dill_pickle_path.exists():
 
             def func(x):

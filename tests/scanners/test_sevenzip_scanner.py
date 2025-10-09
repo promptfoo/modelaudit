@@ -465,7 +465,7 @@ class TestSevenZipScannerIntegration:
     @pytest.fixture
     def assets_dir(self):
         """Get the test assets directory"""
-        return Path(__file__).parent / "assets" / "samples" / "archives"
+        return Path(__file__).parent.parent / "assets" / "samples" / "archives"
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available for integration tests")
     def test_scan_sample_archives_if_available(self, assets_dir):
