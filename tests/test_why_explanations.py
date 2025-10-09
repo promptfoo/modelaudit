@@ -3,7 +3,7 @@
 import pickle
 import tempfile
 
-from modelaudit.explanations import (
+from modelaudit.config.explanations import (
     COMMON_MESSAGE_EXPLANATIONS,
     TF_OP_EXPLANATIONS,
     get_import_explanation,
@@ -186,7 +186,7 @@ def test_tf_op_explanation_function():
 
 def test_all_tf_operations_have_explanations():
     """Test that all TensorFlow operations in TF_OP_EXPLANATIONS have valid explanations."""
-    from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+    from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS
 
     # Verify all SUSPICIOUS_OPS have explanations
     for op in SUSPICIOUS_OPS:
@@ -267,7 +267,7 @@ def test_tf_explanation_categories():
 
 def test_tf_explanation_unified_architecture():
     """Test that TensorFlow explanations use the unified get_explanation architecture."""
-    from modelaudit.explanations import get_explanation
+    from modelaudit.config.explanations import get_explanation
 
     # Test that get_tf_op_explanation uses get_explanation internally
     op_name = "PyFunc"
@@ -457,7 +457,7 @@ def test_message_explanation_serialization():
 
 def test_context_aware_explanations():
     """Test that explanations can be enhanced with context information."""
-    from modelaudit.explanations import get_message_explanation
+    from modelaudit.config.explanations import get_message_explanation
 
     # Test ML model context enhancement
     basic_explanation = get_message_explanation("Custom objects found")

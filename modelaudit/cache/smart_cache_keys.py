@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from ..utils.secure_hasher import SecureFileHasher
+from ..utils.helpers.secure_hasher import SecureFileHasher
 
 
 @dataclass

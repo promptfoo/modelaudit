@@ -2,7 +2,7 @@ import os
 import struct
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
@@ -35,7 +35,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         # Check if it's actually a pytorch binary file
         try:
-            from modelaudit.utils.filetype import detect_file_format, validate_file_type
+            from modelaudit.utils.file.detection import detect_file_format, validate_file_type
 
             file_format = detect_file_format(path)
 
@@ -219,7 +219,7 @@ class PyTorchBinaryScanner(BaseScanner):
         offset: int,
     ) -> None:
         """Check for executable file signatures with ML context awareness"""
-        from modelaudit.utils.ml_context import (
+        from modelaudit.utils.helpers.ml_context import (
             analyze_binary_for_ml_context,
             should_ignore_executable_signature,
         )

@@ -8,7 +8,7 @@ import re
 import struct
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -46,7 +46,7 @@ class SafeTensorsScanner(BaseScanner):
             return True
 
         try:
-            from modelaudit.utils.filetype import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format
 
             return detect_file_format(path) == "safetensors"
         except Exception:
