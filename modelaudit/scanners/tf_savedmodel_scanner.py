@@ -3,9 +3,9 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
-from modelaudit.explanations import get_tf_op_explanation
-from modelaudit.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
-from modelaudit.utils.code_validation import (
+from modelaudit.config.explanations import get_tf_op_explanation
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )

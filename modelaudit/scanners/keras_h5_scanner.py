@@ -2,16 +2,16 @@ import json
 import os
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_LAYER_TYPES,
 )
-from modelaudit.utils.code_validation import (
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
-from ..explanations import get_pattern_explanation
+from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
