@@ -593,9 +593,9 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_advanced_torchscript_vulnerabilities(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan_advanced_torchscript_vulnerabilities(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Advanced TorchScript vulnerability scanning for sophisticated attacks"""
-        findings: list[dict[str, Any]] = []
+        findings: list[JITScriptFinding] = []
 
         try:
             text_data = data.decode("utf-8", errors="ignore")
@@ -615,17 +615,20 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_serialization_injection",
-                        "severity": "CRITICAL",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript serialization vulnerability: {description}",
-                        "context": context,
-                        "recommendation": "Use safe serialization methods and validate all model sources",
-                    }
+                    create_jit_finding(
+                        type="torchscript_serialization_injection",
+                        severity="CRITICAL",
+                        pattern=pattern,
+                        message=f"TorchScript serialization vulnerability: {description}",
+                        context=context,
+                        recommendation="Use safe serialization methods and validate all model sources",
+                        confidence=0.9,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
         # 2. TorchScript module manipulation attacks
@@ -642,17 +645,20 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_module_manipulation",
-                        "severity": "HIGH",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript module manipulation: {description}",
-                        "context": context,
-                        "recommendation": "Review model architecture for unauthorized module modifications",
-                    }
+                    create_jit_finding(
+                        type="torchscript_module_manipulation",
+                        severity="HIGH",
+                        pattern=pattern,
+                        message=f"TorchScript module manipulation: {description}",
+                        context=context,
+                        recommendation="Review model architecture for unauthorized module modifications",
+                        confidence=0.8,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                        builtin=None,
+                        import_=None,
+                    )
                 )
 
         # 3. TorchScript graph manipulation
@@ -668,17 +674,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_graph_manipulation",
-                        "severity": "HIGH",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript graph manipulation: {description}",
-                        "context": context,
-                        "recommendation": "Validate model graph integrity and compilation process",
-                    }
+                    create_jit_finding(
+                        type="torchscript_graph_manipulation",
+                        severity="HIGH",
+                        message=f"TorchScript graph manipulation: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="Validate model graph integrity and compilation process",
+                        confidence=0.8,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         # 4. TorchScript bytecode injection
@@ -694,17 +701,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_bytecode_injection",
-                        "severity": "CRITICAL",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript bytecode injection: {description}",
-                        "context": context,
-                        "recommendation": "This indicates potential code injection at the bytecode level",
-                    }
+                    create_jit_finding(
+                        type="torchscript_bytecode_injection",
+                        severity="CRITICAL",
+                        message=f"TorchScript bytecode injection: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="This indicates potential code injection at the bytecode level",
+                        confidence=0.9,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         # 5. TorchScript CUDA/backend exploitation
@@ -720,17 +728,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_backend_exploitation",
-                        "severity": "HIGH",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript backend exploitation: {description}",
-                        "context": context,
-                        "recommendation": "Review backend operations for security vulnerabilities",
-                    }
+                    create_jit_finding(
+                        type="torchscript_backend_exploitation",
+                        severity="HIGH",
+                        message=f"TorchScript backend exploitation: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="Review backend operations for security vulnerabilities",
+                        confidence=0.8,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         # 6. TorchScript hook and callback injection
@@ -746,17 +755,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_hook_injection",
-                        "severity": "CRITICAL",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"TorchScript hook injection: {description}",
-                        "context": context,
-                        "recommendation": "Hooks can execute arbitrary code - review all hook registrations",
-                    }
+                    create_jit_finding(
+                        type="torchscript_hook_injection",
+                        severity="CRITICAL",
+                        message=f"TorchScript hook injection: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="Hooks can execute arbitrary code - review all hook registrations",
+                        confidence=0.9,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         # 7. Check for obfuscated TorchScript code
@@ -771,17 +781,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_obfuscation",
-                        "severity": "WARNING",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"Obfuscated TorchScript code: {description}",
-                        "context": context,
-                        "recommendation": "Obfuscated code may hide malicious functionality",
-                    }
+                    create_jit_finding(
+                        type="torchscript_obfuscation",
+                        severity="WARNING",
+                        message=f"Obfuscated TorchScript code: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="Obfuscated code may hide malicious functionality",
+                        confidence=0.7,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         # 8. TorchScript version-specific vulnerability patterns
@@ -796,17 +807,18 @@ class JITScriptDetector:
             matches = re.findall(pattern, text_data, re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append(
-                    {
-                        "type": "torchscript_version_vulnerability",
-                        "severity": "CRITICAL",
-                        "pattern": pattern,
-                        "description": description,
-                        "matches": len(matches),
-                        "framework": "TorchScript",
-                        "message": f"Version-specific vulnerability: {description}",
-                        "context": context,
-                        "recommendation": "Update PyTorch version and review loading patterns",
-                    }
+                    create_jit_finding(
+                        type="torchscript_version_vulnerability",
+                        severity="CRITICAL",
+                        message=f"Version-specific vulnerability: {description}",
+                        pattern=pattern,
+                        context=context,
+                        recommendation="Update PyTorch version and review loading patterns",
+                        confidence=0.9,
+                        framework="TorchScript",
+                        code_snippet=None,
+                        operation=None,
+                    )
                 )
 
         return findings
@@ -837,7 +849,7 @@ class JITScriptDetector:
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
             # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
-            # findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
             findings.extend(self.scan_tensorflow(data, context))
@@ -850,7 +862,7 @@ class JITScriptDetector:
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
             # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
-            # findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
 
