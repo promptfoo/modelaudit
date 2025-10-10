@@ -14,17 +14,22 @@ from . import __version__
 from .auth.client import auth_client
 from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
 from .core import determine_exit_code, scan_model_directory_or_file
-from .interrupt_handler import interruptible_scan
-from .jfrog_integration import scan_jfrog_artifact
+from .integrations.jfrog import scan_jfrog_artifact
+from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
-from .sarif_formatter import format_sarif_output
 from .scanners.base import IssueSeverity
 from .utils import resolve_dvc_file
-from .utils.cloud_storage import download_from_cloud, is_cloud_url
-from .utils.huggingface import download_file_from_hf, download_model, is_huggingface_file_url, is_huggingface_url
-from .utils.jfrog import is_jfrog_url
-from .utils.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
-from .utils.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
+from .utils.helpers.interrupt_handler import interruptible_scan
+from .utils.helpers.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
+from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
+from .utils.sources.huggingface import (
+    download_file_from_hf,
+    download_model,
+    is_huggingface_file_url,
+    is_huggingface_url,
+)
+from .utils.sources.jfrog import is_jfrog_url
+from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
 
@@ -765,7 +770,7 @@ def scan_command(
 
                         # Get model info for size preview
                         try:
-                            from .utils.huggingface import get_model_info
+                            from .utils.sources.huggingface import get_model_info
 
                             model_info = get_model_info(path)
 
@@ -896,7 +901,7 @@ def scan_command(
                     if dry_run:
                         import asyncio
 
-                        from .utils.cloud_storage import analyze_cloud_target
+                        from .utils.sources.cloud_storage import analyze_cloud_target
 
                         try:
                             metadata = asyncio.run(analyze_cloud_target(path))
@@ -912,7 +917,7 @@ def scan_command(
                                 click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
 
                                 if final_selective:
-                                    from .utils.cloud_storage import filter_scannable_files
+                                    from .utils.sources.cloud_storage import filter_scannable_files
 
                                     scannable = filter_scannable_files(metadata.get("files", []))
                                     click.echo(
@@ -993,7 +998,7 @@ def scan_command(
                         click.echo(f"Downloading from {path}...")
 
                     try:
-                        from .mlflow_integration import scan_mlflow_model
+                        from .integrations.mlflow import scan_mlflow_model
 
                         # Use scan_mlflow_model to download and get scan results directly
                         results: ModelAuditResultModel = scan_mlflow_model(
@@ -1348,7 +1353,7 @@ def scan_command(
 
     # Generate SBOM if requested
     if sbom:
-        from .sbom import generate_sbom_pydantic
+        from .integrations.sbom_generator import generate_sbom_pydantic
 
         # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
         # to prevent FileNotFoundError when generating SBOM for downloaded content

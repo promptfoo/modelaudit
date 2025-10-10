@@ -4,13 +4,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from modelaudit.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_CONFIG_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 # Try to import the name policies module
 try:
-    from modelaudit.name_policies.blacklist import check_model_name_policies
+    from modelaudit.config.name_blacklist import check_model_name_policies
 
     HAS_NAME_POLICIES = True
 except ImportError:

@@ -6,8 +6,8 @@ import os
 import zlib
 from typing import Any, ClassVar
 
-from ..cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
-from ..utils.filetype import read_magic_bytes
+from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
+from ..utils.file.detection import read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 

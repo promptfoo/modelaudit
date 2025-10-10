@@ -11,9 +11,9 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from ..context.unified_context import UnifiedMLContext
-from ..explanations import get_message_explanation
-from ..interrupt_handler import check_interrupted
+from ..analysis.unified_context import UnifiedMLContext
+from ..config.explanations import get_message_explanation
+from ..utils.helpers.interrupt_handler import check_interrupted
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
@@ -398,7 +398,7 @@ class BaseScanner(ABC):
         Returns:
             ScanResult object (either from cache or fresh scan)
         """
-        from ..utils.cache_decorator import cached_scan
+        from ..utils.helpers.cache_decorator import cached_scan
 
         # Create cached version of the scan method
         @cached_scan()
@@ -538,7 +538,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.secrets_detector import SecretsDetector
+            from modelaudit.detectors.secrets import SecretsDetector
 
             detector = SecretsDetector(self.config.get("secrets_config"))
             findings = detector.scan_model_weights(data, context)
@@ -602,7 +602,7 @@ class BaseScanner(ABC):
             return []
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
@@ -722,7 +722,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
@@ -807,7 +807,7 @@ class BaseScanner(ABC):
             return []
 
         try:
-            from modelaudit.network_comm_detector import NetworkCommDetector
+            from modelaudit.detectors.network_comm import NetworkCommDetector
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
@@ -925,7 +925,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.network_comm_detector import NetworkCommDetector
+            from modelaudit.detectors.network_comm import NetworkCommDetector
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
@@ -1021,7 +1021,7 @@ class BaseScanner(ABC):
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
             try:
-                from modelaudit.utils.filetype import (
+                from modelaudit.utils.file.detection import (
                     detect_file_format_from_magic,
                     detect_format_from_extension,
                     validate_file_type,
