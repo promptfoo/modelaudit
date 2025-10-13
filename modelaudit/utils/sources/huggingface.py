@@ -119,17 +119,29 @@ def get_model_info(url: str) -> dict:
 
     api = HfApi()
     try:
-        # Get model info
+        # Get model info for metadata
         model_info = api.model_info(repo_id)
 
-        # Calculate total size
+        # Use list_repo_tree to get accurate file sizes
+        # (model_info.siblings often returns None for size)
         total_size = 0
         files = []
-        siblings = model_info.siblings or []
-        for sibling in siblings:
-            if sibling.rfilename not in [".gitattributes", "README.md"]:
-                total_size += sibling.size or 0
-                files.append({"name": sibling.rfilename, "size": sibling.size or 0})
+        try:
+            repo_files = api.list_repo_tree(repo_id, recursive=False)
+            for item in repo_files:
+                # Skip metadata files
+                if hasattr(item, 'path') and item.path not in [".gitattributes", "README.md"]:
+                    file_size = getattr(item, 'size', 0) or 0
+                    total_size += file_size
+                    files.append({"name": item.path, "size": file_size})
+        except Exception:
+            # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
+            total_size = 0
+            # Still try to get file count from siblings
+            siblings = model_info.siblings or []
+            for sibling in siblings:
+                if sibling.rfilename not in [".gitattributes", "README.md"]:
+                    files.append({"name": sibling.rfilename, "size": 0})
 
         return {
             "repo_id": repo_id,

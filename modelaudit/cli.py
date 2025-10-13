@@ -555,6 +555,8 @@ def scan_command(
     if strict:
         user_overrides["skip_non_model_files"] = False
         user_overrides["strict_license"] = True
+    if verbose:
+        user_overrides["verbose"] = True
     if quiet:
         user_overrides["verbose"] = False
 
@@ -776,7 +778,9 @@ def scan_command(
 
                             # Format size
                             size_bytes = model_info["total_size"]
-                            if size_bytes >= 1024 * 1024 * 1024:
+                            if size_bytes == 0:
+                                size_str = "Unknown size"
+                            elif size_bytes >= 1024 * 1024 * 1024:
                                 size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
                             elif size_bytes >= 1024 * 1024:
                                 size_str = f"{size_bytes / (1024 * 1024):.2f} MB"

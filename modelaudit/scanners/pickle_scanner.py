@@ -946,6 +946,7 @@ class PickleScanner(BaseScanner):
 
         # Early detection of dangerous patterns BEFORE attempting to parse pickle
         early_detection_successful = False
+
         try:
             # Use the most basic file operations possible to avoid recursion issues
             # Read file in smaller chunks to avoid memory/recursion issues
@@ -968,32 +969,32 @@ class PickleScanner(BaseScanner):
                     raw_content += chunk
                     bytes_read += len(chunk)
 
-                # Use the refactored method to scan for dangerous patterns
-                self._scan_for_dangerous_patterns(raw_content, result, path)
+            # Use the refactored method to scan for dangerous patterns
+            self._scan_for_dangerous_patterns(raw_content, result, path)
 
-                # If we scanned for dangerous patterns but found none, record a successful check
-                dangerous_found = any(
-                    check.name == "Dangerous Pattern Detection" and check.status == CheckStatus.FAILED
-                    for check in result.checks
+            # If we scanned for dangerous patterns but found none, record a successful check
+            dangerous_found = any(
+                check.name == "Dangerous Pattern Detection" and check.status == CheckStatus.FAILED
+                for check in result.checks
+            )
+            if not dangerous_found:
+                result.add_check(
+                    name="Dangerous Pattern Detection",
+                    passed=True,
+                    message="No dangerous patterns found in raw file content",
+                    location=path,
+                    details={
+                        "detection_method": "raw_content_scan",
+                        "patterns_checked": [
+                            "posix",
+                            "subprocess",
+                            "eval",
+                            "exec",
+                            "__import__",
+                            "builtins",
+                        ],
+                    },
                 )
-                if not dangerous_found:
-                    result.add_check(
-                        name="Dangerous Pattern Detection",
-                        passed=True,
-                        message="No dangerous patterns found in raw file content",
-                        location=path,
-                        details={
-                            "detection_method": "raw_content_scan",
-                            "patterns_checked": [
-                                "posix",
-                                "subprocess",
-                                "eval",
-                                "exec",
-                                "__import__",
-                                "builtins",
-                            ],
-                        },
-                    )
 
                 early_detection_successful = True
 
