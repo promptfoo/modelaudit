@@ -148,25 +148,323 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
     },
 }
 
-# Safe ML-specific global patterns
+# SECURITY: ALWAYS flag these as dangerous, regardless of ML context
+# These functions can execute arbitrary code and should NEVER be whitelisted
+# Based on Fickling analysis and security best practices
+ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
+    # System commands
+    "os.system",
+    "os.popen",
+    "os.popen2",
+    "os.popen3",
+    "os.popen4",
+    "os.execl",
+    "os.execle",
+    "os.execlp",
+    "os.execlpe",
+    "os.execv",
+    "os.execve",
+    "os.execvp",
+    "os.execvpe",
+    "os.spawn",
+    "os.spawnl",
+    "os.spawnle",
+    "os.spawnlp",
+    "os.spawnlpe",
+    "os.spawnv",
+    "os.spawnve",
+    "os.spawnvp",
+    "os.spawnvpe",
+    # Subprocess
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.run",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+    # Code execution
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "importlib.import_module",
+    # File operations (can be dangerous in wrong context)
+    "open",
+    "file",
+    "io.open",
+    "builtins.open",
+    # Dynamic attribute access (Fickling: operator module)
+    "getattr",
+    "setattr",
+    "delattr",
+    "operator.getitem",
+    "operator.attrgetter",
+    "operator.itemgetter",
+    "operator.methodcaller",
+    # Code objects
+    "code",
+    "types.CodeType",
+    "types.FunctionType",
+    # Other dangerous operations
+    "pickle.loads",
+    "pickle.load",
+    "marshal.loads",
+    "marshal.load",
+    # Torch dangerous functions (Fickling)
+    "torch.load",
+    "torch.hub.load",
+    "torch.hub.load_state_dict_from_url",
+    "torch.storage._load_from_bytes",
+    # NumPy dangerous functions (Fickling)
+    "numpy.testing._private.utils.runstring",
+    # Shell utilities
+    "shutil.rmtree",
+    "shutil.move",
+    "shutil.copy",
+    "shutil.copytree",
+}
+
+# Module prefixes that are always dangerous (Fickling-based + additional)
+ALWAYS_DANGEROUS_MODULES: set[str] = {
+    "__builtin__",
+    "__builtins__",
+    "builtins",
+    "os",
+    "posix",
+    "nt",
+    "subprocess",
+    "sys",
+    "socket",
+    "urllib",
+    "urllib2",
+    "http",
+    "ftplib",
+    "telnetlib",
+    "pty",
+    "commands",
+    "shutil",
+    "code",
+    "torch.hub",
+}
+
+# Safe ML-specific global patterns (SECURITY: NO WILDCARDS - explicit lists only)
 ML_SAFE_GLOBALS: dict[str, list[str]] = {
-    # PyTorch safe patterns
-    "torch": ["*"],  # All torch functions are generally safe
-    "torch.nn": ["*"],
-    "torch.optim": ["*"],
-    "torch.utils": ["*"],
-    "_pickle": ["*"],  # PyTorch uses _pickle internally
-    "collections": ["OrderedDict", "defaultdict", "namedtuple"],
-    "typing": ["*"],
-    "numpy": ["*"],  # NumPy operations are safe
-    "math": ["*"],  # Math operations are safe
+    # PyTorch - explicit functions only (no wildcards)
+    "torch": [
+        "Tensor",
+        "FloatTensor",
+        "LongTensor",
+        "IntTensor",
+        "DoubleTensor",
+        "HalfTensor",
+        "BFloat16Tensor",
+        "ByteTensor",
+        "CharTensor",
+        "ShortTensor",
+        "BoolTensor",
+        "Size",
+        "device",
+        "dtype",
+        "storage",
+        "_utils",
+        "nn",
+        "optim",
+        "jit",
+        "cuda",
+        "distributed",
+        "multiprocessing",
+        "autograd",
+        "save",
+        "load",
+        "no_grad",
+        "enable_grad",
+        "set_grad_enabled",
+        "inference_mode",
+    ],
+    "torch.nn": [
+        "Module",
+        "Parameter",
+        "Linear",
+        "Conv1d",
+        "Conv2d",
+        "Conv3d",
+        "ConvTranspose1d",
+        "ConvTranspose2d",
+        "ConvTranspose3d",
+        "BatchNorm1d",
+        "BatchNorm2d",
+        "BatchNorm3d",
+        "GroupNorm",
+        "LayerNorm",
+        "InstanceNorm1d",
+        "InstanceNorm2d",
+        "InstanceNorm3d",
+        "ReLU",
+        "LeakyReLU",
+        "PReLU",
+        "ELU",
+        "GELU",
+        "Sigmoid",
+        "Tanh",
+        "Softmax",
+        "LogSoftmax",
+        "Dropout",
+        "Dropout2d",
+        "Dropout3d",
+        "MaxPool1d",
+        "MaxPool2d",
+        "MaxPool3d",
+        "AvgPool1d",
+        "AvgPool2d",
+        "AvgPool3d",
+        "AdaptiveMaxPool1d",
+        "AdaptiveMaxPool2d",
+        "AdaptiveMaxPool3d",
+        "AdaptiveAvgPool1d",
+        "AdaptiveAvgPool2d",
+        "AdaptiveAvgPool3d",
+        "Sequential",
+        "ModuleList",
+        "ModuleDict",
+        "ParameterList",
+        "ParameterDict",
+        "Embedding",
+        "EmbeddingBag",
+        "RNN",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "TransformerEncoder",
+        "TransformerDecoder",
+        "MultiheadAttention",
+    ],
+    "torch.optim": [
+        "Adam",
+        "AdamW",
+        "SGD",
+        "RMSprop",
+        "Adagrad",
+        "Adadelta",
+        "Adamax",
+        "ASGD",
+        "LBFGS",
+        "Optimizer",
+    ],
+    "torch.utils": [
+        "data",
+        "checkpoint",
+        "tensorboard",
+    ],
+    "torch.utils.data": [
+        "Dataset",
+        "DataLoader",
+        "TensorDataset",
+        "ConcatDataset",
+        "Subset",
+        "random_split",
+    ],
+    "_pickle": [
+        "Unpickler",
+        "Pickler",
+    ],
+    "collections": ["OrderedDict", "defaultdict", "namedtuple", "Counter", "deque"],
+    "typing": [
+        "Any",
+        "Union",
+        "Optional",
+        "List",
+        "Dict",
+        "Tuple",
+        "Set",
+        "Callable",
+    ],
+    "numpy": [
+        "ndarray",
+        "array",
+        "zeros",
+        "ones",
+        "empty",
+        "arange",
+        "linspace",
+        "dtype",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float16",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+        "bool_",
+    ],
+    "numpy.core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy.core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
+    "math": [
+        "sqrt",
+        "pow",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "tan",
+        "pi",
+        "e",
+    ],
     # YOLO/Ultralytics safe patterns
-    "ultralytics": ["*"],
-    "yolo": ["*"],
+    "ultralytics": [
+        "YOLO",
+        "NAS",
+        "SAM",
+        "RTDETR",
+        "FastSAM",
+        "utils",
+        "nn",
+    ],
+    "yolo": [
+        "v5",
+        "v8",
+        "Detect",
+        "Segment",
+        "Classify",
+    ],
     # Standard ML libraries
-    "sklearn": ["*"],
-    "transformers": ["*"],
-    "tokenizers": ["*"],
+    "sklearn": [
+        "base",
+        "ensemble",
+        "linear_model",
+        "tree",
+        "svm",
+        "neighbors",
+        "cluster",
+        "decomposition",
+        "preprocessing",
+    ],
+    "transformers": [
+        "AutoModel",
+        "AutoTokenizer",
+        "PreTrainedModel",
+        "PreTrainedTokenizer",
+        "BertModel",
+        "GPT2Model",
+    ],
+    "tokenizers": [
+        "Tokenizer",
+        "BertWordPieceTokenizer",
+        "ByteLevelBPETokenizer",
+    ],
     "joblib": [
         "dump",
         "load",
@@ -178,8 +476,23 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_pickle_load",
     ],
     "dill": ["dump", "dumps", "load", "loads", "copy"],
-    "tensorflow": ["*"],
-    "keras": ["*"],
+    "tensorflow": [
+        "Tensor",
+        "Variable",
+        "constant",
+        "keras",
+        "nn",
+        "function",
+        "Module",
+    ],
+    "keras": [
+        "Model",
+        "Sequential",
+        "layers",
+        "optimizers",
+        "losses",
+        "metrics",
+    ],
     # XGBoost safe patterns
     "xgboost": [
         "Booster",
@@ -335,14 +648,39 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     """
     Smart global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
+
+    Security-first approach: Always flag dangerous functions, then check ML context
+    for less critical operations.
     """
-    # If we have high ML confidence, be more lenient with "suspicious" globals
-    if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5 and mod in ML_SAFE_GLOBALS:
+    full_ref = f"{mod}.{func}"
+
+    # STEP 1: ALWAYS flag dangerous functions (no ML context exceptions)
+    if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
+        logger.warning(
+            f"Always-dangerous function detected: {full_ref} "
+            f"(flagged regardless of ML context confidence={ml_context.get('overall_confidence', 0):.2f})"
+        )
+        return True
+
+    # STEP 2: ALWAYS flag dangerous modules (no exceptions)
+    if mod in ALWAYS_DANGEROUS_MODULES:
+        logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
+        return True
+
+    # STEP 3: Check ML context for less critical operations
+    # Only applies if:
+    # - High ML confidence (> 0.7, raised from 0.5)
+    # - Module is in whitelist
+    # - Function is explicitly listed (NO wildcards!)
+    if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.7 and mod in ML_SAFE_GLOBALS:
         safe_funcs = ML_SAFE_GLOBALS[mod]
-        if safe_funcs == ["*"] or func in safe_funcs:
+
+        # NO MORE WILDCARD SUPPORT - must be exact function match
+        if func in safe_funcs:
+            logger.debug(f"ML context allows {full_ref} (confidence={ml_context.get('overall_confidence', 0):.2f})")
             return False
 
-    # Use original suspicious global check for genuinely suspicious patterns
+    # STEP 4: Use original suspicious global check for other patterns
     return is_suspicious_global(mod, func)
 
 
@@ -514,47 +852,55 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
 def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bool:
     """
     Determine if an opcode sequence should be ignored based on ML context.
+
+    SECURITY: Never skip opcode analysis entirely. ML context can reduce
+    sensitivity but critical security checks must always run.
     """
-    if not ml_context.get("is_ml_content"):
-        return False
-
-    # High confidence ML content - be very permissive with opcode sequences
-    if ml_context.get("overall_confidence", 0) > 0.7:
-        return True
-
-    # Medium confidence - check for specific ML patterns
-    if ml_context.get("overall_confidence", 0) > 0.4:
-        # Look for legitimate ML construction patterns
-        reduce_count = sum(1 for opcode, _, _ in opcodes if opcode.name == "REDUCE")
-        global_count = sum(1 for opcode, _, _ in opcodes if opcode.name == "GLOBAL")
-
-        # High REDUCE/GLOBAL ratio suggests ML object construction
-        if global_count > 0 and reduce_count / global_count > 0.5:
-            return True
-
+    # NEVER skip opcode analysis, regardless of ML confidence
+    # Opcode sequence analysis is a critical security check
     return False
 
 
 def _get_context_aware_severity(
     base_severity: IssueSeverity,
     ml_context: dict,
+    issue_type: str = "",
 ) -> IssueSeverity:
     """
     Adjust severity based on ML context confidence.
+
+    SECURITY: Never downgrade CRITICAL issues below HIGH. Critical means critical.
     """
     if not ml_context.get("is_ml_content"):
         return base_severity
 
     confidence = ml_context.get("overall_confidence", 0)
 
-    # High confidence ML content - downgrade severity
-    if confidence > 0.8:
+    # NEVER downgrade always-dangerous operations
+    # Even with 100% ML confidence, os.system is CRITICAL
+    if issue_type in ["dangerous_global", "dangerous_import", "code_execution"]:
+        return base_severity  # No downgrade for dangerous operations
+
+    # Very high confidence (> 0.95) - minimal downgrade
+    if confidence > 0.95:
         if base_severity == IssueSeverity.CRITICAL:
+            return IssueSeverity.HIGH  # CRITICAL → HIGH (still serious)
+        if base_severity == IssueSeverity.HIGH:
             return IssueSeverity.WARNING
         if base_severity == IssueSeverity.WARNING:
             return IssueSeverity.INFO
-    if confidence > 0.5 and base_severity == IssueSeverity.CRITICAL:
-        return IssueSeverity.WARNING
+
+    # High confidence (> 0.85) - conservative downgrade
+    elif confidence > 0.85:
+        if base_severity == IssueSeverity.HIGH:
+            return IssueSeverity.WARNING
+        if base_severity == IssueSeverity.WARNING:
+            return IssueSeverity.INFO
+
+    # Medium confidence (> 0.7) - only downgrade warnings
+    elif confidence > 0.7:
+        if base_severity == IssueSeverity.WARNING:
+            return IssueSeverity.INFO
 
     return base_severity
 
@@ -1630,7 +1976,7 @@ class PickleScanner(BaseScanner):
 
             if not multiple_pickles:
                 break
-
+        print(globals_found)
         return globals_found
 
     def _extract_stack_global_values(
@@ -2055,6 +2401,7 @@ class PickleScanner(BaseScanner):
                     severity = _get_context_aware_severity(
                         IssueSeverity.CRITICAL,
                         ml_context,
+                        issue_type="dangerous_global",
                     )
                     result.add_check(
                         name="Advanced Global Reference Check",
@@ -2102,6 +2449,7 @@ class PickleScanner(BaseScanner):
                             severity = _get_context_aware_severity(
                                 IssueSeverity.CRITICAL,
                                 ml_context,
+                                issue_type="dangerous_global",
                             )
                             result.add_check(
                                 name="Global Module Reference Check",
@@ -2384,6 +2732,7 @@ class PickleScanner(BaseScanner):
                             severity = _get_context_aware_severity(
                                 IssueSeverity.CRITICAL,
                                 ml_context,
+                                issue_type="dangerous_global",
                             )
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
@@ -2453,6 +2802,7 @@ class PickleScanner(BaseScanner):
                 severity = _get_context_aware_severity(
                     IssueSeverity.CRITICAL,
                     ml_context,
+                    issue_type="dangerous_import",
                 )
                 module_name = dangerous_pattern.get("module", "")
                 result.add_check(

@@ -25,6 +25,7 @@ def pytest_runtest_setup(item):
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
+            "test_bug1_confidence_exploit.py",  # Security bug test
         ]
 
         # Check if this is an allowed test file
