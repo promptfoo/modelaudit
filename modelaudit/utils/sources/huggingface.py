@@ -130,8 +130,8 @@ def get_model_info(url: str) -> dict:
             repo_files = api.list_repo_tree(repo_id, recursive=False)
             for item in repo_files:
                 # Skip metadata files
-                if hasattr(item, 'path') and item.path not in [".gitattributes", "README.md"]:
-                    file_size = getattr(item, 'size', 0) or 0
+                if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
+                    file_size = getattr(item, "size", 0) or 0
                     total_size += file_size
                     files.append({"name": item.path, "size": file_size})
         except Exception:
