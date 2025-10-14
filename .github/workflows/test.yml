@@ -316,8 +316,8 @@ jobs:
 
       - name: Run NumPy compatibility tests
         run: |
-          rye run pytest tests/test_numpy_scanner.py -v
-          rye run pytest tests/test_scanner_registry.py -v -k "numpy"
+          rye run pytest tests/scanners/test_numpy_scanner.py -v
+          rye run pytest tests/scanners/test_scanner_registry.py -v -k "numpy"
 
   build:
     name: Build and Package
