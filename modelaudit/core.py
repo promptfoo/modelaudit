@@ -148,22 +148,17 @@ def _add_issue_to_model(
 
 
 def _calculate_file_hash(file_path: str) -> str:
-    """Calculate SHA256 hash of a file for deduplication purposes."""
-    try:
-        hash_sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            # Read file in chunks to handle large files efficiently
-            for chunk in iter(lambda: f.read(8192), b""):
-                hash_sha256.update(chunk)
-        return hash_sha256.hexdigest()
-    except Exception as e:
-        logger.warning(f"Failed to calculate hash for {file_path}: {e}")
-        # Return a unique identifier based on file path and size as fallback
-        try:
-            file_size = os.path.getsize(file_path)
-            return f"fallback_{file_path}_{file_size}"
-        except Exception:
-            return f"fallback_{file_path}"
+    """Calculate SHA256 hash of a file for deduplication purposes.
+
+    Raises:
+        Exception: If file cannot be hashed (security: prevents hash collision attacks)
+    """
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read file in chunks to handle large files efficiently
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
 
 
 def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
