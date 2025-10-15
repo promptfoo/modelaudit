@@ -244,7 +244,7 @@ def scan_large_file(
 
     # Use cache manager for large file scans
     try:
-        from ..cache import get_cache_manager
+        from ...cache import get_cache_manager
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
 

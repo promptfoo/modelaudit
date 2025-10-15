@@ -10,7 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ..scanners.base import ScanResult
+    from ...scanners.base import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     Returns:
         Reconstructed ScanResult object
     """
-    from ..scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+    from ...scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
     # Create new ScanResult with the same scanner name
     scanner_name = result_dict.get("scanner", "cached")

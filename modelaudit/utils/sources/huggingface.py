@@ -119,17 +119,33 @@ def get_model_info(url: str) -> dict:
 
     api = HfApi()
     try:
-        # Get model info
+        # Get model info for metadata
         model_info = api.model_info(repo_id)
 
-        # Calculate total size
+        # Use list_repo_tree to get accurate file sizes
+        # (model_info.siblings often returns None for size)
         total_size = 0
         files = []
-        siblings = model_info.siblings or []
-        for sibling in siblings:
-            if sibling.rfilename not in [".gitattributes", "README.md"]:
-                total_size += sibling.size or 0
-                files.append({"name": sibling.rfilename, "size": sibling.size or 0})
+        try:
+            repo_files = api.list_repo_tree(repo_id, recursive=False)
+            for item in repo_files:
+                # Skip metadata files
+                if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
+                    file_size = getattr(item, "size", 0) or 0
+                    total_size += file_size
+                    files.append({"name": item.path, "size": file_size})
+        except Exception as e:
+            # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
+            total_size = 0
+            # Still try to get file count from siblings
+            siblings = model_info.siblings or []
+            for sibling in siblings:
+                if sibling.rfilename not in [".gitattributes", "README.md"]:
+                    files.append({"name": sibling.rfilename, "size": 0})
 
         return {
             "repo_id": repo_id,
@@ -247,9 +263,22 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files in the repository to identify model files
+        # Skip for large repos to avoid hanging - download all files instead
         try:
-            repo_files = list_repo_files(repo_id)
+            # Add a timeout-like behavior by catching all exceptions
+            # If this fails or hangs, we'll download everything (safer fallback)
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(list_repo_files, repo_id)
+                try:
+                    # Wait up to 30 seconds for file listing
+                    repo_files = future.result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    # File listing took too long - skip it and download everything
+                    repo_files = []
         except Exception:
+            # Any error - just download everything
             repo_files = []
 
         # Define model file extensions we're interested in
