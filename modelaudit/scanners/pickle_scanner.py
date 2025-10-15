@@ -1068,7 +1068,7 @@ def check_opcode_sequence(
 
         # Fixed threshold for dangerous opcode detection
         # Removed ML confidence-based adjustments to prevent security bypasses
-        threshold = 100  # Balanced threshold to reduce false positives while maintaining security
+        threshold = 50  # Lower threshold for stronger security (may increase false positives on large models)
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
