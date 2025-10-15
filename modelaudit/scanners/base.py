@@ -218,18 +218,20 @@ class ScanResult:
         )
         self.issues.append(issue)
 
-        # Also add as a failed check for consistency
-        check_name = details.get("check_name", "Security Check") if details else "Security Check"
-        check = Check(
-            name=check_name,
-            status=CheckStatus.FAILED,
-            message=message,
-            severity=severity,
-            location=location,
-            details=details or {},
-            why=why,
-        )
-        self.checks.append(check)
+        # Only add as a failed check for WARNING/CRITICAL severity
+        # INFO and DEBUG are informational and should not appear as failed checks
+        if severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
+            check_name = details.get("check_name", "Security Check") if details else "Security Check"
+            check = Check(
+                name=check_name,
+                status=CheckStatus.FAILED,
+                message=message,
+                severity=severity,
+                location=location,
+                details=details or {},
+                why=why,
+            )
+            self.checks.append(check)
 
         log_level = (
             logging.CRITICAL

@@ -1483,7 +1483,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     authenticated = config.is_authenticated()
 
     if authenticated:
-        auth_label = style_text("  Authentication:", fg="bright_black")
+        auth_label = style_text("  Promptfoo Cloud:", fg="bright_black")
         auth_value = style_text("Logged in", fg="green", bold=True)
         output_lines.append(f"{auth_label} {auth_value}")
         # Show enhanced scanner count for authenticated users
@@ -1491,8 +1491,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         scanner_value = style_text(f"{len(available_scanners)}/{total_scanners}", fg="green", bold=True)
         output_lines.append(f"{scanner_label} {scanner_value}")
     else:
-        auth_label = style_text("  Authentication:", fg="bright_black")
-        auth_value = style_text("Anonymous", fg="yellow", bold=True)
+        auth_label = style_text("  Promptfoo Cloud:", fg="bright_black")
+        auth_value = style_text("Not logged in", fg="yellow", bold=True)
         output_lines.append(f"{auth_label} {auth_value}")
         # Show limited scanner info for unauthenticated users
         scanner_label = style_text("  Basic Scanners:", fg="bright_black")

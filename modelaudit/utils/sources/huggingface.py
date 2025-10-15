@@ -259,9 +259,22 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files in the repository to identify model files
+        # Skip for large repos to avoid hanging - download all files instead
         try:
-            repo_files = list_repo_files(repo_id)
+            # Add a timeout-like behavior by catching all exceptions
+            # If this fails or hangs, we'll download everything (safer fallback)
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(list_repo_files, repo_id)
+                try:
+                    # Wait up to 30 seconds for file listing
+                    repo_files = future.result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    # File listing took too long - skip it and download everything
+                    repo_files = []
         except Exception:
+            # Any error - just download everything
             repo_files = []
 
         # Define model file extensions we're interested in
