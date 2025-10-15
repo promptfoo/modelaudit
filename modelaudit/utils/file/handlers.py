@@ -529,7 +529,7 @@ def scan_advanced_large_file(
 
     # Use cache manager for advanced large file scans
     try:
-        from ..cache import get_cache_manager
+        from ...cache import get_cache_manager
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
 

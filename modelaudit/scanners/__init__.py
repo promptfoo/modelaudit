@@ -148,15 +148,6 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
-            "coreml": {
-                "module": "modelaudit.scanners.coreml_scanner",
-                "class": "CoreMLScanner",
-                "description": "Scans Apple Core ML model files",
-                "extensions": [".mlmodel"],
-                "priority": 6,
-                "dependencies": ["coreml"],  # Heavy dependency
-                "numpy_sensitive": True,
-            },
             "openvino": {
                 "module": "modelaudit.scanners.openvino_scanner",
                 "class": "OpenVinoScanner",
@@ -662,7 +653,6 @@ def __getattr__(name: str) -> Any:
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
-        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "ExecuTorchScanner": "executorch",

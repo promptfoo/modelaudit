@@ -516,7 +516,7 @@ def scan_advanced_large_file(
 
     # Use cache manager for advanced large file scans
     try:
-        from ..cache import get_cache_manager
+        from ...cache import get_cache_manager
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
 
@@ -529,7 +529,7 @@ def scan_advanced_large_file(
         result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan_wrapper)
 
         # Convert back to ScanResult
-        from .result_conversion import scan_result_from_dict
+        from .helpers.result_conversion import scan_result_from_dict
 
         return scan_result_from_dict(result_dict)
 

@@ -148,22 +148,17 @@ def _add_issue_to_model(
 
 
 def _calculate_file_hash(file_path: str) -> str:
-    """Calculate SHA256 hash of a file for deduplication purposes."""
-    try:
-        hash_sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            # Read file in chunks to handle large files efficiently
-            for chunk in iter(lambda: f.read(8192), b""):
-                hash_sha256.update(chunk)
-        return hash_sha256.hexdigest()
-    except Exception as e:
-        logger.warning(f"Failed to calculate hash for {file_path}: {e}")
-        # Return a unique identifier based on file path and size as fallback
-        try:
-            file_size = os.path.getsize(file_path)
-            return f"fallback_{file_path}_{file_size}"
-        except Exception:
-            return f"fallback_{file_path}"
+    """Calculate SHA256 hash of a file for deduplication purposes.
+
+    Raises:
+        Exception: If file cannot be hashed (security: prevents hash collision attacks)
+    """
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read file in chunks to handle large files efficiently
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
 
 
 def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
@@ -178,8 +173,14 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     content_groups: dict[str, list[str]] = defaultdict(list)
 
     for file_path in file_paths:
-        content_hash = _calculate_file_hash(file_path)
-        content_groups[content_hash].append(file_path)
+        try:
+            content_hash = _calculate_file_hash(file_path)
+            content_groups[content_hash].append(file_path)
+        except Exception as e:
+            # Log error but continue with other files to prevent single I/O failure from aborting entire scan
+            logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
+            # Add file with unique hash to ensure it gets scanned independently
+            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
 
     # Log information about duplicate content found
     for content_hash, paths in content_groups.items():
