@@ -1903,7 +1903,6 @@ class PickleScanner(BaseScanner):
 
             if not multiple_pickles:
                 break
-        print(globals_found)
         return globals_found
 
     def _extract_stack_global_values(

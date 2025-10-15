@@ -173,8 +173,14 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     content_groups: dict[str, list[str]] = defaultdict(list)
 
     for file_path in file_paths:
-        content_hash = _calculate_file_hash(file_path)
-        content_groups[content_hash].append(file_path)
+        try:
+            content_hash = _calculate_file_hash(file_path)
+            content_groups[content_hash].append(file_path)
+        except Exception as e:
+            # Log error but continue with other files to prevent single I/O failure from aborting entire scan
+            logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
+            # Add file with unique hash to ensure it gets scanned independently
+            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
 
     # Log information about duplicate content found
     for content_hash, paths in content_groups.items():

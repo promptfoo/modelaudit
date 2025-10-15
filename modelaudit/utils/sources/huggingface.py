@@ -134,8 +134,12 @@ def get_model_info(url: str) -> dict:
                     file_size = getattr(item, "size", 0) or 0
                     total_size += file_size
                     files.append({"name": item.path, "size": file_size})
-        except Exception:
+        except Exception as e:
             # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
             total_size = 0
             # Still try to get file count from siblings
             siblings = model_info.siblings or []
