@@ -129,13 +129,19 @@ class TestXGBoostScannerBasic:
 
     def test_can_handle_supported_extensions(self, temp_dir):
         """Test that scanner handles supported XGBoost file extensions."""
-        extensions = [".bst", ".model", ".json", ".ubj"]
-
-        for ext in extensions:
+        # .bst, .model, .ubj are accepted based on extension
+        for ext in [".bst", ".model", ".ubj"]:
             test_file = temp_dir / f"test{ext}"
             test_file.write_text("dummy content")
-
             assert XGBoostScanner.can_handle(str(test_file))
+
+        # .json requires valid XGBoost structure
+        json_file = temp_dir / "test.json"
+        json_file.write_text(json.dumps({
+            "version": [1, 5, 2],
+            "learner": {"gradient_booster": {}}
+        }))
+        assert XGBoostScanner.can_handle(str(json_file))
 
     def test_cannot_handle_unsupported_extensions(self, temp_dir):
         """Test that scanner rejects unsupported file extensions."""
@@ -189,16 +195,15 @@ class TestXGBoostJSONScanning:
         # Should detect JSON parsing error
         assert any("Invalid JSON format" in str(issue.message) for issue in result.issues)
 
-    def test_missing_required_keys_detected(self, temp_dir, xgboost_scanner):
-        """Test detection of missing required XGBoost keys."""
+    def test_missing_required_keys_detected(self, temp_dir):
+        """Test that scanner rejects JSON files missing required XGBoost keys in can_handle()."""
         incomplete_json = {"version": [1, 0, 0]}  # Missing learner
 
         json_file = temp_dir / "incomplete.json"
         json_file.write_text(json.dumps(incomplete_json))
 
-        result = xgboost_scanner.scan(str(json_file))
-
-        assert any("Missing required XGBoost JSON keys" in str(issue.message) for issue in result.issues)
+        # Should be rejected by can_handle() - scanner won't even try to scan it
+        assert not XGBoostScanner.can_handle(str(json_file))
 
     def test_malicious_json_content_detected(self, temp_dir, xgboost_scanner):
         """Test detection of malicious patterns in JSON."""
@@ -222,20 +227,25 @@ class TestXGBoostJSONScanning:
         assert any("Suspicious pattern detected" in str(issue.message) for issue in critical_issues)
 
     def test_extremely_large_json_rejected(self, temp_dir, xgboost_scanner):
-        """Test that extremely large JSON files are rejected."""
-        # Create a scanner with small max size for testing
-        small_scanner = XGBoostScanner({"max_json_size": 100})
+        """Test that extremely large JSON files trigger warnings."""
+        # Create a scanner with small max size for testing (using new tiered approach)
+        small_scanner = XGBoostScanner({"max_json_size_warning": 100})
 
-        large_json = {"data": "x" * 200}  # Larger than 100 bytes
+        large_json = {
+            "version": [1, 0, 0],
+            "learner": {},
+            "data": "x" * 200  # Larger than 100 bytes
+        }
         json_file = temp_dir / "large.json"
         json_file.write_text(json.dumps(large_json))
 
         result = small_scanner.scan(str(json_file))
 
-        assert any("JSON file too large" in str(issue.message) for issue in result.issues)
+        # Message changed to "extremely large"
+        assert any("extremely large" in str(issue.message).lower() for issue in result.issues)
 
     def test_excessive_tree_count_detected(self, temp_dir, xgboost_scanner):
-        """Test detection of excessive number of trees."""
+        """Test detection of large number of trees (INFO level)."""
         # Create a scanner with low max tree count
         strict_scanner = XGBoostScanner({"max_num_trees": 5})
 
@@ -255,7 +265,8 @@ class TestXGBoostJSONScanning:
 
         result = strict_scanner.scan(str(json_file))
 
-        assert any("Excessive number of trees" in str(issue.message) for issue in result.issues)
+        # Changed to INFO severity - check for "large number of trees"
+        assert any("large number of trees" in str(issue.message).lower() for issue in result.issues)
 
 
 @pytest.mark.skipif(not hasattr(pytest, "importorskip"), reason="pytest.importorskip not available")
@@ -263,14 +274,15 @@ class TestXGBoostUBJScanning:
     """Test XGBoost UBJ model scanning."""
 
     def test_ubj_without_ubjson_library(self, temp_dir, xgboost_scanner):
-        """Test UBJ scanning without ubjson library."""
+        """Test UBJ scanning without ubjson library (INFO level)."""
         ubj_file = temp_dir / "model.ubj"
         ubj_file.write_bytes(b"\x7b\x55")  # UBJ object start
 
         with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
             result = xgboost_scanner.scan(str(ubj_file))
 
-        assert any("ubjson package not available" in str(issue.message) for issue in result.issues)
+        # Message changed to "Cannot scan UBJ file"
+        assert any("cannot scan ubj file" in str(issue.message).lower() for issue in result.issues)
 
     def test_invalid_ubj_detected(self, temp_dir, xgboost_scanner):
         """Test detection of invalid UBJ content."""
@@ -415,9 +427,10 @@ class TestXGBoostScannerConfiguration:
     """Test XGBoost scanner configuration options."""
 
     def test_custom_max_json_size(self, temp_dir):
-        """Test custom max JSON size configuration."""
-        custom_scanner = XGBoostScanner({"max_json_size": 50})
-        assert custom_scanner.max_json_size == 50
+        """Test custom max JSON size configuration (tiered approach)."""
+        custom_scanner = XGBoostScanner({"max_json_size_info": 50, "max_json_size_warning": 100})
+        assert custom_scanner.max_json_size_info == 50
+        assert custom_scanner.max_json_size_warning == 100
 
     def test_custom_max_tree_depth(self, temp_dir):
         """Test custom max tree depth configuration."""
@@ -458,7 +471,7 @@ class TestXGBoostSecurityPatterns:
         assert any("Hex-encoded data" in str(issue.message) for issue in critical_issues)
 
     def test_parameter_validation_extreme_values(self, temp_dir, xgboost_scanner):
-        """Test validation of extreme parameter values."""
+        """Test validation of extreme parameter values (now INFO level)."""
         extreme_json = {
             "version": [1, 0, 0],
             "learner": {
@@ -475,10 +488,10 @@ class TestXGBoostSecurityPatterns:
 
         result = xgboost_scanner.scan(str(json_file))
 
-        # Should detect suspicious parameter values
-        warnings = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
-        assert len(warnings) > 0
-        assert any("Suspicious" in str(issue.message) and "value" in str(issue.message) for issue in warnings)
+        # Changed to INFO severity - check for "unusual" parameter values
+        info_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
+        assert len(info_issues) > 0
+        assert any("unusual" in str(issue.message).lower() and "value" in str(issue.message).lower() for issue in info_issues)
 
     def test_tree_depth_bomb_detection(self, temp_dir):
         """Test detection of extremely deep trees (potential DoS)."""
@@ -506,7 +519,8 @@ class TestXGBoostSecurityPatterns:
 
         result = strict_scanner.scan(str(json_file))
 
-        assert any("excessive depth" in str(issue.message) for issue in result.issues)
+        # Changed to INFO severity - check for "deep structure"
+        assert any("deep structure" in str(issue.message).lower() for issue in result.issues)
 
 
 class TestXGBoostPickleIntegration:

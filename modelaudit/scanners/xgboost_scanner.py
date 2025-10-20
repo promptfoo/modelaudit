@@ -71,7 +71,19 @@ class XGBoostScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
-        self.max_json_size = self.config.get("max_json_size", 100 * 1024 * 1024)  # 100MB
+
+        # JSON format thresholds (human-readable, large overhead)
+        self.max_json_size_info = self.config.get("max_json_size_info", 100 * 1024 * 1024)  # 100MB - INFO
+        self.max_json_size_warning = self.config.get("max_json_size_warning", 500 * 1024 * 1024)  # 500MB - WARNING
+
+        # UBJ format thresholds (compact binary JSON)
+        self.max_ubj_size_info = self.config.get("max_ubj_size_info", 50 * 1024 * 1024)  # 50MB - INFO
+        self.max_ubj_size_warning = self.config.get("max_ubj_size_warning", 200 * 1024 * 1024)  # 200MB - WARNING
+
+        # Binary format thresholds (fast, smaller but opaque binary)
+        self.max_binary_size_info = self.config.get("max_binary_size_info", 100 * 1024 * 1024)  # 100MB - INFO
+        self.max_binary_size_warning = self.config.get("max_binary_size_warning", 350 * 1024 * 1024)  # 350MB - WARNING (300-400 range)
+
         self.max_tree_depth = self.config.get("max_tree_depth", 1000)
         self.max_num_trees = self.config.get("max_num_trees", 100000)
 
@@ -82,10 +94,20 @@ class XGBoostScanner(BaseScanner):
             return False
 
         file_ext = os.path.splitext(path)[1].lower()
-        if file_ext in cls.supported_extensions:
+
+        # For exclusive XGBoost formats, accept immediately
+        if file_ext in [".bst", ".ubj"]:
             return True
 
-        # Check for XGBoost files that might not have the right extension
+        # For .json files, validate it's actually an XGBoost model
+        if file_ext == ".json":
+            return cls._is_xgboost_json(path)
+
+        # For .model files, accept (generic extension)
+        if file_ext == ".model":
+            return True
+
+        # Check for XGBoost files without extension
         if file_ext == "":
             try:
                 with open(path, "rb") as f:
@@ -97,6 +119,50 @@ class XGBoostScanner(BaseScanner):
                 pass
 
         return False
+
+    @classmethod
+    def _is_xgboost_json(cls, path: str) -> bool:
+        """
+        Deterministic check for XGBoost JSON format.
+
+        XGBoost JSON models have this structure (any version):
+        {
+            "version": [major, minor, ...],  // Array with at least 2 elements
+            "learner": {                     // Dict with model configuration
+                ...
+            }
+        }
+
+        This matches what _validate_xgboost_json_schema() checks.
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Must be a dict at top level
+            if not isinstance(data, dict):
+                return False
+
+            # Required: both "version" AND "learner" keys (line 379)
+            if "version" not in data or "learner" not in data:
+                return False
+
+            # Validate version is array-like with at least 2 elements
+            version = data.get("version")
+            if not isinstance(version, (list, tuple)) or len(version) < 2:
+                return False
+
+            # Validate learner is a dict
+            learner = data.get("learner")
+            if not isinstance(learner, dict):
+                return False
+
+            # If we got here, it has the exact XGBoost JSON structure
+            return True
+
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+            # Any parsing/validation error = not XGBoost JSON
+            return False
 
     def scan(self, path: str) -> ScanResult:
         """Scan XGBoost model file for security vulnerabilities."""
@@ -152,18 +218,29 @@ class XGBoostScanner(BaseScanner):
         """Scan XGBoost JSON model for security issues."""
         file_size = os.path.getsize(path)
 
-        # Check file size limits for JSON parsing
-        if file_size > self.max_json_size:
+        # Check file size limits for JSON parsing with tiered thresholds
+        if file_size > self.max_json_size_warning:
             result.add_check(
                 name="JSON File Size Check",
                 passed=False,
-                message=f"XGBoost JSON file too large: {file_size} bytes (max: {self.max_json_size})",
+                message=f"XGBoost JSON file extremely large: {file_size} bytes (max: {self.max_json_size_warning})",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"file_size": file_size, "max_size": self.max_json_size},
+                details={"file_size": file_size, "max_size_warning": self.max_json_size_warning},
                 why="Extremely large JSON files may cause memory exhaustion or parsing delays",
             )
             return
+        elif file_size > self.max_json_size_info:
+            result.add_check(
+                name="JSON File Size Check",
+                passed=False,
+                message=f"XGBoost JSON file is large: {file_size} bytes (threshold: {self.max_json_size_info})",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"file_size": file_size, "info_threshold": self.max_json_size_info},
+                why="Large JSON files may impact parsing performance but are often legitimate",
+            )
+            # Continue scanning instead of returning
 
         try:
             with open(path, encoding="utf-8") as f:
@@ -209,30 +286,41 @@ class XGBoostScanner(BaseScanner):
             result.add_check(
                 name="UBJSON Library Check",
                 passed=False,
-                message="ubjson package not available, cannot decode UBJ files",
-                severity=IssueSeverity.WARNING,
+                message="Cannot scan UBJ file: ubjson package is not installed. Install with 'pip install ubjson' to enable scanning.",
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"required_package": "ubjson"},
-                why="Install 'pip install ubjson' to enable UBJ model scanning",
+                details={"required_package": "ubjson", "install_command": "pip install ubjson"},
+                why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
             )
             return
 
         try:
             import ubjson
 
-            # Check file size before attempting to read
+            # Check file size before attempting to read with tiered thresholds
             file_size = os.path.getsize(path)
-            if file_size > self.max_json_size:
+            if file_size > self.max_ubj_size_warning:
                 result.add_check(
                     name="UBJ File Size",
                     passed=False,
-                    message=f"UBJ file too large: {file_size} bytes (max: {self.max_json_size})",
+                    message=f"UBJ file extremely large: {file_size} bytes (max: {self.max_ubj_size_warning})",
                     severity=IssueSeverity.WARNING,
                     location=path,
-                    details={"file_size": file_size, "max_size": self.max_json_size},
+                    details={"file_size": file_size, "max_size_warning": self.max_ubj_size_warning},
                     why="Extremely large UBJ files may indicate malicious content or cause resource exhaustion",
                 )
                 return
+            elif file_size > self.max_ubj_size_info:
+                result.add_check(
+                    name="UBJ File Size",
+                    passed=False,
+                    message=f"UBJ file is large: {file_size} bytes (threshold: {self.max_ubj_size_info})",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"file_size": file_size, "info_threshold": self.max_ubj_size_info},
+                    why="Large UBJ files may impact performance but are often legitimate",
+                )
+                # Continue scanning instead of returning
 
             with open(path, "rb") as f:
                 model_data = ubjson.loadb(f.read())
@@ -275,18 +363,29 @@ class XGBoostScanner(BaseScanner):
             )
             return
 
-        # Check for extremely large binary files (using JSON size limit as reasonable bound)
-        if file_size > self.max_json_size:
+        # Check for extremely large binary files with tiered thresholds
+        if file_size > self.max_binary_size_warning:
             result.add_check(
                 name="Binary File Size Check",
                 passed=False,
-                message=f"XGBoost binary file too large: {file_size} bytes (max: {self.max_json_size})",
+                message=f"XGBoost binary file extremely large: {file_size} bytes (max: {self.max_binary_size_warning})",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"file_size": file_size, "max_size": self.max_json_size},
+                details={"file_size": file_size, "max_size_warning": self.max_binary_size_warning},
                 why="Extremely large binary files may cause resource exhaustion or contain malicious padding",
             )
             return
+        elif file_size > self.max_binary_size_info:
+            result.add_check(
+                name="Binary File Size Check",
+                passed=False,
+                message=f"XGBoost binary file is large: {file_size} bytes (threshold: {self.max_binary_size_info})",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"file_size": file_size, "info_threshold": self.max_binary_size_info},
+                why="Large binary files may impact performance but are often legitimate",
+            )
+            # Continue scanning instead of returning
 
         try:
             # Check if it's actually a pickle file masquerading as .bst
@@ -295,10 +394,10 @@ class XGBoostScanner(BaseScanner):
                     name="File Format Validation",
                     passed=False,
                     message="File appears to be a pickle file with .bst/.model extension",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"detected_format": "pickle", "claimed_format": "bst"},
-                    why="File extension spoofing may indicate an attempt to bypass security checks",
+                    why="File extension spoofing is a security evasion technique used to bypass security scanners. This may indicate malicious intent.",
                 )
                 # Let pickle scanner handle this file
                 return
@@ -330,21 +429,8 @@ class XGBoostScanner(BaseScanner):
 
     def _validate_xgboost_json_schema(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Validate XGBoost JSON model schema and structure."""
-        # Check for required top-level structure
-        required_keys = ["version", "learner"]
-        missing_keys = [key for key in required_keys if key not in data]
-
-        if missing_keys:
-            result.add_check(
-                name="XGBoost JSON Schema Validation",
-                passed=False,
-                message=f"Missing required XGBoost JSON keys: {missing_keys}",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"missing_keys": missing_keys, "available_keys": list(data.keys())},
-                why="Invalid schema may indicate corruption or malicious modification",
-            )
-            return
+        # Note: Basic structure validation (version, learner keys) is already done in can_handle()
+        # This method performs additional validation on the structure
 
         # Validate version
         version = data.get("version")
@@ -391,11 +477,11 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Tree Count Validation",
                             passed=False,
-                            message=f"Excessive number of trees: {num_trees} (max: {self.max_num_trees})",
-                            severity=IssueSeverity.WARNING,
+                            message=f"Large number of trees detected: {num_trees} (threshold: {self.max_num_trees})",
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"num_trees": num_trees, "max_trees": self.max_num_trees},
-                            why="Extremely large tree counts may indicate memory exhaustion attacks",
+                            why="Large tree counts may impact performance but are often legitimate in production models",
                         )
 
                     # Check individual tree structures
@@ -418,11 +504,11 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Tree Depth Validation",
                             passed=False,
-                            message=f"Tree {i} has excessive depth: {depth}",
-                            severity=IssueSeverity.WARNING,
+                            message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
-                            why="Extremely deep trees may cause stack overflow or excessive memory usage",
+                            why="Deep trees may impact performance but can be legitimate in complex models",
                         )
 
     def _validate_model_parameters(self, params: dict[str, Any], result: ScanResult, path: str) -> None:
@@ -442,11 +528,11 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Model Parameter Validation",
                             passed=False,
-                            message=f"Suspicious {param_name} value: {value}",
-                            severity=IssueSeverity.WARNING,
+                            message=f"Unusual {param_name} value: {value} (typical range: {min_val}-{max_val})",
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={param_name: value, "range": [min_val, max_val]},
-                            why=f"Parameter {param_name} outside reasonable range may indicate malicious modification",
+                            why=f"Parameter {param_name} outside typical range. Review if this is expected for your model.",
                         )
                 except (ValueError, TypeError):
                     result.add_check(
@@ -520,11 +606,11 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Binary Content Validation",
                             passed=False,
-                            message="File contains unusual binary patterns, may not be valid XGBoost model",
-                            severity=IssueSeverity.WARNING,
+                            message="File contains unusual binary patterns, may not be standard XGBoost format",
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"header_hex": header[:16].hex()},
-                            why="Unexpected binary patterns may indicate file corruption or spoofing",
+                            why="File does not contain expected XGBoost text markers. May be compressed, encrypted, or a non-standard format.",
                         )
                     else:
                         result.add_check(
@@ -602,10 +688,10 @@ except Exception as e:
                     name="XGBoost Model Loading",
                     passed=False,
                     message=f"Failed to load XGBoost model: {error_msg}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"error": error_msg, "return_code": proc.returncode},
-                    why="Loading failures may indicate file corruption or incompatible format",
+                    why="Loading failures may indicate file corruption or version incompatibility. This is a compatibility test run in an isolated subprocess for safety.",
                 )
 
         except subprocess.TimeoutExpired:
@@ -613,17 +699,17 @@ except Exception as e:
                 name="XGBoost Model Loading",
                 passed=False,
                 message=f"XGBoost model loading timeout after {timeout} seconds",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"timeout": timeout},
-                why="Loading timeouts may indicate extremely large models or infinite loops",
+                why="Loading timeout may indicate an extremely large model. The subprocess was safely terminated.",
             )
         except Exception as e:
             result.add_check(
                 name="XGBoost Model Loading",
                 passed=False,
                 message=f"Error during XGBoost model loading test: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e)},
             )
