@@ -137,10 +137,7 @@ class TestXGBoostScannerBasic:
 
         # .json requires valid XGBoost structure
         json_file = temp_dir / "test.json"
-        json_file.write_text(json.dumps({
-            "version": [1, 5, 2],
-            "learner": {"gradient_booster": {}}
-        }))
+        json_file.write_text(json.dumps({"version": [1, 5, 2], "learner": {"gradient_booster": {}}}))
         assert XGBoostScanner.can_handle(str(json_file))
 
     def test_cannot_handle_unsupported_extensions(self, temp_dir):
@@ -234,7 +231,7 @@ class TestXGBoostJSONScanning:
         large_json = {
             "version": [1, 0, 0],
             "learner": {},
-            "data": "x" * 200  # Larger than 100 bytes
+            "data": "x" * 200,  # Larger than 100 bytes
         }
         json_file = temp_dir / "large.json"
         json_file.write_text(json.dumps(large_json))
@@ -491,7 +488,9 @@ class TestXGBoostSecurityPatterns:
         # Changed to INFO severity - check for "unusual" parameter values
         info_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
         assert len(info_issues) > 0
-        assert any("unusual" in str(issue.message).lower() and "value" in str(issue.message).lower() for issue in info_issues)
+        assert any(
+            "unusual" in str(issue.message).lower() and "value" in str(issue.message).lower() for issue in info_issues
+        )
 
     def test_tree_depth_bomb_detection(self, temp_dir):
         """Test detection of extremely deep trees (potential DoS)."""
@@ -520,6 +519,39 @@ class TestXGBoostSecurityPatterns:
         result = strict_scanner.scan(str(json_file))
 
         # Changed to INFO severity - check for "deep structure"
+        assert any("deep structure" in str(issue.message).lower() for issue in result.issues)
+
+    def test_string_encoded_numeric_values_in_json(self, temp_dir):
+        """Test handling of string-encoded numeric values in XGBoost JSON (real-world scenario)."""
+        strict_scanner = XGBoostScanner({"max_tree_depth": 10})
+
+        # Real XGBoost models often encode numeric values as strings
+        string_values_json = {
+            "version": [1, 0, 0],
+            "learner": {
+                "gradient_booster": {
+                    "model": {
+                        "trees": [
+                            {
+                                "tree_param": {
+                                    "size_leaf_vector": "1000",  # String instead of int
+                                    "num_nodes": "500",
+                                    "num_feature": "768",
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+
+        json_file = temp_dir / "string_values.json"
+        json_file.write_text(json.dumps(string_values_json))
+
+        # Should not raise TypeError, should handle string-to-int conversion
+        result = strict_scanner.scan(str(json_file))
+
+        # Should still detect the deep tree (now converted from string "1000" to int 1000)
         assert any("deep structure" in str(issue.message).lower() for issue in result.issues)
 
 

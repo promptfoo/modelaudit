@@ -82,7 +82,9 @@ class XGBoostScanner(BaseScanner):
 
         # Binary format thresholds (fast, smaller but opaque binary)
         self.max_binary_size_info = self.config.get("max_binary_size_info", 100 * 1024 * 1024)  # 100MB - INFO
-        self.max_binary_size_warning = self.config.get("max_binary_size_warning", 350 * 1024 * 1024)  # 350MB - WARNING (300-400 range)
+        self.max_binary_size_warning = self.config.get(
+            "max_binary_size_warning", 350 * 1024 * 1024
+        )  # 350MB - WARNING (300-400 range)
 
         self.max_tree_depth = self.config.get("max_tree_depth", 1000)
         self.max_num_trees = self.config.get("max_num_trees", 100000)
@@ -149,16 +151,12 @@ class XGBoostScanner(BaseScanner):
 
             # Validate version is array-like with at least 2 elements
             version = data.get("version")
-            if not isinstance(version, (list, tuple)) or len(version) < 2:
+            if not isinstance(version, list | tuple) or len(version) < 2:
                 return False
 
             # Validate learner is a dict
             learner = data.get("learner")
-            if not isinstance(learner, dict):
-                return False
-
-            # If we got here, it has the exact XGBoost JSON structure
-            return True
+            return isinstance(learner, dict)
 
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
             # Any parsing/validation error = not XGBoost JSON
@@ -286,7 +284,10 @@ class XGBoostScanner(BaseScanner):
             result.add_check(
                 name="UBJSON Library Check",
                 passed=False,
-                message="Cannot scan UBJ file: ubjson package is not installed. Install with 'pip install ubjson' to enable scanning.",
+                message=(
+                    "Cannot scan UBJ file: ubjson package is not installed. "
+                    "Install with 'pip install ubjson' to enable scanning."
+                ),
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={"required_package": "ubjson", "install_command": "pip install ubjson"},
@@ -397,7 +398,10 @@ class XGBoostScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"detected_format": "pickle", "claimed_format": "bst"},
-                    why="File extension spoofing is a security evasion technique used to bypass security scanners. This may indicate malicious intent.",
+                    why=(
+                        "File extension spoofing is a security evasion technique "
+                        "used to bypass security scanners. This may indicate malicious intent."
+                    ),
                 )
                 # Let pickle scanner handle this file
                 return
@@ -481,7 +485,9 @@ class XGBoostScanner(BaseScanner):
                             severity=IssueSeverity.INFO,
                             location=path,
                             details={"num_trees": num_trees, "max_trees": self.max_num_trees},
-                            why="Large tree counts may impact performance but are often legitimate in production models",
+                            why=(
+                                "Large tree counts may impact performance but are often legitimate in production models"
+                            ),
                         )
 
                     # Check individual tree structures
@@ -499,7 +505,11 @@ class XGBoostScanner(BaseScanner):
             if "tree_param" in tree:
                 tree_param = tree["tree_param"]
                 if isinstance(tree_param, dict):
-                    depth = tree_param.get("size_leaf_vector", 0)
+                    try:
+                        depth = int(tree_param.get("size_leaf_vector", 0))
+                    except (ValueError, TypeError):
+                        # Skip validation if value can't be converted to int
+                        continue
                     if depth > self.max_tree_depth:
                         result.add_check(
                             name="Tree Depth Validation",
@@ -532,7 +542,10 @@ class XGBoostScanner(BaseScanner):
                             severity=IssueSeverity.INFO,
                             location=path,
                             details={param_name: value, "range": [min_val, max_val]},
-                            why=f"Parameter {param_name} outside typical range. Review if this is expected for your model.",
+                            why=(
+                                f"Parameter {param_name} outside typical range. "
+                                "Review if this is expected for your model."
+                            ),
                         )
                 except (ValueError, TypeError):
                     result.add_check(
@@ -610,7 +623,10 @@ class XGBoostScanner(BaseScanner):
                             severity=IssueSeverity.INFO,
                             location=path,
                             details={"header_hex": header[:16].hex()},
-                            why="File does not contain expected XGBoost text markers. May be compressed, encrypted, or a non-standard format.",
+                            why=(
+                                "File does not contain expected XGBoost text markers. "
+                                "May be compressed, encrypted, or a non-standard format."
+                            ),
                         )
                     else:
                         result.add_check(
@@ -691,7 +707,10 @@ except Exception as e:
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"error": error_msg, "return_code": proc.returncode},
-                    why="Loading failures may indicate file corruption or version incompatibility. This is a compatibility test run in an isolated subprocess for safety.",
+                    why=(
+                        "Loading failures may indicate file corruption or version incompatibility. "
+                        "This is a compatibility test run in an isolated subprocess for safety."
+                    ),
                 )
 
         except subprocess.TimeoutExpired:
