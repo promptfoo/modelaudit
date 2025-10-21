@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
 
@@ -99,7 +99,7 @@ def test_manifest_scanner_no_blacklist_clean_file():
         assert result.success is True
 
         # Should have a passed blacklist check
-        passed_checks = [check for check in result.checks if check.passed]
+        passed_checks = [check for check in result.checks if check.status == CheckStatus.PASSED]
         assert any("Blacklist" in check.name for check in passed_checks)
 
         # Should have no critical issues
