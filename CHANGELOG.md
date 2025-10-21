@@ -7,9 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2025-10-21
+
+### Added
+
+- **feat**: add skops scanner for CVE-2025-54412/54413/54886 detection (#392)
+  - Implement dedicated skops scanner for .skops model files
+  - Detect CVE-2025-54412 (OperatorFuncNode RCE vulnerability)
+  - Detect CVE-2025-54413 (MethodNode dangerous attribute access)
+  - Detect CVE-2025-54886 (Card.get_model silent joblib fallback)
+  - Add ZIP format validation and archive bomb detection
+
+### Changed
+
+- **refactor**: remove non-security checks prone to false positives (#391)
+  - Remove blacklist checks from manifest scanner
+  - Remove model name policy checks from manifest scanner
+  - Streamline XGBoost scanner by removing non-security validation checks
+  - Reduce false positives in metadata scanner
+
 ### Fixed
 
-- **fix**: resolve XGBoost UBJ crash and network scanner false positives
+- **fix**: resolve XGBoost UBJ crash and network scanner false positives (#392)
   - Fix UBJ format JSON serialization crash by sanitizing bytes objects to hex strings
   - Eliminate network scanner false positives for pickle/joblib ML models by adding ML context awareness
   - Add comprehensive XGBoost testing documentation with 25-model test corpus
@@ -401,7 +420,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/promptfoo/modelaudit/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4
