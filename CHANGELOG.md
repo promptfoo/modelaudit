@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2025-10-20
+
+### Fixed
+
+- **fix**: improve XGBoost scanner severity levels and reduce false positives (#389)
+  - Handle string-encoded numeric values in XGBoost JSON models
+  - Add deterministic JSON validation to prevent claiming non-XGBoost files
+  - Implement tiered file size thresholds (INFO → WARNING) for large models
+  - Downgrade metadata scanner generic secret patterns from WARNING to INFO
+  - Reduce false positives for BibTeX citations and code examples in README files
+- **fix**: prevent ML confidence bypass and hash collision security exploits (#388)
+  - Enable --verbose flag and accurate HuggingFace file sizes
+  - Remove CoreML scanner and coremltools dependency
+- **fix**: enable advanced TorchScript vulnerability detection (#384)
+  - Enable comprehensive detection for serialization injection, module manipulation, and bytecode injection patterns
+
+### Changed
+
+- **refactor**: reorganize codebase into logical module structure (#387)
+  - Create detectors/ module for security detection logic
+  - Improve maintainability and reduce import complexity
+- **chore(deps)**: bump tj-actions/changed-files from v46 to v47 (#386)
+
 ## [0.2.6] - 2025-09-10
 
 ### Added
