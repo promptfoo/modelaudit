@@ -71,23 +71,8 @@ class XGBoostScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
-
-        # JSON format thresholds (human-readable, large overhead)
-        self.max_json_size_info = self.config.get("max_json_size_info", 100 * 1024 * 1024)  # 100MB - INFO
-        self.max_json_size_warning = self.config.get("max_json_size_warning", 500 * 1024 * 1024)  # 500MB - WARNING
-
-        # UBJ format thresholds (compact binary JSON)
-        self.max_ubj_size_info = self.config.get("max_ubj_size_info", 50 * 1024 * 1024)  # 50MB - INFO
-        self.max_ubj_size_warning = self.config.get("max_ubj_size_warning", 200 * 1024 * 1024)  # 200MB - WARNING
-
-        # Binary format thresholds (fast, smaller but opaque binary)
-        self.max_binary_size_info = self.config.get("max_binary_size_info", 100 * 1024 * 1024)  # 100MB - INFO
-        self.max_binary_size_warning = self.config.get(
-            "max_binary_size_warning", 350 * 1024 * 1024
-        )  # 350MB - WARNING (300-400 range)
-
+        self.max_num_trees = self.config.get("max_num_trees", 10000)
         self.max_tree_depth = self.config.get("max_tree_depth", 1000)
-        self.max_num_trees = self.config.get("max_num_trees", 100000)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -216,30 +201,6 @@ class XGBoostScanner(BaseScanner):
         """Scan XGBoost JSON model for security issues."""
         file_size = os.path.getsize(path)
 
-        # Check file size limits for JSON parsing with tiered thresholds
-        if file_size > self.max_json_size_warning:
-            result.add_check(
-                name="JSON File Size Check",
-                passed=False,
-                message=f"XGBoost JSON file extremely large: {file_size} bytes (max: {self.max_json_size_warning})",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"file_size": file_size, "max_size_warning": self.max_json_size_warning},
-                why="Extremely large JSON files may cause memory exhaustion or parsing delays",
-            )
-            return
-        elif file_size > self.max_json_size_info:
-            result.add_check(
-                name="JSON File Size Check",
-                passed=False,
-                message=f"XGBoost JSON file is large: {file_size} bytes (threshold: {self.max_json_size_info})",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"file_size": file_size, "info_threshold": self.max_json_size_info},
-                why="Large JSON files may impact parsing performance but are often legitimate",
-            )
-            # Continue scanning instead of returning
-
         try:
             with open(path, encoding="utf-8") as f:
                 model_data = json.load(f)
@@ -298,31 +259,6 @@ class XGBoostScanner(BaseScanner):
         try:
             import ubjson
 
-            # Check file size before attempting to read with tiered thresholds
-            file_size = os.path.getsize(path)
-            if file_size > self.max_ubj_size_warning:
-                result.add_check(
-                    name="UBJ File Size",
-                    passed=False,
-                    message=f"UBJ file extremely large: {file_size} bytes (max: {self.max_ubj_size_warning})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"file_size": file_size, "max_size_warning": self.max_ubj_size_warning},
-                    why="Extremely large UBJ files may indicate malicious content or cause resource exhaustion",
-                )
-                return
-            elif file_size > self.max_ubj_size_info:
-                result.add_check(
-                    name="UBJ File Size",
-                    passed=False,
-                    message=f"UBJ file is large: {file_size} bytes (threshold: {self.max_ubj_size_info})",
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={"file_size": file_size, "info_threshold": self.max_ubj_size_info},
-                    why="Large UBJ files may impact performance but are often legitimate",
-                )
-                # Continue scanning instead of returning
-
             with open(path, "rb") as f:
                 model_data = ubjson.loadb(f.read())
 
@@ -363,30 +299,6 @@ class XGBoostScanner(BaseScanner):
                 why="Empty model files are invalid and may indicate corruption or attack",
             )
             return
-
-        # Check for extremely large binary files with tiered thresholds
-        if file_size > self.max_binary_size_warning:
-            result.add_check(
-                name="Binary File Size Check",
-                passed=False,
-                message=f"XGBoost binary file extremely large: {file_size} bytes (max: {self.max_binary_size_warning})",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"file_size": file_size, "max_size_warning": self.max_binary_size_warning},
-                why="Extremely large binary files may cause resource exhaustion or contain malicious padding",
-            )
-            return
-        elif file_size > self.max_binary_size_info:
-            result.add_check(
-                name="Binary File Size Check",
-                passed=False,
-                message=f"XGBoost binary file is large: {file_size} bytes (threshold: {self.max_binary_size_info})",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"file_size": file_size, "info_threshold": self.max_binary_size_info},
-                why="Large binary files may impact performance but are often legitimate",
-            )
-            # Continue scanning instead of returning
 
         try:
             # Check if it's actually a pickle file masquerading as .bst
