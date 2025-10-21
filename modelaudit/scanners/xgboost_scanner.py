@@ -557,10 +557,22 @@ class XGBoostScanner(BaseScanner):
                         details={param_name: str(params[param_name])},
                     )
 
+    def _sanitize_for_json(self, obj: Any) -> Any:
+        """Recursively sanitize object for JSON serialization by converting bytes to hex strings."""
+        if isinstance(obj, bytes):
+            return obj.hex()
+        elif isinstance(obj, dict):
+            return {k: self._sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list | tuple):
+            return [self._sanitize_for_json(item) for item in obj]
+        return obj
+
     def _check_json_for_malicious_content(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check XGBoost JSON data for potentially malicious content."""
+        # Sanitize data to handle bytes objects before JSON serialization
+        sanitized_data = self._sanitize_for_json(data)
         # Convert to string for pattern matching
-        json_str = json.dumps(data, separators=(",", ":"))
+        json_str = json.dumps(sanitized_data, separators=(",", ":"))
 
         # Check for suspicious patterns using precompiled regex
         for pattern, description in SUSPICIOUS_JSON_PATTERNS:
