@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2025-10-21
+
+### Added
+
+- **feat**: add context-aware severity for PyTorch pickle models (#395)
+  - Implement SafeTensors detection utility to identify safer format alternatives
+  - Add import analysis to distinguish legitimate vs malicious pickle imports
+  - Consolidate opcode warnings into single check with evidence counts
+  - Add `import_reference` field to pickle scanner GLOBAL checks for analysis
+  - Provide actionable recommendations (use SafeTensors format)
+
+### Changed
+
+- **feat**: rewrite PyTorch pickle severity logic with context-awareness (#395)
+  - CRITICAL: malicious imports detected (os.system, subprocess, eval)
+  - WARNING: legitimate imports + SafeTensors alternative available
+  - INFO: legitimate imports + no SafeTensors alternative
+  - Reduces false positives while maintaining security detection accuracy
+  - Example: sentence-transformers/all-MiniLM-L6-v2 now shows WARNING (was CRITICAL)
+
 ## [0.2.8] - 2025-10-21
 
 ### Added
@@ -420,7 +440,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/promptfoo/modelaudit/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...v0.2.6
