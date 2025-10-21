@@ -299,8 +299,7 @@ class SkopsScanner(BaseScanner):
                         name="Archive Bomb Detection",
                         passed=False,
                         message=(
-                            f"Suspicious: Archive contains {len(file_list)} files "
-                            f"(max: {self.max_files_in_archive})"
+                            f"Suspicious: Archive contains {len(file_list)} files (max: {self.max_files_in_archive})"
                         ),
                         severity=IssueSeverity.CRITICAL,
                         location=path,
