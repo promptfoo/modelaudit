@@ -122,7 +122,7 @@ class MetadataScanner(BaseScanner):
                     issues.append(
                         Issue(
                             message=f"Suspicious URL found in text metadata: {url}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=file_path,
                             details={"url": url, "suspicious_domain": domain},
                             why="URL shorteners and tunnel services can hide malicious endpoints",
@@ -194,7 +194,7 @@ class MetadataScanner(BaseScanner):
 
                 # Only flag as suspicious if it has sufficient entropy (randomness)
                 # Typical thresholds: low entropy (~2.0) for structured text, high entropy (~4.5+) for random tokens
-                min_entropy = 3.5  # Balanced threshold to catch real secrets but avoid common words
+                min_entropy = 4.0  # Balanced threshold to catch real secrets but avoid common words
 
                 if not is_placeholder and entropy >= min_entropy and len(secret_part) >= 10:
                     issues.append(
