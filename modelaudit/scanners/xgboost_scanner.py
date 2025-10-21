@@ -71,6 +71,8 @@ class XGBoostScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
+        self.max_num_trees = self.config.get("max_num_trees", 10000)
+        self.max_tree_depth = self.config.get("max_tree_depth", 1000)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -373,10 +375,116 @@ class XGBoostScanner(BaseScanner):
             )
             return
 
+        # Check learner parameters for sanity
+        self._validate_learner_parameters(learner, result, path)
+
+    def _validate_learner_parameters(self, learner: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Validate XGBoost learner parameters for suspicious values."""
+        # Check for gradient booster
+        gradient_booster = learner.get("gradient_booster")
+        if gradient_booster and isinstance(gradient_booster, dict):
+            model = gradient_booster.get("model")
+            if model and isinstance(model, dict):
+                # Check number of trees
+                trees = model.get("trees", [])
+                if isinstance(trees, list):
+                    num_trees = len(trees)
+                    if num_trees > self.max_num_trees:
+                        result.add_check(
+                            name="Tree Count Validation",
+                            passed=False,
+                            message=f"Large number of trees detected: {num_trees} (threshold: {self.max_num_trees})",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={"num_trees": num_trees, "max_trees": self.max_num_trees},
+                            why=(
+                                "Large tree counts may impact performance but are often legitimate in production models"
+                            ),
+                        )
+
+                    # Check individual tree structures
+                    self._validate_tree_structures(trees[:10], result, path)  # Sample first 10 trees
+
+        # Check learner model parameters
+        params = learner.get("learner_model_param", {})
+        if isinstance(params, dict):
+            self._validate_model_parameters(params, result, path)
+
+    def _validate_tree_structures(self, trees: list[dict[str, Any]], result: ScanResult, path: str) -> None:
+        """Validate individual tree structures for anomalies."""
+        for i, tree in enumerate(trees):
+            # Check tree depth
+            if "tree_param" in tree:
+                tree_param = tree["tree_param"]
+                if isinstance(tree_param, dict):
+                    try:
+                        depth = int(tree_param.get("size_leaf_vector", 0))
+                    except (ValueError, TypeError):
+                        # Skip validation if value can't be converted to int
+                        continue
+                    if depth > self.max_tree_depth:
+                        result.add_check(
+                            name="Tree Depth Validation",
+                            passed=False,
+                            message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
+                            why="Deep trees may impact performance but can be legitimate in complex models",
+                        )
+
+    def _validate_model_parameters(self, params: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Validate XGBoost model parameters for suspicious values."""
+        # Check for numeric parameters that could be maliciously large
+        suspicious_params = {
+            "num_features": (0, 1000000),  # (min, max) reasonable range
+            "num_parallel_tree": (1, 1000),
+            "num_roots": (1, 100),
+        }
+
+        for param_name, (min_val, max_val) in suspicious_params.items():
+            if param_name in params:
+                try:
+                    value = int(params[param_name])
+                    if value < min_val or value > max_val:
+                        result.add_check(
+                            name="Model Parameter Validation",
+                            passed=False,
+                            message=f"Unusual {param_name} value: {value} (typical range: {min_val}-{max_val})",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={param_name: value, "range": [min_val, max_val]},
+                            why=(
+                                f"Parameter {param_name} outside typical range. "
+                                "Review if this is expected for your model."
+                            ),
+                        )
+                except (ValueError, TypeError):
+                    result.add_check(
+                        name="Model Parameter Type Validation",
+                        passed=False,
+                        message=f"Invalid type for parameter {param_name}: {type(params[param_name])}",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={param_name: str(params[param_name])},
+                    )
+
+    def _sanitize_for_json(self, obj: Any) -> Any:
+        """Recursively sanitize object for JSON serialization by converting bytes to hex strings."""
+        if isinstance(obj, bytes):
+            return obj.hex()
+        elif isinstance(obj, dict):
+            return {k: self._sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list | tuple):
+            return [self._sanitize_for_json(item) for item in obj]
+        return obj
+
     def _check_json_for_malicious_content(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check XGBoost JSON data for potentially malicious content."""
+        # Sanitize data to handle bytes objects before JSON serialization
+        sanitized_data = self._sanitize_for_json(data)
         # Convert to string for pattern matching
-        json_str = json.dumps(data, separators=(",", ":"))
+        json_str = json.dumps(sanitized_data, separators=(",", ":"))
 
         # Check for suspicious patterns using precompiled regex
         for pattern, description in SUSPICIOUS_JSON_PATTERNS:

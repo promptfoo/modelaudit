@@ -193,6 +193,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "skops": {
+                "module": "modelaudit.scanners.skops_scanner",
+                "class": "SkopsScanner",
+                "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+                "extensions": [".skops"],
+                "priority": 8,  # Same priority as joblib
+                "dependencies": [],  # No heavy dependencies (uses standard zipfile)
+                "numpy_sensitive": False,
+            },
             "numpy": {
                 "module": "modelaudit.scanners.numpy_scanner",
                 "class": "NumPyScanner",
@@ -658,6 +667,7 @@ def __getattr__(name: str) -> Any:
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
         "ManifestScanner": "manifest",
