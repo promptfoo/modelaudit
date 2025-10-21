@@ -2370,6 +2370,7 @@ class PickleScanner(BaseScanner):
                                     "function": func,
                                     "position": pos,
                                     "opcode": opcode.name,
+                                    "import_reference": f"{mod}.{func}",
                                     "ml_context_confidence": ml_context.get(
                                         "overall_confidence",
                                         0,
@@ -2387,6 +2388,7 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "module": mod,
                                     "function": func,
+                                    "import_reference": f"{mod}.{func}",
                                     "position": pos,
                                     "opcode": opcode.name,
                                     "ml_context_confidence": ml_context.get(
