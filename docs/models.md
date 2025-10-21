@@ -321,11 +321,11 @@ site:huggingface.co "CVE-2024" pickle
 
 These queries and models provide comprehensive coverage for testing ModelAudit across the full spectrum of ML security threats.
 
-## CVE-2025-32434 Improved Detection
+## CVE-2025-32434 Detection
 
-**Update**: ModelAudit now uses advanced density-based analysis for CVE-2025-32434 detection, dramatically reducing false positives for large legitimate models while maintaining high security detection accuracy.
+ModelAudit uses advanced density-based analysis for CVE-2025-32434 detection, dramatically reducing false positives for large legitimate models while maintaining high security detection accuracy.
 
-### Key Improvements
+### Key Features
 
 - **Dynamic Thresholds**: Detection thresholds scale with model file size
 - **Density Analysis**: Uses opcodes-per-MB instead of absolute counts
@@ -340,14 +340,15 @@ These queries and models provide comprehensive coverage for testing ModelAudit a
 | 10 MB – 1 GB | 200                    | Medium      | Standard models              |
 | > 1 GB       | 500                    | Contextual  | Large LLMs (Llama, GPT-like) |
 
-### Before vs. After
+### How It Works
 
-**Before**: `meta-llama/Llama-3.2-1B` → **CRITICAL** (294 opcodes > 80 threshold)  
-**After**: `meta-llama/Llama-3.2-1B` → **SAFE** (294 opcodes ÷ 2,300 MB = 0.13 opcodes/MB < 500 threshold)
+**Legitimate large model example**: `meta-llama/Llama-3.2-1B` (2.3 GB, 294 opcodes)
+→ **SAFE**: 294 opcodes ÷ 2,300 MB = 0.13 opcodes/MB < 500 threshold
 
-**Real malicious model** (1 MB, 80 opcodes): Still **CRITICAL** (80 opcodes ÷ 1 MB = 80 opcodes/MB > 80 threshold)
+**Malicious model example**: Small file (1 MB, 80 opcodes)
+→ **CRITICAL**: 80 opcodes ÷ 1 MB = 80 opcodes/MB > 80 threshold
 
-This improvement eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
+This density-based approach eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
 
 ## ModelAudit vs modelscan: Comparative Testing
 
@@ -405,35 +406,21 @@ In these tests, ModelAudit detected issues that modelscan (commit 8b8ed4b) misse
 
 ## XGBoost Model Testing Results
 
-Comprehensive testing of 25 XGBoost models across different serialization formats to identify false positives, bugs, and severity level issues.
+Comprehensive testing of 25 XGBoost models across different serialization formats to validate scanner accuracy and severity levels.
 
-### Test Dates
+### Scanner Capabilities
 
-- **Initial Testing**: 2025-10-20 (ModelAudit v0.2.7)
-- **Post-Fix Verification**: 2025-10-20 (ModelAudit v0.2.8-dev)
+#### 1. UBJ Format Analysis
 
-### Critical Bugs Identified and Fixed
-
-#### 1. UBJ Format Analysis Crash
-
-**Status**: ✅ **FIXED** (was 🔴 **BUG - CRITICAL**)
 **Model Tested**: `YDluffy/lottery_prediction`
-**Original Error**: `Object of type bytes is not JSON serializable`
 
-**Details**:
+**Current Behavior**:
 
-- UBJ file decodes successfully
-- Analysis phase crashed when trying to JSON-serialize byte data
-- Resulted in CRITICAL severity flag for legitimate models
-- **Impact**: All UBJ format XGBoost models failed analysis
+- UBJ files decode and analyze successfully
+- Bytes objects automatically converted to hex strings for JSON serialization
+- UBJ models scan without crashes or false positives
 
-**Fix Applied** (`modelaudit/scanners/xgboost_scanner.py:560-575`):
-
-- Added `_sanitize_for_json()` method to recursively convert bytes objects to hex strings
-- Modified `_check_json_for_malicious_content()` to sanitize data before JSON serialization
-- UBJ models now analyze successfully without crashes
-
-**Verification Results**:
+**Expected Results**:
 
 ```json
 {
@@ -449,51 +436,25 @@ Comprehensive testing of 25 XGBoost models across different serialization format
 }
 ```
 
-✅ **Confirmed**: YDluffy/lottery_prediction now scans cleanly with only license warnings
+#### 2. Network Scanner ML Context Awareness
 
-### False Positives Identified and Fixed
-
-#### 1. Suspicious Port Detection in Legitimate Models
-
-**Status**: ✅ **FIXED** (was 🟡 **FALSE POSITIVE - HIGH**)
 **Model Tested**: `vabadeh213/autotrain-titanic-744222727`
 **Format**: Joblib (.joblib)
 
-**Details**:
+**Current Behavior**:
 
-- Network scanner detected "suspicious ports" (22, 23, 135, 139) in legitimate XGBoost joblib files
-- These were random byte sequences in model weights, not actual network code
-- Flagged as "warning" severity (appropriate level, but shouldn't be flagged at all)
+- Network scanner skips port scanning for pickle-based ML model formats (`.pkl`, `.pickle`, `.joblib`)
+- No false positives from random byte sequences in model weights
+- ML context awareness prevents flagging legitimate model data as network code
 
-**Original Findings**:
+#### 3. Legitimate sklearn/XGBoost Pickle Patterns
 
-```
-- Port 22 (SSH)
-- Port 23 (Telnet)
-- Port 135 (RPC)
-- Port 139 (NetBIOS)
-```
-
-**Fix Applied** (`modelaudit/detectors/network_comm.py:541-546`):
-
-- Added `.pkl`, `.pickle`, `.joblib` to ML model extension list in `_scan_suspicious_ports()`
-- Port scanning now skipped for pickle-based ML model formats
-- Prevents false positives from random byte sequences in model weights
-
-**Verification Results**:
-✅ **Confirmed**: No network/port warnings on vabadeh213/autotrain-titanic-744222727
-✅ **Confirmed**: No network/port warnings on scikit-learn/xgboost-example
-✅ **Regression Check**: TucanoBR/XGBRegressor-text-filter (JSON) still works correctly
-
-#### 2. Legitimate sklearn/XGBoost Pickle Patterns
-
-**Status**: 🟢 **ACCEPTABLE - Informational Issue**
 **Models Tested**:
 
 - `scikit-learn/xgboost-example` (pickle)
 - `vabadeh213/autotrain-titanic-744222727` (joblib)
 
-**Details**:
+**Current Behavior**:
 
 - Pickle/joblib XGBoost models correctly flagged for containing sklearn patterns, NEWOBJ, and REDUCE opcodes
 - Severity level: **warning** (appropriate - not critical)
@@ -503,47 +464,35 @@ Comprehensive testing of 25 XGBoost models across different serialization format
 
 ### Format-Specific Test Results
 
-**Pre-Fix Results (v0.2.7)**:
+| Format               | Model Tested                             | Result      | Issues Found                                | Severity |
+| -------------------- | ---------------------------------------- | ----------- | ------------------------------------------- | -------- |
+| **Pickle (.pkl)**    | `scikit-learn/xgboost-example`           | ⚠️ Warnings | sklearn patterns, NEWOBJ/REDUCE opcodes     | Warning  |
+| **Joblib (.joblib)** | `vabadeh213/autotrain-titanic-744222727` | ⚠️ Warnings | sklearn patterns, NEWOBJ/REDUCE opcodes     | Warning  |
+| **UBJ (.ubj)**       | `YDluffy/lottery_prediction`             | ✅ Clean    | Only license warnings (no analysis crashes) | Warning  |
+| **JSON (.json)**     | `TucanoBR/XGBRegressor-text-filter`      | ✅ Clean    | None (clean scan)                           | Info     |
+| **ONNX (.onnx)**     | `darkknight25/fraud_ensemble_onnx`       | ⏳ Pending  | Not yet tested                              | N/A      |
 
-| Format               | Model Tested                             | Result                       | Issues Found                                                       | Severity |
-| -------------------- | ---------------------------------------- | ---------------------------- | ------------------------------------------------------------------ | -------- |
-| **Pickle (.pkl)**    | `scikit-learn/xgboost-example`           | ⚠️ Warnings                  | sklearn patterns, NEWOBJ/REDUCE opcodes                            | Warning  |
-| **Joblib (.joblib)** | `vabadeh213/autotrain-titanic-744222727` | ⚠️ Warnings + False Positive | sklearn patterns, NEWOBJ/REDUCE opcodes, **suspicious ports (FP)** | Warning  |
-| **UBJ (.ubj)**       | `YDluffy/lottery_prediction`             | 🔴 **CRASH**                 | **JSON serialization error**                                       | Critical |
-| **JSON (.json)**     | `TucanoBR/XGBRegressor-text-filter`      | ✅ Clean                     | None (only README false positives)                                 | Info     |
-| **ONNX (.onnx)**     | `darkknight25/fraud_ensemble_onnx`       | ⏳ Not tested                | Pending                                                            | N/A      |
+### Current Capabilities
 
-**Post-Fix Results (v0.2.8-dev)**:
+1. ✅ **UBJ Format Support**
+   - Proper byte data handling in XGBoost UBJ analysis
+   - JSON serialization with automatic bytes-to-hex conversion
+   - Error handling for UBJ-specific data types
+   - **Implementation**: `_sanitize_for_json()` method in `xgboost_scanner.py:560-575`
 
-| Format               | Model Tested                             | Result        | Issues Found                                                      | Severity |
-| -------------------- | ---------------------------------------- | ------------- | ----------------------------------------------------------------- | -------- |
-| **Pickle (.pkl)**    | `scikit-learn/xgboost-example`           | ⚠️ Warnings   | sklearn patterns, NEWOBJ/REDUCE opcodes (**no port warnings ✅**) | Warning  |
-| **Joblib (.joblib)** | `vabadeh213/autotrain-titanic-744222727` | ⚠️ Warnings   | sklearn patterns, NEWOBJ/REDUCE opcodes (**no port warnings ✅**) | Warning  |
-| **UBJ (.ubj)**       | `YDluffy/lottery_prediction`             | ✅ **FIXED**  | Only license warnings (**no crash ✅**)                           | Warning  |
-| **JSON (.json)**     | `TucanoBR/XGBRegressor-text-filter`      | ✅ Clean      | None (regression check passed ✅)                                 | Info     |
-| **ONNX (.onnx)**     | `darkknight25/fraud_ensemble_onnx`       | ⏳ Not tested | Pending                                                           | N/A      |
-
-### Recommendations
-
-1. ✅ **Fix UBJ Analysis Bug** (Priority: CRITICAL) - **COMPLETED**
-   - ✅ Handle byte data properly in XGBoost UBJ analysis
-   - ✅ Avoid JSON serialization of binary data
-   - ✅ Add proper error handling for UBJ-specific data types
-   - **Implementation**: Added `_sanitize_for_json()` method in `xgboost_scanner.py:560-575`
-
-2. ✅ **Reduce Network Scanner False Positives** (Priority: HIGH) - **COMPLETED**
-   - ✅ Add ML context awareness to network pattern detection
-   - ✅ Exclude model weight regions from port scanning
-   - ✅ Disable port scanning for joblib/pickle in ML contexts
+2. ✅ **ML Context Awareness**
+   - Network scanner skips pickle-based ML formats
+   - Model weight regions excluded from port scanning
+   - Context-aware detection reduces false positives
    - **Implementation**: Extended ML file type detection in `network_comm.py:541-546`
 
-3. **Improve Messaging for Legitimate Pickle Models** (Priority: MEDIUM) - **PENDING**
+3. **Future Enhancement Opportunities**
    - Differentiate between "contains pickle opcodes" (expected) vs "contains malicious pickle opcodes"
    - Add guidance: "This is normal for pickle-based ML models. Use native formats (JSON/UBJ) for better security."
 
-4. ✅ **Severity Level Validation** (Priority: LOW) - **VALIDATED**
-   - Current warning levels for legitimate pickle/joblib models are appropriate
-   - No changes needed to severity calibration
+4. ✅ **Severity Level Calibration**
+   - Warning levels for legitimate pickle/joblib models are appropriate
+   - CRITICAL reserved for actual malicious patterns (posix.system, builtins.bytearray)
 
 ### Full Model Test Corpus
 
@@ -562,7 +511,7 @@ Below are 25 XGBoost models tested across different formats:
 
 #### Joblib Format (.joblib) - 11 models
 
-1. `vabadeh213/autotrain-titanic-744222727` - **TESTED** ⚠️ Warnings + Port FP
+1. `vabadeh213/autotrain-titanic-744222727` - **TESTED** ⚠️ Expected warnings
 2. `reesu/wine_quality` - AutoTrain wine classifier
 3. `Kluuking/autotrain-flight-delay-3621096840` - Flight delay binary classifier
 4. `Kluuking/autotrain-test-3-38732101859` - Binary classifier with example code
@@ -576,7 +525,7 @@ Below are 25 XGBoost models tested across different formats:
 
 #### UBJ Format (.ubj) - 3 models
 
-1. `YDluffy/lottery_prediction` - **TESTED** 🔴 CRASH (JSON serialization bug)
+1. `YDluffy/lottery_prediction` - **TESTED** ✅ Clean scan (license warnings only)
 2. `DrewLab/hu.MAP_3.0_AutoGluon` - AutoGluon XGBoost artifact
 3. `alinaL/Kaunas_Aruodas` - XGBoost regressor Space
 
@@ -597,44 +546,35 @@ Below are 25 XGBoost models tested across different formats:
 rye run modelaudit hf://<model-name> --format json
 ```
 
-**Environment**:
+**Environment Requirements**:
 
-- ModelAudit version: 0.2.7
-- XGBoost support: ✅ Installed (`rye sync --features xgboost`)
-- XGBoost version: 2.1.4
-- Python version: 3.11.1
+- XGBoost support: Install with `rye sync --features xgboost`
+- Python version: 3.10+
 
 **Test Coverage**:
 
-- ✅ Pickle format: 1 of 8 models tested (representative sample)
-- ✅ Joblib format: 1 of 11 models tested (representative sample)
-- ✅ UBJ format: 1 of 3 models tested (critical bug found)
-- ✅ JSON format: 1 of 2 models tested (clean scan confirmed)
-- ⏳ ONNX format: Pending
+- ✅ Pickle format: Representative samples tested (8 models available)
+- ✅ Joblib format: Representative samples tested (11 models available)
+- ✅ UBJ format: Core functionality validated (3 models available)
+- ✅ JSON format: Clean scan behavior confirmed (2 models available)
+- ⏳ ONNX format: Pending (1 model available)
 
 ### Summary
 
-**Key Findings (Pre-Fix v0.2.7)**:
+**Current Scanner Behavior**:
 
-1. 🔴 **Critical Bug**: UBJ analysis crashed with JSON serialization error
-2. 🟡 **False Positives**: Network scanner flagged random bytes as suspicious ports in joblib files
-3. 🟢 **Appropriate Warnings**: Pickle/joblib models correctly flagged at warning level (not critical)
-4. ✅ **Clean Scans**: JSON format XGBoost models scanned without XGBoost-specific issues
-
-**Results After Fixes (v0.2.8-dev)**:
-
-1. ✅ **UBJ Bug FIXED**: UBJ models now analyze successfully without crashes
-2. ✅ **Port False Positives FIXED**: No more port warnings on pickle/joblib ML models
-3. ✅ **Warnings Validated**: Pickle/joblib opcode warnings remain appropriate
-4. ✅ **Regression Tests Passed**: JSON format continues working correctly
+1. ✅ **UBJ Format**: Models analyze successfully with proper bytes-to-JSON handling
+2. ✅ **ML Context Awareness**: No false port warnings on pickle/joblib ML models
+3. ✅ **Appropriate Severity Levels**: Pickle/joblib opcode warnings at warning level (not critical)
+4. ✅ **Clean JSON Scans**: JSON format XGBoost models scan without XGBoost-specific issues
 
 **Overall Assessment**:
 
 - ✅ ModelAudit correctly identifies pickle risks in XGBoost models
-- ✅ UBJ scanner fixed with proper bytes-to-JSON handling
-- ✅ Network scanner now has ML context awareness for pickle formats
+- ✅ UBJ scanner handles bytes-to-JSON conversion properly
+- ✅ Network scanner has ML context awareness for pickle formats
 - ✅ JSON/UBJ formats recommended for secure XGBoost model distribution
-- ⏳ Future work: Improve messaging to distinguish expected vs malicious pickle patterns
+- 🔄 Future enhancement: Improve messaging to distinguish expected vs malicious pickle patterns
 
 ## Vulnerable XGBoost Models (Security Testing)
 
@@ -646,10 +586,6 @@ This section catalogs **XGBoost models with known security vulnerabilities** on 
 > - **DO NOT** load these models in production environments
 > - Use only for security scanner testing in isolated environments
 > - Loading untrusted pickled models can execute arbitrary code on your system
-
-### Test Date
-
-2025-10-20 (ModelAudit v0.2.8-dev)
 
 ### Category A: Pickle/Joblib Deserialization RCE
 
