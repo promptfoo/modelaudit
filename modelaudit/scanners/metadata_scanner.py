@@ -200,7 +200,7 @@ class MetadataScanner(BaseScanner):
                     issues.append(
                         Issue(
                             message=f"Potential exposed secret in text metadata: {description}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=file_path,
                             details={
                                 "pattern_description": description,
