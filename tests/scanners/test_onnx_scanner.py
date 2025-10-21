@@ -109,4 +109,5 @@ def test_onnx_scanner_python_op(tmp_path):
     model_path = create_python_onnx_model(tmp_path)
     result = OnnxScanner().scan(str(model_path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
-    assert any(i.details.get("op_type") == "PythonOp" for i in result.issues)
+    # Check for aggregated Python operator findings
+    assert any("PythonOp" in i.details.get("op_types", "") for i in result.issues)

@@ -2344,6 +2344,14 @@ class PickleScanner(BaseScanner):
                 )
 
             # Now analyze the collected opcodes with ML context awareness
+            # Collect opcode findings for aggregation
+            reduce_opcode_findings: list[dict[str, Any]] = []
+            dangerous_opcode_findings: dict[str, list[dict[str, Any]]] = {
+                "INST": [],
+                "OBJ": [],
+                "NEWOBJ": [],
+            }
+
             for opcode, arg, pos in opcodes:
                 # Check for GLOBAL opcodes that might reference suspicious modules
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -2405,21 +2413,13 @@ class PickleScanner(BaseScanner):
                         IssueSeverity.WARNING,
                         ml_context,
                     )
-                    result.add_check(
-                        name="REDUCE Opcode Safety Check",
-                        passed=False,
-                        message="Found REDUCE opcode - potential __reduce__ method execution",
-                        severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        details={
+                    # Collect for aggregation instead of individual check
+                    reduce_opcode_findings.append(
+                        {
                             "position": pos,
-                            "opcode": opcode.name,
-                            "ml_context_confidence": ml_context.get(
-                                "overall_confidence",
-                                0,
-                            ),
-                        },
-                        why=get_opcode_explanation("REDUCE"),
+                            "severity": severity,
+                            "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                        }
                     )
 
                 # Check dangerous opcodes for potential security issues
@@ -2429,22 +2429,14 @@ class PickleScanner(BaseScanner):
                         IssueSeverity.WARNING,
                         ml_context,
                     )
-                    result.add_check(
-                        name="INST/OBJ Opcode Safety Check",
-                        passed=False,
-                        message=f"Found {opcode.name} opcode - potential code execution",
-                        severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        details={
+                    # Collect for aggregation instead of individual check
+                    dangerous_opcode_findings[opcode.name].append(
+                        {
                             "position": pos,
-                            "opcode": opcode.name,
+                            "severity": severity,
                             "argument": str(arg),
-                            "ml_context_confidence": ml_context.get(
-                                "overall_confidence",
-                                0,
-                            ),
-                        },
-                        why=get_opcode_explanation(opcode.name),
+                            "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                        }
                     )
 
                 # Check for suspicious strings
@@ -2565,6 +2557,75 @@ class PickleScanner(BaseScanner):
                             except Exception:
                                 # Not valid UTF-8, skip Python code check
                                 pass
+
+            # Create aggregated checks for opcode findings
+            if reduce_opcode_findings:
+                # Get the most severe severity from all findings
+                severity = max(
+                    (f["severity"] for f in reduce_opcode_findings),
+                    key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
+                )
+
+                # Get up to 5 example positions
+                example_positions = [f["position"] for f in reduce_opcode_findings[:5]]
+                examples_str = ", ".join(map(str, example_positions))
+
+                plural = "s" if len(reduce_opcode_findings) > 1 else ""
+                message = (
+                    f"Found {len(reduce_opcode_findings)} REDUCE opcode{plural} - potential __reduce__ method execution"
+                )
+
+                result.add_check(
+                    name="REDUCE Opcode Safety Check",
+                    passed=False,
+                    message=message,
+                    severity=severity,
+                    location=self.current_file_path,
+                    details={
+                        "count": len(reduce_opcode_findings),
+                        "example_positions": examples_str,
+                        "ml_context_confidence": reduce_opcode_findings[0].get("ml_context_confidence", 0),
+                        "aggregated": True,
+                    },
+                    why=get_opcode_explanation("REDUCE"),
+                )
+
+            # Create aggregated checks for INST/OBJ/NEWOBJ opcodes
+            for opcode_name, findings in dangerous_opcode_findings.items():
+                if findings:
+                    # Get the most severe severity from all findings
+                    severity = max(
+                        (f["severity"] for f in findings),
+                        key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
+                    )
+
+                    # Get up to 5 example positions
+                    example_positions = [f["position"] for f in findings[:5]]
+                    examples_str = ", ".join(map(str, example_positions))
+
+                    # Get unique arguments (up to 3)
+                    unique_args = list({f["argument"] for f in findings})[:3]
+                    args_str = ", ".join(unique_args) if unique_args else "N/A"
+
+                    plural = "s" if len(findings) > 1 else ""
+                    message = f"Found {len(findings)} {opcode_name} opcode{plural} - potential code execution"
+
+                    result.add_check(
+                        name="INST/OBJ Opcode Safety Check",
+                        passed=False,
+                        message=message,
+                        severity=severity,
+                        location=self.current_file_path,
+                        details={
+                            "opcode": opcode_name,
+                            "count": len(findings),
+                            "example_positions": examples_str,
+                            "example_arguments": args_str,
+                            "ml_context_confidence": findings[0].get("ml_context_confidence", 0),
+                            "aggregated": True,
+                        },
+                        why=get_opcode_explanation(opcode_name),
+                    )
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)

@@ -177,37 +177,75 @@ class OnnxScanner(BaseScanner):
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
-        python_ops_found = False
         safe_nodes = 0
+
+        # Aggregate custom operator findings by domain
+        custom_op_findings: dict[str, dict[str, Any]] = {}
+        python_op_findings: list[dict[str, Any]] = []
 
         for node in model.graph.node:
             # Check for interrupts periodically during node processing
             self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
-                result.add_check(
-                    name="Custom Operator Domain Check",
-                    passed=False,
-                    message=f"Model uses custom operator domain '{node.domain}'",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{path} (node: {node.name})",
-                    details={"op_type": node.op_type, "domain": node.domain},
-                )
+
+                # Aggregate by domain
+                if node.domain not in custom_op_findings:
+                    custom_op_findings[node.domain] = {
+                        "count": 0,
+                        "op_types": set(),
+                        "example_nodes": [],
+                    }
+
+                custom_op_findings[node.domain]["count"] += 1
+                custom_op_findings[node.domain]["op_types"].add(node.op_type)
+
+                # Store up to 3 example nodes
+                if len(custom_op_findings[node.domain]["example_nodes"]) < 3:
+                    custom_op_findings[node.domain]["example_nodes"].append(
+                        {
+                            "name": node.name,
+                            "op_type": node.op_type,
+                        }
+                    )
+
             elif "python" in node.op_type.lower():
-                python_ops_found = True
-                result.add_check(
-                    name="Python Operator Detection",
-                    passed=False,
-                    message=f"Model uses Python operator '{node.op_type}'",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{path} (node: {node.name})",
-                    details={"op_type": node.op_type, "domain": node.domain},
+                python_op_findings.append(
+                    {
+                        "node_name": node.name,
+                        "op_type": node.op_type,
+                        "domain": node.domain,
+                    }
                 )
             else:
                 safe_nodes += 1
 
-        # Record successful checks for safe operators
-        if safe_nodes > 0 and not custom_domains:
+        # Create aggregated check for custom operators
+        if custom_op_findings:
+            for domain, info in custom_op_findings.items():
+                op_types_str = ", ".join(sorted(info["op_types"]))
+                examples = [f"{ex['name']} ({ex['op_type']})" for ex in info["example_nodes"]]
+                examples_str = ", ".join(examples)
+
+                plural = "s" if info["count"] > 1 else ""
+                message = f"Model uses custom operator domain '{domain}' ({info['count']} occurrence{plural})"
+
+                result.add_check(
+                    name="Custom Operator Domain Check",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={
+                        "domain": domain,
+                        "count": info["count"],
+                        "op_types": op_types_str,
+                        "examples": examples_str,
+                        "aggregated": True,
+                    },
+                )
+        elif safe_nodes > 0:
+            # Record successful checks for safe operators
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=True,
@@ -216,7 +254,30 @@ class OnnxScanner(BaseScanner):
                 details={"safe_nodes": safe_nodes},
             )
 
-        if not python_ops_found:
+        # Create aggregated check for Python operators
+        if python_op_findings:
+            op_types = {f["op_type"] for f in python_op_findings}
+            op_types_str = ", ".join(sorted(op_types))
+            examples = [f"{f['node_name']} ({f['op_type']})" for f in python_op_findings[:3]]
+            examples_str = ", ".join(examples)
+
+            plural = "s" if len(python_op_findings) > 1 else ""
+            message = f"Model uses Python operators ({len(python_op_findings)} occurrence{plural})"
+
+            result.add_check(
+                name="Python Operator Detection",
+                passed=False,
+                message=message,
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "count": len(python_op_findings),
+                    "op_types": op_types_str,
+                    "examples": examples_str,
+                    "aggregated": True,
+                },
+            )
+        else:
             result.add_check(
                 name="Python Operator Detection",
                 passed=True,
