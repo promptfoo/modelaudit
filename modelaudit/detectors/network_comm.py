@@ -540,9 +540,20 @@ class NetworkCommDetector:
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
-        is_ml_model = context and any(
-            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx", ".safetensors"]
-        )
+        ml_extensions = [
+            ".bin",
+            ".pt",
+            ".pth",
+            ".ckpt",
+            ".h5",
+            ".pb",
+            ".onnx",
+            ".safetensors",
+            ".pkl",
+            ".pickle",
+            ".joblib",
+        ]
+        is_ml_model = context and any(ext in context.lower() for ext in ml_extensions)
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fix**: resolve XGBoost UBJ crash and network scanner false positives
+  - Fix UBJ format JSON serialization crash by sanitizing bytes objects to hex strings
+  - Eliminate network scanner false positives for pickle/joblib ML models by adding ML context awareness
+  - Add comprehensive XGBoost testing documentation with 25-model test corpus
+
 ## [0.2.7] - 2025-10-20
 
 ### Fixed
