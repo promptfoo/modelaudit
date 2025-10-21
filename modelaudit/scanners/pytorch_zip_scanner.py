@@ -869,14 +869,97 @@ class PyTorchZipScanner(BaseScanner):
             # If version parsing fails, assume vulnerable for safety
             return True
 
+    def _check_safetensors_available(self, model_path: str) -> bool:
+        """Check if a SafeTensors alternative exists in the same directory"""
+        try:
+            import glob
+
+            # Get the directory containing the PyTorch model
+            model_dir = os.path.dirname(model_path)
+            if not model_dir:
+                # If no directory (relative path), use current directory
+                model_dir = "."
+
+            # Look for .safetensors files in the same directory
+            safetensors_pattern = os.path.join(model_dir, "*.safetensors")
+            safetensors_files = glob.glob(safetensors_pattern)
+
+            return len(safetensors_files) > 0
+        except Exception:
+            return False
+
+    def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
+        """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
+        # Standard PyTorch imports that are expected in legitimate models
+        legitimate_imports = {
+            "torch._utils",
+            "torch.LongStorage",
+            "torch.FloatStorage",
+            "torch.HalfStorage",
+            "torch.IntStorage",
+            "torch.Storage",
+            "collections.OrderedDict",
+            "collections",
+            "numpy",
+        }
+
+        # Malicious imports that indicate actual attack
+        malicious_imports = {
+            "os.system",
+            "subprocess",
+            "eval",
+            "exec",
+            "compile",
+            "__builtin__",
+            "builtins.eval",
+            "builtins.exec",
+            "webbrowser",
+            "socket",
+            "urllib",
+        }
+
+        found_imports = set()
+        found_malicious = set()
+
+        # Extract GLOBAL opcodes from ALL checks (both passed and failed)
+        # This is important because legitimate imports are recorded as passed checks
+        all_checks = pickle_result.issues + getattr(pickle_result, "checks", [])
+        for check in all_checks:
+            check_details = check.details or {}
+            if "import_reference" in check_details:
+                imp = check_details["import_reference"]
+                found_imports.add(imp)
+                # Check if this is a malicious import
+                if any(mal in imp for mal in malicious_imports):
+                    found_malicious.add(imp)
+
+        # Determine if all imports are legitimate
+        all_legitimate = (
+            all(any(legit in imp for legit in legitimate_imports) for imp in found_imports) if found_imports else True
+        )
+
+        return {
+            "total_imports": len(found_imports),
+            "all_legitimate": all_legitimate,
+            "found_malicious": list(found_malicious),
+            "found_imports": list(found_imports),
+        }
+
     def _add_weights_only_safety_warnings(
         self, pickle_result: ScanResult, pytorch_result: ScanResult, model_path: str, pickle_name: str
     ) -> None:
-        """Add CVE-2025-32434 specific warnings when dangerous opcodes detected in PyTorch models"""
+        """Add CVE-2025-32434 specific warnings with context-aware severity"""
 
-        # Check if the pickle scan found any dangerous opcodes that would make weights_only=True unsafe
-        dangerous_opcodes_found = []
-        code_execution_risks = []
+        # Check for SafeTensors availability
+        has_safetensors = self._check_safetensors_available(model_path)
+
+        # Analyze imports to distinguish legitimate vs malicious
+        import_analysis = self._analyze_pickle_imports(pickle_result)
+
+        # Check if the pickle scan found any dangerous opcodes
+        dangerous_opcodes_found: list[str] = []
+        code_execution_risks: list[str] = []
+        opcode_counts: dict[str, int] = {}
 
         # Analyze the pickle scan results for dangerous patterns
         for issue in pickle_result.issues:
@@ -886,59 +969,104 @@ class PyTorchZipScanner(BaseScanner):
             # Look for specific dangerous opcodes
             if "reduce" in issue_msg or "REDUCE" in str(issue_details):
                 dangerous_opcodes_found.append("REDUCE")
+                opcode_counts["REDUCE"] = opcode_counts.get("REDUCE", 0) + 1
                 code_execution_risks.append("__reduce__ method exploitation")
             if "inst" in issue_msg or "INST" in str(issue_details):
                 dangerous_opcodes_found.append("INST")
+                opcode_counts["INST"] = opcode_counts.get("INST", 0) + 1
                 code_execution_risks.append("Class instantiation code execution")
             if "obj" in issue_msg or "OBJ" in str(issue_details):
                 dangerous_opcodes_found.append("OBJ")
+                opcode_counts["OBJ"] = opcode_counts.get("OBJ", 0) + 1
                 code_execution_risks.append("Object creation code execution")
             if "newobj" in issue_msg or "NEWOBJ" in str(issue_details):
                 dangerous_opcodes_found.append("NEWOBJ")
+                opcode_counts["NEWOBJ"] = opcode_counts.get("NEWOBJ", 0) + 1
                 code_execution_risks.append("New-style object creation")
             if "stack_global" in issue_msg or "STACK_GLOBAL" in str(issue_details):
                 dangerous_opcodes_found.append("STACK_GLOBAL")
+                opcode_counts["STACK_GLOBAL"] = opcode_counts.get("STACK_GLOBAL", 0) + 1
                 code_execution_risks.append("Dynamic import and attribute access")
             if "global" in issue_msg or "GLOBAL" in str(issue_details):
                 dangerous_opcodes_found.append("GLOBAL")
+                opcode_counts["GLOBAL"] = opcode_counts.get("GLOBAL", 0) + 1
                 code_execution_risks.append("Module import and attribute access")
             if "build" in issue_msg or "BUILD" in str(issue_details):
                 dangerous_opcodes_found.append("BUILD")
+                opcode_counts["BUILD"] = opcode_counts.get("BUILD", 0) + 1
                 code_execution_risks.append("__setstate__ method exploitation")
 
             # Look for any code execution patterns
             if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
                 code_execution_risks.append("Direct code execution patterns")
 
-        # If dangerous opcodes were found, add specific CVE-2025-32434 warning
+        # If dangerous opcodes were found, determine appropriate severity
         if dangerous_opcodes_found or code_execution_risks:
-            # Create detailed warning message
-            opcode_list = ", ".join(set(dangerous_opcodes_found)) if dangerous_opcodes_found else "unknown"
-            # risk_description = "; ".join(set(code_execution_risks)) if code_execution_risks else "code execution"
+            # Determine severity based on context
+            if import_analysis["found_malicious"]:
+                # Malicious imports found - this is CRITICAL
+                severity = IssueSeverity.CRITICAL
+                message_prefix = "CRITICAL: Malicious code detected"
+                recommendation = (
+                    "DO NOT USE THIS MODEL - it contains malicious imports "
+                    f"({', '.join(import_analysis['found_malicious'])}). "
+                    "This is likely a supply chain attack."
+                )
+            elif has_safetensors and import_analysis["all_legitimate"]:
+                # Legitimate opcodes but risky format, SafeTensors available - this is WARNING
+                severity = IssueSeverity.WARNING
+                message_prefix = "Insecure serialization format (SafeTensors available)"
+                recommendation = (
+                    f"This model uses pickle format which has inherent security risks (CVE-2025-32434). "
+                    f"A safer SafeTensors version is available in the same directory. "
+                    f"Recommendation: Use the .safetensors file instead of {os.path.basename(model_path)} "
+                    f"for improved security with zero functionality impact."
+                )
+            elif import_analysis["all_legitimate"]:
+                # Legitimate opcodes but no SafeTensors - this is INFO with recommendation
+                severity = IssueSeverity.INFO
+                message_prefix = "Pickle serialization format detected"
+                recommendation = (
+                    "This model uses pickle serialization format which allows code execution by design "
+                    "(CVE-2025-32434). While the current opcodes appear legitimate, consider requesting "
+                    "a SafeTensors version from the publisher for improved supply chain security."
+                )
+            else:
+                # Suspicious but not definitively malicious - this is WARNING
+                severity = IssueSeverity.WARNING
+                message_prefix = "Suspicious patterns detected"
+                recommendation = (
+                    "Model contains unusual pickle patterns that require manual review. "
+                    "Consider using SafeTensors format or verifying model source before deployment."
+                )
+
+            # Create opcode summary for evidence
+            opcode_summary = ", ".join(f"{op}({count})" for op, count in opcode_counts.items())
 
             pytorch_result.add_check(
-                name="CVE-2025-32434 weights_only=True Safety Warning",
+                name="CVE-2025-32434 Pickle Format Security Analysis",
                 passed=False,
-                message=(
-                    f"PyTorch model contains dangerous opcodes ({opcode_list}) that can execute code "
-                    f"even when loaded with torch.load(weights_only=True). This contradicts the common "
-                    f"assumption that weights_only=True provides safety against code execution."
-                ),
-                severity=IssueSeverity.CRITICAL,
+                message=f"{message_prefix}: {opcode_summary} opcodes detected",
+                severity=severity,
                 location=f"{model_path}:{pickle_name}",
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
-                    "dangerous_opcodes": list(set(dangerous_opcodes_found)),
+                    "opcode_counts": opcode_counts,
+                    "total_dangerous_opcodes": sum(opcode_counts.values()),
+                    "unique_opcode_types": list(set(dangerous_opcodes_found)),
                     "code_execution_risks": list(set(code_execution_risks)),
-                    "weights_only_false_security": True,
+                    "import_analysis": import_analysis,
+                    "safetensors_available": has_safetensors,
+                    "assessment": (
+                        "malicious"
+                        if import_analysis["found_malicious"]
+                        else ("legitimate_but_risky_format" if import_analysis["all_legitimate"] else "suspicious")
+                    ),
                     "vulnerability_description": (
                         "The weights_only=True parameter in torch.load() does not prevent code execution "
-                        "from malicious pickle files, contrary to common security assumptions."
+                        "from pickle files, contrary to common security assumptions."
                     ),
-                    "recommendation": (
-                        "Do not rely on weights_only=True for security. Use PyTorch 2.6.0+ and consider "
-                        "safer serialization formats like SafeTensors. Always validate model sources."
-                    ),
+                    "recommendation": recommendation,
                     "affected_pytorch_versions": "All versions ≤2.5.1",
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                 },
@@ -946,10 +1074,10 @@ class PyTorchZipScanner(BaseScanner):
         else:
             # No dangerous opcodes found - add informational check
             pytorch_result.add_check(
-                name="CVE-2025-32434 weights_only=True Safety Warning",
+                name="CVE-2025-32434 Pickle Format Security Analysis",
                 passed=True,
                 message=(
-                    f"No dangerous pickle opcodes detected in {pickle_name}. However, weights_only=True "
+                    f"No dangerous pickle opcodes detected in {pickle_name}. However, pickle format "
                     f"should not be relied upon for security with untrusted models."
                 ),
                 severity=IssueSeverity.INFO,
@@ -957,13 +1085,14 @@ class PyTorchZipScanner(BaseScanner):
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
                     "dangerous_opcodes_found": False,
-                    "weights_only_security_note": (
-                        "Even when no dangerous opcodes are detected, weights_only=True in torch.load() "
-                        "should not be considered a security boundary for untrusted models."
-                    ),
+                    "safetensors_available": has_safetensors,
                     "recommendation": (
-                        "Use PyTorch 2.6.0+ and prefer SafeTensors format for better security. "
-                        "Always validate model sources and avoid loading untrusted models."
+                        "Use SafeTensors format for better security. "
+                        + (
+                            "A SafeTensors version is available in the same directory."
+                            if has_safetensors
+                            else "Consider requesting a SafeTensors version from the publisher."
+                        )
                     ),
                 },
             )
