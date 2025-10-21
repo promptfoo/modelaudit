@@ -200,8 +200,8 @@ class OnnxScanner(BaseScanner):
                 custom_op_findings[node.domain]["count"] += 1
                 custom_op_findings[node.domain]["op_types"].add(node.op_type)
 
-                # Store up to 3 example nodes
-                if len(custom_op_findings[node.domain]["example_nodes"]) < 3:
+                # Store up to 10 example nodes
+                if len(custom_op_findings[node.domain]["example_nodes"]) < 10:
                     custom_op_findings[node.domain]["example_nodes"].append(
                         {
                             "name": node.name,
@@ -227,21 +227,32 @@ class OnnxScanner(BaseScanner):
                 examples = [f"{ex['name']} ({ex['op_type']})" for ex in info["example_nodes"]]
                 examples_str = ", ".join(examples)
 
-                plural = "s" if info["count"] > 1 else ""
-                message = f"Model uses custom operator domain '{domain}' ({info['count']} occurrence{plural})"
+                # For single occurrence, use detailed location; otherwise aggregate
+                if info["count"] == 1:
+                    first_node = info["example_nodes"][0]
+                    location = f"{path} (node: {first_node['name']})"
+                    message = f"Model uses custom operator domain '{domain}'"
+                    aggregated = False
+                else:
+                    # For multiple occurrences, include first node name in location
+                    first_node = info["example_nodes"][0]
+                    location = f"{path} (first: {first_node['name']})"
+                    plural = "s"
+                    message = f"Model uses custom operator domain '{domain}' ({info['count']} occurrence{plural})"
+                    aggregated = True
 
                 result.add_check(
                     name="Custom Operator Domain Check",
                     passed=False,
                     message=message,
                     severity=IssueSeverity.WARNING,
-                    location=path,
+                    location=location,
                     details={
                         "domain": domain,
                         "count": info["count"],
                         "op_types": op_types_str,
                         "examples": examples_str,
-                        "aggregated": True,
+                        "aggregated": aggregated,
                     },
                 )
         elif safe_nodes > 0:
@@ -258,23 +269,34 @@ class OnnxScanner(BaseScanner):
         if python_op_findings:
             op_types = {f["op_type"] for f in python_op_findings}
             op_types_str = ", ".join(sorted(op_types))
-            examples = [f"{f['node_name']} ({f['op_type']})" for f in python_op_findings[:3]]
+            examples = [f"{f['node_name']} ({f['op_type']})" for f in python_op_findings[:10]]
             examples_str = ", ".join(examples)
 
-            plural = "s" if len(python_op_findings) > 1 else ""
-            message = f"Model uses Python operators ({len(python_op_findings)} occurrence{plural})"
+            # For single occurrence, use detailed location; otherwise aggregate
+            if len(python_op_findings) == 1:
+                first_finding = python_op_findings[0]
+                location = f"{path} (node: {first_finding['node_name']})"
+                message = f"Model uses Python operator '{first_finding['op_type']}'"
+                aggregated = False
+            else:
+                # For multiple occurrences, include first node name in location
+                first_finding = python_op_findings[0]
+                location = f"{path} (first: {first_finding['node_name']})"
+                plural = "s"
+                message = f"Model uses Python operators ({len(python_op_findings)} occurrence{plural})"
+                aggregated = True
 
             result.add_check(
                 name="Python Operator Detection",
                 passed=False,
                 message=message,
                 severity=IssueSeverity.CRITICAL,
-                location=path,
+                location=location,
                 details={
                     "count": len(python_op_findings),
                     "op_types": op_types_str,
                     "examples": examples_str,
-                    "aggregated": True,
+                    "aggregated": aggregated,
                 },
             )
         else:

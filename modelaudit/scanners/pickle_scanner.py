@@ -2566,26 +2566,43 @@ class PickleScanner(BaseScanner):
                     key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
                 )
 
-                # Get up to 5 example positions
-                example_positions = [f["position"] for f in reduce_opcode_findings[:5]]
+                # Get up to 10 example positions
+                example_positions = [f["position"] for f in reduce_opcode_findings[:10]]
                 examples_str = ", ".join(map(str, example_positions))
 
-                plural = "s" if len(reduce_opcode_findings) > 1 else ""
-                message = (
-                    f"Found {len(reduce_opcode_findings)} REDUCE opcode{plural} - potential __reduce__ method execution"
+                # Calculate average ML context confidence
+                avg_confidence = sum(f.get("ml_context_confidence", 0) for f in reduce_opcode_findings) / len(
+                    reduce_opcode_findings
                 )
+
+                # For single occurrence, use detailed location; otherwise aggregate
+                if len(reduce_opcode_findings) == 1:
+                    first_pos = reduce_opcode_findings[0]["position"]
+                    location = f"{self.current_file_path} (pos {first_pos})"
+                    message = "Found REDUCE opcode - potential __reduce__ method execution"
+                    aggregated = False
+                else:
+                    # For multiple occurrences, include first position in location
+                    first_pos = reduce_opcode_findings[0]["position"]
+                    location = f"{self.current_file_path} (first: pos {first_pos})"
+                    plural = "s"
+                    message = (
+                        f"Found {len(reduce_opcode_findings)} REDUCE opcode{plural} - "
+                        f"potential __reduce__ method execution"
+                    )
+                    aggregated = True
 
                 result.add_check(
                     name="REDUCE Opcode Safety Check",
                     passed=False,
                     message=message,
                     severity=severity,
-                    location=self.current_file_path,
+                    location=location,
                     details={
                         "count": len(reduce_opcode_findings),
                         "example_positions": examples_str,
-                        "ml_context_confidence": reduce_opcode_findings[0].get("ml_context_confidence", 0),
-                        "aggregated": True,
+                        "ml_context_confidence": avg_confidence,
+                        "aggregated": aggregated,
                     },
                     why=get_opcode_explanation("REDUCE"),
                 )
@@ -2599,30 +2616,44 @@ class PickleScanner(BaseScanner):
                         key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
                     )
 
-                    # Get up to 5 example positions
-                    example_positions = [f["position"] for f in findings[:5]]
+                    # Get up to 10 example positions
+                    example_positions = [f["position"] for f in findings[:10]]
                     examples_str = ", ".join(map(str, example_positions))
 
-                    # Get unique arguments (up to 3)
-                    unique_args = list({f["argument"] for f in findings})[:3]
+                    # Get unique arguments (up to 10) - sorted deterministically
+                    unique_args = sorted({f["argument"] for f in findings})[:10]
                     args_str = ", ".join(unique_args) if unique_args else "N/A"
 
-                    plural = "s" if len(findings) > 1 else ""
-                    message = f"Found {len(findings)} {opcode_name} opcode{plural} - potential code execution"
+                    # Calculate average ML context confidence
+                    avg_confidence = sum(f.get("ml_context_confidence", 0) for f in findings) / len(findings)
+
+                    # For single occurrence, use detailed location; otherwise aggregate
+                    if len(findings) == 1:
+                        first_pos = findings[0]["position"]
+                        location = f"{self.current_file_path} (pos {first_pos})"
+                        message = f"Found {opcode_name} opcode - potential code execution"
+                        aggregated = False
+                    else:
+                        # For multiple occurrences, include first position in location
+                        first_pos = findings[0]["position"]
+                        location = f"{self.current_file_path} (first: pos {first_pos})"
+                        plural = "s"
+                        message = f"Found {len(findings)} {opcode_name} opcode{plural} - potential code execution"
+                        aggregated = True
 
                     result.add_check(
                         name="INST/OBJ Opcode Safety Check",
                         passed=False,
                         message=message,
                         severity=severity,
-                        location=self.current_file_path,
+                        location=location,
                         details={
                             "opcode": opcode_name,
                             "count": len(findings),
                             "example_positions": examples_str,
                             "example_arguments": args_str,
-                            "ml_context_confidence": findings[0].get("ml_context_confidence", 0),
-                            "aggregated": True,
+                            "ml_context_confidence": avg_confidence,
+                            "aggregated": aggregated,
                         },
                         why=get_opcode_explanation(opcode_name),
                     )
