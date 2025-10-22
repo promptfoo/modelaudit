@@ -280,6 +280,14 @@ class ScanResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
+        # Only count WARNING and CRITICAL severity checks as failures
+        # INFO and DEBUG are informational - they should not count as failures
+        failed_checks_count = sum(
+            1
+            for c in self.checks
+            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        )
+
         return {
             "scanner": self.scanner_name,
             "success": self.success,
@@ -292,7 +300,7 @@ class ScanResult:
             "has_warnings": self.has_warnings,
             "total_checks": len(self.checks),
             "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
-            "failed_checks": sum(1 for c in self.checks if c.status == CheckStatus.FAILED),
+            "failed_checks": failed_checks_count,
         }
 
     def to_json(self, indent: int = 2) -> str:
