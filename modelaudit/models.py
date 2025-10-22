@@ -506,11 +506,17 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
     def _finalize_checks(self) -> None:
         """Calculate check statistics."""
-        from .scanners.base import CheckStatus
+        from .scanners.base import CheckStatus, IssueSeverity
 
         self.total_checks = len(self.checks)
         self.passed_checks = sum(1 for c in self.checks if c.status == CheckStatus.PASSED)
-        self.failed_checks = sum(1 for c in self.checks if c.status == CheckStatus.FAILED)
+        # Only count WARNING and CRITICAL severity checks as failures
+        # INFO and DEBUG are informational - they should not count as failures
+        self.failed_checks = sum(
+            1
+            for c in self.checks
+            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        )
 
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues based on message, severity, and location."""
