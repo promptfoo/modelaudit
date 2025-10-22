@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar
+from typing import IO, Any, BinaryIO, ClassVar, TypedDict
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -30,6 +30,59 @@ from ..config.explanations import (
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+
+# Severity ordering for max() comparisons - higher value = more severe
+SEVERITY_ORDER = {
+    IssueSeverity.DEBUG: 0,
+    IssueSeverity.INFO: 1,
+    IssueSeverity.WARNING: 2,
+    IssueSeverity.CRITICAL: 3,
+}
+
+
+class ReduceOpcodeFinding(TypedDict):
+    """Information about REDUCE opcode findings in pickle data."""
+
+    position: int
+    severity: IssueSeverity
+    ml_context_confidence: float
+
+
+class DangerousOpcodeFinding(TypedDict):
+    """Information about dangerous opcode findings (INST/OBJ/NEWOBJ) in pickle data."""
+
+    position: int
+    severity: IssueSeverity
+    argument: str
+    ml_context_confidence: float
+
+
+def _aggregate_opcode_findings(
+    findings: list[ReduceOpcodeFinding] | list[DangerousOpcodeFinding],
+) -> tuple[IssueSeverity, list[int], str, float]:
+    """
+    Aggregate opcode findings to extract common information.
+
+    Args:
+        findings: List of opcode findings to aggregate
+
+    Returns:
+        Tuple of (max_severity, example_positions, examples_str, avg_confidence)
+    """
+    # Get the most severe severity from all findings
+    severity = max(
+        (f["severity"] for f in findings),
+        key=lambda s: SEVERITY_ORDER.get(s, 0),
+    )
+
+    # Get up to 10 example positions
+    example_positions = [f["position"] for f in findings[:10]]
+    examples_str = ", ".join(map(str, example_positions))
+
+    # Calculate average ML context confidence
+    avg_confidence = sum(f.get("ml_context_confidence", 0) for f in findings) / len(findings)
+
+    return severity, example_positions, examples_str, avg_confidence
 
 
 def _compute_pickle_length(path: str) -> int:
@@ -2345,14 +2398,18 @@ class PickleScanner(BaseScanner):
 
             # Now analyze the collected opcodes with ML context awareness
             # Collect opcode findings for aggregation
-            reduce_opcode_findings: list[dict[str, Any]] = []
-            dangerous_opcode_findings: dict[str, list[dict[str, Any]]] = {
+            reduce_opcode_findings: list[ReduceOpcodeFinding] = []
+            dangerous_opcode_findings: dict[str, list[DangerousOpcodeFinding]] = {
                 "INST": [],
                 "OBJ": [],
                 "NEWOBJ": [],
             }
 
             for opcode, arg, pos in opcodes:
+                # Skip opcodes without position information
+                if pos is None:
+                    continue
+
                 # Check for GLOBAL opcodes that might reference suspicious modules
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
                     # Handle both "module function" and "module.function" formats
@@ -2560,18 +2617,8 @@ class PickleScanner(BaseScanner):
 
             # Create aggregated checks for opcode findings
             if reduce_opcode_findings:
-                # Get the most severe severity from all findings
-                severity = max(
-                    (f["severity"] for f in reduce_opcode_findings),
-                    key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
-                )
-
-                # Get up to 10 example positions
-                example_positions = [f["position"] for f in reduce_opcode_findings[:10]]
-                examples_str = ", ".join(map(str, example_positions))
-
-                # Calculate average ML context confidence
-                avg_confidence = sum(f.get("ml_context_confidence", 0) for f in reduce_opcode_findings) / len(
+                # Aggregate common information using helper function
+                severity, example_positions, examples_str, avg_confidence = _aggregate_opcode_findings(
                     reduce_opcode_findings
                 )
 
@@ -2600,7 +2647,8 @@ class PickleScanner(BaseScanner):
                     location=location,
                     details={
                         "count": len(reduce_opcode_findings),
-                        "example_positions": examples_str,
+                        "example_positions": examples_str,  # String for backward compatibility
+                        "example_positions_list": example_positions,  # Structured list for programmatic access
                         "ml_context_confidence": avg_confidence,
                         "aggregated": aggregated,
                     },
@@ -2610,22 +2658,12 @@ class PickleScanner(BaseScanner):
             # Create aggregated checks for INST/OBJ/NEWOBJ opcodes
             for opcode_name, findings in dangerous_opcode_findings.items():
                 if findings:
-                    # Get the most severe severity from all findings
-                    severity = max(
-                        (f["severity"] for f in findings),
-                        key=lambda s: ["debug", "info", "warning", "critical"].index(s.value),
-                    )
-
-                    # Get up to 10 example positions
-                    example_positions = [f["position"] for f in findings[:10]]
-                    examples_str = ", ".join(map(str, example_positions))
+                    # Aggregate common information using helper function
+                    severity, example_positions, examples_str, avg_confidence = _aggregate_opcode_findings(findings)
 
                     # Get unique arguments (up to 10) - sorted deterministically
                     unique_args = sorted({f["argument"] for f in findings})[:10]
                     args_str = ", ".join(unique_args) if unique_args else "N/A"
-
-                    # Calculate average ML context confidence
-                    avg_confidence = sum(f.get("ml_context_confidence", 0) for f in findings) / len(findings)
 
                     # For single occurrence, use detailed location; otherwise aggregate
                     if len(findings) == 1:
@@ -2650,8 +2688,10 @@ class PickleScanner(BaseScanner):
                         details={
                             "opcode": opcode_name,
                             "count": len(findings),
-                            "example_positions": examples_str,
-                            "example_arguments": args_str,
+                            "example_positions": examples_str,  # String for backward compatibility
+                            "example_positions_list": example_positions,  # Structured list for programmatic access
+                            "example_arguments": args_str,  # String for backward compatibility
+                            "example_arguments_list": unique_args,  # Structured list for programmatic access
                             "ml_context_confidence": avg_confidence,
                             "aggregated": aggregated,
                         },

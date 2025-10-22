@@ -1,8 +1,31 @@
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypedDict
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+
+class ExampleNode(TypedDict):
+    """Example ONNX node for custom operator findings."""
+
+    name: str
+    op_type: str
+
+
+class CustomOpInfo(TypedDict):
+    """Information about custom operator usage in ONNX model."""
+
+    count: int
+    op_types: set[str]
+    example_nodes: list[ExampleNode]
+
+
+class PythonOpFinding(TypedDict):
+    """Information about Python operator usage in ONNX model."""
+
+    node_name: str
+    op_type: str
+    domain: str
 
 
 def _get_onnx_mapping() -> Any:
@@ -180,13 +203,16 @@ class OnnxScanner(BaseScanner):
         safe_nodes = 0
 
         # Aggregate custom operator findings by domain
-        custom_op_findings: dict[str, dict[str, Any]] = {}
-        python_op_findings: list[dict[str, Any]] = []
+        custom_op_findings: dict[str, CustomOpInfo] = {}
+        python_op_findings: list[PythonOpFinding] = []
+
+        # Official ONNX domains that should not be flagged as custom
+        OFFICIAL_ONNX_DOMAINS = ("", "ai.onnx", "ai.onnx.ml", "ai.onnx.preview.training")
 
         for node in model.graph.node:
             # Check for interrupts periodically during node processing
             self.check_interrupted()
-            if node.domain and node.domain not in ("", "ai.onnx"):
+            if node.domain and node.domain not in OFFICIAL_ONNX_DOMAINS:
                 custom_domains.add(node.domain)
 
                 # Aggregate by domain
@@ -250,8 +276,10 @@ class OnnxScanner(BaseScanner):
                     details={
                         "domain": domain,
                         "count": info["count"],
-                        "op_types": op_types_str,
-                        "examples": examples_str,
+                        "op_types": op_types_str,  # String for backward compatibility
+                        "op_types_list": sorted(info["op_types"]),  # Structured list for programmatic access
+                        "examples": examples_str,  # String for backward compatibility
+                        "example_nodes_list": info["example_nodes"],  # Structured list for programmatic access
                         "aggregated": aggregated,
                     },
                 )
@@ -294,8 +322,10 @@ class OnnxScanner(BaseScanner):
                 location=location,
                 details={
                     "count": len(python_op_findings),
-                    "op_types": op_types_str,
-                    "examples": examples_str,
+                    "op_types": op_types_str,  # String for backward compatibility
+                    "op_types_list": sorted(op_types),  # Structured list for programmatic access
+                    "examples": examples_str,  # String for backward compatibility
+                    "python_op_findings_list": python_op_findings[:10],  # Structured list for programmatic access
                     "aggregated": aggregated,
                 },
             )
