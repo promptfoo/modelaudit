@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fix**: INFO and DEBUG severity checks no longer count as failures in success rate calculations
+
 ## [0.2.10] - 2025-10-22
 
 ### Fixed
