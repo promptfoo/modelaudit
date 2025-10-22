@@ -1016,7 +1016,9 @@ class PyTorchZipScanner(BaseScanner):
                 # Legitimate opcodes using safe ML framework functions - this is INFO
                 severity = IssueSeverity.INFO
                 message_prefix = "Pickle serialization with safe ML framework operations (SafeTensors available)"
-                safetensors_name = os.path.basename(model_path).replace(".bin", ".safetensors")
+                # Handle all supported PyTorch extensions (.pt, .pth, .bin)
+                base_name = os.path.splitext(os.path.basename(model_path))[0]
+                safetensors_name = f"{base_name}.safetensors"
                 recommendation = (
                     f"This model uses pickle format with legitimate ML framework operations. "
                     f"All REDUCE opcodes call safe functions from allowlisted ML frameworks. "
