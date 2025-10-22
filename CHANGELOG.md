@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2025-10-22
+
+### Fixed
+
+- **fix**: eliminate false positive REDUCE warnings for safe ML framework operations (#398)
+- **fix**: eliminate ONNX custom domain and PyTorch pickle false positives (#400)
+- **fix**: eliminate false positive JIT/Script warnings on ONNX files (#399)
+
 ## [0.2.9] - 2025-10-21
 
 ### Added
@@ -440,7 +448,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/promptfoo/modelaudit/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...v0.2.7
