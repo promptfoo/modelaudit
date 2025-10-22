@@ -48,6 +48,15 @@ def _check_onnx() -> bool:
     return HAS_ONNX
 
 
+# Well-known safe custom operator domains from trusted vendors
+# These domains are documented, open-source, and widely used in production
+WELL_KNOWN_SAFE_DOMAINS = {
+    "com.microsoft",  # Microsoft ONNX Runtime contrib operators
+    # Documented at: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
+    # Used for performance optimizations like SkipLayerNormalization, BiasGelu, FastGelu
+}
+
+
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
@@ -177,6 +186,8 @@ class OnnxScanner(BaseScanner):
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
+        well_known_domains = set()
+        unknown_domains = set()
         python_ops_found = False
         safe_nodes = 0
 
@@ -185,14 +196,38 @@ class OnnxScanner(BaseScanner):
             self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
-                result.add_check(
-                    name="Custom Operator Domain Check",
-                    passed=False,
-                    message=f"Model uses custom operator domain '{node.domain}'",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{path} (node: {node.name})",
-                    details={"op_type": node.op_type, "domain": node.domain},
-                )
+
+                # Classify domain as well-known or unknown
+                if node.domain in WELL_KNOWN_SAFE_DOMAINS:
+                    well_known_domains.add(node.domain)
+                    # INFO severity for well-known safe domains
+                    result.add_check(
+                        name="Custom Operator Domain Check",
+                        passed=False,
+                        message=f"Model uses well-known custom operator domain '{node.domain}'",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path} (node: {node.name})",
+                        details={
+                            "op_type": node.op_type,
+                            "domain": node.domain,
+                            "trust_level": "well-known",
+                        },
+                    )
+                else:
+                    unknown_domains.add(node.domain)
+                    # WARNING severity for unknown domains
+                    result.add_check(
+                        name="Custom Operator Domain Check",
+                        passed=False,
+                        message=f"Model uses unknown custom operator domain '{node.domain}'",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path} (node: {node.name})",
+                        details={
+                            "op_type": node.op_type,
+                            "domain": node.domain,
+                            "trust_level": "unknown",
+                        },
+                    )
             elif "python" in node.op_type.lower():
                 python_ops_found = True
                 result.add_check(
@@ -227,6 +262,8 @@ class OnnxScanner(BaseScanner):
 
         if custom_domains:
             result.metadata["custom_domains"] = sorted(custom_domains)
+            result.metadata["well_known_domains"] = sorted(well_known_domains)
+            result.metadata["unknown_domains"] = sorted(unknown_domains)
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
