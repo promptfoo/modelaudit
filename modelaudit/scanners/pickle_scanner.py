@@ -2556,28 +2556,43 @@ class PickleScanner(BaseScanner):
                                 },
                             )
                         else:
-                            # NOT in safe globals - show as WARNING
-                            severity = _get_context_aware_severity(
-                                IssueSeverity.WARNING,
-                                ml_context,
-                            )
-                            result.add_check(
-                                name="REDUCE Opcode Safety Check",
-                                passed=False,
-                                message=f"Found REDUCE opcode with non-allowlisted global: {associated_global}",
-                                severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                details={
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "associated_global": associated_global,
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
-                                },
-                                why=get_opcode_explanation("REDUCE"),
-                            )
+                            # NOT in safe globals - check if it's actually dangerous
+                            # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
+                            if reduce_mod and reduce_func:
+                                is_actually_dangerous = _is_actually_dangerous_global(
+                                    reduce_mod, reduce_func, ml_context
+                                )
+                                if is_actually_dangerous:
+                                    # Dangerous global (e.g., os.system) - CRITICAL
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.CRITICAL,
+                                        ml_context,
+                                        issue_type="dangerous_global",
+                                    )
+                                else:
+                                    # Non-allowlisted but not explicitly dangerous - WARNING
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.WARNING,
+                                        ml_context,
+                                    )
+
+                                result.add_check(
+                                    name="REDUCE Opcode Safety Check",
+                                    passed=False,
+                                    message=f"Found REDUCE opcode with non-allowlisted global: {associated_global}",
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details={
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_global": associated_global,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    },
+                                    why=get_opcode_explanation("REDUCE"),
+                                )
 
                 # Check dangerous opcodes for potential security issues
                 # Removed confidence-based skipping to prevent security bypasses
