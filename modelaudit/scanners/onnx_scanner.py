@@ -51,6 +51,12 @@ def _check_onnx() -> bool:
 # Well-known safe custom operator domains from trusted vendors
 # These domains are documented, open-source, and widely used in production
 WELL_KNOWN_SAFE_DOMAINS = {
+    "ai.onnx.ml",  # Official ONNX-ML standard domain
+    # Documented at: https://github.com/onnx/onnx/blob/main/docs/Operators-ml.md
+    # Used for TreeEnsemble, SVMClassifier, preprocessing operations
+    "ai.onnx.preview.training",  # Official ONNX training domain
+    # Documented at: https://github.com/onnx/onnx/blob/main/docs/Operators-training.md
+    # Used for Adam, Adagrad, Momentum training operations
     "com.microsoft",  # Microsoft ONNX Runtime contrib operators
     # Documented at: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
     # Used for performance optimizations like SkipLayerNormalization, BiasGelu, FastGelu
