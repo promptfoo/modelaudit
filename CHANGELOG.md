@@ -7,16 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **fix**: eliminate false positive warnings for well-known ONNX custom operator domains
-  - Implement severity-based classification for ONNX custom operators
-  - Well-known safe domains (e.g., `com.microsoft`) now report as INFO instead of WARNING
-  - Unknown custom domains remain WARNING for security vigilance
-  - Add trust_level metadata to distinguish between well-known and unknown domains
-  - Reduces noise for legitimate production models using Microsoft ONNX Runtime optimizations
-  - Example: sentence-transformers models with SkipLayerNormalization, BiasGelu, FastGelu operators
-
 ## [0.2.9] - 2025-10-21
 
 ### Added
