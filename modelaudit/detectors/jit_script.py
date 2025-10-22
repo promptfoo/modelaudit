@@ -858,7 +858,10 @@ class JITScriptDetector:
             findings.extend(self.scan_onnx(data, context))
 
         # Always check for generic dangerous patterns
-        if model_type == "unknown" or not findings:
+        # Only run fallback scanners if model type is truly unknown
+        # Don't run fallback on known types (pytorch, tensorflow, onnx) even if they have no findings
+        # because that causes false positives (e.g. TorchScript patterns matching ONNX metadata)
+        if model_type == "unknown":
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
             # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
