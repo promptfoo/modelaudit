@@ -168,7 +168,7 @@ class TestPickleSmartDetection(unittest.TestCase):
         )
 
     def test_opcode_sequence_ignoring(self):
-        """Test that ML opcode sequences are properly ignored"""
+        """Test that opcode sequences are never ignored for security reasons"""
         # Mock ML-heavy opcode sequence
         mock_ml_opcodes = [
             (type("MockOp", (), {"name": "GLOBAL"})(), "torch.nn.Linear", 0),
@@ -176,13 +176,15 @@ class TestPickleSmartDetection(unittest.TestCase):
             (type("MockOp", (), {"name": "BUILD"})(), None, 2),
         ] * 50  # Simulate many ML operations
 
-        # Should ignore for high-confidence ML content
+        # SECURITY: Opcode analysis is never skipped, even for high-confidence ML content
+        # This prevents attackers from bypassing security checks by including ML patterns
         high_confidence_context = {"is_ml_content": True, "overall_confidence": 0.8}
-        self.assertTrue(
+        self.assertFalse(
             _should_ignore_opcode_sequence(mock_ml_opcodes, high_confidence_context),
+            "Opcode sequence analysis should never be skipped for security reasons",
         )
 
-        # Should not ignore for low-confidence content
+        # Should also not ignore for low-confidence content
         low_confidence_context = {"is_ml_content": False, "overall_confidence": 0.1}
         self.assertFalse(
             _should_ignore_opcode_sequence(mock_ml_opcodes, low_confidence_context),

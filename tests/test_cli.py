@@ -1001,7 +1001,11 @@ def test_exit_code_security_issues(tmp_path):
 
     # Should exit with code 1 for security findings
     assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    assert "error" in result.output.lower() or "warning" in result.output.lower()
+    # Check for error, warning, or critical in output
+    output_lower = result.output.lower()
+    assert "error" in output_lower or "warning" in output_lower or "critical" in output_lower, (
+        f"Expected 'error', 'warning', or 'critical' in output, but got: {result.output}"
+    )
 
 
 def test_exit_code_scan_errors(tmp_path):
