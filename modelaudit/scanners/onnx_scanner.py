@@ -48,21 +48,6 @@ def _check_onnx() -> bool:
     return HAS_ONNX
 
 
-# Well-known safe custom operator domains from trusted vendors
-# These domains are documented, open-source, and widely used in production
-WELL_KNOWN_SAFE_DOMAINS = {
-    "ai.onnx.ml",  # Official ONNX-ML standard domain
-    # Documented at: https://github.com/onnx/onnx/blob/main/docs/Operators-ml.md
-    # Used for TreeEnsemble, SVMClassifier, preprocessing operations
-    "ai.onnx.preview.training",  # Official ONNX training domain
-    # Documented at: https://github.com/onnx/onnx/blob/main/docs/Operators-training.md
-    # Used for Adam, Adagrad, Momentum training operations
-    "com.microsoft",  # Microsoft ONNX Runtime contrib operators
-    # Documented at: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
-    # Used for performance optimizations like SkipLayerNormalization, BiasGelu, FastGelu
-}
-
-
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
@@ -192,8 +177,6 @@ class OnnxScanner(BaseScanner):
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
-        well_known_domains = set()
-        unknown_domains = set()
         python_ops_found = False
         safe_nodes = 0
 
@@ -203,14 +186,6 @@ class OnnxScanner(BaseScanner):
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
 
-                # Track domain classification for metadata
-                if node.domain in WELL_KNOWN_SAFE_DOMAINS:
-                    well_known_domains.add(node.domain)
-                    trust_level = "well-known"
-                else:
-                    unknown_domains.add(node.domain)
-                    trust_level = "unknown"
-
                 # All custom domains are INFO - they're metadata, not executable code
                 # Security risk is in runtime environment (installing malicious operators)
                 # not in the ONNX file itself
@@ -219,15 +194,13 @@ class OnnxScanner(BaseScanner):
                     passed=False,
                     message=(
                         f"Model references custom operator domain '{node.domain}'. "
-                        f"This is metadata only - ensure operators are from trusted sources before installation. "
-                        f"Domain classification: {trust_level}."
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
                     ),
                     severity=IssueSeverity.INFO,
                     location=f"{path} (node: {node.name})",
                     details={
                         "op_type": node.op_type,
                         "domain": node.domain,
-                        "trust_level": trust_level,
                         "security_note": (
                             "Custom domains indicate dependencies on external operator implementations. "
                             "ONNX files cannot execute code - risk is in runtime environment if malicious "
@@ -269,8 +242,6 @@ class OnnxScanner(BaseScanner):
 
         if custom_domains:
             result.metadata["custom_domains"] = sorted(custom_domains)
-            result.metadata["well_known_domains"] = sorted(well_known_domains)
-            result.metadata["unknown_domains"] = sorted(unknown_domains)
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
