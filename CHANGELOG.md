@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2025-10-22
+
 ### Fixed
 
 - **fix**: INFO and DEBUG severity checks no longer count as failures in success rate calculations
@@ -452,7 +454,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...HEAD
+[0.2.11]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/promptfoo/modelaudit/compare/v0.2.7...v0.2.8
