@@ -1013,14 +1013,18 @@ class PyTorchZipScanner(BaseScanner):
                     "This is likely a supply chain attack."
                 )
             elif has_safetensors and import_analysis["all_legitimate"]:
-                # Legitimate opcodes but risky format, SafeTensors available - this is WARNING
-                severity = IssueSeverity.WARNING
-                message_prefix = "Insecure serialization format (SafeTensors available)"
+                # Legitimate opcodes using safe ML framework functions - this is INFO
+                severity = IssueSeverity.INFO
+                message_prefix = "Pickle serialization with safe ML framework operations (SafeTensors available)"
+                # Handle all supported PyTorch extensions (.pt, .pth, .bin)
+                base_name = os.path.splitext(os.path.basename(model_path))[0]
+                safetensors_name = f"{base_name}.safetensors"
                 recommendation = (
-                    f"This model uses pickle format which has inherent security risks (CVE-2025-32434). "
-                    f"A safer SafeTensors version is available in the same directory. "
-                    f"Recommendation: Use the .safetensors file instead of {os.path.basename(model_path)} "
-                    f"for improved security with zero functionality impact."
+                    f"This model uses pickle format with legitimate ML framework operations. "
+                    f"All REDUCE opcodes call safe functions from allowlisted ML frameworks. "
+                    f"A safer SafeTensors version is available: {safetensors_name}. "
+                    f"While current operations are safe, consider using SafeTensors for defense-in-depth "
+                    f"(protects against environment tampering/supply chain attacks)."
                 )
             elif import_analysis["all_legitimate"]:
                 # Legitimate opcodes but no SafeTensors - this is INFO with recommendation

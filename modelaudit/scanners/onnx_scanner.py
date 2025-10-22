@@ -257,21 +257,27 @@ class OnnxScanner(BaseScanner):
                 if info["count"] == 1:
                     first_node = info["example_nodes"][0]
                     location = f"{path} (node: {first_node['name']})"
-                    message = f"Model uses custom operator domain '{domain}'"
+                    message = (
+                        f"Model references custom operator domain '{domain}'. "
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
+                    )
                     aggregated = False
                 else:
                     # For multiple occurrences, include first node name in location
                     first_node = info["example_nodes"][0]
                     location = f"{path} (first: {first_node['name']})"
                     plural = "s"
-                    message = f"Model uses custom operator domain '{domain}' ({info['count']} occurrence{plural})"
+                    message = (
+                        f"Model references custom operator domain '{domain}' ({info['count']} occurrence{plural}). "
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
+                    )
                     aggregated = True
 
                 result.add_check(
                     name="Custom Operator Domain Check",
                     passed=False,
                     message=message,
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=location,
                     details={
                         "domain": domain,
@@ -281,6 +287,11 @@ class OnnxScanner(BaseScanner):
                         "examples": examples_str,  # String for backward compatibility
                         "example_nodes_list": info["example_nodes"],  # Structured list for programmatic access
                         "aggregated": aggregated,
+                        "security_note": (
+                            "Custom domains indicate dependencies on external operator implementations. "
+                            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+                            "operators are installed. Verify operator packages before installation."
+                        ),
                     },
                 )
         elif safe_nodes > 0:

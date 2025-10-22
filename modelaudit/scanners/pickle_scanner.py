@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, TypedDict
+from typing import IO, Any, BinaryIO, ClassVar
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -30,59 +30,6 @@ from ..config.explanations import (
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
-
-# Severity ordering for max() comparisons - higher value = more severe
-SEVERITY_ORDER = {
-    IssueSeverity.DEBUG: 0,
-    IssueSeverity.INFO: 1,
-    IssueSeverity.WARNING: 2,
-    IssueSeverity.CRITICAL: 3,
-}
-
-
-class ReduceOpcodeFinding(TypedDict):
-    """Information about REDUCE opcode findings in pickle data."""
-
-    position: int
-    severity: IssueSeverity
-    ml_context_confidence: float
-
-
-class DangerousOpcodeFinding(TypedDict):
-    """Information about dangerous opcode findings (INST/OBJ/NEWOBJ) in pickle data."""
-
-    position: int
-    severity: IssueSeverity
-    argument: str
-    ml_context_confidence: float
-
-
-def _aggregate_opcode_findings(
-    findings: list[ReduceOpcodeFinding] | list[DangerousOpcodeFinding],
-) -> tuple[IssueSeverity, list[int], str, float]:
-    """
-    Aggregate opcode findings to extract common information.
-
-    Args:
-        findings: List of opcode findings to aggregate
-
-    Returns:
-        Tuple of (max_severity, example_positions, examples_str, avg_confidence)
-    """
-    # Get the most severe severity from all findings
-    severity = max(
-        (f["severity"] for f in findings),
-        key=lambda s: SEVERITY_ORDER.get(s, 0),
-    )
-
-    # Get up to 10 example positions
-    example_positions = [f["position"] for f in findings[:10]]
-    examples_str = ", ".join(map(str, example_positions))
-
-    # Calculate average ML context confidence
-    avg_confidence = sum(f.get("ml_context_confidence", 0) for f in findings) / len(findings)
-
-    return severity, example_positions, examples_str, avg_confidence
 
 
 def _compute_pickle_length(path: str) -> int:
@@ -316,6 +263,17 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "CharTensor",
         "ShortTensor",
         "BoolTensor",
+        # Storage types (used in PyTorch serialization)
+        "FloatStorage",
+        "LongStorage",
+        "IntStorage",
+        "DoubleStorage",
+        "HalfStorage",
+        "BFloat16Storage",
+        "ByteStorage",
+        "CharStorage",
+        "ShortStorage",
+        "BoolStorage",
         "Size",
         "device",
         "dtype",
@@ -416,6 +374,16 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "ConcatDataset",
         "Subset",
         "random_split",
+    ],
+    # torch._utils - internal PyTorch utilities used in serialization
+    "torch._utils": [
+        "_rebuild_tensor",
+        "_rebuild_tensor_v2",
+        "_rebuild_parameter",
+        "_rebuild_parameter_v2",
+        "_rebuild_device_tensor_from_numpy",
+        "_rebuild_qtensor",
+        "_rebuild_sparse_tensor",
     ],
     "_pickle": [
         "Unpickler",
@@ -697,6 +665,20 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     return context
 
 
+def _is_safe_ml_global(mod: str, func: str) -> bool:
+    """
+    Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
+
+    Returns:
+        True if the global is in the safe list, False otherwise
+    """
+    if mod in ML_SAFE_GLOBALS:
+        safe_funcs = ML_SAFE_GLOBALS[mod]
+        if func in safe_funcs:
+            return True
+    return False
+
+
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
     """
     Smart global reference analysis - distinguishes between legitimate ML operations
@@ -974,12 +956,23 @@ def is_suspicious_global(mod: str, func: str) -> bool:
 
     Enhanced to detect various forms of builtin eval/exec that other tools
     might miss, including __builtin__ (Python 2 style) and __builtins__.
+
+    First checks against ML_SAFE_GLOBALS allowlist to reduce false positives
+    for legitimate ML framework operations.
     """
+    # STEP 1: Check ML_SAFE_GLOBALS allowlist first
+    # If the module.function is in the safe list, it's not suspicious
+    if mod in ML_SAFE_GLOBALS:
+        safe_funcs = ML_SAFE_GLOBALS[mod]
+        if func in safe_funcs:
+            logger.debug(f"Allowlisted ML global: {mod}.{func}")
+            return False
+
     # Normalize module name for consistent checking
     # Some exploits use alternative spellings or references
     normalized_mod = mod.strip().lower() if mod else ""
 
-    # Check for direct matches first
+    # Check for direct matches in suspicious globals
     if mod in SUSPICIOUS_GLOBALS:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
@@ -1111,11 +1104,64 @@ def check_opcode_sequence(
     max_consecutive = 0
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
-        # Track dangerous opcodes
+        # Track dangerous opcodes, but skip REDUCE if it's using safe ML globals
+        is_dangerous_opcode = False
+
         if opcode.name in DANGEROUS_OPCODES:
-            dangerous_opcode_count += 1
-            consecutive_dangerous += 1
-            max_consecutive = max(max_consecutive, consecutive_dangerous)
+            # Special handling for REDUCE - check if it's using safe globals
+            if opcode.name == "REDUCE":
+                # Look back to find the associated GLOBAL or STACK_GLOBAL
+                for j in range(i - 1, max(0, i - 10), -1):
+                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
+
+                    if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                        parts = (
+                            prev_arg.split(" ", 1)
+                            if " " in prev_arg
+                            else prev_arg.rsplit(".", 1)
+                            if "." in prev_arg
+                            else [prev_arg, ""]
+                        )
+                        if len(parts) == 2:
+                            mod, func = parts
+                            # Only count as dangerous if NOT in safe globals
+                            if not _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = True
+                            break
+
+                    elif prev_opcode.name == "STACK_GLOBAL":
+                        # Look for the two most recent string opcodes
+                        recent_strings: list[str] = []
+                        for k in range(j - 1, max(0, j - 10), -1):
+                            stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
+                            if stack_prev_opcode.name in [
+                                "SHORT_BINSTRING",
+                                "BINSTRING",
+                                "STRING",
+                                "SHORT_BINUNICODE",
+                                "BINUNICODE",
+                                "UNICODE",
+                            ] and isinstance(stack_prev_arg, str):
+                                recent_strings.insert(0, stack_prev_arg)
+                                if len(recent_strings) >= 2:
+                                    break
+
+                        if len(recent_strings) >= 2:
+                            mod, func = recent_strings[0], recent_strings[1]
+                            # Only count as dangerous if NOT in safe globals
+                            if not _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = True
+                            break
+            else:
+                # Other dangerous opcodes are always counted
+                is_dangerous_opcode = True
+
+            if is_dangerous_opcode:
+                dangerous_opcode_count += 1
+                consecutive_dangerous += 1
+                max_consecutive = max(max_consecutive, consecutive_dangerous)
+            else:
+                consecutive_dangerous = 0
         else:
             consecutive_dangerous = 0
 
@@ -2397,19 +2443,7 @@ class PickleScanner(BaseScanner):
                 )
 
             # Now analyze the collected opcodes with ML context awareness
-            # Collect opcode findings for aggregation
-            reduce_opcode_findings: list[ReduceOpcodeFinding] = []
-            dangerous_opcode_findings: dict[str, list[DangerousOpcodeFinding]] = {
-                "INST": [],
-                "OBJ": [],
-                "NEWOBJ": [],
-            }
-
-            for opcode, arg, pos in opcodes:
-                # Skip opcodes without position information
-                if pos is None:
-                    continue
-
+            for i, (opcode, arg, pos) in enumerate(opcodes):
                 # Check for GLOBAL opcodes that might reference suspicious modules
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
                     # Handle both "module function" and "module.function" formats
@@ -2464,20 +2498,122 @@ class PickleScanner(BaseScanner):
                             )
 
                 # Check REDUCE opcodes for potential security issues
-                # Removed confidence-based skipping to prevent security bypasses
+                # Flag as WARNING if not in safe globals, INFO if in safe globals
                 if opcode.name == "REDUCE":
-                    severity = _get_context_aware_severity(
-                        IssueSeverity.WARNING,
-                        ml_context,
-                    )
-                    # Collect for aggregation instead of individual check
-                    reduce_opcode_findings.append(
-                        {
-                            "position": pos,
-                            "severity": severity,
-                            "ml_context_confidence": ml_context.get("overall_confidence", 0),
-                        }
-                    )
+                    # Look back to find the associated GLOBAL or STACK_GLOBAL
+                    associated_global: str | None = None
+                    is_safe_global = False
+                    reduce_mod: str | None = None
+                    reduce_func: str | None = None
+
+                    # Search backwards in opcodes (up to 10 opcodes back)
+                    for j in range(i - 1, max(0, i - 10), -1):
+                        prev_opcode, prev_arg, prev_pos = opcodes[j]
+
+                        if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                            # GLOBAL opcode has module.function format
+                            parts = (
+                                prev_arg.split(" ", 1)
+                                if " " in prev_arg
+                                else prev_arg.rsplit(".", 1)
+                                if "." in prev_arg
+                                else [prev_arg, ""]
+                            )
+                            if len(parts) == 2:
+                                reduce_mod, reduce_func = parts
+                                associated_global = f"{reduce_mod}.{reduce_func}"
+                                is_safe_global = _is_safe_ml_global(reduce_mod, reduce_func)
+                                break
+
+                        elif prev_opcode.name == "STACK_GLOBAL":
+                            # STACK_GLOBAL uses two strings from the stack
+                            # Look for the two most recent string opcodes before STACK_GLOBAL
+                            recent_strings: list[str] = []
+                            for k in range(j - 1, max(0, j - 10), -1):
+                                stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
+                                if stack_prev_opcode.name in [
+                                    "SHORT_BINSTRING",
+                                    "BINSTRING",
+                                    "STRING",
+                                    "SHORT_BINUNICODE",
+                                    "BINUNICODE",
+                                    "UNICODE",
+                                ] and isinstance(stack_prev_arg, str):
+                                    recent_strings.insert(0, stack_prev_arg)
+                                    if len(recent_strings) >= 2:
+                                        break
+
+                            if len(recent_strings) >= 2:
+                                reduce_mod = recent_strings[0]
+                                reduce_func = recent_strings[1]
+                                associated_global = f"{reduce_mod}.{reduce_func}"
+                                is_safe_global = _is_safe_ml_global(reduce_mod, reduce_func)
+                                break
+
+                    # Report REDUCE based on safe globals check
+                    if associated_global is not None:
+                        if is_safe_global:
+                            # Safe REDUCE (in ML_SAFE_GLOBALS) - show as INFO
+                            result.add_check(
+                                name="REDUCE Opcode Safety Check",
+                                passed=True,
+                                message=f"REDUCE opcode with safe ML framework global: {associated_global}",
+                                severity=IssueSeverity.INFO,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "associated_global": associated_global,
+                                    "security_note": (
+                                        "This REDUCE operation uses a safe ML framework function and is "
+                                        "expected in model files. However, if the Python environment is "
+                                        "tampered with (e.g., malicious monkey-patching), it could potentially "
+                                        "be exploited. Ensure the execution environment is trusted."
+                                    ),
+                                    "ml_context_confidence": ml_context.get(
+                                        "overall_confidence",
+                                        0,
+                                    ),
+                                },
+                            )
+                        else:
+                            # NOT in safe globals - check if it's actually dangerous
+                            # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
+                            if reduce_mod and reduce_func:
+                                is_actually_dangerous = _is_actually_dangerous_global(
+                                    reduce_mod, reduce_func, ml_context
+                                )
+                                if is_actually_dangerous:
+                                    # Dangerous global (e.g., os.system) - CRITICAL
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.CRITICAL,
+                                        ml_context,
+                                        issue_type="dangerous_global",
+                                    )
+                                else:
+                                    # Non-allowlisted but not explicitly dangerous - WARNING
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.WARNING,
+                                        ml_context,
+                                    )
+
+                                result.add_check(
+                                    name="REDUCE Opcode Safety Check",
+                                    passed=False,
+                                    message=f"Found REDUCE opcode with non-allowlisted global: {associated_global}",
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details={
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_global": associated_global,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    },
+                                    why=get_opcode_explanation("REDUCE"),
+                                )
 
                 # Check dangerous opcodes for potential security issues
                 # Removed confidence-based skipping to prevent security bypasses
@@ -2486,14 +2622,22 @@ class PickleScanner(BaseScanner):
                         IssueSeverity.WARNING,
                         ml_context,
                     )
-                    # Collect for aggregation instead of individual check
-                    dangerous_opcode_findings[opcode.name].append(
-                        {
+                    result.add_check(
+                        name="INST/OBJ Opcode Safety Check",
+                        passed=False,
+                        message=f"Found {opcode.name} opcode - potential code execution",
+                        severity=severity,
+                        location=f"{self.current_file_path} (pos {pos})",
+                        details={
                             "position": pos,
-                            "severity": severity,
+                            "opcode": opcode.name,
                             "argument": str(arg),
-                            "ml_context_confidence": ml_context.get("overall_confidence", 0),
-                        }
+                            "ml_context_confidence": ml_context.get(
+                                "overall_confidence",
+                                0,
+                            ),
+                        },
+                        why=get_opcode_explanation(opcode.name),
                     )
 
                 # Check for suspicious strings
@@ -2615,89 +2759,6 @@ class PickleScanner(BaseScanner):
                                 # Not valid UTF-8, skip Python code check
                                 pass
 
-            # Create aggregated checks for opcode findings
-            if reduce_opcode_findings:
-                # Aggregate common information using helper function
-                severity, example_positions, examples_str, avg_confidence = _aggregate_opcode_findings(
-                    reduce_opcode_findings
-                )
-
-                # For single occurrence, use detailed location; otherwise aggregate
-                if len(reduce_opcode_findings) == 1:
-                    first_pos = reduce_opcode_findings[0]["position"]
-                    location = f"{self.current_file_path} (pos {first_pos})"
-                    message = "Found REDUCE opcode - potential __reduce__ method execution"
-                    aggregated = False
-                else:
-                    # For multiple occurrences, include first position in location
-                    first_pos = reduce_opcode_findings[0]["position"]
-                    location = f"{self.current_file_path} (first: pos {first_pos})"
-                    plural = "s"
-                    message = (
-                        f"Found {len(reduce_opcode_findings)} REDUCE opcode{plural} - "
-                        f"potential __reduce__ method execution"
-                    )
-                    aggregated = True
-
-                result.add_check(
-                    name="REDUCE Opcode Safety Check",
-                    passed=False,
-                    message=message,
-                    severity=severity,
-                    location=location,
-                    details={
-                        "count": len(reduce_opcode_findings),
-                        "example_positions": examples_str,  # String for backward compatibility
-                        "example_positions_list": example_positions,  # Structured list for programmatic access
-                        "ml_context_confidence": avg_confidence,
-                        "aggregated": aggregated,
-                    },
-                    why=get_opcode_explanation("REDUCE"),
-                )
-
-            # Create aggregated checks for INST/OBJ/NEWOBJ opcodes
-            for opcode_name, findings in dangerous_opcode_findings.items():
-                if findings:
-                    # Aggregate common information using helper function
-                    severity, example_positions, examples_str, avg_confidence = _aggregate_opcode_findings(findings)
-
-                    # Get unique arguments (up to 10) - sorted deterministically
-                    unique_args = sorted({f["argument"] for f in findings})[:10]
-                    args_str = ", ".join(unique_args) if unique_args else "N/A"
-
-                    # For single occurrence, use detailed location; otherwise aggregate
-                    if len(findings) == 1:
-                        first_pos = findings[0]["position"]
-                        location = f"{self.current_file_path} (pos {first_pos})"
-                        message = f"Found {opcode_name} opcode - potential code execution"
-                        aggregated = False
-                    else:
-                        # For multiple occurrences, include first position in location
-                        first_pos = findings[0]["position"]
-                        location = f"{self.current_file_path} (first: pos {first_pos})"
-                        plural = "s"
-                        message = f"Found {len(findings)} {opcode_name} opcode{plural} - potential code execution"
-                        aggregated = True
-
-                    result.add_check(
-                        name="INST/OBJ Opcode Safety Check",
-                        passed=False,
-                        message=message,
-                        severity=severity,
-                        location=location,
-                        details={
-                            "opcode": opcode_name,
-                            "count": len(findings),
-                            "example_positions": examples_str,  # String for backward compatibility
-                            "example_positions_list": example_positions,  # Structured list for programmatic access
-                            "example_arguments": args_str,  # String for backward compatibility
-                            "example_arguments_list": unique_args,  # Structured list for programmatic access
-                            "ml_context_confidence": avg_confidence,
-                            "aggregated": aggregated,
-                        },
-                        why=get_opcode_explanation(opcode_name),
-                    )
-
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
             for i, (opcode, _arg, pos) in enumerate(opcodes):
@@ -2705,7 +2766,7 @@ class PickleScanner(BaseScanner):
                     # Find the two immediately preceding STRING-like opcodes
                     # STACK_GLOBAL expects exactly two strings on the stack:
                     # module and function
-                    recent_strings: list[str] = []
+                    recent_strings = []
                     for j in range(
                         i - 1,
                         max(0, i - 10),
