@@ -31,6 +31,16 @@ def _get_onnx_mapping() -> Any:
 HAS_ONNX: bool | None = None
 mapping = None
 
+# Trusted ONNX operator domains that are widely used and from reputable sources
+# These will not be flagged as failures, only informational
+TRUSTED_ONNX_DOMAINS = {
+    "com.microsoft",  # Microsoft ONNX Runtime extensions (BiasGelu, SkipLayerNormalization, etc.)
+    "ai.onnx.ml",  # ONNX ML operators
+    "com.nvidia",  # NVIDIA GPU-optimized operators
+    "ai.onnx.training",  # ONNX training operators
+    "org.pytorch.aten",  # PyTorch ATen operators in ONNX
+}
+
 
 def _check_onnx() -> bool:
     """Check if ONNX is available, with caching."""
@@ -186,21 +196,34 @@ class OnnxScanner(BaseScanner):
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
 
+                # Check if domain is trusted (widely used and from reputable sources)
+                is_trusted = node.domain in TRUSTED_ONNX_DOMAINS
+
                 # All custom domains are INFO - they're metadata, not executable code
                 # Security risk is in runtime environment (installing malicious operators)
                 # not in the ONNX file itself
-                result.add_check(
-                    name="Custom Operator Domain Check",
-                    passed=False,
-                    message=(
+                # Trusted domains pass; untrusted domains are flagged for review
+                if is_trusted:
+                    message = (
+                        f"Model references trusted operator domain '{node.domain}'. "
+                        f"This domain is from a reputable source and is widely used."
+                    )
+                else:
+                    message = (
                         f"Model references custom operator domain '{node.domain}'. "
                         f"This is metadata only - ensure operators are from trusted sources before installation."
-                    ),
+                    )
+
+                result.add_check(
+                    name="Custom Operator Domain Check",
+                    passed=is_trusted,
+                    message=message,
                     severity=IssueSeverity.INFO,
                     location=f"{path} (node: {node.name})",
                     details={
                         "op_type": node.op_type,
                         "domain": node.domain,
+                        "trusted": is_trusted,
                         "security_note": (
                             "Custom domains indicate dependencies on external operator implementations. "
                             "ONNX files cannot execute code - risk is in runtime environment if malicious "

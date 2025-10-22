@@ -10,7 +10,7 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
@@ -110,3 +110,55 @@ def test_onnx_scanner_python_op(tmp_path):
     result = OnnxScanner().scan(str(model_path))
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any(i.details.get("op_type") == "PythonOp" for i in result.issues)
+
+
+def create_onnx_model_with_domain(tmp_path: Path, domain: str) -> Path:
+    """Helper to create ONNX model with specific custom domain."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    node = helper.make_node(
+        "CustomOp",
+        ["input"],
+        ["output"],
+        domain=domain,
+        name="custom",
+    )
+    graph = helper.make_graph([node], "graph", [X], [Y])
+    model = helper.make_model(graph)
+    path = tmp_path / f"model_{domain.replace('.', '_')}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def test_onnx_scanner_trusted_domain_microsoft(tmp_path):
+    """Test that com.microsoft domain passes (trusted domain)."""
+    model_path = create_onnx_model_with_domain(tmp_path, "com.microsoft")
+    result = OnnxScanner().scan(str(model_path))
+
+    # Should find the custom domain
+    domain_checks = [
+        c for c in result.checks if c.name == "Custom Operator Domain Check" and "com.microsoft" in c.message
+    ]
+    assert len(domain_checks) > 0, "Should find custom operator domain check"
+
+    # Should pass (not fail) for trusted domain
+    for check in domain_checks:
+        assert check.status == CheckStatus.PASSED, f"Trusted domain com.microsoft should pass, but got: {check}"
+        assert check.severity == IssueSeverity.INFO
+
+
+def test_onnx_scanner_untrusted_domain(tmp_path):
+    """Test that unknown/untrusted domains are flagged for review."""
+    model_path = create_onnx_model_with_domain(tmp_path, "com.unknown")
+    result = OnnxScanner().scan(str(model_path))
+
+    # Should find the custom domain
+    domain_checks = [
+        c for c in result.checks if c.name == "Custom Operator Domain Check" and "com.unknown" in c.message
+    ]
+    assert len(domain_checks) > 0, "Should find custom operator domain check"
+
+    # Should not pass (flagged for review) for untrusted domain
+    for check in domain_checks:
+        assert check.status == CheckStatus.FAILED, f"Untrusted domain com.unknown should be flagged, but got: {check}"
+        assert check.severity == IssueSeverity.INFO

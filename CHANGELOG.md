@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fix**: whitelist trusted ONNX operator domains to eliminate false positive failures
+  - Add `TRUSTED_ONNX_DOMAINS` whitelist for reputable operator sources (com.microsoft, ai.onnx.ml, com.nvidia, etc.)
+  - Trusted domains now pass with INFO severity instead of failing checks
+  - Reduces false positives for legitimate models like sentence-transformers
+  - Example: sentence-transformers/all-MiniLM-L6-v2 now shows 100% success rate (was 97.6%)
+
 ## [0.2.10] - 2025-10-22
 
 ### Fixed
