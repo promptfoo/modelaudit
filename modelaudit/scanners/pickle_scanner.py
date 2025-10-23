@@ -389,6 +389,88 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Unpickler",
         "Pickler",
     ],
+    # Python builtins - safe built-in types and functions
+    # NOTE: eval, exec, compile, __import__ are NOT in this list (they remain dangerous)
+    "__builtin__": [  # Python 2 builtins
+        "set",
+        "frozenset",
+        "dict",
+        "list",
+        "tuple",
+        "int",
+        "float",
+        "str",
+        "bytes",
+        "bytearray",
+        "bool",
+        "object",
+        "type",
+        "range",
+        "slice",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "reversed",
+        "sorted",
+        "len",
+        "min",
+        "max",
+        "sum",
+        "abs",
+        "round",
+        "divmod",
+        "pow",
+        "hash",
+        "id",
+        "isinstance",
+        "issubclass",
+        "hasattr",
+        "getattr",
+        "setattr",
+        "delattr",
+        "callable",
+    ],
+    "builtins": [  # Python 3 builtins
+        "set",
+        "frozenset",
+        "dict",
+        "list",
+        "tuple",
+        "int",
+        "float",
+        "str",
+        "bytes",
+        "bytearray",
+        "bool",
+        "object",
+        "type",
+        "range",
+        "slice",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "reversed",
+        "sorted",
+        "len",
+        "min",
+        "max",
+        "sum",
+        "abs",
+        "round",
+        "divmod",
+        "pow",
+        "hash",
+        "id",
+        "isinstance",
+        "issubclass",
+        "hasattr",
+        "getattr",
+        "setattr",
+        "delattr",
+        "callable",
+    ],
     "collections": ["OrderedDict", "defaultdict", "namedtuple", "Counter", "deque"],
     "typing": [
         "Any",
@@ -688,6 +770,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     for less critical operations.
     """
     full_ref = f"{mod}.{func}"
+
+    # STEP 0: Check ML_SAFE_GLOBALS allowlist first (before dangerous checks)
+    # This prevents false positives for safe functions from otherwise dangerous modules
+    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe
+    if _is_safe_ml_global(mod, func):
+        logger.debug(f"Allowlisted safe global from potentially dangerous module: {mod}.{func}")
+        return False
 
     # STEP 1: ALWAYS flag dangerous functions (no ML context exceptions)
     if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
@@ -2337,30 +2426,25 @@ class PickleScanner(BaseScanner):
                 worst_warning = max(stack_depth_warnings, key=get_depth)
                 worst_depth = worst_warning["current_depth"]
 
-                # Tiered severity based on depth
-                if worst_depth > base_stack_depth_limit and worst_depth <= warning_stack_depth_limit:
-                    # 3000-5000: INFO - elevated but often seen in large legitimate models
-                    severity = IssueSeverity.INFO
+                # All stack depth warnings are now INFO severity
+                # Stack depth alone is not a reliable security indicator - large legitimate models
+                # commonly have depths of 1000-7000. Always show as INFO for visibility.
+                severity = IssueSeverity.INFO
+                if worst_depth > warning_stack_depth_limit:
+                    # Very high stack depth - still INFO but with stronger warning message
+                    message = f"Very high stack depth ({worst_depth}) detected in pickle file"
+                    why_text = (
+                        "Stack depth is very high. While this can occur in large legitimate models, "
+                        "it may also indicate a maliciously crafted pickle. Verify model source and "
+                        "monitor for resource exhaustion if loading from untrusted sources."
+                    )
+                else:
+                    # 3000-5000: Normal for large models
                     message = f"Elevated stack depth ({worst_depth}) in pickle file"
                     why_text = (
                         "Stack depth is elevated but within range seen in large legitimate ML models. "
-                        "Monitor if you're processing untrusted models, but this is often normal for complex models."
+                        "This is informational - large models commonly have complex nested structures."
                     )
-                elif worst_depth > warning_stack_depth_limit:
-                    # 5000+: WARNING - concerning and should be investigated
-                    severity = IssueSeverity.WARNING
-                    message = f"High stack depth ({worst_depth}) exceeds recommended limit"
-                    why_text = (
-                        "Excessive stack depth can indicate maliciously crafted pickle files "
-                        "designed to cause resource exhaustion attacks or exploit deserialization vulnerabilities. "
-                        "Legitimate large models rarely exceed 5000."
-                    )
-                else:
-                    # This case shouldn't happen (< 3000 shouldn't be in warnings)
-                    # But handle it gracefully
-                    severity = IssueSeverity.INFO
-                    message = f"Stack depth ({worst_depth}) noted"
-                    why_text = "Stack depth is within normal range for large models."
 
                 # Filter warnings based on base limit for details
                 significant_warnings = [
