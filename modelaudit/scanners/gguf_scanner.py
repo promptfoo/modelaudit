@@ -210,27 +210,6 @@ class GgufScanner(BaseScanner):
             },
         )
 
-        # Informational checks on header values - large counts are limited during iteration
-        if n_kv > 1_000_000:
-            result.add_check(
-                name="GGUF Header KV Count Validation",
-                passed=False,
-                message=f"GGUF header declares unusually large KV count ({n_kv} entries)",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={"kv_count": n_kv, "note": "Iteration limited to 10,000 for safety"},
-            )
-
-        if n_tensors > 100_000:
-            result.add_check(
-                name="GGUF Header Tensor Count Validation",
-                passed=False,
-                message=f"GGUF header declares unusually large tensor count ({n_tensors} tensors)",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={"tensor_count": n_tensors, "note": "Iteration limited to 10,000 for safety"},
-            )
-
         if file_size < 24:
             result.add_check(
                 name="GGUF File Size Validation",
