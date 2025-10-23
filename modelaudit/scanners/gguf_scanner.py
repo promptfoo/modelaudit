@@ -307,7 +307,23 @@ class GgufScanner(BaseScanner):
                 )
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
+        except GGUFSizeLimitError as e:
+            # Size limit errors are informational (large vocabularies/tensors are benign)
+            result.add_check(
+                name="GGUF Tensor Parsing",
+                passed=False,
+                message=f"GGUF {e.size_type} size limit exceeded: {e}",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "size_type": e.size_type,
+                    "actual_size": e.actual_size,
+                    "limit": e.limit,
+                },
+            )
+            return
         except Exception as e:
+            # Other parsing errors are critical (corruption, malformed data, etc.)
             result.add_check(
                 name="GGUF Tensor Parsing",
                 passed=False,

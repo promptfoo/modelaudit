@@ -2367,67 +2367,8 @@ class PickleScanner(BaseScanner):
             # SMART DETECTION: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
 
-            # CVE-2025-32434 specific opcode sequence analysis
-            cve_patterns = self._detect_cve_2025_32434_sequences(opcodes, file_size)
-            for cve_pattern in cve_patterns:
-                # Handle informational patterns (large legitimate models)
-                if cve_pattern.get("status") == "normal":
-                    result.add_check(
-                        name="Large Model Opcode Analysis",
-                        passed=True,
-                        message=f"Large model analysis: {cve_pattern['description']}",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={
-                            "pattern_type": cve_pattern["pattern_type"],
-                            "dangerous_count": cve_pattern["dangerous_count"],
-                            "file_size_mb": cve_pattern["file_size_mb"],
-                            "opcode_density_per_mb": cve_pattern["opcode_density_per_mb"],
-                            "threshold_used": cve_pattern["threshold_used"],
-                        },
-                    )
-                    continue
-
-                # Map severity levels to IssueSeverity
-                severity_level = cve_pattern.get("severity_level", "critical")
-                if severity_level == "critical":
-                    severity = IssueSeverity.CRITICAL
-                elif severity_level == "high":
-                    severity = IssueSeverity.CRITICAL  # Still critical, but with context
-                elif severity_level == "medium":
-                    severity = IssueSeverity.WARNING  # Reduced severity for large models
-                else:  # low
-                    severity = IssueSeverity.INFO  # Just informational for very large models
-
-                # Choose message prefix based on severity
-                if severity == IssueSeverity.CRITICAL:
-                    message_prefix = "Detected CVE-2025-32434 exploitation pattern"
-                elif severity == IssueSeverity.WARNING:
-                    message_prefix = "Potential CVE-2025-32434 pattern (large model context)"
-                else:
-                    message_prefix = "CVE-2025-32434 analysis (informational)"
-
-                result.add_check(
-                    name="CVE-2025-32434 Opcode Sequence Detection",
-                    passed=severity not in [IssueSeverity.CRITICAL, IssueSeverity.WARNING],
-                    message=f"{message_prefix}: {cve_pattern['description']}",
-                    severity=severity,
-                    location=f"{self.current_file_path} (pos {cve_pattern.get('position', 0)})",
-                    details={
-                        "cve_id": "CVE-2025-32434",
-                        "pattern_type": cve_pattern["pattern_type"],
-                        "description": cve_pattern["description"],
-                        "opcodes_involved": cve_pattern.get("opcodes", []),
-                        "exploitation_method": cve_pattern.get("exploitation_method", ""),
-                        "position": cve_pattern.get("position", 0),
-                        "dangerous_count": cve_pattern.get("dangerous_count", 0),
-                        "file_size_mb": cve_pattern.get("file_size_mb", 0),
-                        "opcode_density_per_mb": cve_pattern.get("opcode_density_per_mb", 0),
-                        "threshold_used": cve_pattern.get("threshold_used", 0),
-                        "severity_level": severity_level,
-                        "confidence_score": cve_pattern.get("confidence_score", 0),
-                    },
-                )
+            # CVE-2025-32434 specific opcode sequence analysis - REMOVED
+            # Now only show CVE info in REDUCE opcode detection messages
 
             # Stack depth validation with tiered limits
             # Tiered approach: 0-3000 (OK), 3000-5000 (INFO), 5000-10000 (WARNING), 10000+ (CRITICAL)
@@ -2727,13 +2668,17 @@ class PickleScanner(BaseScanner):
                                 result.add_check(
                                     name="REDUCE Opcode Safety Check",
                                     passed=False,
-                                    message=f"Found REDUCE opcode with non-allowlisted global: {associated_global}",
+                                    message=(
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
+                                    ),
                                     severity=severity,
                                     location=f"{self.current_file_path} (pos {pos})",
                                     details={
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
+                                        "cve_id": "CVE-2025-32434",
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,
