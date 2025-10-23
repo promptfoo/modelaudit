@@ -2447,7 +2447,7 @@ class PickleScanner(BaseScanner):
                 # Stack depth alone is not a reliable security indicator - large legitimate models
                 # commonly have depths of 1000-7000. Always show as INFO for visibility.
                 severity = IssueSeverity.INFO
-                if worst_depth > warning_stack_depth_limit:
+                if isinstance(worst_depth, int) and worst_depth > warning_stack_depth_limit:
                     # Very high stack depth - still INFO but with stronger warning message
                     message = f"Very high stack depth ({worst_depth}) detected in pickle file"
                     why_text = (
