@@ -303,19 +303,8 @@ class GgufScanner(BaseScanner):
             )
             return
 
-        # Validate alignment
-        alignment = metadata.get("general.alignment", 32)
-        if alignment < 8 or alignment % 8 != 0 or alignment > 1024:
-            result.add_check(
-                name="GGUF Alignment Validation",
-                passed=False,
-                message=f"Invalid alignment value: {alignment}",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={"alignment": alignment, "valid_range": "8-1024, multiple of 8"},
-            )
-
         # Align to tensor data
+        alignment = metadata.get("general.alignment", 32)
         current = f.tell()
         pad = (alignment - (current % alignment)) % alignment
         if pad:
@@ -341,16 +330,6 @@ class GgufScanner(BaseScanner):
                     # Skip the rest of this tensor's data to prevent DoS
                     f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
                     continue
-
-                if nd > 8:  # Reasonable limit for tensor dimensions
-                    result.add_check(
-                        name="Tensor Dimension Count Check",
-                        passed=False,
-                        message=f"Tensor {t_name} has suspicious number of dimensions: {nd}",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={"tensor_name": t_name, "dimensions": nd, "max_normal": 8},
-                    )
 
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
                 (t_type,) = struct.unpack("<I", f.read(4))
@@ -429,16 +408,6 @@ class GgufScanner(BaseScanner):
                 info = _GGML_TYPE_INFO.get(tensor["type"])
                 if info:
                     blck, ts = info
-                    if nelements % blck != 0:
-                        result.add_check(
-                            name="Tensor Block Alignment Check",
-                            passed=False,
-                            message=f"Tensor {tensor['name']} not aligned to block size {blck}",
-                            severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
-                        )
-
                     expected = ((nelements + blck - 1) // blck) * ts
                     next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
                     actual = next_offset - tensor["offset"]
@@ -502,16 +471,6 @@ class GgufScanner(BaseScanner):
 
             version = struct.unpack("<I", version_bytes)[0]
             result.metadata["version"] = version
-
-            if version > 10000:  # Reasonable upper bound
-                result.add_check(
-                    name="GGML Version Check",
-                    passed=False,
-                    message=f"Suspicious GGML version: {version}",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={"version": version, "max_expected": 10000},
-                )
         except Exception as e:
             result.add_check(
                 name="GGML Header Parsing",

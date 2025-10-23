@@ -375,23 +375,6 @@ class SafeTensorsScanner(BaseScanner):
             # Analyze the metadata for injection patterns
             self._analyze_metadata_content(metadata, result, path)
 
-            # Check metadata size - unusually large metadata can indicate injection
-            import json
-
-            metadata_size = len(json.dumps(metadata, separators=(",", ":")))
-            if metadata_size > 50000:  # 50KB threshold
-                result.add_check(
-                    name="SafeTensors Metadata Size Check",
-                    passed=False,
-                    message=f"Unusually large metadata section ({metadata_size:,} bytes) may indicate injection attack",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "metadata_size": metadata_size,
-                        "size_threshold": 50000,
-                        "potential_attack": "metadata_bloat_injection",
-                    },
-                )
 
         # Check tensor names for injection attempts
         tensor_names = [k for k in header if k != "__metadata__"]
@@ -564,17 +547,6 @@ class SafeTensorsScanner(BaseScanner):
                     },
                 )
 
-        # Check for unusually deep nesting (JSON bomb)
-        max_depth = self._calculate_json_depth(metadata)
-        if max_depth > 50:
-            result.add_check(
-                name="SafeTensors JSON Depth Bomb Detection",
-                passed=False,
-                message=f"Unusually deep JSON nesting ({max_depth} levels) may indicate DoS attack",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"max_depth": max_depth, "depth_threshold": 50, "attack_type": "json_depth_bomb"},
-            )
 
     def _is_suspicious_tensor_name(self, name: str) -> bool:
         """Check if a tensor name contains suspicious patterns"""
