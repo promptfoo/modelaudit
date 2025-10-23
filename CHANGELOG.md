@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2025-10-22
+
+### Fixed
+
+- **fix**: remove non-security format validation checks across scanners (#406)
+- **fix**: eliminate false positives in stack depth, GGUF limits, and builtins detection (#405)
+
 ## [0.2.11] - 2025-10-22
 
 ### Fixed
@@ -454,7 +461,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...v0.2.9
