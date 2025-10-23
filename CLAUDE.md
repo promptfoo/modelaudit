@@ -144,6 +144,40 @@ ModelAudit supports multiple input sources:
 - JFrog Artifactory URLs (files and folders): `https://company.jfrog.io/artifactory/repo/model.pt` or `https://company.jfrog.io/artifactory/repo/models/`
 - DVC pointer files (`.dvc`)
 
+## Model Whitelist System
+
+ModelAudit includes a whitelist system that reduces false positives for trusted models:
+
+- **7,440+ whitelisted models** from popular downloads and trusted organizations
+- Security findings for whitelisted models are automatically downgraded to INFO severity
+- Whitelisting is **enabled by default** but can be disabled via config: `{"use_hf_whitelist": False}`
+
+### Updating the Whitelist
+
+The whitelist should be updated periodically to include new popular models and organization releases:
+
+```bash
+# Update popular models whitelist (top downloads)
+python scripts/fetch_hf_top_models.py --count 2000
+
+# Update organization models whitelist (trusted orgs)
+python scripts/fetch_hf_org_models.py
+
+# Both commands regenerate the whitelist modules in modelaudit/whitelists/
+# Commit the updated files after running
+```
+
+**When to update:**
+
+- Monthly or quarterly for popular models (trends change)
+- When new trusted organizations emerge
+- Before major releases to ensure up-to-date coverage
+
+**Whitelist sources:**
+
+1. `huggingface_popular.py` - Top downloaded models from HuggingFace
+2. `huggingface_organizations.py` - Models from 18 trusted organizations (Meta, Google, Microsoft, NVIDIA, etc.)
+
 ## Environment Variables
 
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` - JFrog authentication

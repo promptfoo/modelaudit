@@ -53,6 +53,10 @@ class UnifiedMLContext:
     file_size: int
     file_type: str
 
+    # Model source tracking (for whitelist support)
+    model_id: str | None = None  # HuggingFace model ID (e.g., "bert-base-uncased")
+    model_source: str | None = None  # Source: "huggingface", "local", "s3", etc.
+
     # ML Framework detection
     frameworks: dict[str, float] = field(default_factory=dict)  # framework -> confidence
     primary_framework: str | None = None

@@ -126,6 +126,10 @@ Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2
 
 Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
 
+### **Smart Whitelist System (Reduces False Positives)**
+
+Automatically downgrades findings for 7,440+ trusted models from popular downloads and verified organizations (Meta, Google, Microsoft, NVIDIA, etc.) - [Learn more](#-whitelist-system)
+
 ## 📊 Supported Model Formats
 
 ModelAudit supports **29 specialized file format scanners** with comprehensive security analysis:
@@ -527,6 +531,58 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/       # Entire fold
 - **`--no-cache`** - Disable result caching
 
 [Advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+## 🛡️ Whitelist System
+
+ModelAudit includes a smart whitelist system that **reduces false positives** for trusted models while maintaining security:
+
+### What's Whitelisted
+
+- **7,440+ models** from two trusted sources:
+  1. **Popular models** (540 models) - Top downloaded models from HuggingFace
+  2. **Trusted organizations** (6,900 models) - Models from 18 verified organizations:
+     - Meta/Facebook, Google, Microsoft, NVIDIA
+     - OpenAI, Hugging Face, Stability AI
+     - EleutherAI, BigScience, BigCode
+     - Mistral AI, Sentence Transformers
+     - And more...
+
+### How It Works
+
+- **Automatic detection**: Model IDs are extracted from URLs, cache paths, and metadata
+- **Smart downgrading**: Security findings are downgraded from WARNING/CRITICAL → INFO
+- **Enabled by default**: Works transparently with no configuration needed
+- **User control**: Disable via config if needed: `{"use_hf_whitelist": False}`
+
+### Example
+
+```bash
+# Scanning a whitelisted model
+$ modelaudit facebook/bart-large-cnn
+
+✓ Scanning facebook/bart-large-cnn
+Files scanned: 3 | Issues found: 0 critical, 0 warning, 2 info
+
+# Issues are downgraded to INFO for trusted models
+1. model.safetensors: [INFO] Contains pickle import (whitelisted model)
+   Original severity: WARNING
+```
+
+### Updating the Whitelist
+
+**For maintainers**: Update periodically to include new popular models and releases:
+
+```bash
+# Update popular models (top downloads)
+python scripts/fetch_hf_top_models.py --count 2000
+
+# Update organization models (trusted orgs)
+python scripts/fetch_hf_org_models.py
+
+# Commit the updated files in modelaudit/whitelists/
+```
+
+**Recommended update frequency**: Monthly or before major releases
 
 ## Output Formats
 

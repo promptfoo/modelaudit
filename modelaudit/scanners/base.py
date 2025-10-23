@@ -127,8 +127,9 @@ class Issue(BaseModel):
 class ScanResult:
     """Collects and manages issues found during scanning"""
 
-    def __init__(self, scanner_name: str = "unknown"):
+    def __init__(self, scanner_name: str = "unknown", scanner: "BaseScanner | None" = None):
         self.scanner_name = scanner_name
+        self.scanner = scanner  # Reference to the scanner for whitelist checks
         self.issues: list[Issue] = []
         self.checks: list[Check] = []  # All checks performed (passed and failed)
         self.start_time = time.time()
@@ -207,6 +208,16 @@ class ScanResult:
         if why is None:
             # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
+
+        # Apply whitelist logic if enabled and scanner is available
+        original_severity = severity
+        if self.scanner and self.scanner._should_apply_whitelist(severity):
+            severity = IssueSeverity.INFO
+            # Add note about whitelisting to the details
+            if details is None:
+                details = {}
+            details["whitelist_downgrade"] = True
+            details["original_severity"] = original_severity.name
 
         issue = Issue(
             message=message,
@@ -382,6 +393,33 @@ class BaseScanner(ABC):
             return val.strip().lower() not in {"false", "0", "no", "off"}
         return bool(val)
 
+    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+        """
+        Check if the whitelist should be applied to downgrade an issue's severity.
+
+        Args:
+            severity: The original severity of the issue
+
+        Returns:
+            True if the issue should be downgraded to INFO, False otherwise
+        """
+        # Only downgrade severities higher than INFO
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        # Check if whitelist is enabled (default: True)
+        use_whitelist = self._get_bool_config("use_hf_whitelist", default=True)
+        if not use_whitelist:
+            return False
+
+        # Check if we have a model ID and it's whitelisted
+        if self.context and self.context.model_id:
+            from modelaudit.whitelists import is_whitelisted_model
+
+            return is_whitelisted_model(self.context.model_id)
+
+        return False
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Return True if this scanner can handle the file at the given path"""
@@ -421,14 +459,26 @@ class BaseScanner(ABC):
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
+        from modelaudit.utils.huggingface import extract_model_id_from_path
+
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
-        self.context = UnifiedMLContext(file_path=path_obj, file_size=file_size, file_type=file_type)
+
+        # Extract model ID if this is from HuggingFace or contains metadata
+        model_id, model_source = extract_model_id_from_path(path)
+
+        self.context = UnifiedMLContext(
+            file_path=path_obj,
+            file_size=file_size,
+            file_type=file_type,
+            model_id=model_id,
+            model_source=model_source,
+        )
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        result = ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name, scanner=self)
 
         # Automatically merge any stored path validation warnings
         if hasattr(self, "_path_validation_result") and self._path_validation_result:
