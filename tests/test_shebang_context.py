@@ -100,7 +100,7 @@ class TestShebangContextVerification:
 
         for interp in interpreters:
             data = interp + b"\ntest\n"
-            assert scanner._verify_shebang_context(data, 0) is True, f"Failed for {interp}"
+            assert scanner._verify_shebang_context(data, 0) is True, f"Failed for {interp!r}"
 
     def test_env_with_interpreter_argument(self, scanner):
         """Test env shebang with interpreter as argument"""
