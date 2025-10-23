@@ -689,16 +689,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
             if hasattr(meta_graph, "ListFields"):
                 fields = meta_graph.ListFields()
 
-                # Look for fields with unusually large sizes
-                for _field_desc, field_value in fields:
-                    if hasattr(field_value, "__len__"):
-                        try:
-                            # Just check if len() works - we removed the size check
-                            len(field_value)
-                        except (AttributeError, TypeError):
-                            continue
-
-
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
 
