@@ -492,7 +492,14 @@ class GgufScanner(BaseScanner):
         if vtype == 9:  # ARRAY
             subtype = struct.unpack("<I", f.read(4))[0]
             (count,) = struct.unpack("<Q", f.read(8))
-            if count > 10000:  # Prevent DoS
+            # Raise limit to accommodate legitimate large vocabulary models
+            # Research shows real-world models have 32K-152K token vocabularies:
+            # - Qwen2.5-7B: 152,064 tokens
+            # - DeepSeek-V2-Chat: 102,400 tokens
+            # - Llama 3.1: 128,256 tokens
+            # - Common range: 32,000 to 152,000 tokens
+            # Setting limit to 500,000 provides generous safety margin while preventing DoS
+            if count > 500_000:  # Prevent DoS while allowing legitimate large vocabs
                 raise ValueError(f"Array too large: {count} elements")
             return [self._read_value(f, subtype) for _ in range(count)]
         if vtype == 10:  # UINT64

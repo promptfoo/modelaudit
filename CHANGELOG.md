@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fix**: raise GGUF array size limit to 500K to eliminate false positives for large vocabulary models
+  - Research shows legitimate models have 32K-152K token vocabularies (Qwen2.5: 152K, DeepSeek-V2: 102K, Llama 3.1: 128K)
+  - Previous 10K limit caused 100% failure rate (16 false positives across 6 models)
+  - New 500K limit provides generous safety margin while maintaining DoS protection
+  - String length limit (1MB) remains unchanged (appropriate for security)
+
 ## [0.2.11] - 2025-10-22
 
 ### Fixed
