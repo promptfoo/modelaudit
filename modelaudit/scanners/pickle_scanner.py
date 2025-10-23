@@ -3572,7 +3572,30 @@ class PickleScanner(BaseScanner):
 
         for i, (opcode, arg, pos) in enumerate(opcodes):
             # Count dangerous opcodes
-            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL"]:
+            # Note: STACK_GLOBAL is only dangerous with malicious imports, not with legitimate ML framework imports
+            is_dangerous = False
+            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                is_dangerous = True
+            elif opcode.name == "STACK_GLOBAL" and arg:
+                # Only count STACK_GLOBAL as dangerous if it's NOT a legitimate ML framework import
+                arg_str = str(arg).lower()
+                is_legitimate_ml_import = any(
+                    pattern in arg_str
+                    for pattern in [
+                        "torch",
+                        "tensorflow",
+                        "collections.ordereddict",
+                        "numpy",
+                        "_pickle",
+                        "copyreg",
+                        "typing",
+                        "__builtin__",
+                    ]
+                )
+                if not is_legitimate_ml_import:
+                    is_dangerous = True
+
+            if is_dangerous:
                 dangerous_opcodes_count += 1
                 dangerous_opcodes_found.append((opcode.name, pos))
 
@@ -3743,7 +3766,11 @@ class PickleScanner(BaseScanner):
 
         # Pattern 6: Improved density-based CVE-2025-32434 detection
         # Use dynamic thresholds based on file size to reduce false positives for large legitimate models
-        if torch_references > 0 and dangerous_opcodes_count > 0:
+        # IMPORTANT: Only trigger density alert if we found specific malicious patterns (Patterns 1-5)
+        # High density alone is not sufficient - legitimate PyTorch models can have high REDUCE density
+        has_specific_malicious_patterns = len(patterns) > 0  # Check if Patterns 1-5 found anything
+
+        if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
             # Calculate density: opcodes per MB
             file_size_mb = file_size / (1024 * 1024)
             raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
