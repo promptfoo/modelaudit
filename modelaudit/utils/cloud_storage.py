@@ -479,7 +479,7 @@ def download_from_cloud(
 
     # Check available disk space before downloading
     object_size = get_cloud_object_size(fs, url)
-    if object_size:
+    if object_size is not None:
         has_space, message = check_disk_space(download_path, object_size)
         if not has_space:
             # Clean up temp directory if we created one

@@ -3777,6 +3777,10 @@ class PickleScanner(BaseScanner):
         )
         opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
 
+        # Initialize density_threshold with a default value to prevent UnboundLocalError
+        density_threshold = 0.0
+        severity_level = "low"
+
         if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
             # Dynamic thresholds based on file size:
             # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
