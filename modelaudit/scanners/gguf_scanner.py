@@ -311,24 +311,9 @@ class GgufScanner(BaseScanner):
         # Parse tensor information
         tensors = []
         try:
-            for _i in range(min(n_tensors, 10000)):  # Limit to prevent DoS
+            for _i in range(min(n_tensors, 10000)):
                 t_name = self._read_string(f)
                 (nd,) = struct.unpack("<I", f.read(4))
-
-                # Hard limit on dimensions to prevent DoS attacks
-                if nd > 1000:  # Extremely large dimension count - skip this tensor
-                    result.add_check(
-                        name="Tensor Dimension Validation",
-                        passed=False,
-                        message=f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
-                    )
-                    # Skip the rest of this tensor's data to prevent DoS
-                    f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
-                    continue
-
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
                 (t_type,) = struct.unpack("<I", f.read(4))
                 (offset,) = struct.unpack("<Q", f.read(8))

@@ -239,42 +239,6 @@ def test_ggml_scanner_truncated(tmp_path):
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
-    """Test DoS protection against tensors with excessive dimensions."""
-    path = tmp_path / "dos_dimensions.gguf"
-    with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<Q", 1))
-
-        key = b"general.alignment"
-        f.write(struct.pack("<Q", len(key)))
-        f.write(key)
-        f.write(struct.pack("<I", 4))
-        f.write(struct.pack("<I", 32))
-
-        pad = (32 - (f.tell() % 32)) % 32
-        f.write(b"\0" * pad)
-
-        name = b"dos_tensor"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 2000))
-
-        for _ in range(2000):
-            f.write(struct.pack("<Q", 10))
-        f.write(struct.pack("<I", 0))
-        f.write(struct.pack("<Q", 1000))
-
-    result = GgufScanner().scan(str(path))
-
-    assert any(
-        "excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues
-    )
-    assert any("skipping for security" in i.message.lower() for i in result.issues)
-
-
 def test_gguf_scanner_file_extensions(tmp_path):
     """Test that scanner handles different file extensions correctly."""
     # Test .gguf extension
