@@ -10,10 +10,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     HAS_TFLITE = False
 
-# Thresholds to detect potential overflow or malicious sizes
-_MAX_COUNT = 1_000_000
-_MAX_DIM = 10_000_000
-
 
 class TFLiteScanner(BaseScanner):
     """Scanner for TensorFlow Lite model files."""

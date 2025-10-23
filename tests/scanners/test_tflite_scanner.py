@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.scanners.tflite_scanner import _MAX_COUNT, _MAX_DIM, TFLiteScanner
+from modelaudit.scanners.tflite_scanner import TFLiteScanner
 
 # Try to import tflite to check availability
 try:

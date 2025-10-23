@@ -675,19 +675,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
 
-        # Check for protobuf schema validation bypasses
-        self._check_protobuf_schema_attacks(saved_model, result)
-
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
-
-    def _check_protobuf_schema_attacks(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf schema validation bypass attempts"""
-
-        for meta_graph in saved_model.meta_graphs:
-            # Check for unknown/unexpected fields in the meta graph
-            if hasattr(meta_graph, "ListFields"):
-                fields = meta_graph.ListFields()
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
