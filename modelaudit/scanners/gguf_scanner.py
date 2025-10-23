@@ -245,7 +245,7 @@ class GgufScanner(BaseScanner):
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
         try:
-            for _i in range(min(n_kv, 10000)):  # Limit to prevent DoS
+            for _i in range(n_kv):
                 key = self._read_string(f)
 
                 # Security check for suspicious keys
@@ -311,7 +311,7 @@ class GgufScanner(BaseScanner):
         # Parse tensor information
         tensors = []
         try:
-            for _i in range(min(n_tensors, 10000)):
+            for _i in range(n_tensors):
                 t_name = self._read_string(f)
                 (nd,) = struct.unpack("<I", f.read(4))
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
