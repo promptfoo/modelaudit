@@ -278,7 +278,6 @@ class GgufScanner(BaseScanner):
 
             result.metadata["metadata"] = metadata
         except GGUFSizeLimitError as e:
-            # Size limit exceeded - informational, not critical
             result.add_check(
                 name="GGUF Metadata Parsing",
                 passed=False,
