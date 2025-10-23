@@ -696,15 +696,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 fields = meta_graph.ListFields()
 
                 # Look for fields with unusually large sizes
-                for field_desc, field_value in fields:
+                for _field_desc, field_value in fields:
                     if hasattr(field_value, "__len__"):
                         try:
-                            field_size = len(field_value)
+                            # Just check if len() works - we removed the size check
+                            len(field_value)
                         except (AttributeError, TypeError):
                             continue
-
-            # Check the graph definition for schema bypass attempts
-            graph_def = meta_graph.graph_def
 
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
@@ -805,22 +803,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
 
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
+        for _meta_graph in saved_model.meta_graphs:
+            pass  # Function body was gutted when we removed the checks
 
 
     def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
         """Check for protobuf field bombs (DoS via excessive fields)"""
 
-        total_nodes = 0
-        total_attrs = 0
-
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
-            meta_graph_nodes = len(graph_def.node)
-            total_nodes += meta_graph_nodes
-
-            # Count total attributes across all nodes
-            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
-            total_attrs += meta_graph_attrs
+        # Function body was gutted when we removed node/complexity count checks
+        # Keep the function for API compatibility but make it a no-op
+        pass
 
