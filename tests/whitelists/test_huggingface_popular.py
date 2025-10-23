@@ -64,7 +64,7 @@ class TestPopularModels:
         model_list = list(POPULAR_MODELS)
         assert len(model_list) == len(POPULAR_MODELS)
 
-    def test_popular_models_sorted_by_downloads(self):
+    def test_popular_models_is_long(self):
         """Test that popular models list is not empty and contains real models."""
         # We should have some well-known models in the top downloads
         # Check for at least some common models
