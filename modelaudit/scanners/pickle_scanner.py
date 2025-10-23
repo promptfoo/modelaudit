@@ -2242,7 +2242,7 @@ class PickleScanner(BaseScanner):
             # Tiered stack depth limits for better false positive handling
             # Legitimate large ML models often have stack depths of 1000-3000
             base_stack_depth_limit = 3000
-            warning_stack_depth_limit = 5000  # Concerning but not critical
+            warning_stack_depth_limit = 5000
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
 
