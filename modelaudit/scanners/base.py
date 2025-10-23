@@ -414,9 +414,9 @@ class BaseScanner(ABC):
 
         # Check if we have a model ID and it's whitelisted
         if self.context and self.context.model_id:
-            from modelaudit.whitelists import is_popular_model
+            from modelaudit.whitelists import is_whitelisted_model
 
-            return is_popular_model(self.context.model_id)
+            return is_whitelisted_model(self.context.model_id)
 
         return False
 
