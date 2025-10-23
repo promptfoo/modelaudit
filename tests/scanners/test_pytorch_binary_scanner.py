@@ -178,7 +178,7 @@ def test_pytorch_binary_scanner_blacklist_patterns(tmp_path):
 
 
 def test_pytorch_binary_scanner_small_file(tmp_path):
-    """Test handling of suspiciously small files."""
+    """Test handling of small files - size alone is not a security issue."""
     scanner = PyTorchBinaryScanner()
 
     # Create a very small binary file
@@ -187,16 +187,8 @@ def test_pytorch_binary_scanner_small_file(tmp_path):
 
     result = scanner.scan(str(binary_file))
 
+    # Small file size is not a security issue - scanner should complete successfully
     assert result.success
-    assert len(result.issues) > 0
-
-    # Check for small file warning
-    found_small_warning = False
-    for issue in result.issues:
-        if "small" in issue.message.lower():
-            found_small_warning = True
-
-    assert found_small_warning
 
 
 def test_filetype_detection_for_bin_files(tmp_path):

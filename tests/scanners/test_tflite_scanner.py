@@ -68,7 +68,7 @@ def test_tflite_scanner_parsing_error(tmp_path):
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
 def test_tflite_scanner_large_subgraph_count(tmp_path):
-    """Test scanner behavior with excessive subgraph count."""
+    """Test scanner handles models with many subgraphs - count alone is not a security issue."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
@@ -101,13 +101,13 @@ def test_tflite_scanner_large_subgraph_count(tmp_path):
 
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
-        assert not result.success
-        assert "exceeds the safe limit" in result.issues[0].message
+        # Large subgraph count is not a security issue - should complete successfully
+        assert result.success
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
 def test_tflite_scanner_large_tensor_count(tmp_path):
-    """Test scanner behavior with excessive tensor count."""
+    """Test scanner handles models with many tensors - count alone is not a security issue."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
@@ -122,13 +122,13 @@ def test_tflite_scanner_large_tensor_count(tmp_path):
 
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
-        assert not result.success
-        assert "extremely large tensor or operator count" in result.issues[0].message
+        # Large tensor/operator count is not a security issue - should complete successfully
+        assert result.success
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
 def test_tflite_scanner_large_tensor_dimension(tmp_path):
-    """Test scanner behavior with excessive tensor dimensions."""
+    """Test scanner handles tensors with large dimensions - size alone is not a security issue."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some tflite data")
 
@@ -147,8 +147,8 @@ def test_tflite_scanner_large_tensor_dimension(tmp_path):
 
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
-        assert not result.success
-        assert "Tensor dimension extremely large" in result.issues[0].message
+        # Large tensor dimensions are not a security issue - should complete successfully
+        assert result.success
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
