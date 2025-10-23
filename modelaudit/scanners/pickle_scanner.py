@@ -3772,7 +3772,9 @@ class PickleScanner(BaseScanner):
 
         # Calculate density metrics unconditionally (needed for both detection and informational messages)
         file_size_mb = file_size / (1024 * 1024)
-        raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1) if dangerous_opcodes_count > 0 else 0
+        raw_opcode_density_per_mb = (
+            dangerous_opcodes_count / max(file_size_mb, 0.1) if dangerous_opcodes_count > 0 else 0
+        )
         opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
 
         # Dynamic thresholds based on file size:
@@ -3789,12 +3791,16 @@ class PickleScanner(BaseScanner):
             density_threshold = 500.0  # Much higher threshold for large models
             severity_level = "medium" if opcode_density_per_mb > 800 else "low"
 
-        if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
-            # Only flag if density exceeds threshold
-            if opcode_density_per_mb > density_threshold:
-                confidence_score = int(min(100.0, (raw_opcode_density_per_mb / density_threshold - 1.0) * 100.0))
+        # Only flag if density exceeds threshold
+        if (
+            torch_references > 0
+            and dangerous_opcodes_count > 0
+            and has_specific_malicious_patterns
+            and opcode_density_per_mb > density_threshold
+        ):
+            confidence_score = int(min(100.0, (raw_opcode_density_per_mb / density_threshold - 1.0) * 100.0))
 
-                patterns.append(
+            patterns.append(
                     {
                         "pattern_type": "high_risk_opcode_density",
                         "description": (

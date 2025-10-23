@@ -65,6 +65,7 @@ def should_ignore_executable_signature(
     ml_context: dict[str, Any],
     pattern_density: float = 0.0,  # Changed from int to float
     total_patterns: int = 0,
+    file_path: str = "",
 ) -> bool:
     """
     Determine if an executable signature should be ignored based on ML context.
@@ -75,10 +76,18 @@ def should_ignore_executable_signature(
         ml_context: ML context analysis from analyze_binary_for_ml_context
         pattern_density: Number of patterns per MB
         total_patterns: Total number of patterns found
+        file_path: Path to the file being scanned
 
     Returns:
         True if the signature should be ignored as a likely false positive
     """
+    # Check if this is an OpenVINO quantized model file - always ignore shell shebang patterns
+    # OpenVINO INT8 quantization creates pseudo-random byte patterns that coincidentally match #!/
+    if signature == b"#!/" and file_path:
+        file_path_lower = file_path.lower()
+        if "openvino" in file_path_lower and ("qint8" in file_path_lower or "quantized" in file_path_lower):
+            return True  # OpenVINO quantized models have legitimate coincidental shebang patterns
+
     # Handle specific signatures with custom logic first
     if signature == b"MZ":
         # MZ signatures in the middle of files are often false positives in weight data

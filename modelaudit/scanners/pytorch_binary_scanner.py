@@ -240,7 +240,9 @@ class PyTorchBinaryScanner(BaseScanner):
             ignored_count = 0
 
             for pos in positions:
-                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                if should_ignore_executable_signature(
+                    sig, pos, ml_context, int(pattern_density), len(positions), self.current_file_path
+                ):
                     ignored_count += 1
                 else:
                     filtered_positions.append(pos)
