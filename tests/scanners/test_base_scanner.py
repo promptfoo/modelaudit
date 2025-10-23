@@ -1,6 +1,8 @@
 import os
+from pathlib import Path
 from typing import ClassVar
 
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.scanners.base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
 
@@ -339,3 +341,157 @@ def test_base_scanner_size_limit_fail(tmp_path):
     checks = {check.name: check for check in result.checks}
     assert checks["File Size Limit"].status == CheckStatus.FAILED
     assert result.success is False
+
+
+def test_whitelist_downgrade_warning_to_info():
+    """Test that whitelisted models have warnings downgraded to INFO."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    # Get a model from the whitelist
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    # Create a context with a whitelisted model
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    # Create a result and add a warning issue
+    result = scanner._create_result()
+    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    # Should be downgraded to INFO
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.issues[0].details.get("original_severity") == "WARNING"
+
+
+def test_whitelist_downgrade_critical_to_info():
+    """Test that whitelisted models have critical issues downgraded to INFO."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    # Get a model from the whitelist
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    # Create a context with a whitelisted model
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    # Create a result and add a critical issue
+    result = scanner._create_result()
+    result.add_issue("Test critical", severity=IssueSeverity.CRITICAL)
+
+    # Should be downgraded to INFO
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.issues[0].details.get("original_severity") == "CRITICAL"
+
+
+def test_whitelist_no_downgrade_info():
+    """Test that INFO severity is not affected by whitelist."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    # Get a model from the whitelist
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    # Create a context with a whitelisted model
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    # Create a result and add an info issue
+    result = scanner._create_result()
+    result.add_issue("Test info", severity=IssueSeverity.INFO)
+
+    # Should remain INFO
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_disabled():
+    """Test that whitelist can be disabled via config."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    # Get a model from the whitelist
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner(config={"use_hf_whitelist": False})
+    # Create a context with a whitelisted model
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    # Create a result and add a warning issue
+    result = scanner._create_result()
+    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    # Should NOT be downgraded because whitelist is disabled
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_unknown_model():
+    """Test that unknown models are not whitelisted."""
+    scanner = MockScanner()
+    # Create a context with an unknown model
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id="unknown-author/unknown-model-12345",
+        model_source="huggingface",
+    )
+
+    # Create a result and add a warning issue
+    result = scanner._create_result()
+    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    # Should NOT be downgraded
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_no_model_id():
+    """Test that files without model ID are not whitelisted."""
+    scanner = MockScanner()
+    # Create a context without a model ID
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=None,
+        model_source=None,
+    )
+
+    # Create a result and add a warning issue
+    result = scanner._create_result()
+    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    # Should NOT be downgraded
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
