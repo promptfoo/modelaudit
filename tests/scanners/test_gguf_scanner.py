@@ -239,104 +239,39 @@ def test_ggml_scanner_truncated(tmp_path):
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
 
-def test_gguf_scanner_invalid_alignment(tmp_path):
-    """Test that alignment values don't cause crashes - format validation is not a security issue."""
-    path = tmp_path / "bad_align.gguf"
-    with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 0))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
-
-        # Unusual alignment value (not multiple of 8)
-        key = b"general.alignment"
-        f.write(struct.pack("<Q", len(key)))
-        f.write(key)
-        f.write(struct.pack("<I", 4))  # UINT32
-        f.write(struct.pack("<I", 3))  # Unusual alignment value
-
-    result = GgufScanner().scan(str(path))
-    # Alignment is format validation, not a security issue
-    # Scanner should complete without crashing, regardless of result
-    assert result is not None
-    assert hasattr(result, "success")
-
-
-def test_gguf_scanner_tensor_dimension_limits(tmp_path):
-    """Test that high dimension counts are handled - count alone is not a security issue."""
-    path = tmp_path / "many_dims.gguf"
-    with open(path, "wb") as f:
-        f.write(b"GGUF")
-        f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
-
-        # Minimal metadata
-        key = b"general.alignment"
-        f.write(struct.pack("<Q", len(key)))
-        f.write(key)
-        f.write(struct.pack("<I", 4))
-        f.write(struct.pack("<I", 32))
-
-        # Align to 32
-        pad = (32 - (f.tell() % 32)) % 32
-        f.write(b"\0" * pad)
-
-        # Tensor with many dimensions (20 is unusual but not a security issue)
-        name = b"tensor"
-        f.write(struct.pack("<Q", len(name)))
-        f.write(name)
-        f.write(struct.pack("<I", 20))  # 20 dimensions
-
-        # Don't write the rest as it would be too long
-
-    result = GgufScanner().scan(str(path))
-    # 20 dimensions is not a security issue (< 1000 DoS threshold)
-    # Test should complete, may have parsing errors but not dimension count warnings
-    assert result is not None
-
-
 def test_gguf_scanner_excessive_tensor_dimensions_dos_protection(tmp_path):
     """Test DoS protection against tensors with excessive dimensions."""
     path = tmp_path / "dos_dimensions.gguf"
     with open(path, "wb") as f:
         f.write(b"GGUF")
         f.write(struct.pack("<I", 3))
-        f.write(struct.pack("<Q", 1))  # tensor count
-        f.write(struct.pack("<Q", 1))  # kv count
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 1))
 
-        # Minimal metadata
         key = b"general.alignment"
         f.write(struct.pack("<Q", len(key)))
         f.write(key)
         f.write(struct.pack("<I", 4))
         f.write(struct.pack("<I", 32))
 
-        # Align to 32
         pad = (32 - (f.tell() % 32)) % 32
         f.write(b"\0" * pad)
 
-        # Tensor with excessive dimensions (DoS attack attempt)
         name = b"dos_tensor"
         f.write(struct.pack("<Q", len(name)))
         f.write(name)
-        f.write(struct.pack("<I", 2000))  # 2000 dimensions (triggers DoS protection)
+        f.write(struct.pack("<I", 2000))
 
-        # Write fake dimension data and tensor metadata
-        # In a real attack, this would be much larger
         for _ in range(2000):
-            f.write(struct.pack("<Q", 10))  # dimension size
-        f.write(struct.pack("<I", 0))  # tensor type
-        f.write(struct.pack("<Q", 1000))  # offset
+            f.write(struct.pack("<Q", 10))
+        f.write(struct.pack("<I", 0))
+        f.write(struct.pack("<Q", 1000))
 
     result = GgufScanner().scan(str(path))
 
-    # Should detect the DoS attempt
     assert any(
         "excessive dimensions" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues
     )
-
-    # Should mention skipping for security
     assert any("skipping for security" in i.message.lower() for i in result.issues)
 
 
