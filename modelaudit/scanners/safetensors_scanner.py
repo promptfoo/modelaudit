@@ -408,7 +408,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Tensor Metadata Injection Check",
                         passed=False,
                         message=f"Tensor {tensor_name} contains unexpected metadata keys: {list(unexpected_keys)}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={
                             "tensor_name": tensor_name,

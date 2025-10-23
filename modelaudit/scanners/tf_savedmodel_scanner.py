@@ -768,7 +768,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     name="Protobuf String Length Check",
                                     passed=False,
                                     message=f"Abnormally long string in node attribute (length: {len(string_val)})",
-                                    severity=IssueSeverity.WARNING,
+                                    severity=IssueSeverity.INFO,
                                     location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
                                     details={
                                         "node_name": node.name,

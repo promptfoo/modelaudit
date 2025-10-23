@@ -210,28 +210,26 @@ class GgufScanner(BaseScanner):
             },
         )
 
-        # Security checks on header values
+        # Informational checks on header values - large counts are limited during iteration
         if n_kv > 1_000_000:
             result.add_check(
                 name="GGUF Header KV Count Validation",
                 passed=False,
-                message=f"GGUF header appears invalid (declared {n_kv} KV entries)",
-                severity=IssueSeverity.CRITICAL,
+                message=f"GGUF header declares unusually large KV count ({n_kv} entries)",
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
-                details={"kv_count": n_kv, "max_allowed": 1_000_000},
+                details={"kv_count": n_kv, "note": "Iteration limited to 10,000 for safety"},
             )
-            return
 
         if n_tensors > 100_000:
             result.add_check(
                 name="GGUF Header Tensor Count Validation",
                 passed=False,
-                message=f"GGUF header appears invalid (declared {n_tensors} tensors)",
-                severity=IssueSeverity.CRITICAL,
+                message=f"GGUF header declares unusually large tensor count ({n_tensors} tensors)",
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
-                details={"tensor_count": n_tensors, "max_allowed": 100_000},
+                details={"tensor_count": n_tensors, "note": "Iteration limited to 10,000 for safety"},
             )
-            return
 
         if file_size < 24:
             result.add_check(
@@ -367,7 +365,7 @@ class GgufScanner(BaseScanner):
                             name="Tensor Dimension Value Validation",
                             passed=False,
                             message=f"Tensor {tensor['name']} has invalid dimension: {d}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "invalid_dimension": d},
                         )
@@ -426,7 +424,7 @@ class GgufScanner(BaseScanner):
                     name="Tensor Validation Error",
                     passed=False,
                     message=f"Error validating tensor {tensor['name']}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"tensor_name": tensor["name"], "error": str(e)},
                 )

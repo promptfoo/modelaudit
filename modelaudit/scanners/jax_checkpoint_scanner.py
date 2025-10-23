@@ -324,8 +324,8 @@ class JaxCheckpointScanner(BaseScanner):
                 result.add_check(
                     name="NumPy Array Size Check",
                     passed=False,
-                    message=f"Extremely large NumPy array: {array.size:,} elements",
-                    severity=IssueSeverity.WARNING,
+                    message=f"Large NumPy array detected: {array.size:,} elements",
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"size": array.size, "shape": array.shape, "threshold": 100_000_000},
                 )
