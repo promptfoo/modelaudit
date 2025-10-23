@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13] - 2025-10-23
+
+### Added
+
+- **feat**: huggingface model whitelist (#409)
+
+### Fixed
+
+- **fix**: eliminate CVE-2025-32434 false positives for legitimate PyTorch models (#408)
+
 ## [0.2.12] - 2025-10-22
 
 ### Fixed
@@ -461,7 +471,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...HEAD
+[0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...v0.2.10
