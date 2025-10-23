@@ -96,6 +96,36 @@ npx prettier@latest --write "**/*.{md,yaml,yml,json}"  # Format markdown, YAML, 
 - Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
 - Model metadata security issues (exposed secrets, suspicious URLs, dangerous code references)
 
+### Security Check Guidelines
+
+**CRITICAL: Only implement checks that represent real, documented security threats.**
+
+**✅ ACCEPTABLE - Keep these checks:**
+
+- **CVE-documented vulnerabilities**: Any check with a specific CVE number (e.g., CVE-2025-32434 for PyTorch pickle RCE, CVE-2025-54412/54413/54886 for skops RCE)
+- **Real-world attacks**: Documented exploits that have actually compromised systems in the wild
+- **Code execution vectors**: eval, exec, os.system, subprocess, \_\_import\_\_, compile
+- **Path traversal**: ../, absolute paths to sensitive files (/etc/passwd, /proc/)
+- **Compression bombs**: Documented thresholds (compression ratio >100x is a real zip bomb)
+- **Dangerous opcodes**: Pickle REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL that enable arbitrary code execution
+- **Exposed secrets**: API keys, passwords, tokens in model metadata
+
+**❌ UNACCEPTABLE - Remove these checks:**
+
+- **Arbitrary thresholds**: "More than N items could be a DoS" without CVE backing
+- **Format validation**: Checking alignment, field counts, block sizes, version numbers
+- **"Seems suspicious" heuristics**: Large dimensions, deep nesting, long strings without exploit evidence
+- **Theoretical DoS**: "This could potentially be slow" without documented attacks
+- **Defensive programming**: "Better safe than sorry" checks that generate false positives
+
+**ℹ️ UNCERTAIN - Downgrade to INFO severity:**
+
+- Large counts/sizes that might indicate issues but have no CVE (e.g., >100k files in archive)
+- Unusual patterns that could be legitimate (e.g., unexpected metadata keys)
+- Informational warnings that don't indicate actual compromise
+
+**The Standard**: If challenged with "Show me the CVE or documented attack", you must be able to provide evidence. No evidence = remove the check.
+
 ## Exit Codes
 
 - 0: No security issues found

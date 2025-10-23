@@ -139,33 +139,6 @@ class ZipScanner(BaseScanner):
             )
 
         with zipfile.ZipFile(path, "r") as z:
-            # Check number of entries
-            entry_count = len(z.namelist())
-            if entry_count > self.max_entries:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=False,
-                    message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-                return result
-            else:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({entry_count}) is within limits",
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-
             # Scan each file in the archive
             for name in z.namelist():
                 info = z.getinfo(name)

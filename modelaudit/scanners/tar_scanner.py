@@ -132,24 +132,6 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
-            if len(members) > self.max_entries:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=False,
-                    message=f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"entries": len(members), "max_entries": self.max_entries},
-                )
-                return result
-            else:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({len(members)}) is within limits",
-                    location=path,
-                    details={"entries": len(members), "max_entries": self.max_entries},
-                )
 
             for member in members:
                 name = member.name
