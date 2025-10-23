@@ -681,12 +681,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
 
-        # Check for buffer overflow patterns
-        self._check_protobuf_buffer_overflow(saved_model, result)
-
-        # Check for large field counts (DoS via memory exhaustion)
-        self._check_protobuf_field_bomb(saved_model, result)
-
     def _check_protobuf_schema_attacks(self, saved_model: Any, result: ScanResult) -> None:
         """Check for protobuf schema validation bypass attempts"""
 
@@ -799,18 +793,4 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         },
                                     )
                                     break  # Only report first match per string to avoid spam
-
-    def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for potential buffer overflow patterns in protobuf data"""
-
-        for _meta_graph in saved_model.meta_graphs:
-            pass  # Function body was gutted when we removed the checks
-
-
-    def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf field bombs (DoS via excessive fields)"""
-
-        # Function body was gutted when we removed node/complexity count checks
-        # Keep the function for API compatibility but make it a no-op
-        pass
 
