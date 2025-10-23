@@ -176,7 +176,7 @@ class OnnxScanner(BaseScanner):
         return result
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
-        custom_domains: dict[str, int] = {}  # domain -> node count
+        custom_domains = set()
         python_ops_found = False
         safe_nodes = 0
 
@@ -184,7 +184,30 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts periodically during node processing
             self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
-                custom_domains[node.domain] = custom_domains.get(node.domain, 0) + 1
+                custom_domains.add(node.domain)
+
+                # All custom domains are INFO - they're metadata, not executable code
+                # Security risk is in runtime environment (installing malicious operators)
+                # not in the ONNX file itself
+                result.add_check(
+                    name="Custom Operator Domain Check",
+                    passed=False,
+                    message=(
+                        f"Model references custom operator domain '{node.domain}'. "
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=f"{path} (node: {node.name})",
+                    details={
+                        "op_type": node.op_type,
+                        "domain": node.domain,
+                        "security_note": (
+                            "Custom domains indicate dependencies on external operator implementations. "
+                            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+                            "operators are installed. Verify operator packages before installation."
+                        ),
+                    },
+                )
             elif "python" in node.op_type.lower():
                 python_ops_found = True
                 result.add_check(
@@ -197,29 +220,6 @@ class OnnxScanner(BaseScanner):
                 )
             else:
                 safe_nodes += 1
-
-        # Create a single INFO check per custom domain (not per node)
-        # This avoids generating 100+ INFO messages for the same domain
-        for domain, node_count in sorted(custom_domains.items()):
-            result.add_check(
-                name="Custom Operator Domain Check",
-                passed=False,
-                message=(
-                    f"Model references custom operator domain '{domain}' ({node_count} nodes). "
-                    f"This is metadata only - ensure operators are from trusted sources before installation."
-                ),
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "domain": domain,
-                    "node_count": node_count,
-                    "security_note": (
-                        "Custom domains indicate dependencies on external operator implementations. "
-                        "ONNX files cannot execute code - risk is in runtime environment if malicious "
-                        "operators are installed. Verify operator packages before installation."
-                    ),
-                },
-            )
 
         # Record successful checks for safe operators
         if safe_nodes > 0 and not custom_domains:
@@ -241,7 +241,7 @@ class OnnxScanner(BaseScanner):
             )
 
         if custom_domains:
-            result.metadata["custom_domains"] = sorted(custom_domains.keys())
+            result.metadata["custom_domains"] = sorted(custom_domains)
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
