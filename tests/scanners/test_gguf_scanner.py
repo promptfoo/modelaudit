@@ -256,8 +256,10 @@ def test_gguf_scanner_invalid_alignment(tmp_path):
         f.write(struct.pack("<I", 3))  # Unusual alignment value
 
     result = GgufScanner().scan(str(path))
-    # Alignment is format validation, not a security issue - should complete successfully
-    assert result.success or not result.success  # May fail on parsing but not on alignment check
+    # Alignment is format validation, not a security issue
+    # Scanner should complete without crashing, regardless of result
+    assert result is not None
+    assert hasattr(result, "success")
 
 
 def test_gguf_scanner_tensor_dimension_limits(tmp_path):
