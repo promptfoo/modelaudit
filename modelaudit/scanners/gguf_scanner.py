@@ -8,6 +8,29 @@ from typing import Any, BinaryIO, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+
+class GGUFSizeLimitError(ValueError):
+    """Raised when GGUF metadata contains sizes that exceed safety limits.
+
+    This is an informational error - the size is unusually large but may be legitimate.
+    Used to distinguish from critical parsing errors (corruption, malformed data).
+    """
+
+    def __init__(self, message: str, *, size_type: str, actual_size: int, limit: int) -> None:
+        """Initialize size limit error with metadata.
+
+        Args:
+            message: Human-readable error message
+            size_type: Type of size limit ("array" or "string")
+            actual_size: The size value that exceeded the limit
+            limit: The safety limit that was exceeded
+        """
+        super().__init__(message)
+        self.size_type = size_type
+        self.actual_size = actual_size
+        self.limit = limit
+
+
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
 # Values derived from ggml source
 _GGML_TYPE_INFO = {
@@ -145,10 +168,27 @@ class GgufScanner(BaseScanner):
         return result
 
     def _read_string(self, f: BinaryIO, max_length: int = 1024 * 1024) -> str:
-        """Read a string with length checking for security."""
+        """Read a string with length checking for security.
+
+        Args:
+            f: Binary file to read from
+            max_length: Maximum allowed string length (default 1MB)
+
+        Returns:
+            Decoded UTF-8 string
+
+        Raises:
+            GGUFSizeLimitError: String length exceeds safety limit
+            ValueError: Unexpected end of file or other parsing error
+        """
         (length,) = struct.unpack("<Q", f.read(8))
         if length > max_length:
-            raise ValueError(f"String length {length} exceeds maximum {max_length}")
+            raise GGUFSizeLimitError(
+                f"String length {length} exceeds maximum {max_length}",
+                size_type="string",
+                actual_size=length,
+                limit=max_length,
+            )
         data = f.read(length)
         if len(data) != length:
             raise ValueError("Unexpected end of file while reading string")
@@ -237,7 +277,22 @@ class GgufScanner(BaseScanner):
                     )
 
             result.metadata["metadata"] = metadata
+        except GGUFSizeLimitError as e:
+            result.add_check(
+                name="GGUF Metadata Parsing",
+                passed=False,
+                message=f"GGUF {e.size_type} size limit exceeded: {e}",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "size_type": e.size_type,
+                    "actual_size": e.actual_size,
+                    "limit": e.limit,
+                },
+            )
+            return
         except Exception as e:
+            # Other parsing errors are critical (corruption, malformed data, etc.)
             result.add_check(
                 name="GGUF Metadata Parsing",
                 passed=False,
@@ -492,8 +547,6 @@ class GgufScanner(BaseScanner):
         if vtype == 9:  # ARRAY
             subtype = struct.unpack("<I", f.read(4))[0]
             (count,) = struct.unpack("<Q", f.read(8))
-            if count > 10000:  # Prevent DoS
-                raise ValueError(f"Array too large: {count} elements")
             return [self._read_value(f, subtype) for _ in range(count)]
         if vtype == 10:  # UINT64
             return struct.unpack("<Q", f.read(8))[0]
