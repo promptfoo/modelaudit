@@ -3770,26 +3770,26 @@ class PickleScanner(BaseScanner):
         # High density alone is not sufficient - legitimate PyTorch models can have high REDUCE density
         has_specific_malicious_patterns = len(patterns) > 0  # Check if Patterns 1-5 found anything
 
+        # Calculate density metrics unconditionally (needed for both detection and informational messages)
+        file_size_mb = file_size / (1024 * 1024)
+        raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1) if dangerous_opcodes_count > 0 else 0
+        opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
+
+        # Dynamic thresholds based on file size:
+        # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
+        # Medium files (10MB-1GB): Moderate sensitivity - 200+ opcodes per MB
+        # Large files (>1GB): Low sensitivity - 500+ opcodes per MB (for large models like Llama)
+        if file_size_mb < 10:
+            density_threshold = 80.0
+            severity_level = "critical"
+        elif file_size_mb < 1000:  # < 1GB
+            density_threshold = 200.0
+            severity_level = "high" if opcode_density_per_mb > 300 else "medium"
+        else:  # >= 1GB (large models)
+            density_threshold = 500.0  # Much higher threshold for large models
+            severity_level = "medium" if opcode_density_per_mb > 800 else "low"
+
         if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
-            # Calculate density: opcodes per MB
-            file_size_mb = file_size / (1024 * 1024)
-            raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
-            opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
-
-            # Dynamic thresholds based on file size:
-            # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
-            # Medium files (10MB-1GB): Moderate sensitivity - 200+ opcodes per MB
-            # Large files (>1GB): Low sensitivity - 500+ opcodes per MB (for large models like Llama)
-            if file_size_mb < 10:
-                density_threshold = 80.0
-                severity_level = "critical"
-            elif file_size_mb < 1000:  # < 1GB
-                density_threshold = 200.0
-                severity_level = "high" if opcode_density_per_mb > 300 else "medium"
-            else:  # >= 1GB (large models)
-                density_threshold = 500.0  # Much higher threshold for large models
-                severity_level = "medium" if opcode_density_per_mb > 800 else "low"
-
             # Only flag if density exceeds threshold
             if opcode_density_per_mb > density_threshold:
                 confidence_score = int(min(100.0, (raw_opcode_density_per_mb / density_threshold - 1.0) * 100.0))
