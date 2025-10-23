@@ -772,4 +772,3 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         },
                                     )
                                     break  # Only report first match per string to avoid spam
-

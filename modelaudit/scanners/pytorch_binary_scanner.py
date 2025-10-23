@@ -72,7 +72,6 @@ class PyTorchBinaryScanner(BaseScanner):
         try:
             self.current_file_path = path
 
-
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
             chunk_size = 1024 * 1024  # 1MB chunks

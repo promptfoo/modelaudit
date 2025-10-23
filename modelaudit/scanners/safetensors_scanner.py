@@ -375,7 +375,6 @@ class SafeTensorsScanner(BaseScanner):
             # Analyze the metadata for injection patterns
             self._analyze_metadata_content(metadata, result, path)
 
-
         # Check tensor names for injection attempts
         tensor_names = [k for k in header if k != "__metadata__"]
         for tensor_name in tensor_names:
@@ -546,7 +545,6 @@ class SafeTensorsScanner(BaseScanner):
                         "total_matches": len(matches),
                     },
                 )
-
 
     def _is_suspicious_tensor_name(self, name: str) -> bool:
         """Check if a tensor name contains suspicious patterns"""
