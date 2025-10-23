@@ -72,25 +72,6 @@ class PyTorchBinaryScanner(BaseScanner):
         try:
             self.current_file_path = path
 
-            # Check for suspiciously small files
-            if file_size < 100:
-                result.add_check(
-                    name="File Size Validation",
-                    passed=False,
-                    message=f"Suspiciously small binary file: {file_size} bytes",
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={"file_size": file_size},
-                )
-            else:
-                result.add_check(
-                    name="File Size Validation",
-                    passed=True,
-                    message="File size is reasonable",
-                    location=path,
-                    details={"file_size": file_size},
-                )
-
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
             chunk_size = 1024 * 1024  # 1MB chunks
