@@ -26,6 +26,7 @@ def pytest_runtest_setup(item):
             "test_core.py",
             "test_cli.py",
             "test_bug1_confidence_exploit.py",  # Security bug test
+            "test_gguf_scanner.py",  # GGUF scanner tests
         ]
 
         # Check if this is an allowed test file
