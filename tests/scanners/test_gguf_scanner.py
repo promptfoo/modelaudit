@@ -365,6 +365,15 @@ def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
         offset2 = 200  # dummy offset
         f.write(struct.pack("<Q", offset2))
 
+        # Align to 32 bytes for tensor data section
+        pad2 = (32 - (f.tell() % 32)) % 32
+        f.write(b"\0" * pad2)
+
+        # Write dummy tensor data to reach the required file size
+        # Need to write at least enough to cover offset2 + some data
+        tensor_data_size = 300  # offset2 (200) + some extra
+        f.write(b"\0" * tensor_data_size)
+
     result = GgufScanner().scan(str(path))
 
     # The scan should succeed but report the invalid dimensions

@@ -288,6 +288,17 @@ class GgufScanner(BaseScanner):
         tensor_data_alignment = metadata.get("general.alignment", 32)
         pad_to_tensor_data = (tensor_data_alignment - (tensor_info_end % tensor_data_alignment)) % tensor_data_alignment
         tensor_data_start = tensor_info_end + pad_to_tensor_data
+        # Only check bounds if there are tensors (empty models don't have tensor data)
+        if n_tensors > 0 and tensor_data_start > file_size:
+            result.add_check(
+                name="Tensor Data Section Bounds",
+                passed=False,
+                message="Tensor data start exceeds file size",
+                severity=IssueSeverity.CRITICAL,
+                location=self.current_file_path,
+                details={"tensor_data_start": tensor_data_start, "file_size": file_size},
+            )
+            return
 
         # Validate tensor sizes and offsets
         for idx, tensor in enumerate(tensors):
@@ -347,6 +358,16 @@ class GgufScanner(BaseScanner):
                     # Calculate actual size: use next tensor's offset, or file size for last tensor
                     if idx + 1 < len(tensors):
                         next_offset = tensors[idx + 1]["offset"]
+                        if next_offset < tensor["offset"]:
+                            result.add_check(
+                                name="Tensor Offset Order Validation",
+                                passed=False,
+                                message=f"Non-monotonic offsets for tensor {tensor['name']}",
+                                severity=IssueSeverity.WARNING,
+                                location=self.current_file_path,
+                                details={"current_offset": tensor["offset"], "next_offset": next_offset},
+                            )
+                            continue
                         actual = next_offset - tensor["offset"]
                     else:
                         # Last tensor: calculate from absolute position to end of file
@@ -360,9 +381,14 @@ class GgufScanner(BaseScanner):
                             name="Tensor Size Consistency Check",
                             passed=False,
                             message=f"Size mismatch for tensor {tensor['name']}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "expected": expected, "actual": actual},
+                            details={
+                                "tensor_name": tensor["name"],
+                                "expected": expected,
+                                "actual": actual,
+                                "alignment_tolerance": tensor_data_alignment,
+                            },
                         )
             except (OverflowError, ValueError) as e:
                 result.add_check(
