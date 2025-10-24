@@ -472,13 +472,10 @@ class SecretsDetector:
                 if self._is_whitelisted(secret_text):
                     continue
 
-                # Skip if likely false positive
                 if self._is_likely_false_positive(secret_text, context):
                     continue
 
-                # NEW: Skip patterns that commonly produce false positives in binary model weights
-                # Password patterns, cryptocurrency addresses, and Azure secrets are often false positives
-                # when found in decoded binary data (they're just random byte sequences)
+                # Skip crypto/Azure patterns in binary model weights (random bytes match these patterns)
                 binary_false_positive_types = [
                     "Hardcoded Password",
                     "Bitcoin Address",
@@ -491,10 +488,8 @@ class SecretsDetector:
                 ):
                     continue
 
-                # Calculate confidence
                 confidence = self._calculate_confidence(secret_text, description, context)
 
-                # Skip low confidence matches if high confidence is required
                 if self.require_high_confidence and confidence < 0.6:
                     continue
 
