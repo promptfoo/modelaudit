@@ -476,9 +476,17 @@ class SecretsDetector:
                 if self._is_likely_false_positive(secret_text, context):
                     continue
 
-                # NEW: Skip password patterns in binary context (model weights)
-                # Check both the text context and if it's from a binary source
-                if description == "Hardcoded Password" and (
+                # NEW: Skip patterns that commonly produce false positives in binary model weights
+                # Password patterns, cryptocurrency addresses, and Azure secrets are often false positives
+                # when found in decoded binary data (they're just random byte sequences)
+                binary_false_positive_types = [
+                    "Hardcoded Password",
+                    "Bitcoin Address",
+                    "Ethereum Address",
+                    "Litecoin Address",
+                    "Azure Client Secret",
+                ]
+                if any(fp_type in description for fp_type in binary_false_positive_types) and (
                     is_binary_source or self._is_likely_binary_context(text, position)
                 ):
                     continue
