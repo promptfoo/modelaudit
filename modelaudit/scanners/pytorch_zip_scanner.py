@@ -772,66 +772,42 @@ class PyTorchZipScanner(BaseScanner):
         return text.strip().startswith(("1.", "2."))
 
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
-        """Check for CVE-2025-32434 vulnerability based on PyTorch version"""
+        """Check for CVE-2025-32434 vulnerability based on installed PyTorch version"""
 
-        # Get the framework version to check
-        framework_version = version_info.get("pytorch_framework_version")
-        version_source = version_info.get("pytorch_version_source", "unknown")
+        # Only check if PyTorch is actually installed
+        try:
+            import torch
 
-        if framework_version:
-            # Check if this is a vulnerable PyTorch version (≤2.5.1)
-            is_vulnerable = self._is_vulnerable_pytorch_version(framework_version)
+            installed_version = torch.__version__
+        except ImportError:
+            # PyTorch not installed, skip the check entirely
+            return
 
-            if is_vulnerable:
-                result.add_check(
-                    name="CVE-2025-32434 PyTorch Version Check",
-                    passed=False,
-                    message=(
-                        f"Model uses vulnerable PyTorch version {framework_version} susceptible to CVE-2025-32434 RCE"
-                    ),
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={
-                        "cve_id": self.CVE_2025_32434_ID,
-                        "pytorch_version": framework_version,
-                        "version_source": version_source,
-                        "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
-                        "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
-                        "recommendation": (
-                            "Update to PyTorch 2.6.0 or later, "
-                            "avoid torch.load(weights_only=True) with untrusted models"
-                        ),
-                    },
-                )
-            else:
-                result.add_check(
-                    name="CVE-2025-32434 PyTorch Version Check",
-                    passed=True,
-                    message=f"Model uses PyTorch version {framework_version} which is not affected by CVE-2025-32434",
-                    location=path,
-                    details={
-                        "pytorch_version": framework_version,
-                        "version_source": version_source,
-                        "cve_status": "not_vulnerable",
-                    },
-                )
-        else:
-            # No version detected - add informational check
+        # Check if the installed PyTorch version is vulnerable (< 2.6.0)
+        is_vulnerable = self._is_vulnerable_pytorch_version(installed_version)
+
+        if is_vulnerable:
+            # Only warn if the installed version is vulnerable
             result.add_check(
                 name="CVE-2025-32434 PyTorch Version Check",
-                passed=True,  # Pass by default if we can't determine version
-                message="Could not determine PyTorch version from model file",
-                severity=IssueSeverity.INFO,
+                passed=False,
+                message=(
+                    f"PyTorch {installed_version} is installed and vulnerable to CVE-2025-32434 RCE. "
+                    f"Upgrade to PyTorch 2.6.0 or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
-                    "version_detection": "failed",
+                    "installed_pytorch_version": installed_version,
+                    "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
+                    "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                     "recommendation": (
-                        "Verify PyTorch version manually - "
-                        "avoid torch.load(weights_only=True) with untrusted models if using PyTorch ≤2.5.1"
+                        "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
                     ),
                 },
             )
+        # If not vulnerable, don't show anything
 
     def _is_vulnerable_pytorch_version(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2025-32434 (≤2.5.1)"""

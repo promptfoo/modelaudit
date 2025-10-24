@@ -894,21 +894,21 @@ class BaseScanner(ABC):
             context: Context string for reporting
         """
         if findings:
+            # Downgrade URL detections to INFO severity since URLs in model data
+            # (vocabularies, training text) are not active security threats
             severity_map = {
-                "CRITICAL": IssueSeverity.CRITICAL,
-                "HIGH": IssueSeverity.CRITICAL,
-                "MEDIUM": IssueSeverity.WARNING,
+                "CRITICAL": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "HIGH": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "MEDIUM": IssueSeverity.INFO,  # Downgraded from WARNING
                 "LOW": IssueSeverity.INFO,
             }
 
-            # Get highest severity across all findings
+            # All URL detections now use INFO severity
             max_severity = IssueSeverity.INFO
             for finding in findings:
-                finding_severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                if (finding_severity.value == "critical" and max_severity.value != "critical") or (
-                    finding_severity.value == "warning" and max_severity.value == "info"
-                ):
-                    max_severity = finding_severity
+                finding_severity = severity_map.get(finding.get("severity", "INFO"), IssueSeverity.INFO)
+                # All findings are now INFO level
+                max_severity = finding_severity
 
             # Extract unique patterns for the message
             unique_patterns: set[str] = set()
