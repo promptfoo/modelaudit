@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.14] - 2025-10-23
+
+### Fixed
+
+- **fix**: eliminate false positives across URL detection, CVE checks, GGUF parsing, and secret detection (#412)
+- **fix**: improve shebang detection, fix fsspec usage, and resolve UnboundLocalError (#411)
+
 ## [0.2.13] - 2025-10-23
 
 ### Added
@@ -471,7 +478,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...HEAD
+[0.2.14]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...v0.2.11
