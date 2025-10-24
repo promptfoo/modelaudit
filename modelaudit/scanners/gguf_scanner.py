@@ -8,29 +8,6 @@ from typing import Any, BinaryIO, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-
-class GGUFSizeLimitError(ValueError):
-    """Raised when GGUF metadata contains sizes that exceed safety limits.
-
-    This is an informational error - the size is unusually large but may be legitimate.
-    Used to distinguish from critical parsing errors (corruption, malformed data).
-    """
-
-    def __init__(self, message: str, *, size_type: str, actual_size: int, limit: int) -> None:
-        """Initialize size limit error with metadata.
-
-        Args:
-            message: Human-readable error message
-            size_type: Type of size limit ("array" or "string")
-            actual_size: The size value that exceeded the limit
-            limit: The safety limit that was exceeded
-        """
-        super().__init__(message)
-        self.size_type = size_type
-        self.actual_size = actual_size
-        self.limit = limit
-
-
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
 # Values derived from ggml source
 _GGML_TYPE_INFO = {
@@ -178,17 +155,11 @@ class GgufScanner(BaseScanner):
             Decoded UTF-8 string
 
         Raises:
-            GGUFSizeLimitError: String length exceeds safety limit
-            ValueError: Unexpected end of file or other parsing error
+            ValueError: String length exceeds limit, unexpected EOF, or other parsing error
         """
         (length,) = struct.unpack("<Q", f.read(8))
         if length > max_length:
-            raise GGUFSizeLimitError(
-                f"String length {length} exceeds maximum {max_length}",
-                size_type="string",
-                actual_size=length,
-                limit=max_length,
-            )
+            raise ValueError(f"String length {length} exceeds maximum {max_length}")
         data = f.read(length)
         if len(data) != length:
             raise ValueError("Unexpected end of file while reading string")
@@ -254,20 +225,6 @@ class GgufScanner(BaseScanner):
                     )
 
             result.metadata["metadata"] = metadata
-        except GGUFSizeLimitError as e:
-            result.add_check(
-                name="GGUF Metadata Parsing",
-                passed=False,
-                message=f"GGUF {e.size_type} size limit exceeded: {e}",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={
-                    "size_type": e.size_type,
-                    "actual_size": e.actual_size,
-                    "limit": e.limit,
-                },
-            )
-            return
         except Exception as e:
             # Other parsing errors are critical (corruption, malformed data, etc.)
             result.add_check(
@@ -281,11 +238,21 @@ class GgufScanner(BaseScanner):
             return
 
         # Align to tensor data
-        alignment = metadata.get("general.alignment", 32)
-        current = f.tell()
-        pad = (alignment - (current % alignment)) % alignment
-        if pad:
-            f.seek(pad, os.SEEK_CUR)
+        # Note: general.alignment may be absent in files created by some tools (e.g., llama.cpp).
+        # Only apply alignment if explicitly specified in metadata.
+        metadata_end = f.tell()
+        alignment = metadata.get("general.alignment")
+
+        if alignment is not None:
+            # Accept only positive power-of-two integers
+            if isinstance(alignment, int) and alignment > 0 and (alignment & (alignment - 1)) == 0:
+                # Explicit alignment specified - apply it
+                pad = (alignment - (metadata_end % alignment)) % alignment
+                if pad:
+                    f.seek(pad, os.SEEK_CUR)
+            else:
+                # Ignore invalid alignment values
+                alignment = None
 
         # Parse tensor information
         tensors = []
@@ -308,6 +275,7 @@ class GgufScanner(BaseScanner):
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
         except Exception as e:
+            # Other parsing errors are critical (corruption, malformed data, etc.)
             result.add_check(
                 name="GGUF Tensor Parsing",
                 passed=False,
@@ -315,6 +283,25 @@ class GgufScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
+            )
+            return
+
+        # Calculate tensor data section start (offsets in tensor info are relative to this)
+        # According to GGUF spec, tensor data is aligned after tensor info section
+        tensor_info_end = f.tell()
+        # Use default 32-byte alignment if not specified (GGUF spec default)
+        tensor_data_alignment = metadata.get("general.alignment", 32)
+        pad_to_tensor_data = (tensor_data_alignment - (tensor_info_end % tensor_data_alignment)) % tensor_data_alignment
+        tensor_data_start = tensor_info_end + pad_to_tensor_data
+        # Only check bounds if there are tensors (empty models don't have tensor data)
+        if n_tensors > 0 and tensor_data_start > file_size:
+            result.add_check(
+                name="Tensor Data Section Bounds",
+                passed=False,
+                message="Tensor data start exceeds file size",
+                severity=IssueSeverity.CRITICAL,
+                location=self.current_file_path,
+                details={"tensor_data_start": tensor_data_start, "file_size": file_size},
             )
             return
 
@@ -367,21 +354,46 @@ class GgufScanner(BaseScanner):
                     )
 
                 # Validate tensor type and size
+                # Note: tensor offsets are relative to tensor_data_start, not file start
                 info = _GGML_TYPE_INFO.get(tensor["type"])
                 if info:
                     blck, ts = info
                     expected = ((nelements + blck - 1) // blck) * ts
-                    next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
-                    actual = next_offset - tensor["offset"]
 
-                    if expected != actual:
+                    # Calculate actual size: use next tensor's offset, or file size for last tensor
+                    if idx + 1 < len(tensors):
+                        next_offset = tensors[idx + 1]["offset"]
+                        if next_offset < tensor["offset"]:
+                            result.add_check(
+                                name="Tensor Offset Order Validation",
+                                passed=False,
+                                message=f"Non-monotonic offsets for tensor {tensor['name']}",
+                                severity=IssueSeverity.WARNING,
+                                location=self.current_file_path,
+                                details={"current_offset": tensor["offset"], "next_offset": next_offset},
+                            )
+                            continue
+                        actual = next_offset - tensor["offset"]
+                    else:
+                        # Last tensor: calculate from absolute position to end of file
+                        tensor_abs_start = tensor_data_start + tensor["offset"]
+                        actual = file_size - tensor_abs_start
+
+                    # Allow for alignment padding (tensors may be aligned to 32 bytes)
+                    # Only flag if difference is more than alignment padding
+                    if abs(expected - actual) > tensor_data_alignment:
                         result.add_check(
                             name="Tensor Size Consistency Check",
                             passed=False,
                             message=f"Size mismatch for tensor {tensor['name']}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "expected": expected, "actual": actual},
+                            details={
+                                "tensor_name": tensor["name"],
+                                "expected": expected,
+                                "actual": actual,
+                                "alignment_tolerance": tensor_data_alignment,
+                            },
                         )
             except (OverflowError, ValueError) as e:
                 result.add_check(
