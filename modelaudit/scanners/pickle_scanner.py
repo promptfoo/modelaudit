@@ -3770,12 +3770,18 @@ class PickleScanner(BaseScanner):
         # High density alone is not sufficient - legitimate PyTorch models can have high REDUCE density
         has_specific_malicious_patterns = len(patterns) > 0  # Check if Patterns 1-5 found anything
 
-        if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
-            # Calculate density: opcodes per MB
-            file_size_mb = file_size / (1024 * 1024)
-            raw_opcode_density_per_mb = dangerous_opcodes_count / max(file_size_mb, 0.1)  # Avoid division by zero
-            opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
+        # Calculate density metrics unconditionally (needed for both detection and informational messages)
+        file_size_mb = file_size / (1024 * 1024)
+        raw_opcode_density_per_mb = (
+            dangerous_opcodes_count / max(file_size_mb, 0.1) if dangerous_opcodes_count > 0 else 0
+        )
+        opcode_density_per_mb = round(raw_opcode_density_per_mb, 1)
 
+        # Initialize density_threshold with a default value to prevent UnboundLocalError
+        density_threshold = 0.0
+        severity_level = "low"
+
+        if torch_references > 0 and dangerous_opcodes_count > 0 and has_specific_malicious_patterns:
             # Dynamic thresholds based on file size:
             # Small files (<10MB): Very sensitive - 80+ opcodes per MB is suspicious
             # Medium files (10MB-1GB): Moderate sensitivity - 200+ opcodes per MB
