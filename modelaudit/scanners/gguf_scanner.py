@@ -244,10 +244,15 @@ class GgufScanner(BaseScanner):
         alignment = metadata.get("general.alignment")
 
         if alignment is not None:
-            # Explicit alignment specified - apply it
-            pad = (alignment - (metadata_end % alignment)) % alignment
-            if pad:
-                f.seek(pad, os.SEEK_CUR)
+            # Accept only positive power-of-two integers
+            if isinstance(alignment, int) and alignment > 0 and (alignment & (alignment - 1)) == 0:
+                # Explicit alignment specified - apply it
+                pad = (alignment - (metadata_end % alignment)) % alignment
+                if pad:
+                    f.seek(pad, os.SEEK_CUR)
+            else:
+                # Ignore invalid alignment values
+                alignment = None
 
         # Parse tensor information
         tensors = []
