@@ -42,7 +42,8 @@ def stream_analyze_file(
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for streaming analysis. Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
+            "fsspec package is required for streaming analysis. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     fs_protocol = get_fs_protocol(url)

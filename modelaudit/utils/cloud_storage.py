@@ -142,7 +142,8 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for cloud storage URL support. Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
+            "fsspec package is required for cloud storage URL support. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     fs_protocol = get_fs_protocol(url)
@@ -407,7 +408,8 @@ def download_from_cloud(
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for cloud storage URL support. Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
+            "fsspec package is required for cloud storage URL support. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     # Initialize cache
