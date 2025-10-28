@@ -367,7 +367,6 @@ pip install modelaudit[tensorflow,pytorch,h5]
 **Additional features:**
 
 ```bash
-pip install modelaudit[cloud]       # S3, GCS, Azure storage
 pip install modelaudit[coreml]      # Apple Core ML
 pip install modelaudit[flax]        # JAX/Flax models
 pip install modelaudit[mlflow]      # MLflow registry
