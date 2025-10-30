@@ -1,6 +1,7 @@
 import re
 import shutil
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import requests
@@ -77,7 +78,7 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     return dest_dir
 
 
-def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True):
+def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
 

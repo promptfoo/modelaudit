@@ -1,6 +1,7 @@
 """Utilities for handling HuggingFace model downloads."""
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -381,7 +382,9 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
         raise Exception(f"Failed to download model from {url}: {e!s}") from e
 
 
-def download_model_streaming(url: str, cache_dir: Path | None = None, show_progress: bool = True):
+def download_model_streaming(
+    url: str, cache_dir: Path | None = None, show_progress: bool = True
+) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
     This generator yields (file_path, is_last_file) tuples as each file is downloaded.

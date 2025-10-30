@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import tempfile
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -573,7 +574,7 @@ def download_from_cloud_streaming(
     max_size: int | None = None,
     show_progress: bool = True,
     selective: bool = True,
-):
+) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
 
