@@ -893,6 +893,7 @@ def scan_command(
 
                 # Check if this is a PyTorch Hub URL
                 elif is_pytorch_hub_url(path):
+                    download_spinner = None  # Initialize for error handling
                     try:
                         if final_stream_and_delete:
                             # STREAMING MODE: Download weights one-by-one, scan, delete
@@ -1014,6 +1015,7 @@ def scan_command(
                             continue
 
                     # Normal download mode
+                    download_spinner = None  # Initialize for error handling
                     try:
                         if final_stream_and_delete:
                             # STREAMING MODE: Download files one-by-one, scan, delete
