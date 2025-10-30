@@ -1,6 +1,6 @@
 # Streaming Scan-and-Delete Testing Guide
 
-This guide provides step-by-step instructions for testing the new `--stream-and-delete` feature across all supported sources.
+This guide provides step-by-step instructions for testing the new `--scan-and-delete` feature across all supported sources.
 
 ## Table of Contents
 
@@ -20,7 +20,7 @@ This guide provides step-by-step instructions for testing the new `--stream-and-
 
 ## Quick Start
 
-**What does `--stream-and-delete` do?**
+**What does `--scan-and-delete` do?**
 
 - Downloads/processes files **one at a time** instead of all at once
 - Scans each file immediately after download
@@ -31,7 +31,7 @@ This guide provides step-by-step instructions for testing the new `--stream-and-
 **Basic usage:**
 
 ```bash
-rye run modelaudit scan --stream-and-delete hf://model-name
+rye run modelaudit scan --scan-and-delete hf://model-name
 ```
 
 ---
@@ -50,7 +50,7 @@ For each test, confirm:
 
 ### Key Flags
 
-- `--stream-and-delete`: Enable streaming mode
+- `--scan-and-delete`: Enable streaming mode
 - `--format json`: Get JSON output (easier to verify `content_hash`)
 - `--verbose`: See detailed progress messages
 - `--no-cache`: Avoid caching (useful for testing)
@@ -67,7 +67,7 @@ For each test, confirm:
 
 ```bash
 # Streaming mode with JSON output
-rye run modelaudit scan --stream-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > streaming_result.json
+rye run modelaudit scan --scan-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > streaming_result.json
 
 # Verify content_hash exists
 cat streaming_result.json | jq '.content_hash'
@@ -94,7 +94,7 @@ cat streaming_result.json | jq '.bytes_scanned'
 
 ```bash
 # This tests the MODEL_EXTENSIONS fix (40 formats)
-rye run modelaudit scan --stream-and-delete --format json hf://TheBloke/Llama-2-7B-Chat-GGUF > gguf_result.json
+rye run modelaudit scan --scan-and-delete --format json hf://TheBloke/Llama-2-7B-Chat-GGUF > gguf_result.json
 
 # Verify .gguf files were downloaded (not fallback to "download everything")
 cat gguf_result.json | jq '.files_scanned'
@@ -118,7 +118,7 @@ cat gguf_result.json | jq '.content_hash'
 rye run modelaudit scan --format json --no-cache hf://ibm-granite/granite-4.0-h-1b > normal.json
 
 # Streaming mode (download one-by-one, scan, delete)
-rye run modelaudit scan --stream-and-delete --format json --no-cache hf://ibm-granite/granite-4.0-h-1b > streaming.json
+rye run modelaudit scan --scan-and-delete --format json --no-cache hf://ibm-granite/granite-4.0-h-1b > streaming.json
 
 # Compare security findings (should be identical)
 diff <(jq '.issues' normal.json) <(jq '.issues' streaming.json)
@@ -165,7 +165,7 @@ ls -lh
 
 ```bash
 # Run streaming scan (WILL DELETE FILES!)
-rye run modelaudit scan --stream-and-delete --format json /tmp/test_streaming_models > local_streaming.json
+rye run modelaudit scan --scan-and-delete --format json /tmp/test_streaming_models > local_streaming.json
 
 # Verify content_hash
 cat local_streaming.json | jq '{files_scanned, bytes_scanned, content_hash}'
@@ -214,7 +214,7 @@ ls -la /tmp/test_streaming_models/
 S3_URL="s3://your-bucket/path/to/models/"
 
 # Streaming mode
-rye run modelaudit scan --stream-and-delete --format json "$S3_URL" > s3_streaming.json
+rye run modelaudit scan --scan-and-delete --format json "$S3_URL" > s3_streaming.json
 
 # Verify results
 cat s3_streaming.json | jq '{files_scanned, content_hash}'
@@ -227,7 +227,7 @@ cat s3_streaming.json | jq '{files_scanned, content_hash}'
 GCS_URL="gs://your-bucket/path/to/models/"
 
 # Streaming mode
-rye run modelaudit scan --stream-and-delete --format json "$GCS_URL" > gcs_streaming.json
+rye run modelaudit scan --scan-and-delete --format json "$GCS_URL" > gcs_streaming.json
 
 # Verify results
 cat gcs_streaming.json | jq '{files_scanned, content_hash}'
@@ -249,7 +249,7 @@ cat gcs_streaming.json | jq '{files_scanned, content_hash}'
 
 ```bash
 # Streaming mode
-rye run modelaudit scan --stream-and-delete --format json https://pytorch.org/hub/pytorch_vision_resnet/ > pytorch_streaming.json
+rye run modelaudit scan --scan-and-delete --format json https://pytorch.org/hub/pytorch_vision_resnet/ > pytorch_streaming.json
 
 # Check results
 cat pytorch_streaming.json | jq '{files_scanned, content_hash, has_errors}'
@@ -288,16 +288,16 @@ After running each test, verify:
 
 ```bash
 # Test determinism (same files = same hash)
-rye run modelaudit scan --stream-and-delete --format json hf://model > run1.json
-rye run modelaudit scan --stream-and-delete --format json hf://model > run2.json
+rye run modelaudit scan --scan-and-delete --format json hf://model > run1.json
+rye run modelaudit scan --scan-and-delete --format json hf://model > run2.json
 
 jq '.content_hash' run1.json
 jq '.content_hash' run2.json
 # Expected: Identical hashes
 
 # Test uniqueness (different models = different hashes)
-rye run modelaudit scan --stream-and-delete --format json hf://model-A > modelA.json
-rye run modelaudit scan --stream-and-delete --format json hf://model-B > modelB.json
+rye run modelaudit scan --scan-and-delete --format json hf://model-A > modelA.json
+rye run modelaudit scan --scan-and-delete --format json hf://model-B > modelB.json
 
 jq '.content_hash' modelA.json
 jq '.content_hash' modelB.json
@@ -327,7 +327,7 @@ rye run modelaudit scan --format json --no-cache "$MODEL" > normal.json
 
 # Streaming mode
 echo "Running streaming mode..."
-rye run modelaudit scan --stream-and-delete --format json --no-cache "$MODEL" > streaming.json
+rye run modelaudit scan --scan-and-delete --format json --no-cache "$MODEL" > streaming.json
 
 echo ""
 echo "Comparison Results:"
@@ -386,7 +386,7 @@ Content hash (streaming only): 75dd01228f75ab2ec6c0ff76693982aa54dffe684354e812a
 
 ```bash
 mkdir -p /tmp/empty_test
-rye run modelaudit scan --stream-and-delete /tmp/empty_test
+rye run modelaudit scan --scan-and-delete /tmp/empty_test
 # Expected: Warning about no model files found
 ```
 
@@ -404,7 +404,7 @@ echo "readme" > README.md
 echo "config" > config.json
 
 # Run streaming scan
-rye run modelaudit scan --stream-and-delete --format json /tmp/mixed_test > mixed.json
+rye run modelaudit scan --scan-and-delete --format json /tmp/mixed_test > mixed.json
 
 # Only .pkl should be scanned
 cat mixed.json | jq '.files_scanned'
@@ -424,7 +424,7 @@ ls -la /tmp/mixed_test/
 df -h .
 
 # Streaming mode (minimal disk usage)
-rye run modelaudit scan --stream-and-delete --format json hf://large-model > large_streaming.json
+rye run modelaudit scan --scan-and-delete --format json hf://large-model > large_streaming.json
 
 # Check disk usage during scan (in another terminal)
 watch -n 1 'df -h . && ls -lh ~/.modelaudit/cache/'
@@ -435,7 +435,7 @@ watch -n 1 'df -h . && ls -lh ~/.modelaudit/cache/'
 
 ```bash
 # Set very short timeout to test timeout handling
-rye run modelaudit scan --stream-and-delete --timeout 5 hf://large-model
+rye run modelaudit scan --scan-and-delete --timeout 5 hf://large-model
 # Expected: Times out gracefully, returns partial results
 ```
 
@@ -443,7 +443,7 @@ rye run modelaudit scan --stream-and-delete --timeout 5 hf://large-model
 
 ```bash
 # Start a scan and interrupt with Ctrl+C
-rye run modelaudit scan --stream-and-delete hf://large-model
+rye run modelaudit scan --scan-and-delete hf://large-model
 # Press Ctrl+C after a few seconds
 
 # Verify temp files are cleaned up
@@ -459,7 +459,7 @@ ls /tmp/modelaudit_*
 
 ```bash
 # Monitor memory usage during streaming scan
-/usr/bin/time -v rye run modelaudit scan --stream-and-delete hf://large-model 2>&1 | grep "Maximum resident"
+/usr/bin/time -v rye run modelaudit scan --scan-and-delete hf://large-model 2>&1 | grep "Maximum resident"
 
 # Compare with normal mode
 /usr/bin/time -v rye run modelaudit scan hf://large-model 2>&1 | grep "Maximum resident"
@@ -482,7 +482,7 @@ done &
 MONITOR_PID=$!
 
 # Run streaming scan
-rye run modelaudit scan --stream-and-delete hf://model
+rye run modelaudit scan --scan-and-delete hf://model
 
 # Stop monitoring
 kill $MONITOR_PID
@@ -497,7 +497,7 @@ kill $MONITOR_PID
 time rye run modelaudit scan --format json hf://model > normal.json
 
 # Time streaming mode
-time rye run modelaudit scan --stream-and-delete --format json hf://model > streaming.json
+time rye run modelaudit scan --scan-and-delete --format json hf://model > streaming.json
 
 # Expected: Similar times (streaming may be slightly slower due to per-file overhead)
 ```
@@ -518,7 +518,7 @@ echo "========================================"
 # Test 1: HuggingFace small model
 echo ""
 echo "Test 1: HuggingFace Streaming"
-rye run modelaudit scan --stream-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test1.json
+rye run modelaudit scan --scan-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test1.json
 HASH1=$(jq -r '.content_hash' test1.json)
 FILES1=$(jq '.files_scanned' test1.json)
 echo "  ✅ Files scanned: $FILES1"
@@ -534,7 +534,7 @@ for i in range(3):
     with open(f'/tmp/stream_test/model_{i}.pkl', 'wb') as f:
         pickle.dump({'id': i}, f)
 EOF
-rye run modelaudit scan --stream-and-delete --format json /tmp/stream_test > test2.json
+rye run modelaudit scan --scan-and-delete --format json /tmp/stream_test > test2.json
 FILES2=$(jq '.files_scanned' test2.json)
 REMAINING=$(ls -1 /tmp/stream_test/ 2>/dev/null | wc -l)
 echo "  ✅ Files scanned: $FILES2"
@@ -543,8 +543,8 @@ echo "  ✅ Files remaining: $REMAINING (expected: 0)"
 # Test 3: Content hash determinism
 echo ""
 echo "Test 3: Content Hash Determinism"
-rye run modelaudit scan --stream-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test3a.json
-rye run modelaudit scan --stream-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test3b.json
+rye run modelaudit scan --scan-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test3a.json
+rye run modelaudit scan --scan-and-delete --format json hf://ibm-granite/granite-4.0-h-1b > test3b.json
 HASH3A=$(jq -r '.content_hash' test3a.json)
 HASH3B=$(jq -r '.content_hash' test3b.json)
 if [ "$HASH3A" = "$HASH3B" ]; then
@@ -576,10 +576,10 @@ chmod +x test_streaming.sh
 
 ```bash
 # Wrong (files cached):
-rye run modelaudit scan --stream-and-delete --cache hf://model
+rye run modelaudit scan --scan-and-delete --cache hf://model
 
 # Correct (files deleted):
-rye run modelaudit scan --stream-and-delete --no-cache hf://model
+rye run modelaudit scan --scan-and-delete --no-cache hf://model
 ```
 
 ### Issue: No `content_hash` in output
@@ -591,7 +591,7 @@ rye run modelaudit scan --stream-and-delete --no-cache hf://model
 rye run modelaudit scan hf://model
 
 # Correct (has content_hash):
-rye run modelaudit scan --stream-and-delete hf://model
+rye run modelaudit scan --scan-and-delete hf://model
 ```
 
 ### Issue: "Download failed" errors
@@ -609,7 +609,7 @@ rye run modelaudit scan --stream-and-delete hf://model
 ```bash
 # Generate debug info
 rye run modelaudit scan --verbose --format json hf://model > normal.json
-rye run modelaudit scan --stream-and-delete --verbose --format json hf://model > streaming.json
+rye run modelaudit scan --scan-and-delete --verbose --format json hf://model > streaming.json
 
 # Compare
 diff <(jq '.issues' normal.json) <(jq '.issues' streaming.json)
@@ -638,13 +638,13 @@ Before approving the PR, verify:
 
 ```bash
 # Enable streaming
---stream-and-delete
+--scan-and-delete
 
 # Common combinations
---stream-and-delete --format json              # Streaming with JSON output
---stream-and-delete --format json --verbose    # Streaming with detailed logging
---stream-and-delete --no-cache                 # Streaming without caching
---stream-and-delete --timeout 1800             # Streaming with 30min timeout
+--scan-and-delete --format json              # Streaming with JSON output
+--scan-and-delete --format json --verbose    # Streaming with detailed logging
+--scan-and-delete --no-cache                 # Streaming without caching
+--scan-and-delete --timeout 1800             # Streaming with 30min timeout
 
 # Sources that support streaming
 hf://model-name                                # HuggingFace

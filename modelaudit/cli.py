@@ -460,7 +460,7 @@ def delegate_info() -> None:
     help="Force disable caching (overrides smart detection)",
 )
 @click.option(
-    "--stream-and-delete",
+    "--scan-and-delete",
     is_flag=True,
     help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
 )
@@ -478,7 +478,7 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
-    stream_and_delete: bool,
+    scan_and_delete: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -558,8 +558,8 @@ def scan_command(
         user_overrides["show_progress"] = True
     if no_cache:
         user_overrides["use_cache"] = False
-    if stream_and_delete:
-        user_overrides["stream_and_delete"] = True
+    if scan_and_delete:
+        user_overrides["scan_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
         user_overrides["strict_license"] = True
@@ -585,7 +585,7 @@ def scan_command(
     # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
-    final_stream_and_delete = config.get("stream_and_delete", False)
+    final_scan_and_delete = config.get("scan_and_delete", False)
     final_max_file_size = config.get("max_file_size", 0)
     final_max_total_size = config.get("max_total_size", 0)
     final_skip_files = config.get("skip_non_model_files", True)
@@ -800,7 +800,7 @@ def scan_command(
                             click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
 
                             # Show streaming mode notification
-                            if final_stream_and_delete:
+                            if final_scan_and_delete:
                                 click.echo(style_text("   Mode: Streaming (scan-and-delete to save disk)", fg="cyan"))
                         except Exception:
                             # Don't fail if we can't get model info
@@ -816,7 +816,7 @@ def scan_command(
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
 
                         # Choose between streaming and normal download mode
-                        if final_stream_and_delete:
+                        if final_scan_and_delete:
                             # STREAMING MODE: Download files one-by-one, scan, delete
                             from .core import scan_model_streaming
                             from .utils.sources.huggingface import download_model_streaming
@@ -885,7 +885,7 @@ def scan_command(
                             click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                             click.echo(
                                 style_text(
-                                    "💡 Tip: Use --stream-and-delete to minimize disk usage, or use "
+                                    "💡 Tip: Use --scan-and-delete to minimize disk usage, or use "
                                     "--cache-dir to specify a directory with more space",
                                     fg="cyan",
                                 ),
@@ -902,7 +902,7 @@ def scan_command(
                 elif is_pytorch_hub_url(path):
                     download_spinner = None  # Initialize for error handling
                     try:
-                        if final_stream_and_delete:
+                        if final_scan_and_delete:
                             # STREAMING MODE: Download weights one-by-one, scan, delete
                             from .core import scan_model_streaming
                             from .utils.sources.pytorch_hub import download_pytorch_hub_model_streaming
@@ -1032,7 +1032,7 @@ def scan_command(
                     # Normal download mode
                     download_spinner = None  # Initialize for error handling
                     try:
-                        if final_stream_and_delete:
+                        if final_scan_and_delete:
                             # STREAMING MODE: Download files one-by-one, scan, delete
                             from .core import scan_model_streaming
                             from .utils.sources.cloud_storage import download_from_cloud_streaming
@@ -1318,7 +1318,7 @@ def scan_command(
                         progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[possibly-unresolved-reference]
 
                     # Check if streaming mode is enabled for local files/directories
-                    if final_stream_and_delete and os.path.isdir(actual_path):
+                    if final_scan_and_delete and os.path.isdir(actual_path):
                         # STREAMING MODE for local directories: Iterate files, scan, optionally delete
                         from .core import scan_model_streaming
                         from .utils.helpers.file_iterator import iterate_files_streaming

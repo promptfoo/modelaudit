@@ -622,7 +622,7 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
-    """Test streaming scan with --stream-and-delete flag."""
+    """Test streaming scan with --scan-and-delete flag."""
     # Setup mocks
     mock_is_hf_url.return_value = True
 
@@ -647,7 +647,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
 
     runner = CliRunner()
     result = runner.invoke(
-        cli, ["scan", "--stream-and-delete", "--format", "json", "https://huggingface.co/test/streaming-model"]
+        cli, ["scan", "--scan-and-delete", "--format", "json", "https://huggingface.co/test/streaming-model"]
     )
 
     # Should succeed
@@ -694,7 +694,7 @@ def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_downlo
     mock_scan_streaming.return_value = mock_result
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream-and-delete", "hf://test/malicious-model"])
+    result = runner.invoke(cli, ["scan", "--scan-and-delete", "hf://test/malicious-model"])
 
     # Should exit with code 1 (security issues found)
     assert result.exit_code == 1
@@ -712,7 +712,7 @@ def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mo
     mock_download_streaming.side_effect = Exception("Streaming download failed")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream-and-delete", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--scan-and-delete", "https://huggingface.co/test/model"])
 
     # Should fail with error code 2
     assert result.exit_code == 2
@@ -741,7 +741,7 @@ def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_downlo
     mock_scan_streaming.return_value = mock_result
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream-and-delete", "hf://test/model"])
+    result = runner.invoke(cli, ["scan", "--scan-and-delete", "hf://test/model"])
 
     # Should exit with code 2 (scan errors)
     assert result.exit_code == 2
@@ -751,12 +751,12 @@ def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_downlo
     mock_scan_streaming.assert_called_once()
 
 
-def test_scan_stream_and_delete_help():
-    """Test that --stream-and-delete flag appears in help."""
+def test_scan_scan_and_delete_help():
+    """Test that --scan-and-delete flag appears in help."""
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "--stream-and-delete" in result.output
+    assert "--scan-and-delete" in result.output
     assert "download files one-by-one" in result.output.lower() or "stream" in result.output.lower()
 
 

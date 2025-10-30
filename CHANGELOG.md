@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **feat**: universal streaming scan-and-delete mode for all sources to minimize disk usage
-  - New `--stream-and-delete` CLI flag works with ALL sources (not just HuggingFace):
+  - New `--scan-and-delete` CLI flag works with ALL sources (not just HuggingFace):
     - HuggingFace models (`hf://` or `https://huggingface.co/`)
     - Cloud storage (S3, GCS: `s3://`, `gs://`)
     - PyTorch Hub (`https://pytorch.org/hub/`)
