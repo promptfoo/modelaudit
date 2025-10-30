@@ -28,6 +28,9 @@ def pytest_runtest_setup(item):
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_shebang_context.py",  # Shebang context verification tests
+            "test_file_hash.py",  # SHA256 hashing utility tests
+            "test_streaming_scan.py",  # Streaming scan-and-delete tests
+            "test_secure_hasher.py",  # Aggregate hash computation tests
         ]
 
         # Check if this is an allowed test file

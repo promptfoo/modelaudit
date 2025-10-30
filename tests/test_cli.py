@@ -514,7 +514,7 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
 
     # Should fail with error code 2
     assert result.exit_code == 2
-    assert "Error downloading model" in result.output
+    assert "Error processing model" in result.output or "Error downloading model" in result.output
     assert "Download failed" in result.output
 
 
@@ -616,6 +616,148 @@ def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
 
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+    """Test streaming scan with --stream-and-delete flag."""
+    # Setup mocks
+    mock_is_hf_url.return_value = True
+
+    # Create temporary files for streaming
+    test_files = []
+    for i in range(3):
+        test_file = tmp_path / f"model_shard_{i}.bin"
+        test_file.write_text(f"dummy content {i}")
+        test_files.append(test_file)
+
+    # Mock file generator
+    def file_generator():
+        for i, f in enumerate(test_files):
+            yield (f, i == len(test_files) - 1)
+
+    mock_download_streaming.return_value = file_generator()
+
+    # Mock streaming scan result with content_hash
+    mock_result = create_mock_scan_result(bytes_scanned=300, files_scanned=3, has_errors=False)
+    mock_result.content_hash = "a" * 64  # Mock SHA256 hash
+    mock_scan_streaming.return_value = mock_result
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["scan", "--stream-and-delete", "--format", "json", "https://huggingface.co/test/streaming-model"]
+    )
+
+    # Should succeed
+    assert result.exit_code == 0
+
+    # Verify streaming functions were called
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+    # Verify content_hash is in JSON output
+    try:
+        output_json = json.loads(result.output)
+        assert "content_hash" in output_json
+        assert output_json["content_hash"] == "a" * 64
+        assert output_json["files_scanned"] == 3
+    except json.JSONDecodeError:
+        pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+    """Test streaming scan with security issues detected."""
+    mock_is_hf_url.return_value = True
+
+    # Mock file generator
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_text("malicious content")
+
+    def file_generator():
+        yield (test_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+
+    # Mock scan result with issues
+    mock_result = create_mock_scan_result(
+        bytes_scanned=100,
+        files_scanned=1,
+        issues=[{"message": "Dangerous import detected", "severity": "critical", "location": "malicious.pkl"}],
+        has_errors=False,
+    )
+    mock_result.content_hash = "b" * 64
+    mock_scan_streaming.return_value = mock_result
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream-and-delete", "hf://test/malicious-model"])
+
+    # Should exit with code 1 (security issues found)
+    assert result.exit_code == 1
+
+    # Verify streaming functions were called
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mock_is_hf_url):
+    """Test handling of download failure in streaming mode."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.side_effect = Exception("Streaming download failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream-and-delete", "https://huggingface.co/test/model"])
+
+    # Should fail with error code 2
+    assert result.exit_code == 2
+    assert "Error" in result.output
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+    """Test handling of scan errors during streaming."""
+    mock_is_hf_url.return_value = True
+
+    # Mock file generator
+    test_file = tmp_path / "test.bin"
+    test_file.write_text("test content")
+
+    def file_generator():
+        yield (test_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+
+    # Mock scan result with errors
+    mock_result = create_mock_scan_result(bytes_scanned=100, files_scanned=1, has_errors=True)
+    mock_result.content_hash = "c" * 64
+    mock_scan_streaming.return_value = mock_result
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream-and-delete", "hf://test/model"])
+
+    # Should exit with code 2 (scan errors)
+    assert result.exit_code == 2
+
+    # Verify streaming functions were called
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+def test_scan_stream_and_delete_help():
+    """Test that --stream-and-delete flag appears in help."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--help"])
+    assert result.exit_code == 0
+    assert "--stream-and-delete" in result.output
+    assert "download files one-by-one" in result.output.lower() or "stream" in result.output.lower()
 
 
 @patch("modelaudit.cli.is_cloud_url")

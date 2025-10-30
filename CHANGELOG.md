@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **feat**: streaming scan-and-delete mode for HuggingFace models to minimize disk usage
+  - New `--stream-and-delete` CLI flag downloads files one-by-one, scans immediately, then deletes
+  - Computes SHA256 hash for each file and aggregate content hash for deduplication
+  - Adds `content_hash` field to scan results for identifying identical models
+  - Ideal for scanning large models in constrained disk environments
+
 ## [0.2.14] - 2025-10-23
 
 ### Fixed

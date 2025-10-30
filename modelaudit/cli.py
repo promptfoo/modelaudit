@@ -459,6 +459,11 @@ def delegate_info() -> None:
     is_flag=True,
     help="Force disable caching (overrides smart detection)",
 )
+@click.option(
+    "--stream-and-delete",
+    is_flag=True,
+    help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
+)
 def scan_command(
     paths: tuple[str, ...],
     format: str | None,
@@ -473,6 +478,7 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
+    stream_and_delete: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -552,6 +558,8 @@ def scan_command(
         user_overrides["show_progress"] = True
     if no_cache:
         user_overrides["use_cache"] = False
+    if stream_and_delete:
+        user_overrides["stream_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
         user_overrides["strict_license"] = True
@@ -577,6 +585,7 @@ def scan_command(
     # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
+    final_stream_and_delete = config.get("stream_and_delete", False)
     final_max_file_size = config.get("max_file_size", 0)
     final_max_total_size = config.get("max_total_size", 0)
     final_skip_files = config.get("skip_non_model_files", True)
@@ -789,15 +798,13 @@ def scan_command(
 
                             click.echo(f"   Model: {model_info['model_id']}")
                             click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
+
+                            # Show streaming mode notification
+                            if final_stream_and_delete:
+                                click.echo(style_text("   Mode: Streaming (scan-and-delete to save disk)", fg="cyan"))
                         except Exception:
                             # Don't fail if we can't get model info
                             pass
-
-                    # Show download progress with spinner if appropriate
-                    download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
-                        download_spinner.start()
 
                     try:
                         # Convert cache_dir string to Path if provided
@@ -808,23 +815,61 @@ def scan_command(
                             # Use default cache directory
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
 
-                        # Download with caching support and progress bar
-                        show_progress = final_format == "text" and not output and should_show_spinner()
-                        download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
-                        actual_path = str(download_path)
-                        # Only track for cleanup if not using cache
-                        temp_dir = str(download_path) if not final_cache else None
+                        # Choose between streaming and normal download mode
+                        if final_stream_and_delete:
+                            # STREAMING MODE: Download files one-by-one, scan, delete
+                            from .core import scan_model_streaming
+                            from .utils.sources.huggingface import download_model_streaming
 
-                        if download_spinner:
-                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif final_format == "text" and not output:
-                            click.echo(style_text("✅ Download complete", fg="green", bold=True))
+                            if final_format == "text" and not output:
+                                click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
+
+                            # Create file generator
+                            file_generator = download_model_streaming(
+                                path,
+                                cache_dir=hf_cache_dir,
+                                show_progress=final_progress,
+                            )
+
+                            # Scan with streaming mode
+                            streaming_result = scan_model_streaming(
+                                file_generator=file_generator,
+                                timeout=final_timeout,
+                                delete_after_scan=True,  # Always delete in streaming mode
+                            )
+
+                            # Merge streaming results into audit_result
+                            audit_result.aggregate_scan_result(streaming_result.model_dump())
+
+                            if final_format == "text" and not output:
+                                click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+
+                            # No actual_path to scan in normal flow - already done
+                            url_handled = True
+                            continue
+
+                        else:
+                            # NORMAL MODE: Download all files, then scan
+                            download_spinner = None
+                            if final_format == "text" and not output and should_show_spinner():
+                                download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
+                                download_spinner.start()
+
+                            # Download with caching support and progress bar
+                            show_progress = final_format == "text" and not output and should_show_spinner()
+                            download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
+                            actual_path = str(download_path)
+                            # Only track for cleanup if not using cache
+                            temp_dir = str(download_path) if not final_cache else None
+
+                            if download_spinner:
+                                download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                            elif final_format == "text" and not output:
+                                click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
                     except Exception as e:
-                        if download_spinner:
-                            download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
-                            click.echo(style_text("❌ Download failed", fg="red", bold=True))
+                        if final_format == "text" and not output:
+                            click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
                         error_msg = str(e)
                         # Provide more helpful message for disk space errors
@@ -833,15 +878,15 @@ def scan_command(
                             click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                             click.echo(
                                 style_text(
-                                    "💡 Tip: Free up disk space or use --cache-dir to specify a "
-                                    "directory with more space",
+                                    "💡 Tip: Use --stream-and-delete to minimize disk usage, or use "
+                                    "--cache-dir to specify a directory with more space",
                                     fg="cyan",
                                 ),
                                 err=True,
                             )
                         else:
-                            logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
-                            click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+                            logger.error(f"Failed to process model from {path}: {error_msg}", exc_info=verbose)
+                            click.echo(f"Error processing model from {path}: {error_msg}", err=True)
 
                         audit_result.has_errors = True
                         continue
