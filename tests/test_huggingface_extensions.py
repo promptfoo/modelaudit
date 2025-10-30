@@ -1,6 +1,5 @@
 """Tests for centralized MODEL_EXTENSIONS in HuggingFace downloads."""
 
-
 from modelaudit.utils.sources.huggingface import MODEL_EXTENSIONS
 
 

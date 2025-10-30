@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Lock
 from typing import IO, Any
@@ -1374,7 +1374,7 @@ def merge_scan_result(
 
 
 def scan_model_streaming(
-    file_generator,
+    file_generator: Iterator[tuple[Path, bool]],
     timeout: int = 3600,
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,

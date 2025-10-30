@@ -17,17 +17,17 @@ def temp_test_files():
     """Create temporary test files for streaming."""
     files = []
     for i in range(3):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
-            f.write(f"Test content {i}")
-            files.append(Path(f.name))
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as tmp:
+            tmp.write(f"Test content {i}")
+            files.append(Path(tmp.name))
     yield files
     # Cleanup
-    for f in files:
-        if f.exists():
-            f.unlink()
+    for file_path in files:
+        if file_path.exists():
+            file_path.unlink()
 
 
-def create_mock_scan_result(bytes_scanned: int = 1024):
+def create_mock_scan_result(bytes_scanned: int = 1024) -> ScanResult:
     """Create a mock ScanResult for testing."""
     result = ScanResult(scanner_name="test_scanner")
     result.bytes_scanned = bytes_scanned
@@ -101,14 +101,14 @@ def test_scan_model_streaming_content_hash_deterministic():
     files2 = []
 
     for _i in range(2):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write("Same content")
-            files1.append(Path(f.name))
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp.write("Same content")
+            files1.append(Path(tmp.name))
 
     for _i in range(2):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write("Same content")
-            files2.append(Path(f.name))
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp.write("Same content")
+            files2.append(Path(tmp.name))
 
     try:
 
@@ -121,7 +121,7 @@ def test_scan_model_streaming_content_hash_deterministic():
                 yield (f, i == len(files2) - 1)
 
         with patch("modelaudit.core.scan_file") as mock_scan:
-            mock_scan.side_effect = [create_mock_scan_result() for f in files1 + files2]
+            mock_scan.side_effect = [create_mock_scan_result() for _ in files1 + files2]
 
             result1 = scan_model_streaming(file_generator=gen1(), timeout=30, delete_after_scan=False)
             result2 = scan_model_streaming(file_generator=gen2(), timeout=30, delete_after_scan=False)
@@ -130,9 +130,9 @@ def test_scan_model_streaming_content_hash_deterministic():
             assert result1.content_hash == result2.content_hash
 
     finally:
-        for f in files1 + files2:
-            if f.exists():
-                f.unlink()
+        for file_path in files1 + files2:
+            if file_path.exists():
+                file_path.unlink()
 
 
 def test_scan_model_streaming_empty_generator():
@@ -198,17 +198,17 @@ def test_scan_model_streaming_timeout():
                 yield (f, i == len(temp_files) - 1)
 
         with patch("modelaudit.core.scan_file") as mock_scan:
-            # Make each scan take 100ms (3 files = 300ms total)
+            # Make each scan take 0.5 seconds (3 files = 1.5s total)
             def slow_scan(*args, **kwargs):
-                time.sleep(0.1)
+                time.sleep(0.5)
                 return create_mock_scan_result()
 
             mock_scan.side_effect = slow_scan
 
-            # Set timeout to 150ms (should complete 1-2 files, then timeout)
+            # Set timeout to 1 second (should complete 1-2 files, then timeout)
             result = scan_model_streaming(
                 file_generator=slow_generator(),
-                timeout=0.15,  # 150ms timeout
+                timeout=1,  # 1 second timeout
                 delete_after_scan=False,
             )
 
@@ -218,9 +218,9 @@ def test_scan_model_streaming_timeout():
             assert 1 <= result.files_scanned < 3
 
     finally:
-        for f in temp_files:
-            if f.exists():
-                f.unlink()
+        for file_path in temp_files:
+            if file_path.exists():
+                file_path.unlink()
 
 
 def test_compute_aggregate_hash_empty_list():
