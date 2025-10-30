@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **feat**: streaming scan-and-delete mode for HuggingFace models to minimize disk usage
-  - New `--stream-and-delete` CLI flag downloads files one-by-one, scans immediately, then deletes
+- **feat**: universal streaming scan-and-delete mode for all sources to minimize disk usage
+  - New `--stream-and-delete` CLI flag works with ALL sources (not just HuggingFace):
+    - HuggingFace models (`hf://` or `https://huggingface.co/`)
+    - Cloud storage (S3, GCS: `s3://`, `gs://`)
+    - PyTorch Hub (`https://pytorch.org/hub/`)
+    - Local directories
+  - Files are downloaded/scanned one-by-one, then deleted immediately
   - Computes SHA256 hash for each file and aggregate content hash for deduplication
   - Adds `content_hash` field to scan results for identifying identical models
-  - Ideal for scanning large models in constrained disk environments
+  - Ideal for CI/CD or constrained disk environments where downloading entire models (100GB+) isn't feasible
 
 ## [0.2.14] - 2025-10-23
 

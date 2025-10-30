@@ -75,3 +75,63 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
             raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
     return dest_dir
+
+
+def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True):
+    """
+    Download model weights from PyTorch Hub one at a time (streaming mode).
+
+    Yields (file_path, is_last) tuples for each downloaded weight file.
+
+    Args:
+        url: PyTorch Hub model page URL
+        show_progress: Whether to show progress messages
+
+    Yields:
+        Tuples of (file_path, is_last) for each weight file
+    """
+    if not is_pytorch_hub_url(url):
+        raise ValueError(f"Not a PyTorch Hub URL: {url}")
+
+    try:
+        page = requests.get(url, timeout=10)
+        page.raise_for_status()
+    except Exception as e:
+        raise Exception(f"Failed to fetch PyTorch Hub page {url}: {e!s}") from e
+
+    weight_urls = _extract_weight_urls(page.text)
+    if not weight_urls:
+        raise Exception(f"No model files found at {url}")
+
+    if show_progress:
+        print(f"Found {len(weight_urls)} model weight files")
+
+    # Create temp directory for downloads
+    temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))
+
+    try:
+        total_files = len(weight_urls)
+        for i, weight_url in enumerate(weight_urls):
+            is_last = i == total_files - 1
+            filename = weight_url.split("/")[-1]
+            dest_file = temp_dir / filename
+
+            if show_progress:
+                print(f"⬇️  Downloading {filename}")
+
+            try:
+                with requests.get(weight_url, stream=True, timeout=30) as resp:
+                    resp.raise_for_status()
+                    with open(dest_file, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+            except Exception as e:
+                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+
+            yield (dest_file, is_last)
+
+    finally:
+        # Clean up temp directory after all files are processed
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)

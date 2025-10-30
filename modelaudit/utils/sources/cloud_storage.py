@@ -563,3 +563,107 @@ def download_from_cloud(
         cache.cache_file(url, download_path)
 
     return download_path
+
+
+def download_from_cloud_streaming(
+    url: str,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
+    show_progress: bool = True,
+    selective: bool = True,
+):
+    """
+    Download files from cloud storage one at a time (streaming mode).
+
+    Yields (file_path, is_last) tuples for each downloaded file.
+    Files are downloaded to temporary locations for immediate scanning.
+
+    Args:
+        url: Cloud storage URL (s3://, gs://, etc.)
+        cache_dir: Optional cache directory (not used in streaming mode)
+        max_size: Maximum total size allowed
+        show_progress: Whether to show progress messages
+        selective: Whether to filter to only scannable files
+
+    Yields:
+        Tuples of (file_path, is_last) for each downloaded file
+    """
+    try:
+        import fsspec
+    except ImportError as e:
+        raise ImportError(
+            "fsspec package is required for cloud storage URL support. Install with 'pip install modelaudit[cloud]'"
+        ) from e
+
+    # Analyze target to get file list
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        metadata = asyncio.run(analyze_cloud_target(url))
+    else:
+        metadata = asyncio.run_coroutine_threadsafe(analyze_cloud_target(url), loop).result()
+
+    if "error" in metadata or metadata.get("type") == "unknown":
+        error_msg = metadata.get("error", "Unknown cloud target type")
+        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
+
+    # Check size limits
+    size = metadata.get("total_size", metadata.get("size", 0))
+    if max_size and size > max_size:
+        raise ValueError(f"Total size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
+
+    # Get filesystem
+    fs_protocol = get_fs_protocol(url)
+    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+    fs = fsspec.filesystem(fs_protocol, **fs_args)
+
+    # Get list of files to download
+    if metadata["type"] == "directory":
+        raw_files = metadata.get("files")
+        if raw_files is None:
+            files = []
+        elif isinstance(raw_files, list):
+            files = raw_files
+        else:
+            raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
+
+        if selective:
+            files = filter_scannable_files(files)
+            if show_progress and files:
+                click.echo(f"Found {len(files)} scannable files to stream")
+
+        if not files:
+            raise ValueError("No scannable model files found")
+    else:
+        # Single file
+        files = [{"path": url, "name": Path(url).name, "size": metadata.get("size", 0)}]
+
+    # Create temp directory for downloads
+    temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
+
+    try:
+        # Download files one at a time
+        total_files = len(files)
+        for i, file_info in enumerate(files):
+            file_url = file_info["path"]
+            file_name = file_info["name"]
+            is_last = i == total_files - 1
+
+            # Download to temp location
+            local_path = temp_dir / f"file_{i}_{file_name}"
+
+            if show_progress:
+                click.echo(f"⬇️  Downloading {file_name} ({file_info.get('human_size', 'unknown size')})")
+
+            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            def download_file():
+                fs.get(file_url, str(local_path))
+
+            download_file()
+
+            yield (local_path, is_last)
+
+    finally:
+        # Clean up temp directory after all files are processed
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)

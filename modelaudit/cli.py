@@ -893,25 +893,57 @@ def scan_command(
 
                 # Check if this is a PyTorch Hub URL
                 elif is_pytorch_hub_url(path):
-                    download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
-                        download_spinner.start()
-                    elif final_format == "text" and not output:
-                        click.echo(f"Downloading from {path}...")
-
                     try:
-                        download_path = download_pytorch_hub_model(
-                            path,
-                            cache_dir=Path(final_cache_dir) if final_cache_dir else None,
-                        )
-                        actual_path = str(download_path)
-                        temp_dir = str(download_path)
+                        if final_stream_and_delete:
+                            # STREAMING MODE: Download weights one-by-one, scan, delete
+                            from .core import scan_model_streaming
+                            from .utils.sources.pytorch_hub import download_pytorch_hub_model_streaming
 
-                        if download_spinner:
-                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif final_format == "text" and not output:
-                            click.echo("Downloaded successfully")
+                            if final_format == "text" and not output:
+                                click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
+
+                            # Create file generator
+                            file_generator = download_pytorch_hub_model_streaming(
+                                path,
+                                show_progress=final_progress,
+                            )
+
+                            # Scan with streaming mode
+                            streaming_result = scan_model_streaming(
+                                file_generator=file_generator,
+                                timeout=final_timeout,
+                                delete_after_scan=True,
+                            )
+
+                            # Merge streaming results
+                            audit_result.aggregate_scan_result(streaming_result.model_dump())
+
+                            if final_format == "text" and not output:
+                                click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+
+                            url_handled = True
+                            continue
+
+                        else:
+                            # NORMAL MODE: Download all weights, then scan
+                            download_spinner = None
+                            if final_format == "text" and not output and should_show_spinner():
+                                download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                                download_spinner.start()
+                            elif final_format == "text" and not output:
+                                click.echo(f"Downloading from {path}...")
+
+                            download_path = download_pytorch_hub_model(
+                                path,
+                                cache_dir=Path(final_cache_dir) if final_cache_dir else None,
+                            )
+                            actual_path = str(download_path)
+                            temp_dir = str(download_path)
+
+                            if download_spinner:
+                                download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                            elif final_format == "text" and not output:
+                                click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
@@ -982,33 +1014,69 @@ def scan_command(
                             continue
 
                     # Normal download mode
-                    download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
-                        download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
-                        download_spinner.start()
-                    elif final_format == "text" and not output:
-                        click.echo(f"Downloading from {path}...")
-
                     try:
-                        # Convert cache_dir string to Path if provided
-                        cache_path = Path(final_cache_dir) if final_cache_dir else None
+                        if final_stream_and_delete:
+                            # STREAMING MODE: Download files one-by-one, scan, delete
+                            from .core import scan_model_streaming
+                            from .utils.sources.cloud_storage import download_from_cloud_streaming
 
-                        download_path = download_from_cloud(
-                            path,
-                            cache_dir=cache_path,
-                            max_size=max_download_bytes,
-                            use_cache=final_cache,
-                            show_progress=verbose,
-                            selective=final_selective,
-                            stream_analyze=final_stream,
-                        )
-                        actual_path = str(download_path)
-                        temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
+                            if final_format == "text" and not output:
+                                click.echo(style_text("🔄 Starting streaming scan from cloud storage...", fg="cyan"))
 
-                        if download_spinner:
-                            download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif final_format == "text" and not output:
-                            click.echo("Downloaded successfully")
+                            # Create file generator
+                            cache_path = Path(final_cache_dir) if final_cache_dir else None
+                            file_generator = download_from_cloud_streaming(
+                                path,
+                                cache_dir=cache_path,
+                                max_size=max_download_bytes,
+                                show_progress=final_progress,
+                                selective=final_selective,
+                            )
+
+                            # Scan with streaming mode
+                            streaming_result = scan_model_streaming(
+                                file_generator=file_generator,
+                                timeout=final_timeout,
+                                delete_after_scan=True,
+                            )
+
+                            # Merge streaming results
+                            audit_result.aggregate_scan_result(streaming_result.model_dump())
+
+                            if final_format == "text" and not output:
+                                click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+
+                            url_handled = True
+                            continue
+
+                        else:
+                            # NORMAL MODE: Download all files, then scan
+                            download_spinner = None
+                            if final_format == "text" and not output and should_show_spinner():
+                                download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                                download_spinner.start()
+                            elif final_format == "text" and not output:
+                                click.echo(f"Downloading from {path}...")
+
+                            # Convert cache_dir string to Path if provided
+                            cache_path = Path(final_cache_dir) if final_cache_dir else None
+
+                            download_path = download_from_cloud(
+                                path,
+                                cache_dir=cache_path,
+                                max_size=max_download_bytes,
+                                use_cache=final_cache,
+                                show_progress=verbose,
+                                selective=final_selective,
+                                stream_analyze=final_stream,
+                            )
+                            actual_path = str(download_path)
+                            temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
+
+                            if download_spinner:
+                                download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
+                            elif final_format == "text" and not output:
+                                click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
@@ -1224,7 +1292,43 @@ def scan_command(
 
                         progress_callback = create_enhanced_progress_callback(progress_tracker, total_bytes, spinner)  # type: ignore[possibly-unresolved-reference]
 
-                    # Run the scan with progress reporting
+                    # Check if streaming mode is enabled for local files/directories
+                    if final_stream_and_delete and os.path.isdir(actual_path):
+                        # STREAMING MODE for local directories: Iterate files, scan, optionally delete
+                        from .core import scan_model_streaming
+                        from .utils.helpers.file_iterator import iterate_files_streaming
+
+                        if spinner:
+                            spinner.text = "Starting streaming scan of directory..."
+                        elif final_format == "text" and not output:
+                            click.echo(style_text("🔄 Starting streaming scan of directory...", fg="cyan"))
+
+                        # Create file iterator
+                        file_generator = iterate_files_streaming(actual_path)
+
+                        # Scan with streaming mode
+                        streaming_result = scan_model_streaming(
+                            file_generator=file_generator,
+                            timeout=final_timeout,
+                            delete_after_scan=True,  # Delete files after scanning in streaming mode
+                            progress_callback=progress_callback,
+                        )
+
+                        # Merge streaming results
+                        audit_result.aggregate_scan_result(streaming_result.model_dump())
+
+                        if spinner:
+                            spinner.ok(style_text("✅ Streaming scan complete", fg="green", bold=True))
+                        elif final_format == "text" and not output:
+                            click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+
+                        # Track the scanned path for SBOM
+                        scanned_paths.append(actual_path)
+
+                        # Skip normal scanning flow - continue to next path
+                        continue
+
+                    # Run the scan with progress reporting (NORMAL MODE)
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
                         "progress_update_interval": 2.0,  # Smart default
