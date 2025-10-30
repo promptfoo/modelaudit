@@ -831,11 +831,18 @@ def scan_command(
                                 show_progress=final_progress,
                             )
 
-                            # Scan with streaming mode
+                            # Scan with streaming mode - propagate all config
                             streaming_result = scan_model_streaming(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
                                 delete_after_scan=True,  # Always delete in streaming mode
+                                blacklist_patterns=list(blacklist) if blacklist else None,
+                                max_file_size=final_max_file_size,
+                                max_total_size=final_max_total_size,
+                                strict_license=final_strict_license,
+                                skip_file_types=final_skip_files,
+                                cache_enabled=final_cache,
+                                cache_dir=final_cache_dir,
                             )
 
                             # Merge streaming results into audit_result
@@ -909,11 +916,18 @@ def scan_command(
                                 show_progress=final_progress,
                             )
 
-                            # Scan with streaming mode
+                            # Scan with streaming mode - propagate all config
                             streaming_result = scan_model_streaming(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
                                 delete_after_scan=True,
+                                blacklist_patterns=list(blacklist) if blacklist else None,
+                                max_file_size=final_max_file_size,
+                                max_total_size=final_max_total_size,
+                                strict_license=final_strict_license,
+                                skip_file_types=final_skip_files,
+                                cache_enabled=final_cache,
+                                cache_dir=final_cache_dir,
                             )
 
                             # Merge streaming results
@@ -929,7 +943,8 @@ def scan_command(
                             # NORMAL MODE: Download all weights, then scan
                             download_spinner = None
                             if final_format == "text" and not output and should_show_spinner():
-                                download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                                download_spinner = yaspin(Spinners.dots, text=spinner_text)
                                 download_spinner.start()
                             elif final_format == "text" and not output:
                                 click.echo(f"Downloading from {path}...")
@@ -1035,11 +1050,18 @@ def scan_command(
                                 selective=final_selective,
                             )
 
-                            # Scan with streaming mode
+                            # Scan with streaming mode - propagate all config
                             streaming_result = scan_model_streaming(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
                                 delete_after_scan=True,
+                                blacklist_patterns=list(blacklist) if blacklist else None,
+                                max_file_size=final_max_file_size,
+                                max_total_size=final_max_total_size,
+                                strict_license=final_strict_license,
+                                skip_file_types=final_skip_files,
+                                cache_enabled=final_cache,
+                                cache_dir=final_cache_dir,
                             )
 
                             # Merge streaming results
@@ -1055,7 +1077,8 @@ def scan_command(
                             # NORMAL MODE: Download all files, then scan
                             download_spinner = None
                             if final_format == "text" and not output and should_show_spinner():
-                                download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+                                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                                download_spinner = yaspin(Spinners.dots, text=spinner_text)
                                 download_spinner.start()
                             elif final_format == "text" and not output:
                                 click.echo(f"Downloading from {path}...")
@@ -1308,12 +1331,19 @@ def scan_command(
                         # Create file iterator
                         file_generator = iterate_files_streaming(actual_path)
 
-                        # Scan with streaming mode
+                        # Scan with streaming mode - propagate all config
                         streaming_result = scan_model_streaming(
                             file_generator=file_generator,
                             timeout=final_timeout,
                             delete_after_scan=True,  # Delete files after scanning in streaming mode
                             progress_callback=progress_callback,
+                            blacklist_patterns=list(blacklist) if blacklist else None,
+                            max_file_size=final_max_file_size,
+                            max_total_size=final_max_total_size,
+                            strict_license=final_strict_license,
+                            skip_file_types=final_skip_files,
+                            cache_enabled=final_cache,
+                            cache_dir=final_cache_dir,
                         )
 
                         # Merge streaming results

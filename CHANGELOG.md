@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Adds `content_hash` field to scan results for identifying identical models
   - Ideal for CI/CD or constrained disk environments where downloading entire models (100GB+) isn't feasible
 
+### Changed
+
+- **chore**: move cloud storage dependencies (fsspec, s3fs, gcsfs) to default install - S3, GCS, and cloud storage now work without [cloud] extra
+
 ### Fixed
 
 - **fix**: centralize MODEL_EXTENSIONS to ensure all scannable formats are downloaded from HuggingFace
