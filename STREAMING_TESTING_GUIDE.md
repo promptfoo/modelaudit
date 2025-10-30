@@ -3,6 +3,7 @@
 This guide provides step-by-step instructions for testing the new `--stream-and-delete` feature across all supported sources.
 
 ## Table of Contents
+
 - [Quick Start](#quick-start)
 - [Feature Overview](#feature-overview)
 - [Testing by Source](#testing-by-source)
@@ -20,6 +21,7 @@ This guide provides step-by-step instructions for testing the new `--stream-and-
 ## Quick Start
 
 **What does `--stream-and-delete` do?**
+
 - Downloads/processes files **one at a time** instead of all at once
 - Scans each file immediately after download
 - **Deletes** each file after scanning to free disk space
@@ -27,6 +29,7 @@ This guide provides step-by-step instructions for testing the new `--stream-and-
 - Ideal for large models (100GB+) on disk-constrained systems
 
 **Basic usage:**
+
 ```bash
 rye run modelaudit scan --stream-and-delete hf://model-name
 ```
@@ -36,7 +39,9 @@ rye run modelaudit scan --stream-and-delete hf://model-name
 ## Feature Overview
 
 ### What to Verify
+
 For each test, confirm:
+
 1. ✅ Files are downloaded/processed one at a time
 2. ✅ Scan completes successfully
 3. ✅ `content_hash` field appears in JSON output
@@ -44,6 +49,7 @@ For each test, confirm:
 5. ✅ Results match non-streaming mode (same security findings)
 
 ### Key Flags
+
 - `--stream-and-delete`: Enable streaming mode
 - `--format json`: Get JSON output (easier to verify `content_hash`)
 - `--verbose`: See detailed progress messages
@@ -56,6 +62,7 @@ For each test, confirm:
 ### 1. HuggingFace Models
 
 #### Test 1.1: Small Model (Quick Test)
+
 **Model:** `ibm-granite/granite-4.0-h-1b` (2.7 GB)
 
 ```bash
@@ -76,11 +83,13 @@ cat streaming_result.json | jq '.bytes_scanned'
 ```
 
 **What to look for:**
+
 - ✅ Progress messages showing download → scan → delete cycle
 - ✅ `content_hash` field in output
 - ✅ No files left in cache after completion
 
 #### Test 1.2: GGUF Model (Extension Fix Verification)
+
 **Model:** `TheBloke/Llama-2-7B-Chat-GGUF` (GGUF format)
 
 ```bash
@@ -97,11 +106,13 @@ cat gguf_result.json | jq '.content_hash'
 ```
 
 **What to look for:**
+
 - ✅ Only `.gguf` files downloaded (selective, not "download everything")
 - ✅ No `.md`, `.txt`, `LICENSE` files downloaded
 - ✅ Multiple GGUF variants scanned
 
 #### Test 1.3: Compare Streaming vs Normal Mode
+
 ```bash
 # Normal mode (download all, then scan)
 rye run modelaudit scan --format json --no-cache hf://ibm-granite/granite-4.0-h-1b > normal.json
@@ -127,6 +138,7 @@ jq '.content_hash' streaming.json   # Expected: 64-char hex string
 ### 2. Local Directories
 
 #### Test 2.1: Create Test Directory
+
 ```bash
 # Create test models directory
 mkdir -p /tmp/test_streaming_models
@@ -150,6 +162,7 @@ ls -lh
 ```
 
 #### Test 2.2: Streaming Scan with Deletion
+
 ```bash
 # Run streaming scan (WILL DELETE FILES!)
 rye run modelaudit scan --stream-and-delete --format json /tmp/test_streaming_models > local_streaming.json
@@ -165,6 +178,7 @@ ls -la /tmp/test_streaming_models/
 **⚠️ WARNING:** Files are permanently deleted! Don't use on important data.
 
 #### Test 2.3: Normal Mode (No Deletion)
+
 ```bash
 # Recreate test files
 cd /tmp/test_streaming_models
@@ -188,11 +202,13 @@ ls -la /tmp/test_streaming_models/
 ### 3. Cloud Storage (S3/GCS)
 
 **Prerequisites:**
+
 - AWS credentials configured (for S3)
 - GCP credentials configured (for GCS)
 - Test bucket with model files
 
 #### Test 3.1: S3 Streaming
+
 ```bash
 # Replace with your S3 bucket
 S3_URL="s3://your-bucket/path/to/models/"
@@ -205,6 +221,7 @@ cat s3_streaming.json | jq '{files_scanned, content_hash}'
 ```
 
 #### Test 3.2: GCS Streaming
+
 ```bash
 # Replace with your GCS bucket
 GCS_URL="gs://your-bucket/path/to/models/"
@@ -217,6 +234,7 @@ cat gcs_streaming.json | jq '{files_scanned, content_hash}'
 ```
 
 **What to look for:**
+
 - ✅ Files downloaded one at a time (check verbose output)
 - ✅ Temporary files cleaned up after scanning
 - ✅ `content_hash` in results
@@ -228,6 +246,7 @@ cat gcs_streaming.json | jq '{files_scanned, content_hash}'
 **Note:** PyTorch Hub may have issues with some models (known pre-existing limitation).
 
 #### Test 4.1: ResNet Model
+
 ```bash
 # Streaming mode
 rye run modelaudit scan --stream-and-delete --format json https://pytorch.org/hub/pytorch_vision_resnet/ > pytorch_streaming.json
@@ -245,6 +264,7 @@ cat pytorch_streaming.json | jq '{files_scanned, content_hash, has_errors}'
 After running each test, verify:
 
 ### ✅ Basic Functionality
+
 - [ ] Command completes without errors
 - [ ] Exit code is 0 (for clean scans) or 1 (if issues found)
 - [ ] JSON output is valid
@@ -252,17 +272,20 @@ After running each test, verify:
 - [ ] `bytes_scanned > 0`
 
 ### ✅ Streaming-Specific Features
+
 - [ ] `content_hash` field exists in output
 - [ ] `content_hash` is 64-character hex string
 - [ ] Files are deleted after scanning (directory empty for local, temp files cleaned for remote)
 - [ ] Memory usage stays low (not loading entire model into memory)
 
 ### ✅ Security Scanning
+
 - [ ] Security checks are performed (check `total_checks > 0`)
 - [ ] Issues are detected (if applicable)
 - [ ] Results match non-streaming mode
 
 ### ✅ Content Hash Properties
+
 ```bash
 # Test determinism (same files = same hash)
 rye run modelaudit scan --stream-and-delete --format json hf://model > run1.json
@@ -338,6 +361,7 @@ fi
 ```
 
 **Expected output:**
+
 ```
 Testing: hf://ibm-granite/granite-4.0-h-1b
 ========================
@@ -359,6 +383,7 @@ Content hash (streaming only): 75dd01228f75ab2ec6c0ff76693982aa54dffe684354e812a
 ## Edge Cases
 
 ### Test: Empty Directory
+
 ```bash
 mkdir -p /tmp/empty_test
 rye run modelaudit scan --stream-and-delete /tmp/empty_test
@@ -366,6 +391,7 @@ rye run modelaudit scan --stream-and-delete /tmp/empty_test
 ```
 
 ### Test: Mixed File Types
+
 ```bash
 mkdir -p /tmp/mixed_test
 cd /tmp/mixed_test
@@ -390,6 +416,7 @@ ls -la /tmp/mixed_test/
 ```
 
 ### Test: Large Model (Disk Space Savings)
+
 ```bash
 # For a very large model, compare disk usage
 
@@ -405,6 +432,7 @@ watch -n 1 'df -h . && ls -lh ~/.modelaudit/cache/'
 ```
 
 ### Test: Timeout Behavior
+
 ```bash
 # Set very short timeout to test timeout handling
 rye run modelaudit scan --stream-and-delete --timeout 5 hf://large-model
@@ -412,6 +440,7 @@ rye run modelaudit scan --stream-and-delete --timeout 5 hf://large-model
 ```
 
 ### Test: Interrupted Scan
+
 ```bash
 # Start a scan and interrupt with Ctrl+C
 rye run modelaudit scan --stream-and-delete hf://large-model
@@ -427,6 +456,7 @@ ls /tmp/modelaudit_*
 ## Performance Testing
 
 ### Test: Memory Usage
+
 ```bash
 # Monitor memory usage during streaming scan
 /usr/bin/time -v rye run modelaudit scan --stream-and-delete hf://large-model 2>&1 | grep "Maximum resident"
@@ -438,6 +468,7 @@ ls /tmp/modelaudit_*
 ```
 
 ### Test: Disk Usage Over Time
+
 ```bash
 #!/bin/bash
 # monitor_disk.sh
@@ -460,6 +491,7 @@ kill $MONITOR_PID
 ```
 
 ### Test: Speed Comparison
+
 ```bash
 # Time normal mode
 time rye run modelaudit scan --format json hf://model > normal.json
@@ -528,6 +560,7 @@ echo "✅ All tests passed!"
 ```
 
 Run with:
+
 ```bash
 chmod +x test_streaming.sh
 ./test_streaming.sh
@@ -538,7 +571,9 @@ chmod +x test_streaming.sh
 ## Troubleshooting
 
 ### Issue: Files not being deleted
+
 **Check:** Are you using `--cache`? Cached files are preserved.
+
 ```bash
 # Wrong (files cached):
 rye run modelaudit scan --stream-and-delete --cache hf://model
@@ -548,7 +583,9 @@ rye run modelaudit scan --stream-and-delete --no-cache hf://model
 ```
 
 ### Issue: No `content_hash` in output
+
 **Check:** Streaming mode enabled?
+
 ```bash
 # Wrong (no content_hash):
 rye run modelaudit scan hf://model
@@ -558,13 +595,17 @@ rye run modelaudit scan --stream-and-delete hf://model
 ```
 
 ### Issue: "Download failed" errors
+
 **Check:**
+
 - Network connectivity
 - Authentication (for private models)
 - Model exists and is accessible
 
 ### Issue: Different results between streaming and normal
+
 **This is unexpected!** Please report with:
+
 ```bash
 # Generate debug info
 rye run modelaudit scan --verbose --format json hf://model > normal.json

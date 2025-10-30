@@ -658,8 +658,8 @@ def download_from_cloud_streaming(
                 click.echo(f"⬇️  Downloading {file_name} ({file_info.get('human_size', 'unknown size')})")
 
             @retry_with_backoff(max_retries=3, verbose=show_progress)
-            def download_file():
-                fs.get(file_url, str(local_path))
+            def download_file(url=file_url, path=local_path):
+                fs.get(url, str(path))
 
             download_file()
 

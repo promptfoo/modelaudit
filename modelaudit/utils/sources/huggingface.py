@@ -11,46 +11,46 @@ from ..helpers.disk_space import check_disk_space
 # This list is derived from all registered scanners in modelaudit
 # Excludes: archives (.zip, .tar), configs (.json, .yaml), docs (.md, .txt)
 MODEL_EXTENSIONS = {
-    ".bin",           # Generic binary model files
-    ".bst",           # Boost model files
-    ".checkpoint",    # Checkpoint files
-    ".ckpt",          # Checkpoint files (short form)
-    ".dill",          # Dill serialization
-    ".engine",        # TensorRT engine files
-    ".flax",          # Flax model files
-    ".ggjt",          # GGML variant
-    ".ggla",          # GGML variant
-    ".ggmf",          # GGML variant
-    ".ggml",          # GGML model format
-    ".ggsa",          # GGML variant
-    ".gguf",          # GGUF model format (llama.cpp)
-    ".h5",            # HDF5/Keras
-    ".hdf5",          # HDF5 format
-    ".jax",           # JAX model files
-    ".joblib",        # Joblib serialization
-    ".keras",         # Keras model format
-    ".model",         # Generic model extension
-    ".msgpack",       # MessagePack serialization
-    ".npy",           # NumPy array
-    ".npz",           # NumPy compressed array
-    ".onnx",          # ONNX model format
-    ".orbax",         # Orbax checkpoint
+    ".bin",  # Generic binary model files
+    ".bst",  # Boost model files
+    ".checkpoint",  # Checkpoint files
+    ".ckpt",  # Checkpoint files (short form)
+    ".dill",  # Dill serialization
+    ".engine",  # TensorRT engine files
+    ".flax",  # Flax model files
+    ".ggjt",  # GGML variant
+    ".ggla",  # GGML variant
+    ".ggmf",  # GGML variant
+    ".ggml",  # GGML model format
+    ".ggsa",  # GGML variant
+    ".gguf",  # GGUF model format (llama.cpp)
+    ".h5",  # HDF5/Keras
+    ".hdf5",  # HDF5 format
+    ".jax",  # JAX model files
+    ".joblib",  # Joblib serialization
+    ".keras",  # Keras model format
+    ".model",  # Generic model extension
+    ".msgpack",  # MessagePack serialization
+    ".npy",  # NumPy array
+    ".npz",  # NumPy compressed array
+    ".onnx",  # ONNX model format
+    ".orbax",  # Orbax checkpoint
     ".orbax-checkpoint",  # Orbax checkpoint variant
-    ".pb",            # Protocol Buffer (TensorFlow)
-    ".pdiparams",     # PaddlePaddle parameters
-    ".pdmodel",       # PaddlePaddle model
-    ".pickle",        # Pickle serialization
-    ".pkl",           # Pickle (short form)
-    ".plan",          # TensorRT plan files
-    ".pmml",          # PMML model format
-    ".pt",            # PyTorch model
-    ".pte",           # PyTorch ExecuTorch
-    ".pth",           # PyTorch model (alternate)
-    ".ptl",           # PyTorch Lightning
-    ".safetensors",   # SafeTensors format
-    ".skops",         # Skops format
-    ".tflite",        # TensorFlow Lite
-    ".ubj",           # Universal Binary JSON
+    ".pb",  # Protocol Buffer (TensorFlow)
+    ".pdiparams",  # PaddlePaddle parameters
+    ".pdmodel",  # PaddlePaddle model
+    ".pickle",  # Pickle serialization
+    ".pkl",  # Pickle (short form)
+    ".plan",  # TensorRT plan files
+    ".pmml",  # PMML model format
+    ".pt",  # PyTorch model
+    ".pte",  # PyTorch ExecuTorch
+    ".pth",  # PyTorch model (alternate)
+    ".ptl",  # PyTorch Lightning
+    ".safetensors",  # SafeTensors format
+    ".skops",  # Skops format
+    ".tflite",  # TensorFlow Lite
+    ".ubj",  # Universal Binary JSON
 }
 
 

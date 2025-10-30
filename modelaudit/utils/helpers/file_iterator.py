@@ -1,15 +1,13 @@
 """File iterator utility for streaming mode across all sources."""
 
 import logging
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
 
-def iterate_files_streaming(
-    path: Path | str, pattern: str = "**/*"
-) -> Iterator[tuple[Path, bool]]:
+def iterate_files_streaming(path: Path | str, pattern: str = "**/*") -> Iterator[tuple[Path, bool]]:
     """
     Generate (file_path, is_last) tuples from a directory or single file.
 

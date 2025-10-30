@@ -4,8 +4,6 @@ import hashlib
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from modelaudit.utils.helpers.secure_hasher import (
     SecureFileHasher,
     compute_aggregate_hash,
@@ -186,9 +184,9 @@ def test_compute_aggregate_hash_with_model_scan():
 def test_compute_aggregate_hash_unicode():
     """Test that aggregate hash handles unicode correctly."""
     hashes = [
-        hashlib.sha256("file1_émoji_🎉".encode("utf-8")).hexdigest(),
-        hashlib.sha256("file2_日本語".encode("utf-8")).hexdigest(),
-        hashlib.sha256("file3_العربية".encode("utf-8")).hexdigest(),
+        hashlib.sha256("file1_émoji_🎉".encode()).hexdigest(),
+        hashlib.sha256("file2_日本語".encode()).hexdigest(),
+        hashlib.sha256("file3_العربية".encode()).hexdigest(),
     ]
 
     result = compute_aggregate_hash(hashes)

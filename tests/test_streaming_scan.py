@@ -3,14 +3,12 @@
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
 from modelaudit.core import scan_model_streaming
-from modelaudit.models import create_initial_audit_result
 from modelaudit.scanners.base import ScanResult
-from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
@@ -102,12 +100,12 @@ def test_scan_model_streaming_content_hash_deterministic():
     files1 = []
     files2 = []
 
-    for i in range(2):
+    for _i in range(2):
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
             f.write("Same content")
             files1.append(Path(f.name))
 
-    for i in range(2):
+    for _i in range(2):
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
             f.write("Same content")
             files2.append(Path(f.name))
@@ -300,22 +298,24 @@ def test_scan_model_streaming_asset_creation(temp_test_files):
         for i, file_path in enumerate(temp_test_files):
             yield (file_path, i == len(temp_test_files) - 1)
 
-    with patch("modelaudit.core.scan_file") as mock_scan:
-        with patch("modelaudit.utils.helpers.assets.asset_from_scan_result") as mock_asset:
-            mock_scan.side_effect = [create_mock_scan_result() for f in temp_test_files]
+    with (
+        patch("modelaudit.core.scan_file") as mock_scan,
+        patch("modelaudit.utils.helpers.assets.asset_from_scan_result") as mock_asset,
+    ):
+        mock_scan.side_effect = [create_mock_scan_result() for f in temp_test_files]
 
-            # Mock asset creation
-            mock_asset.return_value = {
-                "path": "test",
-                "type": "test",
-                "size": 100,
-            }
+        # Mock asset creation
+        mock_asset.return_value = {
+            "path": "test",
+            "type": "test",
+            "size": 100,
+        }
 
-            result = scan_model_streaming(
-                file_generator=file_generator(),
-                timeout=30,
-                delete_after_scan=False,
-            )
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
 
-            # asset_from_scan_result should be called for each file
-            assert mock_asset.call_count == 3
+        # asset_from_scan_result should be called for each file
+        assert mock_asset.call_count == 3
