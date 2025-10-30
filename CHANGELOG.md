@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Adds `content_hash` field to scan results for identifying identical models
   - Ideal for CI/CD or constrained disk environments where downloading entire models (100GB+) isn't feasible
 
+### Fixed
+
+- **fix**: centralize MODEL_EXTENSIONS to ensure all scannable formats are downloaded from HuggingFace
+  - Created single source of truth for model extensions (40 formats including GGUF)
+  - Previously: GGUF files relied on fallback download (inefficient, downloads all files)
+  - Now: GGUF, JAX, Flax, NumPy and 26 other formats are properly detected and selectively downloaded
+  - Reduces bandwidth and disk usage by skipping documentation/config files
+
 ## [0.2.14] - 2025-10-23
 
 ### Fixed
