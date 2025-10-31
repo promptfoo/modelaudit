@@ -4,6 +4,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
+import click
 import requests
 
 from ..helpers.disk_space import check_disk_space
@@ -105,7 +106,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
         raise Exception(f"No model files found at {url}")
 
     if show_progress:
-        print(f"Found {len(weight_urls)} model weight files")
+        click.echo(f"Found {len(weight_urls)} model weight files")
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))

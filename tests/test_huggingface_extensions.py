@@ -1,6 +1,9 @@
 """Tests for centralized MODEL_EXTENSIONS in HuggingFace downloads."""
 
-from modelaudit.utils.sources.huggingface import MODEL_EXTENSIONS
+from modelaudit.utils.sources.huggingface import _get_model_extensions
+
+# Get extensions once for all tests
+MODEL_EXTENSIONS = _get_model_extensions()
 
 
 def test_model_extensions_includes_common_formats():
@@ -17,13 +20,10 @@ def test_model_extensions_includes_common_formats():
 
 
 def test_model_extensions_includes_gguf_formats():
-    """Test that GGUF and variants are included (critical for llama.cpp models)."""
+    """Test that GGUF and GGML formats are included (critical for llama.cpp models)."""
     assert ".gguf" in MODEL_EXTENSIONS
     assert ".ggml" in MODEL_EXTENSIONS
-    assert ".ggjt" in MODEL_EXTENSIONS
-    assert ".ggla" in MODEL_EXTENSIONS
-    assert ".ggmf" in MODEL_EXTENSIONS
-    assert ".ggsa" in MODEL_EXTENSIONS
+    # Note: variants like .ggjt, .ggla, .ggmf, .ggsa are not in actual scanners
 
 
 def test_model_extensions_includes_jax_flax():
@@ -60,25 +60,27 @@ def test_model_extensions_includes_framework_specific():
     assert ".dill" in MODEL_EXTENSIONS
 
 
-def test_model_extensions_excludes_config_files():
-    """Test that config/documentation files are NOT in MODEL_EXTENSIONS."""
-    # These should be excluded
-    assert ".json" not in MODEL_EXTENSIONS
-    assert ".yaml" not in MODEL_EXTENSIONS
-    assert ".yml" not in MODEL_EXTENSIONS
-    assert ".txt" not in MODEL_EXTENSIONS
-    assert ".md" not in MODEL_EXTENSIONS
-    assert ".markdown" not in MODEL_EXTENSIONS
-    assert ".rst" not in MODEL_EXTENSIONS
+def test_model_extensions_includes_config_files():
+    """Test that config/documentation files ARE in MODEL_EXTENSIONS (they have scanners)."""
+    # Manifest scanner handles these
+    assert ".json" in MODEL_EXTENSIONS
+    assert ".yaml" in MODEL_EXTENSIONS
+    assert ".yml" in MODEL_EXTENSIONS
+    # Text scanner handles these
+    assert ".txt" in MODEL_EXTENSIONS
+    assert ".md" in MODEL_EXTENSIONS
+    assert ".markdown" in MODEL_EXTENSIONS
+    assert ".rst" in MODEL_EXTENSIONS
 
 
-def test_model_extensions_excludes_archives():
-    """Test that archive formats are NOT in MODEL_EXTENSIONS."""
-    # Archives should be handled separately
-    assert ".zip" not in MODEL_EXTENSIONS
-    assert ".tar" not in MODEL_EXTENSIONS
-    assert ".tar.gz" not in MODEL_EXTENSIONS
-    assert ".tgz" not in MODEL_EXTENSIONS
+def test_model_extensions_includes_archives():
+    """Test that archive formats ARE in MODEL_EXTENSIONS (they have scanners)."""
+    # Archive scanners handle these
+    assert ".zip" in MODEL_EXTENSIONS
+    assert ".tar" in MODEL_EXTENSIONS
+    assert ".tar.gz" in MODEL_EXTENSIONS
+    assert ".tgz" in MODEL_EXTENSIONS
+    assert ".7z" in MODEL_EXTENSIONS
 
 
 def test_model_extensions_is_set():
@@ -88,8 +90,8 @@ def test_model_extensions_is_set():
 
 def test_model_extensions_not_empty():
     """Test that MODEL_EXTENSIONS has a reasonable number of formats."""
-    # Should have at least 30 formats (current implementation has 40)
-    assert len(MODEL_EXTENSIONS) >= 30
+    # Should have at least 50 formats (includes all scannable files)
+    assert len(MODEL_EXTENSIONS) >= 50
 
 
 def test_model_extensions_all_lowercase():
@@ -100,7 +102,7 @@ def test_model_extensions_all_lowercase():
 
 
 def test_gguf_repo_file_filtering():
-    """Test that GGUF-only repos are properly filtered (regression test)."""
+    """Test that GGUF repos download all scannable files."""
     # Simulate a typical GGUF model repo (like TheBloke's models)
     repo_files = [
         ".gitattributes",
@@ -118,15 +120,17 @@ def test_gguf_repo_file_filtering():
     # Filter using MODEL_EXTENSIONS
     model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
 
-    # Should find GGUF files
-    assert len(model_files) == 5
-    assert all(f.endswith(".gguf") for f in model_files)
+    # Should find GGUF files + scannable files (README.md, config.json)
+    assert len(model_files) >= 5  # At least the GGUF files
+    assert all(f.endswith(".gguf") for f in model_files if ".gguf" in f)
 
-    # Should NOT include non-model files
+    # Should include scannable files
+    assert "README.md" in model_files  # Text scanner
+    assert "config.json" in model_files  # Manifest scanner
+
+    # Should NOT include files without scanners
     assert ".gitattributes" not in model_files
-    assert "LICENSE.txt" not in model_files
-    assert "README.md" not in model_files
-    assert "config.json" not in model_files
+    assert "LICENSE.txt" in model_files  # Text scanner handles .txt
 
 
 def test_mixed_format_repo_filtering():
@@ -144,16 +148,18 @@ def test_mixed_format_repo_filtering():
 
     model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
 
-    # Should find 4 model files
-    assert len(model_files) == 4
+    # Should find 8 model files (4 weights + 4 configs/docs)
+    assert len(model_files) == 8
     assert "model.safetensors" in model_files
     assert "pytorch_model.bin" in model_files
     assert "model.onnx" in model_files
     assert "model.gguf" in model_files
 
-    # Should NOT include config/tokenizer files
-    assert "config.json" not in model_files
-    assert "tokenizer.json" not in model_files
+    # Should include config/tokenizer files (manifest scanner handles .json)
+    assert "README.md" in model_files  # Text scanner
+    assert "config.json" in model_files  # Manifest scanner
+    assert "tokenizer.json" in model_files  # Manifest scanner
+    assert "special_tokens_map.json" in model_files  # Manifest scanner
 
 
 def test_jax_flax_repo_filtering():
@@ -168,8 +174,12 @@ def test_jax_flax_repo_filtering():
 
     model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
 
-    # Should find 3 model files
-    assert len(model_files) == 3
+    # Should find 5 model files (3 weights + 2 configs/docs)
+    assert len(model_files) == 5
     assert "model.msgpack" in model_files
     assert "checkpoint.flax" in model_files
     assert "params.orbax" in model_files
+
+    # Should include config/docs (have scanners)
+    assert "README.md" in model_files  # Text scanner
+    assert "config.json" in model_files  # Manifest scanner

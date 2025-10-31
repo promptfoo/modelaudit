@@ -8,51 +8,17 @@ from urllib.parse import unquote, urlparse
 
 from ..helpers.disk_space import check_disk_space
 
-# Model file extensions that should be downloaded from HuggingFace repositories
-# This list is derived from all registered scanners in modelaudit
-# Excludes: archives (.zip, .tar), configs (.json, .yaml), docs (.md, .txt)
-MODEL_EXTENSIONS = {
-    ".bin",  # Generic binary model files
-    ".bst",  # Boost model files
-    ".checkpoint",  # Checkpoint files
-    ".ckpt",  # Checkpoint files (short form)
-    ".dill",  # Dill serialization
-    ".engine",  # TensorRT engine files
-    ".flax",  # Flax model files
-    ".ggjt",  # GGML variant
-    ".ggla",  # GGML variant
-    ".ggmf",  # GGML variant
-    ".ggml",  # GGML model format
-    ".ggsa",  # GGML variant
-    ".gguf",  # GGUF model format (llama.cpp)
-    ".h5",  # HDF5/Keras
-    ".hdf5",  # HDF5 format
-    ".jax",  # JAX model files
-    ".joblib",  # Joblib serialization
-    ".keras",  # Keras model format
-    ".model",  # Generic model extension
-    ".msgpack",  # MessagePack serialization
-    ".npy",  # NumPy array
-    ".npz",  # NumPy compressed array
-    ".onnx",  # ONNX model format
-    ".orbax",  # Orbax checkpoint
-    ".orbax-checkpoint",  # Orbax checkpoint variant
-    ".pb",  # Protocol Buffer (TensorFlow)
-    ".pdiparams",  # PaddlePaddle parameters
-    ".pdmodel",  # PaddlePaddle model
-    ".pickle",  # Pickle serialization
-    ".pkl",  # Pickle (short form)
-    ".plan",  # TensorRT plan files
-    ".pmml",  # PMML model format
-    ".pt",  # PyTorch model
-    ".pte",  # PyTorch ExecuTorch
-    ".pth",  # PyTorch model (alternate)
-    ".ptl",  # PyTorch Lightning
-    ".safetensors",  # SafeTensors format
-    ".skops",  # Skops format
-    ".tflite",  # TensorFlow Lite
-    ".ubj",  # Universal Binary JSON
-}
+
+def _get_model_extensions() -> set[str]:
+    """
+    Lazy-load model extensions to avoid circular imports.
+
+    Returns all file extensions that ModelAudit can scan - dynamically loaded from scanner registry.
+    This ensures we download and scan everything we have scanners for.
+    """
+    from ..model_extensions import get_model_extensions
+
+    return get_model_extensions()
 
 
 def is_huggingface_url(url: str) -> bool:
@@ -328,8 +294,9 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             # Any error - just download everything
             repo_files = []
 
-        # Find model files in the repository (using centralized MODEL_EXTENSIONS)
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
+        # Find model files in the repository (using centralized model extensions)
+        model_extensions = _get_model_extensions()
+        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -358,7 +325,8 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
-        found_models = any(downloaded_path.glob(f"*{ext}") for ext in MODEL_EXTENSIONS)
+        model_extensions = _get_model_extensions()
+        found_models = any(downloaded_path.glob(f"*{ext}") for ext in model_extensions)
 
         if not found_models and not any(downloaded_path.glob("config.json")):
             # If no model files and no config, warn the user
@@ -436,7 +404,8 @@ def download_model_streaming(
                 raise Exception(f"Timeout listing files in repository {repo_id}") from e
 
         # Filter for model files
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
+        model_extensions = _get_model_extensions()
+        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
 
         if not model_files:
             raise Exception(f"No model files found in repository {repo_id}")
