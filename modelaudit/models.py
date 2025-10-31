@@ -375,6 +375,9 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     has_errors: bool = Field(..., description="Whether any critical issues were found")
     scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
     file_metadata: dict[str, FileMetadataModel] = Field(default_factory=dict, description="Metadata for each file")
+    content_hash: str | None = Field(
+        default=None, description="Aggregate SHA-256 hash of all scanned files (for deduplication)"
+    )
 
     # Timing and performance
     start_time: float = Field(..., description="Scan start timestamp")
@@ -437,6 +440,10 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         for scanner in results_dict.get("scanners", []):
             if scanner and scanner not in self.scanner_names and scanner != "unknown":
                 self.scanner_names.append(scanner)
+
+        # Merge content_hash if present (for streaming mode)
+        if "content_hash" in results_dict and results_dict["content_hash"] is not None:
+            self.content_hash = results_dict["content_hash"]
 
     def aggregate_scan_result_direct(self, scan_result: Any) -> None:
         """Directly aggregate a ScanResult object into this model without dict conversion.
