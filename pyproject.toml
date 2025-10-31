@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.14"
+version = "0.4.0"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },

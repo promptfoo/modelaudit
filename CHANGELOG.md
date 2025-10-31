@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-10-31
+
 ### Added
 
 - **feat**: universal streaming scan-and-delete mode for all sources to minimize disk usage
@@ -27,10 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **fix**: centralize MODEL_EXTENSIONS to ensure all scannable formats are downloaded from HuggingFace
-  - Created single source of truth for model extensions (40 formats including GGUF)
+  - Created single source of truth for model extensions (62+ formats including GGUF)
   - Previously: GGUF files relied on fallback download (inefficient, downloads all files)
-  - Now: GGUF, JAX, Flax, NumPy and 26 other formats are properly detected and selectively downloaded
-  - Reduces bandwidth and disk usage by skipping documentation/config files
+  - Now: GGUF, JAX, Flax, NumPy and other formats are properly detected and selectively downloaded
+  - Dynamically extracts extensions from scanner registry to stay in sync
+- **fix**: restore fallback behavior in streaming downloads to maintain parity with non-streaming mode
 
 ## [0.2.14] - 2025-10-23
 
