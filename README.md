@@ -528,8 +528,31 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/       # Entire fold
 - **`--sbom`** - Generate CycloneDX SBOM
 - **`--blacklist`** - Additional patterns to flag
 - **`--no-cache`** - Disable result caching
+- **`--scan-and-delete`** - Stream scan: download files one-by-one, scan immediately, then delete to save disk space
 
 [Advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
+
+### 💾 Disk Space Optimization
+
+For large models or environments with limited disk space, use the `--scan-and-delete` flag to minimize storage usage:
+
+```bash
+# Scan large models without filling disk
+modelaudit hf://meta-llama/Llama-3.2-90B --scan-and-delete
+
+# Works with all sources
+modelaudit s3://bucket/large-model.pkl --scan-and-delete
+modelaudit gs://bucket/model/ --scan-and-delete
+modelaudit ./local-models/ --scan-and-delete
+```
+
+**How it works:**
+
+- Files are downloaded one at a time (not all at once)
+- Each file is scanned immediately after download
+- Files are deleted after scanning to free up space
+- Ideal for CI/CD pipelines or constrained environments
+- Computes SHA256 hash and aggregate content hash for deduplication
 
 ## 🛡️ Whitelist System
 

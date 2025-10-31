@@ -1,11 +1,24 @@
 """Utilities for handling HuggingFace model downloads."""
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..helpers.disk_space import check_disk_space
+
+
+def _get_model_extensions() -> set[str]:
+    """
+    Lazy-load model extensions to avoid circular imports.
+
+    Returns all file extensions that ModelAudit can scan - dynamically loaded from scanner registry.
+    This ensures we download and scan everything we have scanners for.
+    """
+    from ..model_extensions import get_model_extensions
+
+    return get_model_extensions()
 
 
 def is_huggingface_url(url: str) -> bool:
@@ -281,26 +294,9 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             # Any error - just download everything
             repo_files = []
 
-        # Define model file extensions we're interested in
-        MODEL_EXTENSIONS = {
-            ".bin",
-            ".pt",
-            ".pth",
-            ".pkl",
-            ".safetensors",
-            ".onnx",
-            ".pb",
-            ".h5",
-            ".keras",
-            ".tflite",
-            ".ckpt",
-            ".pdparams",
-            ".joblib",
-            ".dill",
-        }
-
-        # Find model files in the repository
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in MODEL_EXTENSIONS)]
+        # Find model files in the repository (using centralized model extensions)
+        model_extensions = _get_model_extensions()
+        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -329,7 +325,8 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
-        found_models = any(downloaded_path.glob(f"*{ext}") for ext in MODEL_EXTENSIONS)
+        model_extensions = _get_model_extensions()
+        found_models = any(downloaded_path.glob(f"*{ext}") for ext in model_extensions)
 
         if not found_models and not any(downloaded_path.glob("config.json")):
             # If no model files and no config, warn the user
@@ -350,6 +347,104 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             import shutil
 
             shutil.rmtree(download_path)
+        raise Exception(f"Failed to download model from {url}: {e!s}") from e
+
+
+def download_model_streaming(
+    url: str, cache_dir: Path | None = None, show_progress: bool = True
+) -> Iterator[tuple[Path, bool]]:
+    """Download a model from HuggingFace one file at a time (streaming mode).
+
+    This generator yields (file_path, is_last_file) tuples as each file is downloaded.
+    Designed for scan-and-delete workflows to minimize disk usage.
+
+    Args:
+        url: HuggingFace model URL
+        cache_dir: Optional cache directory for downloads
+        show_progress: Whether to show download progress
+
+    Yields:
+        Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
+
+    Raises:
+        ValueError: If URL is invalid
+        Exception: If download fails
+    """
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    namespace, repo_name = parse_huggingface_url(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+
+    try:
+        # List all files in the repository
+        import concurrent.futures
+        import os
+
+        from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
+        # Configure progress display
+        if not show_progress:
+            disable_progress_bars()
+        else:
+            enable_progress_bars()
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
+
+        # List files with timeout
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(list_repo_files, repo_id)
+            try:
+                repo_files = future.result(timeout=30)
+            except concurrent.futures.TimeoutError as e:
+                raise Exception(f"Timeout listing files in repository {repo_id}") from e
+
+        # Filter for model files
+        model_extensions = _get_model_extensions()
+        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+
+        if not model_files:
+            # Fallback: download all files if no recognized extensions found
+            # This maintains parity with download_model() behavior
+            model_files = repo_files
+
+        # Setup cache directory
+        download_path = None
+        if cache_dir is not None:
+            download_path = cache_dir / "huggingface" / namespace
+            if repo_name:
+                download_path = download_path / repo_name
+            download_path.mkdir(parents=True, exist_ok=True)
+
+        # Download each file one at a time
+        total_files = len(model_files)
+        for idx, filename in enumerate(model_files):
+            is_last = idx == total_files - 1
+
+            # Download single file
+            if cache_dir is not None and download_path is not None:
+                # Use specific cache dir for local placement
+                local_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    cache_dir=str(cache_dir / "huggingface"),
+                    local_dir=str(download_path),
+                    local_dir_use_symlinks=False,
+                )
+            else:
+                # Use HF default cache
+                local_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                )
+
+            yield (Path(local_path), is_last)
+
+    except Exception as e:
         raise Exception(f"Failed to download model from {url}: {e!s}") from e
 
 

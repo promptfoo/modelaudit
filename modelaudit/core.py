@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Lock
 from typing import IO, Any
@@ -1371,3 +1371,120 @@ def merge_scan_result(
     else:
         # Fallback to dict-based aggregation for backward compatibility
         results.aggregate_scan_result(scan_result)
+
+
+def scan_model_streaming(
+    file_generator: Iterator[tuple[Path, bool]],
+    timeout: int = 3600,
+    progress_callback: ProgressCallback | None = None,
+    delete_after_scan: bool = True,
+    **kwargs: Any,
+) -> ModelAuditResultModel:
+    """
+    Scan model files from a generator in streaming mode.
+
+    Downloads files one at a time, scans immediately, computes hash, and optionally
+    deletes to minimize disk usage. Computes aggregate content hash at the end.
+
+    Args:
+        file_generator: Generator yielding (file_path, is_last) tuples
+        timeout: Scan timeout in seconds
+        progress_callback: Optional callback for progress reporting
+        delete_after_scan: Whether to delete files after scanning (default: True)
+        **kwargs: Additional arguments passed to scanners
+
+    Returns:
+        ModelAuditResultModel with scan results and content_hash field
+    """
+    from .models import convert_assets_to_models
+    from .utils.helpers.assets import asset_from_scan_result
+    from .utils.helpers.file_hash import compute_sha256_hash
+    from .utils.helpers.secure_hasher import compute_aggregate_hash
+
+    start_time = time.time()
+    results = create_initial_audit_result()
+    file_hashes: list[str] = []
+    files_processed = 0
+
+    try:
+        for file_path, _is_last in file_generator:
+            # Check for interruption
+            check_interrupted()
+
+            # Check timeout
+            if time.time() - start_time > timeout:
+                results.has_errors = True
+                logger.error(f"Streaming scan timeout after {timeout}s")
+                break
+
+            try:
+                # Compute file hash
+                if progress_callback:
+                    progress_callback(f"Hashing {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+
+                file_hash = compute_sha256_hash(file_path)
+                file_hashes.append(file_hash)
+
+                # Scan the file
+                if progress_callback:
+                    progress_callback(f"Scanning {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+
+                # Build config dict for scan_file
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **kwargs,
+                }
+
+                scan_result = scan_file(
+                    str(file_path),
+                    config=scan_config,
+                )
+
+                # Merge results
+                if scan_result:
+                    # Use dict-based aggregation to avoid import issues
+                    scan_result_dict = {
+                        "bytes_scanned": scan_result.bytes_scanned,
+                        "files_scanned": 1,  # Each scan_result represents one file
+                        "has_errors": scan_result.has_errors,
+                        "success": scan_result.success,
+                        "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
+                        "checks": [check.__dict__ for check in (scan_result.checks or [])],
+                        "scanners": [scan_result.scanner_name] if scan_result.scanner_name else [],
+                    }
+                    results.aggregate_scan_result(scan_result_dict)
+
+                    # Add asset
+                    asset = asset_from_scan_result(str(file_path), scan_result)
+                    if asset:
+                        results.assets.extend(convert_assets_to_models([asset]))
+
+                files_processed += 1
+
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+                results.has_errors = True
+
+            finally:
+                # Delete file after scanning if requested
+                if delete_after_scan and file_path.exists():
+                    try:
+                        file_path.unlink()
+                        logger.debug(f"Deleted {file_path} after scanning")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {e}")
+
+        # Compute aggregate hash from all file hashes
+        if file_hashes:
+            results.content_hash = compute_aggregate_hash(file_hashes)
+            logger.info(f"Computed aggregate content hash: {results.content_hash}")
+
+        # Finalize statistics
+        results.finalize_statistics()
+
+    except Exception as e:
+        logger.error(f"Streaming scan failed: {e}")
+        results.has_errors = True
+        raise
+
+    return results
