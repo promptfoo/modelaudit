@@ -408,7 +408,9 @@ def download_model_streaming(
         model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
 
         if not model_files:
-            raise Exception(f"No model files found in repository {repo_id}")
+            # Fallback: download all files if no recognized extensions found
+            # This maintains parity with download_model() behavior
+            model_files = repo_files
 
         # Setup cache directory
         download_path = None
