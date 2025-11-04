@@ -505,6 +505,8 @@ def scan_model_directory_or_file(
         "success": True,
         "scanners": [],  # Track the scanners used (different from scanner_names)
     }
+    # Track file hashes for aggregate hash computation
+    file_hashes: list[str] = []
 
     # Configure scan options
     config = {
@@ -703,6 +705,11 @@ def scan_model_directory_or_file(
                     if limit_reached:
                         break
 
+                    # Collect valid content hashes for aggregate hash computation
+                    # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
+                    if not content_hash.startswith("unhashable_"):
+                        file_hashes.append(content_hash)
+
                     # Scan the first file in each content group (representative)
                     representative_file = file_paths[0]
 
@@ -879,6 +886,14 @@ def scan_model_directory_or_file(
                 file_size = os.path.getsize(target)
                 results.files_scanned += 1
 
+                # Compute hash for single file to enable aggregate hash
+                try:
+                    file_hash = _calculate_file_hash(target)
+                    file_hashes.append(file_hash)
+                except Exception as e:
+                    logger.debug(f"Failed to hash file {target}: {e}")
+                    # Continue without hash - not a critical error
+
                 if progress_callback is not None and file_size > 0:
 
                     def create_progress_open(
@@ -1032,6 +1047,13 @@ def scan_model_directory_or_file(
 
     # Set success flag for backward compatibility
     results.success = bool(scan_metadata.get("success", True))
+
+    # Compute aggregate content hash if we collected file hashes
+    if file_hashes:
+        from .utils.helpers.secure_hasher import compute_aggregate_hash
+
+        results.content_hash = compute_aggregate_hash(file_hashes)
+        logger.info(f"Computed aggregate content hash from {len(file_hashes)} file(s): {results.content_hash}")
 
     # Finalize statistics and return Pydantic model
     results.finalize_statistics()

@@ -356,7 +356,7 @@ def download_model_streaming(
     """Download a model from HuggingFace one file at a time (streaming mode).
 
     This generator yields (file_path, is_last_file) tuples as each file is downloaded.
-    Designed for scan-and-delete workflows to minimize disk usage.
+    Designed for streaming workflows to minimize disk usage.
 
     Args:
         url: HuggingFace model URL
