@@ -32,6 +32,7 @@ def pytest_runtest_setup(item):
             "test_streaming_scan.py",  # Streaming scan-and-delete tests
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
+            "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
         ]
 
         # Check if this is an allowed test file
