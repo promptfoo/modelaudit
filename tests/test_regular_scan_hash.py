@@ -106,12 +106,15 @@ class TestRegularScanContentHash:
                 pickle.dump({"name": name}, f)
             files.append(file_path)
 
-        # Scan the directory (os.walk might process in different order)
-        result = scan_model_directory_or_file(str(tmp_path))
+        # Scan the directory multiple times to verify consistent hash
+        # (os.walk might process in different order)
+        result1 = scan_model_directory_or_file(str(tmp_path))
+        result2 = scan_model_directory_or_file(str(tmp_path))
 
-        # The hash should be the same regardless of file discovery order
+        # Hashes should be identical across scans (order-independent)
         # This is guaranteed by compute_aggregate_hash sorting the hashes
-        assert result.content_hash is not None
+        assert result1.content_hash is not None
+        assert result1.content_hash == result2.content_hash
 
     def test_duplicate_files_single_hash(self, tmp_path):
         """Test that duplicate files are deduplicated and contribute once to hash."""
@@ -133,8 +136,8 @@ class TestRegularScanContentHash:
         # Scan empty directory
         result = scan_model_directory_or_file(str(tmp_path))
 
-        # Should not have content_hash or it should be None
-        assert not hasattr(result, "content_hash") or result.content_hash is None
+        # content_hash should not be set (remains None) when no files are hashed
+        assert result.content_hash is None
 
     def test_hash_consistency_with_streaming(self, tmp_path):
         """Test that regular and streaming modes produce compatible hashes."""
@@ -171,7 +174,7 @@ class TestRegularScanContentHash:
         with open(model_file, "wb") as f:
             pickle.dump({"data": "model"}, f)
 
-        # Create a text file
+        # Create a text file (scanned for metadata but not with model scanners)
         text_file = tmp_path / "readme.txt"
         text_file.write_text("This is a readme")
 
@@ -180,8 +183,8 @@ class TestRegularScanContentHash:
 
         # Should have a content hash
         assert result.content_hash is not None
-        # Should have scanned at least the model file
-        assert result.files_scanned >= 1
+        # Both files are processed (readme.txt for metadata)
+        assert result.files_scanned == 2
 
 
 @pytest.mark.unit
@@ -209,18 +212,50 @@ class TestHashGenerationEdgeCases:
         assert result.content_hash is not None
         assert result.files_scanned == 2
 
-    def test_hash_with_symlinks(self, tmp_path):
-        """Test that symlinks are handled correctly in hash generation."""
-        # Create a real file
-        real_file = tmp_path / "real.pkl"
-        with open(real_file, "wb") as f:
-            pickle.dump({"type": "real"}, f)
+    def test_hash_with_regular_files(self, tmp_path):
+        """Test that regular files generate hash correctly."""
+        # Create a regular file
+        regular_file = tmp_path / "model.pkl"
+        with open(regular_file, "wb") as f:
+            pickle.dump({"type": "regular"}, f)
 
-        # Note: Symlink handling depends on os.walk(followlinks=False)
-        # which is used in scan_model_directory_or_file
+        # Scan directory
         result = scan_model_directory_or_file(str(tmp_path))
 
         assert result.content_hash is not None
+        assert result.files_scanned == 1
+
+    def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
+        """Test that files failing to hash are excluded from aggregate hash."""
+        # Create a valid file
+        valid_file = tmp_path / "valid.pkl"
+        with open(valid_file, "wb") as f:
+            pickle.dump({"data": "valid"}, f)
+
+        # Create a file that will fail to hash
+        bad_file = tmp_path / "bad.pkl"
+        with open(bad_file, "wb") as f:
+            pickle.dump({"data": "bad"}, f)
+
+        # Mock _calculate_file_hash to fail for bad.pkl
+        from modelaudit import core
+
+        original_hash = core._calculate_file_hash
+
+        def mock_hash(path):
+            if "bad.pkl" in str(path):
+                raise OSError("Simulated hash failure")
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", mock_hash)
+
+        # Scan directory
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        # Should have a hash based only on the valid file
+        assert result.content_hash is not None
+        # files_scanned should include both files
+        assert result.files_scanned == 2
 
     def test_hash_generation_performance(self, tmp_path):
         """Test that hash generation doesn't significantly impact performance."""
@@ -237,7 +272,7 @@ class TestHashGenerationEdgeCases:
         result = scan_model_directory_or_file(str(tmp_path))
         duration = time.time() - start
 
-        # Should complete quickly (under 5 seconds for 10 small files)
-        assert duration < 5.0
+        # Should complete quickly (under 2 seconds for 10 small files)
+        assert duration < 2.0
         assert result.content_hash is not None
         assert result.files_scanned == 10
