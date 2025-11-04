@@ -460,7 +460,7 @@ def delegate_info() -> None:
     help="Force disable caching (overrides smart detection)",
 )
 @click.option(
-    "--scan-and-delete",
+    "--stream",
     is_flag=True,
     help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
 )
@@ -478,7 +478,7 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
-    scan_and_delete: bool,
+    stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -558,7 +558,7 @@ def scan_command(
         user_overrides["show_progress"] = True
     if no_cache:
         user_overrides["use_cache"] = False
-    if scan_and_delete:
+    if stream:
         user_overrides["scan_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
@@ -801,7 +801,7 @@ def scan_command(
 
                             # Show streaming mode notification
                             if final_scan_and_delete:
-                                click.echo(style_text("   Mode: Streaming (scan-and-delete to save disk)", fg="cyan"))
+                                click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
                         except Exception:
                             # Don't fail if we can't get model info
                             pass
@@ -885,7 +885,7 @@ def scan_command(
                             click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                             click.echo(
                                 style_text(
-                                    "💡 Tip: Use --scan-and-delete to minimize disk usage, or use "
+                                    "💡 Tip: Use --stream to minimize disk usage, or use "
                                     "--cache-dir to specify a directory with more space",
                                     fg="cyan",
                                 ),
