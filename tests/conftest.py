@@ -29,7 +29,7 @@ def pytest_runtest_setup(item):
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_shebang_context.py",  # Shebang context verification tests
             "test_file_hash.py",  # SHA256 hashing utility tests
-            "test_streaming_scan.py",  # Streaming scan-and-delete tests
+            "test_streaming_scan.py",  # Streaming scan tests
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
