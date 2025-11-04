@@ -1,8 +1,6 @@
 """Tests for content hash generation in regular scan mode."""
 
 import pickle
-import tempfile
-from pathlib import Path
 
 import pytest
 
