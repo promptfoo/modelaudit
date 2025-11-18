@@ -342,6 +342,13 @@ class TestMLDirectoryDetection:
         assert _is_ml_config_file("model.json") is True
         assert _is_ml_config_file("generation_config.json") is True
 
+        # Sentence-transformers config files
+        assert _is_ml_config_file("special_tokens_map.json") is True
+        assert _is_ml_config_file("config_sentence_transformers.json") is True
+        assert _is_ml_config_file("sentence_bert_config.json") is True
+        assert _is_ml_config_file("data_config.json") is True
+        assert _is_ml_config_file("modules.json") is True
+
         assert _is_ml_config_file("data.json") is False
         assert _is_ml_config_file("analysis.json") is False
         assert _is_ml_config_file("config.txt") is False
