@@ -375,7 +375,7 @@ def test_xml_detection_boundary_conditions(tmp_path):
     # Create XML where <net> is at exactly byte 60 (within 64 bytes)
     xml_path = tmp_path / "boundary.xml"
     # Position <net> to be just within the 64-byte limit
-    xml_content = b'<?xml version="1.0"?>' + (b' ' * 17) + b'<net name="M"/>'
+    xml_content = b'<?xml version="1.0"?>' + (b" " * 17) + b'<net name="M"/>'
     xml_path.write_bytes(xml_content)
 
     # Should detect as openvino
