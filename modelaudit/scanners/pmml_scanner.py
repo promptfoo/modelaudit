@@ -189,7 +189,11 @@ class PmmlScanner(BaseScanner):
 
     def _validate_pmml_structure(self, root: Any, result: ScanResult, path: str) -> None:
         """Validate basic PMML structure and extract metadata."""
-        if root.tag.lower() != "pmml":
+        # Extract local tag name (without namespace)
+        # Tags can be "{http://namespace}PMML" or just "PMML"
+        tag_name = root.tag.split("}")[-1].lower() if "}" in root.tag else root.tag.lower()
+
+        if tag_name != "pmml":
             result.add_check(
                 name="PMML Root Element Validation",
                 passed=False,
