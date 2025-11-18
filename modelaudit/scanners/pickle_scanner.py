@@ -2856,28 +2856,66 @@ class PickleScanner(BaseScanner):
                                     why=get_opcode_explanation(opcode.name),
                                 )
                     else:
-                        # No associated class found - use context-aware severity
-                        severity = _get_context_aware_severity(
-                            IssueSeverity.WARNING,
-                            ml_context,
-                        )
-                        result.add_check(
-                            name="INST/OBJ/NEWOBJ Opcode Safety Check",
-                            passed=False,
-                            message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
-                            severity=severity,
-                            location=f"{self.current_file_path} (pos {pos})",
-                            details={
-                                "position": pos,
-                                "opcode": opcode.name,
-                                "argument": str(arg),
-                                "ml_context_confidence": ml_context.get(
-                                    "overall_confidence",
-                                    0,
-                                ),
-                            },
-                            why=get_opcode_explanation(opcode.name),
-                        )
+                        # No associated class found via backward search
+                        # Try fallback: INST in protocol 0 encodes class info directly in arg
+                        if opcode.name == "INST" and isinstance(arg, str):
+                            # Parse arg using same split/rsplit pattern as GLOBAL
+                            parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                            if len(parts) == 2:
+                                class_mod, class_name = parts
+                                associated_class = f"{class_mod}.{class_name}"
+                                is_safe_class = _is_safe_ml_global(class_mod, class_name)
+
+                                if is_safe_class:
+                                    # Safe class found via arg parsing - INFO
+                                    result.add_check(
+                                        name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                        passed=True,
+                                        message=f"{opcode.name} opcode with safe ML class: {associated_class}",
+                                        severity=IssueSeverity.INFO,
+                                        location=f"{self.current_file_path} (pos {pos})",
+                                        details={
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_class": associated_class,
+                                            "security_note": (
+                                                f"This {opcode.name} operation instantiates a safe ML framework class "
+                                                "and is expected in model files. "
+                                                "The class is in the ML_SAFE_GLOBALS allowlist."
+                                            ),
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        },
+                                    )
+                                    continue  # Skip unknown-class WARNING below
+
+                        # Still no class found, or class not safe - gate WARNING on ml_context
+                        # Only emit WARNING if not in ML context or low confidence
+                        is_ml_content = ml_context.get("is_ml_content", False)
+                        ml_confidence = ml_context.get("overall_confidence", 0)
+
+                        if not is_ml_content or ml_confidence < 0.3:
+                            # Not ML content or low confidence - emit WARNING
+                            severity = _get_context_aware_severity(
+                                IssueSeverity.WARNING,
+                                ml_context,
+                            )
+                            result.add_check(
+                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                passed=False,
+                                message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "argument": str(arg),
+                                    "ml_context_confidence": ml_confidence,
+                                },
+                                why=get_opcode_explanation(opcode.name),
+                            )
 
                 # Check for suspicious strings
                 if opcode.name in [
