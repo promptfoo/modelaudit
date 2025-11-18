@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: NEWOBJ/OBJ/INST opcodes now recognize safe ML classes (eliminates sklearn model false positives)
   - Applied same safety logic as REDUCE opcode: check if class is in ML_SAFE_GLOBALS allowlist
   - sklearn models like LogisticRegression now correctly identified as INFO instead of WARNING
-  - Added support for nested sklearn modules (e.g., sklearn.linear_model._logistic)
+  - Added support for nested sklearn modules (e.g., sklearn.linear_model.\_logistic)
   - Added joblib.numpy_pickle.NumpyArrayWrapper and dtype.dtype to safe class list
 - **fix**: handle joblib protocol mismatches gracefully (protocol 4 files using protocol 5 opcodes)
   - joblib files may declare protocol 4 but use protocol 5 opcodes like READONLY_BUFFER (0x0f)
