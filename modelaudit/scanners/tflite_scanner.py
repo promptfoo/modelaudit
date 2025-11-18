@@ -48,6 +48,35 @@ class TFLiteScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
                 result.bytes_scanned = len(data)
+
+            # Validate minimum file size and magic bytes
+            if len(data) < 8:
+                result.add_check(
+                    name="TFLite File Size Check",
+                    passed=False,
+                    message=f"File too small to be valid TFLite model ({len(data)} bytes, minimum 8 required)",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={"file_size": len(data), "minimum_size": 8},
+                )
+                result.finish(success=False)
+                return result
+
+            # Check for TFLite magic bytes "TFL3"
+            if not data.startswith(b"TFL3"):
+                result.add_check(
+                    name="TFLite Magic Bytes Check",
+                    passed=False,
+                    message="File does not have valid TFLite magic bytes (expected 'TFL3')",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={"magic_bytes": data[:4].hex() if len(data) >= 4 else ""},
+                    why="Valid TFLite files must start with 'TFL3' magic bytes. "
+                    "Missing magic bytes may indicate file corruption or spoofing.",
+                )
+                result.finish(success=False)
+                return result
+
             model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
             result.add_check(
