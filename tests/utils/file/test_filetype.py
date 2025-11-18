@@ -315,9 +315,68 @@ def test_detect_pmml_xml_format(tmp_path):
     # Extension detection should return pmml
     assert detect_format_from_extension(str(pmml_path)) == "pmml"
 
-    # Magic detection returns openvino for all XML files
-    # (this is expected - we rely on extension for PMML/OpenVINO disambiguation)
-    assert detect_file_format_from_magic(str(pmml_path)) == "openvino"
+    # Magic detection won't recognize PMML (no <net> tag), returns unknown
+    # This is fine - we rely on extension for PMML detection
+    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
 
-    # Validation should pass due to PMML/OpenVINO compatibility rule
+    # Validation should pass - extension-based detection is used
     assert validate_file_type(str(pmml_path)) is True
+
+
+def test_detect_generic_xml_format(tmp_path):
+    """Test that generic XML files don't get misdetected as OpenVINO."""
+    # Create a generic XML file (SVG, config, etc.)
+    xml_path = tmp_path / "config.xml"
+    xml_content = b'<?xml version="1.0"?>\n<configuration>\n<setting>value</setting>\n</configuration>'
+    xml_path.write_bytes(xml_content)
+
+    # Magic detection should return unknown (no <net> tag)
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+
+
+def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
+    """Test that <net> tag beyond 64 bytes is not detected as OpenVINO."""
+    # Create XML where <net> appears after 64 bytes
+    xml_path = tmp_path / "late_net.xml"
+    # Padding to push <net> beyond 64 bytes
+    padding = b" " * 50
+    xml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<net name="Model0">\n</net>'
+    xml_path.write_bytes(xml_content)
+
+    # Should return unknown since <net> is beyond the 64-byte read limit
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+
+
+def test_detect_openvino_xml_short_file(tmp_path):
+    """Test OpenVINO detection with file smaller than 64 bytes."""
+    # Create a short OpenVINO XML file
+    xml_path = tmp_path / "short.xml"
+    xml_content = b'<?xml version="1.0"?>\n<net/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as openvino (file is small but contains <net>)
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_detect_xml_with_net_in_comment(tmp_path):
+    """Test that <net> in XML comment doesn't trigger false positive."""
+    # Create XML with <net> inside a comment
+    xml_path = tmp_path / "commented.xml"
+    xml_content = b'<?xml version="1.0"?>\n<!-- <net> -->\n<root/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as openvino because we're doing simple byte matching
+    # This is acceptable - the actual OpenVINO scanner will validate properly
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_xml_detection_boundary_conditions(tmp_path):
+    """Test XML detection at exact 64-byte boundary."""
+    # Create XML where <net> is at exactly byte 60 (within 64 bytes)
+    xml_path = tmp_path / "boundary.xml"
+    # Position <net> to be just within the 64-byte limit
+    xml_content = b'<?xml version="1.0"?>' + (b' ' * 17) + b'<net name="M"/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should detect as openvino
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"

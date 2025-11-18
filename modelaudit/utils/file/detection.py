@@ -69,10 +69,6 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
         case _:
             pass
 
-    # Check for XML files (OpenVINO, PMML, etc.)
-    # XML files typically start with "<?xml"
-    if magic16.startswith(b"<?xml"):
-        return "openvino"
 
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
@@ -118,6 +114,14 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
             if format_result != "unknown":
                 return format_result
+
+            # Check for OpenVINO XML files (need to read more bytes for <net> tag)
+            if magic16.startswith(b"<?xml"):
+                # Read first 64 bytes to check for OpenVINO-specific <net> tag
+                f.seek(0)
+                xml_header = f.read(64)
+                if b"<net" in xml_header:
+                    return "openvino"
 
             # SafeTensors format check: 8-byte length header + JSON metadata
             if size >= 12:  # Minimum: 8 bytes length + some JSON
