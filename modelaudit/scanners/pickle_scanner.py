@@ -868,6 +868,96 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     return is_suspicious_global(mod, func)
 
 
+def _parse_module_function(arg: str) -> tuple[str, str] | None:
+    """
+    Parse module.function format from a string argument.
+
+    Handles both space-separated and dot-separated formats:
+    - "module function" -> ("module", "function")
+    - "module.submodule.Class" -> ("module.submodule", "Class")
+
+    Returns:
+        Tuple of (module, function/class) or None if parsing fails
+    """
+    parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    return None
+
+
+def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 10) -> tuple[str, str] | None:
+    """
+    Find the two most recent string opcodes before a STACK_GLOBAL.
+
+    STACK_GLOBAL uses two strings from the stack (module and function/class name).
+    This searches backwards to find them.
+
+    Args:
+        opcodes: List of (opcode, arg, pos) tuples
+        start_index: Index to start searching backwards from
+        lookback: Maximum number of opcodes to search back
+
+    Returns:
+        Tuple of (module, function/class) or None if not found
+    """
+    string_opcodes = {
+        "SHORT_BINSTRING",
+        "BINSTRING",
+        "STRING",
+        "SHORT_BINUNICODE",
+        "BINUNICODE",
+        "UNICODE",
+    }
+
+    recent_strings: list[str] = []
+    for k in range(start_index - 1, max(0, start_index - lookback), -1):
+        prev_opcode, prev_arg, _prev_pos = opcodes[k]
+        if prev_opcode.name in string_opcodes and isinstance(prev_arg, str):
+            recent_strings.insert(0, prev_arg)
+            if len(recent_strings) >= 2:
+                return recent_strings[0], recent_strings[1]
+
+    return None
+
+
+def _find_associated_global_or_class(
+    opcodes: list, current_index: int, lookback: int = 10
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Look backward to find the associated GLOBAL or STACK_GLOBAL for an opcode.
+
+    This is used by REDUCE, NEWOBJ, OBJ, and INST opcodes to determine what
+    class or function they're operating on.
+
+    Args:
+        opcodes: List of (opcode, arg, pos) tuples
+        current_index: Current opcode index
+        lookback: Maximum number of opcodes to search back
+
+    Returns:
+        Tuple of (module, function/class, full_name) or (None, None, None)
+    """
+    for j in range(current_index - 1, max(0, current_index - lookback), -1):
+        prev_opcode, prev_arg, _prev_pos = opcodes[j]
+
+        if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+            # Parse GLOBAL opcode argument
+            parsed = _parse_module_function(prev_arg)
+            if parsed:
+                mod, func = parsed
+                return mod, func, f"{mod}.{func}"
+
+        elif prev_opcode.name == "STACK_GLOBAL":
+            # Find two strings before STACK_GLOBAL
+            strings = _find_stack_global_strings(opcodes, j, lookback)
+            if strings:
+                mod, func = strings
+                return mod, func, f"{mod}.{func}"
+
+    return None, None, None
+
+
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
     Smart string analysis - looks for actual executable code rather than ML patterns.
@@ -2624,54 +2714,10 @@ class PickleScanner(BaseScanner):
                 # Flag as WARNING if not in safe globals, INFO if in safe globals
                 if opcode.name == "REDUCE":
                     # Look back to find the associated GLOBAL or STACK_GLOBAL
-                    associated_global: str | None = None
-                    is_safe_global = False
-                    reduce_mod: str | None = None
-                    reduce_func: str | None = None
-
-                    # Search backwards in opcodes (up to 10 opcodes back)
-                    for j in range(i - 1, max(0, i - 10), -1):
-                        prev_opcode, prev_arg, prev_pos = opcodes[j]
-
-                        if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
-                            # GLOBAL opcode has module.function format
-                            parts = (
-                                prev_arg.split(" ", 1)
-                                if " " in prev_arg
-                                else prev_arg.rsplit(".", 1)
-                                if "." in prev_arg
-                                else [prev_arg, ""]
-                            )
-                            if len(parts) == 2:
-                                reduce_mod, reduce_func = parts
-                                associated_global = f"{reduce_mod}.{reduce_func}"
-                                is_safe_global = _is_safe_ml_global(reduce_mod, reduce_func)
-                                break
-
-                        elif prev_opcode.name == "STACK_GLOBAL":
-                            # STACK_GLOBAL uses two strings from the stack
-                            # Look for the two most recent string opcodes before STACK_GLOBAL
-                            recent_strings: list[str] = []
-                            for k in range(j - 1, max(0, j - 10), -1):
-                                stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
-                                if stack_prev_opcode.name in [
-                                    "SHORT_BINSTRING",
-                                    "BINSTRING",
-                                    "STRING",
-                                    "SHORT_BINUNICODE",
-                                    "BINUNICODE",
-                                    "UNICODE",
-                                ] and isinstance(stack_prev_arg, str):
-                                    recent_strings.insert(0, stack_prev_arg)
-                                    if len(recent_strings) >= 2:
-                                        break
-
-                            if len(recent_strings) >= 2:
-                                reduce_mod = recent_strings[0]
-                                reduce_func = recent_strings[1]
-                                associated_global = f"{reduce_mod}.{reduce_func}"
-                                is_safe_global = _is_safe_ml_global(reduce_mod, reduce_func)
-                                break
+                    reduce_mod, reduce_func, associated_global = _find_associated_global_or_class(opcodes, i)
+                    is_safe_global = (
+                        _is_safe_ml_global(reduce_mod, reduce_func) if reduce_mod and reduce_func else False
+                    )
 
                     # Report REDUCE based on safe globals check
                     if associated_global is not None:
@@ -2746,53 +2792,8 @@ class PickleScanner(BaseScanner):
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
-                    associated_class: str | None = None
-                    is_safe_class = False
-                    class_mod: str | None = None
-                    class_name: str | None = None
-
-                    # Search backwards in opcodes (up to 10 opcodes back)
-                    for j in range(i - 1, max(0, i - 10), -1):
-                        prev_opcode, prev_arg, prev_pos = opcodes[j]
-
-                        if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
-                            # GLOBAL opcode has module.class format
-                            parts = (
-                                prev_arg.split(" ", 1)
-                                if " " in prev_arg
-                                else prev_arg.rsplit(".", 1)
-                                if "." in prev_arg
-                                else [prev_arg, ""]
-                            )
-                            if len(parts) == 2:
-                                class_mod, class_name = parts
-                                associated_class = f"{class_mod}.{class_name}"
-                                is_safe_class = _is_safe_ml_global(class_mod, class_name)
-                                break
-
-                        elif prev_opcode.name == "STACK_GLOBAL":
-                            # STACK_GLOBAL uses two strings from the stack
-                            class_strings: list[str] = []
-                            for k in range(j - 1, max(0, j - 10), -1):
-                                stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
-                                if stack_prev_opcode.name in [
-                                    "SHORT_BINSTRING",
-                                    "BINSTRING",
-                                    "STRING",
-                                    "SHORT_BINUNICODE",
-                                    "BINUNICODE",
-                                    "UNICODE",
-                                ] and isinstance(stack_prev_arg, str):
-                                    class_strings.insert(0, stack_prev_arg)
-                                    if len(class_strings) >= 2:
-                                        break
-
-                            if len(class_strings) >= 2:
-                                class_mod = class_strings[0]
-                                class_name = class_strings[1]
-                                associated_class = f"{class_mod}.{class_name}"
-                                is_safe_class = _is_safe_ml_global(class_mod, class_name)
-                                break
+                    class_mod, class_name, associated_class = _find_associated_global_or_class(opcodes, i)
+                    is_safe_class = _is_safe_ml_global(class_mod, class_name) if class_mod and class_name else False
 
                     # Report based on safe class check (same logic as REDUCE)
                     if associated_class is not None:
@@ -2859,10 +2860,10 @@ class PickleScanner(BaseScanner):
                         # No associated class found via backward search
                         # Try fallback: INST in protocol 0 encodes class info directly in arg
                         if opcode.name == "INST" and isinstance(arg, str):
-                            # Parse arg using same split/rsplit pattern as GLOBAL
-                            parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
-                            if len(parts) == 2:
-                                class_mod, class_name = parts
+                            # Parse arg using helper function
+                            parsed = _parse_module_function(arg)
+                            if parsed:
+                                class_mod, class_name = parsed
                                 associated_class = f"{class_mod}.{class_name}"
                                 is_safe_class = _is_safe_ml_global(class_mod, class_name)
 
@@ -3043,7 +3044,7 @@ class PickleScanner(BaseScanner):
                     # Find the two immediately preceding STRING-like opcodes
                     # STACK_GLOBAL expects exactly two strings on the stack:
                     # module and function
-                    recent_strings = []
+                    recent_strings: list[str] = []
                     for j in range(
                         i - 1,
                         max(0, i - 10),
