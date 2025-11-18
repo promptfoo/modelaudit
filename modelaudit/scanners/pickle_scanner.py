@@ -32,6 +32,31 @@ from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 
+def _genops_with_fallback(file_obj):
+    """
+    Wrapper around pickletools.genops that handles protocol mismatches.
+
+    Some files (especially joblib) may declare protocol 4 but use protocol 5 opcodes
+    like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
+    before hitting unknown opcodes.
+
+    Yields: (opcode, arg, pos) tuples from pickletools.genops
+    """
+    try:
+        yield from pickletools.genops(file_obj)
+    except ValueError as e:
+        error_str = str(e).lower()
+        # Check if it's an unknown opcode error (protocol mismatch)
+        if "opcode" in error_str and "unknown" in error_str:
+            # Log that we hit a protocol mismatch - this is expected for joblib files
+            logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
+            # Don't re-raise - we've already yielded all valid opcodes before the unknown one
+            return
+        else:
+            # Re-raise other ValueError types
+            raise
+
+
 def _compute_pickle_length(path: str) -> int:
     """
     Compute the exact length of pickle data by finding the STOP opcode position.
@@ -595,6 +620,16 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_pickle_dump",
         "_pickle_load",
     ],
+    "joblib.numpy_pickle": [
+        "NumpyArrayWrapper",
+        "NDArrayWrapper",
+        "ZNDArrayWrapper",
+        "read_array",
+        "write_array",
+    ],
+    "dtype": [
+        "dtype",  # numpy.dtype().dtype pattern
+    ],
     "dill": ["dump", "dumps", "load", "loads", "copy"],
     "tensorflow": [
         "Tensor",
@@ -768,13 +803,33 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
 
+    Supports both exact module matches and prefix matching for nested modules
+    (e.g., sklearn.linear_model._logistic matches sklearn.linear_model).
+
     Returns:
         True if the global is in the safe list, False otherwise
     """
+    # Try exact match first
     if mod in ML_SAFE_GLOBALS:
         safe_funcs = ML_SAFE_GLOBALS[mod]
         if func in safe_funcs:
             return True
+
+    # For sklearn/xgboost: check if module starts with allowed submodule
+    # e.g., sklearn.linear_model._logistic -> check sklearn.linear_model
+    if mod.startswith("sklearn.") or mod.startswith("xgboost."):
+        # Get the base framework (sklearn or xgboost)
+        base = mod.split(".")[0]
+        if base in ML_SAFE_GLOBALS:
+            safe_submodules = ML_SAFE_GLOBALS[base]
+            # Check if any allowed submodule is a prefix of the actual module
+            for allowed_submodule in safe_submodules:
+                # Build full path: sklearn.linear_model
+                full_allowed = f"{base}.{allowed_submodule}"
+                if mod.startswith(full_allowed):
+                    # Module is under an allowed submodule, func is implicitly safe
+                    return True
+
     return False
 
 
@@ -2246,7 +2301,7 @@ class PickleScanner(BaseScanner):
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
 
-            for opcode, arg, pos in pickletools.genops(file_obj):
+            for opcode, arg, pos in _genops_with_fallback(file_obj):
                 # Check for interrupts periodically during opcode processing
                 if opcode_count % 1000 == 0:  # Check every 1000 opcodes
                     self.check_interrupted()
@@ -2687,30 +2742,142 @@ class PickleScanner(BaseScanner):
                                     why=get_opcode_explanation("REDUCE"),
                                 )
 
-                # Check dangerous opcodes for potential security issues
-                # Removed confidence-based skipping to prevent security bypasses
+                # Check NEWOBJ/OBJ/INST opcodes for potential security issues
+                # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
-                    severity = _get_context_aware_severity(
-                        IssueSeverity.WARNING,
-                        ml_context,
-                    )
-                    result.add_check(
-                        name="INST/OBJ Opcode Safety Check",
-                        passed=False,
-                        message=f"Found {opcode.name} opcode - potential code execution",
-                        severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        details={
-                            "position": pos,
-                            "opcode": opcode.name,
-                            "argument": str(arg),
-                            "ml_context_confidence": ml_context.get(
-                                "overall_confidence",
-                                0,
-                            ),
-                        },
-                        why=get_opcode_explanation(opcode.name),
-                    )
+                    # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
+                    associated_class: str | None = None
+                    is_safe_class = False
+                    class_mod: str | None = None
+                    class_name: str | None = None
+
+                    # Search backwards in opcodes (up to 10 opcodes back)
+                    for j in range(i - 1, max(0, i - 10), -1):
+                        prev_opcode, prev_arg, prev_pos = opcodes[j]
+
+                        if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                            # GLOBAL opcode has module.class format
+                            parts = (
+                                prev_arg.split(" ", 1)
+                                if " " in prev_arg
+                                else prev_arg.rsplit(".", 1)
+                                if "." in prev_arg
+                                else [prev_arg, ""]
+                            )
+                            if len(parts) == 2:
+                                class_mod, class_name = parts
+                                associated_class = f"{class_mod}.{class_name}"
+                                is_safe_class = _is_safe_ml_global(class_mod, class_name)
+                                break
+
+                        elif prev_opcode.name == "STACK_GLOBAL":
+                            # STACK_GLOBAL uses two strings from the stack
+                            class_strings: list[str] = []
+                            for k in range(j - 1, max(0, j - 10), -1):
+                                stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
+                                if stack_prev_opcode.name in [
+                                    "SHORT_BINSTRING",
+                                    "BINSTRING",
+                                    "STRING",
+                                    "SHORT_BINUNICODE",
+                                    "BINUNICODE",
+                                    "UNICODE",
+                                ] and isinstance(stack_prev_arg, str):
+                                    class_strings.insert(0, stack_prev_arg)
+                                    if len(class_strings) >= 2:
+                                        break
+
+                            if len(class_strings) >= 2:
+                                class_mod = class_strings[0]
+                                class_name = class_strings[1]
+                                associated_class = f"{class_mod}.{class_name}"
+                                is_safe_class = _is_safe_ml_global(class_mod, class_name)
+                                break
+
+                    # Report based on safe class check (same logic as REDUCE)
+                    if associated_class is not None:
+                        if is_safe_class:
+                            # Safe class (in ML_SAFE_GLOBALS) - show as INFO
+                            result.add_check(
+                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                passed=True,
+                                message=f"{opcode.name} opcode with safe ML class: {associated_class}",
+                                severity=IssueSeverity.INFO,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "associated_class": associated_class,
+                                    "security_note": (
+                                        f"This {opcode.name} operation instantiates a safe ML framework class "
+                                        "and is expected in model files. The class is in the ML_SAFE_GLOBALS allowlist."
+                                    ),
+                                    "ml_context_confidence": ml_context.get(
+                                        "overall_confidence",
+                                        0,
+                                    ),
+                                },
+                            )
+                        else:
+                            # NOT in safe classes - check if actually dangerous
+                            if class_mod and class_name:
+                                is_actually_dangerous = _is_actually_dangerous_global(class_mod, class_name, ml_context)
+                                if is_actually_dangerous:
+                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.CRITICAL,
+                                        ml_context,
+                                        issue_type="dangerous_global",
+                                    )
+                                else:
+                                    # Non-allowlisted but not explicitly dangerous - WARNING
+                                    severity = _get_context_aware_severity(
+                                        IssueSeverity.WARNING,
+                                        ml_context,
+                                    )
+
+                                result.add_check(
+                                    name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                    passed=False,
+                                    message=(
+                                        f"Found {opcode.name} opcode with non-allowlisted class: {associated_class}"
+                                    ),
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details={
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_class": associated_class,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    },
+                                    why=get_opcode_explanation(opcode.name),
+                                )
+                    else:
+                        # No associated class found - use context-aware severity
+                        severity = _get_context_aware_severity(
+                            IssueSeverity.WARNING,
+                            ml_context,
+                        )
+                        result.add_check(
+                            name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                            passed=False,
+                            message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
+                            severity=severity,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            details={
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "argument": str(arg),
+                                "ml_context_confidence": ml_context.get(
+                                    "overall_confidence",
+                                    0,
+                                ),
+                            },
+                            why=get_opcode_explanation(opcode.name),
+                        )
 
                 # Check for suspicious strings
                 if opcode.name in [
