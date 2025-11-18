@@ -478,8 +478,12 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "onnx":
             return header_format in {"onnx", "unknown"}
 
-        # NumPy files should match
+        # NumPy files (.npy should match, .npz is ZIP by design)
         if ext_format == "numpy":
+            # .npz files are ZIP archives containing multiple .npy files
+            # This is the standard NumPy compressed format, not spoofing
+            if path.endswith(".npz"):
+                return header_format in {"zip", "numpy"}
             return header_format == "numpy"
 
         # Flax msgpack files (less strict validation)

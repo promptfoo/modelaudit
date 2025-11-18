@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<PMML xmlns="http://www.dmg.org/PMML-4_4" xmlns:data="http://jpmml.org/jpmml-model/InlineTable" version="4.4">
+    <Header>
+        <Application name="JPMML-SkLearn library" version="1.7.16"/>
+        <Timestamp>2025-11-18T12:00:00Z</Timestamp>
+    </Header>
+    <DataDictionary>
+        <DataField name="sepal length (cm)" optype="continuous" dataType="double"/>
+        <DataField name="sepal width (cm)" optype="continuous" dataType="double"/>
+        <DataField name="petal length (cm)" optype="continuous" dataType="double"/>
+        <DataField name="petal width (cm)" optype="continuous" dataType="double"/>
+        <DataField name="species" optype="categorical" dataType="string">
+            <Value value="setosa"/>
+            <Value value="versicolor"/>
+            <Value value="virginica"/>
+        </DataField>
+    </DataDictionary>
+    <MiningModel functionName="classification">
+        <MiningSchema>
+            <MiningField name="sepal length (cm)"/>
+            <MiningField name="sepal width (cm)"/>
+            <MiningField name="petal length (cm)"/>
+            <MiningField name="petal width (cm)"/>
+            <MiningField name="species" usageType="target"/>
+        </MiningSchema>
+        <Segmentation multipleModelMethod="majorityVote">
+            <Segment id="1">
+                <True/>
+                <TreeModel functionName="classification" splitCharacteristic="binarySplit">
+                    <MiningSchema>
+                        <MiningField name="sepal length (cm)"/>
+                        <MiningField name="sepal width (cm)"/>
+                        <MiningField name="petal length (cm)"/>
+                        <MiningField name="petal width (cm)"/>
+                        <MiningField name="species" usageType="target"/>
+                    </MiningSchema>
+                    <Output>
+                        <OutputField name="probability_setosa" optype="continuous" dataType="double" feature="probability" value="setosa"/>
+                        <OutputField name="probability_versicolor" optype="continuous" dataType="double" feature="probability" value="versicolor"/>
+                        <OutputField name="probability_virginica" optype="continuous" dataType="double" feature="probability" value="virginica"/>
+                    </Output>
+                    <Node score="setosa">
+                        <True/>
+                        <Node score="setosa">
+                            <SimplePredicate field="petal width (cm)" operator="lessOrEqual" value="0.8"/>
+                            <ScoreDistribution value="setosa" recordCount="50"/>
+                        </Node>
+                        <Node score="versicolor">
+                            <SimplePredicate field="petal width (cm)" operator="greaterThan" value="0.8"/>
+                            <Node score="versicolor">
+                                <SimplePredicate field="petal width (cm)" operator="lessOrEqual" value="1.75"/>
+                                <ScoreDistribution value="versicolor" recordCount="54"/>
+                            </Node>
+                            <Node score="virginica">
+                                <SimplePredicate field="petal width (cm)" operator="greaterThan" value="1.75"/>
+                                <ScoreDistribution value="virginica" recordCount="46"/>
+                            </Node>
+                        </Node>
+                    </Node>
+                </TreeModel>
+            </Segment>
+            <Segment id="2">
+                <True/>
+                <TreeModel functionName="classification" splitCharacteristic="binarySplit">
+                    <MiningSchema>
+                        <MiningField name="sepal length (cm)"/>
+                        <MiningField name="sepal width (cm)"/>
+                        <MiningField name="petal length (cm)"/>
+                        <MiningField name="petal width (cm)"/>
+                        <MiningField name="species" usageType="target"/>
+                    </MiningSchema>
+                    <Node score="setosa">
+                        <True/>
+                        <Node score="setosa">
+                            <SimplePredicate field="petal length (cm)" operator="lessOrEqual" value="2.45"/>
+                            <ScoreDistribution value="setosa" recordCount="50"/>
+                        </Node>
+                        <Node score="versicolor">
+                            <SimplePredicate field="petal length (cm)" operator="greaterThan" value="2.45"/>
+                            <ScoreDistribution value="versicolor" recordCount="50"/>
+                            <ScoreDistribution value="virginica" recordCount="50"/>
+                        </Node>
+                    </Node>
+                </TreeModel>
+            </Segment>
+        </Segmentation>
+    </MiningModel>
+</PMML>
