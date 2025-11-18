@@ -303,3 +303,21 @@ def test_detect_openvino_xml_format(tmp_path):
 
     # Test file type validation should pass (no mismatch)
     assert validate_file_type(str(xml_path)) is True
+
+
+def test_detect_pmml_xml_format(tmp_path):
+    """Test that PMML XML files don't trigger false positives."""
+    # Create a PMML XML file
+    pmml_path = tmp_path / "model.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML version="4.4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Extension detection should return pmml
+    assert detect_format_from_extension(str(pmml_path)) == "pmml"
+
+    # Magic detection returns openvino for all XML files
+    # (this is expected - we rely on extension for PMML/OpenVINO disambiguation)
+    assert detect_file_format_from_magic(str(pmml_path)) == "openvino"
+
+    # Validation should pass due to PMML/OpenVINO compatibility rule
+    assert validate_file_type(str(pmml_path)) is True

@@ -70,8 +70,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             pass
 
     # Check for XML files (OpenVINO, PMML, etc.)
-    # XML files typically start with "<?xml" or similar
-    if magic8.startswith(b"<?xml") or magic16.startswith(b"<?xml"):
+    # XML files typically start with "<?xml"
+    if magic16.startswith(b"<?xml"):
         return "openvino"
 
     # Check for patterns in first 16 bytes
@@ -439,6 +439,10 @@ def validate_file_type(path: str) -> bool:
 
         # TensorFlow protobuf files (.pb extension)
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
+            return True
+
+        # PMML files are XML-based and use the same magic bytes as OpenVINO
+        if ext_format == "pmml" and header_format == "openvino":
             return True
 
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
