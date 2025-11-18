@@ -306,20 +306,19 @@ def test_detect_openvino_xml_format(tmp_path):
 
 
 def test_detect_pmml_xml_format(tmp_path):
-    """Test that PMML XML files don't trigger false positives."""
-    # Create a PMML XML file
+    """Test detecting PMML XML files by magic bytes."""
+    # Create a PMML XML file with standard XML header
     pmml_path = tmp_path / "model.pmml"
     pmml_content = b'<?xml version="1.0"?>\n<PMML version="4.4">\n</PMML>'
     pmml_path.write_bytes(pmml_content)
 
-    # Extension detection should return pmml
+    # Test magic byte detection should now recognize PMML
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+    # Test extension detection
     assert detect_format_from_extension(str(pmml_path)) == "pmml"
 
-    # Magic detection won't recognize PMML (no <net> tag), returns unknown
-    # This is fine - we rely on extension for PMML detection
-    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
-
-    # Validation should pass - extension-based detection is used
+    # Test file type validation should pass (no mismatch)
     assert validate_file_type(str(pmml_path)) is True
 
 
@@ -380,3 +379,72 @@ def test_xml_detection_boundary_conditions(tmp_path):
 
     # Should detect as openvino
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
+    """Test that <PMML> tag beyond 64 bytes is not detected as PMML."""
+    # Create XML where <PMML> appears after 64 bytes
+    pmml_path = tmp_path / "late_pmml.pmml"
+    # Padding to push <PMML> beyond 64 bytes
+    padding = b" " * 50
+    pmml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<PMML version="4.4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should return unknown since <PMML> is beyond the 64-byte read limit
+    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
+
+
+def test_detect_pmml_xml_short_file(tmp_path):
+    """Test PMML detection with file smaller than 64 bytes."""
+    # Create a short PMML XML file
+    pmml_path = tmp_path / "short.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML/>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should still detect as pmml (file is small but contains <PMML>)
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_detect_xml_with_pmml_in_comment(tmp_path):
+    """Test that <PMML> in XML comment still triggers detection."""
+    # Create XML with <PMML> inside a comment
+    xml_path = tmp_path / "commented.pmml"
+    xml_content = b'<?xml version="1.0"?>\n<!-- <PMML> -->\n<root/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as pmml because we're doing simple byte matching
+    # This is acceptable - the actual PMML scanner will validate properly
+    assert detect_file_format_from_magic(str(xml_path)) == "pmml"
+
+
+def test_pmml_detection_boundary_conditions(tmp_path):
+    """Test PMML detection at exact 64-byte boundary."""
+    # Create XML where <PMML> is just within the 64-byte limit
+    pmml_path = tmp_path / "boundary.pmml"
+    # Position <PMML> to be just within the 64-byte limit
+    pmml_content = b'<?xml version="1.0"?>' + (b" " * 16) + b'<PMML version="4"/>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should detect as pmml
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_openvino_vs_pmml_detection(tmp_path):
+    """Test that OpenVINO and PMML formats are detected independently."""
+    # OpenVINO file
+    openvino_path = tmp_path / "model.xml"
+    openvino_content = b'<?xml version="1.0"?>\n<net name="Model0" version="11">\n</net>'
+    openvino_path.write_bytes(openvino_content)
+
+    # PMML file
+    pmml_path = tmp_path / "model.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML version="4.4" xmlns="http://www.dmg.org/PMML-4_4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Each should be detected correctly
+    assert detect_file_format_from_magic(str(openvino_path)) == "openvino"
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+    # Validation should pass for both
+    assert validate_file_type(str(openvino_path)) is True
+    assert validate_file_type(str(pmml_path)) is True
