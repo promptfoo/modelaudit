@@ -114,6 +114,16 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
+            # Check for XML-based formats (OpenVINO and PMML)
+            if magic16.startswith(b"<?xml"):
+                # Read first 64 bytes to check for format-specific tags
+                f.seek(0)
+                xml_header = f.read(64)
+                if b"<net" in xml_header:
+                    return "openvino"
+                if b"<PMML" in xml_header:
+                    return "pmml"
+
             # SafeTensors format check: 8-byte length header + JSON metadata
             if size >= 12:  # Minimum: 8 bytes length + some JSON
                 try:
@@ -267,8 +277,6 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
-    if ext == ".mlmodel":
-        return "coreml"
     if ext in (
         ".tar",
         ".tar.gz",
@@ -331,7 +339,6 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
-    ".mlmodel": "coreml",
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
     ".engine": "tensorrt",
@@ -374,8 +381,6 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "protobuf"
         case ".tflite":
             return "tflite"
-        case ".mlmodel":
-            return "coreml"
         case ".engine":
             return "tensorrt"
         case ".pdmodel":
@@ -441,6 +446,10 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
+        # PMML files are XML-based with <PMML> tag detection
+        if ext_format == "pmml" and header_format == "pmml":
+            return True
+
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
         if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
             return True
@@ -484,9 +493,6 @@ def validate_file_type(path: str) -> bool:
         # TensorFlow Lite files
         if ext_format == "tflite":
             return True  # TFLite format can be complex to validate
-
-        if ext_format == "coreml":
-            return True  # Core ML files are protobuf and lack clear magic bytes
 
         if ext_format == "tensorrt":
             return True  # TensorRT engine files have complex binary format

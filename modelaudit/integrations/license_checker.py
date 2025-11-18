@@ -363,6 +363,12 @@ def _is_ml_config_file(filename: str) -> bool:
         "training_args.json",
         "optimizer.json",
         "scheduler.json",
+        # Sentence-transformers specific config files
+        "special_tokens_map.json",
+        "config_sentence_transformers.json",
+        "sentence_bert_config.json",
+        "data_config.json",
+        "modules.json",
     }
 
     return filename in ml_config_patterns
