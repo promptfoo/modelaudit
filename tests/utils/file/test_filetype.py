@@ -286,3 +286,20 @@ def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "open", open_raise)
     assert detect_file_format_from_magic(str(file_path)) == "unknown"
+
+
+def test_detect_openvino_xml_format(tmp_path):
+    """Test detecting OpenVINO XML files by magic bytes."""
+    # Create an OpenVINO XML file with standard XML header
+    xml_path = tmp_path / "openvino_model.xml"
+    xml_content = b'<?xml version="1.0"?>\n<net name="Model0" version="11">\n</net>'
+    xml_path.write_bytes(xml_content)
+
+    # Test magic byte detection
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+    # Test extension detection
+    assert detect_format_from_extension(str(xml_path)) == "openvino"
+
+    # Test file type validation should pass (no mismatch)
+    assert validate_file_type(str(xml_path)) is True

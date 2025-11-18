@@ -69,6 +69,11 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
         case _:
             pass
 
+    # Check for XML files (OpenVINO, PMML, etc.)
+    # XML files typically start with "<?xml" or similar
+    if magic8.startswith(b"<?xml") or magic16.startswith(b"<?xml"):
+        return "openvino"
+
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
         return "onnx"
