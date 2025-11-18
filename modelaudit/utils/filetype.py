@@ -69,7 +69,6 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
         case _:
             pass
 
-
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
         return "onnx"
