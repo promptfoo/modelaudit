@@ -114,13 +114,15 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
-            # Check for OpenVINO XML files (need to read more bytes for <net> tag)
+            # Check for XML-based formats (OpenVINO and PMML)
             if magic16.startswith(b"<?xml"):
-                # Read first 64 bytes to check for OpenVINO-specific <net> tag
+                # Read first 64 bytes to check for format-specific tags
                 f.seek(0)
                 xml_header = f.read(64)
                 if b"<net" in xml_header:
                     return "openvino"
+                if b"<PMML" in xml_header:
+                    return "pmml"
 
             # SafeTensors format check: 8-byte length header + JSON metadata
             if size >= 12:  # Minimum: 8 bytes length + some JSON
@@ -444,8 +446,8 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
-        # PMML files are XML-based and use the same magic bytes as OpenVINO
-        if ext_format == "pmml" and header_format == "openvino":
+        # PMML files are XML-based with <PMML> tag detection
+        if ext_format == "pmml" and header_format == "pmml":
             return True
 
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
