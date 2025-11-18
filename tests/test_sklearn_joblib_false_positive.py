@@ -153,8 +153,7 @@ tR."""
 
         # Should still detect os.system as a threat
         has_system_warning = any(
-            "system" in issue.message.lower()
-            and issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING, IssueSeverity.ERROR]
+            "system" in issue.message.lower() and issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING]
             for issue in result.issues
         )
 
@@ -162,34 +161,27 @@ tR."""
             "Malicious os.system pattern should still be detected after removing sklearn patterns"
         )
 
-    def test_cve_regex_patterns_still_work(self, tmp_path):
+    def test_scanner_handles_malformed_content(self, tmp_path):
         """
-        Verify CVE regex patterns still detect actual exploits.
+        Robustness check: Verify scanner handles malformed files without crashing.
 
-        The binary patterns were removed, but the regex CVE patterns should still
-        catch actual exploitation attempts that require COMBINATIONS of sklearn + dangerous ops.
+        This test ensures that removing binary patterns doesn't break the scanner's
+        ability to process files, even if they contain suspicious-looking text strings.
+        This is NOT a CVE detection test (that would require valid pickle format).
         """
-        # Create a pickle that mimics CVE exploitation (sklearn + dangerous operation)
-        # This is a benign test case but structured like an exploit
-        exploit_like_content = b"""sklearn.linear_model.LogisticRegression joblib.load os.system"""
+        # Create a file with suspicious text (not a valid pickle)
+        suspicious_content = b"""sklearn.linear_model.LogisticRegression joblib.load os.system"""
 
-        exploit_path = tmp_path / "exploit_like.pkl"
-        with open(exploit_path, "wb") as f:
-            f.write(exploit_like_content)
+        test_path = tmp_path / "malformed.pkl"
+        with open(test_path, "wb") as f:
+            f.write(suspicious_content)
 
-        # Scan the file
-        result = scan_file(str(exploit_path))
+        # Scan the file - should not crash
+        result = scan_file(str(test_path))
 
-        # The regex CVE patterns should catch combinations like "sklearn.*joblib.*os.system"
-        # We expect some kind of warning/critical finding
-        has_security_finding = any(
-            issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING] for issue in result.issues
-        )
-
-        # This test validates that removing binary patterns doesn't break CVE detection
-        # Note: The exact detection depends on whether the content forms a valid exploit pattern
-        # This is more of a smoke test to ensure the scanner still runs and detects issues
-        assert result is not None, "Scanner should still process the file"
+        # This is a robustness test, not a CVE detection test
+        # We just verify the scanner processes the file without errors
+        assert result is not None, "Scanner should still process the file without crashing"
 
 
 @pytest.mark.skipif(not HAS_SKLEARN, reason="sklearn not installed")

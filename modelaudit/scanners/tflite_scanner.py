@@ -58,6 +58,8 @@ class TFLiteScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"file_size": len(data), "minimum_size": 8},
+                    why="TFLite files require a minimum of 8 bytes (4-byte magic + 4-byte identifier). "
+                    "Undersized files prevent safe parsing and may indicate corruption or truncation.",
                 )
                 result.finish(success=False)
                 return result
@@ -70,7 +72,7 @@ class TFLiteScanner(BaseScanner):
                     message="File does not have valid TFLite magic bytes (expected 'TFL3')",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"magic_bytes": data[:4].hex() if len(data) >= 4 else ""},
+                    details={"magic_bytes": data[:4].hex()},
                     why="Valid TFLite files must start with 'TFL3' magic bytes. "
                     "Missing magic bytes may indicate file corruption or spoofing.",
                 )
