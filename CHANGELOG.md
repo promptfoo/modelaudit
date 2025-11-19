@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17] - 2025-11-19
+
 ### Fixed
 
 - **fix**: eliminate false positive WARNINGs on sklearn/joblib models (removed overly broad pattern matching)
@@ -31,9 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PMML 4.x files with namespaces like `{http://www.dmg.org/PMML-4_4}PMML` now recognized
   - Strips namespace prefix before comparing tag name
 - **fix**: add validation to prevent TFLite scanner crashes on malformed files
-  - Pre-validates file size (minimum 8 bytes) and magic bytes ("TFL3") before parsing
+  - Pre-validates magic bytes ("TFL3") before parsing
   - Prevents buffer overflow crashes: "unpack_from requires a buffer of at least X bytes"
-  - Added security rationale ("why" field) to file size and magic bytes checks
+  - Added security rationale ("why" field) to magic bytes check
 
 ## [0.2.16] - 2025-11-04
 
