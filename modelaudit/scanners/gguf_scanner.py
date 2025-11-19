@@ -121,7 +121,7 @@ class GgufScanner(BaseScanner):
                         name="File Format Recognition",
                         passed=False,
                         message=f"Unrecognized file format: {magic!r}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"magic_bytes": magic.hex()},
                     )
@@ -132,7 +132,7 @@ class GgufScanner(BaseScanner):
                 name="GGUF/GGML File Scan",
                 passed=False,
                 message=f"Error scanning GGUF/GGML file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -186,7 +186,7 @@ class GgufScanner(BaseScanner):
                 name="GGUF File Size Validation",
                 passed=False,
                 message="File too small to contain GGUF metadata",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 24},
             )
@@ -226,12 +226,12 @@ class GgufScanner(BaseScanner):
 
             result.metadata["metadata"] = metadata
         except Exception as e:
-            # Other parsing errors are critical (corruption, malformed data, etc.)
+            # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
                 name="GGUF Metadata Parsing",
                 passed=False,
                 message=f"GGUF metadata parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
             )
@@ -275,12 +275,12 @@ class GgufScanner(BaseScanner):
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
         except Exception as e:
-            # Other parsing errors are critical (corruption, malformed data, etc.)
+            # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
                 name="GGUF Tensor Parsing",
                 passed=False,
                 message=f"GGUF tensor parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
             )

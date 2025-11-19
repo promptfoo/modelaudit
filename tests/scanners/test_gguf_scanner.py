@@ -137,7 +137,7 @@ def test_gguf_scanner_large_kv_count(tmp_path):
     path = tmp_path / "bad.gguf"
     _write_minimal_gguf(path, n_kv=2**31)
     result = GgufScanner().scan(str(path))
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
     # Should detect parsing error due to impossibly large KV count
     assert "parse error" in str(result.issues[0].message).lower() or "invalid" in str(result.issues[0].message).lower()
 
@@ -152,7 +152,7 @@ def test_gguf_scanner_large_tensor_count(tmp_path):
         f.write(struct.pack("<Q", 0))  # kv count
 
     result = GgufScanner().scan(str(path))
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_gguf_scanner_truncated_file(tmp_path):
@@ -165,7 +165,7 @@ def test_gguf_scanner_truncated_file(tmp_path):
         f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
 
     result = GgufScanner().scan(str(path))
-    assert not result.success or any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert not result.success or any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_gguf_scanner_suspicious_key_paths(tmp_path):
@@ -198,7 +198,7 @@ def test_gguf_scanner_string_length_security(tmp_path):
         # File ends here, should trigger error
 
     result = GgufScanner().scan(str(path))
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_ggml_scanner_basic(tmp_path):

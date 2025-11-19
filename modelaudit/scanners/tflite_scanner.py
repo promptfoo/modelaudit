@@ -37,7 +37,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite Library Check",
                 passed=False,
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"required_package": "tflite"},
             )
@@ -55,7 +55,7 @@ class TFLiteScanner(BaseScanner):
                     name="TFLite Magic Bytes Check",
                     passed=False,
                     message="File does not have valid TFLite magic bytes (expected 'TFL3')",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"magic_bytes": data[:4].hex()},
                     why="Valid TFLite files must start with 'TFL3' magic bytes. "
@@ -70,7 +70,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite File Parse",
                 passed=False,
                 message=f"Invalid TFLite file or parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
