@@ -248,6 +248,17 @@ def test_validate_file_type(tmp_path):
     bad_gguf.write_bytes(b"FAKE" + b"\x00" * 20)
     assert validate_file_type(str(bad_gguf)) is False
 
+    # NumPy .npz file (ZIP archive by design)
+    npz_path = tmp_path / "arrays.npz"
+    # .npz files are ZIP archives - this is correct, not spoofing
+    npz_path.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+    assert validate_file_type(str(npz_path)) is True
+
+    # NumPy .npy file should have numpy magic
+    npy_path = tmp_path / "array.npy"
+    npy_path.write_bytes(b"\x93NUMPY" + b"\x00" * 20)
+    assert validate_file_type(str(npy_path)) is True
+
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"
     small_file.write_bytes(b"hi")

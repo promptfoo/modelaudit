@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **fix**: eliminate false positive WARNINGs on sklearn/joblib models (removed overly broad pattern matching)
+  - Removed `b"sklearn"`, `b"NumpyArrayWrapper"`, and `b"numpy_pickle"` from binary pattern detection
+  - These patterns flagged ALL legitimate sklearn/joblib models (100% false positive rate)
+  - Regex CVE patterns still detect actual exploits requiring dangerous combinations
+  - Reduces false positive WARNING rate by 77% (10 out of 13 WARNINGs eliminated)
+- **fix**: NEWOBJ/OBJ/INST opcodes now recognize safe ML classes (eliminates sklearn model false positives)
+  - Applied same safety logic as REDUCE opcode: check if class is in ML_SAFE_GLOBALS allowlist
+  - sklearn models like LogisticRegression now correctly identified as INFO instead of WARNING
+  - Added support for nested sklearn modules (e.g., sklearn.linear_model.\_logistic)
+  - Added joblib.numpy_pickle.NumpyArrayWrapper and dtype.dtype to safe class list
+- **fix**: handle joblib protocol mismatches gracefully (protocol 4 files using protocol 5 opcodes)
+  - joblib files may declare protocol 4 but use protocol 5 opcodes like READONLY_BUFFER (0x0f)
+  - Scanner now parses as much as possible before unknown opcodes, logs INFO instead of failing
+  - Eliminates false positive "Invalid pickle format - unrecognized opcode" WARNING on joblib files
+- **fix**: accept ZIP magic bytes for .npz files (NumPy compressed format is ZIP by design)
+  - .npz files ARE ZIP archives containing multiple .npy files (numpy.savez format)
+  - Now accepts both "zip" and "numpy" header formats for .npz extension
+  - Fixed case-sensitivity bug: MODEL.NPZ, model.Npz now handled correctly
+- **fix**: handle XML namespaces in PMML root element validation
+  - PMML 4.x files with namespaces like `{http://www.dmg.org/PMML-4_4}PMML` now recognized
+  - Strips namespace prefix before comparing tag name
+- **fix**: add validation to prevent TFLite scanner crashes on malformed files
+  - Pre-validates file size (minimum 8 bytes) and magic bytes ("TFL3") before parsing
+  - Prevents buffer overflow crashes: "unpack_from requires a buffer of at least X bytes"
+  - Added security rationale ("why" field) to file size and magic bytes checks
+
 ## [0.2.16] - 2025-11-04
 
 ### Added
