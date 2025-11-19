@@ -82,7 +82,7 @@ class KerasH5Scanner(BaseScanner):
                 name="H5PY Library Check",
                 passed=False,
                 message="h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "h5py"},
             )
@@ -145,7 +145,7 @@ class KerasH5Scanner(BaseScanner):
                         name="Model Config Type Validation",
                         passed=False,
                         message=f"Invalid model config type: expected dict, got {type(model_config).__name__}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
@@ -158,7 +158,7 @@ class KerasH5Scanner(BaseScanner):
                         name="Custom Objects Security Check",
                         passed=False,
                         message="Model contains custom objects which could contain arbitrary code",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{self.current_file_path} (model_config)",
                         details={"custom_objects": custom_objects_list},
                     )
@@ -224,7 +224,7 @@ class KerasH5Scanner(BaseScanner):
                     name="Layers Type Validation",
                     passed=False,
                     message=f"Invalid layers type: expected list, got {type(layers_value).__name__}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
                 )
@@ -239,7 +239,7 @@ class KerasH5Scanner(BaseScanner):
                     name="Layer Type Validation",
                     passed=False,
                     message=f"Invalid layer type: expected dict, got {type(layer).__name__}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"actual_type": type(layer).__name__, "expected_type": "dict"},
                 )

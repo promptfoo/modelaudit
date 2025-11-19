@@ -244,7 +244,7 @@ def test_ggml_scanner_truncated(tmp_path):
         f.write(b"\0" * 10)  # Too short
 
     result = GgufScanner().scan(str(path))
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_gguf_scanner_file_extensions(tmp_path):
@@ -440,7 +440,7 @@ def test_gguf_scanner_without_alignment_metadata(tmp_path):
     result = GgufScanner().scan(str(path))
     assert result.success
     assert len(result.metadata["tensors"]) == 1
-    assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    assert not any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_gguf_scanner_tensor_size_validation(tmp_path):

@@ -299,7 +299,7 @@ class GgufScanner(BaseScanner):
                 name="Tensor Data Section Bounds",
                 passed=False,
                 message="Tensor data start exceeds file size",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"tensor_data_start": tensor_data_start, "file_size": file_size},
             )
@@ -423,7 +423,7 @@ class GgufScanner(BaseScanner):
                 name="GGML File Size Validation",
                 passed=False,
                 message="File too small to be valid GGML",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 32},
             )
@@ -437,7 +437,7 @@ class GgufScanner(BaseScanner):
                     name="GGML Header Integrity Check",
                     passed=False,
                     message="Truncated GGML header",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"header_bytes_read": len(version_bytes), "expected": 4},
                 )

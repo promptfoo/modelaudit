@@ -37,7 +37,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite Library Check",
                 passed=False,
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "tflite"},
             )

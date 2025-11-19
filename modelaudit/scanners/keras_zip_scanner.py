@@ -91,7 +91,7 @@ class KerasZipScanner(BaseScanner):
                         name="Keras ZIP Format Check",
                         passed=False,
                         message="No config.json found in Keras ZIP file",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"files": zf.namelist()},
                     )
