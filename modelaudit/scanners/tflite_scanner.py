@@ -49,21 +49,6 @@ class TFLiteScanner(BaseScanner):
                 data = f.read()
                 result.bytes_scanned = len(data)
 
-            # Validate minimum file size and magic bytes
-            if len(data) < 8:
-                result.add_check(
-                    name="TFLite File Size Check",
-                    passed=False,
-                    message=f"File too small to be valid TFLite model ({len(data)} bytes, minimum 8 required)",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"file_size": len(data), "minimum_size": 8},
-                    why="TFLite files require a minimum of 8 bytes (4-byte magic + 4-byte identifier). "
-                    "Undersized files prevent safe parsing and may indicate corruption or truncation.",
-                )
-                result.finish(success=False)
-                return result
-
             # Check for TFLite magic bytes "TFL3"
             if not data.startswith(b"TFL3"):
                 result.add_check(
