@@ -1098,7 +1098,7 @@ class BaseScanner(ABC):
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
                         ),
-                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        severity=IssueSeverity.INFO,  # Informational - format mismatch not necessarily a security issue
                         location=path,
                         details={
                             "header_format": header_format,

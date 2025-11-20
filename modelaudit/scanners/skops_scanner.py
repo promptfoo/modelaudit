@@ -281,7 +281,7 @@ class SkopsScanner(BaseScanner):
                     name="Skops File Format Check",
                     passed=False,
                     message="File does not appear to be a valid skops file (not a ZIP archive)",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"magic_bytes": magic.hex()},
                 )
@@ -301,7 +301,7 @@ class SkopsScanner(BaseScanner):
                         message=(
                             f"Suspicious: Archive contains {len(file_list)} files (max: {self.max_files_in_archive})"
                         ),
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={
                             "file_count": len(file_list),
@@ -336,7 +336,7 @@ class SkopsScanner(BaseScanner):
                 name="Skops File Format Check",
                 passed=False,
                 message="Invalid ZIP file - may be corrupted or malicious",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
             )
             result.finish(success=False)

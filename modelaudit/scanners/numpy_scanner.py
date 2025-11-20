@@ -129,7 +129,7 @@ class NumPyScanner(BaseScanner):
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for scanning .npy files",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"numpy_version": NUMPY_VERSION},
             )
@@ -177,7 +177,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Magic String Validation",
                             passed=False,
                             message="Invalid NumPy file magic",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"expected": "\x93NUMPY", "found": magic.hex()},
                         )
@@ -212,7 +212,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Header Read",
                             passed=False,
                             message=f"Failed to read NumPy array header: {header_error}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
                         )
@@ -293,7 +293,7 @@ class NumPyScanner(BaseScanner):
                             name="File Integrity Check",
                             passed=False,
                             message="File size does not match header information",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "expected_size": expected_size,
