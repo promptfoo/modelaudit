@@ -22,7 +22,7 @@ class MockScanner(BaseScanner):
             return path_check
 
         # Add a test issue
-        result.add_issue(
+        result._add_issue(
             "Test issue",
             severity=IssueSeverity.INFO,
             location=path,
@@ -195,9 +195,12 @@ def test_scanner_implementation(tmp_path):
     assert isinstance(result, ScanResult)
     assert result.scanner_name == "test_scanner"
     assert result.success is True
-    assert len(result.issues) == 1
-    assert result.issues[0].message == "Test issue"
-    assert result.issues[0].severity == IssueSeverity.INFO
+    # INFO severity creates passed checks, not issues
+    assert len(result.issues) == 0
+    assert len(result.checks) == 1
+    assert result.checks[0].message == "Test issue"
+    assert result.checks[0].severity == IssueSeverity.INFO
+    assert result.checks[0].status == CheckStatus.PASSED
     assert result.bytes_scanned == len(b"test content")
 
 
@@ -362,7 +365,7 @@ def test_whitelist_downgrade_warning_to_info():
 
     # Create a result and add a warning issue
     result = scanner._create_result()
-    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
 
     # Should be downgraded to INFO
     assert len(result.issues) == 1
@@ -390,7 +393,7 @@ def test_whitelist_downgrade_critical_to_info():
 
     # Create a result and add a critical issue
     result = scanner._create_result()
-    result.add_issue("Test critical", severity=IssueSeverity.CRITICAL)
+    result._add_issue("Test critical", severity=IssueSeverity.CRITICAL)
 
     # Should be downgraded to INFO
     assert len(result.issues) == 1
@@ -418,12 +421,15 @@ def test_whitelist_no_downgrade_info():
 
     # Create a result and add an info issue
     result = scanner._create_result()
-    result.add_issue("Test info", severity=IssueSeverity.INFO)
+    result._add_issue("Test info", severity=IssueSeverity.INFO)
 
-    # Should remain INFO
-    assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
-    assert result.issues[0].details.get("whitelist_downgrade") is None
+    # INFO severity creates passed checks, not issues
+    assert len(result.issues) == 0
+    assert len(result.checks) == 1
+    assert result.checks[0].severity == IssueSeverity.INFO
+    assert result.checks[0].status == CheckStatus.PASSED
+    # INFO doesn't get downgraded (already informational)
+    assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
 def test_whitelist_disabled():
@@ -445,7 +451,7 @@ def test_whitelist_disabled():
 
     # Create a result and add a warning issue
     result = scanner._create_result()
-    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
 
     # Should NOT be downgraded because whitelist is disabled
     assert len(result.issues) == 1
@@ -467,7 +473,7 @@ def test_whitelist_unknown_model():
 
     # Create a result and add a warning issue
     result = scanner._create_result()
-    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
 
     # Should NOT be downgraded
     assert len(result.issues) == 1
@@ -489,7 +495,7 @@ def test_whitelist_no_model_id():
 
     # Create a result and add a warning issue
     result = scanner._create_result()
-    result.add_issue("Test warning", severity=IssueSeverity.WARNING)
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
 
     # Should NOT be downgraded
     assert len(result.issues) == 1

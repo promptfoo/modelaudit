@@ -46,7 +46,7 @@ class SlowTestScanner(BaseScanner):
 
             # Add some fake issues
             if bytes_scanned % 5000 == 0:
-                result.add_issue(
+                result._add_issue(
                     f"Test issue at byte {bytes_scanned}",
                     severity=IssueSeverity.WARNING,
                     location=path,
