@@ -1197,8 +1197,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         file_size = os.path.getsize(path)
     except OSError as e:
         sr = ScanResult(scanner_name="error")
-        sr.add_issue(
-            f"Error checking file size: {e}",
+        sr.add_check(
+            name="File Size Check",
+            passed=False,
+            message=f"Error checking file size: {e}",
             severity=IssueSeverity.WARNING,
             details={"error": str(e), "path": path},
         )
@@ -1213,8 +1215,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
     if not use_extreme_handler and max_file_size > 0 and file_size > max_file_size:
         sr = ScanResult(scanner_name="size_check")
-        sr.add_issue(
-            f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+        sr.add_check(
+            name="File Size Limit Check",
+            passed=False,
+            message=f"File too large to scan: {file_size} bytes (max: {max_file_size})",
             severity=IssueSeverity.WARNING,
             details={
                 "file_size": file_size,
@@ -1312,8 +1316,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         except TimeoutError as e:
             # Handle timeout gracefully
             result = ScanResult(scanner_name=preferred_scanner.name)
-            result.add_issue(
-                f"Scan timeout: {e}",
+            result.add_check(
+                name="Scan Timeout Check",
+                passed=False,
+                message=f"Scan timeout: {e}",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"timeout": config.get("timeout", 3600), "error": str(e)},
@@ -1340,8 +1346,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             except TimeoutError as e:
                 # Handle timeout gracefully
                 result = ScanResult(scanner_name=scanner_class.name)
-                result.add_issue(
-                    f"Scan timeout: {e}",
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scan timeout: {e}",
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"timeout": config.get("timeout", 3600), "error": str(e)},
@@ -1350,8 +1358,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_issue(
-                f"Unknown or unhandled format: {format_}",
+            sr.add_check(
+                name="Format Detection",
+                passed=False,
+                message=f"Unknown or unhandled format: {format_}",
                 severity=IssueSeverity.DEBUG,
                 details={"format": format_, "path": path},
             )
@@ -1362,8 +1372,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
         # For validation failures, use the actual magic format
         detail_header_format = magic_format if not file_type_valid else header_format
-        result.add_issue(
-            discrepancy_msg + " Using header-based detection.",
+        result.add_check(
+            name="Format Validation",
+            passed=False,
+            message=discrepancy_msg + " Using header-based detection.",
             severity=severity,
             location=path,
             details={
