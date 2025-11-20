@@ -741,7 +741,7 @@ class PyTorchZipScanner(BaseScanner):
                     # Found a reference to torch version - try to get the value
                     # Look for subsequent opcodes that might contain the version string
                     for j in range(i + 1, min(i + 10, len(opcodes))):
-                        next_opcode, next_arg, next_pos = opcodes[j]
+                        next_opcode, next_arg, _next_pos = opcodes[j]
                         if (
                             next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
                             and next_arg
