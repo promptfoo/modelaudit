@@ -1,4 +1,5 @@
 import pickle
+import time
 import zipfile
 
 from modelaudit.scanners.base import IssueSeverity
@@ -169,8 +170,6 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
 
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
-    import time
-
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
