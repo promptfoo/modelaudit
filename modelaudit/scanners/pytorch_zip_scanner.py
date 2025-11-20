@@ -346,7 +346,6 @@ class PyTorchZipScanner(BaseScanner):
             except Exception as e:
                 # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
-                pass
 
         # Create single aggregated checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
