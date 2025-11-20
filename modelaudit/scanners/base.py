@@ -214,8 +214,7 @@ class ScanResult:
         This method is deprecated and should not be used in new code.
         It exists only for backward compatibility with unmigrated scanner code.
         """
-        # Determine if this should be a passed or failed check based on severity
-        # INFO/DEBUG are informational (passed), WARNING/CRITICAL are failures
+        # INFO/DEBUG are informational (passed checks), WARNING/CRITICAL are failures
         passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
 
         self.add_check(
@@ -1209,7 +1208,7 @@ class BaseScanner(ABC):
 
         if self.max_file_read_size and self.max_file_read_size > 0:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
             self._path_validation_result.add_check(
                 name="File Size Limit",
@@ -1223,7 +1222,7 @@ class BaseScanner(ABC):
             )
         else:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
 
         return None
