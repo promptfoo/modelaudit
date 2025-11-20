@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import tempfile
 import zipfile
@@ -7,6 +8,8 @@ from typing import Any, ClassVar
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+
+logger = logging.getLogger(__name__)
 
 
 class PyTorchZipScanner(BaseScanner):
@@ -309,6 +312,14 @@ class PyTorchZipScanner(BaseScanner):
 
         for name in safe_entries:
             try:
+                # Skip numeric tensor data files in archive/data/ (e.g., archive/data/0, archive/data/1)
+                # These are binary weight files that cause performance issues when scanned
+                # Still scan non-numeric files that could contain code (e.g., .py, .json, .pkl)
+                if name.startswith("archive/data/"):
+                    basename = os.path.basename(name)
+                    if basename.isdigit():
+                        continue
+
                 with zip_file.open(name, "r") as zf:
                     # Collect all data from this file for analysis
                     chunks: list[bytes] = []
@@ -332,8 +343,9 @@ class PyTorchZipScanner(BaseScanner):
                         all_jit_findings.extend(jit_findings)
                         all_network_findings.extend(network_findings)
 
-            except Exception:
+            except Exception as e:
                 # Skip files that can't be read
+                logger.debug(f"Exception reading {name}: {e}")
                 pass
 
         # Create single aggregated checks for the entire ZIP file
