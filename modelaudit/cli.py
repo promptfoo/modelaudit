@@ -103,7 +103,7 @@ class DefaultCommandGroup(click.Group):
         # Simply delegate to parent's get_command - no default logic here
         return click.Group.get_command(self, ctx, cmd_name)
 
-    def resolve_command(
+    def resolve_command(  # type: ignore[override]
         self, ctx: click.Context, args: list[str]
     ) -> tuple[str | None, click.Command | None, list[str]]:
         """Resolve command, using 'scan' as default when paths are provided"""

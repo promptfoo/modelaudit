@@ -629,9 +629,7 @@ def test_whitelist_apply_downgrade_helper_none_details():
     )
 
     # Test with None details
-    new_severity, new_details = scanner._apply_whitelist_downgrade(
-        IssueSeverity.CRITICAL, None
-    )
+    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.CRITICAL, None)
 
     assert new_severity == IssueSeverity.INFO
     assert new_details is not None
@@ -657,9 +655,7 @@ def test_whitelist_apply_downgrade_helper_existing_details():
 
     # Test with existing details
     existing_details = {"custom_field": "value"}
-    new_severity, new_details = scanner._apply_whitelist_downgrade(
-        IssueSeverity.WARNING, existing_details
-    )
+    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.WARNING, existing_details)
 
     assert new_severity == IssueSeverity.INFO
     assert new_details.get("whitelist_downgrade") is True
