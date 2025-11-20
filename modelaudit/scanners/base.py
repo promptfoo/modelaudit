@@ -158,6 +158,8 @@ class ScanResult:
         # Apply whitelist downgrading logic for failed checks if scanner is available
         # This must happen BEFORE creating the Check to ensure consistent severity
         if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
             severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
 
         check = Check(

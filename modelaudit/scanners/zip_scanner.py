@@ -163,7 +163,7 @@ class ZipScanner(BaseScanner):
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(
+                    _target_resolved, target_safe = sanitize_archive_path(
                         target,
                         target_base,
                     )

@@ -97,7 +97,7 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
 
         # Verify scan was called with the directory path, not the file path
         mock_scan.assert_called_once()
-        args, kwargs = mock_scan.call_args
+        args, _kwargs = mock_scan.call_args
         assert args[0] == temp_dir  # Should be directory, not file
 
 
