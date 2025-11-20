@@ -19,7 +19,9 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
     def fake_scan_pickle_bytes(self, file_obj, size):
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
-        result.add_issue("scanner issue", IssueSeverity.WARNING, location="memory")
+        result.add_check(
+            name="Test Check", passed=False, message="scanner issue", severity=IssueSeverity.WARNING, location="memory"
+        )
         result.metadata["scanner_used"] = True
         result.bytes_scanned = size
         result.finish(success=True)
@@ -50,7 +52,9 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
     def fake_scan_pickle_bytes(self, file_obj, size):
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
-        result.add_issue("scanner issue", IssueSeverity.WARNING, location="memory")
+        result.add_check(
+            name="Test Check", passed=False, message="scanner issue", severity=IssueSeverity.WARNING, location="memory"
+        )
         result.finish(success=True)
         return result
 

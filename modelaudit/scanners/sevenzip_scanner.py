@@ -62,7 +62,7 @@ class SevenZipScanner(BaseScanner):
         # Check if py7zr is available
         if not HAS_PY7ZR:
             result = self._create_result()
-            result.add_issue(
+            result._add_issue(
                 message=(
                     "py7zr library not installed. "
                     "Install with 'pip install py7zr' or 'pip install modelaudit[sevenzip]'"
@@ -103,7 +103,7 @@ class SevenZipScanner(BaseScanner):
 
                 # Check for zip bomb protection
                 if len(file_names) > self.max_entries:
-                    result.add_issue(
+                    result._add_issue(
                         message=f"7z archive contains {len(file_names)} files, exceeding limit of {self.max_entries}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
@@ -195,7 +195,7 @@ class SevenZipScanner(BaseScanner):
             temp_base = "/tmp/modelaudit_7z"  # Placeholder base directory
             sanitized_path, is_safe = sanitize_archive_path(file_name, temp_base)
             if not is_safe:
-                result.add_issue(
+                result._add_issue(
                     message=f"Potential path traversal attempt in archive entry: {file_name}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}:{file_name}",
@@ -223,7 +223,7 @@ class SevenZipScanner(BaseScanner):
                             # Check extracted file size
                             extracted_size = os.path.getsize(extracted_path)
                             if extracted_size > self.max_extract_size:
-                                result.add_issue(
+                                result._add_issue(
                                     message=f"Extracted file {file_name} is too large ({extracted_size} bytes)",
                                     severity=IssueSeverity.WARNING,
                                     location=f"{archive_path}:{file_name}",
