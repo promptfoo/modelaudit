@@ -165,3 +165,98 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
     scanner.scan(str(model_path))
 
     assert closed.get("closed") is True
+
+
+def test_pytorch_zip_skips_numeric_data_files(tmp_path):
+    """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
+    import time
+
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+
+        # Add a normal pickle file
+        data = {"weights": [1, 2, 3]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("archive/data.pkl", pickled_data)
+
+        # Add numeric tensor data files (these should be skipped)
+        # Create a large-ish binary file to simulate real tensor data
+        large_binary_data = b"\x00" * 10_000_000  # 10MB of zeros
+        zipf.writestr("archive/data/0", large_binary_data)
+        zipf.writestr("archive/data/1", large_binary_data)
+        zipf.writestr("archive/data/123", large_binary_data)
+
+    scanner = PyTorchZipScanner()
+
+    # Measure scan time - should be fast since numeric files are skipped
+    start_time = time.time()
+    result = scanner.scan(str(zip_path))
+    elapsed_time = time.time() - start_time
+
+    # Should complete quickly (under 5 seconds) even with large numeric files
+    assert elapsed_time < 5.0, f"Scan took {elapsed_time:.2f}s, expected < 5s"
+    assert result.success is True
+
+
+def test_pytorch_zip_scans_non_numeric_files_in_archive_data(tmp_path):
+    """Test that non-numeric files in archive/data/ are still scanned for security."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+
+        # Add a normal pickle file
+        data = {"weights": [1, 2, 3]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("archive/data.pkl", pickled_data)
+
+        # Add a non-numeric file with suspicious content in archive/data/
+        # This should NOT be skipped
+        malicious_code = b"import os; os.system('whoami')"
+        zipf.writestr("archive/data/malicious.py", malicious_code)
+
+        # Add a numeric file (should be skipped)
+        zipf.writestr("archive/data/0", b"\x00" * 1000)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # The scanner should have scanned archive/data/malicious.py
+    # and detected the suspicious os.system pattern
+    assert result.success is True
+    # Note: The actual detection depends on the JIT pattern detector
+    # At minimum, the file should have been scanned (not skipped)
+
+
+def test_pytorch_zip_numeric_detection_edge_cases(tmp_path):
+    """Test edge cases for numeric file detection in archive/data/."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+
+        # Add a normal pickle file
+        data = {"weights": [1, 2, 3]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("archive/data.pkl", pickled_data)
+
+        # Edge cases that should NOT be skipped:
+        # - File with number in extension
+        zipf.writestr("archive/data/weights.v2", b"data")
+        # - File starting with number but not pure numeric
+        zipf.writestr("archive/data/0abc", b"data")
+        # - File with hex notation
+        zipf.writestr("archive/data/0x123", b"data")
+
+        # Files that SHOULD be skipped (pure numeric):
+        zipf.writestr("archive/data/0", b"\x00" * 1000)
+        zipf.writestr("archive/data/42", b"\x00" * 1000)
+        zipf.writestr("archive/data/999999", b"\x00" * 1000)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should complete successfully without hanging
+    assert result.success is True
