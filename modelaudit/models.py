@@ -512,18 +512,26 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Dictionary-like access provided by DictCompatMixin
 
     def _finalize_checks(self) -> None:
-        """Calculate check statistics."""
+        """Calculate check statistics.
+
+        Only counts security-relevant checks (excludes failed INFO/DEBUG from total).
+        This ensures the success rate reflects actual security status, not informational notes.
+        """
         from .scanners.base import CheckStatus, IssueSeverity
 
-        self.total_checks = len(self.checks)
-        self.passed_checks = sum(1 for c in self.checks if c.status == CheckStatus.PASSED)
-        # Only count WARNING and CRITICAL severity checks as failures
-        # INFO and DEBUG are informational - they should not count as failures
-        self.failed_checks = sum(
-            1
-            for c in self.checks
-            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
-        )
+        # Exclude only failed INFO/DEBUG checks from success rate calculation
+        # Include: passed checks, skipped checks, and failed WARNING/CRITICAL checks
+        def is_failed_info_or_debug(check):
+            if check.status != CheckStatus.FAILED:
+                return False
+            # Only exclude failed INFO/DEBUG checks
+            return check.severity in (IssueSeverity.INFO, IssueSeverity.DEBUG)
+
+        security_checks = [c for c in self.checks if not is_failed_info_or_debug(c)]
+
+        self.total_checks = len(security_checks)
+        self.passed_checks = sum(1 for c in security_checks if c.status == CheckStatus.PASSED)
+        self.failed_checks = sum(1 for c in security_checks if c.status == CheckStatus.FAILED)
 
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues based on message, severity, and location."""

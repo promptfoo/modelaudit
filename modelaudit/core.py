@@ -354,10 +354,31 @@ def _update_result_counts(
         consolidated_checks: List of consolidated checks
         original_count: Original number of checks before consolidation
     """
-    total_checks = len(consolidated_checks)
-    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
+    from .scanners.base import IssueSeverity
+
+    # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
+    # Exclude failed INFO/DEBUG checks from success rate (they're informational)
+    def is_failed_info_or_debug(check):
+        if check.get("status") != "failed":
+            return False
+        severity = check.get("severity", "")
+        # Check both string and enum values for compatibility
+        return severity in ("info", "debug", IssueSeverity.INFO.value, IssueSeverity.DEBUG.value)
+
+    # Exclude only failed INFO/DEBUG checks from success rate
+    security_checks = [c for c in consolidated_checks if not is_failed_info_or_debug(c)]
+
+    total_checks = len(security_checks)
+    passed_checks = sum(1 for c in security_checks if c.get("status") == "passed")
+    failed_checks = sum(1 for c in security_checks if c.get("status") == "failed")
     skipped_checks = total_checks - passed_checks - failed_checks
+
+    # Debug logging
+    info_debug_excluded = len(consolidated_checks) - len(security_checks)
+    logger.debug(
+        f"Check statistics: {total_checks} total ({info_debug_excluded} INFO/DEBUG excluded), "
+        f"{passed_checks} passed, {failed_checks} failed"
+    )
 
     # Validate counts make sense
     if passed_checks + failed_checks + skipped_checks != total_checks:
