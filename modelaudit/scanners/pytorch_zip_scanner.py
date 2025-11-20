@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 import tempfile
 import zipfile
 from typing import Any, ClassVar
@@ -312,13 +313,9 @@ class PyTorchZipScanner(BaseScanner):
 
         for name in safe_entries:
             try:
-                # Skip numeric tensor data files in archive/data/ (e.g., archive/data/0, archive/data/1)
-                # These are binary weight files that cause performance issues when scanned
-                # Still scan non-numeric files that could contain code (e.g., .py, .json, .pkl)
-                if name.startswith("archive/data/"):
-                    basename = os.path.basename(name)
-                    if basename.isdigit():
-                        continue
+                # Skip numeric tensor data files to support different versions of PyTorch ZIP files
+                if re.match(r"^(?:.+/)?data/\d+$", name):
+                    continue
 
                 with zip_file.open(name, "r") as zf:
                     # Collect all data from this file for analysis
