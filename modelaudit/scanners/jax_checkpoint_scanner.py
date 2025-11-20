@@ -309,7 +309,7 @@ class JaxCheckpointScanner(BaseScanner):
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for checkpoint analysis",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_library": "numpy"},
             )
@@ -336,7 +336,7 @@ class JaxCheckpointScanner(BaseScanner):
                     name="NumPy Array Shape Validation",
                     passed=False,
                     message="Invalid array shape with non-positive dimensions",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"shape": array.shape},
                 )

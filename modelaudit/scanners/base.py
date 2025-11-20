@@ -155,6 +155,13 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        # This must happen BEFORE creating the Check to ensure consistent severity
+        if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
         check = Check(
             name=name,
             status=status,
@@ -1103,7 +1110,7 @@ class BaseScanner(ABC):
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
                         ),
-                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        severity=IssueSeverity.INFO,  # Informational - format mismatch not necessarily a security issue
                         location=path,
                         details={
                             "header_format": header_format,

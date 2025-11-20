@@ -99,7 +99,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 name="TensorFlow Library Check",
                 passed=False,
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "tensorflow"},
             )

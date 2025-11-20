@@ -201,7 +201,7 @@ class TestDiskSpaceCheckingForCloud:
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
         # Test download failure
-        with pytest.raises(Exception, match="Cannot download from.*Insufficient disk space"):
+        with pytest.raises(Exception, match=r"Cannot download from.*Insufficient disk space"):
             download_from_cloud("s3://bucket/large-model.bin", use_cache=False)
 
         # Verify download was not attempted

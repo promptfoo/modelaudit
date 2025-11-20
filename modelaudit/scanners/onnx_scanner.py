@@ -85,7 +85,7 @@ class OnnxScanner(BaseScanner):
                 name="ONNX Library Check",
                 passed=False,
                 message="onnx package not installed, cannot scan ONNX files.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "onnx"},
             )
@@ -367,7 +367,7 @@ class OnnxScanner(BaseScanner):
                             name="Tensor Size Validation",
                             passed=False,
                             message=f"Tensor '{tensor.name}' data appears truncated",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{path} (tensor: {tensor.name})",
                             details={
                                 "expected_size": expected_size,

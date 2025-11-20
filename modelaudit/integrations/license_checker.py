@@ -563,7 +563,7 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
         warnings.append(
             {
                 "type": "license_warning",
-                "severity": "warning",
+                "severity": "info",
                 "message": f"Datasets with unspecified licenses detected "
                 f"({len(significant_unlicensed_datasets)} files). Verify data usage rights.",
                 "details": {
