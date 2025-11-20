@@ -529,13 +529,13 @@ def test_whitelist_downgrade_check_critical():
     assert result.issues[0].details.get("whitelist_downgrade") is True
     assert result.issues[0].details.get("original_severity") == "CRITICAL"
 
-    # Verify the Check exists
+    # Verify the Check exists and severity is also downgraded
     assert len(result.checks) == 1
     assert result.checks[0].name == "Test Security Check"
     assert result.checks[0].status == CheckStatus.FAILED
-    # This is the bug: Check severity should also be downgraded but isn't
-    # Commenting out the assertion that would fail with current code
-    # assert result.checks[0].severity == IssueSeverity.INFO
+    assert result.checks[0].severity == IssueSeverity.INFO
+    assert result.checks[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].details.get("original_severity") == "CRITICAL"
 
 
 def test_whitelist_downgrade_check_warning():
@@ -570,10 +570,13 @@ def test_whitelist_downgrade_check_warning():
     assert result.issues[0].details.get("whitelist_downgrade") is True
     assert result.issues[0].details.get("original_severity") == "WARNING"
 
-    # Verify the Check exists
+    # Verify the Check exists and severity is also downgraded
     assert len(result.checks) == 1
     assert result.checks[0].name == "Test Suspicious Pattern"
     assert result.checks[0].status == CheckStatus.FAILED
+    assert result.checks[0].severity == IssueSeverity.INFO
+    assert result.checks[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].details.get("original_severity") == "WARNING"
 
 
 def test_whitelist_no_downgrade_passed_check():

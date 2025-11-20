@@ -155,6 +155,11 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        # This must happen BEFORE creating the Check to ensure consistent severity
+        if not passed and self.scanner:
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
         check = Check(
             name=name,
             status=status,
@@ -172,10 +177,6 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
-
-            # Apply whitelist downgrading logic if scanner is available
-            if self.scanner:
-                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
 
             issue = Issue(
                 message=message,
