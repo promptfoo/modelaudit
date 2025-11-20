@@ -237,7 +237,7 @@ class TestModelSizeAndDiskSpace:
 
         # Test download failure with custom cache directory (this enables disk space checking)
         cache_dir = tmp_path / "custom_cache"
-        with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
+        with pytest.raises(Exception, match=r"Cannot download model.*Insufficient disk space"):
             download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify snapshot_download was not called
