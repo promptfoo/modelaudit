@@ -429,8 +429,8 @@ def download_model_streaming(
             if cache_dir is not None and download_path is not None:
                 # Use specific cache dir for local placement
                 local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
+                    repo_id,
+                    filename,
                     cache_dir=str(cache_dir / "huggingface"),
                     local_dir=str(download_path),
                     local_dir_use_symlinks=False,

@@ -155,6 +155,13 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        # This must happen BEFORE creating the Check to ensure consistent severity
+        if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
         check = Check(
             name=name,
             status=status,
@@ -172,6 +179,7 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
+
             issue = Issue(
                 message=message,
                 severity=severity,
@@ -209,15 +217,9 @@ class ScanResult:
             # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
 
-        # Apply whitelist logic if enabled and scanner is available
-        original_severity = severity
-        if self.scanner and self.scanner._should_apply_whitelist(severity):
-            severity = IssueSeverity.INFO
-            # Add note about whitelisting to the details
-            if details is None:
-                details = {}
-            details["whitelist_downgrade"] = True
-            details["original_severity"] = original_severity.name
+        # Apply whitelist downgrading logic if scanner is available
+        if self.scanner:
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
 
         issue = Issue(
             message=message,
@@ -419,6 +421,34 @@ class BaseScanner(ABC):
             return is_whitelisted_model(self.context.model_id)
 
         return False
+
+    def _apply_whitelist_downgrade(
+        self,
+        severity: IssueSeverity,
+        details: dict[str, Any] | None,
+    ) -> tuple[IssueSeverity, dict[str, Any]]:
+        """
+        Apply whitelist downgrading logic to severity and details.
+
+        Args:
+            severity: The original severity
+            details: The details dictionary (may be None)
+
+        Returns:
+            Tuple of (potentially modified severity, details dict)
+        """
+        original_severity = severity
+        if self._should_apply_whitelist(severity):
+            severity = IssueSeverity.INFO
+            # Add note about whitelisting to the details
+            if details is None:
+                details = {}
+            details["whitelist_downgrade"] = True
+            details["original_severity"] = original_severity.name
+        elif details is None:
+            details = {}
+
+        return severity, details
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
