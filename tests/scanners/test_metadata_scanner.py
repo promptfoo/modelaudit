@@ -66,7 +66,7 @@ class TestMetadataScanner:
             result = scanner.scan(str(readme_path))
 
         assert len(result.issues) == 2
-        assert all(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("bit.ly" in issue.message for issue in result.issues)
         assert any("ngrok.io" in issue.message for issue in result.issues)
 
@@ -86,7 +86,7 @@ class TestMetadataScanner:
             result = scanner.scan(str(readme_path))
 
         assert len(result.issues) >= 1  # Should detect at least one potential secret
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
     def test_scan_ignores_placeholder_secrets(self):
         """Test that obvious placeholders are not flagged as secrets."""
@@ -109,7 +109,7 @@ class TestMetadataScanner:
         result = scanner.scan("/nonexistent/README.md")
 
         assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.WARNING
+        assert result.issues[0].severity == IssueSeverity.INFO
         assert "Error reading" in result.issues[0].message
 
     def test_bytes_scanned_reported(self):

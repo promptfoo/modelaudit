@@ -44,7 +44,7 @@ class PaddleScanner(BaseScanner):
                 name="PaddlePaddle Library Check",
                 passed=False,
                 message="paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "paddlepaddle"},
             )

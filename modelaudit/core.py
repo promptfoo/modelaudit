@@ -619,7 +619,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 "Broken symlink encountered",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"error": str(e)},
                             )
@@ -828,7 +828,7 @@ def scan_model_directory_or_file(
                                 results,
                                 f"Total scan size limit exceeded: {results.bytes_scanned} bytes "
                                 f"(max: {max_total_size})",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=representative_file,
                                 details={"max_total_size": max_total_size},
                             )
@@ -843,7 +843,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.CRITICAL.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"exception_type": type(e).__name__},
                             )
@@ -955,7 +955,7 @@ def scan_model_directory_or_file(
                     _add_issue_to_model(
                         results,
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                        severity=IssueSeverity.WARNING.value,
+                        severity=IssueSeverity.INFO.value,
                         location=target,
                         details={"max_total_size": max_total_size},
                     )
@@ -975,7 +975,7 @@ def scan_model_directory_or_file(
         _add_issue_to_model(
             results,
             f"Error during scan: {e!s}",
-            severity=IssueSeverity.CRITICAL.value,
+            severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
         _add_error_asset_to_results(results, path)
@@ -1201,7 +1201,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             name="File Size Check",
             passed=False,
             message=f"Error checking file size: {e}",
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             details={"error": str(e), "path": path},
         )
         sr.finish(success=False)
@@ -1219,7 +1219,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             name="File Size Limit Check",
             passed=False,
             message=f"File too large to scan: {file_size} bytes (max: {max_file_size})",
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             details={
                 "file_size": file_size,
                 "max_file_size": max_file_size,
@@ -1320,7 +1320,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 name="Scan Timeout Check",
                 passed=False,
                 message=f"Scan timeout: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"timeout": config.get("timeout", 3600), "error": str(e)},
             )
@@ -1350,7 +1350,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     name="Scan Timeout Check",
                     passed=False,
                     message=f"Scan timeout: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"timeout": config.get("timeout", 3600), "error": str(e)},
                 )

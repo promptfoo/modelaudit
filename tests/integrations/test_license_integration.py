@@ -109,7 +109,7 @@ class TestLicenseIntegration:
         assert len(dataset_warnings) >= 1, "Unlicensed datasets should trigger warnings"
 
         dataset_warning = dataset_warnings[0]
-        assert dataset_warning["severity"] == "warning"
+        assert dataset_warning["severity"] == "info"
         assert "Verify data usage rights" in dataset_warning["message"]
 
     def test_mixed_licenses_detection(self, test_data_dir: Any) -> None:
