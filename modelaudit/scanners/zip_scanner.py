@@ -90,7 +90,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
             )
@@ -101,7 +101,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Scan",
                 passed=False,
                 message=f"Error scanning zip file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

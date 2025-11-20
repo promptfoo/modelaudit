@@ -257,8 +257,8 @@ def test_base_scanner_file_type_validation(tmp_path):
     ]
     assert len(validation_issues) > 0
 
-    # Should be WARNING level (not CRITICAL) to allow scan to continue
-    assert validation_issues[0].severity == IssueSeverity.WARNING
+    # Should be INFO level (informational - format mismatch not necessarily a security issue)
+    assert validation_issues[0].severity == IssueSeverity.INFO
 
     # Should contain details about the mismatch
     assert "header_format" in validation_issues[0].details

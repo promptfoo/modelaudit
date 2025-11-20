@@ -88,7 +88,7 @@ class PmmlScanner(BaseScanner):
                 name="PMML File Read",
                 passed=False,
                 message=f"Error reading file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -114,7 +114,7 @@ class PmmlScanner(BaseScanner):
                     name="PMML Text Decoding",
                     passed=False,
                     message=f"Failed to decode file as text: {e}",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
@@ -145,7 +145,7 @@ class PmmlScanner(BaseScanner):
                 name="XML Parse Validation",
                 passed=False,
                 message=f"Malformed XML: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
                 why=(

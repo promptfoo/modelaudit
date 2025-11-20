@@ -78,7 +78,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Size Check",
                         passed=False,
                         message="File too small to contain SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_len_bytes), "required": 8},
                     )
@@ -91,7 +91,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Length Validation",
                         passed=False,
                         message="Invalid SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"header_len": header_len, "max_allowed": file_size - 8},
                     )
@@ -112,7 +112,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Read",
                         passed=False,
                         message="Failed to read SafeTensors header",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_bytes), "expected": header_len},
                     )
@@ -124,7 +124,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Format Validation",
                         passed=False,
                         message="SafeTensors header does not start with '{'",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                     )
                     result.finish(success=False)
@@ -144,7 +144,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors JSON Parse",
                         passed=False,
                         message=f"Invalid JSON header: {e!s}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
                         why="SafeTensors header contained invalid JSON.",
@@ -170,7 +170,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Entry Type Validation",
                             passed=False,
                             message=f"Invalid tensor entry for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
                         )
@@ -185,7 +185,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Offset Type Validation",
                             passed=False,
                             message=f"Invalid data_offsets for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "tensor": name,
@@ -255,7 +255,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Offset Continuity Check",
                             passed=False,
                             message="Tensor data offsets have gaps or overlap",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"gap_at": begin, "expected": last_end},
                         )
@@ -277,7 +277,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Tensor Data Coverage Check",
                         passed=False,
                         message="Tensor data does not cover entire file",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"last_offset": last_end, "data_size": data_size},
                     )

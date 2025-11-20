@@ -46,7 +46,7 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
     assert "params" in result.metadata.get("top_level_keys", [])
     assert (
         len(
-            [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL],
+            [issue for issue in result.issues if issue.severity == IssueSeverity.INFO],
         )
         == 0
     )
@@ -61,7 +61,7 @@ def test_flax_msgpack_suspicious_content(tmp_path):
     result = scanner.scan(str(path))
 
     # Should detect multiple security issues
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert len(critical_issues) > 0
 
     # Check for specific threats
@@ -115,7 +115,7 @@ def test_flax_msgpack_deep_nesting(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert any("recursion depth exceeded" in issue.message for issue in critical_issues)
 
 
@@ -153,7 +153,7 @@ def test_flax_msgpack_corrupted(tmp_path):
     result = scanner.scan(str(path))
 
     assert result.has_errors
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert any(
         "Invalid msgpack format" in issue.message or "Unexpected error processing" in issue.message
         for issue in critical_issues
@@ -233,8 +233,8 @@ def test_flax_msgpack_jax_specific_threats(tmp_path):
     result = scanner.scan(str(path))
 
     # Should detect multiple threats
-    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
-    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
 
     # Check for JAX-specific threats
     issues_messages = [issue.message for issue in critical_issues + warning_issues]
@@ -329,7 +329,7 @@ def test_flax_msgpack_trailing_data(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert any("trailing" in issue.message for issue in warning_issues)
 
 

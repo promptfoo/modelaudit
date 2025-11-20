@@ -67,7 +67,7 @@ class SevenZipScanner(BaseScanner):
                     "py7zr library not installed. "
                     "Install with 'pip install py7zr' or 'pip install modelaudit[sevenzip]'"
                 ),
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "error_type": "missing_dependency",
@@ -141,7 +141,7 @@ class SevenZipScanner(BaseScanner):
                 name="7z File Format Validation",
                 passed=False,
                 message=f"Invalid 7z file format: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"error": str(e), "error_type": "invalid_format"},
             )
