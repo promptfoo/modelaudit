@@ -577,11 +577,11 @@ JINJA2_SSTI_PATTERNS = {
         r"['\"]\.join\(",  # String joining: ''.join([chr(x) for x in ...])
         # Attribute access bypasses
         r"\|attr\(",  # Jinja2 filter: |attr('__class__')
-        r"\[['\"]\w+['\"]\]",  # Bracket notation: ['__class__']
+        r"\[['\"]__\w+__['\"]\]",  # Bracket notation for dunder attrs: ['__class__'], ['__init__']
         r"getattr\s*\(",  # getattr(obj, '__class__')
         # String construction bypasses
         r"format\s*\(",  # String formatting
-        r"|format\(",  # Template string formatting
+        r"\|format\(",  # Template string formatting (Jinja2 pipe filter)
         r"f['\"].*\{",  # f-string formatting
         # Base64 and other encoding
         r"base64\.",  # Base64 encoding/decoding
