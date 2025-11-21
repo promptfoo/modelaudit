@@ -98,19 +98,19 @@ def test_liquidai_template_no_false_positives():
     config = {
         "tokenizer_class": "LlamaTokenizer",
         "chat_template": (
-            '{{- bos_token -}}'
+            "{{- bos_token -}}"
             '{%- set ns = namespace(system_prompt="") -%}'
             '{%- if messages[0]["role"] == "system" -%}'
             '  {%- set ns.system_prompt = messages[0]["content"] -%}'
-            '{%- endif -%}'
-            '{%- for message in messages -%}'
+            "{%- endif -%}"
+            "{%- for message in messages -%}"
             '  {{- "<|im_start|>" + message["role"] + "\\n" -}}'
             '  {%- set content = message["content"] -%}'
             '  {%- if message["role"] == "tool" -%}'
             '    {%- set content = "<|tool_response_start|>" + content + "<|tool_response_end|>" -%}'
-            '  {%- endif -%}'
+            "  {%- endif -%}"
             '  {{- content + "<|im_end|>\\n" -}}'
-            '{%- endfor -%}'
+            "{%- endfor -%}"
         ),
     }
 
@@ -150,6 +150,7 @@ def test_liquidai_template_no_false_positives():
 
     finally:
         import shutil
+
         shutil.rmtree(tmpdir)
 
 
