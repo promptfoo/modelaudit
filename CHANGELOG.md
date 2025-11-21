@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18] - 2025-11-20
+
+### Fixed
+
+- **fix**: exclude INFO/DEBUG checks from success rate calculation - success rate now only includes security-relevant checks (WARNING/CRITICAL), with informational checks (INFO/DEBUG) shown separately in "Failed Checks (non-critical)" section
+- **fix**: missing whitelist logic in validation checks - whitelist downgrading now correctly applies to validation result instantiations
+- **fix**: resolve PyTorch ZIP scanner hang on large models - improved memory-mapped file handling and timeout configuration
+- **fix**: additional severity downgrades - further reduced false positives across multiple scanners
+
+### Changed
+
+- **chore**: standardize on `add_check()` API - migrated all internal code from legacy `add_issue()` method to modern `add_check()` method for structured check reporting with explicit pass/fail status
+
 ## [0.2.17] - 2025-11-19
 
 ### Fixed
