@@ -332,6 +332,44 @@ def test_detect_pmml_xml_format(tmp_path):
     assert validate_file_type(str(pmml_path)) is True
 
 
+def test_msgpack_validation_valid_format(tmp_path):
+    """Test that valid MessagePack files pass validation (regression test for false positive)."""
+    # Create a valid MessagePack file with real Flax model header
+    # 0x81 = fixmap with 1 element
+    # 0xab = fixstr with 11 characters
+    # Following bytes spell "transformer"
+    msgpack_path = tmp_path / "model.msgpack"
+    msgpack_content = (
+        bytes(
+            [
+                0x81,
+                0xAB,  # fixmap(1), fixstr(11)
+                0x74,
+                0x72,
+                0x61,
+                0x6E,
+                0x73,
+                0x66,
+                0x6F,
+                0x72,
+                0x6D,
+                0x65,
+                0x72,  # "transformer"
+                0x84,  # fixmap(4) for nested data
+            ]
+        )
+        + b"\x00" * 100
+    )  # Additional data
+
+    msgpack_path.write_bytes(msgpack_content)
+
+    # Test that extension detection returns flax_msgpack
+    assert detect_format_from_extension(str(msgpack_path)) == "flax_msgpack"
+
+    # Test that validation passes (this was the bug - it was failing before)
+    assert validate_file_type(str(msgpack_path)) is True
+
+
 def test_detect_generic_xml_format(tmp_path):
     """Test that generic XML files don't get misdetected as OpenVINO."""
     # Create a generic XML file (SVG, config, etc.)
