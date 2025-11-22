@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 
 from modelaudit.scanners.base import IssueSeverity
@@ -149,8 +150,6 @@ def test_liquidai_template_no_false_positives():
         print("✅ LiquidAI template test PASSED - no false positives!")
 
     finally:
-        import shutil
-
         shutil.rmtree(tmpdir)
 
 

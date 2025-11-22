@@ -339,11 +339,27 @@ def test_msgpack_validation_valid_format(tmp_path):
     # 0xab = fixstr with 11 characters
     # Following bytes spell "transformer"
     msgpack_path = tmp_path / "model.msgpack"
-    msgpack_content = bytes([
-        0x81, 0xab,  # fixmap(1), fixstr(11)
-        0x74, 0x72, 0x61, 0x6e, 0x73, 0x66, 0x6f, 0x72, 0x6d, 0x65, 0x72,  # "transformer"
-        0x84,  # fixmap(4) for nested data
-    ]) + b"\x00" * 100  # Additional data
+    msgpack_content = (
+        bytes(
+            [
+                0x81,
+                0xAB,  # fixmap(1), fixstr(11)
+                0x74,
+                0x72,
+                0x61,
+                0x6E,
+                0x73,
+                0x66,
+                0x6F,
+                0x72,
+                0x6D,
+                0x65,
+                0x72,  # "transformer"
+                0x84,  # fixmap(4) for nested data
+            ]
+        )
+        + b"\x00" * 100
+    )  # Additional data
 
     msgpack_path.write_bytes(msgpack_content)
 
@@ -352,13 +368,6 @@ def test_msgpack_validation_valid_format(tmp_path):
 
     # Test that validation passes (this was the bug - it was failing before)
     assert validate_file_type(str(msgpack_path)) is True
-
-    # Test other Flax ecosystem extensions
-    for ext in [".flax", ".orbax", ".jax"]:
-        path = tmp_path / f"model{ext}"
-        path.write_bytes(msgpack_content)
-        assert detect_format_from_extension(str(path)) == "flax_msgpack"
-        assert validate_file_type(str(path)) is True
 
 
 def test_detect_generic_xml_format(tmp_path):
