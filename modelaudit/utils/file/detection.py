@@ -391,8 +391,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pmml"
         case ".npy" | ".npz":
             return "numpy"
-        case ".msgpack":
-            return "msgpack"
+        case ".msgpack" | ".flax" | ".orbax" | ".jax":
+            return "flax_msgpack"
         case ".7z":
             return "sevenzip"
         case _:
