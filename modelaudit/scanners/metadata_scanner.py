@@ -159,13 +159,28 @@ class MetadataScanner(BaseScanner):
         issues: list[Issue] = []
         import re
 
-        # Common secret patterns
+        # Specific secret patterns (removed overly broad generic pattern)
+        # Only include patterns with known prefixes/formats to avoid false positives
         secret_patterns = [
-            (r"[A-Za-z0-9]{20,}", "Potential API key or token"),
+            # GitHub tokens have specific prefixes
             (r"ghp_[A-Za-z0-9]{36}", "GitHub personal access token"),
+            (r"gho_[A-Za-z0-9]{36}", "GitHub OAuth token"),
+            (r"ghu_[A-Za-z0-9]{36}", "GitHub user token"),
+            (r"ghs_[A-Za-z0-9]{36}", "GitHub server token"),
+            (r"ghr_[A-Za-z0-9]{36}", "GitHub refresh token"),
+            # OpenAI API keys have specific prefix
             (r"sk-[A-Za-z0-9]{48}", "OpenAI API key"),
-            (r"Bearer\s+[A-Za-z0-9._-]+", "Bearer token"),
-            (r'[A-Za-z0-9._-]*[Tt]oken[A-Za-z0-9._-]*\s*[:=]\s*["\']?([A-Za-z0-9._-]{10,})', "Token assignment"),
+            # AWS keys have specific format
+            (r"AKIA[0-9A-Z]{16}", "AWS Access Key ID"),
+            # Slack tokens
+            (r"xox[baprs]-[0-9a-zA-Z]{10,48}", "Slack token"),
+            # Bearer tokens (but with context - needs Bearer keyword)
+            (r"Bearer\s+[A-Za-z0-9._-]{20,}", "Bearer token"),
+            # API key assignments with explicit key/token keywords
+            (
+                r'(?:api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]\s*["\']([A-Za-z0-9._-]{16,})["\']',
+                "API key assignment",
+            ),
         ]
 
         for pattern, description in secret_patterns:
@@ -175,42 +190,73 @@ class MetadataScanner(BaseScanner):
                 matched_text = match.group(0)
 
                 # Extract the actual secret part for entropy analysis
-                secret_part = matched_text
-                if "=" in matched_text:
-                    # For token assignments like "api_key=abc123", extract just the value
-                    secret_part = matched_text.split("=", 1)[1].strip(" \"'")
-                elif " " in matched_text and "Bearer" in matched_text:
-                    # For Bearer tokens, extract just the token part
+                # If pattern has capture group, use that; otherwise use full match
+                secret_part = match.group(1) if match.lastindex and match.lastindex >= 1 else matched_text
+
+                # For Bearer tokens, extract just the token part
+                if "Bearer" in matched_text and " " in matched_text:
                     secret_part = matched_text.split(" ", 1)[1].strip()
 
                 # Check for obvious placeholders
                 is_placeholder = any(
                     placeholder in matched_text.lower()
-                    for placeholder in ["example", "placeholder", "your_", "xxx", "****", "token_here", "sample"]
+                    for placeholder in [
+                        "example",
+                        "placeholder",
+                        "your_",
+                        "xxx",
+                        "****",
+                        "token_here",
+                        "sample",
+                        "test",
+                    ]
                 )
 
-                # Calculate entropy to reduce false positives
-                entropy = self._calculate_entropy(secret_part)
+                # For well-known token formats (GitHub, OpenAI, AWS), we trust the pattern
+                # and don't need entropy checks - these have specific prefixes/formats
+                is_known_format = any(prefix in description.lower() for prefix in ["github", "openai", "aws", "slack"])
 
-                # Only flag as suspicious if it has sufficient entropy (randomness)
-                # Typical thresholds: low entropy (~2.0) for structured text, high entropy (~4.5+) for random tokens
-                min_entropy = 4.0  # Balanced threshold to catch real secrets but avoid common words
-
-                if not is_placeholder and entropy >= min_entropy and len(secret_part) >= 10:
-                    issues.append(
-                        Issue(
-                            message=f"Potential exposed secret in text metadata: {description}",
-                            severity=IssueSeverity.INFO,
-                            location=file_path,
-                            details={
-                                "pattern_description": description,
-                                "match_preview": matched_text[:20] + "..." if len(matched_text) > 20 else matched_text,
-                                "entropy": round(entropy, 2),
-                                "length": len(secret_part),
-                            },
-                            why="Exposed secrets in documentation can lead to unauthorized access",
-                            type="exposed_secret",
+                if is_known_format:
+                    # Known format - report if not a placeholder
+                    if not is_placeholder:
+                        issues.append(
+                            Issue(
+                                message=f"Potential exposed secret in text metadata: {description}",
+                                severity=IssueSeverity.INFO,
+                                location=file_path,
+                                details={
+                                    "pattern_description": description,
+                                    "match_preview": matched_text[:20] + "..."
+                                    if len(matched_text) > 20
+                                    else matched_text,
+                                    "length": len(secret_part),
+                                },
+                                why="Exposed secrets in documentation can lead to unauthorized access",
+                                type="exposed_secret",
+                            )
                         )
-                    )
+                else:
+                    # Generic pattern - use entropy check to reduce false positives
+                    entropy = self._calculate_entropy(secret_part)
+                    min_entropy = 4.0
+
+                    if not is_placeholder and entropy >= min_entropy and len(secret_part) >= 16:
+                        issues.append(
+                            Issue(
+                                message=f"Potential exposed secret in text metadata: {description}",
+                                severity=IssueSeverity.INFO,
+                                location=file_path,
+                                details={
+                                    "pattern_description": description,
+                                    "match_preview": matched_text[:20] + "..."
+                                    if len(matched_text) > 20
+                                    else matched_text,
+                                    "entropy": round(entropy, 2),
+                                    "length": len(secret_part),
+                                },
+                                why="Exposed secrets in documentation can lead to unauthorized access",
+                                type="exposed_secret",
+                            )
+                        )
 
         return issues
