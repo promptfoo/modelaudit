@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19] - 2025-11-24
+
+### Fixed
+
+- **fix**: resolve Jinja2 SSTI false positives from bracket notation - refined obfuscation pattern to only match dunder attributes (`["__class__"]`) instead of legitimate dict access (`["role"]`), and fixed regex bug where `|format\(` matched any pipe character
+- **fix**: remove overly broad secret detection pattern - replaced generic `[A-Za-z0-9]{20,}` pattern with specific well-known token formats (GitHub, OpenAI, AWS, Slack) to eliminate false positives on URLs and model IDs
+- **fix**: resolve msgpack file type validation false positive - unified format name inconsistency where functions returned different values (`"msgpack"` vs `"flax_msgpack"`), causing validation failures on legitimate MessagePack files
+- **fix**: add HuggingFace training utilities to pickle safe globals - added safe Transformers, Accelerate, and TRL classes (HubStrategy, SchedulerType, DistributedType, DeepSpeedPlugin, DPOConfig, etc.) to reduce false positives on training checkpoints
+
 ## [0.2.18] - 2025-11-20
 
 ### Fixed
