@@ -317,6 +317,8 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "enable_grad",
         "set_grad_enabled",
         "inference_mode",
+        # PyTorch dtypes (safe built-in types)
+        "bfloat16",
     ],
     "torch.nn": [
         "Module",
@@ -673,6 +675,34 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "XGBRanker",
         "XGBRFClassifier",
         "XGBRFRegressor",
+    ],
+    # HuggingFace Transformers - Training utilities (Enums and config classes)
+    "transformers.trainer_utils": [
+        "HubStrategy",  # Enum for hub push strategy
+        "SchedulerType",  # Enum for learning rate schedulers
+        "IntervalStrategy",  # Enum for save/eval intervals
+    ],
+    "transformers.training_args": [
+        "OptimizerNames",  # Enum for optimizer selection
+    ],
+    "transformers.integrations.deepspeed": [
+        "HfDeepSpeedConfig",  # DeepSpeed config wrapper
+        "HfTrainerDeepSpeedConfig",  # Trainer-specific DeepSpeed config
+    ],
+    "transformers.trainer_pt_utils": [
+        "AcceleratorConfig",  # Dataclass for accelerator configuration
+    ],
+    # HuggingFace Accelerate - Distributed training utilities
+    "accelerate.utils.dataclasses": [
+        "DistributedType",  # Enum for distributed training types
+        "DeepSpeedPlugin",  # Dataclass for DeepSpeed plugin config
+    ],
+    "accelerate.state": [
+        "PartialState",  # Singleton class for distributed state
+    ],
+    # Alignment/TRL - Training config classes
+    "alignment.configs": [
+        "DPOConfig",  # Dataclass for DPO training configuration
     ],
 }
 
