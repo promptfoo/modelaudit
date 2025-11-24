@@ -706,6 +706,20 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
 }
 
+# IMPORTANT: Why certain functions are/aren't in the allowlist:
+#
+# ✅ numpy.core.multiarray._reconstruct (line 559 - ALLOWED)
+#    Despite CVE-2019-6446, this is the standard NumPy array reconstruction function
+#    and appears in all legitimate NumPy pickles. The vulnerability comes from malicious
+#    objects INSIDE dtype=object arrays, not from _reconstruct itself. Our scanner checks
+#    array contents separately, so whitelisting _reconstruct reduces false positives.
+#
+# ⚠️ _codecs.encode (NOT in allowlist)
+#    While legitimate for pickle protocol 2 backward compatibility (encoding bytes),
+#    it can obfuscate malicious payloads. Attackers use it to encode commands that
+#    decode into executable code during unpickling, bypassing string pattern detection.
+#    Not critical for ML models (protocol 3+ preferred), so excluded to prevent abuse.
+
 # Dangerous actual code execution patterns in strings
 ACTUAL_DANGEROUS_STRING_PATTERNS = [
     r"os\.system\s*\(",
