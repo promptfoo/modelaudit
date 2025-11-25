@@ -217,6 +217,49 @@ def test_scan_output_file(tmp_path):
     assert f"Results written to {output_file}" in result.output
 
 
+def test_scan_json_output_to_file(tmp_path):
+    """Test scanning with JSON output to a file - JSON should be valid and not mixed with progress."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    output_file = tmp_path / "output.json"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--output", str(output_file)])
+
+    # The file should be created
+    assert output_file.exists()
+
+    # JSON in file should be valid and parseable
+    try:
+        output_json = json.loads(output_file.read_text())
+        assert "files_scanned" in output_json
+        assert "issues" in output_json
+        assert output_json["files_scanned"] == 1
+    except json.JSONDecodeError:
+        pytest.fail("JSON output file is not valid JSON")
+
+    # Stdout should contain confirmation message (and potentially progress output)
+    assert f"Results written to {output_file}" in result.output
+
+
+def test_scan_json_to_stdout_no_progress_interference(tmp_path):
+    """Test that JSON to stdout remains valid (no progress output mixed in)."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json"])
+
+    # Output should be valid JSON when going to stdout (no progress interference)
+    try:
+        output_json = json.loads(result.output)
+        assert "files_scanned" in output_json
+        assert "issues" in output_json
+    except json.JSONDecodeError:
+        pytest.fail("JSON output to stdout is not valid JSON - may be corrupted by progress")
+
+
 def test_scan_sbom_output(tmp_path):
     """Test scanning with SBOM output."""
     test_file = tmp_path / "test_file.dat"

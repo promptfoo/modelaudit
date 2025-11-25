@@ -656,24 +656,16 @@ def scan_command(
 
     if final_progress and len(expanded_paths) > 0:
         try:
-            # Prevent circular imports during scanner loading
-            import sys
+            from .progress import (
+                ConsoleProgressReporter,
+                ProgressPhase,
+                ProgressTracker,
+            )
 
-            if "modelaudit.scanners" in sys.modules:
-                if verbose:
-                    click.echo("Progress tracking disabled during scanner initialization", err=True)
-                progress_tracker = None
-            else:
-                from .progress import (
-                    ConsoleProgressReporter,
-                    ProgressPhase,
-                    ProgressTracker,
-                )
-
-                # Create progress tracker
-                progress_tracker = ProgressTracker(
-                    update_interval=2.0,  # Smart default
-                )
+            # Create progress tracker
+            progress_tracker = ProgressTracker(
+                update_interval=2.0,  # Smart default
+            )
 
             # Add console reporter based on format preference
             # Enable progress when: text format (any output), or output to file (any format)
