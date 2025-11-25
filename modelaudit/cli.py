@@ -581,6 +581,9 @@ def scan_command(
     # Extract final configuration values
     final_timeout = config.get("timeout", 3600)
     final_progress = config.get("show_progress", False)
+    # Auto-enable progress when output goes to a file (stdout is free for progress)
+    if output:
+        final_progress = True
     final_cache = config.get("use_cache", True)
     final_cache_dir = config.get("cache_dir")
     final_format = config.get("format", "text")
@@ -673,7 +676,8 @@ def scan_command(
                 )
 
             # Add console reporter based on format preference
-            if progress_tracker and final_format == "text" and not output:
+            # Enable progress when: text format (any output), or output to file (any format)
+            if progress_tracker and (final_format == "text" or output):
                 if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
