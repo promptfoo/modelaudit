@@ -516,6 +516,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "next",
     ],
     "collections": ["OrderedDict", "defaultdict", "namedtuple", "Counter", "deque"],
+    # _codecs is used by NumPy/PyTorch for binary data serialization (e.g., RNG states)
+    # encode() only transforms string encodings, it cannot execute code
+    "_codecs": ["encode"],
     "typing": [
         "Any",
         "Union",
