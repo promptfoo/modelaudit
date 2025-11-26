@@ -584,6 +584,9 @@ def scan_command(
     final_cache = config.get("use_cache", True)
     final_cache_dir = config.get("cache_dir")
     final_format = config.get("format", "text")
+    # Determine if we should show styled console output (spinners, colors, headers)
+    # Show styled output when: text format OR output goes to file (stdout is free)
+    show_styled_output = final_format == "text" or bool(output)
     # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
@@ -602,7 +605,7 @@ def scan_command(
             max_download_bytes = parse_size_string(max_size)
 
     # Show smart detection info if not quiet
-    if not quiet and final_format == "text" and not output:
+    if not quiet and show_styled_output:
         if verbose:
             click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
@@ -611,8 +614,8 @@ def scan_command(
         elif not config.get("colors", True):  # In CI mode
             pass  # No smart detection message needed
 
-    # Print a nice header if not in structured format mode and not writing to a file
-    if final_format == "text" and not output and not quiet:
+    # Print a nice header if not in structured format mode
+    if show_styled_output and not quiet:
         # Add delegation indicator if running via promptfoo
         delegation_note = ""
         if is_delegated_from_promptfoo():
@@ -653,26 +656,20 @@ def scan_command(
 
     if final_progress and len(expanded_paths) > 0:
         try:
-            # Prevent circular imports during scanner loading
-            import sys
+            from .progress import (
+                ConsoleProgressReporter,
+                ProgressPhase,
+                ProgressTracker,
+            )
 
-            if "modelaudit.scanners" in sys.modules:
-                if verbose:
-                    click.echo("Progress tracking disabled during scanner initialization", err=True)
-                progress_tracker = None
-            else:
-                from .progress import (
-                    ConsoleProgressReporter,
-                    ProgressPhase,
-                    ProgressTracker,
-                )
-
-                # Create progress tracker
-                progress_tracker = ProgressTracker(
-                    update_interval=2.0,  # Smart default
-                )
+            # Create progress tracker
+            progress_tracker = ProgressTracker(
+                update_interval=2.0,  # Smart default
+            )
 
             # Add console reporter based on format preference
+            # Only enable ProgressTracker for text format without output file
+            # (ProgressTracker has threading issues that cause segfaults)
             if progress_tracker and final_format == "text" and not output:
                 if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
@@ -722,12 +719,12 @@ def scan_command(
                 if is_huggingface_file_url(path):
                     # Handle direct file downloads
                     download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
+                    if show_styled_output and should_show_spinner():
                         download_spinner = yaspin(
                             Spinners.dots, text=f"Downloading file from {style_text(path, fg='cyan')}"
                         )
                         download_spinner.start()
-                    elif final_format == "text" and not output:
+                    elif show_styled_output:
                         click.echo(f"Downloading file from {path}...")
 
                     try:
@@ -754,7 +751,7 @@ def scan_command(
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
                         # The downloaded file should continue through normal scanning flow
@@ -765,7 +762,7 @@ def scan_command(
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
                         error_msg = str(e)
@@ -778,7 +775,7 @@ def scan_command(
                 # Check if this is a HuggingFace model URL
                 elif is_huggingface_url(path):
                     # Show initial message and get model info
-                    if final_format == "text" and not output:
+                    if show_styled_output:
                         click.echo(f"\n📥 Preparing to download from {style_text(path, fg='cyan')}")
 
                         # Get model info for size preview
@@ -823,7 +820,7 @@ def scan_command(
                             from .core import scan_model_streaming
                             from .utils.sources.huggingface import download_model_streaming
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
                             # Create file generator
@@ -850,7 +847,7 @@ def scan_command(
                             # Merge streaming results into audit_result
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                             # No actual_path to scan in normal flow - already done
@@ -860,12 +857,12 @@ def scan_command(
                         else:
                             # NORMAL MODE: Download all files, then scan
                             download_spinner = None
-                            if final_format == "text" and not output and should_show_spinner():
+                            if show_styled_output and should_show_spinner():
                                 download_spinner = yaspin(Spinners.dots, text="Downloading model files...")
                                 download_spinner.start()
 
                             # Download with caching support and progress bar
-                            show_progress = final_format == "text" and not output and should_show_spinner()
+                            show_progress = show_styled_output and should_show_spinner()
                             download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                             actual_path = str(download_path)
                             # Only track for cleanup if not using cache
@@ -873,11 +870,11 @@ def scan_command(
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo(style_text("✅ Download complete", fg="green", bold=True))
 
                     except Exception as e:
-                        if final_format == "text" and not output:
+                        if show_styled_output:
                             click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
                         error_msg = str(e)
@@ -909,7 +906,7 @@ def scan_command(
                             from .core import scan_model_streaming
                             from .utils.sources.pytorch_hub import download_pytorch_hub_model_streaming
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
                             # Create file generator
@@ -935,7 +932,7 @@ def scan_command(
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                             url_handled = True
@@ -944,11 +941,11 @@ def scan_command(
                         else:
                             # NORMAL MODE: Download all weights, then scan
                             download_spinner = None
-                            if final_format == "text" and not output and should_show_spinner():
+                            if show_styled_output and should_show_spinner():
                                 spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
                                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                                 download_spinner.start()
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo(f"Downloading from {path}...")
 
                             download_path = download_pytorch_hub_model(
@@ -960,13 +957,13 @@ def scan_command(
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Download failed")
 
                         error_msg = str(e)
@@ -1039,7 +1036,7 @@ def scan_command(
                             from .core import scan_model_streaming
                             from .utils.sources.cloud_storage import download_from_cloud_streaming
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("🔄 Starting streaming scan from cloud storage...", fg="cyan"))
 
                             # Create file generator
@@ -1069,7 +1066,7 @@ def scan_command(
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
-                            if final_format == "text" and not output:
+                            if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                             url_handled = True
@@ -1078,11 +1075,11 @@ def scan_command(
                         else:
                             # NORMAL MODE: Download all files, then scan
                             download_spinner = None
-                            if final_format == "text" and not output and should_show_spinner():
+                            if show_styled_output and should_show_spinner():
                                 spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
                                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                                 download_spinner.start()
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo(f"Downloading from {path}...")
 
                             # Convert cache_dir string to Path if provided
@@ -1102,13 +1099,13 @@ def scan_command(
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo("Downloaded successfully")
 
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Download failed")
 
                         error_msg = str(e)
@@ -1135,10 +1132,10 @@ def scan_command(
                 elif is_mlflow_uri(path):
                     # Show download progress if in text mode
                     download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
+                    if show_styled_output and should_show_spinner():
                         download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
                         download_spinner.start()
-                    elif final_format == "text" and not output:
+                    elif show_styled_output:
                         click.echo(f"Downloading from {path}...")
 
                     try:
@@ -1156,7 +1153,7 @@ def scan_command(
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results directly from MLflow scan using Pydantic model
@@ -1168,7 +1165,7 @@ def scan_command(
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Download failed")
 
                         logger.error(f"Failed to download model from {path}: {e!s}", exc_info=verbose)
@@ -1179,12 +1176,12 @@ def scan_command(
                 # Check if this is a JFrog URL
                 elif is_jfrog_url(path):
                     download_spinner = None
-                    if final_format == "text" and not output and should_show_spinner():
+                    if show_styled_output and should_show_spinner():
                         download_spinner = yaspin(
                             Spinners.dots, text=f"Downloading and scanning from {style_text(path, fg='cyan')}"
                         )
                         download_spinner.start()
-                    elif final_format == "text" and not output:
+                    elif show_styled_output:
                         click.echo(f"Downloading and scanning from {path}...")
 
                     try:
@@ -1203,7 +1200,7 @@ def scan_command(
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded and scanned", fg="green", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Downloaded and scanned successfully")
 
                         # Aggregate results using Pydantic model
@@ -1214,7 +1211,7 @@ def scan_command(
                     except Exception as e:
                         if download_spinner:
                             download_spinner.fail(style_text("❌ Download/scan failed", fg="red", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo("Download/scan failed")
 
                         logger.error(f"Failed to download/scan model from {path}: {e!s}", exc_info=verbose)
@@ -1250,11 +1247,11 @@ def scan_command(
 
                 # Show progress indicator if in text mode and not writing to a file
                 spinner = None
-                if final_format == "text" and not output and should_show_spinner():
+                if show_styled_output and should_show_spinner():
                     spinner_text = f"Scanning {style_text(path, fg='cyan')}"
                     spinner = yaspin(Spinners.dots, text=spinner_text)
                     spinner.start()
-                elif final_format == "text" and not output:
+                elif show_styled_output:
                     click.echo(f"Scanning {path}...")
 
                 # Perform the scan with the specified options
@@ -1327,7 +1324,7 @@ def scan_command(
 
                         if spinner:
                             spinner.text = "Starting streaming scan of directory..."
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo(style_text("🔄 Starting streaming scan of directory...", fg="cyan"))
 
                         # Create file iterator
@@ -1353,7 +1350,7 @@ def scan_command(
 
                         if spinner:
                             spinner.ok(style_text("✅ Streaming scan complete", fg="green", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                         # Track the scanned path for SBOM
@@ -1423,7 +1420,7 @@ def scan_command(
                                             bold=True,
                                         ),
                                     )
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 issues_str = "issue" if issue_count == 1 else "issues"
                                 if has_critical:
                                     click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
@@ -1434,14 +1431,14 @@ def scan_command(
                             if spinner:
                                 spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
-                            elif final_format == "text" and not output:
+                            elif show_styled_output:
                                 click.echo(f"Scanned {path}: Clean")
                     else:
                         # No issues at all
                         if spinner:
                             spinner.text = f"Scanned {style_text(path, fg='cyan')}"
                             spinner.ok(style_text("✅ Clean", fg="green", bold=True))
-                        elif final_format == "text" and not output:
+                        elif show_styled_output:
                             click.echo(f"Scanned {path}: Clean")
 
                 except Exception as e:
@@ -1449,7 +1446,7 @@ def scan_command(
                     if spinner:
                         spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
                         spinner.fail(style_text("❌ Error", fg="red", bold=True))
-                    elif final_format == "text" and not output:
+                    elif show_styled_output:
                         click.echo(f"Error scanning {path}")
 
                     logger.error(f"Error during scan of {path}: {e!s}", exc_info=verbose)
