@@ -229,14 +229,192 @@ def test_manifest_scanner_can_handle():
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
-    # Should handle HuggingFace configs
-    assert scanner.can_handle("config.json") is True
-    assert scanner.can_handle("generation_config.json") is True
-    assert scanner.can_handle("model_index.json") is True
+    # Test files with expected can_handle results
+    test_cases = [
+        # HuggingFace/ML configs - should be handled
+        ("config.json", True),
+        ("generation_config.json", True),
+        ("model_index.json", True),
+        # Files containing "config.json" substring also match
+        ("tokenizer_config.json", True),
+        # Non-ML configs - should not be handled
+        ("package.json", False),
+        ("data.json", False),
+    ]
 
-    # Should not handle tokenizer configs (excluded)
-    assert scanner.can_handle("tokenizer_config.json") is False
+    created_files = []
+    try:
+        for filename, expected in test_cases:
+            Path(filename).write_text("{}")
+            created_files.append(filename)
+            assert scanner.can_handle(filename) is expected, f"{filename} expected {expected}"
+    finally:
+        for filename in created_files:
+            Path(filename).unlink(missing_ok=True)
 
-    # Should not handle non-ML configs
-    assert scanner.can_handle("package.json") is False
-    assert scanner.can_handle("tsconfig.json") is False
+
+def test_manifest_scanner_suspicious_url_shortener():
+    """Test that URL shorteners in config values are flagged."""
+    test_file = "config.json"
+    config_with_shortener = {
+        "model_type": "bert",
+        "download_url": "https://bit.ly/abc123",
+        "architectures": ["BertModel"],
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_shortener, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should have a suspicious URL check that failed
+        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        assert len(url_checks) > 0
+        assert any(check.status == CheckStatus.FAILED for check in url_checks)
+
+        # Verify the URL was detected
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert any("bit.ly" in c.details.get("suspicious_domain", "") for c in failed_url_checks)
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_suspicious_tunnel_service():
+    """Test that tunnel services (ngrok, localtunnel) in config values are flagged."""
+    test_file = "config.json"
+    config_with_tunnel = {
+        "model_type": "gpt2",
+        "callback_url": "https://abc123.ngrok.io/webhook",
+        "hidden_size": 768,
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_tunnel, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should have a suspicious URL check that failed
+        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        assert len(url_checks) > 0
+        assert any(check.status == CheckStatus.FAILED for check in url_checks)
+
+        # Verify ngrok was detected
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert any("ngrok.io" in c.details.get("suspicious_domain", "") for c in failed_url_checks)
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_legitimate_urls_not_flagged():
+    """Test that legitimate URLs (huggingface, github, etc.) are NOT flagged."""
+    test_file = "config.json"
+    config_with_legit_urls = {
+        "model_type": "bert",
+        "_name_or_path": "https://huggingface.co/bert-base-uncased",
+        "repository": "https://github.com/huggingface/transformers",
+        "documentation": "https://example.com/docs",
+        "homepage": "https://pytorch.org/models",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_legit_urls, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should have NO suspicious URL checks that failed
+        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 0
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_nested_suspicious_url():
+    """Test that suspicious URLs in nested config structures are detected."""
+    test_file = "config.json"
+    config_with_nested_url = {
+        "model_type": "bert",
+        "training": {
+            "callbacks": {
+                "webhook_url": "https://tinyurl.com/malicious",
+            }
+        },
+        "pipelines": [
+            {"name": "inference", "endpoint": "https://localtunnel.me/api"},
+        ],
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_nested_url, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should detect both suspicious URLs
+        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 2
+
+        # Verify both domains were detected
+        detected_domains = {c.details.get("suspicious_domain", "") for c in failed_url_checks}
+        assert "tinyurl.com" in detected_domains
+        assert "localtunnel.me" in detected_domains
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_duplicate_urls_not_repeated():
+    """Test that the same suspicious URL appearing multiple times is only reported once."""
+    test_file = "config.json"
+    config_with_duplicate_urls = {
+        "model_type": "bert",
+        "primary_url": "https://bit.ly/same123",
+        "backup_url": "https://bit.ly/same123",
+        "fallback_url": "https://bit.ly/same123",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_duplicate_urls, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should only have ONE suspicious URL check (deduplication)
+        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 1
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()

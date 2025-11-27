@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
@@ -55,6 +56,27 @@ MODEL_NAME_KEYS_LOWER = [
     "artifact_id",
     "package_name",
 ]
+
+# URL shorteners and tunnel services that can hide malicious endpoints
+# These are flagged because legitimate ML configs use full URLs
+SUSPICIOUS_URL_DOMAINS = [
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "is.gd",
+    "rb.gy",
+    "tiny.one",
+    "ngrok.io",
+    "ngrok-free.app",
+    "localtunnel.me",
+    "serveo.net",
+    "localhost.run",
+]
+
+# Regex to find URLs in text
+URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
 
 
 class ManifestScanner(BaseScanner):
@@ -183,6 +205,9 @@ class ManifestScanner(BaseScanner):
 
                     # Check for blacklisted model names in config values
                     self._check_model_name_policies(content, result)
+
+                    # Check for suspicious URLs in config values
+                    self._check_suspicious_urls(content, result)
 
             else:
                 result.add_check(
@@ -395,3 +420,50 @@ class ManifestScanner(BaseScanner):
                             check_dict(item, f"{full_key}[{i}]")
 
         check_dict(content)
+
+    def _check_suspicious_urls(self, content: dict[str, Any], result: ScanResult) -> None:
+        """Check for suspicious URLs (shorteners, tunnels) in config values.
+
+        Only flags URL shorteners and tunnel services that can hide malicious endpoints.
+        Legitimate URLs (huggingface.co, github.com, etc.) are NOT flagged.
+        """
+        seen_urls: set[str] = set()
+
+        def extract_urls_from_value(value: Any, key_path: str) -> None:
+            """Recursively extract and check URLs from any value type."""
+            if isinstance(value, str):
+                # Find all URLs in the string
+                urls = URL_PATTERN.findall(value)
+                for url in urls:
+                    if url in seen_urls:
+                        continue
+                    url_lower = url.lower()
+                    for domain in SUSPICIOUS_URL_DOMAINS:
+                        if domain in url_lower:
+                            seen_urls.add(url)
+                            result.add_check(
+                                name="Suspicious URL Check",
+                                passed=False,
+                                message=f"Suspicious URL found in config: {url}",
+                                severity=IssueSeverity.INFO,
+                                location=self.current_file_path,
+                                details={
+                                    "url": url,
+                                    "suspicious_domain": domain,
+                                    "key_path": key_path,
+                                },
+                                why=(
+                                    "URL shorteners and tunnel services can hide malicious "
+                                    "endpoints. Legitimate ML configs typically use full URLs."
+                                ),
+                            )
+                            break
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    new_path = f"{key_path}.{k}" if key_path else k
+                    extract_urls_from_value(v, new_path)
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    extract_urls_from_value(item, f"{key_path}[{i}]")
+
+        extract_urls_from_value(content, "")
