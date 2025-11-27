@@ -43,6 +43,7 @@ dependencies = [
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
+    "posthog>=3.0.0",
 ]
 
 [project.optional-dependencies]

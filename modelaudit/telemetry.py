@@ -105,7 +105,13 @@ class TelemetryEvent(str, Enum):
 # PostHog configuration - follows Promptfoo's conventions
 # Use PROMPTFOO_DISABLE_TELEMETRY=1 to disable (shared with Promptfoo)
 # Uses Promptfoo's analytics proxy by default for shared project
-POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", ""))
+#
+# NOTE: The project API key (phc_...) is a PUBLIC key, safe to commit to git.
+# It can only write events, not read private data. This is standard practice
+# for client-side analytics (browsers, mobile apps, CLIs).
+# See: https://posthog.com/docs/api
+_DEFAULT_POSTHOG_KEY = "phc_E5n5uHnDo2eREJL1uqX1cIlbkoRby4yFWt3V94HqRRg"
+POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", _DEFAULT_POSTHOG_KEY))
 POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
 
 # Promptfoo analytics endpoints for dual-track submission

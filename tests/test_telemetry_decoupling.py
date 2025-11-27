@@ -132,15 +132,17 @@ class TestTelemetryDecoupling:
     def test_posthog_import_failure_handled(self):
         """Test that PostHog import failures don't break telemetry initialization."""
         with patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False):
-            with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-                mock_home.return_value = Path(temp_dir)
+            # Reset the global client cache to force re-initialization
+            with patch("modelaudit.telemetry._telemetry_client", None):
+                with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+                    mock_home.return_value = Path(temp_dir)
 
-                from modelaudit.telemetry import get_telemetry_client
+                    from modelaudit.telemetry import get_telemetry_client
 
-                client = get_telemetry_client()
-                # Should still initialize, just without PostHog
-                assert client is not None
-                assert client._posthog_client is None
+                    client = get_telemetry_client()
+                    # Should still initialize, just without PostHog
+                    assert client is not None
+                    assert client._posthog_client is None
 
     def test_network_failures_dont_break_functionality(self):
         """Test that network failures in telemetry don't affect core functionality."""
