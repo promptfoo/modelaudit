@@ -298,7 +298,10 @@ class TelemetryClient:
         return not self._user_config.telemetry_enabled
 
     def _identify_user(self) -> None:
-        """Identify user to PostHog."""
+        """Set user properties in PostHog.
+
+        Note: PostHog Python SDK v7 replaced identify() with set().
+        """
         if not self._posthog_client or self._is_disabled():
             return
 
@@ -311,11 +314,12 @@ class TelemetryClient:
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
             }
 
-            self._posthog_client.identify(distinct_id=self._user_config.user_id, properties=properties)
+            # PostHog v7 uses set() instead of identify()
+            self._posthog_client.set(distinct_id=self._user_config.user_id, properties=properties)
             # Flush immediately (matches Promptfoo's pattern)
             self._posthog_client.flush()
         except Exception as e:
-            logger.debug(f"Failed to identify user: {e}")
+            logger.debug(f"Failed to set user properties: {e}")
 
     def _record_telemetry_disabled(self) -> None:
         """Mark that telemetry was disabled (no network calls for true decoupling)."""
