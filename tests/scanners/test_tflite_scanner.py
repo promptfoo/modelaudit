@@ -142,7 +142,9 @@ def test_tflite_scanner_safe_model(tmp_path):
 def test_tflite_scanner_metadata_collection(tmp_path):
     """Test that scanner collects appropriate metadata."""
     path = tmp_path / "model.tflite"
-    path.write_bytes(b"some tflite data")
+    # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
 
     if HAS_TFLITE:
         with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
