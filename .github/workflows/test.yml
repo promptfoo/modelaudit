@@ -222,6 +222,15 @@ jobs:
         run: |
           rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
+      - name: Run slow/integration tests on PR (if labeled)
+        # Run slow tests on PRs when the 'run-slow-tests' label is added
+        # This allows developers to validate slow tests before merging
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests') && matrix.python-version == '3.12'
+        timeout-minutes: 20
+        run: |
+          echo "Running slow/integration tests due to 'run-slow-tests' label"
+          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+
       - name: Run fast tests with coverage (main branch only)
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
@@ -232,15 +241,15 @@ jobs:
         run: |
           rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
-      - name: Run slow/integration tests (if main branch)
-        if: github.ref == 'refs/heads/main'
-        timeout-minutes: 15
+      - name: Run slow/integration tests (main branch only)
+        # Run ALL slow/integration/performance tests on main branch.
+        # Tests with missing dependencies auto-skip via pytest.importorskip() or framework markers.
+        # Runs on Python 3.12 only to keep CI time reasonable.
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
+        timeout-minutes: 20
         run: |
-          # Only run tests explicitly marked with @pytest.mark.slow or @pytest.mark.integration
-          rye run pytest -n 1 --tb=short \
-            tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_stress_performance \
-            tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories \
-            tests/test_license_integration.py::TestLicenseIntegration::test_end_to_end_cli_integration
+          # Run all slow, integration, and performance tests
+          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}

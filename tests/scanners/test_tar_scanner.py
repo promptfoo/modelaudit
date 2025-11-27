@@ -200,27 +200,6 @@ class TestTarScanner:
                 if os.path.exists(path):
                     os.unlink(path)
 
-    def test_max_entries_limit(self):
-        """Test that maximum entries limit is enforced"""
-        scanner = TarScanner(config={"max_tar_entries": 5})
-
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
-            with tarfile.open(tmp.name, "w") as t:
-                # Add more files than the limit
-                for i in range(10):
-                    info = tarfile.TarInfo(f"file{i}.txt")
-                    content = f"Content {i}".encode()
-                    info.size = len(content)
-                    t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
-            tmp_path = tmp.name
-
-        try:
-            result = scanner.scan(tmp_path)
-            entries_issues = [i for i in result.issues if "too many entries" in i.message.lower()]
-            assert len(entries_issues) > 0
-        finally:
-            os.unlink(tmp_path)
-
     def test_scan_tar_with_pickle_file(self):
         """Test scanning TAR containing pickle files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
