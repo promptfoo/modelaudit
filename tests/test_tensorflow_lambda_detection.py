@@ -16,6 +16,17 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
 
+def has_tensorflow():
+    """Check if TensorFlow is available."""
+    try:
+        import tensorflow  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.tensorflow
 class TestTensorFlowLambdaDetection:
     """Test detection of Lambda layers and unsafe operations."""
 
@@ -203,7 +214,7 @@ __import__('pickle').loads(data)
         finally:
             os.unlink(pb_path)
 
-    @pytest.mark.skipif(not TensorFlowSavedModelScanner.can_handle("dummy.pb"), reason="TensorFlow not installed")
+    @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
     def test_suspicious_metadata_patterns(self):
         """Test detection of suspicious patterns directly in metadata."""
         scanner = TensorFlowSavedModelScanner()

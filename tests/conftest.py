@@ -1,7 +1,6 @@
 import logging
 import pickle
 import shutil
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -9,38 +8,29 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-# Mock utilities for heavy dependencies
+
+# ============================================================================
+# Framework availability detection (cached for performance)
+# ============================================================================
+def _check_framework(name: str) -> bool:
+    """Check if a framework is available."""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
 
 
-def pytest_runtest_setup(item):
-    """Skip problematic tests on Python 3.10, 3.12, and 3.13 to ensure CI passes."""
-    if sys.version_info[:2] in [(3, 10), (3, 12), (3, 13)]:
-        test_file = str(item.fspath)
-        test_name = item.name
-
-        # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
-        allowed_test_files = [
-            "test_xgboost_scanner.py",
-            "test_pickle_scanner.py",
-            "test_base_scanner.py",
-            "test_core.py",
-            "test_cli.py",
-            "test_bug1_confidence_exploit.py",  # Security bug test
-            "test_gguf_scanner.py",  # GGUF scanner tests
-            "test_shebang_context.py",  # Shebang context verification tests
-            "test_file_hash.py",  # SHA256 hashing utility tests
-            "test_streaming_scan.py",  # Streaming scan tests
-            "test_secure_hasher.py",  # Aggregate hash computation tests
-            "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
-            "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
-        ]
-
-        # Check if this is an allowed test file
-        if any(allowed_file in test_file for allowed_file in allowed_test_files):
-            return  # Allow these tests to run
-
-        # Skip all other tests on Python 3.10/3.12/3.13 to prevent CI issues
-        pytest.skip(f"Skipping test on Python {sys.version_info[:2]} - only core functionality tested on this version")
+# Cache framework availability at module load time
+HAS_TENSORFLOW = _check_framework("tensorflow")
+HAS_TORCH = _check_framework("torch")
+HAS_ONNX = _check_framework("onnx")
+HAS_H5PY = _check_framework("h5py")
+HAS_MSGPACK = _check_framework("msgpack")
+HAS_XGBOOST = _check_framework("xgboost")
+HAS_SAFETENSORS = _check_framework("safetensors")
+HAS_JOBLIB = _check_framework("joblib")
+HAS_DILL = _check_framework("dill")
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +166,7 @@ def performance_markers():
 # Configure pytest to handle missing optional dependencies gracefully
 def pytest_configure(config):
     """Configure pytest with custom markers."""
+    # Test category markers
     config.addinivalue_line(
         "markers",
         "slow: mark test as slow (deselect with '-m \"not slow\"')",
@@ -185,6 +176,65 @@ def pytest_configure(config):
         "markers",
         "performance: mark test as performance benchmark",
     )
+
+    # Framework-specific markers (tests auto-skip if framework unavailable)
+    config.addinivalue_line(
+        "markers",
+        "tensorflow: mark test as requiring TensorFlow",
+    )
+    config.addinivalue_line(
+        "markers",
+        "pytorch: mark test as requiring PyTorch",
+    )
+    config.addinivalue_line(
+        "markers",
+        "onnx: mark test as requiring ONNX",
+    )
+    config.addinivalue_line(
+        "markers",
+        "h5py: mark test as requiring h5py",
+    )
+    config.addinivalue_line(
+        "markers",
+        "msgpack: mark test as requiring msgpack",
+    )
+    config.addinivalue_line(
+        "markers",
+        "xgboost: mark test as requiring XGBoost",
+    )
+    config.addinivalue_line(
+        "markers",
+        "safetensors: mark test as requiring safetensors",
+    )
+    config.addinivalue_line(
+        "markers",
+        "joblib: mark test as requiring joblib",
+    )
+    config.addinivalue_line(
+        "markers",
+        "dill: mark test as requiring dill",
+    )
+
+
+def pytest_runtest_setup(item):
+    """Auto-skip tests based on framework markers when framework is unavailable."""
+    # Map markers to availability flags
+    framework_markers = {
+        "tensorflow": HAS_TENSORFLOW,
+        "pytorch": HAS_TORCH,
+        "onnx": HAS_ONNX,
+        "h5py": HAS_H5PY,
+        "msgpack": HAS_MSGPACK,
+        "xgboost": HAS_XGBOOST,
+        "safetensors": HAS_SAFETENSORS,
+        "joblib": HAS_JOBLIB,
+        "dill": HAS_DILL,
+    }
+
+    for marker_name, is_available in framework_markers.items():
+        marker = item.get_closest_marker(marker_name)
+        if marker is not None and not is_available:
+            pytest.skip(f"{marker_name} is not installed")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -299,3 +349,55 @@ def cleanup_test_files():
                     shutil.rmtree(file)
             except (OSError, PermissionError):
                 pass  # Ignore cleanup errors
+
+
+# =============================================================================
+# Common file creation fixtures
+# =============================================================================
+@pytest.fixture
+def safe_pickle_file(tmp_path):
+    """Create a safe pickle file for testing."""
+    path = tmp_path / "safe_model.pkl"
+    data = {"model": "test", "weights": [1.0, 2.0, 3.0]}
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    return path
+
+
+@pytest.fixture
+def malicious_pickle_file(tmp_path):
+    """Create a malicious pickle file for testing detection."""
+    path = tmp_path / "malicious.pkl"
+    # os.system payload
+    path.write_bytes(b"cos\nsystem\n(S'echo pwned'\ntR.")
+    return path
+
+
+@pytest.fixture
+def mock_pytorch_zip(tmp_path):
+    """Create a mock PyTorch ZIP model file."""
+    path = tmp_path / "model.pt"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("version", "3")
+        data = pickle.dumps({"model": "pytorch_test"})
+        zf.writestr("data.pkl", data)
+    return path
+
+
+@pytest.fixture
+def model_directory(tmp_path):
+    """Create a directory with various model files for comprehensive testing."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    # Create pickle file
+    pickle_path = model_dir / "model.pkl"
+    with open(pickle_path, "wb") as f:
+        pickle.dump({"weights": [1, 2, 3]}, f)
+
+    # Create a subdirectory
+    sub_dir = model_dir / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "config.json").write_text('{"name": "test"}')
+
+    return model_dir

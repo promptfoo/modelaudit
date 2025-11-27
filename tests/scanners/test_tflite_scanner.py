@@ -55,22 +55,27 @@ def test_tflite_scanner_no_tflite_installed(tmp_path):
 def test_tflite_scanner_parsing_error(tmp_path):
     """Test scanner behavior with invalid tflite data."""
     path = tmp_path / "model.tflite"
+    # Scanner now checks for magic bytes first, so invalid data triggers that check
     path.write_bytes(b"invalid tflite data")
 
-    # Mock the tflite module to simulate parsing error
-    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
-        mock_tflite.Model.GetRootAsModel.side_effect = Exception("parsing error")
-        scanner = TFLiteScanner()
-        result = scanner.scan(str(path))
-        assert not result.success
-        assert "Invalid TFLite file or parse error" in result.issues[0].message
+    scanner = TFLiteScanner()
+    result = scanner.scan(str(path))
+    assert not result.success
+    # Scanner checks magic bytes first, so invalid data will fail the magic check
+    assert any(
+        "TFLite magic bytes" in issue.message or "Invalid TFLite file" in issue.message for issue in result.issues
+    )
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
 def test_tflite_scanner_custom_operator(tmp_path):
     """Test scanner behavior with custom operators."""
     path = tmp_path / "model.tflite"
-    path.write_bytes(b"some tflite data")
+    # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
+    # Bytes 0-3: FlatBuffer root table offset (4 bytes)
+    # Bytes 4-7: "TFL3" file identifier
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
@@ -103,7 +108,11 @@ def test_tflite_scanner_custom_operator(tmp_path):
 def test_tflite_scanner_safe_model(tmp_path):
     """Test scanner behavior with safe model."""
     path = tmp_path / "model.tflite"
-    path.write_bytes(b"some tflite data")
+    # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
+    # Bytes 0-3: FlatBuffer root table offset (4 bytes)
+    # Bytes 4-7: "TFL3" file identifier
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
@@ -133,7 +142,9 @@ def test_tflite_scanner_safe_model(tmp_path):
 def test_tflite_scanner_metadata_collection(tmp_path):
     """Test that scanner collects appropriate metadata."""
     path = tmp_path / "model.tflite"
-    path.write_bytes(b"some tflite data")
+    # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
 
     if HAS_TFLITE:
         with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
