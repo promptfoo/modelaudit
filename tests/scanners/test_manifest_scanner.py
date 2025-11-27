@@ -319,30 +319,64 @@ def test_manifest_scanner_suspicious_tunnel_service():
             test_file_path.unlink()
 
 
-def test_manifest_scanner_legitimate_urls_not_flagged():
-    """Test that legitimate URLs (huggingface, github, etc.) are NOT flagged."""
+def test_manifest_scanner_trusted_urls_not_flagged():
+    """Test that URLs from trusted domains (huggingface, github, etc.) are NOT flagged."""
     test_file = "config.json"
-    config_with_legit_urls = {
+    config_with_trusted_urls = {
         "model_type": "bert",
         "_name_or_path": "https://huggingface.co/bert-base-uncased",
         "repository": "https://github.com/huggingface/transformers",
-        "documentation": "https://example.com/docs",
         "homepage": "https://pytorch.org/models",
+        "weights": "https://s3.amazonaws.com/models/bert.bin",
+        "storage": "https://storage.googleapis.com/models/bert",
     }
 
     try:
         with Path(test_file).open("w") as f:
-            json.dump(config_with_legit_urls, f)
+            json.dump(config_with_trusted_urls, f)
 
         scanner = ManifestScanner()
         result = scanner.scan(test_file)
 
         assert result.success is True
 
-        # Should have NO suspicious URL checks that failed
-        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        # Should have NO URL checks that failed (all trusted domains)
+        url_checks = [check for check in result.checks if "URL" in check.name]
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
-        assert len(failed_url_checks) == 0
+        assert len(failed_url_checks) == 0, f"Unexpected failed checks: {failed_url_checks}"
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_untrusted_domain_flagged():
+    """Test that URLs from untrusted/unknown domains ARE flagged."""
+    test_file = "config.json"
+    config_with_untrusted_url = {
+        "model_type": "bert",
+        "download_url": "https://totally-legit-models.com/model.bin",
+        "callback": "https://unknown-server.net/webhook",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_untrusted_url, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should flag untrusted domains
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 2, f"Expected 2 untrusted URLs, got {len(failed_url_checks)}"
+
+        # Verify reason is set correctly
+        for check in failed_url_checks:
+            assert check.details.get("reason") == "untrusted_domain"
 
     finally:
         test_file_path = Path(test_file)

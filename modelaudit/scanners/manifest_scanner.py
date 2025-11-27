@@ -57,8 +57,7 @@ MODEL_NAME_KEYS_LOWER = [
     "package_name",
 ]
 
-# URL shorteners and tunnel services that can hide malicious endpoints
-# These are flagged because legitimate ML configs use full URLs
+# URL shorteners and tunnel services - ALWAYS suspicious in ML configs
 SUSPICIOUS_URL_DOMAINS = [
     "bit.ly",
     "tinyurl.com",
@@ -73,6 +72,52 @@ SUSPICIOUS_URL_DOMAINS = [
     "localtunnel.me",
     "serveo.net",
     "localhost.run",
+]
+
+# Trusted domains for ML model configs - URLs from these domains are NOT flagged
+# This allowlist ensures unknown/untrusted domains are detected
+TRUSTED_URL_DOMAINS = [
+    # Model hubs and repositories
+    "huggingface.co",
+    "hf.co",
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    # ML framework official sites
+    "pytorch.org",
+    "download.pytorch.org",
+    "tensorflow.org",
+    "keras.io",
+    "onnx.ai",
+    "mlflow.org",
+    # Cloud storage (legitimate model hosting)
+    "s3.amazonaws.com",
+    "s3-",  # Regional: s3-us-west-2.amazonaws.com
+    ".s3.",  # Bucket URLs: bucket.s3.region.amazonaws.com
+    "storage.googleapis.com",
+    "storage.cloud.google.com",
+    "blob.core.windows.net",
+    # Research and datasets
+    "arxiv.org",
+    "paperswithcode.com",
+    "kaggle.com",
+    "zenodo.org",
+    # Major AI/ML companies
+    "openai.com",
+    "anthropic.com",
+    "ai.meta.com",
+    "meta.com",
+    "microsoft.com",
+    "nvidia.com",
+    "google.com",
+    "deepmind.com",
+    # Documentation and package repos
+    "readthedocs.io",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "anaconda.org",
+    "conda.anaconda.org",
 ]
 
 # Regex to find URLs in text
@@ -422,42 +467,78 @@ class ManifestScanner(BaseScanner):
         check_dict(content)
 
     def _check_suspicious_urls(self, content: dict[str, Any], result: ScanResult) -> None:
-        """Check for suspicious URLs (shorteners, tunnels) in config values.
+        """Check for suspicious or untrusted URLs in config values.
 
-        Only flags URL shorteners and tunnel services that can hide malicious endpoints.
-        Legitimate URLs (huggingface.co, github.com, etc.) are NOT flagged.
+        Uses a hybrid allowlist/blocklist approach:
+        1. URLs from SUSPICIOUS domains (shorteners, tunnels) → Always flagged
+        2. URLs from TRUSTED domains (huggingface, github, etc.) → Not flagged
+        3. URLs from UNKNOWN domains → Flagged as untrusted (security best practice)
         """
         seen_urls: set[str] = set()
+
+        def is_trusted_domain(url_lower: str) -> bool:
+            """Check if URL is from a trusted domain."""
+            return any(domain in url_lower for domain in TRUSTED_URL_DOMAINS)
+
+        def is_suspicious_domain(url_lower: str) -> str | None:
+            """Check if URL is from a suspicious domain. Returns domain name if found."""
+            for domain in SUSPICIOUS_URL_DOMAINS:
+                if domain in url_lower:
+                    return domain
+            return None
 
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
             if isinstance(value, str):
-                # Find all URLs in the string
                 urls = URL_PATTERN.findall(value)
                 for url in urls:
                     if url in seen_urls:
                         continue
+                    seen_urls.add(url)
                     url_lower = url.lower()
-                    for domain in SUSPICIOUS_URL_DOMAINS:
-                        if domain in url_lower:
-                            seen_urls.add(url)
-                            result.add_check(
-                                name="Suspicious URL Check",
-                                passed=False,
-                                message=f"Suspicious URL found in config: {url}",
-                                severity=IssueSeverity.INFO,
-                                location=self.current_file_path,
-                                details={
-                                    "url": url,
-                                    "suspicious_domain": domain,
-                                    "key_path": key_path,
-                                },
-                                why=(
-                                    "URL shorteners and tunnel services can hide malicious "
-                                    "endpoints. Legitimate ML configs typically use full URLs."
-                                ),
-                            )
-                            break
+
+                    # Check 1: Known suspicious domains (shorteners, tunnels)
+                    suspicious_domain = is_suspicious_domain(url_lower)
+                    if suspicious_domain:
+                        result.add_check(
+                            name="Suspicious URL Check",
+                            passed=False,
+                            message=f"Suspicious URL found in config: {url}",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={
+                                "url": url,
+                                "suspicious_domain": suspicious_domain,
+                                "key_path": key_path,
+                                "reason": "url_shortener_or_tunnel",
+                            },
+                            why=(
+                                "URL shorteners and tunnel services can hide malicious "
+                                "endpoints and are commonly used in supply chain attacks."
+                            ),
+                        )
+                        continue
+
+                    # Check 2: Unknown/untrusted domains (not in allowlist)
+                    if not is_trusted_domain(url_lower):
+                        result.add_check(
+                            name="Untrusted URL Check",
+                            passed=False,
+                            message=f"URL from untrusted domain in config: {url}",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={
+                                "url": url,
+                                "key_path": key_path,
+                                "reason": "untrusted_domain",
+                            },
+                            why=(
+                                "This URL is from a domain not in the trusted allowlist. "
+                                "ML configs should typically only reference well-known "
+                                "sources like huggingface.co, github.com, or pytorch.org."
+                            ),
+                        )
+
             elif isinstance(value, dict):
                 for k, v in value.items():
                     new_path = f"{key_path}.{k}" if key_path else k
