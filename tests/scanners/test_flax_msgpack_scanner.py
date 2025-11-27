@@ -1,6 +1,11 @@
 import os
 from typing import Any
 
+import pytest
+
+# Skip if msgpack is not available before importing it
+pytest.importorskip("msgpack")
+
 import msgpack
 
 from modelaudit.scanners.base import IssueSeverity

@@ -2,9 +2,13 @@
 
 import json
 
-import msgpack
 import numpy as np
 import pytest
+
+# Skip if msgpack is not available before importing it
+pytest.importorskip("msgpack")
+
+import msgpack
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner

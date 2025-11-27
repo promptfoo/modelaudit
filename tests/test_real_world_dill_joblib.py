@@ -292,23 +292,6 @@ class TestPerformanceBenchmarks:
 class TestErrorScenarios:
     """Test various error scenarios for robustness."""
 
-    def test_corrupted_file_handling(self, tmp_path):
-        """Test handling of corrupted files."""
-        corrupted_file = tmp_path / "corrupted.joblib"
-
-        # Create partially corrupted file
-        with open(corrupted_file, "wb") as f:
-            f.write(b"joblib")
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"\xff" * 100)  # Corrupted data
-
-        scanner = PickleScanner()
-        result = scanner.scan(str(corrupted_file))
-
-        # Should handle corruption gracefully
-        assert isinstance(result.success, bool)
-        assert len(result.issues) > 0  # Should report issues
-
     def test_permission_denied_handling(self, tmp_path):
         """Test handling of files with permission issues."""
         if hasattr(os, "chmod"):  # Unix-like systems

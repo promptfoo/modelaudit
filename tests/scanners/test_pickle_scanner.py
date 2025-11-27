@@ -3,6 +3,11 @@ import sys
 import unittest
 from pathlib import Path
 
+import pytest
+
+# Skip if dill is not available before importing it
+pytest.importorskip("dill")
+
 import dill
 
 from modelaudit.detectors.suspicious_symbols import (

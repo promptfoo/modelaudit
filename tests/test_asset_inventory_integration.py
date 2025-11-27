@@ -19,6 +19,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 from click.testing import CliRunner
+
+# Skip if safetensors is not available before importing it
+pytest.importorskip("safetensors")
+
 from safetensors.numpy import save_file
 
 from modelaudit.cli import cli

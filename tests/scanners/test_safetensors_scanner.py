@@ -3,6 +3,11 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+# Skip if safetensors is not available before importing it
+pytest.importorskip("safetensors")
+
 from safetensors.numpy import save_file
 
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
