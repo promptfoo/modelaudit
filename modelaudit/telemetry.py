@@ -98,14 +98,19 @@ class TelemetryEvent(str, Enum):
     DOWNLOAD_COMPLETED = "download_completed"
 
 
-# PostHog configuration - use Promptfoo's endpoints for consistency
+# PostHog configuration
+# Can use own PostHog instance or Promptfoo's shared infrastructure
 POSTHOG_PROJECT_KEY = os.getenv("MODELAUDIT_POSTHOG_KEY", "")
-POSTHOG_HOST = "https://a.promptfoo.app"
+POSTHOG_HOST = os.getenv("MODELAUDIT_POSTHOG_HOST", "https://app.posthog.com")
 
-# Use Promptfoo's analytics endpoints for consistency
+# Promptfoo analytics endpoints (fallback when no direct PostHog configured)
 EVENTS_ENDPOINT = "https://a.promptfoo.app"
 KA_ENDPOINT = "https://ka.promptfoo.app/"
 R_ENDPOINT = "https://r.promptfoo.app/"
+
+# Feature flag: send rich data (full paths, model names, exact findings)
+# Set to "1" to enable detailed analytics for your own PostHog instance
+RICH_ANALYTICS = os.getenv("MODELAUDIT_RICH_ANALYTICS", "1").lower() in ("1", "true", "yes")
 
 # Timeout for analytics requests (in seconds)
 ANALYTICS_TIMEOUT = 2.0
@@ -341,41 +346,101 @@ class TelemetryClient:
         except Exception as e:
             logger.debug(f"Failed to record telemetry event: {e}")
 
+    def _extract_model_name(self, path: str) -> str | None:
+        """Extract model name from path or URL."""
+        # HuggingFace format: hf://org/model or https://huggingface.co/org/model
+        if "huggingface.co/" in path or path.startswith("hf://"):
+            parts = path.replace("hf://", "").replace("https://huggingface.co/", "").split("/")
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+        # PyTorch Hub format: pytorch://org/repo/model
+        if "pytorch" in path.lower() and "/" in path:
+            parts = path.split("/")
+            return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+        # Local file: just the filename
+        if "/" in path or "\\" in path:
+            return Path(path).name
+        return path
+
     def record_scan_started(self, paths: list[str], scan_options: dict[str, Any]) -> None:
         """Record that a scan has started."""
-        self.record_event(
-            TelemetryEvent.SCAN_STARTED,
-            {
-                "num_paths": len(paths),
-                "path_hashes": [self._hash_path(path) for path in paths],  # Hash paths for privacy
-                "path_types": [self._classify_path(path) for path in paths],
-                "timeout": scan_options.get("timeout"),
-                "max_file_size": scan_options.get("max_file_size"),
-                "format": scan_options.get("format", "text"),
-                "has_blacklist": bool(scan_options.get("blacklist_patterns")),
-                "num_blacklist_patterns": len(
-                    scan_options.get("blacklist_patterns", [])
-                ),  # Count only, not actual patterns
-                "large_model_support": scan_options.get("large_model_support", True),
-                "progress_enabled": scan_options.get("progress", True),
-            },
-        )
+        properties: dict[str, Any] = {
+            "num_paths": len(paths),
+            "path_types": [self._classify_path(path) for path in paths],
+            "timeout": scan_options.get("timeout"),
+            "max_file_size": scan_options.get("max_file_size"),
+            "format": scan_options.get("format", "text"),
+            "has_blacklist": scan_options.get("has_blacklist", False),
+            "num_blacklist_patterns": scan_options.get("num_blacklist_patterns", 0),
+            "progress_enabled": scan_options.get("progress", True),
+        }
+
+        # Rich analytics: include full paths and model names
+        if RICH_ANALYTICS:
+            properties["paths"] = paths
+            properties["model_names"] = [self._extract_model_name(p) for p in paths]
+            # Extract source types
+            properties["source_types"] = [
+                "huggingface"
+                if "huggingface" in p.lower() or p.startswith("hf://")
+                else "pytorch_hub"
+                if "pytorch" in p.lower()
+                else "s3"
+                if p.startswith("s3://")
+                else "gcs"
+                if p.startswith("gs://")
+                else "http"
+                if p.startswith("http")
+                else "local"
+                for p in paths
+            ]
+        else:
+            properties["path_hashes"] = [self._hash_path(path) for path in paths]
+
+        self.record_event(TelemetryEvent.SCAN_STARTED, properties)
 
     def record_scan_completed(self, duration: float, results: dict[str, Any]) -> None:
         """Record that a scan has completed successfully."""
-        self.record_event(
-            TelemetryEvent.SCAN_COMPLETED,
-            {
-                "duration": duration,
-                "total_files": len(results.get("assets", [])),
-                "total_issues": sum(len(asset.get("issues", [])) for asset in results.get("assets", [])),
-                "issue_severities": self._count_issue_severities(results),
-                "file_types": self._count_file_types(results),
-                "scanners_used": list(
-                    {scanner for asset in results.get("assets", []) for scanner in asset.get("scanners_used", [])}
-                ),
-            },
-        )
+        properties: dict[str, Any] = {
+            "duration": duration,
+            "total_files": len(results.get("assets", [])),
+            "total_issues": sum(len(asset.get("issues", [])) for asset in results.get("assets", [])),
+            "issue_severities": self._count_issue_severities(results),
+            "file_types": self._count_file_types(results),
+            "scanners_used": list(
+                {scanner for asset in results.get("assets", []) for scanner in asset.get("scanners_used", [])}
+            ),
+        }
+
+        # Rich analytics: include detailed findings breakdown
+        if RICH_ANALYTICS:
+            # Collect all unique issue types with counts
+            issue_types: dict[str, int] = {}
+            issue_details: list[dict[str, Any]] = []
+            for asset in results.get("assets", []):
+                file_path = asset.get("path", "")
+                model_name = self._extract_model_name(file_path) if file_path else None
+                for issue in asset.get("issues", []):
+                    issue_type = issue.get("message", "unknown")
+                    severity = issue.get("severity", "unknown")
+                    issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
+                    # Capture first 50 issues in detail
+                    if len(issue_details) < 50:
+                        issue_details.append(
+                            {
+                                "type": issue_type,
+                                "severity": severity,
+                                "scanner": issue.get("scanner", "unknown"),
+                                "file_path": file_path,
+                                "model_name": model_name,
+                            }
+                        )
+            properties["issue_types"] = issue_types
+            properties["issue_details"] = issue_details
+            # Include file paths scanned
+            properties["files_scanned"] = [asset.get("path", "") for asset in results.get("assets", [])]
+
+        self.record_event(TelemetryEvent.SCAN_COMPLETED, properties)
 
     def record_scan_failed(self, duration: float, error: Union[Exception, str]) -> None:
         """Record that a scan has failed."""
@@ -401,27 +466,47 @@ class TelemetryClient:
 
     def record_file_type_detected(self, file_path: str, detected_type: str, confidence: float = 1.0) -> None:
         """Record detection of a file type."""
-        self.record_event(
-            TelemetryEvent.FILE_TYPE_DETECTED,
-            {
-                "file_type": detected_type,
-                "confidence": confidence,
-                "file_hash": self._hash_path(file_path),  # Hash path for privacy
-                "file_extension": Path(file_path).suffix.lower(),
-                "path_type": self._classify_path(file_path),
-            },
-        )
+        properties: dict[str, Any] = {
+            "file_type": detected_type,
+            "confidence": confidence,
+            "file_extension": Path(file_path).suffix.lower(),
+            "path_type": self._classify_path(file_path),
+        }
 
-    def record_issue_found(self, issue_type: str, severity: str, scanner: str) -> None:
+        if RICH_ANALYTICS:
+            properties["file_path"] = file_path
+            properties["model_name"] = self._extract_model_name(file_path)
+        else:
+            properties["file_hash"] = self._hash_path(file_path)
+
+        self.record_event(TelemetryEvent.FILE_TYPE_DETECTED, properties)
+
+    def record_issue_found(
+        self,
+        issue_type: str,
+        severity: str,
+        scanner: str,
+        file_path: str | None = None,
+    ) -> None:
         """Record that a security issue was found."""
-        self.record_event(
-            TelemetryEvent.ISSUE_FOUND,
-            {
-                "issue_type": self._sanitize_issue_type(issue_type),
-                "severity": severity,
-                "scanner": scanner,
-            },
-        )
+        properties: dict[str, Any] = {
+            "severity": severity,
+            "scanner": scanner,
+        }
+
+        if RICH_ANALYTICS:
+            # Full issue message for detailed analytics
+            properties["issue_type"] = issue_type
+            properties["issue_message"] = issue_type  # Full message
+            if file_path:
+                properties["file_path"] = file_path
+                properties["model_name"] = self._extract_model_name(file_path)
+                properties["file_extension"] = Path(file_path).suffix.lower()
+        else:
+            # Sanitized category only
+            properties["issue_type"] = self._sanitize_issue_type(issue_type)
+
+        self.record_event(TelemetryEvent.ISSUE_FOUND, properties)
 
     def record_command_used(self, command: str, duration: float | None = None, **kwargs: Any) -> None:
         """Record usage of a CLI command."""
@@ -459,27 +544,36 @@ class TelemetryClient:
 
     def record_download_started(self, source_type: str, url: str, size_bytes: int | None = None) -> None:
         """Record that a download has started."""
-        self.record_event(
-            TelemetryEvent.DOWNLOAD_STARTED,
-            {
-                "source_type": source_type,
-                "url_hash": self._hash_url(url),  # Hash URL for privacy
-                "domain": self._extract_domain(url),
-                "size_bytes": size_bytes,
-            },
-        )
+        properties: dict[str, Any] = {
+            "source_type": source_type,
+            "domain": self._extract_domain(url),
+            "size_bytes": size_bytes,
+        }
 
-    def record_download_completed(self, source_type: str, duration: float, size_bytes: int) -> None:
+        if RICH_ANALYTICS:
+            properties["url"] = url
+            properties["model_name"] = self._extract_model_name(url)
+        else:
+            properties["url_hash"] = self._hash_url(url)
+
+        self.record_event(TelemetryEvent.DOWNLOAD_STARTED, properties)
+
+    def record_download_completed(
+        self, source_type: str, duration: float, size_bytes: int, url: str | None = None
+    ) -> None:
         """Record that a download has completed."""
-        self.record_event(
-            TelemetryEvent.DOWNLOAD_COMPLETED,
-            {
-                "source_type": source_type,
-                "duration": duration,
-                "size_bytes": size_bytes,
-                "speed_mbps": (size_bytes / (1024 * 1024)) / duration if duration > 0 else 0,
-            },
-        )
+        properties: dict[str, Any] = {
+            "source_type": source_type,
+            "duration": duration,
+            "size_bytes": size_bytes,
+            "speed_mbps": (size_bytes / (1024 * 1024)) / duration if duration > 0 else 0,
+        }
+
+        if RICH_ANALYTICS and url:
+            properties["url"] = url
+            properties["model_name"] = self._extract_model_name(url)
+
+        self.record_event(TelemetryEvent.DOWNLOAD_COMPLETED, properties)
 
     def flush(self) -> None:
         """Flush any pending analytics events."""
@@ -704,11 +798,11 @@ def record_file_type_detected(file_path: str, detected_type: str, confidence: fl
 
 
 @safe_telemetry
-def record_issue_found(issue_type: str, severity: str, scanner: str) -> None:
+def record_issue_found(issue_type: str, severity: str, scanner: str, file_path: str | None = None) -> None:
     """Record that a security issue was found."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_issue_found(issue_type, severity, scanner)
+        client.record_issue_found(issue_type, severity, scanner, file_path)
 
 
 @safe_telemetry
@@ -720,11 +814,11 @@ def record_download_started(source_type: str, url: str, size_bytes: int | None =
 
 
 @safe_telemetry
-def record_download_completed(source_type: str, duration: float, size_bytes: int) -> None:
+def record_download_completed(source_type: str, duration: float, size_bytes: int, url: str | None = None) -> None:
     """Record that a download has completed."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_download_completed(source_type, duration, size_bytes)
+        client.record_download_completed(source_type, duration, size_bytes, url)
 
 
 @safe_telemetry

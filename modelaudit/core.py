@@ -1441,21 +1441,25 @@ def merge_scan_result(
     """
     # Record telemetry for issues before aggregation
     if isinstance(scan_result, ScanResult):
+        file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
         for issue in scan_result.issues:
             record_issue_found(
                 issue.message,
                 issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
                 scan_result.scanner_name,
+                file_path=file_path,
             )
         # Use the new direct aggregation method for better performance and type safety
         results.aggregate_scan_result_direct(scan_result)
     else:
         # Fallback to dict-based aggregation for backward compatibility with telemetry
+        file_path = scan_result.get("file_path")
         for issue in scan_result.get("issues", []):
             record_issue_found(
                 issue.get("message", "unknown_issue"),
                 issue.get("severity", "unknown"),
                 scan_result.get("scanner_name", "unknown"),
+                file_path=file_path,
             )
         results.aggregate_scan_result(scan_result)
 

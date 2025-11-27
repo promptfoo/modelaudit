@@ -209,8 +209,35 @@ class TestDataAnonymization:
             assert "private" not in hashed
 
     @patch("modelaudit.telemetry.urlopen")
-    def test_scan_started_uses_hashed_paths(self, mock_urlopen):
-        """Test that scan_started records hashed paths, not actual paths."""
+    def test_scan_started_includes_full_paths_in_rich_mode(self, mock_urlopen):
+        """Test that scan_started includes full paths when RICH_ANALYTICS is enabled (default)."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._user_config.telemetry_enabled = True
+
+            paths = ["/models/llama-2-7b.pkl", "/models/gpt-neo.pt"]
+            scan_options = {"has_blacklist": False, "num_blacklist_patterns": 0, "format": "json"}
+
+            client.record_scan_started(paths, scan_options)
+
+            # With RICH_ANALYTICS=1 (default), full paths should be included
+            call_args = mock_urlopen.call_args_list
+            for call in call_args:
+                request_data = call[0][0].data.decode()
+                # Full paths should be present in rich mode
+                assert "llama-2-7b.pkl" in request_data or "gpt-neo.pt" in request_data
+                # Model names should be extracted
+                assert "model_names" in request_data
+
+    @patch("modelaudit.telemetry.RICH_ANALYTICS", False)
+    @patch("modelaudit.telemetry.urlopen")
+    def test_scan_started_hashes_paths_in_privacy_mode(self, mock_urlopen):
+        """Test that scan_started hashes paths when RICH_ANALYTICS is disabled."""
         mock_response = MagicMock()
         mock_response.status = 200
         mock_urlopen.return_value.__enter__.return_value = mock_response
@@ -221,22 +248,46 @@ class TestDataAnonymization:
             client._user_config.telemetry_enabled = True
 
             paths = ["/sensitive/model1.pkl", "/private/model2.pt"]
-            scan_options = {"blacklist_patterns": ["secret", "private"], "format": "json"}
+            scan_options = {"has_blacklist": True, "num_blacklist_patterns": 2, "format": "json"}
 
             client.record_scan_started(paths, scan_options)
 
-            # Verify that actual paths are not in the request
+            # With RICH_ANALYTICS=0, actual paths should NOT be in the request
             call_args = mock_urlopen.call_args_list
             for call in call_args:
                 request_data = call[0][0].data.decode()
                 assert "/sensitive/model1.pkl" not in request_data
                 assert "/private/model2.pt" not in request_data
-                assert "secret" not in request_data
-                assert "private" not in request_data
+                # Should have path_hashes instead
+                assert "path_hashes" in request_data
 
     @patch("modelaudit.telemetry.urlopen")
-    def test_download_started_uses_hashed_url(self, mock_urlopen):
-        """Test that download_started records hashed URLs."""
+    def test_download_started_includes_full_url_in_rich_mode(self, mock_urlopen):
+        """Test that download_started includes full URL when RICH_ANALYTICS is enabled (default)."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._user_config.telemetry_enabled = True
+
+            url = "https://huggingface.co/meta-llama/Llama-2-7b"
+
+            client.record_download_started("huggingface", url)
+
+            # With RICH_ANALYTICS=1 (default), full URL should be included
+            call_args = mock_urlopen.call_args_list
+            for call in call_args:
+                request_data = call[0][0].data.decode()
+                assert "huggingface.co" in request_data
+                assert "model_name" in request_data
+
+    @patch("modelaudit.telemetry.RICH_ANALYTICS", False)
+    @patch("modelaudit.telemetry.urlopen")
+    def test_download_started_hashes_url_in_privacy_mode(self, mock_urlopen):
+        """Test that download_started hashes URL when RICH_ANALYTICS is disabled."""
         mock_response = MagicMock()
         mock_response.status = 200
         mock_urlopen.return_value.__enter__.return_value = mock_response
@@ -250,12 +301,14 @@ class TestDataAnonymization:
 
             client.record_download_started("huggingface", sensitive_url)
 
-            # Verify that actual URL is not in the request
+            # With RICH_ANALYTICS=0, actual URL should NOT be in the request
             call_args = mock_urlopen.call_args_list
             for call in call_args:
                 request_data = call[0][0].data.decode()
                 assert "api_key=secret123" not in request_data
                 assert sensitive_url not in request_data
+                # Should have url_hash instead
+                assert "url_hash" in request_data
 
     def test_email_hashing(self):
         """Test that email addresses are properly hashed."""
