@@ -131,36 +131,56 @@ class TestTelemetryDecoupling:
 
     def test_posthog_import_failure_handled(self):
         """Test that PostHog import failures don't break telemetry initialization."""
-        with patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False):
-            # Reset the global client cache to force re-initialization
-            with patch("modelaudit.telemetry._telemetry_client", None):
-                with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-                    mock_home.return_value = Path(temp_dir)
+        with (
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),  # Simulate production
+            patch("modelaudit.telemetry._telemetry_client", None),  # Reset client cache
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
 
-                    from modelaudit.telemetry import get_telemetry_client
+            from modelaudit.telemetry import get_telemetry_client
 
-                    client = get_telemetry_client()
-                    # Should still initialize, just without PostHog
-                    assert client is not None
-                    assert client._posthog_client is None
+            client = get_telemetry_client()
+            # Should still initialize, just without PostHog
+            assert client is not None
+            assert client._posthog_client is None
 
     def test_network_failures_dont_break_functionality(self):
         """Test that network failures in telemetry don't affect core functionality."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        mock_posthog = MagicMock()
+        mock_posthog.capture.side_effect = Exception("Network down")
+        mock_posthog.flush.side_effect = Exception("Network down")
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
             mock_home.return_value = Path(temp_dir)
 
-            # Enable telemetry but make all network calls fail
-            with patch("modelaudit.telemetry.urlopen", side_effect=Exception("Network down")):
-                from modelaudit.telemetry import get_telemetry_client
+            from modelaudit.telemetry import get_telemetry_client
 
-                client = get_telemetry_client()
-                if client is not None:
-                    client._user_config.telemetry_enabled = True
+            client = get_telemetry_client()
+            if client is not None:
+                client._posthog_client = mock_posthog
+                client._user_config.telemetry_enabled = True
 
-                    # These should all complete without exceptions
-                    record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
-                    record_command_used("test")
-                    flush_telemetry()
+                # These should all complete without exceptions (even with network failures)
+                record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
+                record_command_used("test")
+                flush_telemetry()
 
     def test_file_system_failures_handled(self):
         """Test that file system failures don't break telemetry initialization."""
@@ -190,6 +210,7 @@ class TestTelemetryFunctionalityWhenWorking:
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),  # Simulate production
             patch.dict(
                 os.environ,
                 {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},

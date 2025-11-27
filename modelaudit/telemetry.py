@@ -6,22 +6,19 @@ Follows privacy-first principles with comprehensive opt-out controls.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar, Union, cast
-from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from . import __version__
 
@@ -114,13 +111,44 @@ _DEFAULT_POSTHOG_KEY = "phc_E5n5uHnDo2eREJL1uqX1cIlbkoRby4yFWt3V94HqRRg"
 POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", _DEFAULT_POSTHOG_KEY))
 POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
 
-# Promptfoo analytics endpoints for dual-track submission
-EVENTS_ENDPOINT = "https://a.promptfoo.app"
-KA_ENDPOINT = "https://ka.promptfoo.app/"
-R_ENDPOINT = "https://r.promptfoo.app/"
 
-# Timeout for analytics requests (in seconds)
-ANALYTICS_TIMEOUT = 2.0
+def _is_development_install() -> bool:
+    """Check if running from a development/editable install (pip install -e).
+
+    This prevents polluting production analytics with development test data.
+    Uses importlib.metadata to properly detect editable installs.
+    See: https://stackoverflow.com/questions/43348746/how-to-detect-if-module-is-installed-in-editable-mode
+
+    Returns True if:
+    - Package is installed in editable mode (pip install -e)
+    - MODELAUDIT_DEV=1 is explicitly set
+    """
+    # Explicit dev mode flag
+    if os.getenv("MODELAUDIT_DEV", "").lower() in ("1", "true", "yes"):
+        return True
+
+    # Check if installed in editable mode using importlib.metadata
+    try:
+        from importlib.metadata import Distribution
+
+        dist = Distribution.from_name("modelaudit")
+        # Modern pip (21.3+) uses direct_url.json for editable installs
+        direct_url_text = dist.read_text("direct_url.json")
+        if direct_url_text:
+            import json
+
+            direct_url = json.loads(direct_url_text)
+            if direct_url.get("dir_info", {}).get("editable", False):
+                return True
+    except Exception:
+        # Package not installed or metadata not available - not editable
+        pass
+
+    return False
+
+
+# Cache the development check at module load time
+_IS_DEVELOPMENT = _is_development_install()
 
 
 class UserConfig:
@@ -161,8 +189,6 @@ class UserConfig:
         """
         if self._promptfoo_user_id is not None:
             return self._promptfoo_user_id
-
-        import re
 
         promptfoo_config = Path.home() / ".promptfoo" / "promptfooConfig.yaml"
         if promptfoo_config.exists():
@@ -248,6 +274,11 @@ class TelemetryClient:
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
+        # Development installs don't send telemetry by default (prevents polluting analytics)
+        # Allow explicit opt-in during development with MODELAUDIT_TELEMETRY_DEV=1
+        if _IS_DEVELOPMENT and os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower() not in ("1", "true", "yes"):
+            return True
+
         # Check environment variables - use Promptfoo's standard env var
         if os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower() in ("1", "true", "yes"):
             return True
@@ -295,13 +326,12 @@ class TelemetryClient:
             "source": "modelaudit",
             "modelaudit_version": __version__,
             "session_id": self._session_id,
-            "timestamp": datetime.utcnow().isoformat(),
             "user_id": self._user_config.user_id,
-            "platform": os.name,
-            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "platform": sys.platform,
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         }
 
-        # Send to PostHog if available
+        # Send to PostHog
         if self._posthog_client:
             try:
                 self._posthog_client.capture(
@@ -312,74 +342,6 @@ class TelemetryClient:
                 self._posthog_client.flush()
             except Exception as e:
                 logger.debug(f"Failed to send event to PostHog: {e}")
-
-        # Send to Promptfoo's analytics endpoints for consistency
-        self._send_to_promptfoo_endpoints(event.value, event_properties)
-
-    def _send_to_promptfoo_endpoints(self, event: str, properties: dict[str, Any]) -> None:
-        """Send event to Promptfoo's analytics endpoints following their pattern."""
-        # Send to KA endpoint (following Promptfoo's pattern)
-        try:
-            ka_payload = {
-                "profile_id": self._user_config.user_id,
-                "email": self._hash_email(self._user_config.email),
-                "events": [
-                    {
-                        "message_id": str(uuid.uuid4()),
-                        "type": "track",
-                        "event": event,
-                        "properties": properties,
-                        "sent_at": datetime.utcnow().isoformat(),
-                    }
-                ],
-            }
-
-            data = json.dumps(ka_payload).encode("utf-8")
-            req = Request(
-                KA_ENDPOINT,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ModelAudit/{__version__}",
-                },
-            )
-
-            with urlopen(req, timeout=ANALYTICS_TIMEOUT) as response:
-                if response.status != 200:
-                    logger.debug(f"KA endpoint returned status {response.status}")
-
-        except (URLError, OSError) as e:
-            logger.debug(f"Failed to send event to KA endpoint: {e}")
-
-        # Send to R endpoint (following Promptfoo's pattern)
-        try:
-            r_payload = {
-                "event": event,
-                "source": "modelaudit",
-                "environment": os.getenv("NODE_ENV", "development"),
-                "email": self._hash_email(self._user_config.email),
-                "meta": {
-                    "user_id": self._user_config.user_id,
-                    **properties,
-                },
-            }
-
-            data = json.dumps(r_payload).encode("utf-8")
-            req = Request(
-                R_ENDPOINT,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ModelAudit/{__version__}",
-                },
-            )
-
-            with urlopen(req, timeout=ANALYTICS_TIMEOUT) as response:
-                if response.status != 200:
-                    logger.debug(f"R endpoint returned status {response.status}")
-
-        except (URLError, OSError) as e:
-            logger.debug(f"Failed to send event to R endpoint: {e}")
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
@@ -649,76 +611,8 @@ class TelemetryClient:
         except Exception:
             return "unknown"
 
-    def _hash_path(self, path: str) -> str:
-        """Hash file path for privacy while maintaining analytics value."""
-        # Use SHA-256 hash of the path for privacy
-        return hashlib.sha256(path.encode()).hexdigest()[:16]  # First 16 chars for brevity
-
-    def _hash_url(self, url: str) -> str:
-        """Hash URL for privacy while maintaining analytics value."""
-        # Remove query parameters and hash the clean URL
-        try:
-            parsed = urlparse(url)
-            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            return hashlib.sha256(clean_url.encode()).hexdigest()[:16]
-        except Exception:
-            return hashlib.sha256(url.encode()).hexdigest()[:16]
-
-    def _hash_email(self, email: str | None) -> str | None:
-        """Hash email for privacy - only send domain for analytics."""
-        if not email:
-            return None
-        try:
-            # Only keep the domain part, hash the local part
-            if "@" in email:
-                local, domain = email.rsplit("@", 1)
-                local_hash = hashlib.sha256(local.encode()).hexdigest()[:8]
-                return f"{local_hash}@{domain}"
-            return hashlib.sha256(email.encode()).hexdigest()[:16]
-        except Exception:
-            return None
-
-    def _sanitize_issue_type(self, message: str) -> str:
-        """Extract issue type from message, removing sensitive details."""
-        # Common issue type patterns - extract just the category
-        issue_patterns = [
-            "malicious_code",
-            "dangerous_import",
-            "pickle_exploit",
-            "code_execution",
-            "suspicious_opcode",
-            "unsafe_lambda",
-            "network_access",
-            "file_access",
-            "encoded_payload",
-            "blacklisted_model",
-            "weight_anomaly",
-            "metadata_issue",
-            "secret_exposure",
-            "path_traversal",
-            "compression_bomb",
-            "unsafe_deserialization",
-        ]
-        message_lower = message.lower()
-        for pattern in issue_patterns:
-            if pattern.replace("_", " ") in message_lower or pattern in message_lower:
-                return pattern
-        # If no pattern matches, return a generic category based on severity keywords
-        # Check more specific patterns FIRST (pickle before code since pickle opcode contains "code")
-        if any(kw in message_lower for kw in ["pickle", "opcode", "reduce"]):
-            return "pickle_related"
-        if any(kw in message_lower for kw in ["exec", "eval", "import", "code"]):
-            return "code_execution_related"
-        if any(kw in message_lower for kw in ["network", "url", "http"]):
-            return "network_related"
-        if any(kw in message_lower for kw in ["file", "path", "directory"]):
-            return "file_related"
-        return "other"
-
     def _sanitize_error(self, error: Union[Exception, str]) -> str:
         """Sanitize error message to remove sensitive information."""
-        import re
-
         error_str = str(error)
         # Remove URLs FIRST (before path matching can break them)
         error_str = re.sub(r"https?://[^\s]+", "[URL]", error_str)

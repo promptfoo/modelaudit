@@ -77,11 +77,12 @@ class TestUserConfig:
 class TestTelemetryClient:
     """Test telemetry client functionality."""
 
-    def test_telemetry_enabled_by_default(self):
-        """Test that telemetry is enabled by default (opt-out model)."""
+    def test_telemetry_enabled_by_default_in_production(self):
+        """Test that telemetry is enabled by default in production (non-editable install)."""
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),  # Simulate production
             patch.dict(
                 os.environ,
                 {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
@@ -91,13 +92,62 @@ class TestTelemetryClient:
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
 
-            # Telemetry should be enabled by default (not disabled)
+            # Telemetry should be enabled by default in production
+            assert client._is_disabled() is False
+
+    def test_telemetry_disabled_in_development(self):
+        """Test that telemetry is disabled by default in development (editable install)."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", True),  # Simulate development
+            patch.dict(
+                os.environ,
+                {
+                    "CI": "",
+                    "IS_TESTING": "",
+                    "PROMPTFOO_DISABLE_TELEMETRY": "",
+                    "NO_ANALYTICS": "",
+                    "MODELAUDIT_TELEMETRY_DEV": "",
+                },
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # Telemetry should be disabled by default in development
+            assert client._is_disabled() is True
+
+    def test_telemetry_can_be_enabled_in_development(self):
+        """Test that telemetry can be explicitly enabled in development."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", True),  # Simulate development
+            patch.dict(
+                os.environ,
+                {
+                    "CI": "",
+                    "IS_TESTING": "",
+                    "PROMPTFOO_DISABLE_TELEMETRY": "",
+                    "NO_ANALYTICS": "",
+                    "MODELAUDIT_TELEMETRY_DEV": "1",
+                },
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # Telemetry should be enabled when explicitly opted in during development
             assert client._is_disabled() is False
 
     def test_promptfoo_disable_env_var(self):
         """Test that PROMPTFOO_DISABLE_TELEMETRY works."""
         with (
             patch.dict(os.environ, {"PROMPTFOO_DISABLE_TELEMETRY": "1"}),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
         ):
@@ -110,6 +160,7 @@ class TestTelemetryClient:
         """Test that CI environment disables telemetry."""
         with (
             patch.dict(os.environ, {"CI": "1"}),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
         ):
@@ -123,6 +174,7 @@ class TestTelemetryClient:
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             patch.dict(
                 os.environ,
                 {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
@@ -136,16 +188,16 @@ class TestTelemetryClient:
 
             assert client._is_disabled() is True
 
-    @patch("modelaudit.telemetry.urlopen")
-    def test_event_recording_when_enabled(self, mock_urlopen):
+    def test_event_recording_when_enabled(self):
         """Test that events are recorded when telemetry is enabled."""
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+        mock_posthog = MagicMock()
 
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
             patch.dict(
                 os.environ,
                 {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
@@ -154,148 +206,46 @@ class TestTelemetryClient:
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
+            client._posthog_client = mock_posthog
             client._user_config.telemetry_enabled = True
 
             client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
 
-            # Should make network calls
-            assert mock_urlopen.call_count == 2  # KA and R endpoints
+            # Should call PostHog capture
+            mock_posthog.capture.assert_called_once()
+            mock_posthog.flush.assert_called()
 
     def test_event_not_recorded_when_disabled(self):
         """Test that events are not recorded when telemetry is disabled."""
+        mock_posthog = MagicMock()
+
         with (
-            patch("modelaudit.telemetry.urlopen") as mock_urlopen,
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
+            client._posthog_client = mock_posthog
             # Explicitly disable telemetry
             client._user_config.telemetry_enabled = False
 
             client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
 
-            # Should not make network calls
-            mock_urlopen.assert_not_called()
+            # Should not call PostHog
+            mock_posthog.capture.assert_not_called()
 
 
-class TestDataAnonymization:
-    """Test data anonymization and privacy features."""
-
-    def test_path_hashing(self):
-        """Test that file paths are hashed for privacy."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            path = "/sensitive/path/to/model.pkl"
-            hashed = client._hash_path(path)
-
-            assert hashed != path
-            assert len(hashed) == 16  # Truncated hash
-            assert hashed.isalnum()  # Hex string
-
-    def test_url_hashing_removes_query_params(self):
-        """Test that URL hashing removes potentially sensitive query parameters."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            url_with_token = "https://example.com/model?token=secret123&key=private"
-            hashed = client._hash_url(url_with_token)
-
-            assert hashed != url_with_token
-            assert "secret123" not in hashed
-            assert "private" not in hashed
-
-    @patch("modelaudit.telemetry.urlopen")
-    def test_scan_started_includes_full_paths(self, mock_urlopen):
-        """Test that scan_started includes full paths and model names."""
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_urlopen.return_value.__enter__.return_value = mock_response
-
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._user_config.telemetry_enabled = True
-
-            paths = ["/models/llama-2-7b.pkl", "/models/gpt-neo.pt"]
-            scan_options = {"has_blacklist": False, "num_blacklist_patterns": 0, "format": "json"}
-
-            client.record_scan_started(paths, scan_options)
-
-            # Full paths should be included
-            call_args = mock_urlopen.call_args_list
-            for call in call_args:
-                request_data = call[0][0].data.decode()
-                # Full paths should be present
-                assert "llama-2-7b.pkl" in request_data or "gpt-neo.pt" in request_data
-                # Model names should be extracted
-                assert "model_names" in request_data
-
-    @patch("modelaudit.telemetry.urlopen")
-    def test_download_started_includes_full_url(self, mock_urlopen):
-        """Test that download_started includes full URL and model name."""
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_urlopen.return_value.__enter__.return_value = mock_response
-
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-            client._user_config.telemetry_enabled = True
-
-            url = "https://huggingface.co/meta-llama/Llama-2-7b"
-
-            client.record_download_started("huggingface", url)
-
-            # Full URL should be included
-            call_args = mock_urlopen.call_args_list
-            for call in call_args:
-                request_data = call[0][0].data.decode()
-                assert "huggingface.co" in request_data
-                assert "model_name" in request_data
-
-    def test_email_hashing(self):
-        """Test that email addresses are properly hashed."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            # Test normal email
-            email = "user@example.com"
-            hashed = client._hash_email(email)
-            assert hashed is not None
-            assert "user" not in hashed
-            assert "@example.com" in hashed  # Domain is preserved
-
-            # Test None email
-            assert client._hash_email(None) is None
-
-    def test_issue_type_sanitization(self):
-        """Test that issue messages are sanitized to just type categories."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            # Test that sensitive paths in messages are not included
-            msg_with_path = "Dangerous import detected in /home/user/secret/model.pkl"
-            sanitized = client._sanitize_issue_type(msg_with_path)
-            assert "/home/user/secret" not in sanitized
-            assert sanitized == "dangerous_import"
-
-            # Test pickle-related detection
-            pickle_msg = "Suspicious pickle opcode REDUCE found"
-            assert client._sanitize_issue_type(pickle_msg) == "pickle_related"
-
-            # Test code execution detection
-            exec_msg = "eval() call detected in code"
-            assert client._sanitize_issue_type(exec_msg) == "code_execution_related"
+class TestDataHandling:
+    """Test data handling and sanitization."""
 
     def test_error_sanitization(self):
         """Test that error messages are properly sanitized."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
 
@@ -316,6 +266,28 @@ class TestDataAnonymization:
             sanitized = client._sanitize_error(long_error)
             assert len(sanitized) <= 100
 
+    def test_model_name_extraction(self):
+        """Test model name extraction from various path formats."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # HuggingFace URL
+            hf_url = "https://huggingface.co/meta-llama/Llama-2-7b/blob/main/model.pkl"
+            assert client._extract_model_name(hf_url) == "meta-llama/Llama-2-7b"
+
+            # HuggingFace shorthand
+            hf_short = "hf://meta-llama/Llama-2-7b"
+            assert client._extract_model_name(hf_short) == "meta-llama/Llama-2-7b"
+
+            # Local path
+            local_path = "/home/user/models/my_model.pkl"
+            assert client._extract_model_name(local_path) == "my_model.pkl"
+
 
 class TestPrivacyCompliance:
     """Test privacy and compliance features."""
@@ -323,7 +295,11 @@ class TestPrivacyCompliance:
     def test_no_file_content_collection(self):
         """Test that file contents are never collected."""
         # This test verifies our implementation doesn't collect file contents
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
 
@@ -340,22 +316,6 @@ class TestPrivacyCompliance:
                 # Method signatures should not include content parameters
                 assert "content" not in str(method.__annotations__)
                 assert "data" not in str(method.__annotations__)
-
-    def test_error_handling_does_not_leak_data(self):
-        """Test that error handling doesn't leak sensitive data."""
-        with patch("modelaudit.telemetry.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = Exception("Network error with /sensitive/path")
-
-            with (
-                tempfile.TemporaryDirectory() as temp_dir,
-                patch("modelaudit.telemetry.Path.home") as mock_home,
-            ):
-                mock_home.return_value = Path(temp_dir)
-                client = TelemetryClient()
-                client._user_config.telemetry_enabled = True
-
-                # This should not raise an exception or leak data
-                client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
 
 
 class TestConvenienceFunctions:
@@ -399,6 +359,7 @@ class TestTelemetryIntegration:
         """Test that missing PostHog dependency is handled gracefully."""
         with (
             patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
         ):
@@ -407,7 +368,6 @@ class TestTelemetryIntegration:
 
             # Should still work without PostHog
             assert client._posthog_client is None
-            assert not client._is_disabled() or True  # Depends on config
 
 
 if __name__ == "__main__":
