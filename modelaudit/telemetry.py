@@ -82,26 +82,31 @@ def is_telemetry_available() -> bool:
 
 
 class TelemetryEvent(str, Enum):
-    """Enumeration of all telemetry events that can be tracked."""
+    """Enumeration of all telemetry events that can be tracked.
 
-    SCAN_STARTED = "scan_started"
-    SCAN_COMPLETED = "scan_completed"
-    SCAN_FAILED = "scan_failed"
-    SCANNER_USED = "scanner_used"
-    FILE_TYPE_DETECTED = "file_type_detected"
-    ISSUE_FOUND = "issue_found"
-    COMMAND_USED = "command_used"
-    FEATURE_USED = "feature_used"
-    ERROR_OCCURRED = "error_occurred"
-    PERFORMANCE_METRIC = "performance_metric"
-    DOWNLOAD_STARTED = "download_started"
-    DOWNLOAD_COMPLETED = "download_completed"
+    All events are prefixed with 'modelaudit_' to distinguish from Promptfoo events
+    when sharing the same PostHog project.
+    """
+
+    SCAN_STARTED = "modelaudit_scan_started"
+    SCAN_COMPLETED = "modelaudit_scan_completed"
+    SCAN_FAILED = "modelaudit_scan_failed"
+    SCANNER_USED = "modelaudit_scanner_used"
+    FILE_TYPE_DETECTED = "modelaudit_file_type_detected"
+    ISSUE_FOUND = "modelaudit_issue_found"
+    COMMAND_USED = "modelaudit_command_used"
+    FEATURE_USED = "modelaudit_feature_used"
+    ERROR_OCCURRED = "modelaudit_error_occurred"
+    PERFORMANCE_METRIC = "modelaudit_performance_metric"
+    DOWNLOAD_STARTED = "modelaudit_download_started"
+    DOWNLOAD_COMPLETED = "modelaudit_download_completed"
 
 
 # PostHog configuration - follows Promptfoo's conventions
 # Use PROMPTFOO_DISABLE_TELEMETRY=1 to disable (shared with Promptfoo)
+# Uses Promptfoo's analytics proxy by default for shared project
 POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", ""))
-POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://app.posthog.com")
+POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
 
 # Promptfoo analytics endpoints for dual-track submission
 EVENTS_ENDPOINT = "https://a.promptfoo.app"
@@ -119,6 +124,7 @@ class UserConfig:
         self._config_dir = Path.home() / ".modelaudit"
         self._config_file = self._config_dir / "user_config.json"
         self._config = self._load_config()
+        self._promptfoo_user_id: str | None = None
 
     def _load_config(self) -> dict[str, Any]:
         """Load user configuration from file."""
@@ -142,9 +148,42 @@ class UserConfig:
         except OSError as e:
             logger.debug(f"Failed to save user config: {e}")
 
+    def _get_promptfoo_user_id(self) -> str | None:
+        """Try to read Promptfoo's user ID for cross-tool correlation.
+
+        This allows correlating ModelAudit usage with Promptfoo usage for the same user.
+        """
+        if self._promptfoo_user_id is not None:
+            return self._promptfoo_user_id
+
+        import re
+
+        promptfoo_config = Path.home() / ".promptfoo" / "promptfooConfig.yaml"
+        if promptfoo_config.exists():
+            try:
+                content = promptfoo_config.read_text()
+                # Simple regex to extract userId from YAML without adding pyyaml dependency
+                match = re.search(r"userId:\s*['\"]?([^'\"\s\n]+)", content)
+                if match:
+                    self._promptfoo_user_id = match.group(1)
+                    return self._promptfoo_user_id
+            except OSError:
+                pass
+        return None
+
     @property
     def user_id(self) -> str:
-        """Get or generate user ID."""
+        """Get or generate user ID.
+
+        Prefers Promptfoo's user ID if available for cross-tool correlation,
+        otherwise uses ModelAudit's own user ID.
+        """
+        # Try Promptfoo's user ID first for correlation
+        promptfoo_id = self._get_promptfoo_user_id()
+        if promptfoo_id:
+            return promptfoo_id
+
+        # Fall back to ModelAudit's own user ID
         if "user_id" not in self._config:
             self._config["user_id"] = str(uuid.uuid4())
             self._save_config()
@@ -223,6 +262,7 @@ class TelemetryClient:
 
         try:
             properties = {
+                "source": "modelaudit",
                 "email": self._user_config.email,
                 "modelaudit_version": __version__,
                 "platform": os.name,
@@ -230,6 +270,8 @@ class TelemetryClient:
             }
 
             self._posthog_client.identify(distinct_id=self._user_config.user_id, properties=properties)
+            # Flush immediately (matches Promptfoo's pattern)
+            self._posthog_client.flush()
         except Exception as e:
             logger.debug(f"Failed to identify user: {e}")
 
@@ -243,6 +285,8 @@ class TelemetryClient:
         """Internal method to send events without checking disabled state."""
         event_properties = {
             **properties,
+            # Source identifier for filtering in shared PostHog project
+            "source": "modelaudit",
             "modelaudit_version": __version__,
             "session_id": self._session_id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -257,6 +301,9 @@ class TelemetryClient:
                 self._posthog_client.capture(
                     distinct_id=self._user_config.user_id, event=event.value, properties=event_properties
                 )
+                # Flush immediately to ensure events are sent before process exits
+                # (matches Promptfoo's pattern with flushInterval: 0)
+                self._posthog_client.flush()
             except Exception as e:
                 logger.debug(f"Failed to send event to PostHog: {e}")
 
@@ -302,6 +349,7 @@ class TelemetryClient:
         try:
             r_payload = {
                 "event": event,
+                "source": "modelaudit",
                 "environment": os.getenv("NODE_ENV", "development"),
                 "email": self._hash_email(self._user_config.email),
                 "meta": {
