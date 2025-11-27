@@ -58,11 +58,16 @@ MODEL_NAME_KEYS_LOWER = [
 ]
 
 # Comprehensive allowlist of trusted domains for ML model configs
-# URLs from domains NOT in this list will be flagged
+# URLs from domains NOT in this list will be flagged as untrusted
 # This is more secure than a blocklist - attackers can't bypass by registering new domains
+#
+# MAINTENANCE: When adding domains, ensure they are:
+# 1. Established ML/AI infrastructure (not personal sites)
+# 2. Commonly referenced in model configs
+# 3. Not easily exploitable for hosting malicious content
 TRUSTED_URL_DOMAINS = [
     # ===========================================
-    # MODEL HUBS & CODE REPOSITORIES
+    # MODEL HUBS & REPOSITORIES
     # ===========================================
     "huggingface.co",
     "hf.co",
@@ -76,8 +81,12 @@ TRUSTED_URL_DOMAINS = [
     "bitbucket.org",
     "codeberg.org",
     "sourceforge.net",
+    # International model hubs
+    "modelscope.cn",  # Alibaba's model hub
+    "civitai.com",  # Popular for diffusion models
+    "tfhub.dev",  # TensorFlow Hub
     # ===========================================
-    # ML FRAMEWORKS & TOOLS
+    # ML FRAMEWORKS & LIBRARIES
     # ===========================================
     "pytorch.org",
     "download.pytorch.org",
@@ -85,6 +94,13 @@ TRUSTED_URL_DOMAINS = [
     "keras.io",
     "onnx.ai",
     "onnxruntime.ai",
+    "scikit-learn.org",
+    "spacy.io",
+    "huggingface.co",
+    "jax.readthedocs.io",
+    # ===========================================
+    # ML OPERATIONS & EXPERIMENT TRACKING
+    # ===========================================
     "mlflow.org",
     "wandb.ai",
     "neptune.ai",
@@ -100,30 +116,45 @@ TRUSTED_URL_DOMAINS = [
     "bentoml.com",
     "gradio.app",
     "streamlit.io",
+    "mosaicml.com",
+    # ===========================================
+    # VECTOR DATABASES (for RAG/embeddings)
+    # ===========================================
+    "pinecone.io",
+    "weaviate.io",
+    "qdrant.tech",
+    "milvus.io",
+    "chroma.ai",
+    "lancedb.com",
+    "vespa.ai",
     # ===========================================
     # CLOUD STORAGE & CDNs
     # ===========================================
-    # AWS S3 (multiple URL patterns)
+    # AWS
     "s3.amazonaws.com",
-    "s3-",  # s3-us-west-2.amazonaws.com
-    ".s3.",  # bucket.s3.region.amazonaws.com
+    "s3-",  # Regional: s3-us-west-2.amazonaws.com
+    ".s3.",  # Bucket URLs: bucket.s3.region.amazonaws.com
     "cloudfront.net",
     # Google Cloud
     "storage.googleapis.com",
     "storage.cloud.google.com",
+    "googleusercontent.com",  # User content storage
     "gcr.io",
     # Azure
     "blob.core.windows.net",
     "azureedge.net",
     "azure.com",
-    # Other CDNs
+    # CDNs
     "cdn.jsdelivr.net",
     "unpkg.com",
     "cdnjs.cloudflare.com",
     "fastly.net",
+    "akamaized.net",
+    "replicate.delivery",  # Replicate CDN
     # ===========================================
     # AI/ML COMPANIES
     # ===========================================
+    # Major labs
     "openai.com",
     "anthropic.com",
     "google.com",
@@ -135,14 +166,21 @@ TRUSTED_URL_DOMAINS = [
     "microsoft.com",
     "nvidia.com",
     "developer.nvidia.com",
+    # Model providers
     "stability.ai",
     "mistral.ai",
     "cohere.com",
     "cohere.ai",
     "replicate.com",
     "together.ai",
+    "together.xyz",
     "fireworks.ai",
     "perplexity.ai",
+    "ai21.com",  # AI21 Labs
+    "aleph-alpha.com",
+    "runwayml.com",
+    "midjourney.com",
+    # ML platforms
     "databricks.com",
     "snowflake.com",
     "datarobot.com",
@@ -151,8 +189,10 @@ TRUSTED_URL_DOMAINS = [
     "scale.com",
     "labelbox.com",
     "appen.com",
+    "sagemaker.aws",
+    "vertexai.google.com",
     # ===========================================
-    # RESEARCH & ACADEMIC
+    # RESEARCH ORGANIZATIONS
     # ===========================================
     "arxiv.org",
     "paperswithcode.com",
@@ -166,6 +206,11 @@ TRUSTED_URL_DOMAINS = [
     "nature.com",
     "sciencedirect.com",
     "researchgate.net",
+    # Non-profit AI research
+    "eleuther.ai",
+    "laion.ai",
+    "allenai.org",
+    "bigscience.huggingface.co",
     # ===========================================
     # DATASETS & DATA PLATFORMS
     # ===========================================
@@ -180,12 +225,18 @@ TRUSTED_URL_DOMAINS = [
     "image-net.org",
     "cocodataset.org",
     "visualgenome.org",
+    "lvis-dataset.org",
+    "openimages.github.io",
+    # Academic CS departments (common dataset hosts)
     "cs.stanford.edu",
     "cs.cmu.edu",
     "cs.berkeley.edu",
     "cs.toronto.edu",
     "cs.nyu.edu",
     "yann.lecun.com",
+    "people.eecs.berkeley.edu",
+    "nlp.stanford.edu",
+    "vision.stanford.edu",
     # ===========================================
     # PACKAGE REPOSITORIES
     # ===========================================
@@ -199,17 +250,13 @@ TRUSTED_URL_DOMAINS = [
     "rubygems.org",
     "mvnrepository.com",
     # ===========================================
-    # DOCUMENTATION & HOSTING
+    # DOCUMENTATION
     # ===========================================
     "readthedocs.io",
     "readthedocs.org",
     "rtfd.io",
     "gitbook.io",
-    "notion.so",
-    "medium.com",
-    "towardsdatascience.com",
-    "dev.to",
-    "substack.com",
+    "docs.python.org",
     # ===========================================
     # CONTAINER REGISTRIES
     # ===========================================
@@ -219,8 +266,16 @@ TRUSTED_URL_DOMAINS = [
     "ghcr.io",
     "nvcr.io",
     "registry.hub.docker.com",
+    "ecr.aws",
     # ===========================================
-    # INTERNAL/LOCALHOST (for development)
+    # PLACEHOLDER/EXAMPLE DOMAINS (RFC 2606)
+    # These are reserved and commonly used in examples
+    # ===========================================
+    "example.com",
+    "example.org",
+    "example.net",
+    # ===========================================
+    # LOCALHOST (for development/testing)
     # ===========================================
     "localhost",
     "127.0.0.1",
