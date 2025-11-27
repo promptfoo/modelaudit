@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, TypeVar, Union, cast
 from urllib.parse import urlparse
 
+import yaml
+
 from . import __version__
 
 # Type variable for generic function decoration
@@ -192,16 +194,15 @@ class UserConfig:
         if self._promptfoo_user_id is not None:
             return self._promptfoo_user_id
 
-        promptfoo_config = Path.home() / ".promptfoo" / "promptfooConfig.yaml"
+        promptfoo_config = Path.home() / ".promptfoo" / "promptfoo.yaml"
         if promptfoo_config.exists():
             try:
-                content = promptfoo_config.read_text()
-                # Simple regex to extract userId from YAML without adding pyyaml dependency
-                match = re.search(r"userId:\s*['\"]?([^'\"\s\n]+)", content)
-                if match:
-                    self._promptfoo_user_id = match.group(1)
+                with open(promptfoo_config) as f:
+                    config = yaml.safe_load(f)
+                if isinstance(config, dict) and "id" in config:
+                    self._promptfoo_user_id = str(config["id"])
                     return self._promptfoo_user_id
-            except OSError:
+            except (OSError, yaml.YAMLError):
                 pass
         return None
 
