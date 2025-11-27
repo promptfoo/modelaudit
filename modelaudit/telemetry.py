@@ -25,13 +25,15 @@ from . import __version__
 # Type variable for generic function decoration
 F = TypeVar("F", bound=Callable[..., Any])
 
+# PostHog client for analytics
+# We use Any for the client type since posthog may not be installed
 try:
     from posthog import Posthog
 
     POSTHOG_AVAILABLE = True
 except ImportError:
     POSTHOG_AVAILABLE = False
-    Posthog = None
+    Posthog = None  # type: ignore[misc,assignment]
 
 logger = logging.getLogger("modelaudit.telemetry")
 
@@ -254,7 +256,10 @@ class UserConfig:
 class TelemetryClient:
     """Main telemetry client for ModelAudit analytics."""
 
-    def __init__(self):
+    # Type annotation for PostHog client (Any since posthog may not be installed)
+    _posthog_client: Any
+
+    def __init__(self) -> None:
         self._user_config = UserConfig()
         self._posthog_client = None
         self._session_id = str(uuid.uuid4())
