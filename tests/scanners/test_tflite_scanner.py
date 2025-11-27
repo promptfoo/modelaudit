@@ -71,7 +71,11 @@ def test_tflite_scanner_parsing_error(tmp_path):
 def test_tflite_scanner_custom_operator(tmp_path):
     """Test scanner behavior with custom operators."""
     path = tmp_path / "model.tflite"
-    path.write_bytes(b"some tflite data")
+    # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
+    # Bytes 0-3: FlatBuffer root table offset (4 bytes)
+    # Bytes 4-7: "TFL3" file identifier
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
 
     with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
         mock_model = MagicMock()
