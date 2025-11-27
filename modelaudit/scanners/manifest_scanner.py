@@ -57,67 +57,174 @@ MODEL_NAME_KEYS_LOWER = [
     "package_name",
 ]
 
-# URL shorteners and tunnel services - ALWAYS suspicious in ML configs
-SUSPICIOUS_URL_DOMAINS = [
-    "bit.ly",
-    "tinyurl.com",
-    "t.co",
-    "goo.gl",
-    "ow.ly",
-    "is.gd",
-    "rb.gy",
-    "tiny.one",
-    "ngrok.io",
-    "ngrok-free.app",
-    "localtunnel.me",
-    "serveo.net",
-    "localhost.run",
-]
-
-# Trusted domains for ML model configs - URLs from these domains are NOT flagged
-# This allowlist ensures unknown/untrusted domains are detected
+# Comprehensive allowlist of trusted domains for ML model configs
+# URLs from domains NOT in this list will be flagged
+# This is more secure than a blocklist - attackers can't bypass by registering new domains
 TRUSTED_URL_DOMAINS = [
-    # Model hubs and repositories
+    # ===========================================
+    # MODEL HUBS & CODE REPOSITORIES
+    # ===========================================
     "huggingface.co",
     "hf.co",
     "github.com",
     "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github.io",
     "gitlab.com",
+    "gitlab.io",
     "bitbucket.org",
-    # ML framework official sites
+    "codeberg.org",
+    "sourceforge.net",
+    # ===========================================
+    # ML FRAMEWORKS & TOOLS
+    # ===========================================
     "pytorch.org",
     "download.pytorch.org",
     "tensorflow.org",
     "keras.io",
     "onnx.ai",
+    "onnxruntime.ai",
     "mlflow.org",
-    # Cloud storage (legitimate model hosting)
+    "wandb.ai",
+    "neptune.ai",
+    "comet.ml",
+    "dvc.org",
+    "labelstud.io",
+    "roboflow.com",
+    "ultralytics.com",
+    "lightning.ai",
+    "ray.io",
+    "anyscale.com",
+    "determined.ai",
+    "bentoml.com",
+    "gradio.app",
+    "streamlit.io",
+    # ===========================================
+    # CLOUD STORAGE & CDNs
+    # ===========================================
+    # AWS S3 (multiple URL patterns)
     "s3.amazonaws.com",
-    "s3-",  # Regional: s3-us-west-2.amazonaws.com
-    ".s3.",  # Bucket URLs: bucket.s3.region.amazonaws.com
+    "s3-",  # s3-us-west-2.amazonaws.com
+    ".s3.",  # bucket.s3.region.amazonaws.com
+    "cloudfront.net",
+    # Google Cloud
     "storage.googleapis.com",
     "storage.cloud.google.com",
+    "gcr.io",
+    # Azure
     "blob.core.windows.net",
-    # Research and datasets
-    "arxiv.org",
-    "paperswithcode.com",
-    "kaggle.com",
-    "zenodo.org",
-    # Major AI/ML companies
+    "azureedge.net",
+    "azure.com",
+    # Other CDNs
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
+    "fastly.net",
+    # ===========================================
+    # AI/ML COMPANIES
+    # ===========================================
     "openai.com",
     "anthropic.com",
-    "ai.meta.com",
+    "google.com",
+    "ai.google",
+    "deepmind.com",
     "meta.com",
+    "ai.meta.com",
+    "llama.meta.com",
     "microsoft.com",
     "nvidia.com",
-    "google.com",
-    "deepmind.com",
-    # Documentation and package repos
-    "readthedocs.io",
+    "developer.nvidia.com",
+    "stability.ai",
+    "mistral.ai",
+    "cohere.com",
+    "cohere.ai",
+    "replicate.com",
+    "together.ai",
+    "fireworks.ai",
+    "perplexity.ai",
+    "databricks.com",
+    "snowflake.com",
+    "datarobot.com",
+    "h2o.ai",
+    "clarifai.com",
+    "scale.com",
+    "labelbox.com",
+    "appen.com",
+    # ===========================================
+    # RESEARCH & ACADEMIC
+    # ===========================================
+    "arxiv.org",
+    "paperswithcode.com",
+    "semanticscholar.org",
+    "aclanthology.org",
+    "neurips.cc",
+    "openreview.net",
+    "ieee.org",
+    "acm.org",
+    "springer.com",
+    "nature.com",
+    "sciencedirect.com",
+    "researchgate.net",
+    # ===========================================
+    # DATASETS & DATA PLATFORMS
+    # ===========================================
+    "kaggle.com",
+    "zenodo.org",
+    "dataverse.harvard.edu",
+    "data.world",
+    "registry.opendata.aws",
+    "commoncrawl.org",
+    "ftp.ncbi.nlm.nih.gov",
+    "physionet.org",
+    "image-net.org",
+    "cocodataset.org",
+    "visualgenome.org",
+    "cs.stanford.edu",
+    "cs.cmu.edu",
+    "cs.berkeley.edu",
+    "cs.toronto.edu",
+    "cs.nyu.edu",
+    "yann.lecun.com",
+    # ===========================================
+    # PACKAGE REPOSITORIES
+    # ===========================================
     "pypi.org",
     "files.pythonhosted.org",
     "anaconda.org",
     "conda.anaconda.org",
+    "npmjs.com",
+    "crates.io",
+    "packagist.org",
+    "rubygems.org",
+    "mvnrepository.com",
+    # ===========================================
+    # DOCUMENTATION & HOSTING
+    # ===========================================
+    "readthedocs.io",
+    "readthedocs.org",
+    "rtfd.io",
+    "gitbook.io",
+    "notion.so",
+    "medium.com",
+    "towardsdatascience.com",
+    "dev.to",
+    "substack.com",
+    # ===========================================
+    # CONTAINER REGISTRIES
+    # ===========================================
+    "docker.io",
+    "docker.com",
+    "quay.io",
+    "ghcr.io",
+    "nvcr.io",
+    "registry.hub.docker.com",
+    # ===========================================
+    # INTERNAL/LOCALHOST (for development)
+    # ===========================================
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
 ]
 
 # Regex to find URLs in text
@@ -467,25 +574,19 @@ class ManifestScanner(BaseScanner):
         check_dict(content)
 
     def _check_suspicious_urls(self, content: dict[str, Any], result: ScanResult) -> None:
-        """Check for suspicious or untrusted URLs in config values.
+        """Check for untrusted URLs in config values using allowlist approach.
 
-        Uses a hybrid allowlist/blocklist approach:
-        1. URLs from SUSPICIOUS domains (shorteners, tunnels) → Always flagged
-        2. URLs from TRUSTED domains (huggingface, github, etc.) → Not flagged
-        3. URLs from UNKNOWN domains → Flagged as untrusted (security best practice)
+        Only URLs from trusted domains (huggingface, github, pytorch, etc.) are allowed.
+        Any URL from a domain NOT in the allowlist is flagged.
+
+        This is more secure than a blocklist because attackers cannot bypass
+        detection by registering new domains.
         """
         seen_urls: set[str] = set()
 
         def is_trusted_domain(url_lower: str) -> bool:
-            """Check if URL is from a trusted domain."""
+            """Check if URL is from a trusted domain in the allowlist."""
             return any(domain in url_lower for domain in TRUSTED_URL_DOMAINS)
-
-        def is_suspicious_domain(url_lower: str) -> str | None:
-            """Check if URL is from a suspicious domain. Returns domain name if found."""
-            for domain in SUSPICIOUS_URL_DOMAINS:
-                if domain in url_lower:
-                    return domain
-            return None
 
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
@@ -497,45 +598,23 @@ class ManifestScanner(BaseScanner):
                     seen_urls.add(url)
                     url_lower = url.lower()
 
-                    # Check 1: Known suspicious domains (shorteners, tunnels)
-                    suspicious_domain = is_suspicious_domain(url_lower)
-                    if suspicious_domain:
-                        result.add_check(
-                            name="Suspicious URL Check",
-                            passed=False,
-                            message=f"Suspicious URL found in config: {url}",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={
-                                "url": url,
-                                "suspicious_domain": suspicious_domain,
-                                "key_path": key_path,
-                                "reason": "url_shortener_or_tunnel",
-                            },
-                            why=(
-                                "URL shorteners and tunnel services can hide malicious "
-                                "endpoints and are commonly used in supply chain attacks."
-                            ),
-                        )
-                        continue
-
-                    # Check 2: Unknown/untrusted domains (not in allowlist)
+                    # Flag any URL not from a trusted domain
                     if not is_trusted_domain(url_lower):
                         result.add_check(
                             name="Untrusted URL Check",
                             passed=False,
-                            message=f"URL from untrusted domain in config: {url}",
+                            message=f"URL from untrusted domain: {url}",
                             severity=IssueSeverity.INFO,
                             location=self.current_file_path,
                             details={
                                 "url": url,
                                 "key_path": key_path,
-                                "reason": "untrusted_domain",
                             },
                             why=(
                                 "This URL is from a domain not in the trusted allowlist. "
-                                "ML configs should typically only reference well-known "
-                                "sources like huggingface.co, github.com, or pytorch.org."
+                                "ML model configs should only reference well-known sources. "
+                                "Unknown domains may indicate supply chain attacks or "
+                                "data exfiltration attempts."
                             ),
                         )
 

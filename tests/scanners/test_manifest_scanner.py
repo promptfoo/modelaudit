@@ -253,8 +253,8 @@ def test_manifest_scanner_can_handle():
             Path(filename).unlink(missing_ok=True)
 
 
-def test_manifest_scanner_suspicious_url_shortener():
-    """Test that URL shorteners in config values are flagged."""
+def test_manifest_scanner_url_shortener_flagged():
+    """Test that URL shorteners are flagged (not in allowlist)."""
     test_file = "config.json"
     config_with_shortener = {
         "model_type": "bert",
@@ -271,14 +271,11 @@ def test_manifest_scanner_suspicious_url_shortener():
 
         assert result.success is True
 
-        # Should have a suspicious URL check that failed
-        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
-        assert len(url_checks) > 0
-        assert any(check.status == CheckStatus.FAILED for check in url_checks)
-
-        # Verify the URL was detected
+        # Should flag URL shortener as untrusted domain
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
-        assert any("bit.ly" in c.details.get("suspicious_domain", "") for c in failed_url_checks)
+        assert len(failed_url_checks) == 1
+        assert "bit.ly" in failed_url_checks[0].details.get("url", "")
 
     finally:
         test_file_path = Path(test_file)
@@ -286,8 +283,8 @@ def test_manifest_scanner_suspicious_url_shortener():
             test_file_path.unlink()
 
 
-def test_manifest_scanner_suspicious_tunnel_service():
-    """Test that tunnel services (ngrok, localtunnel) in config values are flagged."""
+def test_manifest_scanner_tunnel_service_flagged():
+    """Test that tunnel services (ngrok, localtunnel) are flagged (not in allowlist)."""
     test_file = "config.json"
     config_with_tunnel = {
         "model_type": "gpt2",
@@ -304,14 +301,11 @@ def test_manifest_scanner_suspicious_tunnel_service():
 
         assert result.success is True
 
-        # Should have a suspicious URL check that failed
-        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
-        assert len(url_checks) > 0
-        assert any(check.status == CheckStatus.FAILED for check in url_checks)
-
-        # Verify ngrok was detected
+        # Should flag tunnel service as untrusted domain
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
-        assert any("ngrok.io" in c.details.get("suspicious_domain", "") for c in failed_url_checks)
+        assert len(failed_url_checks) == 1
+        assert "ngrok.io" in failed_url_checks[0].details.get("url", "")
 
     finally:
         test_file_path = Path(test_file)
@@ -374,9 +368,10 @@ def test_manifest_scanner_untrusted_domain_flagged():
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
         assert len(failed_url_checks) == 2, f"Expected 2 untrusted URLs, got {len(failed_url_checks)}"
 
-        # Verify reason is set correctly
-        for check in failed_url_checks:
-            assert check.details.get("reason") == "untrusted_domain"
+        # Verify URLs were detected
+        detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+        assert any("totally-legit-models.com" in url for url in detected_urls)
+        assert any("unknown-server.net" in url for url in detected_urls)
 
     finally:
         test_file_path = Path(test_file)
@@ -384,8 +379,8 @@ def test_manifest_scanner_untrusted_domain_flagged():
             test_file_path.unlink()
 
 
-def test_manifest_scanner_nested_suspicious_url():
-    """Test that suspicious URLs in nested config structures are detected."""
+def test_manifest_scanner_nested_untrusted_url():
+    """Test that untrusted URLs in nested config structures are detected."""
     test_file = "config.json"
     config_with_nested_url = {
         "model_type": "bert",
@@ -408,15 +403,15 @@ def test_manifest_scanner_nested_suspicious_url():
 
         assert result.success is True
 
-        # Should detect both suspicious URLs
-        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        # Should detect both untrusted URLs
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
         assert len(failed_url_checks) == 2
 
-        # Verify both domains were detected
-        detected_domains = {c.details.get("suspicious_domain", "") for c in failed_url_checks}
-        assert "tinyurl.com" in detected_domains
-        assert "localtunnel.me" in detected_domains
+        # Verify both URLs were detected
+        detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+        assert any("tinyurl.com" in url for url in detected_urls)
+        assert any("localtunnel.me" in url for url in detected_urls)
 
     finally:
         test_file_path = Path(test_file)
@@ -425,7 +420,7 @@ def test_manifest_scanner_nested_suspicious_url():
 
 
 def test_manifest_scanner_duplicate_urls_not_repeated():
-    """Test that the same suspicious URL appearing multiple times is only reported once."""
+    """Test that the same untrusted URL appearing multiple times is only reported once."""
     test_file = "config.json"
     config_with_duplicate_urls = {
         "model_type": "bert",
@@ -443,8 +438,8 @@ def test_manifest_scanner_duplicate_urls_not_repeated():
 
         assert result.success is True
 
-        # Should only have ONE suspicious URL check (deduplication)
-        url_checks = [check for check in result.checks if "Suspicious URL" in check.name]
+        # Should only have ONE untrusted URL check (deduplication)
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
         failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
         assert len(failed_url_checks) == 1
 
