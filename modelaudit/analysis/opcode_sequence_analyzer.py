@@ -8,7 +8,7 @@ malicious operations.
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class OpcodePattern:
     opcodes: list[str]
     description: str
     severity: str
-    cve_references: Optional[list[str]] = None
+    cve_references: list[str] | None = None
 
     def matches(self, opcode_window: list[str]) -> bool:
         """Check if the opcode window matches this pattern."""
@@ -39,7 +39,7 @@ class SequenceAnalysisResult:
 
     pattern_name: str
     matched_opcodes: list[str]
-    position: Optional[int]
+    position: int | None
     severity: str
     description: str
     evidence: dict[str, Any]
@@ -125,7 +125,7 @@ class OpcodeSequenceAnalyzer:
         ]
 
     def analyze_opcode(
-        self, opcode_name: str, arg: Any = None, position: Optional[int] = None
+        self, opcode_name: str, arg: Any = None, position: int | None = None
     ) -> list[SequenceAnalysisResult]:
         """Analyze a single opcode in the context of recent opcodes.
 
@@ -202,8 +202,8 @@ class OpcodeSequenceAnalyzer:
             logger.debug(f"Stack simulation error for {opcode_name}: {e}")
 
     def _analyze_pattern_match(
-        self, pattern: OpcodePattern, window: list[str], position: Optional[int]
-    ) -> Optional[SequenceAnalysisResult]:
+        self, pattern: OpcodePattern, window: list[str], position: int | None
+    ) -> SequenceAnalysisResult | None:
         """Analyze a detected pattern match for detailed results."""
         try:
             # Get evidence from stack simulation

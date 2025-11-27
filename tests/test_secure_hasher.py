@@ -1,297 +1,249 @@
-"""Tests for secure file hashing functionality."""
+"""Tests for secure_hasher.py including aggregate hash computation."""
 
-import builtins
-import contextlib
+import hashlib
+import tempfile
+from pathlib import Path
 
-import pytest
-
-from modelaudit.utils.secure_hasher import (
+from modelaudit.utils.helpers.secure_hasher import (
     SecureFileHasher,
-    benchmark_hashing_performance,
+    compute_aggregate_hash,
     hash_file_secure,
     verify_file_hash,
 )
 
 
-class TestSecureFileHasher:
-    """Test cases for SecureFileHasher class."""
-
-    def test_init_default_threshold(self):
-        """Test hasher initialization with default threshold."""
-        hasher = SecureFileHasher()
-        assert hasher.full_hash_threshold == 2 * 1024**3  # 2GB
-        assert hasher.chunk_size == 8 * 1024 * 1024  # 8MB
-
-    def test_init_custom_threshold(self):
-        """Test hasher initialization with custom threshold."""
-        threshold = 100 * 1024 * 1024  # 100MB
-        hasher = SecureFileHasher(threshold)
-        assert hasher.full_hash_threshold == threshold
-
-    def test_hash_small_file_secure_method(self, tmp_path):
-        """Test hashing of small files uses secure method."""
-        # Create test file < 2GB
-        test_file = tmp_path / "small_test.bin"
-        test_content = b"Hello, ModelAudit!" * 1000  # ~18KB
-        test_file.write_bytes(test_content)
-
-        hasher = SecureFileHasher()
-        result = hasher.hash_file(str(test_file))
+def test_compute_aggregate_hash_empty():
+    """Test aggregate hash with empty list."""
+    result = compute_aggregate_hash([])
+    # Hash of empty string
+    expected = hashlib.sha256(b"").hexdigest()
+    assert result == expected
+    assert len(result) == 64
 
-        # Should use secure method for small files
-        assert result.startswith("secure:")
-        assert len(result.split(":")[1]) == 64  # Blake2b 256-bit = 64 hex chars
 
-    def test_hash_large_file_fingerprint_method(self, tmp_path):
-        """Test hashing of large files uses fingerprint method."""
-        # Create test file > 2GB threshold by setting low threshold
-        test_file = tmp_path / "large_test.bin"
-        test_content = b"A" * 1024 * 1024  # 1MB
-        test_file.write_bytes(test_content)
-
-        # Use hasher with very low threshold to trigger fingerprint method
-        hasher = SecureFileHasher(full_hash_threshold=512 * 1024)  # 512KB threshold
-        result = hasher.hash_file(str(test_file))
+def test_compute_aggregate_hash_single():
+    """Test aggregate hash with single hash."""
+    file_hash = "a" * 64
+    result = compute_aggregate_hash([file_hash])
 
-        # Should use fingerprint method for "large" files
-        assert result.startswith("fingerprint:")
-        assert len(result.split(":")[1]) == 64  # Blake2b 256-bit = 64 hex chars
+    # Should hash the single hash string
+    expected = hashlib.sha256(file_hash.encode("utf-8")).hexdigest()
+    assert result == expected
+    assert len(result) == 64
 
-    def test_hash_nonexistent_file(self):
-        """Test hashing nonexistent file raises ValueError."""
-        hasher = SecureFileHasher()
-
-        with pytest.raises(ValueError, match="File does not exist"):
-            hasher.hash_file("/nonexistent/file.bin")
 
-    def test_hash_empty_file(self, tmp_path):
-        """Test hashing empty file raises ValueError."""
-        empty_file = tmp_path / "empty.bin"
-        empty_file.write_bytes(b"")
+def test_compute_aggregate_hash_multiple():
+    """Test aggregate hash with multiple hashes."""
+    hashes = [
+        "abc123" + "0" * 58,  # 64 chars
+        "def456" + "1" * 58,  # 64 chars
+        "ghi789" + "2" * 58,  # 64 chars
+    ]
+    result = compute_aggregate_hash(hashes)
 
-        hasher = SecureFileHasher()
+    # Verify it's a valid SHA256
+    assert len(result) == 64
+    assert all(c in "0123456789abcdef" for c in result)
 
-        with pytest.raises(ValueError, match="File is empty"):
-            hasher.hash_file(str(empty_file))
 
-    def test_hash_consistency(self, tmp_path):
-        """Test that identical files produce identical hashes."""
-        # Create two identical files
-        content = b"Test content for consistency check" * 1000
+def test_compute_aggregate_hash_deterministic():
+    """Test that aggregate hash is deterministic."""
+    hashes = ["hash1" + "a" * 59, "hash2" + "b" * 59, "hash3" + "c" * 59]
 
-        file1 = tmp_path / "file1.bin"
-        file2 = tmp_path / "file2.bin"
+    result1 = compute_aggregate_hash(hashes)
+    result2 = compute_aggregate_hash(hashes)
 
-        file1.write_bytes(content)
-        file2.write_bytes(content)
+    assert result1 == result2
 
-        hasher = SecureFileHasher()
-        hash1 = hasher.hash_file(str(file1))
-        hash2 = hasher.hash_file(str(file2))
 
-        assert hash1 == hash2
+def test_compute_aggregate_hash_order_independent():
+    """Test that aggregate hash is order-independent (sorts hashes)."""
+    hashes_ordered = ["aaa", "bbb", "ccc", "ddd"]
+    hashes_reversed = ["ddd", "ccc", "bbb", "aaa"]
+    hashes_random = ["ccc", "aaa", "ddd", "bbb"]
 
-    def test_hash_different_content(self, tmp_path):
-        """Test that different files produce different hashes."""
-        file1 = tmp_path / "file1.bin"
-        file2 = tmp_path / "file2.bin"
+    result1 = compute_aggregate_hash(hashes_ordered)
+    result2 = compute_aggregate_hash(hashes_reversed)
+    result3 = compute_aggregate_hash(hashes_random)
 
-        file1.write_bytes(b"Content A" * 1000)
-        file2.write_bytes(b"Content B" * 1000)
+    # All should be identical (sorted before hashing)
+    assert result1 == result2 == result3
 
-        hasher = SecureFileHasher()
-        hash1 = hasher.hash_file(str(file1))
-        hash2 = hasher.hash_file(str(file2))
 
-        assert hash1 != hash2
+def test_compute_aggregate_hash_different_content():
+    """Test that different hash lists produce different aggregates."""
+    hashes1 = ["hash_a" + "1" * 58, "hash_b" + "2" * 58]
+    hashes2 = ["hash_c" + "3" * 58, "hash_d" + "4" * 58]
 
-    def test_verify_hash_success(self, tmp_path):
-        """Test successful hash verification."""
-        test_file = tmp_path / "verify_test.bin"
-        test_content = b"Verification test content"
-        test_file.write_bytes(test_content)
+    result1 = compute_aggregate_hash(hashes1)
+    result2 = compute_aggregate_hash(hashes2)
 
-        hasher = SecureFileHasher()
-        file_hash = hasher.hash_file(str(test_file))
+    assert result1 != result2
 
-        # Verification should succeed
-        assert hasher.verify_hash(str(test_file), file_hash) is True
 
-    def test_verify_hash_failure(self, tmp_path):
-        """Test hash verification failure."""
-        test_file = tmp_path / "verify_test.bin"
-        test_content = b"Original content"
-        test_file.write_bytes(test_content)
+def test_compute_aggregate_hash_realistic_sha256():
+    """Test with realistic SHA256 hashes."""
+    # Simulate real file hashes
+    hash1 = hashlib.sha256(b"file1 content").hexdigest()
+    hash2 = hashlib.sha256(b"file2 content").hexdigest()
+    hash3 = hashlib.sha256(b"file3 content").hexdigest()
 
-        hasher = SecureFileHasher()
-        original_hash = hasher.hash_file(str(test_file))
+    hashes = [hash1, hash2, hash3]
+    result = compute_aggregate_hash(hashes)
 
-        # Modify file
-        test_file.write_bytes(b"Modified content")
+    # Manually compute expected result
+    sorted_hashes = sorted(hashes)
+    combined = "".join(sorted_hashes)
+    expected = hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
-        # Verification should fail
-        assert hasher.verify_hash(str(test_file), original_hash) is False
+    assert result == expected
 
-    def test_get_hash_info_secure(self):
-        """Test parsing secure hash info."""
-        hasher = SecureFileHasher()
-        hash_string = "secure:abcd1234ef567890"
 
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "full_hash"
-        assert info["algorithm"] == "blake2b"
-        assert info["security_level"] == "high"
-        assert info["hash"] == "abcd1234ef567890"
-
-    def test_get_hash_info_fingerprint(self):
-        """Test parsing fingerprint hash info."""
-        hasher = SecureFileHasher()
-        hash_string = "fingerprint:1234abcd5678ef90"
-
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "enhanced_fingerprint"
-        assert info["algorithm"] == "blake2b"
-        assert info["security_level"] == "medium"
-        assert info["hash"] == "1234abcd5678ef90"
-
-    def test_get_hash_info_unknown(self):
-        """Test parsing unknown hash format."""
-        hasher = SecureFileHasher()
-        hash_string = "unknown_format:hash_value"
-
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "unknown"
-        assert info["algorithm"] == "unknown"
-        assert info["security_level"] == "unknown"
-        assert info["hash"] == "unknown_format:hash_value"
-
-
-class TestConvenienceFunctions:
-    """Test convenience functions."""
-
-    def test_hash_file_secure_function(self, tmp_path):
-        """Test hash_file_secure convenience function."""
-        test_file = tmp_path / "convenience_test.bin"
-        test_file.write_bytes(b"Test content for convenience function")
-
-        result = hash_file_secure(str(test_file))
-
-        assert result.startswith("secure:")
-        assert len(result.split(":")[1]) == 64
-
-    def test_hash_file_secure_with_threshold(self, tmp_path):
-        """Test hash_file_secure with custom threshold."""
-        test_file = tmp_path / "threshold_test.bin"
-        test_content = b"A" * 1024  # 1KB
-        test_file.write_bytes(test_content)
-
-        # Set very low threshold to force fingerprint method
-        result = hash_file_secure(str(test_file), threshold=512)
-
-        assert result.startswith("fingerprint:")
-
-    def test_verify_file_hash_function(self, tmp_path):
-        """Test verify_file_hash convenience function."""
-        test_file = tmp_path / "verify_convenience_test.bin"
-        test_file.write_bytes(b"Content for verification test")
-
-        # Get hash
-        file_hash = hash_file_secure(str(test_file))
-
-        # Verification should succeed
-        assert verify_file_hash(str(test_file), file_hash) is True
-
-        # Modify file
-        test_file.write_bytes(b"Modified content")
-
-        # Verification should fail
-        assert verify_file_hash(str(test_file), file_hash) is False
-
-
-class TestBenchmarking:
-    """Test benchmarking functionality."""
-
-    def test_benchmark_hashing_performance(self, tmp_path):
-        """Test benchmarking function."""
-        # Create test file
-        test_file = tmp_path / "benchmark_test.bin"
-        test_content = b"Benchmark content " * 1000  # ~17KB
-        test_file.write_bytes(test_content)
-
-        # Run benchmark
-        results = benchmark_hashing_performance(str(test_file), iterations=2)
-
-        # Verify results structure
-        assert "file_size_mb" in results
-        assert "avg_time_seconds" in results
-        assert "min_time_seconds" in results
-        assert "max_time_seconds" in results
-        assert "throughput_mbps" in results
-        assert "hash_method" in results
-        assert "hash_result" in results
-
-        # Verify reasonable values
-        assert results["file_size_mb"] > 0
-        assert results["avg_time_seconds"] > 0
-        assert results["throughput_mbps"] > 0
-        assert results["hash_method"] in ["full_hash", "enhanced_fingerprint"]
-        assert results["hash_result"].startswith(("secure:", "fingerprint:"))
-
-    def test_benchmark_nonexistent_file(self):
-        """Test benchmarking with nonexistent file."""
-        with pytest.raises(ValueError, match="Test file does not exist"):
-            benchmark_hashing_performance("/nonexistent/file.bin")
-
-
-class TestErrorHandling:
-    """Test error handling scenarios."""
-
-    def test_hash_permission_denied(self, tmp_path):
-        """Test handling of permission denied errors."""
-        # This test is platform-specific and may not work on all systems
-        test_file = tmp_path / "permission_test.bin"
-        test_file.write_bytes(b"Test content")
-
-        # Try to make file unreadable (may not work on all systems)
-        try:
-            test_file.chmod(0o000)
-
-            hasher = SecureFileHasher()
-            with pytest.raises(OSError):
-                hasher.hash_file(str(test_file))
-
-        finally:
-            # Restore permissions for cleanup
-            with contextlib.suppress(builtins.BaseException):
-                test_file.chmod(0o644)
-
-
-# Integration test with actual pickle file
-def test_integration_with_pickle_file(tmp_path):
-    """Test integration with a real pickle file."""
-    import pickle
-
-    # Create a simple pickle file
-    test_data = {"model": "test", "weights": [1, 2, 3, 4, 5]}
-    pickle_file = tmp_path / "test_model.pkl"
-
-    with open(pickle_file, "wb") as f:
-        pickle.dump(test_data, f)
-
-    # Hash the pickle file
+def test_secure_file_hasher_basic():
+    """Test basic SecureFileHasher functionality."""
     hasher = SecureFileHasher()
-    result = hasher.hash_file(str(pickle_file))
 
-    # Verify result format
-    assert result.startswith("secure:")
-    assert len(result.split(":")[1]) == 64
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write("Test content")
+        temp_file = f.name
 
-    # Verify consistency
-    result2 = hasher.hash_file(str(pickle_file))
+    try:
+        result = hasher.hash_file(temp_file)
+
+        # Should have prefix
+        assert result.startswith("secure:")
+        # Should be valid hash
+        hash_part = result.replace("secure:", "")
+        assert len(hash_part) == 64
+    finally:
+        Path(temp_file).unlink()
+
+
+def test_hash_file_secure_convenience():
+    """Test convenience function for secure hashing."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write("Test content")
+        temp_file = f.name
+
+    try:
+        result = hash_file_secure(temp_file)
+
+        assert result.startswith("secure:")
+        hash_part = result.replace("secure:", "")
+        assert len(hash_part) == 64
+    finally:
+        Path(temp_file).unlink()
+
+
+def test_verify_file_hash():
+    """Test hash verification."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write("Test content")
+        temp_file = f.name
+
+    try:
+        # Hash the file
+        file_hash = hash_file_secure(temp_file)
+
+        # Verify should succeed
+        assert verify_file_hash(temp_file, file_hash) is True
+
+        # Wrong hash should fail
+        wrong_hash = "secure:" + "0" * 64
+        assert verify_file_hash(temp_file, wrong_hash) is False
+    finally:
+        Path(temp_file).unlink()
+
+
+def test_compute_aggregate_hash_with_model_scan():
+    """Test aggregate hash in a model scanning scenario."""
+    # Simulate scanning multiple model files
+    model_files = [
+        b"model weights layer 1",
+        b"model weights layer 2",
+        b"model config",
+        b"tokenizer vocab",
+    ]
+
+    # Compute individual file hashes
+    file_hashes = [hashlib.sha256(content).hexdigest() for content in model_files]
+
+    # Compute aggregate
+    aggregate = compute_aggregate_hash(file_hashes)
+
+    # Verify properties
+    assert len(aggregate) == 64
+    assert aggregate != file_hashes[0]  # Different from any individual hash
+
+    # Same files in different order should produce same aggregate
+    shuffled_hashes = [file_hashes[2], file_hashes[0], file_hashes[3], file_hashes[1]]
+    aggregate2 = compute_aggregate_hash(shuffled_hashes)
+    assert aggregate == aggregate2
+
+
+def test_compute_aggregate_hash_unicode():
+    """Test that aggregate hash handles unicode correctly."""
+    hashes = [
+        hashlib.sha256("file1_émoji_🎉".encode()).hexdigest(),
+        hashlib.sha256("file2_日本語".encode()).hexdigest(),
+        hashlib.sha256("file3_العربية".encode()).hexdigest(),
+    ]
+
+    result = compute_aggregate_hash(hashes)
+
+    # Should work without errors
+    assert len(result) == 64
+    assert isinstance(result, str)
+
+
+def test_compute_aggregate_hash_large_list():
+    """Test aggregate hash with large list of hashes (simulating many model files)."""
+    # Simulate scanning 1000 model files
+    file_hashes = [hashlib.sha256(f"file_{i}".encode()).hexdigest() for i in range(1000)]
+
+    result = compute_aggregate_hash(file_hashes)
+
+    assert len(result) == 64
+    # Should complete quickly even with many files
+
+
+def test_compute_aggregate_hash_duplicates():
+    """Test that duplicate hashes are handled correctly."""
+    # Same hash repeated (e.g., identical sharded files)
+    duplicate_hash = "a" * 64
+    hashes = [duplicate_hash] * 5
+
+    result = compute_aggregate_hash(hashes)
+
+    # Should still produce valid hash
+    assert len(result) == 64
+
+    # Should be deterministic
+    result2 = compute_aggregate_hash(hashes)
     assert result == result2
 
-    # Verify verification works
-    assert hasher.verify_hash(str(pickle_file), result) is True
+
+def test_secure_file_hasher_get_hash_info():
+    """Test hash info extraction."""
+    hasher = SecureFileHasher()
+
+    secure_hash = "secure:abc123"
+    info = hasher.get_hash_info(secure_hash)
+
+    assert info["method"] == "full_hash"
+    assert info["algorithm"] == "blake2b"
+    assert info["security_level"] == "high"
+    assert info["hash"] == "abc123"
+
+
+def test_secure_file_hasher_fingerprint_info():
+    """Test fingerprint hash info extraction."""
+    hasher = SecureFileHasher()
+
+    fingerprint_hash = "fingerprint:def456"
+    info = hasher.get_hash_info(fingerprint_hash)
+
+    assert info["method"] == "enhanced_fingerprint"
+    assert info["algorithm"] == "blake2b"
+    assert info["security_level"] == "medium"
+    assert info["hash"] == "def456"

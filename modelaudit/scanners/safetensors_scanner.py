@@ -8,7 +8,7 @@ import re
 import struct
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -46,7 +46,7 @@ class SafeTensorsScanner(BaseScanner):
             return True
 
         try:
-            from modelaudit.utils.filetype import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format
 
             return detect_file_format(path) == "safetensors"
         except Exception:
@@ -78,7 +78,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Size Check",
                         passed=False,
                         message="File too small to contain SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_len_bytes), "required": 8},
                     )
@@ -91,7 +91,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Length Validation",
                         passed=False,
                         message="Invalid SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"header_len": header_len, "max_allowed": file_size - 8},
                     )
@@ -112,7 +112,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Read",
                         passed=False,
                         message="Failed to read SafeTensors header",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_bytes), "expected": header_len},
                     )
@@ -124,7 +124,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Format Validation",
                         passed=False,
                         message="SafeTensors header does not start with '{'",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                     )
                     result.finish(success=False)
@@ -144,7 +144,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors JSON Parse",
                         passed=False,
                         message=f"Invalid JSON header: {e!s}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
                         why="SafeTensors header contained invalid JSON.",
@@ -170,7 +170,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Entry Type Validation",
                             passed=False,
                             message=f"Invalid tensor entry for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
                         )
@@ -185,7 +185,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Offset Type Validation",
                             passed=False,
                             message=f"Invalid data_offsets for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "tensor": name,
@@ -255,7 +255,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Offset Continuity Check",
                             passed=False,
                             message="Tensor data offsets have gaps or overlap",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"gap_at": begin, "expected": last_end},
                         )
@@ -277,7 +277,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Tensor Data Coverage Check",
                         passed=False,
                         message="Tensor data does not cover entire file",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"last_offset": last_end, "data_size": data_size},
                     )
@@ -375,24 +375,6 @@ class SafeTensorsScanner(BaseScanner):
             # Analyze the metadata for injection patterns
             self._analyze_metadata_content(metadata, result, path)
 
-            # Check metadata size - unusually large metadata can indicate injection
-            import json
-
-            metadata_size = len(json.dumps(metadata, separators=(",", ":")))
-            if metadata_size > 50000:  # 50KB threshold
-                result.add_check(
-                    name="SafeTensors Metadata Size Check",
-                    passed=False,
-                    message=f"Unusually large metadata section ({metadata_size:,} bytes) may indicate injection attack",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "metadata_size": metadata_size,
-                        "size_threshold": 50000,
-                        "potential_attack": "metadata_bloat_injection",
-                    },
-                )
-
         # Check tensor names for injection attempts
         tensor_names = [k for k in header if k != "__metadata__"]
         for tensor_name in tensor_names:
@@ -425,7 +407,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Tensor Metadata Injection Check",
                         passed=False,
                         message=f"Tensor {tensor_name} contains unexpected metadata keys: {list(unexpected_keys)}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={
                             "tensor_name": tensor_name,
@@ -563,18 +545,6 @@ class SafeTensorsScanner(BaseScanner):
                         "total_matches": len(matches),
                     },
                 )
-
-        # Check for unusually deep nesting (JSON bomb)
-        max_depth = self._calculate_json_depth(metadata)
-        if max_depth > 50:
-            result.add_check(
-                name="SafeTensors JSON Depth Bomb Detection",
-                passed=False,
-                message=f"Unusually deep JSON nesting ({max_depth} levels) may indicate DoS attack",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"max_depth": max_depth, "depth_threshold": 50, "attack_type": "json_depth_bomb"},
-            )
 
     def _is_suspicious_tensor_name(self, name: str) -> bool:
         """Check if a tensor name contains suspicious patterns"""

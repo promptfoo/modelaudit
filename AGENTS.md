@@ -165,12 +165,23 @@ first accessed.
 Use the `ScanResult` and `Issue` classes for consistent reporting:
 
 ```python
-# Report security issues
-result.add_issue(
-    "Detected malicious code execution",
+# Report security issues (failures)
+result.add_check(
+    name="Malicious Code Detection",
+    passed=False,
+    message="Detected malicious code execution",
     severity=IssueSeverity.CRITICAL,
     location=path,
     details={"pattern": "os.system", "position": 123}
+)
+
+# Report successful checks (informational)
+result.add_check(
+    name="Format Detection",
+    passed=True,
+    message="Valid model format detected",
+    severity=IssueSeverity.INFO,
+    details={"format": "pytorch"}
 )
 
 # Valid severity levels: DEBUG, INFO, WARNING, CRITICAL

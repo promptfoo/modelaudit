@@ -2,7 +2,7 @@ import os
 import re
 from typing import ClassVar
 
-from modelaudit.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
+from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -44,7 +44,7 @@ class PaddleScanner(BaseScanner):
                 name="PaddlePaddle Library Check",
                 passed=False,
                 message="paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "paddlepaddle"},
             )

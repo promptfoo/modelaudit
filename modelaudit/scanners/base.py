@@ -7,13 +7,13 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from ..context.unified_context import UnifiedMLContext
-from ..explanations import get_message_explanation
-from ..interrupt_handler import check_interrupted
+from ..analysis.unified_context import UnifiedMLContext
+from ..config.explanations import get_message_explanation
+from ..utils.helpers.interrupt_handler import check_interrupted
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
@@ -61,10 +61,10 @@ class Check(BaseModel):
     name: str = Field(..., description="Name of the check performed")
     status: CheckStatus = Field(..., description="Whether the check passed or failed")
     message: str = Field(..., description="Description of what was checked")
-    severity: Optional[IssueSeverity] = Field(None, description="Severity (only for failed checks)")
-    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    severity: IssueSeverity | None = Field(None, description="Severity (only for failed checks)")
+    location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
-    why: Optional[str] = Field(None, description="Explanation (mainly for failed checks)")
+    why: str | None = Field(None, description="Explanation (mainly for failed checks)")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
 
     @field_serializer("status")
@@ -73,7 +73,7 @@ class Check(BaseModel):
         return status.value
 
     @field_serializer("severity")
-    def serialize_severity(self, severity: Optional[IssueSeverity]) -> Optional[str]:
+    def serialize_severity(self, severity: IssueSeverity | None) -> str | None:
         """Serialize severity enum to string value"""
         return severity.value if severity else None
 
@@ -100,11 +100,11 @@ class Issue(BaseModel):
 
     message: str = Field(..., description="Description of the issue")
     severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
-    location: Optional[str] = Field(None, description="File position, line number, etc.")
+    location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
-    why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
+    why: str | None = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
-    type: Optional[str] = Field(None, description="Type of issue for categorization")
+    type: str | None = Field(None, description="Type of issue for categorization")
 
     @field_serializer("severity")
     def serialize_severity(self, severity: IssueSeverity) -> str:
@@ -127,12 +127,13 @@ class Issue(BaseModel):
 class ScanResult:
     """Collects and manages issues found during scanning"""
 
-    def __init__(self, scanner_name: str = "unknown"):
+    def __init__(self, scanner_name: str = "unknown", scanner: "BaseScanner | None" = None):
         self.scanner_name = scanner_name
+        self.scanner = scanner  # Reference to the scanner for whitelist checks
         self.issues: list[Issue] = []
         self.checks: list[Check] = []  # All checks performed (passed and failed)
         self.start_time = time.time()
-        self.end_time: Optional[float] = None
+        self.end_time: float | None = None
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
@@ -142,10 +143,10 @@ class ScanResult:
         name: str,
         passed: bool,
         message: str,
-        severity: Optional[IssueSeverity] = None,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
+        severity: IssueSeverity | None = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
     ) -> None:
         """Add a check result (passed or failed)"""
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
@@ -153,6 +154,13 @@ class ScanResult:
         # For failed checks, ensure we have a severity
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
+
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        # This must happen BEFORE creating the Check to ensure consistent severity
+        if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
 
         check = Check(
             name=name,
@@ -171,6 +179,11 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
+
+            # Apply whitelist downgrading logic if scanner is available
+            if self.scanner:
+                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
             issue = Issue(
                 message=message,
                 severity=severity,
@@ -195,52 +208,31 @@ class ScanResult:
             # Log successful checks at DEBUG level
             logger.debug(f"Check passed: {name} - {message}")
 
-    def add_issue(
+    def _add_issue(
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
     ) -> None:
-        """Add an issue to the result (for backward compatibility)"""
-        if why is None:
-            # Pass scanner name as context for more specific explanations
-            why = get_message_explanation(message, context=self.scanner_name)
+        """Private legacy method - use add_check() instead.
 
-        issue = Issue(
+        This method is deprecated and should not be used in new code.
+        It exists only for backward compatibility with unmigrated scanner code.
+        """
+        # INFO/DEBUG are informational (passed checks), WARNING/CRITICAL are failures
+        passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
+
+        self.add_check(
+            name="Legacy Security Check",
+            passed=passed,
             message=message,
             severity=severity,
             location=location,
-            details=details or {},
-            why=why,
-            type=f"{self.scanner_name}_issue",
-        )
-        self.issues.append(issue)
-
-        # Also add as a failed check for consistency
-        check_name = details.get("check_name", "Security Check") if details else "Security Check"
-        check = Check(
-            name=check_name,
-            status=CheckStatus.FAILED,
-            message=message,
-            severity=severity,
-            location=location,
-            details=details or {},
+            details=details,
             why=why,
         )
-        self.checks.append(check)
-
-        log_level = (
-            logging.CRITICAL
-            if severity == IssueSeverity.CRITICAL
-            else (
-                logging.WARNING
-                if severity == IssueSeverity.WARNING
-                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
-            )
-        )
-        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -278,6 +270,14 @@ class ScanResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
+        # Only count WARNING and CRITICAL severity checks as failures
+        # INFO and DEBUG are informational - they should not count as failures
+        failed_checks_count = sum(
+            1
+            for c in self.checks
+            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        )
+
         return {
             "scanner": self.scanner_name,
             "success": self.success,
@@ -290,7 +290,7 @@ class ScanResult:
             "has_warnings": self.has_warnings,
             "total_checks": len(self.checks),
             "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
-            "failed_checks": sum(1 for c in self.checks if c.status == CheckStatus.FAILED),
+            "failed_checks": failed_checks_count,
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -332,7 +332,7 @@ class BaseScanner(ABC):
     description: ClassVar[str] = "Base scanner class"
     supported_extensions: ClassVar[list[str]] = []
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
         self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
@@ -345,12 +345,12 @@ class BaseScanner(ABC):
             "max_file_read_size",
             0,
         )  # Default unlimited
-        self._path_validation_result: Optional[ScanResult] = None
-        self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
-        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
+        self._path_validation_result: ScanResult | None = None
+        self.context: UnifiedMLContext | None = None  # Will be initialized when scanning a file
+        self.scan_start_time: float | None = None  # Track scan start time for timeout
 
         # Progress tracking setup
-        self.progress_tracker: Optional[Any] = None
+        self.progress_tracker: Any | None = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
 
     def _get_bool_config(self, key: str, default: bool = True) -> bool:
@@ -372,6 +372,61 @@ class BaseScanner(ABC):
             return val.strip().lower() not in {"false", "0", "no", "off"}
         return bool(val)
 
+    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+        """
+        Check if the whitelist should be applied to downgrade an issue's severity.
+
+        Args:
+            severity: The original severity of the issue
+
+        Returns:
+            True if the issue should be downgraded to INFO, False otherwise
+        """
+        # Only downgrade severities higher than INFO
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        # Check if whitelist is enabled (default: True)
+        use_whitelist = self._get_bool_config("use_hf_whitelist", default=True)
+        if not use_whitelist:
+            return False
+
+        # Check if we have a model ID and it's whitelisted
+        if self.context and self.context.model_id:
+            from modelaudit.whitelists import is_whitelisted_model
+
+            return is_whitelisted_model(self.context.model_id)
+
+        return False
+
+    def _apply_whitelist_downgrade(
+        self,
+        severity: IssueSeverity,
+        details: dict[str, Any] | None,
+    ) -> tuple[IssueSeverity, dict[str, Any]]:
+        """
+        Apply whitelist downgrading logic to severity and details.
+
+        Args:
+            severity: The original severity
+            details: The details dictionary (may be None)
+
+        Returns:
+            Tuple of (potentially modified severity, details dict)
+        """
+        original_severity = severity
+        if self._should_apply_whitelist(severity):
+            severity = IssueSeverity.INFO
+            # Add note about whitelisting to the details
+            if details is None:
+                details = {}
+            details["whitelist_downgrade"] = True
+            details["original_severity"] = original_severity.name
+        elif details is None:
+            details = {}
+
+        return severity, details
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Return True if this scanner can handle the file at the given path"""
@@ -390,7 +445,7 @@ class BaseScanner(ABC):
         Scan with optional caching support.
 
         This method provides caching capabilities for individual scanners.
-        If caching is disabled in the config, it falls back to the regular scan() method.
+        Uses the unified cache decorator to eliminate duplicate caching logic.
 
         Args:
             path: Path to the file to scan
@@ -398,50 +453,39 @@ class BaseScanner(ABC):
         Returns:
             ScanResult object (either from cache or fresh scan)
         """
-        # Check if caching is enabled in scanner config
-        cache_enabled = self.config.get("cache_enabled", True)
-        cache_dir = self.config.get("cache_dir")
+        from ..utils.helpers.cache_decorator import cached_scan
 
-        # If caching is disabled, proceed with direct scan
-        if not cache_enabled:
-            return self.scan(path)
+        # Create cached version of the scan method
+        @cached_scan()
+        def cached_scan_method(scanner_self: "BaseScanner", file_path: str) -> ScanResult:
+            return scanner_self.scan(file_path)
 
-        # Use cache manager for scanner-level caching
-        try:
-            from ..cache import get_cache_manager
-
-            cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-            # Create cache-aware scan function
-            def cached_scanner_wrapper(fpath: str) -> dict:
-                result = self.scan(fpath)
-                return result.to_dict()
-
-            # Get cached result or perform scan
-            result_dict = cache_manager.cached_scan(path, cached_scanner_wrapper)
-
-            # Convert back to ScanResult
-            from ..utils.result_conversion import scan_result_from_dict
-
-            return scan_result_from_dict(result_dict)
-
-        except Exception as e:
-            # If cache system fails, fall back to direct scanning
-            logger.warning(f"Scanner cache error for {path} ({self.name}): {e}. Falling back to direct scan.")
-            return self.scan(path)
+        return cached_scan_method(self, path)
 
     def _initialize_context(self, path: str) -> None:
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
+        from modelaudit.utils.huggingface import extract_model_id_from_path
+
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
-        self.context = UnifiedMLContext(file_path=path_obj, file_size=file_size, file_type=file_type)
+
+        # Extract model ID if this is from HuggingFace or contains metadata
+        model_id, model_source = extract_model_id_from_path(path)
+
+        self.context = UnifiedMLContext(
+            file_path=path_obj,
+            file_size=file_size,
+            file_type=file_type,
+            model_id=model_id,
+            model_source=model_source,
+        )
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        result = ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name, scanner=self)
 
         # Automatically merge any stored path validation warnings
         if hasattr(self, "_path_validation_result") and self._path_validation_result:
@@ -501,8 +545,13 @@ class BaseScanner(ABC):
             total_bytes: Total bytes in the file
         """
         percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
-        result.add_issue(
-            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+        result.add_check(
+            name="Scan Timeout Check",
+            passed=False,
+            message=(
+                f"Scan incomplete: Timeout after scanning {bytes_scanned:,} "
+                f"of {total_bytes:,} bytes ({percentage:.1f}%)"
+            ),
             severity=IssueSeverity.WARNING,
             location=self.current_file_path,
             details={
@@ -561,7 +610,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.secrets_detector import SecretsDetector
+            from modelaudit.detectors.secrets import SecretsDetector
 
             detector = SecretsDetector(self.config.get("secrets_config"))
             findings = detector.scan_model_weights(data, context)
@@ -625,7 +674,7 @@ class BaseScanner(ABC):
             return []
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
@@ -745,7 +794,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
@@ -830,7 +879,7 @@ class BaseScanner(ABC):
             return []
 
         try:
-            from modelaudit.network_comm_detector import NetworkCommDetector
+            from modelaudit.detectors.network_comm import NetworkCommDetector
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
@@ -857,21 +906,21 @@ class BaseScanner(ABC):
             context: Context string for reporting
         """
         if findings:
+            # Downgrade URL detections to INFO severity since URLs in model data
+            # (vocabularies, training text) are not active security threats
             severity_map = {
-                "CRITICAL": IssueSeverity.CRITICAL,
-                "HIGH": IssueSeverity.CRITICAL,
-                "MEDIUM": IssueSeverity.WARNING,
+                "CRITICAL": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "HIGH": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "MEDIUM": IssueSeverity.INFO,  # Downgraded from WARNING
                 "LOW": IssueSeverity.INFO,
             }
 
-            # Get highest severity across all findings
+            # All URL detections now use INFO severity
             max_severity = IssueSeverity.INFO
             for finding in findings:
-                finding_severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                if (finding_severity.value == "critical" and max_severity.value != "critical") or (
-                    finding_severity.value == "warning" and max_severity.value == "info"
-                ):
-                    max_severity = finding_severity
+                finding_severity = severity_map.get(finding.get("severity", "INFO"), IssueSeverity.INFO)
+                # All findings are now INFO level
+                max_severity = finding_severity
 
             # Extract unique patterns for the message
             unique_patterns: set[str] = set()
@@ -948,7 +997,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.network_comm_detector import NetworkCommDetector
+            from modelaudit.detectors.network_comm import NetworkCommDetector
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
@@ -991,7 +1040,7 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for network communication: {e}")
             return 0
 
-    def _check_path(self, path: str) -> Optional[ScanResult]:
+    def _check_path(self, path: str) -> ScanResult | None:
         """Common path checks and validation
 
         Returns:
@@ -1044,7 +1093,7 @@ class BaseScanner(ABC):
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
             try:
-                from modelaudit.utils.filetype import (
+                from modelaudit.utils.file.detection import (
                     detect_file_format_from_magic,
                     detect_format_from_extension,
                     validate_file_type,
@@ -1061,7 +1110,7 @@ class BaseScanner(ABC):
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
                         ),
-                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        severity=IssueSeverity.INFO,  # Informational - format mismatch not necessarily a security issue
                         location=path,
                         details={
                             "header_format": header_format,
@@ -1139,7 +1188,7 @@ class BaseScanner(ABC):
 
         return hashes
 
-    def _check_size_limit(self, path: str) -> Optional[ScanResult]:
+    def _check_size_limit(self, path: str) -> ScanResult | None:
         """Check if the file exceeds the configured size limit."""
         file_size = self.get_file_size(path)
 
@@ -1166,7 +1215,7 @@ class BaseScanner(ABC):
 
         if self.max_file_read_size and self.max_file_read_size > 0:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
             self._path_validation_result.add_check(
                 name="File Size Limit",
@@ -1180,7 +1229,7 @@ class BaseScanner(ABC):
             )
         else:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
 
         return None
@@ -1304,7 +1353,7 @@ class BaseScanner(ABC):
             self._report_progress_error(e)
             raise
 
-    def get_progress_stats(self) -> Optional[dict[str, Any]]:
+    def get_progress_stats(self) -> dict[str, Any] | None:
         """Get current progress statistics."""
         if self.progress_tracker:
             return self.progress_tracker.get_stats()

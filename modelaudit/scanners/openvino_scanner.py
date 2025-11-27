@@ -6,7 +6,7 @@ import os
 import re
 from typing import ClassVar
 
-from modelaudit.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -56,7 +56,7 @@ class OpenVinoScanner(BaseScanner):
                 name="OpenVINO Weights File Check",
                 passed=False,
                 message="Associated .bin weights file not found",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=bin_path,
                 details={"expected_file": bin_path},
             )
@@ -69,7 +69,7 @@ class OpenVinoScanner(BaseScanner):
                 name="OpenVINO XML Parse",
                 passed=False,
                 message=f"Invalid OpenVINO XML: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

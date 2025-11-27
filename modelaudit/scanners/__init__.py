@@ -55,8 +55,8 @@ class ScannerRegistry:
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
-        self._numpy_compatible: Optional[bool] = None  # Lazy initialization
-        self._numpy_status: Optional[str] = None
+        self._numpy_compatible: bool | None = None  # Lazy initialization
+        self._numpy_status: str | None = None
         self._init_registry()
 
     def _ensure_numpy_status(self) -> None:
@@ -148,15 +148,6 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
-            "coreml": {
-                "module": "modelaudit.scanners.coreml_scanner",
-                "class": "CoreMLScanner",
-                "description": "Scans Apple Core ML model files",
-                "extensions": [".mlmodel"],
-                "priority": 6,
-                "dependencies": ["coreml"],  # Heavy dependency
-                "numpy_sensitive": True,
-            },
             "openvino": {
                 "module": "modelaudit.scanners.openvino_scanner",
                 "class": "OpenVinoScanner",
@@ -200,6 +191,15 @@ class ScannerRegistry:
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "skops": {
+                "module": "modelaudit.scanners.skops_scanner",
+                "class": "SkopsScanner",
+                "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+                "extensions": [".skops"],
+                "priority": 8,  # Same priority as joblib
+                "dependencies": [],  # No heavy dependencies (uses standard zipfile)
                 "numpy_sensitive": False,
             },
             "numpy": {
@@ -381,6 +381,15 @@ class ScannerRegistry:
                 "dependencies": ["py7zr"],
                 "numpy_sensitive": False,
             },
+            "xgboost": {
+                "module": "modelaudit.scanners.xgboost_scanner",
+                "class": "XGBoostScanner",
+                "description": "Scans XGBoost model files for security vulnerabilities",
+                "extensions": [".bst", ".model", ".json", ".ubj"],
+                "priority": 7,  # After GGUF scanner, before joblib
+                "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
+                "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -392,7 +401,7 @@ class ScannerRegistry:
             },
         }
 
-    def _load_scanner(self, scanner_id: str) -> Optional[type[BaseScanner]]:
+    def _load_scanner(self, scanner_id: str) -> type[BaseScanner] | None:
         """Lazy load a scanner class (thread-safe) with enhanced error handling"""
         # Check if already loaded (fast path without lock)
         if scanner_id in self._loaded_scanners:
@@ -500,7 +509,7 @@ class ScannerRegistry:
 
         return scanner_classes
 
-    def get_scanner_for_path(self, path: str) -> Optional[type[BaseScanner]]:
+    def get_scanner_for_path(self, path: str) -> type[BaseScanner] | None:
         """Get the best scanner for a given path (lazy loaded)"""
         import os
 
@@ -534,11 +543,11 @@ class ScannerRegistry:
         """Get list of available scanner IDs"""
         return list(self._scanners.keys())
 
-    def get_scanner_info(self, scanner_id: str) -> Optional[dict[str, Any]]:
+    def get_scanner_info(self, scanner_id: str) -> dict[str, Any] | None:
         """Get metadata about a scanner without loading it"""
         return self._scanners.get(scanner_id)
 
-    def load_scanner_by_id(self, scanner_id: str) -> Optional[type[BaseScanner]]:
+    def load_scanner_by_id(self, scanner_id: str) -> type[BaseScanner] | None:
         """Load a specific scanner by ID (public API)"""
         return self._load_scanner(scanner_id)
 
@@ -611,7 +620,7 @@ class _LazyList:
 
     def __init__(self, registry: ScannerRegistry) -> None:
         self._registry = registry
-        self._cached_list: Optional[list[type[BaseScanner]]] = None
+        self._cached_list: list[type[BaseScanner]] | None = None
         self._lock = threading.Lock()
 
     def _get_list(self) -> list[type[BaseScanner]]:
@@ -653,12 +662,12 @@ def __getattr__(name: str) -> Any:
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
-        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
         "ManifestScanner": "manifest",
@@ -673,6 +682,7 @@ def __getattr__(name: str) -> Any:
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
+        "XGBoostScanner": "xgboost",
         "ZipScanner": "zip",
     }
 
@@ -689,7 +699,7 @@ def __getattr__(name: str) -> Any:
 
 
 # Helper function for getting scanner for a file
-def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+def get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> BaseScanner | None:
     """Get an instantiated scanner for a given file path"""
     scanner_class = _registry.get_scanner_for_path(path)
     if scanner_class:

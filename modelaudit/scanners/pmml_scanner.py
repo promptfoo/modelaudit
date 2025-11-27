@@ -1,6 +1,6 @@
 import os
 import re
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -88,7 +88,7 @@ class PmmlScanner(BaseScanner):
                 name="PMML File Read",
                 passed=False,
                 message=f"Error reading file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -114,7 +114,7 @@ class PmmlScanner(BaseScanner):
                     name="PMML Text Decoding",
                     passed=False,
                     message=f"Failed to decode file as text: {e}",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
                 )
@@ -145,7 +145,7 @@ class PmmlScanner(BaseScanner):
                 name="XML Parse Validation",
                 passed=False,
                 message=f"Malformed XML: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
                 why=(
@@ -187,9 +187,13 @@ class PmmlScanner(BaseScanner):
                     "allowing attackers to read local files, perform SSRF attacks, or cause denial of service.",
                 )
 
-    def _validate_pmml_structure(self, root, result: ScanResult, path: str) -> None:
+    def _validate_pmml_structure(self, root: Any, result: ScanResult, path: str) -> None:
         """Validate basic PMML structure and extract metadata."""
-        if root.tag.lower() != "pmml":
+        # Extract local tag name (without namespace)
+        # Tags can be "{http://namespace}PMML" or just "PMML"
+        tag_name = root.tag.split("}")[-1].lower() if "}" in root.tag else root.tag.lower()
+
+        if tag_name != "pmml":
             result.add_check(
                 name="PMML Root Element Validation",
                 passed=False,
@@ -211,7 +215,7 @@ class PmmlScanner(BaseScanner):
                     why="PMML files should specify a version for compatibility.",
                 )
 
-    def _check_suspicious_content(self, root, result: ScanResult, path: str) -> None:
+    def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
         for elem in root.iter():
             # Combine element text content with attributes for comprehensive scanning
@@ -273,7 +277,7 @@ class PmmlScanner(BaseScanner):
                         )
                         break
 
-    def _get_all_text_content(self, element) -> str:
+    def _get_all_text_content(self, element: Any) -> str:
         """Recursively get all text content from an element and its children."""
         text_parts = []
 

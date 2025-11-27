@@ -4,13 +4,13 @@ import logging
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Lock
-from typing import IO, Any, Callable, Optional, Union
+from typing import IO, Any
 from unittest.mock import patch
 
-from modelaudit.interrupt_handler import check_interrupted
-from modelaudit.license_checker import (
+from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
@@ -20,22 +20,28 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
-from modelaudit.utils.advanced_file_handler import (
-    scan_advanced_large_file,
-    should_use_advanced_handler,
-)
-from modelaudit.utils.assets import asset_from_scan_result
-from modelaudit.utils.filetype import (
+from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
     validate_file_type,
 )
-from modelaudit.utils.large_file_handler import (
+from modelaudit.utils.file.handlers import (
+    scan_advanced_large_file,
+    should_use_advanced_handler,
+)
+from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.streaming import stream_analyze_file
+from modelaudit.utils.file.streaming import stream_analyze_file
+from modelaudit.utils.helpers.assets import asset_from_scan_result
+from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.interrupt_handler import check_interrupted
+from modelaudit.utils.helpers.types import (
+    FilePath,
+    ProgressCallback,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -113,9 +119,9 @@ def _add_issue_to_model(
     results: ModelAuditResultModel,
     message: str,
     severity: str = "warning",
-    location: Optional[str] = None,
-    details: Optional[dict] = None,
-    issue_type: Optional[str] = None,
+    location: str | None = None,
+    details: dict | None = None,
+    issue_type: str | None = None,
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
@@ -143,22 +149,17 @@ def _add_issue_to_model(
 
 
 def _calculate_file_hash(file_path: str) -> str:
-    """Calculate SHA256 hash of a file for deduplication purposes."""
-    try:
-        hash_sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            # Read file in chunks to handle large files efficiently
-            for chunk in iter(lambda: f.read(8192), b""):
-                hash_sha256.update(chunk)
-        return hash_sha256.hexdigest()
-    except Exception as e:
-        logger.warning(f"Failed to calculate hash for {file_path}: {e}")
-        # Return a unique identifier based on file path and size as fallback
-        try:
-            file_size = os.path.getsize(file_path)
-            return f"fallback_{file_path}_{file_size}"
-        except Exception:
-            return f"fallback_{file_path}"
+    """Calculate SHA256 hash of a file for deduplication purposes.
+
+    Raises:
+        Exception: If file cannot be hashed (security: prevents hash collision attacks)
+    """
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read file in chunks to handle large files efficiently
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
 
 
 def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
@@ -173,8 +174,14 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     content_groups: dict[str, list[str]] = defaultdict(list)
 
     for file_path in file_paths:
-        content_hash = _calculate_file_hash(file_path)
-        content_groups[content_hash].append(file_path)
+        try:
+            content_hash = _calculate_file_hash(file_path)
+            content_groups[content_hash].append(file_path)
+        except Exception as e:
+            # Log error but continue with other files to prevent single I/O failure from aborting entire scan
+            logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
+            # Add file with unique hash to ensure it gets scanned independently
+            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
 
     # Log information about duplicate content found
     for content_hash, paths in content_groups.items():
@@ -299,7 +306,7 @@ def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[st
     return consolidated_details
 
 
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str]]:
+def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
     """Extract severity and explanation from failed checks.
 
     Args:
@@ -334,7 +341,7 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
     Returns:
         Most recent timestamp, or current time if none found
     """
-    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
+    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), int | float)]
     return max(timestamps) if timestamps else time.time()
 
 
@@ -348,10 +355,31 @@ def _update_result_counts(
         consolidated_checks: List of consolidated checks
         original_count: Original number of checks before consolidation
     """
-    total_checks = len(consolidated_checks)
-    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
+    from .scanners.base import IssueSeverity
+
+    # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
+    # Exclude failed INFO/DEBUG checks from success rate (they're informational)
+    def is_failed_info_or_debug(check):
+        if check.get("status") != "failed":
+            return False
+        severity = check.get("severity", "")
+        # Check both string and enum values for compatibility
+        return severity in ("info", "debug", IssueSeverity.INFO.value, IssueSeverity.DEBUG.value)
+
+    # Exclude only failed INFO/DEBUG checks from success rate
+    security_checks = [c for c in consolidated_checks if not is_failed_info_or_debug(c)]
+
+    total_checks = len(security_checks)
+    passed_checks = sum(1 for c in security_checks if c.get("status") == "passed")
+    failed_checks = sum(1 for c in security_checks if c.get("status") == "failed")
     skipped_checks = total_checks - passed_checks - failed_checks
+
+    # Debug logging
+    info_debug_excluded = len(consolidated_checks) - len(security_checks)
+    logger.debug(
+        f"Check statistics: {total_checks} total ({info_debug_excluded} INFO/DEBUG excluded), "
+        f"{passed_checks} passed, {failed_checks} failed"
+    )
 
     # Validate counts make sense
     if passed_checks + failed_checks + skipped_checks != total_checks:
@@ -460,15 +488,15 @@ def create_scan_config(**kwargs: Any) -> ScanConfigModel:
 
 
 def scan_model_directory_or_file(
-    path: str,
-    blacklist_patterns: Optional[list[str]] = None,
+    path: FilePath,
+    blacklist_patterns: list[str] | None = None,
     timeout: int = 3600,  # 1 hour for large models (up to 8GB+)
     max_file_size: int = 0,  # 0 means unlimited - support any size
     max_total_size: int = 0,  # 0 means unlimited
     strict_license: bool = False,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: ProgressCallback | None = None,
     skip_file_types: bool = True,
-    **kwargs,
+    **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
     Scan a model file or directory for malicious content.
@@ -499,6 +527,8 @@ def scan_model_directory_or_file(
         "success": True,
         "scanners": [],  # Track the scanners used (different from scanner_names)
     }
+    # Track file hashes for aggregate hash computation
+    file_hashes: list[str] = []
 
     # Configure scan options
     config = {
@@ -611,7 +641,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 "Broken symlink encountered",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"error": str(e)},
                             )
@@ -696,6 +726,11 @@ def scan_model_directory_or_file(
                 for content_hash, file_paths in content_groups.items():
                     if limit_reached:
                         break
+
+                    # Collect valid content hashes for aggregate hash computation
+                    # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
+                    if not content_hash.startswith("unhashable_"):
+                        file_hashes.append(content_hash)
 
                     # Scan the first file in each content group (representative)
                     representative_file = file_paths[0]
@@ -815,7 +850,7 @@ def scan_model_directory_or_file(
                                 results,
                                 f"Total scan size limit exceeded: {results.bytes_scanned} bytes "
                                 f"(max: {max_total_size})",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=representative_file,
                                 details={"max_total_size": max_total_size},
                             )
@@ -830,7 +865,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.CRITICAL.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"exception_type": type(e).__name__},
                             )
@@ -873,9 +908,19 @@ def scan_model_directory_or_file(
                 file_size = os.path.getsize(target)
                 results.files_scanned += 1
 
+                # Compute hash for single file to enable aggregate hash
+                try:
+                    file_hash = _calculate_file_hash(target)
+                    file_hashes.append(file_hash)
+                except Exception as e:
+                    logger.debug(f"Failed to hash file {target}: {e}")
+                    # Continue without hash - not a critical error
+
                 if progress_callback is not None and file_size > 0:
 
-                    def create_progress_open(callback: Callable[[str, float], None], current_file_size: int):
+                    def create_progress_open(
+                        callback: Callable[[str, float], None], current_file_size: int
+                    ) -> Callable[..., IO[Any]]:
                         """Create a progress-aware file opener with properly bound variables."""
 
                         def progress_open(file_path: str, mode: str = "r", *args: Any, **kwargs: Any) -> IO[Any]:
@@ -890,7 +935,7 @@ def scan_model_directory_or_file(
                             def progress_read(size: int = -1) -> Any:
                                 nonlocal file_pos
                                 data = original_read(size)
-                                if isinstance(data, (str, bytes)):
+                                if isinstance(data, str | bytes):
                                     file_pos += len(data)
                                 callback(
                                     f"Reading file: {os.path.basename(file_path)}",
@@ -932,7 +977,7 @@ def scan_model_directory_or_file(
                     _add_issue_to_model(
                         results,
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                        severity=IssueSeverity.WARNING.value,
+                        severity=IssueSeverity.INFO.value,
                         location=target,
                         details={"max_total_size": max_total_size},
                     )
@@ -952,7 +997,7 @@ def scan_model_directory_or_file(
         _add_issue_to_model(
             results,
             f"Error during scan: {e!s}",
-            severity=IssueSeverity.CRITICAL.value,
+            severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
         _add_error_asset_to_results(results, path)
@@ -1024,6 +1069,13 @@ def scan_model_directory_or_file(
 
     # Set success flag for backward compatibility
     results.success = bool(scan_metadata.get("success", True))
+
+    # Compute aggregate content hash if we collected file hashes
+    if file_hashes:
+        from .utils.helpers.secure_hasher import compute_aggregate_hash
+
+        results.content_hash = compute_aggregate_hash(file_hashes)
+        logger.info(f"Computed aggregate content hash from {len(file_hashes)} file(s): {results.content_hash}")
 
     # Finalize statistics and return Pydantic model
     results.finalize_statistics()
@@ -1113,7 +1165,8 @@ def _is_huggingface_cache_file(path: str) -> bool:
     return bool("/refs/" in path and filename in ["main", "HEAD"])
 
 
-def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+@cached_scan()
+def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Scan a single file with the appropriate scanner.
 
@@ -1128,40 +1181,11 @@ def scan_file(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
         config = {}
     validate_scan_config(config)
 
-    # Check cache configuration
-    cache_enabled = config.get("cache_enabled", True)
-    cache_dir = config.get("cache_dir")
-
-    # If caching is disabled, proceed with direct scan
-    if not cache_enabled:
-        return _scan_file_internal(path, config)
-
-    # Use cache manager for cache-enabled scans
-    try:
-        from .cache import get_cache_manager
-
-        cache_manager = get_cache_manager(cache_dir, enabled=True)
-
-        # Create a wrapper function for the cache manager
-        def cached_scan_wrapper(file_path: str) -> dict:
-            result = _scan_file_internal(file_path, config)
-            return result.to_dict()
-
-        # Get cached result or perform scan
-        result_dict = cache_manager.cached_scan(path, cached_scan_wrapper)
-
-        # Convert back to ScanResult
-        from .utils.result_conversion import scan_result_from_dict
-
-        return scan_result_from_dict(result_dict)
-
-    except Exception as e:
-        # If cache system fails, fall back to direct scanning
-        logger.warning(f"Cache system error for {path}: {e}. Falling back to direct scan.")
-        return _scan_file_internal(path, config)
+    # Delegate to internal implementation - cache decorator handles caching
+    return _scan_file_internal(path, config)
 
 
-def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> ScanResult:
+def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """
     Internal implementation of file scanning (cache-agnostic).
 
@@ -1195,9 +1219,11 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         file_size = os.path.getsize(path)
     except OSError as e:
         sr = ScanResult(scanner_name="error")
-        sr.add_issue(
-            f"Error checking file size: {e}",
-            severity=IssueSeverity.WARNING,
+        sr.add_check(
+            name="File Size Check",
+            passed=False,
+            message=f"Error checking file size: {e}",
+            severity=IssueSeverity.INFO,
             details={"error": str(e), "path": path},
         )
         sr.finish(success=False)
@@ -1211,9 +1237,11 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
     if not use_extreme_handler and max_file_size > 0 and file_size > max_file_size:
         sr = ScanResult(scanner_name="size_check")
-        sr.add_issue(
-            f"File too large to scan: {file_size} bytes (max: {max_file_size})",
-            severity=IssueSeverity.WARNING,
+        sr.add_check(
+            name="File Size Limit Check",
+            passed=False,
+            message=f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+            severity=IssueSeverity.INFO,
             details={
                 "file_size": file_size,
                 "max_file_size": max_file_size,
@@ -1259,7 +1287,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
             logger.debug(discrepancy_msg)
 
     # Prefer scanner based on header format using lazy loading
-    preferred_scanner: Optional[type[BaseScanner]] = None
+    preferred_scanner: type[BaseScanner] | None = None
 
     # Special handling for PyTorch files that are ZIP-based
     if header_format == "zip" and ext in [".pt", ".pth"]:
@@ -1286,7 +1314,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
-    result: Optional[ScanResult]
+    result: ScanResult | None
 
     # We already checked use_extreme_handler above for size limit bypass
     # Now check if we should use regular large handler
@@ -1321,9 +1349,11 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         except TimeoutError as e:
             # Handle timeout gracefully
             result = ScanResult(scanner_name=preferred_scanner.name)
-            result.add_issue(
-                f"Scan timeout: {e}",
-                severity=IssueSeverity.WARNING,
+            result.add_check(
+                name="Scan Timeout Check",
+                passed=False,
+                message=f"Scan timeout: {e}",
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"timeout": config.get("timeout", 3600), "error": str(e)},
             )
@@ -1356,9 +1386,11 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
             except TimeoutError as e:
                 # Handle timeout gracefully
                 result = ScanResult(scanner_name=scanner_class.name)
-                result.add_issue(
-                    f"Scan timeout: {e}",
-                    severity=IssueSeverity.WARNING,
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scan timeout: {e}",
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"timeout": config.get("timeout", 3600), "error": str(e)},
                 )
@@ -1366,8 +1398,10 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_issue(
-                f"Unknown or unhandled format: {format_}",
+            sr.add_check(
+                name="Format Detection",
+                passed=False,
+                message=f"Unknown or unhandled format: {format_}",
                 severity=IssueSeverity.DEBUG,
                 details={"format": format_, "path": path},
             )
@@ -1378,8 +1412,10 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
         severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
         # For validation failures, use the actual magic format
         detail_header_format = magic_format if not file_type_valid else header_format
-        result.add_issue(
-            discrepancy_msg + " Using header-based detection.",
+        result.add_check(
+            name="Format Validation",
+            passed=False,
+            message=discrepancy_msg + " Using header-based detection.",
             severity=severity,
             location=path,
             details={
@@ -1394,7 +1430,7 @@ def _scan_file_internal(path: str, config: Optional[dict[str, Any]] = None) -> S
 
 def merge_scan_result(
     results: ModelAuditResultModel,
-    scan_result: Union[ScanResult, dict[str, Any]],
+    scan_result: ScanResult | dict[str, Any],
 ) -> None:
     """
     Merge a ScanResult object into the ModelAuditResultModel.
@@ -1422,3 +1458,120 @@ def merge_scan_result(
                 scan_result.get("scanner_name", "unknown"),
             )
         results.aggregate_scan_result(scan_result)
+
+
+def scan_model_streaming(
+    file_generator: Iterator[tuple[Path, bool]],
+    timeout: int = 3600,
+    progress_callback: ProgressCallback | None = None,
+    delete_after_scan: bool = True,
+    **kwargs: Any,
+) -> ModelAuditResultModel:
+    """
+    Scan model files from a generator in streaming mode.
+
+    Downloads files one at a time, scans immediately, computes hash, and optionally
+    deletes to minimize disk usage. Computes aggregate content hash at the end.
+
+    Args:
+        file_generator: Generator yielding (file_path, is_last) tuples
+        timeout: Scan timeout in seconds
+        progress_callback: Optional callback for progress reporting
+        delete_after_scan: Whether to delete files after scanning (default: True)
+        **kwargs: Additional arguments passed to scanners
+
+    Returns:
+        ModelAuditResultModel with scan results and content_hash field
+    """
+    from .models import convert_assets_to_models
+    from .utils.helpers.assets import asset_from_scan_result
+    from .utils.helpers.file_hash import compute_sha256_hash
+    from .utils.helpers.secure_hasher import compute_aggregate_hash
+
+    start_time = time.time()
+    results = create_initial_audit_result()
+    file_hashes: list[str] = []
+    files_processed = 0
+
+    try:
+        for file_path, _is_last in file_generator:
+            # Check for interruption
+            check_interrupted()
+
+            # Check timeout
+            if time.time() - start_time > timeout:
+                results.has_errors = True
+                logger.error(f"Streaming scan timeout after {timeout}s")
+                break
+
+            try:
+                # Compute file hash
+                if progress_callback:
+                    progress_callback(f"Hashing {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+
+                file_hash = compute_sha256_hash(file_path)
+                file_hashes.append(file_hash)
+
+                # Scan the file
+                if progress_callback:
+                    progress_callback(f"Scanning {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+
+                # Build config dict for scan_file
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **kwargs,
+                }
+
+                scan_result = scan_file(
+                    str(file_path),
+                    config=scan_config,
+                )
+
+                # Merge results
+                if scan_result:
+                    # Use dict-based aggregation to avoid import issues
+                    scan_result_dict = {
+                        "bytes_scanned": scan_result.bytes_scanned,
+                        "files_scanned": 1,  # Each scan_result represents one file
+                        "has_errors": scan_result.has_errors,
+                        "success": scan_result.success,
+                        "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
+                        "checks": [check.__dict__ for check in (scan_result.checks or [])],
+                        "scanners": [scan_result.scanner_name] if scan_result.scanner_name else [],
+                    }
+                    results.aggregate_scan_result(scan_result_dict)
+
+                    # Add asset
+                    asset = asset_from_scan_result(str(file_path), scan_result)
+                    if asset:
+                        results.assets.extend(convert_assets_to_models([asset]))
+
+                files_processed += 1
+
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+                results.has_errors = True
+
+            finally:
+                # Delete file after scanning if requested
+                if delete_after_scan and file_path.exists():
+                    try:
+                        file_path.unlink()
+                        logger.debug(f"Deleted {file_path} after scanning")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {e}")
+
+        # Compute aggregate hash from all file hashes
+        if file_hashes:
+            results.content_hash = compute_aggregate_hash(file_hashes)
+            logger.info(f"Computed aggregate content hash: {results.content_hash}")
+
+        # Finalize statistics
+        results.finalize_statistics()
+
+    except Exception as e:
+        logger.error(f"Streaming scan failed: {e}")
+        results.has_errors = True
+        raise
+
+    return results

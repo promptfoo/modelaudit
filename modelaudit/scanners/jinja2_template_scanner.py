@@ -22,9 +22,9 @@ import json
 import os
 import re
 import warnings
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -95,7 +95,7 @@ class Jinja2TemplateScanner(BaseScanner):
     description = "Scans for Jinja2 template injection vulnerabilities in ML model templates"
     supported_extensions: ClassVar[list[str]] = [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
 
         # Configuration options
@@ -346,7 +346,7 @@ class Jinja2TemplateScanner(BaseScanner):
             for key, field in reader.fields.items():
                 if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
                     value = field.parts[field.data[0]]
-                    if isinstance(value, (list, tuple)):
+                    if isinstance(value, list | tuple):
                         # Convert list of integers to string
                         template_str = "".join(chr(i) for i in value if isinstance(i, int) and 0 <= i <= 1114111)
                     else:
@@ -392,7 +392,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     templates[current_path] = value
 
                 # Recursively check nested structures
-                elif isinstance(value, (dict, list)):
+                elif isinstance(value, dict | list):
                     self._find_json_templates(value, templates, current_path)
 
                 # Check for template-like strings (contain Jinja2 syntax)
@@ -510,6 +510,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         # Common HuggingFace chat template patterns
         if context.framework == "huggingface":
+            # Normalize quotes for matching (handle both single and double quotes)
+            match_normalized = match_lower.replace('"', "'")
+
             benign_patterns = [
                 "for message in messages",
                 "message['role']",
@@ -518,9 +521,18 @@ class Jinja2TemplateScanner(BaseScanner):
                 "if message['role'] == 'system'",
                 "if message['role'] == 'user'",
                 "if message['role'] == 'assistant'",
+                "if message['role'] == 'tool'",
+                # Bracket notation patterns (non-dunder attributes)
+                "['role']",
+                "['content']",
+                "['tools']",
+                "['name']",
+                # Tool-related patterns
+                "for tool in tools",
+                "if tool is not string",
             ]
 
-            return any(pattern in match_lower for pattern in benign_patterns)
+            return any(pattern in match_normalized for pattern in benign_patterns)
 
         return False
 
@@ -548,7 +560,8 @@ class Jinja2TemplateScanner(BaseScanner):
 
         base_severity = base_severity_map.get(detection.risk_level, IssueSeverity.WARNING)
 
-        # Context-based adjustments
+        # Context-based adjustments: Don't downgrade critical attack patterns
+        # Only downgrade truly benign patterns in legitimate ML contexts
         if (
             context.confidence >= 3
             and context.framework == "huggingface"
@@ -556,6 +569,9 @@ class Jinja2TemplateScanner(BaseScanner):
             and base_severity == IssueSeverity.WARNING
         ):
             return IssueSeverity.INFO
+
+        # Don't downgrade obfuscation patterns in HuggingFace context
+        # The regex fix should prevent false positives, so any remaining matches are suspicious
 
         # Sensitivity level adjustments
         if self.sensitivity_level == "high":

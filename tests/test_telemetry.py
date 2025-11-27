@@ -35,13 +35,13 @@ class TestUserConfig:
                 assert len(config.user_id) == 36  # UUID length
                 assert config_file.exists()
 
-    def test_user_config_defaults_to_disabled(self):
-        """Test that telemetry defaults to disabled (opt-in)."""
+    def test_user_config_defaults_to_enabled(self):
+        """Test that telemetry defaults to enabled (opt-out model)."""
         with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
             mock_home.return_value = Path(temp_dir)
             config = UserConfig()
 
-            assert config.telemetry_enabled is False
+            assert config.telemetry_enabled is True
 
     def test_user_config_persists_settings(self):
         """Test that settings are persisted to file."""
@@ -70,19 +70,29 @@ class TestUserConfig:
 
                 # Should create new config despite corrupted file
                 assert config.user_id
-                assert config.telemetry_enabled is False
+                # Default to enabled (opt-out model)
+                assert config.telemetry_enabled is True
 
 
 class TestTelemetryClient:
     """Test telemetry client functionality."""
 
-    def test_telemetry_disabled_by_default(self):
-        """Test that telemetry is disabled by default."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+    def test_telemetry_enabled_by_default(self):
+        """Test that telemetry is enabled by default (opt-out model)."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
 
-            assert client._is_disabled() is True
+            # Telemetry should be enabled by default (not disabled)
+            assert client._is_disabled() is False
 
     def test_promptfoo_disable_env_var(self):
         """Test that PROMPTFOO_DISABLE_TELEMETRY works."""
@@ -108,8 +118,8 @@ class TestTelemetryClient:
 
             assert client._is_disabled() is True
 
-    def test_telemetry_enabled_when_opted_in(self):
-        """Test that telemetry works when explicitly enabled."""
+    def test_telemetry_can_be_disabled_via_config(self):
+        """Test that telemetry can be disabled via user config."""
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
@@ -121,9 +131,10 @@ class TestTelemetryClient:
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
-            client._user_config.telemetry_enabled = True
+            # Explicitly disable via config
+            client._user_config.telemetry_enabled = False
 
-            assert client._is_disabled() is False
+            assert client._is_disabled() is True
 
     @patch("modelaudit.telemetry.urlopen")
     def test_event_recording_when_enabled(self, mock_urlopen):
@@ -159,7 +170,8 @@ class TestTelemetryClient:
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
-            # telemetry_enabled defaults to False
+            # Explicitly disable telemetry
+            client._user_config.telemetry_enabled = False
 
             client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
 
@@ -244,6 +256,65 @@ class TestDataAnonymization:
                 request_data = call[0][0].data.decode()
                 assert "api_key=secret123" not in request_data
                 assert sensitive_url not in request_data
+
+    def test_email_hashing(self):
+        """Test that email addresses are properly hashed."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # Test normal email
+            email = "user@example.com"
+            hashed = client._hash_email(email)
+            assert hashed is not None
+            assert "user" not in hashed
+            assert "@example.com" in hashed  # Domain is preserved
+
+            # Test None email
+            assert client._hash_email(None) is None
+
+    def test_issue_type_sanitization(self):
+        """Test that issue messages are sanitized to just type categories."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # Test that sensitive paths in messages are not included
+            msg_with_path = "Dangerous import detected in /home/user/secret/model.pkl"
+            sanitized = client._sanitize_issue_type(msg_with_path)
+            assert "/home/user/secret" not in sanitized
+            assert sanitized == "dangerous_import"
+
+            # Test pickle-related detection
+            pickle_msg = "Suspicious pickle opcode REDUCE found"
+            assert client._sanitize_issue_type(pickle_msg) == "pickle_related"
+
+            # Test code execution detection
+            exec_msg = "eval() call detected in code"
+            assert client._sanitize_issue_type(exec_msg) == "code_execution_related"
+
+    def test_error_sanitization(self):
+        """Test that error messages are properly sanitized."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            # Test that paths are removed
+            error_with_path = "File not found: /home/user/secret/model.pkl"
+            sanitized = client._sanitize_error(error_with_path)
+            assert "/home/user" not in sanitized
+            assert "[PATH]" in sanitized
+
+            # Test that URLs are removed
+            error_with_url = "Failed to fetch https://api.example.com/models?key=secret"
+            sanitized = client._sanitize_error(error_with_url)
+            assert "api.example.com" not in sanitized
+            assert "[URL]" in sanitized
+
+            # Test truncation
+            long_error = "x" * 200
+            sanitized = client._sanitize_error(long_error)
+            assert len(sanitized) <= 100
 
 
 class TestPrivacyCompliance:

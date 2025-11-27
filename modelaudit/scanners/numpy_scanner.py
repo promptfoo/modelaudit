@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -81,7 +81,7 @@ class NumPyScanner(BaseScanner):
                     f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
-    def _validate_dtype(self, dtype) -> None:
+    def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
         dangerous_names = ["object"]
@@ -98,7 +98,7 @@ class NumPyScanner(BaseScanner):
                 f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
-    def _calculate_safe_array_size(self, shape: tuple, dtype) -> int:
+    def _calculate_safe_array_size(self, shape: tuple, dtype: Any) -> int:
         """Calculate array size with overflow protection"""
         total_elements = 1
         max_elements = sys.maxsize // max(dtype.itemsize, 1)
@@ -129,7 +129,7 @@ class NumPyScanner(BaseScanner):
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for scanning .npy files",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"numpy_version": NUMPY_VERSION},
             )
@@ -177,7 +177,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Magic String Validation",
                             passed=False,
                             message="Invalid NumPy file magic",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"expected": "\x93NUMPY", "found": magic.hex()},
                         )
@@ -212,7 +212,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Header Read",
                             passed=False,
                             message=f"Failed to read NumPy array header: {header_error}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
                         )
@@ -293,7 +293,7 @@ class NumPyScanner(BaseScanner):
                             name="File Integrity Check",
                             passed=False,
                             message="File size does not match header information",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "expected_size": expected_size,

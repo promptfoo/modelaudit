@@ -1,11 +1,11 @@
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.explanations import get_tf_op_explanation
-from modelaudit.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
-from modelaudit.utils.code_validation import (
+from modelaudit.config.explanations import get_tf_op_explanation
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
@@ -24,23 +24,31 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Try to import TensorFlow, but handle the case where it's not installed
-try:
-    import tensorflow as tf  # noqa: F401
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+# Defer TensorFlow availability check to avoid module-level imports
+HAS_TENSORFLOW: bool | None = None
 
-    HAS_TENSORFLOW = True
-    SavedModelType: type = SavedModel
-except ImportError:
-    HAS_TENSORFLOW = False
 
-    # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModel:  # type: ignore[no-redef]
-        """Placeholder for SavedModel when TensorFlow is not installed"""
+def _check_tensorflow() -> bool:
+    """Check if TensorFlow is available, with caching."""
+    global HAS_TENSORFLOW
+    if HAS_TENSORFLOW is None:
+        try:
+            import tensorflow as tf  # noqa: F401
 
-        meta_graphs: ClassVar[list] = []
+            HAS_TENSORFLOW = True
+        except ImportError:
+            HAS_TENSORFLOW = False
+    return HAS_TENSORFLOW
 
-    SavedModelType = SavedModel
+
+# Create a placeholder for type hints when TensorFlow is not available
+class SavedModel:  # type: ignore[no-redef]
+    """Placeholder for SavedModel when TensorFlow is not installed"""
+
+    meta_graphs: ClassVar[list] = []
+
+
+SavedModelType = SavedModel
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -50,7 +58,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     description = "Scans TensorFlow SavedModel for suspicious operations"
     supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_ops = set(self.config.get("suspicious_ops", SUSPICIOUS_OPS))
@@ -58,7 +66,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             return False
 
         if os.path.isfile(path):
@@ -85,13 +93,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.current_file_path = path
 
         # Check if TensorFlow is installed
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             result = self._create_result()
             result.add_check(
                 name="TensorFlow Library Check",
                 passed=False,
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "tensorflow"},
             )
@@ -133,11 +141,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
+            # Import the actual SavedModel from TensorFlow
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
             with open(path, "rb") as f:
                 content = f.read()
                 result.bytes_scanned = len(content)
 
-                saved_model = SavedModelType()
+                saved_model = SavedModel()
                 saved_model.ParseFromString(content)
                 for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(
@@ -556,7 +567,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     found_patterns.append(pattern)
 
                             if found_patterns:
-                                result.add_issue(
+                                result.add_check(
+                                    name="Lambda Layer Security Check",
+                                    passed=False,
                                     message=f"Lambda layer contains dangerous code: {', '.join(found_patterns)}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=path,
@@ -664,71 +677,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
 
-        # Check for protobuf schema validation bypasses
-        self._check_protobuf_schema_attacks(saved_model, result)
-
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
-
-        # Check for buffer overflow patterns
-        self._check_protobuf_buffer_overflow(saved_model, result)
-
-        # Check for large field counts (DoS via memory exhaustion)
-        self._check_protobuf_field_bomb(saved_model, result)
-
-    def _check_protobuf_schema_attacks(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf schema validation bypass attempts"""
-
-        for meta_graph in saved_model.meta_graphs:
-            # Check for unknown/unexpected fields in the meta graph
-            if hasattr(meta_graph, "ListFields"):
-                fields = meta_graph.ListFields()
-
-                # Look for fields with unusually large sizes
-                for field_desc, field_value in fields:
-                    if hasattr(field_value, "__len__"):
-                        try:
-                            field_size = len(field_value)
-                            # Check for abnormally large repeated fields
-                            if field_size > 10000:  # 10k threshold
-                                result.add_check(
-                                    name="Protobuf Field Size Check",
-                                    passed=False,
-                                    message=(
-                                        f"Abnormally large protobuf field '{field_desc.name}' "
-                                        f"with {field_size} elements"
-                                    ),
-                                    severity=IssueSeverity.WARNING,
-                                    location=self.current_file_path,
-                                    details={
-                                        "field_name": field_desc.name,
-                                        "field_size": field_size,
-                                        "size_threshold": 10000,
-                                        "potential_attack": "protobuf_field_bomb",
-                                    },
-                                )
-                        except (AttributeError, TypeError):
-                            continue
-
-            # Check the graph definition for schema bypass attempts
-            graph_def = meta_graph.graph_def
-
-            # Look for nodes with excessive attributes (potential DoS)
-            for node in graph_def.node:
-                if hasattr(node, "attr") and len(node.attr) > 1000:
-                    result.add_check(
-                        name="Protobuf Node Attribute Bomb Check",
-                        passed=False,
-                        message=f"Node '{node.name}' has excessive attributes ({len(node.attr)})",
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (node: {node.name})",
-                        details={
-                            "node_name": node.name,
-                            "attribute_count": len(node.attr),
-                            "threshold": 1000,
-                            "attack_type": "protobuf_attribute_bomb",
-                        },
-                    )
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
@@ -791,7 +741,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     name="Protobuf String Length Check",
                                     passed=False,
                                     message=f"Abnormally long string in node attribute (length: {len(string_val)})",
-                                    severity=IssueSeverity.WARNING,
+                                    severity=IssueSeverity.INFO,
                                     location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
                                     details={
                                         "node_name": node.name,
@@ -824,91 +774,3 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         },
                                     )
                                     break  # Only report first match per string to avoid spam
-
-    def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for potential buffer overflow patterns in protobuf data"""
-
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
-
-            # Check for nodes with extremely long names (potential buffer overflow)
-            for node in graph_def.node:
-                if len(node.name) > 2048:  # 2KB threshold for node names
-                    result.add_check(
-                        name="Protobuf Node Name Length Check",
-                        passed=False,
-                        message=(
-                            f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
-                        ),
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (node: {node.name[:100]}...)",
-                        details={
-                            "node_name_length": len(node.name),
-                            "name_threshold": 2048,
-                            "attack_type": "protobuf_buffer_overflow",
-                            "node_name_preview": node.name[:200],  # First 200 chars
-                        },
-                    )
-
-                # Check input names for excessive length
-                for input_name in node.input:
-                    if len(input_name) > 2048:
-                        result.add_check(
-                            name="Protobuf Input Name Length Check",
-                            passed=False,
-                            message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{self.current_file_path} (node: {node.name})",
-                            details={
-                                "node_name": node.name,
-                                "input_name_length": len(input_name),
-                                "name_threshold": 2048,
-                                "attack_type": "protobuf_buffer_overflow",
-                            },
-                        )
-
-    def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf field bombs (DoS via excessive fields)"""
-
-        total_nodes = 0
-        total_attrs = 0
-
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
-            meta_graph_nodes = len(graph_def.node)
-            total_nodes += meta_graph_nodes
-
-            # Count total attributes across all nodes
-            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
-            total_attrs += meta_graph_attrs
-
-            # Check for excessive nodes in single meta graph
-            if meta_graph_nodes > 50000:  # 50k nodes threshold
-                result.add_check(
-                    name="Protobuf Node Count Bomb Check",
-                    passed=False,
-                    message=f"Meta graph contains excessive nodes ({meta_graph_nodes:,}) - potential DoS attack",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={
-                        "node_count": meta_graph_nodes,
-                        "node_threshold": 50000,
-                        "attack_type": "protobuf_node_bomb",
-                    },
-                )
-
-        # Check total model complexity
-        if total_nodes > 100000:  # 100k total nodes
-            result.add_check(
-                name="Protobuf Total Complexity Check",
-                passed=False,
-                message=f"Model has excessive total complexity ({total_nodes:,} nodes, {total_attrs:,} attributes)",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={
-                    "total_nodes": total_nodes,
-                    "total_attributes": total_attrs,
-                    "node_threshold": 100000,
-                    "attack_type": "protobuf_complexity_bomb",
-                },
-            )

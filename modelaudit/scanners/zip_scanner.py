@@ -3,7 +3,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -30,7 +30,7 @@ class ZipScanner(BaseScanner):
     description = "Scans ZIP archive files and their contents recursively"
     supported_extensions: ClassVar[list[str]] = [".zip", ".npz"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
         self.max_entries = self.config.get(
@@ -90,7 +90,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
             )
@@ -101,7 +101,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Scan",
                 passed=False,
                 message=f"Error scanning zip file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -139,33 +139,6 @@ class ZipScanner(BaseScanner):
             )
 
         with zipfile.ZipFile(path, "r") as z:
-            # Check number of entries
-            entry_count = len(z.namelist())
-            if entry_count > self.max_entries:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=False,
-                    message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-                return result
-            else:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({entry_count}) is within limits",
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-
             # Scan each file in the archive
             for name in z.namelist():
                 info = z.getinfo(name)
@@ -190,7 +163,7 @@ class ZipScanner(BaseScanner):
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(
+                    _target_resolved, target_safe = sanitize_archive_path(
                         target,
                         target_base,
                     )

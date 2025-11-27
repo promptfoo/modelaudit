@@ -3,7 +3,7 @@
 import pickle
 import tempfile
 
-from modelaudit.explanations import (
+from modelaudit.config.explanations import (
     COMMON_MESSAGE_EXPLANATIONS,
     TF_OP_EXPLANATIONS,
     get_import_explanation,
@@ -21,7 +21,9 @@ def test_issue_with_why_field():
         message="Test security issue",
         severity=IssueSeverity.CRITICAL,
         location="test.pkl",
+        timestamp=0.0,
         why="This is dangerous because it can execute arbitrary code.",
+        type=None,
     )
 
     # Test that the why field is stored
@@ -39,6 +41,9 @@ def test_issue_without_why_field():
         message="Test security issue",
         severity=IssueSeverity.WARNING,
         location="test.pkl",
+        timestamp=0.0,
+        why=None,
+        type=None,
     )
 
     # Test that why field is None
@@ -111,7 +116,7 @@ def test_pickle_scanner_includes_why():
         assert len(system_issues) > 0
 
         # The explanation should mention system commands or operating system
-        assert any("system" in issue.why.lower() for issue in system_issues)
+        assert any("system" in (issue.why or "").lower() for issue in system_issues)
 
     finally:
         import os
@@ -181,7 +186,7 @@ def test_tf_op_explanation_function():
 
 def test_all_tf_operations_have_explanations():
     """Test that all TensorFlow operations in TF_OP_EXPLANATIONS have valid explanations."""
-    from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
+    from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS
 
     # Verify all SUSPICIOUS_OPS have explanations
     for op in SUSPICIOUS_OPS:
@@ -262,7 +267,7 @@ def test_tf_explanation_categories():
 
 def test_tf_explanation_unified_architecture():
     """Test that TensorFlow explanations use the unified get_explanation architecture."""
-    from modelaudit.explanations import get_explanation
+    from modelaudit.config.explanations import get_explanation
 
     # Test that get_tf_op_explanation uses get_explanation internally
     op_name = "PyFunc"
@@ -360,7 +365,7 @@ def test_scan_result_auto_explanation_integration():
     ]
 
     for message in test_messages:
-        result.add_issue(message, severity=IssueSeverity.WARNING)
+        result.add_check(name="Test Check", passed=False, message=message, severity=IssueSeverity.WARNING)
 
     # Check that the right issues got explanations
     issues_with_explanation = [issue for issue in result.issues if issue.why is not None]
@@ -379,8 +384,10 @@ def test_scan_result_explicit_why_overrides_auto():
     # Add an issue with a message that would normally get an auto-explanation,
     # but provide an explicit 'why' parameter
     explicit_why = "This is a custom explanation that should override the default"
-    result.add_issue(
-        "Maximum ZIP nesting depth exceeded",
+    result.add_check(
+        name="Test Check",
+        passed=False,
+        message="Maximum ZIP nesting depth exceeded",
         severity=IssueSeverity.WARNING,
         why=explicit_why,
     )
@@ -435,7 +442,9 @@ def test_common_message_explanations_security_focus():
 def test_message_explanation_serialization():
     """Test that issues with automatic explanations serialize correctly."""
     result = ScanResult("test_scanner")
-    result.add_issue("File too large: exceeds limit", severity=IssueSeverity.WARNING)
+    result.add_check(
+        name="Test Check", passed=False, message="File too large: exceeds limit", severity=IssueSeverity.WARNING
+    )
 
     # Test dictionary serialization
     result_dict = result.to_dict()
@@ -452,7 +461,7 @@ def test_message_explanation_serialization():
 
 def test_context_aware_explanations():
     """Test that explanations can be enhanced with context information."""
-    from modelaudit.explanations import get_message_explanation
+    from modelaudit.config.explanations import get_message_explanation
 
     # Test ML model context enhancement
     basic_explanation = get_message_explanation("Custom objects found")
@@ -477,7 +486,7 @@ def test_context_aware_explanations():
 def test_scan_result_context_integration():
     """Test that ScanResult passes scanner context for enhanced explanations."""
     result = ScanResult("pickle_scanner")
-    result.add_issue("Custom objects found in model")
+    result.add_check(name="Test Check", passed=False, message="Custom objects found in model")
 
     # Should get the enhanced pickle-specific explanation
     assert len(result.issues) == 1

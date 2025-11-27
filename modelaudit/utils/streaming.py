@@ -2,7 +2,7 @@
 
 import io
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import click
@@ -25,7 +25,7 @@ def stream_analyze_file(
     url: str,
     scanner: BaseScanner,
     max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
-) -> tuple[Optional[ScanResult], bool]:
+) -> tuple[ScanResult | None, bool]:
     """Stream analyze a file from cloud storage.
 
     After downloading a configurable chunk of bytes, this function attempts to
@@ -42,7 +42,8 @@ def stream_analyze_file(
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for streaming analysis. Install with 'pip install modelaudit[cloud]'"
+            "fsspec package is required for streaming analysis. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     fs_protocol = get_fs_protocol(url)
@@ -73,7 +74,7 @@ def stream_analyze_file(
         metadata: dict[str, Any] = {}
 
         # Try to use scanner's partial capabilities if available
-        scan_result: Optional[ScanResult] = None
+        scan_result: ScanResult | None = None
         try:
             temp_file.seek(0)
             scan_result = scanner.scan(temp_file)  # type: ignore[arg-type]
@@ -201,7 +202,7 @@ def stream_analyze_file(
         return None, False
 
 
-def get_streaming_preview(url: str, max_bytes: int = 1024) -> Optional[dict[str, Any]]:
+def get_streaming_preview(url: str, max_bytes: int = 1024) -> dict[str, Any] | None:
     """Get a preview of file contents for analysis."""
     try:
         import fsspec

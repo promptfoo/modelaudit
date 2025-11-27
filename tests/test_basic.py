@@ -116,7 +116,7 @@ def test_max_total_size(tmp_path):
     with file3.open("wb") as f:
         pickle.dump({"data": "z" * 100}, f)
 
-    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150)
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150, cache_enabled=False)
 
     assert results.success is True
 
@@ -185,10 +185,10 @@ def test_scan_result_class():
     result = ScanResult(scanner_name="test_scanner")
 
     # Add issues of different severities
-    result.add_issue("Debug message", severity=IssueSeverity.DEBUG)
-    result.add_issue("Info message", severity=IssueSeverity.INFO)
-    result.add_issue("Warning message", severity=IssueSeverity.WARNING)
-    result.add_issue("Error message", severity=IssueSeverity.CRITICAL)
+    result._add_issue("Debug message", severity=IssueSeverity.DEBUG)
+    result._add_issue("Info message", severity=IssueSeverity.INFO)
+    result._add_issue("Warning message", severity=IssueSeverity.WARNING)
+    result._add_issue("Error message", severity=IssueSeverity.CRITICAL)
 
     # Test issue count
     assert len(result.issues) == 4
@@ -222,11 +222,11 @@ def test_merge_scan_results():
     """Test merging scan results."""
     # Create two scan results
     result1 = ScanResult(scanner_name="scanner1")
-    result1.add_issue("Issue from scanner1")
+    result1._add_issue("Issue from scanner1")
     result1.bytes_scanned = 100
 
     result2 = ScanResult(scanner_name="scanner2")
-    result2.add_issue("Issue from scanner2")
+    result2._add_issue("Issue from scanner2")
     result2.bytes_scanned = 200
 
     # Merge result2 into result1

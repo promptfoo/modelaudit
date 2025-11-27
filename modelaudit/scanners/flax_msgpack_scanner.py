@@ -274,10 +274,10 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 for key, value in data.items():
                     count += count_parameters(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     count += count_parameters(value, f"{path}[{i}]")
-            elif isinstance(data, (bytes, bytearray)):
+            elif isinstance(data, bytes | bytearray):
                 # Estimate parameter count from byte arrays (assuming float32)
                 if len(data) >= 16 and len(data) % 4 == 0:
                     count += len(data) // 4
@@ -334,7 +334,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     check_jax_transforms(value, f"{path}[{i}]")
 
@@ -356,14 +356,14 @@ class FlaxMsgpackScanner(BaseScanner):
                     )
 
                 # Check for unusual shape specifications that might indicate attacks
-                if "shape" in data and isinstance(data["shape"], (list, tuple)):
+                if "shape" in data and isinstance(data["shape"], list | tuple):
                     shape = data["shape"]
                     if any(dim < 0 for dim in shape if isinstance(dim, int)):
                         result.add_check(
                             name="Tensor Shape Validation",
                             passed=False,
                             message="Invalid tensor shape with negative dimensions",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"shape": shape},
                         )
@@ -434,13 +434,13 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="Recursion Depth Check",
                 passed=False,
                 message=f"Maximum recursion depth exceeded: {depth}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=location,
                 details={"depth": depth, "max_allowed": self.max_recursion_depth},
             )
             return
 
-        if isinstance(value, (bytes, bytearray)):
+        if isinstance(value, bytes | bytearray):
             size = len(value)
             if size > self.max_blob_bytes:
                 result.add_check(
@@ -504,7 +504,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 self._analyze_content(v, f"{location}/{key_str}", result, depth + 1)
 
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             if len(value) > self.max_items_per_container:
                 result.add_check(
                     name="Array Size Check",
@@ -521,7 +521,7 @@ class FlaxMsgpackScanner(BaseScanner):
             for i, v in enumerate(value):
                 self._analyze_content(v, f"{location}[{i}]", result, depth + 1)
 
-        elif isinstance(value, (int, float)):
+        elif isinstance(value, int | float):
             # Check for suspicious numerical values that might indicate attacks
             if isinstance(value, int) and abs(value) > 2**63:
                 result.add_check(
@@ -556,12 +556,10 @@ class FlaxMsgpackScanner(BaseScanner):
             if isinstance(data, dict):
                 for key, value in data.items():
                     tensors.extend(collect_tensors(value, f"{path}/{key}" if path else key))
-            elif isinstance(data, (list, tuple)):
+            elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     tensors.extend(collect_tensors(value, f"{path}[{i}]"))
-            elif (
-                isinstance(data, (bytes, bytearray)) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0)
-            ):
+            elif isinstance(data, bytes | bytearray) and len(data) >= 16 and (len(data) % 4 == 0 or len(data) % 8 == 0):
                 # Check if binary data could be a serialized tensor
                 tensors.append(
                     {
@@ -761,7 +759,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="ML Model Pattern Validation",
                 passed=False,
                 message="Suspicious data structure - does not match known ML model patterns",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location="root",
                 details={
                     "analysis": ml_analysis,
@@ -821,7 +819,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="msgpack Library Check",
                 passed=False,
                 message="msgpack library not installed - cannot analyze Flax checkpoints",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "msgpack"},
             )
@@ -881,7 +879,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         name="Msgpack Format Validation",
                         passed=False,
                         message=f"Invalid msgpack format: {e!s}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"msgpack_error": str(e)},
                     )
@@ -912,7 +910,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="File Size Safety Check",
                 passed=False,
                 message="File too large to process safely - potential memory exhaustion attack",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
             )
             result.finish(success=False)

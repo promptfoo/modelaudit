@@ -132,24 +132,6 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
-            if len(members) > self.max_entries:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=False,
-                    message=f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"entries": len(members), "max_entries": self.max_entries},
-                )
-                return result
-            else:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({len(members)}) is within limits",
-                    location=path,
-                    details={"entries": len(members), "max_entries": self.max_entries},
-                )
 
             for member in members:
                 name = member.name
@@ -169,7 +151,7 @@ class TarScanner(BaseScanner):
                 if member.issym() or member.islnk():
                     target = member.linkname
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(target, target_base)
+                    _target_resolved, target_safe = sanitize_archive_path(target, target_base)
                     if not target_safe:
                         # Check if it's specifically a critical system path
                         if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):

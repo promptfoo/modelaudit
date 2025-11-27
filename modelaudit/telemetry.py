@@ -12,12 +12,13 @@ import logging
 import os
 import sys
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, TypeVar, Union, cast
+from typing import Any, TypeVar, Union, cast
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -166,8 +167,9 @@ class UserConfig:
     @property
     def telemetry_enabled(self) -> bool:
         """Check if telemetry is enabled for this user."""
-        # Default to FALSE - require explicit opt-in
-        enabled = self._config.get("telemetry_enabled", False)
+        # Default to TRUE - opt-out model for better analytics coverage
+        # Users can disable via env var or config file
+        enabled = self._config.get("telemetry_enabled", True)
         return bool(enabled)
 
     @telemetry_enabled.setter
@@ -210,7 +212,7 @@ class TelemetryClient:
         if os.getenv("IS_TESTING", "").lower() in ("1", "true", "yes"):
             return True
 
-        # Check user configuration - NOW DEFAULTS TO DISABLED (opt-in only)
+        # Check user configuration - defaults to enabled (opt-out model)
         return not self._user_config.telemetry_enabled
 
     def _identify_user(self) -> None:
@@ -266,7 +268,7 @@ class TelemetryClient:
         try:
             ka_payload = {
                 "profile_id": self._user_config.user_id,
-                "email": self._user_config.email,
+                "email": self._hash_email(self._user_config.email),
                 "events": [
                     {
                         "message_id": str(uuid.uuid4()),
@@ -300,7 +302,7 @@ class TelemetryClient:
             r_payload = {
                 "event": event,
                 "environment": os.getenv("NODE_ENV", "development"),
-                "email": self._user_config.email,
+                "email": self._hash_email(self._user_config.email),
                 "meta": {
                     "user_id": self._user_config.user_id,
                     **properties,
@@ -375,14 +377,14 @@ class TelemetryClient:
             },
         )
 
-    def record_scan_failed(self, duration: float, error: str) -> None:
+    def record_scan_failed(self, duration: float, error: Union[Exception, str]) -> None:
         """Record that a scan has failed."""
         self.record_event(
             TelemetryEvent.SCAN_FAILED,
             {
                 "duration": duration,
-                "error_type": type(error).__name__ if hasattr(error, "__class__") else "unknown",
-                "error_message": str(error)[:200],  # Limit error message length
+                "error_type": type(error).__name__ if isinstance(error, Exception) else "str",
+                "error_message": self._sanitize_error(error),
             },
         )
 
@@ -415,21 +417,21 @@ class TelemetryClient:
         self.record_event(
             TelemetryEvent.ISSUE_FOUND,
             {
-                "issue_type": issue_type,
+                "issue_type": self._sanitize_issue_type(issue_type),
                 "severity": severity,
                 "scanner": scanner,
             },
         )
 
-    def record_command_used(self, command: str, duration: float | None = None, **kwargs) -> None:
+    def record_command_used(self, command: str, duration: float | None = None, **kwargs: Any) -> None:
         """Record usage of a CLI command."""
-        properties = {"command": command, **kwargs}
+        properties: dict[str, Any] = {"command": command, **kwargs}
         if duration is not None:
             properties["duration"] = duration
 
         self.record_event(TelemetryEvent.COMMAND_USED, properties)
 
-    def record_feature_used(self, feature: str, **kwargs) -> None:
+    def record_feature_used(self, feature: str, **kwargs: Any) -> None:
         """Record usage of a specific feature."""
         self.record_event(TelemetryEvent.FEATURE_USED, {"feature": feature, **kwargs})
 
@@ -439,7 +441,7 @@ class TelemetryClient:
             TelemetryEvent.ERROR_OCCURRED,
             {
                 "error_type": type(error).__name__,
-                "error_message": str(error)[:200],
+                "error_message": self._sanitize_error(error),
                 "context": context,
             },
         )
@@ -535,6 +537,73 @@ class TelemetryClient:
         except Exception:
             return hashlib.sha256(url.encode()).hexdigest()[:16]
 
+    def _hash_email(self, email: str | None) -> str | None:
+        """Hash email for privacy - only send domain for analytics."""
+        if not email:
+            return None
+        try:
+            # Only keep the domain part, hash the local part
+            if "@" in email:
+                local, domain = email.rsplit("@", 1)
+                local_hash = hashlib.sha256(local.encode()).hexdigest()[:8]
+                return f"{local_hash}@{domain}"
+            return hashlib.sha256(email.encode()).hexdigest()[:16]
+        except Exception:
+            return None
+
+    def _sanitize_issue_type(self, message: str) -> str:
+        """Extract issue type from message, removing sensitive details."""
+        # Common issue type patterns - extract just the category
+        issue_patterns = [
+            "malicious_code",
+            "dangerous_import",
+            "pickle_exploit",
+            "code_execution",
+            "suspicious_opcode",
+            "unsafe_lambda",
+            "network_access",
+            "file_access",
+            "encoded_payload",
+            "blacklisted_model",
+            "weight_anomaly",
+            "metadata_issue",
+            "secret_exposure",
+            "path_traversal",
+            "compression_bomb",
+            "unsafe_deserialization",
+        ]
+        message_lower = message.lower()
+        for pattern in issue_patterns:
+            if pattern.replace("_", " ") in message_lower or pattern in message_lower:
+                return pattern
+        # If no pattern matches, return a generic category based on severity keywords
+        # Check more specific patterns FIRST (pickle before code since pickle opcode contains "code")
+        if any(kw in message_lower for kw in ["pickle", "opcode", "reduce"]):
+            return "pickle_related"
+        if any(kw in message_lower for kw in ["exec", "eval", "import", "code"]):
+            return "code_execution_related"
+        if any(kw in message_lower for kw in ["network", "url", "http"]):
+            return "network_related"
+        if any(kw in message_lower for kw in ["file", "path", "directory"]):
+            return "file_related"
+        return "other"
+
+    def _sanitize_error(self, error: Union[Exception, str]) -> str:
+        """Sanitize error message to remove sensitive information."""
+        import re
+
+        error_str = str(error)
+        # Remove URLs FIRST (before path matching can break them)
+        error_str = re.sub(r"https?://[^\s]+", "[URL]", error_str)
+        # Remove Windows-style paths
+        error_str = re.sub(r"[A-Za-z]:\\[\w.\\-]+", "[PATH]", error_str)
+        # Remove Unix-style paths (must come after URLs)
+        error_str = re.sub(r"/[\w./-]+", "[PATH]", error_str)
+        # Remove anything that looks like a token/key
+        error_str = re.sub(r"[A-Za-z0-9_-]{20,}", "[REDACTED]", error_str)
+        # Truncate to reasonable length
+        return error_str[:100]
+
     def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""
         severities: dict[str, int] = {}
@@ -595,7 +664,7 @@ def record_scan_completed(duration: float, results: dict[str, Any]) -> None:
 
 
 @safe_telemetry
-def record_scan_failed(duration: float, error: str) -> None:
+def record_scan_failed(duration: float, error: Union[Exception, str]) -> None:
     """Record that a scan has failed."""
     client = get_telemetry_client()
     if client is not None:
@@ -603,7 +672,7 @@ def record_scan_failed(duration: float, error: str) -> None:
 
 
 @safe_telemetry
-def record_command_used(command: str, duration: float | None = None, **kwargs) -> None:
+def record_command_used(command: str, duration: float | None = None, **kwargs: Any) -> None:
     """Record usage of a CLI command."""
     client = get_telemetry_client()
     if client is not None:
@@ -611,7 +680,7 @@ def record_command_used(command: str, duration: float | None = None, **kwargs) -
 
 
 @safe_telemetry
-def record_feature_used(feature: str, **kwargs) -> None:
+def record_feature_used(feature: str, **kwargs: Any) -> None:
     """Record usage of a specific feature."""
     client = get_telemetry_client()
     if client is not None:
