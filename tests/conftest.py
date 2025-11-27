@@ -376,8 +376,6 @@ def malicious_pickle_file(tmp_path):
 @pytest.fixture
 def mock_pytorch_zip(tmp_path):
     """Create a mock PyTorch ZIP model file."""
-    import zipfile
-
     path = tmp_path / "model.pt"
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("version", "3")

@@ -14,17 +14,21 @@ Usage:
 """
 
 import functools
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 
-def _make_requires_decorator(module_name: str, package_name: str | None = None):
+def _make_requires_decorator(
+    module_name: str, package_name: str | None = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Create a decorator that skips if a module is not installed."""
     display_name = package_name or module_name
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             pytest.importorskip(module_name)
             return func(*args, **kwargs)
 
@@ -46,12 +50,14 @@ requires_joblib = _make_requires_decorator("joblib")
 requires_dill = _make_requires_decorator("dill")
 
 
-def skip_if_slow(reason: str = "Test is slow"):
+def skip_if_slow(reason: str = "Test is slow") -> pytest.MarkDecorator:
     """Skip test in fast mode (when running with -m 'not slow')."""
     return pytest.mark.slow
 
 
-def skip_in_ci(reason: str = "Test not suitable for CI"):
+def skip_in_ci(
+    reason: str = "Test not suitable for CI",
+) -> Callable[[Callable[..., Any]], Callable[..., Any]] | pytest.MarkDecorator:
     """Skip test in CI environment."""
     import os
 

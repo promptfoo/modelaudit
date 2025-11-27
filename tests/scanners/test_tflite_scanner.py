@@ -55,15 +55,16 @@ def test_tflite_scanner_no_tflite_installed(tmp_path):
 def test_tflite_scanner_parsing_error(tmp_path):
     """Test scanner behavior with invalid tflite data."""
     path = tmp_path / "model.tflite"
+    # Scanner now checks for magic bytes first, so invalid data triggers that check
     path.write_bytes(b"invalid tflite data")
 
-    # Mock the tflite module to simulate parsing error
-    with patch("modelaudit.scanners.tflite_scanner.tflite") as mock_tflite:
-        mock_tflite.Model.GetRootAsModel.side_effect = Exception("parsing error")
-        scanner = TFLiteScanner()
-        result = scanner.scan(str(path))
-        assert not result.success
-        assert "Invalid TFLite file or parse error" in result.issues[0].message
+    scanner = TFLiteScanner()
+    result = scanner.scan(str(path))
+    assert not result.success
+    # Scanner checks magic bytes first, so invalid data will fail the magic check
+    assert any(
+        "TFLite magic bytes" in issue.message or "Invalid TFLite file" in issue.message for issue in result.issues
+    )
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
