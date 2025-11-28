@@ -3,7 +3,8 @@
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional  # noqa: UP035
+from collections.abc import Callable
+from typing import Any
 
 from .base import ProgressPhase, ProgressStats
 
@@ -86,7 +87,7 @@ class WebhookProgressHook(ProgressHook):
         self,
         name: str,
         webhook_url: str,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         timeout: float = 10.0,
         retry_attempts: int = 3,
         min_interval: float = 30.0,
@@ -225,7 +226,7 @@ class EmailProgressHook(ProgressHook):
         username: str,
         password: str,
         from_email: str,
-        to_emails: List[str],  # noqa: UP006
+        to_emails: list[str],
         use_tls: bool = True,
         send_on_start: bool = True,
         send_on_complete: bool = True,
@@ -267,7 +268,7 @@ class EmailProgressHook(ProgressHook):
         self.periodic_interval = periodic_interval
 
         self._last_periodic_email = 0.0
-        self._scan_start_time: Optional[float] = None
+        self._scan_start_time: float | None = None
 
     def _send_email(self, subject: str, body: str) -> bool:
         """Send email notification.
@@ -394,7 +395,7 @@ class SlackProgressHook(ProgressHook):
         self,
         name: str,
         webhook_url: str,
-        channel: Optional[str] = None,
+        channel: str | None = None,
         username: str = "ModelAudit",
         emoji: str = ":robot_face:",
         send_on_start: bool = True,
@@ -560,11 +561,11 @@ class CustomFunctionHook(ProgressHook):
     def __init__(
         self,
         name: str,
-        on_start_func: Optional[Callable[[ProgressStats], None]] = None,
-        on_progress_func: Optional[Callable[[ProgressStats], None]] = None,
-        on_phase_change_func: Optional[Callable[[ProgressPhase, ProgressPhase, ProgressStats], None]] = None,
-        on_complete_func: Optional[Callable[[ProgressStats], None]] = None,
-        on_error_func: Optional[Callable[[Exception, ProgressStats], None]] = None,
+        on_start_func: Callable[[ProgressStats], None] | None = None,
+        on_progress_func: Callable[[ProgressStats], None] | None = None,
+        on_phase_change_func: Callable[[ProgressPhase, ProgressPhase, ProgressStats], None] | None = None,
+        on_complete_func: Callable[[ProgressStats], None] | None = None,
+        on_error_func: Callable[[Exception, ProgressStats], None] | None = None,
     ):
         """Initialize custom function hook.
 
@@ -628,7 +629,7 @@ class CustomFunctionHook(ProgressHook):
 class ProgressHookManager:
     """Manager for progress hooks."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize progress hook manager."""
         self._hooks: dict[str, ProgressHook] = {}
 
@@ -656,7 +657,7 @@ class ProgressHookManager:
             return True
         return False
 
-    def get_hook(self, name: str) -> Optional[ProgressHook]:
+    def get_hook(self, name: str) -> ProgressHook | None:
         """Get a progress hook by name.
 
         Args:
@@ -667,7 +668,7 @@ class ProgressHookManager:
         """
         return self._hooks.get(name)
 
-    def list_hooks(self) -> List[str]:  # noqa: UP006
+    def list_hooks(self) -> list[str]:
         """List all hook names.
 
         Returns:

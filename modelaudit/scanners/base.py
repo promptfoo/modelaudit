@@ -7,11 +7,13 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, List, Optional  # noqa: UP035
+from typing import Any, ClassVar
 
-from ..context.unified_context import UnifiedMLContext
-from ..explanations import get_message_explanation
-from ..interrupt_handler import check_interrupted
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+from ..analysis.unified_context import UnifiedMLContext
+from ..config.explanations import get_message_explanation
+from ..utils.helpers.interrupt_handler import check_interrupted
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
@@ -48,93 +50,79 @@ class CheckStatus(Enum):
     SKIPPED = "skipped"  # Check was skipped
 
 
-class Check:
-    """Represents a single security check performed during scanning"""
+class Check(BaseModel):
+    """Pydantic model representing a single security check performed during scanning"""
 
-    def __init__(
-        self,
-        name: str,
-        status: CheckStatus,
-        message: str,
-        severity: Optional[IssueSeverity] = None,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-        rule_code: Optional[str] = None,
-    ):
-        self.name = name  # Name of the check performed
-        self.status = status  # Whether the check passed or failed
-        self.message = message  # Description of what was checked
-        self.severity = severity  # Severity (only for failed checks)
-        self.location = location  # File position, line number, etc.
-        self.details = details or {}
-        self.why = why  # Explanation (mainly for failed checks)
-        self.rule_code = rule_code  # Rule code for this check (e.g., S101)
-        self.timestamp = time.time()
+    model_config = ConfigDict(
+        validate_assignment=True,
+        extra="allow",  # Allow extra fields for extensibility
+    )
+
+    name: str = Field(..., description="Name of the check performed")
+    status: CheckStatus = Field(..., description="Whether the check passed or failed")
+    message: str = Field(..., description="Description of what was checked")
+    severity: IssueSeverity | None = Field(None, description="Severity (only for failed checks)")
+    location: str | None = Field(None, description="File position, line number, etc.")
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
+    why: str | None = Field(None, description="Explanation (mainly for failed checks)")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this check")
+    timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
+
+    @field_serializer("status")
+    def serialize_status(self, status: CheckStatus) -> str:
+        """Serialize status enum to string value"""
+        return status.value
+
+    @field_serializer("severity")
+    def serialize_severity(self, severity: IssueSeverity | None) -> str | None:
+        """Serialize severity enum to string value"""
+        return severity.value if severity else None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the check to a dictionary for serialization"""
-        result = {
-            "name": self.name,
-            "status": self.status.value,
-            "message": self.message,
-            "location": self.location,
-            "details": self.details,
-            "timestamp": self.timestamp,
-        }
-        if self.severity:
-            result["severity"] = self.severity.value
-        if self.why:
-            result["why"] = self.why
-        return result
+        """Convert the check to a dictionary for serialization (backward compatibility)"""
+        return self.model_dump(exclude_none=True, mode="json")
 
     def __str__(self) -> str:
         """String representation of the check"""
         status_symbol = "✓" if self.status == CheckStatus.PASSED else "✗"
         prefix = f"[{status_symbol}] {self.name}"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
 
 
-class Issue:
-    """Represents a single issue found during scanning"""
+class Issue(BaseModel):
+    """Pydantic model representing a single issue found during scanning"""
 
-    def __init__(
-        self,
-        message: str,
-        severity: IssueSeverity = IssueSeverity.WARNING,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-        rule_code: Optional[str] = None,
-    ):
-        self.message = message
-        self.severity = severity
-        self.location = location  # File position, line number, etc.
-        self.details = details or {}
-        self.why = why  # Explanation of why this is a security concern
-        self.rule_code = rule_code  # Rule code (e.g., "S101")
-        self.timestamp = time.time()
+    model_config = ConfigDict(
+        validate_assignment=True,
+        extra="allow",  # Allow extra fields for extensibility
+    )
+
+    message: str = Field(..., description="Description of the issue")
+    severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
+    location: str | None = Field(None, description="File position, line number, etc.")
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
+    why: str | None = Field(None, description="Explanation of why this is a security concern")
+    timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
+    type: str | None = Field(None, description="Type of issue for categorization")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this issue")
+
+    @field_serializer("severity")
+    def serialize_severity(self, severity: IssueSeverity) -> str:
+        """Serialize severity enum to string value"""
+        return severity.value
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the issue to a dictionary for serialization"""
-        result = {
-            "message": self.message,
-            "severity": self.severity.value,
-            "location": self.location,
-            "details": self.details,
-            "timestamp": self.timestamp,
-        }
-        if self.why:
-            result["why"] = self.why
-        if self.rule_code:
-            result["rule_code"] = self.rule_code
-        return result
+        """Convert the issue to a dictionary for serialization (backward compatibility)"""
+        return self.model_dump(exclude_none=True, mode="json")
 
     def __str__(self) -> str:
         """String representation of the issue"""
-        prefix = f"[{self.severity.value.upper()}]"
+        severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
+        prefix = f"[{severity_str.upper()}]"
         if self.rule_code:
             prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
@@ -145,12 +133,13 @@ class Issue:
 class ScanResult:
     """Collects and manages issues found during scanning"""
 
-    def __init__(self, scanner_name: str = "unknown"):
+    def __init__(self, scanner_name: str = "unknown", scanner: "BaseScanner | None" = None):
         self.scanner_name = scanner_name
-        self.issues: List[Issue] = []  # noqa: UP006
-        self.checks: List[Check] = []  # All checks performed (passed and failed)  # noqa: UP006
+        self.scanner = scanner  # Reference to the scanner for whitelist checks
+        self.issues: list[Issue] = []
+        self.checks: list[Check] = []  # All checks performed (passed and failed)
         self.start_time = time.time()
-        self.end_time: Optional[float] = None
+        self.end_time: float | None = None
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
@@ -160,51 +149,47 @@ class ScanResult:
         name: str,
         passed: bool,
         message: str,
-        severity: Optional[IssueSeverity] = None,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-        rule_code: Optional[str] = None,
+        severity: IssueSeverity | None = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
-        """Add a check result (passed or failed) with rule support"""
+        """Add a check result (passed or failed) with rule support and rule-based severity."""
         from ..config import get_config
         from ..rules import RuleRegistry, Severity
+
+        severity_map = {
+            Severity.CRITICAL: IssueSeverity.CRITICAL,
+            Severity.HIGH: IssueSeverity.CRITICAL,
+            Severity.MEDIUM: IssueSeverity.WARNING,
+            Severity.LOW: IssueSeverity.INFO,
+            Severity.INFO: IssueSeverity.INFO,
+        }
 
         # Auto-detect rule code if not provided
         if not rule_code and not passed:
             match = RuleRegistry.find_matching_rule(message)
             if match:
                 rule_code, rule = match
-                # Use rule's default severity if not specified
                 if severity is None:
-                    severity_map = {
-                        Severity.CRITICAL: IssueSeverity.CRITICAL,
-                        Severity.HIGH: IssueSeverity.CRITICAL,
-                        Severity.MEDIUM: IssueSeverity.WARNING,
-                        Severity.LOW: IssueSeverity.INFO,
-                        Severity.INFO: IssueSeverity.INFO,
-                    }
                     severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
 
-        # Check if rule is suppressed
         config = get_config()
+
+        # Check if rule is suppressed
         if rule_code and config.is_suppressed(rule_code, location):
             logger.debug(f"Suppressed {rule_code}: {message}")
             return
 
-        # Apply severity override from config
-        if rule_code and severity is not None:
+        # Apply severity override from config if available
+        if rule_code:
             config_rule = RuleRegistry.get_rule(rule_code)
             if config_rule:
                 configured_severity = config.get_severity(rule_code, config_rule.default_severity)
-                severity_map = {
-                    Severity.CRITICAL: IssueSeverity.CRITICAL,
-                    Severity.HIGH: IssueSeverity.CRITICAL,
-                    Severity.MEDIUM: IssueSeverity.WARNING,
-                    Severity.LOW: IssueSeverity.INFO,
-                    Severity.INFO: IssueSeverity.INFO,
-                }
-                severity = severity_map.get(configured_severity, severity)
+                mapped = severity_map.get(configured_severity)
+                if mapped is not None:
+                    severity = mapped
 
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
 
@@ -212,7 +197,22 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
-        check = Check(name, status, message, severity, location, details, why, rule_code)
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
+        check = Check(
+            name=name,
+            status=status,
+            message=message,
+            severity=severity,
+            location=location,
+            details=details or {},
+            why=why,
+            rule_code=rule_code,
+        )
         self.checks.append(check)
 
         # If the check failed, also add it as an issue for backward compatibility
@@ -221,7 +221,20 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
-            issue = Issue(message, severity, location, details, why, rule_code)
+
+            # Apply whitelist downgrading logic if scanner is available
+            if self.scanner:
+                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
+            issue = Issue(
+                message=message,
+                severity=severity,
+                location=location,
+                details=details or {},
+                why=why,
+                type=f"{self.scanner_name}_check",
+                rule_code=rule_code,
+            )
             self.issues.append(issue)
 
             log_level = (
@@ -238,77 +251,60 @@ class ScanResult:
             # Log successful checks at DEBUG level
             logger.debug(f"Check passed: {name} - {message}")
 
-    def add_issue(
+    def _add_issue(
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
-        location: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-        why: Optional[str] = None,
-        rule_code: Optional[str] = None,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
         """Add an issue to the result with rule support"""
         from ..config import get_config
         from ..rules import RuleRegistry, Severity
+
+        severity_map = {
+            Severity.CRITICAL: IssueSeverity.CRITICAL,
+            Severity.HIGH: IssueSeverity.CRITICAL,
+            Severity.MEDIUM: IssueSeverity.WARNING,
+            Severity.LOW: IssueSeverity.INFO,
+            Severity.INFO: IssueSeverity.INFO,
+        }
 
         # Auto-detect rule code if not provided
         if not rule_code:
             match = RuleRegistry.find_matching_rule(message)
             if match:
                 rule_code, rule = match
-                # Use rule's default severity if not specified explicitly
-                severity_map = {
-                    Severity.CRITICAL: IssueSeverity.CRITICAL,
-                    Severity.HIGH: IssueSeverity.CRITICAL,
-                    Severity.MEDIUM: IssueSeverity.WARNING,
-                    Severity.LOW: IssueSeverity.INFO,
-                    Severity.INFO: IssueSeverity.INFO,
-                }
-                # Only override if severity wasn't explicitly set
-                if severity == IssueSeverity.WARNING:  # Default value
-                    severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
+                if severity == IssueSeverity.WARNING:
+                    severity = severity_map.get(rule.default_severity, severity)
 
-        # Check if rule is suppressed
         config = get_config()
         if rule_code and config.is_suppressed(rule_code, location):
             logger.debug(f"Suppressed {rule_code}: {message}")
             return
 
-        # Apply severity override from config
         if rule_code:
             config_rule = RuleRegistry.get_rule(rule_code)
             if config_rule:
                 configured_severity = config.get_severity(rule_code, config_rule.default_severity)
-                severity_map = {
-                    Severity.CRITICAL: IssueSeverity.CRITICAL,
-                    Severity.HIGH: IssueSeverity.CRITICAL,
-                    Severity.MEDIUM: IssueSeverity.WARNING,
-                    Severity.LOW: IssueSeverity.INFO,
-                    Severity.INFO: IssueSeverity.INFO,
-                }
-                severity = severity_map.get(configured_severity, severity)
+                mapped = severity_map.get(configured_severity)
+                if mapped is not None:
+                    severity = mapped
 
         if why is None:
-            # Pass scanner name as context for more specific explanations
             why = get_message_explanation(message, context=self.scanner_name)
-        issue = Issue(message, severity, location, details, why, rule_code)
-        self.issues.append(issue)
 
-        # Also add as a failed check for consistency
-        check_name = details.get("check_name", "Security Check") if details else "Security Check"
-        check = Check(check_name, CheckStatus.FAILED, message, severity, location, details, why)
-        self.checks.append(check)
-
-        log_level = (
-            logging.CRITICAL
-            if severity == IssueSeverity.CRITICAL
-            else (
-                logging.WARNING
-                if severity == IssueSeverity.WARNING
-                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
-            )
+        issue = Issue(
+            message=message,
+            severity=severity,
+            location=location,
+            details=details or {},
+            why=why,
+            rule_code=rule_code,
         )
-        logger.log(log_level, str(issue))
+        self.issues.append(issue)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -346,6 +342,14 @@ class ScanResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
+        # Only count WARNING and CRITICAL severity checks as failures
+        # INFO and DEBUG are informational - they should not count as failures
+        failed_checks_count = sum(
+            1
+            for c in self.checks
+            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        )
+
         return {
             "scanner": self.scanner_name,
             "success": self.success,
@@ -358,7 +362,7 @@ class ScanResult:
             "has_warnings": self.has_warnings,
             "total_checks": len(self.checks),
             "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
-            "failed_checks": sum(1 for c in self.checks if c.status == CheckStatus.FAILED),
+            "failed_checks": failed_checks_count,
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -398,9 +402,9 @@ class BaseScanner(ABC):
 
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
-    supported_extensions: ClassVar[List[str]] = []  # noqa: UP006
+    supported_extensions: ClassVar[list[str]] = []
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
         self.config = config or {}
         self.timeout = self.config.get("timeout", 3600)  # Default 1 hour for large models
@@ -413,13 +417,87 @@ class BaseScanner(ABC):
             "max_file_read_size",
             0,
         )  # Default unlimited
-        self._path_validation_result: Optional[ScanResult] = None
-        self.context: Optional[UnifiedMLContext] = None  # Will be initialized when scanning a file
-        self.scan_start_time: Optional[float] = None  # Track scan start time for timeout
+        self._path_validation_result: ScanResult | None = None
+        self.context: UnifiedMLContext | None = None  # Will be initialized when scanning a file
+        self.scan_start_time: float | None = None  # Track scan start time for timeout
 
         # Progress tracking setup
-        self.progress_tracker: Optional[Any] = None
+        self.progress_tracker: Any | None = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
+
+    def _get_bool_config(self, key: str, default: bool = True) -> bool:
+        """
+        Helper method to parse boolean configuration values with flexible input handling.
+
+        Args:
+            key: Configuration key to retrieve
+            default: Default value if key is not found
+
+        Returns:
+            Boolean value parsed from config, with string values like "false", "0", "no", "off"
+            being treated as False
+        """
+        val = self.config.get(key, default)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() not in {"false", "0", "no", "off"}
+        return bool(val)
+
+    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+        """
+        Check if the whitelist should be applied to downgrade an issue's severity.
+
+        Args:
+            severity: The original severity of the issue
+
+        Returns:
+            True if the issue should be downgraded to INFO, False otherwise
+        """
+        # Only downgrade severities higher than INFO
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        # Check if whitelist is enabled (default: True)
+        use_whitelist = self._get_bool_config("use_hf_whitelist", default=True)
+        if not use_whitelist:
+            return False
+
+        # Check if we have a model ID and it's whitelisted
+        if self.context and self.context.model_id:
+            from modelaudit.whitelists import is_whitelisted_model
+
+            return is_whitelisted_model(self.context.model_id)
+
+        return False
+
+    def _apply_whitelist_downgrade(
+        self,
+        severity: IssueSeverity,
+        details: dict[str, Any] | None,
+    ) -> tuple[IssueSeverity, dict[str, Any]]:
+        """
+        Apply whitelist downgrading logic to severity and details.
+
+        Args:
+            severity: The original severity
+            details: The details dictionary (may be None)
+
+        Returns:
+            Tuple of (potentially modified severity, details dict)
+        """
+        original_severity = severity
+        if self._should_apply_whitelist(severity):
+            severity = IssueSeverity.INFO
+            # Add note about whitelisting to the details
+            if details is None:
+                details = {}
+            details["whitelist_downgrade"] = True
+            details["original_severity"] = original_severity.name
+        elif details is None:
+            details = {}
+
+        return severity, details
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -434,18 +512,52 @@ class BaseScanner(ABC):
         """Scan the model file or directory at the given path"""
         pass
 
+    def scan_with_cache(self, path: str) -> ScanResult:
+        """
+        Scan with optional caching support.
+
+        This method provides caching capabilities for individual scanners.
+        Uses the unified cache decorator to eliminate duplicate caching logic.
+
+        Args:
+            path: Path to the file to scan
+
+        Returns:
+            ScanResult object (either from cache or fresh scan)
+        """
+        from ..utils.helpers.cache_decorator import cached_scan
+
+        # Create cached version of the scan method
+        @cached_scan()
+        def cached_scan_method(scanner_self: "BaseScanner", file_path: str) -> ScanResult:
+            return scanner_self.scan(file_path)
+
+        return cached_scan_method(self, path)
+
     def _initialize_context(self, path: str) -> None:
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
+        from modelaudit.utils.huggingface import extract_model_id_from_path
+
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
-        self.context = UnifiedMLContext(file_path=path_obj, file_size=file_size, file_type=file_type)
+
+        # Extract model ID if this is from HuggingFace or contains metadata
+        model_id, model_source = extract_model_id_from_path(path)
+
+        self.context = UnifiedMLContext(
+            file_path=path_obj,
+            file_size=file_size,
+            file_type=file_type,
+            model_id=model_id,
+            model_source=model_source,
+        )
 
     def _create_result(self) -> ScanResult:
         """Create a new ScanResult instance for this scanner"""
-        result = ScanResult(scanner_name=self.name)
+        result = ScanResult(scanner_name=self.name, scanner=self)
 
         # Automatically merge any stored path validation warnings
         if hasattr(self, "_path_validation_result") and self._path_validation_result:
@@ -505,8 +617,13 @@ class BaseScanner(ABC):
             total_bytes: Total bytes in the file
         """
         percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
-        result.add_issue(
-            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+        result.add_check(
+            name="Scan Timeout Check",
+            passed=False,
+            message=(
+                f"Scan incomplete: Timeout after scanning {bytes_scanned:,} "
+                f"of {total_bytes:,} bytes ({percentage:.1f}%)"
+            ),
             severity=IssueSeverity.WARNING,
             location=self.current_file_path,
             details={
@@ -565,7 +682,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.secrets_detector import SecretsDetector
+            from modelaudit.detectors.secrets import SecretsDetector
 
             detector = SecretsDetector(self.config.get("secrets_config"))
             findings = detector.scan_model_weights(data, context)
@@ -608,6 +725,124 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for embedded secrets: {e}")
             return 0
 
+    def collect_jit_script_findings(
+        self,
+        data: bytes,
+        model_type: str = "unknown",
+        context: str = "",
+        enable_check: bool = True,
+    ) -> list[dict]:
+        """Collect JIT/script code findings without creating checks.
+
+        Args:
+            data: Binary model data to check
+            model_type: Type of model (pytorch, tensorflow, etc.)
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            List of findings
+        """
+        if not enable_check or not self.config.get("check_jit_script", True):
+            return []
+
+        try:
+            from modelaudit.detectors.jit_script import JITScriptDetector
+
+            detector = JITScriptDetector(self.config.get("jit_script_config"))
+            findings = detector.scan_model(data, model_type, context)
+
+            # Convert findings to dict format for consistency
+            standardized_findings = []
+            for finding in findings:
+                if hasattr(finding, "model_dump"):
+                    standardized_findings.append(finding.model_dump())
+                elif hasattr(finding, "get"):
+                    standardized_findings.append(dict(finding))
+                else:
+                    standardized_findings.append(
+                        finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+                    )
+
+            return standardized_findings
+
+        except ImportError:
+            logger.debug("JITScriptDetector not available, skipping JIT/Script check")
+            return []
+        except Exception as e:
+            logger.warning(f"Error checking for JIT/Script code: {e}")
+            return []
+
+    def summarize_jit_script_findings(
+        self,
+        findings: list[dict],
+        result: ScanResult,
+        context: str = "",
+    ) -> None:
+        """Create a single aggregated check from JIT/script findings.
+
+        Args:
+            findings: List of findings to summarize
+            result: ScanResult to add the summary check to
+            context: Context string for reporting
+        """
+        if findings:
+            # Map severity to IssueSeverity enum
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
+                "INFO": IssueSeverity.INFO,
+            }
+
+            # Get highest severity across all findings
+            max_severity = IssueSeverity.INFO
+            for finding in findings:
+                finding_severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                if (finding_severity.value == "critical" and max_severity.value != "critical") or (
+                    finding_severity.value == "warning" and max_severity.value == "info"
+                ):
+                    max_severity = finding_severity
+
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
+            result.add_check(
+                name="JIT/Script Code Execution Summary",
+                passed=False,
+                message=f"Found {len(findings)} JIT/Script code risks across file",
+                severity=max_severity,
+                location=context,
+                details={
+                    "findings_count": len(findings),
+                    "findings": sanitized_findings,  # Redacted examples
+                    "total_findings": len(findings),
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
+                why="JIT/Script code patterns can execute arbitrary code during model loading",
+            )
+        else:
+            result.add_check(
+                name="JIT/Script Code Execution Summary",
+                passed=True,
+                message="No JIT/Script code execution risks detected",
+                location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
+            )
+
     def check_for_jit_script_code(
         self,
         data: bytes,
@@ -632,7 +867,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.jit_script_detector import JITScriptDetector
+            from modelaudit.detectors.jit_script import JITScriptDetector
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
@@ -643,17 +878,40 @@ class BaseScanner(ABC):
                     "WARNING": IssueSeverity.WARNING,
                     "INFO": IssueSeverity.INFO,
                 }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                # Handle both dict and Pydantic model findings
+                if hasattr(finding, "model_dump"):
+                    # Pydantic model (JITScriptFinding)
+                    severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
+                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                    message = finding.message
+                    location = finding.context
+                    recommendation = finding.recommendation or "Review JIT/Script code for security"
+                    details = finding.model_dump()
+                elif hasattr(finding, "get"):
+                    # Dict format (backward compatibility)
+                    severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                    message = finding.get("message", "JIT/Script code risk detected")
+                    location = finding.get("context", context)
+                    recommendation = finding.get("recommendation", "Review JIT/Script code for security")
+                    details = dict(finding)  # Ensure it's a dict
+                else:
+                    # Object with attributes but not Pydantic
+                    severity_value = getattr(finding, "severity", "WARNING")
+                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                    message = getattr(finding, "message", "JIT/Script code risk detected")
+                    location = getattr(finding, "context", context)
+                    recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
+                    details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
 
                 result.add_check(
                     name="JIT/Script Code Execution Detection",
                     passed=False,
-                    message=finding.get("message", "JIT/Script code risk detected"),
+                    message=message,
                     rule_code="S507",
                     severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why=finding.get("recommendation", "Review JIT/Script code for security"),
+                    location=location,
+                    details=details,
+                    why=recommendation,
                 )
 
             # Add a passing check if no risks were found
@@ -674,6 +932,122 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
+
+    def collect_network_communication_findings(
+        self,
+        data: bytes,
+        context: str = "",
+        enable_check: bool = True,
+    ) -> list[dict]:
+        """Collect network communication findings without creating checks.
+
+        Args:
+            data: Binary model data to check
+            context: Context string for reporting
+            enable_check: Whether to perform the check (allows disabling)
+
+        Returns:
+            List of findings
+        """
+        if not enable_check or not self.config.get("check_network_comm", True):
+            return []
+
+        try:
+            from modelaudit.detectors.network_comm import NetworkCommDetector
+
+            detector = NetworkCommDetector(self.config.get("network_comm_config"))
+            findings = detector.scan(data, context)
+            return findings
+
+        except ImportError:
+            logger.debug("NetworkCommDetector not available, skipping network comm check")
+            return []
+        except Exception as e:
+            logger.warning(f"Error checking for network communication: {e}")
+            return []
+
+    def summarize_network_communication_findings(
+        self,
+        findings: list[dict],
+        result: ScanResult,
+        context: str = "",
+    ) -> None:
+        """Create a single aggregated check from network communication findings.
+
+        Args:
+            findings: List of findings to summarize
+            result: ScanResult to add the summary check to
+            context: Context string for reporting
+        """
+        if findings:
+            # Downgrade URL detections to INFO severity since URLs in model data
+            # (vocabularies, training text) are not active security threats
+            severity_map = {
+                "CRITICAL": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "HIGH": IssueSeverity.INFO,  # Downgraded from CRITICAL
+                "MEDIUM": IssueSeverity.INFO,  # Downgraded from WARNING
+                "LOW": IssueSeverity.INFO,
+            }
+
+            # All URL detections now use INFO severity
+            max_severity = IssueSeverity.INFO
+            for finding in findings:
+                finding_severity = severity_map.get(finding.get("severity", "INFO"), IssueSeverity.INFO)
+                # All findings are now INFO level
+                max_severity = finding_severity
+
+            # Extract unique patterns for the message
+            unique_patterns: set[str] = set()
+            for finding in findings[:10]:  # Check first 10 findings for patterns
+                # Check multiple fields for pattern information
+                # Exclude 'matched_text' to reduce PII leakage
+                for field in ["pattern", "domain", "url", "message"]:
+                    pattern = str(finding.get(field, "") or "").strip()
+                    if pattern and len(pattern) < 50:
+                        # Add short, meaningful patterns (avoid very long strings)
+                        unique_patterns.add(pattern)
+
+            # Sanitize example findings to reduce PII/oversized fields
+            sanitized_findings: list[dict] = []
+            for f in findings[:10]:
+                try:
+                    d = dict(f)
+                except Exception:
+                    d = {"value": str(f)}
+                d.pop("matched_text", None)
+                for k, v in list(d.items()):
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = v[:200] + "..."
+                sanitized_findings.append(d)
+
+            pattern_summary = ", ".join(sorted(unique_patterns)[:5]) if unique_patterns else "various patterns"
+            result.add_check(
+                name="Network Communication Summary",
+                passed=False,
+                message=f"Found {len(findings)} network communication patterns ({pattern_summary}) across file",
+                severity=max_severity,
+                location=context,
+                details={
+                    "findings_count": len(findings),
+                    "findings": sanitized_findings,  # Redacted examples
+                    "total_findings": len(findings),
+                    "patterns": sorted(unique_patterns)[:10],
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
+                why="Models should not contain network communication capabilities",
+            )
+        else:
+            result.add_check(
+                name="Network Communication Summary",
+                passed=True,
+                message="No network communication patterns detected",
+                location=context,
+                details={
+                    "aggregated": True,
+                    "aggregation_type": "summary",
+                },
+            )
 
     def check_for_network_communication(
         self,
@@ -697,7 +1071,7 @@ class BaseScanner(ABC):
             return 0
 
         try:
-            from modelaudit.network_comm_detector import NetworkCommDetector
+            from modelaudit.detectors.network_comm import NetworkCommDetector
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
@@ -741,7 +1115,7 @@ class BaseScanner(ABC):
             logger.warning(f"Error checking for network communication: {e}")
             return 0
 
-    def _check_path(self, path: str) -> Optional[ScanResult]:
+    def _check_path(self, path: str) -> ScanResult | None:
         """Common path checks and validation
 
         Returns:
@@ -794,7 +1168,7 @@ class BaseScanner(ABC):
         # Validate file type consistency for files (security check)
         if os.path.isfile(path):
             try:
-                from modelaudit.utils.filetype import (
+                from modelaudit.utils.file.detection import (
                     detect_file_format_from_magic,
                     detect_format_from_extension,
                     validate_file_type,
@@ -811,7 +1185,7 @@ class BaseScanner(ABC):
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
                         ),
-                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        severity=IssueSeverity.INFO,  # Informational - format mismatch not necessarily a security issue
                         location=path,
                         details={
                             "header_format": header_format,
@@ -890,7 +1264,7 @@ class BaseScanner(ABC):
 
         return hashes
 
-    def _check_size_limit(self, path: str) -> Optional[ScanResult]:
+    def _check_size_limit(self, path: str) -> ScanResult | None:
         """Check if the file exceeds the configured size limit."""
         file_size = self.get_file_size(path)
 
@@ -917,7 +1291,7 @@ class BaseScanner(ABC):
 
         if self.max_file_read_size and self.max_file_read_size > 0:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
             self._path_validation_result.add_check(
                 name="File Size Limit",
@@ -931,7 +1305,7 @@ class BaseScanner(ABC):
             )
         else:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
 
         return None
@@ -1055,7 +1429,7 @@ class BaseScanner(ABC):
             self._report_progress_error(e)
             raise
 
-    def get_progress_stats(self):
+    def get_progress_stats(self) -> dict[str, Any] | None:
         """Get current progress statistics."""
         if self.progress_tracker:
             return self.progress_tracker.get_stats()

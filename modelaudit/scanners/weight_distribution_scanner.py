@@ -1,33 +1,8 @@
 import os
 import zipfile
-from typing import Any, ClassVar, Optional
-
-import numpy as np
-from scipy import stats
+from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
-
-# Try to import format-specific libraries
-try:
-    import h5py
-
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
-
-try:
-    import torch
-
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-
-try:
-    import tensorflow as tf
-
-    HAS_TENSORFLOW = True
-except ImportError:
-    HAS_TENSORFLOW = False
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -43,10 +18,10 @@ class WeightDistributionScanner(BaseScanner):
         ".hdf5",
         ".pb",
         ".onnx",
-        ".safetensors",
+        # Note: .safetensors removed - handled exclusively by SafeTensorsScanner
     ]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Configuration parameters
         self.z_score_threshold = self.config.get("z_score_threshold", 3.0)
@@ -69,7 +44,13 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
-            return HAS_TENSORFLOW and os.path.exists(os.path.join(path, "saved_model.pb"))
+            try:
+                import tensorflow as tf
+
+                has_tensorflow = True
+            except ImportError:
+                has_tensorflow = False
+            return has_tensorflow and os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False
@@ -78,12 +59,29 @@ class WeightDistributionScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
+        # Skip weight distribution analysis for SafeTensors files
+        # SafeTensors are inherently safe and can only contain tensor data
+        # The SafeTensorsScanner already validates structure and metadata
+        if ext == ".safetensors":
+            return False
+
         # Check if we have the necessary libraries for the format
-        if ext in [".pt", ".pth"] and not HAS_TORCH:
-            return False
-        if ext in [".h5", ".keras", ".hdf5"] and not HAS_H5PY:
-            return False
-        return not (ext == ".pb" and not HAS_TENSORFLOW)
+        if ext in [".pt", ".pth"]:
+            try:
+                import torch  # noqa: F401
+            except ImportError:
+                return False
+        if ext in [".h5", ".keras", ".hdf5"]:
+            try:
+                import h5py  # noqa: F401
+            except ImportError:
+                return False
+        if ext == ".pb":
+            try:
+                import tensorflow as tf  # noqa: F401
+            except ImportError:
+                return False
+        return True
 
     def scan(self, path: str) -> ScanResult:
         """Scan a model file for weight distribution anomalies"""
@@ -185,15 +183,18 @@ class WeightDistributionScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    def _extract_pytorch_weights(self, path: str) -> dict[str, np.ndarray]:
+    def _extract_pytorch_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from PyTorch model files"""
-        if not HAS_TORCH:
+        try:
+            import numpy as np
+            import torch
+        except ImportError:
             return {}
 
         # Reset safety flag for each extraction
         self.extraction_unsafe = False
 
-        weights_info: dict[str, np.ndarray] = {}
+        weights_info: dict[str, Any] = {}
 
         try:
             # Load model with map_location to CPU to avoid GPU requirements
@@ -295,12 +296,15 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_keras_weights(self, path: str) -> dict[str, np.ndarray]:
+    def _extract_keras_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from Keras/TensorFlow H5 model files"""
-        if not HAS_H5PY:
+        try:
+            import h5py
+            import numpy as np
+        except ImportError:
             return {}
 
-        weights_info: dict[str, np.ndarray] = {}
+        weights_info: dict[str, Any] = {}
 
         try:
             with h5py.File(path, "r") as f:
@@ -316,12 +320,15 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_tensorflow_weights(self, path: str) -> dict[str, np.ndarray]:
+    def _extract_tensorflow_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from TensorFlow SavedModel files"""
-        if not HAS_TENSORFLOW:
+        try:
+            import numpy as np
+            import tensorflow as tf
+        except ImportError:
             return {}
 
-        weights_info: dict[str, np.ndarray] = {}
+        weights_info: dict[str, Any] = {}
 
         try:
             if os.path.isdir(path):
@@ -370,27 +377,22 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_onnx_weights(self, path: str) -> dict[str, np.ndarray]:
+    def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from ONNX model files"""
         try:
             import onnx
-
-            HAS_ONNX = True
         except ImportError:
-            HAS_ONNX = False
-
-        if not HAS_ONNX:
             return {}
 
-        weights_info: dict[str, np.ndarray] = {}
+        weights_info: dict[str, Any] = {}
 
         try:
-            model = onnx.load(path)
+            model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
 
             # Extract initializers (weights)
             for initializer in model.graph.initializer:
                 if "weight" in initializer.name.lower():
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(
+                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )
 
@@ -399,22 +401,17 @@ class WeightDistributionScanner(BaseScanner):
 
         return weights_info
 
-    def _extract_safetensors_weights(self, path: str) -> dict[str, np.ndarray]:
+    def _extract_safetensors_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from SafeTensors files"""
         try:
             from safetensors import safe_open
-
-            HAS_SAFETENSORS = True
         except ImportError:
-            HAS_SAFETENSORS = False
-
-        if not HAS_SAFETENSORS:
             return {}
 
-        weights_info: dict[str, np.ndarray] = {}
+        weights_info: dict[str, Any] = {}
 
         try:
-            with safe_open(path, framework="numpy") as f:
+            with safe_open(path, framework="numpy") as f:  # type: ignore[possibly-unresolved-reference]
                 for key in f:
                     if "weight" in key.lower():
                         weights_info[key] = f.get_tensor(key)
@@ -426,7 +423,7 @@ class WeightDistributionScanner(BaseScanner):
 
     def _analyze_weight_distributions(
         self,
-        weights_info: dict[str, np.ndarray],
+        weights_info: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Analyze weight distributions for anomalies"""
         anomalies = []
@@ -467,7 +464,7 @@ class WeightDistributionScanner(BaseScanner):
 
         return anomalies
 
-    def _analyze_architecture_properties(self, weights_info: dict[str, np.ndarray]) -> dict[str, Any]:
+    def _analyze_architecture_properties(self, weights_info: dict[str, Any]) -> dict[str, Any]:
         """
         Analyze the mathematical and architectural properties to determine model characteristics.
         Uses structural analysis rather than name-based detection to avoid security bypasses.
@@ -585,10 +582,17 @@ class WeightDistributionScanner(BaseScanner):
     def _analyze_layer_weights(
         self,
         layer_name: str,
-        weights: np.ndarray,
+        weights: Any,
         architecture_analysis: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Analyze a single layer's weights for anomalies using pre-computed architectural analysis"""
+        try:
+            import numpy as np
+            from scipy import stats
+        except ImportError:
+            # Skip analysis if numpy/scipy not available
+            return []
+
         anomalies: list[dict[str, Any]] = []
 
         # Weights shape is typically (input_features, output_features) for dense layers

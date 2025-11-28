@@ -10,15 +10,15 @@
 2. **Auto-Detection**: Messages are matched to rules via regex patterns
 3. **Configuration**: Rules can be suppressed or severity adjusted via `.modelaudit.toml`
 
-## ⚠️ Critical Limitations
+## Current Limitations
 
-1. **No Explicit Codes**: Scanners don't explicitly set rule codes
-2. **Pattern Mismatches**: Many messages don't match any rule pattern
-3. **Incomplete Coverage**: Only ~20% of actual security checks have rule codes
+1. Some scanners still rely on message-based auto-detection for edge cases.
+2. Rule taxonomy and severities are being tuned; defaults may change.
+3. A small number of checks may still lack codes; please file issues with examples.
 
 ## All Security Rules (105 Total)
 
-### S100-S199: Code Execution & Imports
+### S100–S199: Module/Import Security
 
 | Code | Severity | Name                     | Pattern                       | Status     |
 | ---- | -------- | ------------------------ | ----------------------------- | ---------- |
@@ -33,7 +33,7 @@
 | S109 | CRITICAL | webbrowser module usage  | `import webbrowser`           | ⚠️ Partial |
 | S110 | HIGH     | ctypes module usage      | `import ctypes`               | ⚠️ Partial |
 
-### S200-S299: Pickle & Deserialization
+### S200–S299: Execution/Code Injection
 
 | Code | Severity | Name                 | Pattern                            | Status     |
 | ---- | -------- | -------------------- | ---------------------------------- | ---------- |
@@ -48,7 +48,7 @@
 | S209 | MEDIUM   | Pickle SETITEM       | `SETITEM`                          | ⚠️ Partial |
 | S210 | MEDIUM   | Pickle SETITEMS      | `SETITEMS`                         | ⚠️ Partial |
 
-### S300-S399: Network & Communication
+### S300–S399: Serialization/Deserialization
 
 | Code | Severity | Name                  | Pattern                     | Status        |
 | ---- | -------- | --------------------- | --------------------------- | ------------- |
@@ -63,7 +63,7 @@
 | S309 | LOW      | Hardcoded URLs        | `https://`, `http://`       | ❌ No matches |
 | S310 | HIGH     | Data exfiltration     | `send.*data`, `upload`      | ❌ No matches |
 
-### S400-S499: File System Operations
+### S400–S499: File System/Archive Security
 
 | Code | Severity | Name                | Pattern                 | Status        |
 | ---- | -------- | ------------------- | ----------------------- | ------------- |
@@ -78,7 +78,7 @@
 | S409 | MEDIUM   | Home dir access     | `~/`, `home/`           | ❌ No matches |
 | S410 | HIGH     | Archive bomb        | `zip.*bomb`             | ⚠️ Partial    |
 
-### S500-S599: Embedded Code & Executables
+### S500–S599: Cryptography/Keys
 
 | Code | Severity | Name                  | Pattern                        | Status        |
 | ---- | -------- | --------------------- | ------------------------------ | ------------- |
@@ -93,7 +93,7 @@
 | S509 | HIGH     | WebAssembly           | `.wasm`, `WebAssembly`         | ❌ No matches |
 | S510 | MEDIUM   | JIT/TorchScript       | `TorchScript`, `torch.jit`     | ❌ No matches |
 
-### S600-S699: Encoding & Obfuscation
+### S600–S699: Data/Model Integrity
 
 | Code | Severity | Name            | Pattern                  | Status        |
 | ---- | -------- | --------------- | ------------------------ | ------------- |
@@ -105,7 +105,7 @@
 | S606 | LOW      | ROT13/Caesar    | `rot13`, `caesar`        | ❌ No matches |
 | S607 | MEDIUM   | XOR obfuscation | `xor.*encrypt`           | ❌ No matches |
 
-### S700-S799: Secrets & Credentials
+### S700–S799: Model-Specific Vulnerabilities
 
 | Code | Severity | Name              | Pattern                             | Status        |
 | ---- | -------- | ----------------- | ----------------------------------- | ------------- |
@@ -120,7 +120,7 @@
 | S709 | LOW      | Webhook URL       | `webhook`, `hook.*url`              | ❌ No matches |
 | S710 | LOW      | High entropy      | `entropy.*high`                     | ⚠️ Partial    |
 
-### S800-S899: Model Architecture & Weights
+### S800–S899: Cloud/Remote Operations
 
 | Code | Severity | Name                 | Pattern                | Status        |
 | ---- | -------- | -------------------- | ---------------------- | ------------- |
@@ -135,7 +135,7 @@
 | S809 | LOW      | Custom activations   | `custom.*activation`   | ❌ No matches |
 | S810 | MEDIUM   | Layers with code     | `lambda.*layer`        | ❌ No matches |
 
-### S900-S999: File Integrity
+### S900–S999: Structural/Format Issues
 
 | Code | Severity | Name                | Pattern                | Status        |
 | ---- | -------- | ------------------- | ---------------------- | ------------- |
@@ -148,7 +148,7 @@
 | S907 | MEDIUM   | Multiple formats    | `multiple.*format`     | ❌ No matches |
 | S908 | HIGH     | Polyglot file       | `polyglot`             | ❌ No matches |
 
-### S1000-S1099: Supply Chain
+### S1000–S1110: Network/Communication
 
 | Code  | Severity | Name               | Pattern                         | Status        |
 | ----- | -------- | ------------------ | ------------------------------- | ------------- |
@@ -163,7 +163,6 @@
 | S1009 | LOW      | GPL violation      | `GPL.*proprietary`              | ❌ No matches |
 | S1010 | LOW      | Missing provenance | `missing.*provenance`           | ❌ No matches |
 
-### S1100-S1199: Framework-Specific
 
 | Code  | Severity | Name             | Pattern                         | Status        |
 | ----- | -------- | ---------------- | ------------------------------- | ------------- |

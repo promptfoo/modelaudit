@@ -8,8 +8,9 @@ with chunked reading, progress reporting, and memory management.
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..scanners.base import IssueSeverity, ScanResult
 
@@ -34,7 +35,7 @@ class LargeFileHandler:
         self,
         file_path: str,
         scanner: Any,
-        progress_callback: Optional[Callable[[str, float], None]] = None,
+        progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 3600,
     ):
         """
@@ -131,7 +132,7 @@ class LargeFileHandler:
             with open(self.file_path, "rb") as f:
                 while True:
                     if self._check_timeout():
-                        result.add_issue(
+                        result._add_issue(
                             f"Scan timeout after {self.timeout} seconds",
                             severity=IssueSeverity.WARNING,
                             details={
@@ -167,7 +168,7 @@ class LargeFileHandler:
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")
-            result.add_issue(
+            result._add_issue(
                 f"Scanning error: {e!s}",
                 severity=IssueSeverity.WARNING,
                 details={"error": str(e)},
@@ -211,11 +212,63 @@ def should_use_large_file_handler(file_path: str) -> bool:
 def scan_large_file(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 3600,
 ) -> ScanResult:
     """
     Scan a large file with appropriate strategy.
+
+    Args:
+        file_path: Path to the file to scan
+        scanner: Scanner instance to use
+        progress_callback: Optional progress callback
+        timeout: Maximum scan time in seconds
+
+    Returns:
+        ScanResult with findings
+    """
+    # Check if caching is enabled in scanner config
+    config = getattr(scanner, "config", {})
+    cache_enabled = config.get("cache_enabled", True)
+    cache_dir = config.get("cache_dir")
+
+    # If caching is disabled, proceed with direct scan
+    if not cache_enabled:
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+    # Use cache manager for large file scans
+    try:
+        from ..cache import get_cache_manager
+
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+
+        # Create wrapper function for cache manager
+        def cached_large_scan_wrapper(fpath: str) -> dict:
+            result = _scan_large_file_internal(fpath, scanner, progress_callback, timeout)
+            return result.to_dict()
+
+        # Get cached result or perform scan
+        result_dict = cache_manager.cached_scan(file_path, cached_large_scan_wrapper)
+
+        # Convert back to ScanResult
+        from .result_conversion import scan_result_from_dict
+
+        return scan_result_from_dict(result_dict)
+
+    except Exception as e:
+        # If cache system fails, fall back to direct scanning
+        logger.warning(f"Large file cache error for {file_path}: {e}. Falling back to direct scan.")
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+
+def _scan_large_file_internal(
+    file_path: str,
+    scanner: Any,
+    progress_callback: Callable[[str, float], None] | None = None,
+    timeout: int = 3600,
+) -> ScanResult:
+    """
+    Internal implementation of large file scanning (cache-agnostic).
 
     Args:
         file_path: Path to the file to scan

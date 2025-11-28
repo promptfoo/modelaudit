@@ -4,14 +4,48 @@ from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-try:
-    import numpy as np
-    import onnx
-    from onnx import mapping
 
-    HAS_ONNX = True
-except Exception:
-    HAS_ONNX = False
+def _get_onnx_mapping() -> Any:
+    """Get ONNX mapping module from different locations depending on version."""
+    try:
+        # Try ONNX 1.12+ location
+        import onnx
+
+        if hasattr(onnx, "mapping"):
+            return onnx.mapping
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        # Try older ONNX location
+        from onnx.onnx_cpp2py_export import mapping as mapping_export  # type: ignore[attr-defined]
+
+        return mapping_export
+    except (ImportError, AttributeError):
+        pass
+
+    return None
+
+
+# Defer ONNX availability check to avoid module-level imports
+HAS_ONNX: bool | None = None
+mapping = None
+
+
+def _check_onnx() -> bool:
+    """Check if ONNX is available, with caching."""
+    global HAS_ONNX, mapping
+    if HAS_ONNX is None:
+        try:
+            import numpy as np  # noqa: F401
+            import onnx  # noqa: F401
+
+            mapping = _get_onnx_mapping()
+            HAS_ONNX = True
+        except Exception:
+            HAS_ONNX = False
+            mapping = None
+    return HAS_ONNX
 
 
 class OnnxScanner(BaseScanner):
@@ -23,7 +57,7 @@ class OnnxScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not HAS_ONNX:
+        if not _check_onnx():
             return False
         if not os.path.isfile(path):
             return False
@@ -46,12 +80,12 @@ class OnnxScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
-        if not HAS_ONNX:
+        if not _check_onnx():
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
                 message="onnx package not installed, cannot scan ONNX files.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "onnx"},
                 rule_code="S902",
@@ -60,6 +94,8 @@ class OnnxScanner(BaseScanner):
             return result
 
         try:
+            import onnx
+
             # Check for interrupts before starting the potentially long-running load
             self.check_interrupted()
             model = onnx.load(path, load_external_data=False)
@@ -98,19 +134,30 @@ class OnnxScanner(BaseScanner):
                 model_data = f.read()
             # Check for interrupts after file reading
             self.check_interrupted()
-            self.check_for_jit_script_code(
+            # Collect findings without creating individual checks
+            jit_findings = self.collect_jit_script_findings(
                 model_data,
-                result,
                 model_type="onnx",
                 context=path,
             )
-
-            # Check for network communication patterns
-            self.check_for_network_communication(
+            network_findings = self.collect_network_communication_findings(
                 model_data,
-                result,
                 context=path,
             )
+
+            # Create single aggregated checks for the file (only if checks are enabled)
+            check_jit = self._get_bool_config("check_jit_script", True)
+            if check_jit:
+                self.summarize_jit_script_findings(jit_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+
+            check_net = self._get_bool_config("check_network_comm", True)
+            if check_net:
+                self.summarize_network_communication_findings(network_findings, result, context=path)
+            else:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+
         except Exception as e:
             # Log but don't fail the scan
             result.add_check(
@@ -140,14 +187,29 @@ class OnnxScanner(BaseScanner):
             self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
+
+                # All custom domains are INFO - they're metadata, not executable code
+                # Security risk is in runtime environment (installing malicious operators)
+                # not in the ONNX file itself
                 result.add_check(
                     name="Custom Operator Domain Check",
                     passed=False,
-                    message=f"Model uses custom operator domain '{node.domain}'",
-                    severity=IssueSeverity.WARNING,
+                    message=(
+                        f"Model references custom operator domain '{node.domain}'. "
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
+                    ),
+                    severity=IssueSeverity.INFO,
                     location=f"{path} (node: {node.name})",
                     rule_code="S302",
-                    details={"op_type": node.op_type, "domain": node.domain},
+                    details={
+                        "op_type": node.op_type,
+                        "domain": node.domain,
+                        "security_note": (
+                            "Custom domains indicate dependencies on external operator implementations. "
+                            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+                            "operators are installed. Verify operator packages before installation."
+                        ),
+                    },
                 )
             elif "python" in node.op_type.lower():
                 python_ops_found = True
@@ -191,6 +253,8 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during external data processing
             self.check_interrupted()
+            import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
@@ -243,6 +307,10 @@ class OnnxScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         try:
+            import numpy as np
+
+            if mapping is None:
+                return  # Skip if mapping is not available
             dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
             num_elem = 1
             for d in tensor.dims:
@@ -288,10 +356,16 @@ class OnnxScanner(BaseScanner):
         for tensor in model.graph.initializer:
             # Check for interrupts during tensor size validation
             self.check_interrupted()
+            import onnx
+
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 continue
             if tensor.raw_data:
                 try:
+                    import numpy as np
+
+                    if mapping is None:
+                        continue  # Skip if mapping is not available
                     dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
                     num_elem = 1
                     for d in tensor.dims:
@@ -303,7 +377,7 @@ class OnnxScanner(BaseScanner):
                             name="Tensor Size Validation",
                             passed=False,
                             message=f"Tensor '{tensor.name}' data appears truncated",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{path} (tensor: {tensor.name})",
                             rule_code="S703",
                             details={

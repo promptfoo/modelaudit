@@ -1,8 +1,8 @@
 import os
 import struct
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
@@ -17,7 +17,7 @@ class PyTorchBinaryScanner(BaseScanner):
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])
@@ -35,7 +35,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
         # Check if it's actually a pytorch binary file
         try:
-            from modelaudit.utils.filetype import detect_file_format, validate_file_type
+            from modelaudit.utils.file.detection import detect_file_format, validate_file_type
 
             file_format = detect_file_format(path)
 
@@ -92,7 +92,6 @@ class PyTorchBinaryScanner(BaseScanner):
                     details={"file_size": file_size},
                     rule_code=None,  # Passing check
                 )
-
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
             chunk_size = 1024 * 1024  # 1MB chunks
@@ -218,17 +217,64 @@ class PyTorchBinaryScanner(BaseScanner):
                 rule_code=None,  # Passing check
             )
 
+    def _verify_shebang_context(self, data: bytes, offset_in_chunk: int) -> bool:
+        """
+        Verify that a shebang pattern has the context of a real executable script.
+
+        Real shebangs must have:
+        1. Valid interpreter path after #!/
+        2. Proper line ending after interpreter path
+        """
+        # Extract enough bytes to check full shebang line
+        max_shebang_len = 50
+        snippet = data[offset_in_chunk : offset_in_chunk + max_shebang_len]
+
+        if len(snippet) < 10:  # Need at least #!/bin/sh
+            return False
+
+        # Valid interpreter paths
+        valid_interpreters = [
+            b"#!/bin/bash",
+            b"#!/bin/sh",
+            b"#!/usr/bin/python",
+            b"#!/usr/bin/python3",
+            b"#!/usr/bin/env",
+            b"#!/bin/zsh",
+            b"#!/bin/dash",
+            b"#!/usr/bin/perl",
+            b"#!/usr/bin/ruby",
+        ]
+
+        # Check if snippet matches a valid interpreter
+        for interpreter in valid_interpreters:
+            if snippet.startswith(interpreter):
+                # Found valid interpreter - check what follows
+                interp_len = len(interpreter)
+
+                if len(snippet) <= interp_len:
+                    return False
+
+                # Get character right after interpreter
+                next_char = snippet[interp_len : interp_len + 1]
+
+                # Valid next characters: newline, space, tab, or / (for /usr/bin/env python)
+                if next_char in (b"\n", b"\r", b" ", b"\t", b"/"):
+                    return True
+
+        return False
+
     def _check_for_executable_signatures(
         self,
         chunk: bytes,
         result: ScanResult,
         offset: int,
     ) -> None:
-        """Check for executable file signatures with ML context awareness"""
-        from modelaudit.utils.ml_context import (
-            analyze_binary_for_ml_context,
-            should_ignore_executable_signature,
-        )
+        """Check for executable file signatures with context-aware detection"""
+        from modelaudit.utils.helpers.ml_context import analyze_binary_for_ml_context
+
+        # RULE 1: Only scan first 64KB - real executables have signatures at start
+        if offset > 65536:
+            return
 
         # Analyze ML context for this chunk
         ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
@@ -252,7 +298,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 if positions:
                     pattern_counts[sig] = (positions, description)
 
-        # Process findings with ML context filtering
+        # Process findings with context-aware filtering
         for sig, (positions, description) in pattern_counts.items():
             # Calculate pattern density more reasonably for small files
             file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
@@ -260,15 +306,26 @@ class PyTorchBinaryScanner(BaseScanner):
             effective_size_mb = max(file_size_mb, 1.0)
             pattern_density = len(positions) / effective_size_mb
 
-            # Apply ML context filtering
+            # Apply context-aware filtering
             filtered_positions = []
             ignored_count = 0
 
             for pos in positions:
-                if should_ignore_executable_signature(sig, pos, ml_context, int(pattern_density), len(positions)):
+                # For shell shebangs, verify they have valid interpreter context
+                if sig == b"#!/":
+                    # Calculate position within chunk
+                    pos_in_chunk = pos - offset
+                    if not self._verify_shebang_context(chunk, pos_in_chunk):
+                        ignored_count += 1
+                        continue  # Skip - not a real shebang
+
+                # For other signatures, check if it's in weight data
+                # High ML weight confidence means it's likely coincidental
+                if ml_context.get("weight_confidence", 0) > 0.7:
                     ignored_count += 1
-                else:
-                    filtered_positions.append(pos)
+                    continue
+
+                filtered_positions.append(pos)
 
             # Report significant patterns that weren't filtered out
             for pos in filtered_positions[:10]:  # Limit to first 10

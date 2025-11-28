@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import click
@@ -80,7 +80,7 @@ def format_size(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def get_cloud_object_size(fs, url: str) -> Optional[int]:
+def get_cloud_object_size(fs: Any, url: str) -> int | None:
     """Get the size of a cloud storage object or directory.
 
     Args:
@@ -91,20 +91,48 @@ def get_cloud_object_size(fs, url: str) -> Optional[int]:
         Total size in bytes, or None if size cannot be determined
     """
     try:
-        # Check if it's a single file or directory
         info = fs.info(url)
         if "size" in info:
             return int(info["size"])
 
-        # If it's a directory, sum up all file sizes
         total_size = 0
-        for item in fs.ls(url, detail=True):
-            if isinstance(item, dict) and "size" in item:
-                total_size += int(item["size"])
+
+        # Try using fs.walk to traverse directories
+        try:
+            for _, _, files in fs.walk(url):
+                for file_path in files:
+                    try:
+                        file_info = fs.info(file_path)
+                        if "size" in file_info:
+                            total_size += int(file_info["size"])
+                    except Exception:
+                        continue
+            if total_size > 0:
+                return total_size
+        except Exception:
+            pass
+
+        # Fallback to recursive ls if walk is unavailable
+        def _collect(path: str) -> None:
+            nonlocal total_size
+            try:
+                entries = fs.ls(path, detail=True)
+            except Exception:
+                return
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name") or entry.get("path")
+                if entry.get("type") == "directory" or (name and name.endswith("/")):
+                    if name:
+                        _collect(name)
+                elif "size" in entry:
+                    total_size += int(entry["size"])
+
+        _collect(url)
 
         return total_size if total_size > 0 else None
     except Exception:
-        # If we can't get the size, return None
         return None
 
 
@@ -114,58 +142,59 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for cloud storage URL support. Install with 'pip install modelaudit[cloud]'"
+            "fsspec package is required for cloud storage URL support. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     fs_protocol = get_fs_protocol(url)
     fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
 
     try:
-        with fsspec.filesystem(fs_protocol, **fs_args) as fs:
-            # Get info about the target with retry
-            @retry_with_backoff(max_retries=3, verbose=True)
-            def get_info():
-                return fs.info(url)
+        # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
+        fs = fsspec.filesystem(fs_protocol, **fs_args)
 
-            info = get_info()
+        # Get info about the target with retry
+        @retry_with_backoff(max_retries=3, verbose=True)
+        def get_info():
+            return fs.info(url)
 
-            # Check if it's a file or directory
-            if info.get("type") == "file" or (info.get("type") != "directory" and "size" in info):
-                return {
-                    "type": "file",
-                    "size": info.get("size", 0),
-                    "name": Path(url).name,
-                    "estimated_time": estimate_download_time(info.get("size", 0)),
-                    "human_size": format_size(info.get("size", 0)),
-                }
+        info = get_info()
 
-            # It's a directory, list contents
-            files = []
-            total_size = 0
-
-            # List all files recursively
-            # Ensure URL ends with / for proper globbing
-            glob_pattern = f"{url.rstrip('/')}/**"
-            for item in fs.glob(glob_pattern):
-                try:
-                    item_info = fs.info(item)
-                    if item_info.get("type") == "file" or "size" in item_info:
-                        size = item_info.get("size", 0)
-                        files.append(
-                            {"path": item, "name": Path(item).name, "size": size, "human_size": format_size(size)}
-                        )
-                        total_size += size
-                except Exception:
-                    continue
-
+        # Check if it's a file or directory
+        if info.get("type") == "file" or (info.get("type") != "directory" and "size" in info):
             return {
-                "type": "directory",
-                "file_count": len(files),
-                "total_size": total_size,
-                "human_size": format_size(total_size),
-                "files": files,
-                "estimated_time": estimate_download_time(total_size),
+                "type": "file",
+                "size": info.get("size", 0),
+                "name": Path(url).name,
+                "estimated_time": estimate_download_time(info.get("size", 0)),
+                "human_size": format_size(info.get("size", 0)),
             }
+
+        # It's a directory, list contents
+        files = []
+        total_size = 0
+
+        # List all files recursively
+        # Ensure URL ends with / for proper globbing
+        glob_pattern = f"{url.rstrip('/')}/**"
+        for item in fs.glob(glob_pattern):
+            try:
+                item_info = fs.info(item)
+                if item_info.get("type") == "file" or "size" in item_info:
+                    size = item_info.get("size", 0)
+                    files.append({"path": item, "name": Path(item).name, "size": size, "human_size": format_size(size)})
+                    total_size += size
+            except Exception:
+                continue
+
+        return {
+            "type": "directory",
+            "file_count": len(files),
+            "total_size": total_size,
+            "human_size": format_size(total_size),
+            "files": files,
+            "estimated_time": estimate_download_time(total_size),
+        }
     except Exception as e:
         # If we can't get info, assume it's a file
         return {"type": "unknown", "error": str(e)}
@@ -191,7 +220,7 @@ def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
 class GCSCache:
     """Smart caching system for cloud downloads."""
 
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(self, cache_dir: Path | None = None):
         if cache_dir is None:
             self.cache_dir = Path.home() / ".modelaudit" / "cache"
         else:
@@ -221,7 +250,7 @@ class GCSCache:
         """Generate cache key for URL."""
         return hashlib.sha256(url.encode()).hexdigest()
 
-    def get_cached_path(self, url: str, etag: Optional[str] = None) -> Optional[Path]:
+    def get_cached_path(self, url: str, etag: str | None = None) -> Path | None:
         """Return cached file if still valid."""
         cache_key = self.get_cache_key(url)
 
@@ -247,7 +276,7 @@ class GCSCache:
 
         return None
 
-    def cache_file(self, url: str, local_path: Path, etag: Optional[str] = None):
+    def cache_file(self, url: str, local_path: Path, etag: str | None = None) -> None:
         """Cache downloaded file with metadata."""
         cache_key = self.get_cache_key(url)
 
@@ -285,7 +314,7 @@ class GCSCache:
         }
         self._save_metadata()
 
-    def clean_old_cache(self, max_age_days: int = 7):
+    def clean_old_cache(self, max_age_days: int = 7) -> None:
         """Clean cache entries older than max_age_days."""
         now = datetime.now()
         keys_to_remove = []
@@ -343,21 +372,26 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ".model",
         ".mlmodel",
         ".ov",
+        ".tar",
+        ".tar.gz",
+        ".tgz",
     }
-
     scannable = []
     for file in files:
         path = Path(file["path"])
-        if path.suffix.lower() in SCANNABLE_EXTENSIONS:
-            scannable.append(file)
+        suffixes = [s.lower() for s in path.suffixes]
+        for i in range(1, len(suffixes) + 1):
+            if "".join(suffixes[-i:]) in SCANNABLE_EXTENSIONS:
+                scannable.append(file)
+                break
 
     return scannable
 
 
 def download_from_cloud(
     url: str,
-    cache_dir: Optional[Path] = None,
-    max_size: Optional[int] = None,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
     use_cache: bool = True,
     show_progress: bool = True,
     selective: bool = True,
@@ -374,7 +408,8 @@ def download_from_cloud(
         import fsspec
     except ImportError as e:
         raise ImportError(
-            "fsspec package is required for cloud storage URL support. Install with 'pip install modelaudit[cloud]'"
+            "fsspec package is required for cloud storage URL support. "
+            "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
     # Initialize cache
@@ -404,7 +439,7 @@ def download_from_cloud(
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
         # Import here to avoid circular dependency
-        from modelaudit.utils.streaming import get_streaming_preview
+        from modelaudit.utils.file.streaming import get_streaming_preview
 
         # Try to get a preview first
         preview = get_streaming_preview(url)
@@ -441,87 +476,89 @@ def download_from_cloud(
     fs_protocol = get_fs_protocol(url)
     fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
 
-    with fsspec.filesystem(fs_protocol, **fs_args) as fs:
-        # Check available disk space before downloading
-        object_size = get_cloud_object_size(fs, url)
-        if object_size:
-            has_space, message = check_disk_space(download_path, object_size)
-            if not has_space:
-                # Clean up temp directory if we created one
-                if cache_dir is None and download_path.exists():
-                    shutil.rmtree(download_path)
-                raise Exception(f"Cannot download from {url}: {message}")
+    # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
+    fs = fsspec.filesystem(fs_protocol, **fs_args)
 
-        # Download based on type
-        if metadata["type"] == "directory":
-            # Handle directory download
-            raw_files = metadata.get("files")
-            if raw_files is None:
-                files = []
-            elif isinstance(raw_files, list):
-                files = raw_files
-            else:
-                raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
+    # Check available disk space before downloading
+    object_size = get_cloud_object_size(fs, url)
+    if object_size is not None:
+        has_space, message = check_disk_space(download_path, object_size)
+        if not has_space:
+            # Clean up temp directory if we created one
+            if cache_dir is None and download_path.exists():
+                shutil.rmtree(download_path)
+            raise Exception(f"Cannot download from {url}: {message}")
 
-            if selective:
-                # Filter to only scannable files
-                files = filter_scannable_files(files)
-                if show_progress:
-                    total = metadata.get("file_count", 0)
-                    if files:
-                        click.echo(f"Found {len(files)} scannable files out of {total} total files")
-                    else:
-                        click.echo(f"No scannable files found out of {total} total files")
-
-            if not files:
-                raise ValueError("No scannable model files found in directory")
-
-            # Download files
-            for file_info in files:
-                file_url = file_info["path"]
-                # Calculate relative path more robustly
-                base_url = url.rstrip("/")
-                if file_url.startswith(base_url + "/"):
-                    relative_path = file_url[len(base_url) + 1 :]
-                elif file_url.startswith(base_url):
-                    # Handle case where file_url might be exactly base_url
-                    relative_path = Path(file_url).name
-                else:
-                    # Fallback to just the filename
-                    relative_path = Path(file_url).name
-
-                local_path = download_path / relative_path
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if show_progress:
-                    click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
-
-                @retry_with_backoff(max_retries=3, verbose=show_progress)
-                def download_file(url=file_url, path=local_path):
-                    fs.get(url, str(path))
-
-                download_file()
+    # Download based on type
+    if metadata["type"] == "directory":
+        # Handle directory download
+        raw_files = metadata.get("files")
+        if raw_files is None:
+            files = []
+        elif isinstance(raw_files, list):
+            files = raw_files
         else:
-            # Single file download
-            file_name = Path(url).name
-            local_file = download_path / file_name
+            raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
+
+        if selective:
+            # Filter to only scannable files
+            files = filter_scannable_files(files)
+            if show_progress:
+                total = metadata.get("file_count", 0)
+                if files:
+                    click.echo(f"Found {len(files)} scannable files out of {total} total files")
+                else:
+                    click.echo(f"No scannable files found out of {total} total files")
+
+        if not files:
+            raise ValueError("No scannable model files found in directory")
+
+        # Download files
+        for file_info in files:
+            file_url = file_info["path"]
+            # Calculate relative path more robustly
+            base_url = url.rstrip("/")
+            if file_url.startswith(base_url + "/"):
+                relative_path = file_url[len(base_url) + 1 :]
+            elif file_url.startswith(base_url):
+                # Handle case where file_url might be exactly base_url
+                relative_path = Path(file_url).name
+            else:
+                # Fallback to just the filename
+                relative_path = Path(file_url).name
+
+            local_path = download_path / relative_path
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if show_progress:
+                click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
 
             @retry_with_backoff(max_retries=3, verbose=show_progress)
-            def download_single_file():
-                fs.get(url, str(local_file))
+            def download_file(url=file_url, path=local_path):
+                fs.get(url, str(path))
 
-            if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
-                with yaspin(text=f"Downloading {file_name}") as spinner:
-                    download_single_file()
-                    spinner.ok("✓")
-            else:
+            download_file()
+    else:
+        # Single file download
+        file_name = Path(url).name
+        local_file = download_path / file_name
+
+        @retry_with_backoff(max_retries=3, verbose=show_progress)
+        def download_single_file():
+            fs.get(url, str(local_file))
+
+        if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
+            with yaspin(text=f"Downloading {file_name}") as spinner:
                 download_single_file()
+                spinner.ok("✓")
+        else:
+            download_single_file()
 
-            # Cache the download
-            if cache:
-                cache.cache_file(url, local_file)  # Cache the actual file, not the directory
+        # Cache the download
+        if cache:
+            cache.cache_file(url, local_file)  # Cache the actual file, not the directory
 
-            return local_file  # Return the actual file path for single files
+        return local_file  # Return the actual file path for single files
 
     # Cache the download (for directories)
     if cache:

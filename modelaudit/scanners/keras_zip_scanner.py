@@ -4,18 +4,18 @@ import base64
 import json
 import os
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_LAYER_TYPES,
 )
-from modelaudit.utils.code_validation import (
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
-from ..explanations import get_pattern_explanation
+from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -26,7 +26,7 @@ class KerasZipScanner(BaseScanner):
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
     supported_extensions: ClassVar[list[str]] = [".keras"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
@@ -91,7 +91,7 @@ class KerasZipScanner(BaseScanner):
                         name="Keras ZIP Format Check",
                         passed=False,
                         message="No config.json found in Keras ZIP file",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"files": zf.namelist()},
                     )
@@ -291,7 +291,7 @@ class KerasZipScanner(BaseScanner):
                             found_patterns.append(pattern)
 
                     if found_patterns:
-                        result.add_issue(
+                        result._add_issue(
                             message=f"Lambda layer '{layer_name}' contains dangerous code: {', '.join(found_patterns)}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (layer: {layer_name})",

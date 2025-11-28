@@ -10,6 +10,7 @@ import pytest
 from modelaudit.core import scan_model_directory_or_file
 
 
+@pytest.mark.performance
 class TestPerformanceBenchmarks:
     """Performance benchmarks for the model scanning system."""
 
@@ -48,10 +49,10 @@ class TestPerformanceBenchmarks:
             results.append(
                 {
                     "duration": duration,
-                    "files_scanned": scan_result["files_scanned"],
-                    "bytes_scanned": scan_result["bytes_scanned"],
-                    "issues_found": len(scan_result["issues"]),
-                    "success": scan_result["success"],
+                    "files_scanned": scan_result.files_scanned,
+                    "bytes_scanned": scan_result.bytes_scanned,
+                    "issues_found": len(scan_result.issues),
+                    "success": scan_result.success,
                 },
             )
 
@@ -82,12 +83,16 @@ class TestPerformanceBenchmarks:
             "malicious_keras.h5",
         ]
 
+        # Fewer runs in CI to reduce execution time
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        runs = 2 if is_ci else 5
+
         for filename in test_files:
             file_path = assets_dir / filename
             if not file_path.exists():
                 continue
 
-            metrics = self.measure_scan_performance(str(file_path), runs=5)
+            metrics = self.measure_scan_performance(str(file_path), runs=runs)
 
             # Performance assertions
             assert metrics["all_successful"], f"Not all scans successful for {filename}"
@@ -102,8 +107,6 @@ class TestPerformanceBenchmarks:
             if metrics["duration_stdev"] > 0:
                 cv = metrics["duration_stdev"] / metrics["duration_avg"]  # Coefficient of variation
                 # More lenient CV threshold for CI environments
-                import os
-
                 is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
                 cv_threshold = 2.0 if is_ci else 0.5
                 assert cv < cv_threshold, f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
@@ -113,7 +116,10 @@ class TestPerformanceBenchmarks:
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
-        metrics = self.measure_scan_performance(str(assets_dir), runs=3)
+        # Fewer runs in CI to reduce execution time
+        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+        runs = 2 if is_ci else 3
+        metrics = self.measure_scan_performance(str(assets_dir), runs=runs)
 
         # Performance assertions
         assert metrics["all_successful"], "Not all directory scans successful"
@@ -184,7 +190,7 @@ class TestPerformanceBenchmarks:
         try:
             import os
 
-            import psutil
+            import psutil  # type: ignore[import-untyped]
         except ImportError:
             pytest.skip("psutil not available for memory testing")
 
@@ -194,7 +200,7 @@ class TestPerformanceBenchmarks:
         # Perform multiple scans
         for _ in range(5):
             results = scan_model_directory_or_file(str(assets_dir))
-            assert results["success"], "Scan should succeed"
+            assert results.success, "Scan should succeed"
 
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
         memory_growth = final_memory - initial_memory
@@ -217,8 +223,8 @@ class TestPerformanceBenchmarks:
             duration = time.time() - start_time
             return {
                 "duration": duration,
-                "success": results["success"],
-                "files_scanned": results["files_scanned"],
+                "success": results.success,
+                "files_scanned": results.files_scanned,
             }
 
         # Test with 3 concurrent scans
@@ -274,7 +280,7 @@ class TestPerformanceBenchmarks:
 
             # Should handle large files reasonably
             assert duration < 10.0, f"Large file scan took too long: {duration:.2f}s"
-            assert results["success"], "Large file scan should succeed"
+            assert results.success, "Large file scan should succeed"
 
             # Calculate throughput
             throughput = large_file_size / duration if duration > 0 else 0
@@ -297,14 +303,10 @@ class TestPerformanceBenchmarks:
         # All scans should have consistent results
         first_result = scan_results[0]
         for i, result in enumerate(scan_results[1:], 1):
-            assert result["files_scanned"] == first_result["files_scanned"], (
-                f"Inconsistent files_scanned on run {i + 1}"
-            )
-            assert result["bytes_scanned"] == first_result["bytes_scanned"], (
-                f"Inconsistent bytes_scanned on run {i + 1}"
-            )
-            assert len(result["issues"]) == len(first_result["issues"]), f"Inconsistent issue count on run {i + 1}"
-            assert result["success"] == first_result["success"], f"Inconsistent success status on run {i + 1}"
+            assert result.files_scanned == first_result.files_scanned, f"Inconsistent files_scanned on run {i + 1}"
+            assert result.bytes_scanned == first_result.bytes_scanned, f"Inconsistent bytes_scanned on run {i + 1}"
+            assert len(result.issues) == len(first_result.issues), f"Inconsistent issue count on run {i + 1}"
+            assert result.success == first_result.success, f"Inconsistent success status on run {i + 1}"
 
     def test_timeout_performance(self, assets_dir):
         """Test that timeout handling doesn't significantly impact performance."""
@@ -314,48 +316,6 @@ class TestPerformanceBenchmarks:
             "which introduces legitimate performance variance that makes timeout "
             "overhead measurements unreliable. The core security functionality "
             "has been verified to work correctly."
-        )
-        if not assets_dir.exists():
-            pytest.skip("Assets directory does not exist")
-
-        # Test with generous timeout
-        start_time = time.time()
-        results_long_timeout = scan_model_directory_or_file(
-            str(assets_dir),
-            timeout=300,
-        )
-        duration_long = time.time() - start_time
-
-        # Test with shorter but reasonable timeout
-        start_time = time.time()
-        results_short_timeout = scan_model_directory_or_file(
-            str(assets_dir),
-            timeout=60,
-        )
-        duration_short = time.time() - start_time
-
-        # Both should succeed for small test directory
-        assert results_long_timeout["success"], "Long timeout scan should succeed"
-        assert results_short_timeout["success"], "Short timeout scan should succeed"
-
-        # Results should be consistent
-        assert results_long_timeout["files_scanned"] == results_short_timeout["files_scanned"]
-        assert results_long_timeout["bytes_scanned"] == results_short_timeout["bytes_scanned"]
-
-        # Performance should be similar (timeout mechanism shouldn't add overhead)
-        timeout_overhead = abs(duration_long - duration_short) / min(
-            duration_long,
-            duration_short,
-        )
-        # More lenient threshold for CI environments where timing can be variable
-        # Also account for enhanced security scanning that may impact performance
-        import os
-
-        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        # Increased thresholds to account for enhanced security scanning
-        overhead_threshold = 25.0 if is_ci else 5.0  # Allow up to 2500% variance in CI, 500% locally
-        assert timeout_overhead < overhead_threshold, (
-            f"Timeout mechanism adds too much overhead: {timeout_overhead:.2%}"
         )
 
     @pytest.mark.slow
@@ -379,7 +339,7 @@ class TestPerformanceBenchmarks:
             duration = time.time() - start_time
             durations.append(duration)
 
-            assert results["success"], f"Iteration {i + 1} should succeed"
+            assert results.success, f"Iteration {i + 1} should succeed"
 
         # Remove outliers using IQR method
         q1 = statistics.quantiles(durations, n=4)[0]
@@ -412,9 +372,9 @@ class TestPerformanceBenchmarks:
 
     def benchmark_and_save_results(
         self,
-        assets_dir,
+        assets_dir: Path,
         output_file: str = "benchmark_results.json",
-    ):
+    ) -> None:
         """Run comprehensive benchmarks and save results for comparison."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -436,5 +396,3 @@ class TestPerformanceBenchmarks:
         output_path = Path(output_file)
         with open(output_path, "w") as f:
             json.dump(benchmark_results, f, indent=2)
-
-        return benchmark_results

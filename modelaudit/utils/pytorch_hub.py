@@ -2,7 +2,6 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 import requests
 
@@ -18,7 +17,7 @@ def is_pytorch_hub_url(url: str) -> bool:
 
 def _extract_weight_urls(html: str) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
-    pattern = r"https://download\.pytorch\.org/models/[\w\-_.]+\.(?:pth|pt|pth\.tar\.gz|pth\.zip)"
+    pattern = r"https://download\.pytorch\.org/models/[\w\-_.]+(?:\.pt|\.pth(?:\.tar\.gz|\.zip)?)(?![\w.])"
     return re.findall(pattern, html)
 
 
@@ -34,7 +33,7 @@ def _get_total_size(urls: list[str]) -> int:
     return total
 
 
-def download_pytorch_hub_model(url: str, cache_dir: Optional[Path] = None) -> Path:
+def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")

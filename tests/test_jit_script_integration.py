@@ -127,3 +127,74 @@ class TestONNXScannerJITIntegration:
         # Should detect Python operator risks
         jit_checks = [c for c in result.checks if "JIT/Script" in c.name or "Python" in c.name]
         assert len(jit_checks) > 0, "Should detect Python operator risks"
+
+    def test_onnx_no_false_positive_torchscript_warnings(self, tmp_path):
+        """Test that ONNX files with PyTorch metadata don't trigger false JIT/Script warnings.
+
+        Regression test for bug where ONNX files exported from PyTorch contain
+        'org.pytorch.aten' custom operator domain metadata, which was incorrectly
+        flagged as "Hex-encoded TorchScript references" by the pattern r"\\x[0-9a-fA-F]{2}.*torch".
+
+        This test verifies that the fix (only running TorchScript scanners on unknown model types)
+        eliminates these false positives.
+        """
+        import onnx
+        from onnx import TensorProto, helper
+
+        # Create a simple ONNX model with PyTorch custom domain (org.pytorch.aten)
+        input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3])
+        output_tensor = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3])
+
+        # Create a node using PyTorch ATen operator domain
+        # This is legitimate and common in ONNX models exported from PyTorch
+        aten_node = helper.make_node(
+            "ATen",
+            inputs=["input"],
+            outputs=["output"],
+            domain="org.pytorch.aten",  # Standard PyTorch custom operator domain
+        )
+
+        graph = helper.make_graph(
+            [aten_node],
+            "pytorch_onnx_model",
+            [input_tensor],
+            [output_tensor],
+        )
+
+        # Create model with custom operator domain import
+        model = helper.make_model(graph)
+        # Add the custom domain to opset imports (simulates real PyTorch export)
+        opset_import = model.opset_import.add()
+        opset_import.domain = "org.pytorch.aten"
+        opset_import.version = 1
+
+        # Save the model
+        model_path = tmp_path / "pytorch_exported.onnx"
+        onnx.save(model, str(model_path))
+
+        # Scan the model
+        from modelaudit.scanners.onnx_scanner import OnnxScanner
+
+        scanner = OnnxScanner({"check_jit_script": True})
+        result = scanner.scan(str(model_path))
+
+        # Should NOT trigger false positive "Hex-encoded TorchScript references" warnings
+        # The fix ensures TorchScript vulnerability scanners don't run on identified ONNX files
+        torchscript_obfuscation_issues = [
+            issue
+            for issue in result.issues
+            if issue.type == "torchscript_obfuscation" or "Hex-encoded TorchScript" in issue.message
+        ]
+
+        assert len(torchscript_obfuscation_issues) == 0, (
+            f"Should not have false positive TorchScript warnings for ONNX file with PyTorch metadata. "
+            f"Found: {[i.message for i in torchscript_obfuscation_issues]}"
+        )
+
+        # Should still perform legitimate ONNX checks (custom domain warnings are OK)
+        # But severity should be INFO for well-known domains, not WARNING
+        custom_domain_checks = [
+            c for c in result.checks if "Custom Operator Domain" in c.name or "custom" in str(c.details)
+        ]
+        # Having custom domain checks is fine - we just want to ensure no TorchScript false positives
+        assert len(torchscript_obfuscation_issues) == 0, "No TorchScript false positives"

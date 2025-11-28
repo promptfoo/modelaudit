@@ -55,8 +55,8 @@ class ScannerRegistry:
         self._loaded_scanners: dict[str, type[BaseScanner]] = {}
         self._failed_scanners: dict[str, str] = {}  # Track failed scanner loads
         self._lock = threading.Lock()
-        self._numpy_compatible: Optional[bool] = None  # Lazy initialization
-        self._numpy_status: Optional[str] = None
+        self._numpy_compatible: bool | None = None  # Lazy initialization
+        self._numpy_status: str | None = None
         self._init_registry()
 
     def _ensure_numpy_status(self) -> None:
@@ -148,15 +148,6 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
-            "coreml": {
-                "module": "modelaudit.scanners.coreml_scanner",
-                "class": "CoreMLScanner",
-                "description": "Scans Apple Core ML model files",
-                "extensions": [".mlmodel"],
-                "priority": 6,
-                "dependencies": ["coreml"],  # Heavy dependency
-                "numpy_sensitive": True,
-            },
             "openvino": {
                 "module": "modelaudit.scanners.openvino_scanner",
                 "class": "OpenVinoScanner",
@@ -200,6 +191,15 @@ class ScannerRegistry:
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "skops": {
+                "module": "modelaudit.scanners.skops_scanner",
+                "class": "SkopsScanner",
+                "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+                "extensions": [".skops"],
+                "priority": 8,  # Same priority as joblib
+                "dependencies": [],  # No heavy dependencies (uses standard zipfile)
                 "numpy_sensitive": False,
             },
             "numpy": {
@@ -271,7 +271,7 @@ class ScannerRegistry:
                     ".hdf5",
                     ".pb",
                     ".onnx",
-                    ".safetensors",
+                    # Note: .safetensors removed - handled exclusively by SafeTensorsScanner
                 ],
                 "priority": 13,
                 "dependencies": [
@@ -354,6 +354,42 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "jinja2_template": {
+                "module": "modelaudit.scanners.jinja2_template_scanner",
+                "class": "Jinja2TemplateScanner",
+                "description": "Scans for Jinja2 template injection vulnerabilities in ML models",
+                "extensions": [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"],
+                "priority": 14,  # High priority for security scanner, before safetensors
+                "dependencies": ["jinja2", "gguf"],  # gguf optional for GGUF support
+                "numpy_sensitive": False,
+            },
+            "metadata": {
+                "module": "modelaudit.scanners.metadata_scanner",
+                "class": "MetadataScanner",
+                "description": "Scans model metadata files for security issues",
+                "extensions": [".json", ".md", ".markdown", ".rst", ".yml", ".yaml"],
+                "priority": 1,  # High priority for security-focused metadata scanning
+                "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "sevenzip": {
+                "module": "modelaudit.scanners.sevenzip_scanner",
+                "class": "SevenZipScanner",
+                "description": "Scans 7-Zip archive files",
+                "extensions": [".7z"],
+                "priority": 97,  # Before generic zip scanner
+                "dependencies": ["py7zr"],
+                "numpy_sensitive": False,
+            },
+            "xgboost": {
+                "module": "modelaudit.scanners.xgboost_scanner",
+                "class": "XGBoostScanner",
+                "description": "Scans XGBoost model files for security vulnerabilities",
+                "extensions": [".bst", ".model", ".json", ".ubj"],
+                "priority": 7,  # After GGUF scanner, before joblib
+                "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
+                "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -365,7 +401,7 @@ class ScannerRegistry:
             },
         }
 
-    def _load_scanner(self, scanner_id: str) -> Optional[type[BaseScanner]]:
+    def _load_scanner(self, scanner_id: str) -> type[BaseScanner] | None:
         """Lazy load a scanner class (thread-safe) with enhanced error handling"""
         # Check if already loaded (fast path without lock)
         if scanner_id in self._loaded_scanners:
@@ -400,12 +436,33 @@ class ScannerRegistry:
                 logger.debug(f"Loaded scanner: {scanner_id}")
                 return scanner_class
 
-            except Exception as e:
-                # Enhanced error handling for all types of import failures
+            except ImportError as e:
+                # Missing dependency - provide helpful message
                 scanner_deps = scanner_info.get("dependencies", [])
                 is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
-                error_msg = f"Failed to load scanner {scanner_id}: {e}"
+                if scanner_deps:
+                    error_msg = (
+                        f"Scanner {scanner_id} requires dependencies: {scanner_deps}. "
+                        f"Install with 'pip install modelaudit[{','.join(scanner_deps)}]'"
+                    )
+                else:
+                    error_msg = f"Scanner {scanner_id} import failed: {e}"
+
+                self._failed_scanners[scanner_id] = error_msg
+
+                # For expected dependency issues, use debug level
+                if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
+                    logger.debug(error_msg)
+                else:
+                    logger.debug(error_msg)
+
+                return None
+
+            except Exception as e:
+                # Unexpected error - provide detailed information
+                scanner_deps = scanner_info.get("dependencies", [])
+                is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
                 if _is_numpy_compatibility_error(e):
                     if is_numpy_sensitive:
@@ -414,29 +471,30 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
+                        logger.debug(error_msg)  # Debug level - expected NumPy compatibility issues
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
-                elif isinstance(e, ImportError):
-                    if scanner_deps:
-                        error_msg = (
-                            f"Scanner {scanner_id} requires dependencies: {scanner_deps}. "
-                            f"Install with 'pip install modelaudit[{','.join(scanner_deps)}]'"
-                        )
-                    else:
-                        error_msg = f"Scanner {scanner_id} import failed: {e}"
+                        logger.warning(error_msg)  # Warning - unexpected NumPy issue
                 elif isinstance(e, AttributeError):
                     error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-
-                # Store failure reason and log appropriately
-                self._failed_scanners[scanner_id] = error_msg
-
-                self._ensure_numpy_status()  # Lazy initialization
-                if is_numpy_sensitive and not self._numpy_compatible:
-                    logger.info(error_msg)  # Info level for expected NumPy issues
+                    logger.warning(error_msg)  # Warning - code structure issue
                 else:
-                    logger.debug(error_msg)  # Debug level for other issues
+                    error_msg = f"Scanner {scanner_id} failed to load: {e}"
+                    logger.warning(error_msg)  # Warning - unexpected error
 
+                self._failed_scanners[scanner_id] = error_msg
                 return None
+
+    def has_scanner_class(self, class_name: str) -> bool:
+        """Check if a scanner class is available without loading it.
+
+        Args:
+            class_name: Name of the scanner class to check for
+
+        Returns:
+            True if the scanner is registered and can potentially be loaded
+        """
+        return any(scanner_info.get("class") == class_name for scanner_info in self._scanners.values())
 
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
@@ -451,7 +509,7 @@ class ScannerRegistry:
 
         return scanner_classes
 
-    def get_scanner_for_path(self, path: str) -> Optional[type[BaseScanner]]:
+    def get_scanner_for_path(self, path: str) -> type[BaseScanner] | None:
         """Get the best scanner for a given path (lazy loaded)"""
         import os
 
@@ -485,17 +543,59 @@ class ScannerRegistry:
         """Get list of available scanner IDs"""
         return list(self._scanners.keys())
 
-    def get_scanner_info(self, scanner_id: str) -> Optional[dict[str, Any]]:
+    def get_scanner_info(self, scanner_id: str) -> dict[str, Any] | None:
         """Get metadata about a scanner without loading it"""
         return self._scanners.get(scanner_id)
 
-    def load_scanner_by_id(self, scanner_id: str) -> Optional[type[BaseScanner]]:
+    def load_scanner_by_id(self, scanner_id: str) -> type[BaseScanner] | None:
         """Load a specific scanner by ID (public API)"""
         return self._load_scanner(scanner_id)
 
     def get_failed_scanners(self) -> dict[str, str]:
         """Get information about scanners that failed to load"""
         return self._failed_scanners.copy()
+
+    def get_available_scanners_summary(self) -> dict[str, Any]:
+        """Get comprehensive summary of scanner availability for diagnostics"""
+        # Force loading of all scanners to populate failed_scanners
+        loaded_scanners = []
+        dependency_errors = {}
+        numpy_errors = {}
+
+        for scanner_id in self._scanners:
+            scanner_class = self._load_scanner(scanner_id)
+            if scanner_class:
+                loaded_scanners.append(scanner_id)
+            elif scanner_id in self._failed_scanners:
+                error_msg = self._failed_scanners[scanner_id]
+                scanner_info = self._scanners[scanner_id]
+                dependencies = scanner_info.get("dependencies", [])
+
+                # Categorize errors for better reporting
+                if "NumPy compatibility" in error_msg or "numpy" in error_msg.lower():
+                    numpy_errors[scanner_id] = error_msg
+                elif dependencies and (
+                    "requires dependencies" in error_msg
+                    or (isinstance(error_msg, str) and "pip install modelaudit[" in error_msg)
+                ):
+                    dependency_errors[scanner_id] = {
+                        "error": error_msg,
+                        "dependencies": dependencies,
+                        "install_command": f"pip install modelaudit[{','.join(dependencies)}]",
+                    }
+
+        return {
+            "total_scanners": len(self._scanners),
+            "loaded_scanners": len(loaded_scanners),
+            "failed_scanners": len(self._failed_scanners),
+            "loaded_scanner_list": sorted(loaded_scanners),
+            "failed_scanner_details": self._failed_scanners.copy(),
+            "dependency_errors": dependency_errors,
+            "numpy_errors": numpy_errors,
+            "success_rate": round((len(loaded_scanners) / len(self._scanners)) * 100, 1)
+            if len(self._scanners) > 0
+            else 0.0,
+        }
 
     def get_numpy_status(self) -> tuple[bool, str]:
         """Get NumPy compatibility status"""
@@ -520,7 +620,7 @@ class _LazyList:
 
     def __init__(self, registry: ScannerRegistry) -> None:
         self._registry = registry
-        self._cached_list: Optional[list[type[BaseScanner]]] = None
+        self._cached_list: list[type[BaseScanner]] | None = None
         self._lock = threading.Lock()
 
     def _get_list(self) -> list[type[BaseScanner]]:
@@ -562,12 +662,12 @@ def __getattr__(name: str) -> Any:
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
-        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
         "ManifestScanner": "manifest",
@@ -580,6 +680,9 @@ def __getattr__(name: str) -> Any:
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
         "TarScanner": "tar",
+        "Jinja2TemplateScanner": "jinja2_template",
+        "MetadataScanner": "metadata",
+        "XGBoostScanner": "xgboost",
         "ZipScanner": "zip",
     }
 
@@ -596,7 +699,7 @@ def __getattr__(name: str) -> Any:
 
 
 # Helper function for getting scanner for a file
-def get_scanner_for_file(path: str, config: Optional[dict[str, Any]] = None) -> Optional[BaseScanner]:
+def get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> BaseScanner | None:
     """Get an instantiated scanner for a given file path"""
     scanner_class = _registry.get_scanner_for_path(path)
     if scanner_class:

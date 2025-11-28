@@ -175,7 +175,7 @@ class TarScanner(BaseScanner):
                 if member.issym() or member.islnk():
                     target = member.linkname
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(target, target_base)
+                    _target_resolved, target_safe = sanitize_archive_path(target, target_base)
                     if not target_safe:
                         # Check if it's specifically a critical system path
                         if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):

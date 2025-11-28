@@ -31,9 +31,9 @@ class TestCLILicenseIntegration:
         """Test CLI scanning of MIT licensed model."""
         mit_dir = test_data_dir / "mit_model"
 
-        # Run CLI scan
+        # Run CLI scan with cache disabled to ensure fresh scan results
         result = subprocess.run(
-            [*cli_command, "scan", str(mit_dir), "--format", "json"],
+            [*cli_command, "scan", str(mit_dir), "--format", "json", "--no-cache"],
             capture_output=True,
             text=True,
         )
@@ -60,9 +60,9 @@ class TestCLILicenseIntegration:
         """Test CLI scanning of AGPL component triggers warnings."""
         agpl_dir = test_data_dir / "agpl_component"
 
-        # Run CLI scan with --no-skip-files to scan the .py file containing AGPL license
+        # Run CLI scan with --strict to scan the .py file containing AGPL license
         result = subprocess.run(
-            [*cli_command, "scan", str(agpl_dir), "--format", "json", "--no-skip-files"],
+            [*cli_command, "scan", str(agpl_dir), "--format", "json", "--strict"],
             capture_output=True,
             text=True,
         )
@@ -98,13 +98,14 @@ class TestCLILicenseIntegration:
             text=True,
         )
 
-        # Should trigger warnings
-        assert result.returncode == 1, "Unlicensed datasets should trigger warnings"
+        # INFO-level issues don't cause exit code 1
+        # Unlicensed dataset warnings are informational (INFO), not security issues (WARNING/CRITICAL)
+        assert result.returncode == 0, f"Unlicensed datasets are INFO severity (exit code 0). Got: {result.returncode}"
 
         # Parse JSON output
         output_data = json.loads(result.stdout)
 
-        # Should have dataset license warnings
+        # Should have dataset license warnings (even if INFO severity)
         dataset_issues = [
             issue
             for issue in output_data.get("issues", [])

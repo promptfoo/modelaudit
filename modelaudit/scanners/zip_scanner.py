@@ -3,7 +3,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -30,7 +30,7 @@ class ZipScanner(BaseScanner):
     description = "Scans ZIP archive files and their contents recursively"
     supported_extensions: ClassVar[list[str]] = [".zip", ".npz"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
         self.max_entries = self.config.get(
@@ -90,7 +90,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 rule_code="S902",  # Corrupted structure
                 location=path,
                 details={"path": path},
@@ -102,7 +102,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Scan",
                 passed=False,
                 message=f"Error scanning zip file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 rule_code="S902",  # Scan error
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
@@ -171,7 +171,6 @@ class ZipScanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-
             # Scan each file in the archive
             for name in z.namelist():
                 info = z.getinfo(name)
@@ -197,7 +196,7 @@ class ZipScanner(BaseScanner):
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(
+                    _target_resolved, target_safe = sanitize_archive_path(
                         target,
                         target_base,
                     )

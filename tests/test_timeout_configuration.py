@@ -46,7 +46,7 @@ class SlowTestScanner(BaseScanner):
 
             # Add some fake issues
             if bytes_scanned % 5000 == 0:
-                result.add_issue(
+                result._add_issue(
                     f"Test issue at byte {bytes_scanned}",
                     severity=IssueSeverity.WARNING,
                     location=path,
@@ -101,6 +101,7 @@ class TestTimeoutConfiguration:
         finally:
             os.unlink(temp_path)
 
+    @pytest.mark.slow
     def test_partial_results_on_timeout(self):
         """Test that partial results are returned when timeout occurs"""
         # Create a large test file
@@ -142,8 +143,8 @@ class TestTimeoutConfiguration:
             results = scan_model_directory_or_file(tmpdir, timeout=1)
 
             # Should complete and return results
-            assert "files_scanned" in results
-            assert results["files_scanned"] >= 0
+            assert hasattr(results, "files_scanned")
+            assert results.files_scanned >= 0
 
     def test_check_timeout_methods(self):
         """Test the timeout checking helper methods"""
@@ -191,13 +192,13 @@ class TestTimeoutConfiguration:
         """Test that zero or negative timeout values are rejected"""
         from modelaudit.core import validate_scan_config
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="Input should be greater than 0"):
             validate_scan_config({"timeout": 0})
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="Input should be greater than 0"):
             validate_scan_config({"timeout": -1})
 
-        with pytest.raises(ValueError, match="timeout must be a positive integer"):
+        with pytest.raises(ValueError, match="unable to parse string as an integer"):
             validate_scan_config({"timeout": "invalid"})
 
 

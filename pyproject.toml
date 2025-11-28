@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling==1.26.3"]  # Without a version spec, hatchling==1.27.0 is used which fails to publish. Ref: https://github.com/astral-sh/rye/issues/1446#issuecomment-2545154562
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.3"
+version = "0.2.19"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -19,24 +19,31 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "click>=8.1.7",
     "yaspin>=2.5.0",
     "numpy>=1.19.0",
     "scipy>=1.7.0",
-    "cyclonedx-python-lib>=10.2.0",
+    "cyclonedx-python-lib>=11.0.0",
     "defusedxml>=0.7.1",
     "huggingface-hub>=0.23.0",
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
     "platformdirs>=3.0.0",
     "pyyaml>=6.0,<7.0",
+    "pydantic>=2.11.0,<3.0",
+    "fickling==0.1.4",
+    "contourpy<1.3.3",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
+    "posthog>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -53,11 +60,11 @@ dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
-coreml = ["coremltools>=8.0"]
 tensorrt = ["tensorrt>=8.6.0"]
+xgboost = ["xgboost>=1.6.0,<3.0", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
-cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
+sevenzip = ["py7zr>=0.20.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
     "numpy>=1.19.0,<2.0",
@@ -72,12 +79,7 @@ numpy1 = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
-    "tensorrt>=8.6.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
 ]
 # All dependencies except platform-specific ones (for CI)
 all-ci = [
@@ -92,12 +94,10 @@ all-ci = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
+    "xgboost>=1.6.0,<3.0",
+    "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
 ]
 all = [
     "tensorflow>=2.13.0,<3.0",
@@ -111,13 +111,10 @@ all = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
-    "tensorrt>=8.6.0",
+    "xgboost>=1.6.0,<3.0",
+    "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
 ]
 
 [project.scripts]
@@ -130,10 +127,10 @@ Homepage = "https://github.com/promptfoo/modelaudit"
 [tool.rye]
 managed = true
 dev-dependencies = [
-    "pytest>=8.0.0",
-    "coverage>=7.4.0",
-    "mypy>=1.8.0",
-    "ruff>=0.10.0",
+    "pytest>=8.4.0",
+    "coverage>=7.9.0",
+    "mypy>=1.16.0",
+    "ruff>=0.12.0",
     "types-PyYAML>=6.0.12.20250516",
     "types-tensorflow>=2.18.0.20250516",
     "types-requests>=2.31.0",
@@ -142,11 +139,13 @@ dev-dependencies = [
     "dill>=0.4.0",
     "pytest-xdist>=3.7.0",
     "pytest-asyncio>=1.1.0",
+    "pyupgrade>=3.20.0",
+    "ty>=0.0.1a20",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 # Extend the default rule set to be more prescriptive
@@ -205,11 +204,22 @@ addopts = [
 ]
 testpaths = ["tests"]
 markers = [
+    # Test category markers
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "performance: marks tests as performance benchmarks",
     "unit: marks tests as unit tests (fast)",
     "asyncio: marks tests as asyncio tests",
+    # Framework-specific markers (tests auto-skip if framework unavailable)
+    "tensorflow: marks tests as requiring TensorFlow",
+    "pytorch: marks tests as requiring PyTorch",
+    "onnx: marks tests as requiring ONNX",
+    "h5py: marks tests as requiring h5py",
+    "msgpack: marks tests as requiring msgpack",
+    "xgboost: marks tests as requiring XGBoost",
+    "safetensors: marks tests as requiring safetensors",
+    "joblib: marks tests as requiring joblib",
+    "dill: marks tests as requiring dill",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
@@ -217,12 +227,12 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
 warn_unused_configs = true     # Warn about unused config options
-warn_unused_ignores = true     # Remove unnecessary type: ignore comments
+warn_unused_ignores = false    # Allow type: ignore comments for multiple tools (ty, mypy)
 warn_redundant_casts = true    # Remove unnecessary casts
 warn_unreachable = true        # Detect unreachable code
 no_implicit_optional = true    # Require Optional[] for None defaults
@@ -233,9 +243,9 @@ show_error_codes = true
 show_column_numbers = true
 pretty = true
 
-# Phase 2: To enable after fixing current issues
-# check_untyped_defs = true      # Type-check untyped function bodies
-# disallow_incomplete_defs = true # Functions with annotations must be fully annotated
+# Phase 2: Enhanced strictness (now enabled for Python 3.10+)
+check_untyped_defs = true      # Type-check untyped function bodies
+disallow_incomplete_defs = true # Functions with annotations must be fully annotated
 
 # Phase 3: Long-term strict typing goals
 # disallow_untyped_defs = true   # Require type annotations for all functions
@@ -243,6 +253,10 @@ pretty = true
 
 # Continue ignoring missing imports for now
 ignore_missing_imports = true
+
+# Temporary workaround for numpy/tensorflow/cyclonedx type compatibility issues
+# See: https://github.com/python/mypy/issues/15238
+follow_imports = "silent"
 
 # Per-module overrides for gradual adoption
 [[tool.mypy.overrides]]
@@ -265,3 +279,64 @@ warn_unreachable = false
 module = "modelaudit.scanners.oci_layer_scanner"
 # Runtime validation needs to check types even with annotations
 warn_unreachable = false
+
+[tool.ty]
+# ty configuration for advanced type checking
+
+[tool.ty.environment]
+# Use the minimum Python version from requires-python
+python-version = "3.10"
+# Include both main source and test directories
+root = [".", "./modelaudit", "./tests"]
+
+[tool.ty.src]
+# Include main source and tests for type checking
+include = ["modelaudit", "tests"]
+# Exclude generated files, assets, and cache directories
+exclude = [
+    "tests/assets/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**", 
+    "**/build/**",
+    "**/dist/**",
+    "picklescan/**",      # Legacy code that might be removed
+    "modelscan/**",       # Legacy code that might be removed
+]
+
+[tool.ty.rules]
+# Start with conservative configuration to avoid overwhelming output
+# Error level rules (will cause ty to exit with non-zero code)
+"unresolved-import" = "error"
+"unresolved-reference" = "error"
+"invalid-argument-type" = "error"
+"invalid-assignment" = "error"
+"invalid-return-type" = "error"
+"call-non-callable" = "error"
+"missing-argument" = "error"
+"too-many-positional-arguments" = "error"
+"unknown-argument" = "error"
+"parameter-already-assigned" = "error"
+"no-matching-overload" = "error"
+
+# Warning level rules (useful feedback but don't fail CI)
+"possibly-unresolved-reference" = "warn"
+"possibly-unbound-attribute" = "warn" 
+"deprecated" = "warn"
+"redundant-cast" = "warn"
+
+# Ignore rules that may be too noisy initially
+"division-by-zero" = "ignore"
+"unused-ignore-comment" = "ignore"
+
+[tool.ty.terminal]
+# Use concise output format for better readability in CI
+output-format = "concise"
+# Don't fail on warnings initially - focus on errors first
+error-on-warning = false
+
+# Override configuration for test files - be more permissive
+[[tool.ty.overrides]]
+include = ["tests/**"]
+[tool.ty.overrides.rules]
+"possibly-unresolved-reference" = "ignore"
+"invalid-argument-type" = "warn"  # Tests often use dynamic fixtures
