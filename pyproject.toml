@@ -44,6 +44,7 @@ dependencies = [
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
     "posthog>=7.0.0",
+    "tomli>=2.0.1; python_version<'3.11'",
 ]
 
 [project.optional-dependencies]
