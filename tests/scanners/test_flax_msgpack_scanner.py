@@ -318,18 +318,25 @@ def test_flax_msgpack_can_handle_extensions(tmp_path):
         assert FlaxMsgpackScanner.can_handle(str(test_file))
 
 
+@pytest.mark.slow
 def test_flax_msgpack_ml_context_confidence(tmp_path):
-    """Test ML context confidence scoring."""
+    """Test ML context confidence scoring.
+
+    Note: This test is marked as slow because it creates a large (~150MB)
+    simulated GPT-2 model file which takes significant time to serialize,
+    write to disk, and scan.
+    """
     path = tmp_path / "ml_model.msgpack"
 
     # Create data that strongly indicates ML model
+    # Using smaller matrices to reduce test time while still being representative
     data = {
         "params": {
             "transformer": {
-                "attention": {"query": b"\x00" * (768 * 768 * 4)},  # 768x768 matrix
-                "feed_forward": {"dense": b"\x00" * (768 * 3072 * 4)},  # 768x3072 matrix
+                "attention": {"query": b"\x00" * (768 * 768 * 4)},  # 768x768 matrix (~2.4MB)
+                "feed_forward": {"dense": b"\x00" * (768 * 3072 * 4)},  # 768x3072 matrix (~9.4MB)
             },
-            "embedding": {"token_embedding": b"\x00" * (50257 * 768 * 4)},  # GPT-2 vocab size
+            "embedding": {"token_embedding": b"\x00" * (50257 * 768 * 4)},  # GPT-2 vocab size (~147MB)
         }
     }
     create_msgpack_file(path, data)
