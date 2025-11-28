@@ -163,7 +163,6 @@
 | S1009 | LOW      | GPL violation      | `GPL.*proprietary`              | ❌ No matches |
 | S1010 | LOW      | Missing provenance | `missing.*provenance`           | ❌ No matches |
 
-
 | Code  | Severity | Name             | Pattern                         | Status        |
 | ----- | -------- | ---------------- | ------------------------------- | ------------- |
 | S1101 | HIGH     | PyTorch unsafe   | `torch.load`, `unsafe.*pytorch` | ❌ No matches |
