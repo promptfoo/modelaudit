@@ -2042,8 +2042,11 @@ class PickleScanner(BaseScanner):
 
         # Fallback heuristic for CVE-2020-13092 if analyzer missed it (e.g., partial pickle bytes)
         content_lower = content_str.lower()
-        if not cve_attributions and "joblib" in content_lower and "__reduce__" in content_lower and (
-            "os.system" in content_lower or "subprocess" in content_lower
+        if (
+            not cve_attributions
+            and "joblib" in content_lower
+            and "__reduce__" in content_lower
+            and ("os.system" in content_lower or "subprocess" in content_lower)
         ):
             from modelaudit.detectors.cve_patterns import CVEAttribution
 
