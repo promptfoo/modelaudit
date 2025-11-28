@@ -1,33 +1,54 @@
+import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.explanations import get_tf_op_explanation
-from modelaudit.suspicious_symbols import SUSPICIOUS_OPS
-from modelaudit.utils.code_validation import (
+from modelaudit.config.explanations import get_tf_op_explanation
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-# Try to import TensorFlow, but handle the case where it's not installed
-try:
-    import tensorflow as tf  # noqa: F401
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+logger = logging.getLogger(__name__)
 
-    HAS_TENSORFLOW = True
-    SavedModelType: type = SavedModel
-except ImportError:
-    HAS_TENSORFLOW = False
+# Derive from centralized list; keep severities unified here
+# Exclude Python ops (handled elsewhere) and pure decode ops from the generic pass
+_EXCLUDE_FROM_GENERIC = {"DecodeRaw", "DecodeJpeg", "DecodePng"}
+DANGEROUS_TF_OPERATIONS = {
+    op: IssueSeverity.CRITICAL for op in TENSORFLOW_DANGEROUS_OPS if op not in _EXCLUDE_FROM_GENERIC
+}
 
-    # Create a placeholder for type hints when TensorFlow is not available
-    class SavedModel:  # type: ignore[no-redef]
-        """Placeholder for SavedModel when TensorFlow is not installed"""
+# Python operations that require special handling
+PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-        meta_graphs: ClassVar[list] = []
+# Defer TensorFlow availability check to avoid module-level imports
+HAS_TENSORFLOW: bool | None = None
 
-    SavedModelType = SavedModel
+
+def _check_tensorflow() -> bool:
+    """Check if TensorFlow is available, with caching."""
+    global HAS_TENSORFLOW
+    if HAS_TENSORFLOW is None:
+        try:
+            import tensorflow as tf  # noqa: F401
+
+            HAS_TENSORFLOW = True
+        except ImportError:
+            HAS_TENSORFLOW = False
+    return HAS_TENSORFLOW
+
+
+# Create a placeholder for type hints when TensorFlow is not available
+class SavedModel:  # type: ignore[no-redef]
+    """Placeholder for SavedModel when TensorFlow is not installed"""
+
+    meta_graphs: ClassVar[list] = []
+
+
+SavedModelType = SavedModel
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -37,7 +58,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     description = "Scans TensorFlow SavedModel for suspicious operations"
     supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_ops = set(self.config.get("suspicious_ops", SUSPICIOUS_OPS))
@@ -45,7 +66,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             return False
 
         if os.path.isfile(path):
@@ -72,13 +93,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.current_file_path = path
 
         # Check if TensorFlow is installed
-        if not HAS_TENSORFLOW:
+        if not _check_tensorflow():
             result = self._create_result()
             result.add_check(
                 name="TensorFlow Library Check",
                 passed=False,
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "tensorflow"},
                 rule_code="S902",
@@ -122,12 +143,29 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
+            # Import the actual SavedModel from TensorFlow
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
             with open(path, "rb") as f:
                 content = f.read()
                 result.bytes_scanned = len(content)
 
-                saved_model = SavedModelType()
+                saved_model = SavedModel()
                 saved_model.ParseFromString(content)
+                for op_info in self._scan_tf_operations(saved_model):
+                    result.add_check(
+                        name="TensorFlow Operation Security Check",
+                        passed=False,
+                        message=f"Dangerous TensorFlow operation: {op_info['operation']}",
+                        severity=op_info["severity"],
+                        location=f"{self.current_file_path} (node: {op_info['node_name']})",
+                        details={
+                            "op_type": op_info["operation"],
+                            "node_name": op_info["node_name"],
+                            "meta_graph": op_info.get("meta_graph", "unknown"),
+                        },
+                        why=get_tf_op_explanation(op_info["operation"]),
+                    )
 
                 self._analyze_saved_model(saved_model, result)
 
@@ -240,6 +278,31 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _scan_tf_operations(self, saved_model: Any) -> list[dict[str, Any]]:
+        """Scan TensorFlow graph for dangerous operations (generic pass)"""
+        dangerous_ops: list[dict[str, Any]] = []
+        try:
+            for meta_graph in saved_model.meta_graphs:
+                graph_def = meta_graph.graph_def
+                for node in graph_def.node:
+                    # Skip Python ops here; they are handled by _check_python_op
+                    if node.op in PYTHON_OPS:
+                        continue
+                    if node.op in DANGEROUS_TF_OPERATIONS:
+                        dangerous_ops.append(
+                            {
+                                "operation": node.op,
+                                "node_name": node.name,
+                                "severity": DANGEROUS_TF_OPERATIONS[node.op],
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            }
+                        )
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Failed to iterate TensorFlow graph: {e}")
+        return dangerous_ops
+
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
         suspicious_op_found = False
@@ -251,19 +314,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Scan all nodes in the graph for suspicious operations
             for node in graph_def.node:
                 # Count all operation types
-                if node.op in op_counts:
-                    op_counts[node.op] += 1
-                else:
-                    op_counts[node.op] = 1
+                op_counts[node.op] = op_counts.get(node.op, 0) + 1
 
-                # Check if the operation is suspicious
                 if node.op in self.suspicious_ops:
                     suspicious_op_found = True
 
                     # Special handling for PyFunc/PyCall - try to extract and validate Python code
-                    if node.op in ["PyFunc", "PyCall"]:
+                    if node.op in PYTHON_OPS:
                         self._check_python_op(node, result, meta_graph)
-                    else:
+                    elif node.op not in DANGEROUS_TF_OPERATIONS:
                         result.add_check(
                             name="TensorFlow Operation Security Check",
                             passed=False,
@@ -280,6 +339,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                             why=get_tf_op_explanation(node.op),
                         )
+                    # else: already reported by generic dangerous-op pass
 
                 # Check for StatefulPartitionedCall which can contain custom functions
                 if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
@@ -327,6 +387,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
         result.metadata["suspicious_op_found"] = suspicious_op_found
+
+        # Enhanced protobuf vulnerability scanning
+        self._scan_protobuf_vulnerabilities(saved_model, result)
 
     def _check_python_op(self, node: Any, result: ScanResult, meta_graph: Any) -> None:
         """Check PyFunc/PyCall operations for embedded Python code"""
@@ -515,7 +578,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     found_patterns.append(pattern)
 
                             if found_patterns:
-                                result.add_issue(
+                                result.add_check(
+                                    name="Lambda Layer Security Check",
+                                    passed=False,
                                     message=f"Lambda layer contains dangerous code: {', '.join(found_patterns)}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=path,
@@ -619,3 +684,104 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+
+    def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
+        """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
+
+        # Check for malicious string data in protobuf fields
+        self._check_protobuf_string_injection(saved_model, result)
+
+    def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
+        """Check for string injection attacks in protobuf fields"""
+
+        # Patterns that indicate potential injection attacks
+        injection_patterns = [
+            # Code injection patterns
+            (r"eval\s*\(", "code_injection", "eval function call"),
+            (r"exec\s*\(", "code_injection", "exec function call"),
+            (r"__import__\s*\(", "code_injection", "import function call"),
+            (r"compile\s*\(", "code_injection", "compile function call"),
+            (r"os\.system\s*\(", "system_command", "OS system call"),
+            (r"subprocess\.[a-zA-Z_]+\s*\(", "system_command", "subprocess call"),
+            # Path traversal patterns
+            (r"\.\./+", "path_traversal", "directory traversal"),
+            (r"\.\.\\+", "path_traversal", "Windows directory traversal"),
+            (r"/etc/passwd", "path_traversal", "system file access"),
+            (r"/proc/", "path_traversal", "proc filesystem access"),
+            # Encoding bypass attempts
+            (r"\\x[0-9a-fA-F]{2}", "encoding_bypass", "hex encoding"),
+            (r"\\u[0-9a-fA-F]{4}", "encoding_bypass", "unicode escape"),
+            (r"%[0-9a-fA-F]{2}", "encoding_bypass", "URL encoding"),
+            # Script injection
+            (r"<script[^>]*>", "script_injection", "HTML script tag"),
+            (r"javascript:", "script_injection", "JavaScript URI"),
+            (r"vbscript:", "script_injection", "VBScript URI"),
+            # Base64 encoded payloads
+            (r"[A-Za-z0-9+/]{20,}={0,2}", "encoded_payload", "potential base64 payload"),
+        ]
+
+        import re
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+
+            for node in graph_def.node:
+                # Check string values in node attributes
+                if hasattr(node, "attr"):
+                    for attr_name, attr_value in node.attr.items():
+                        string_vals_to_check = []
+
+                        # Extract string values from different attribute types
+                        if hasattr(attr_value, "s"):  # String attribute
+                            try:
+                                string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                            except (UnicodeDecodeError, AttributeError):
+                                continue
+
+                        elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
+                            for s_val in attr_value.list.s:
+                                try:
+                                    string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
+                                except (UnicodeDecodeError, AttributeError):
+                                    continue
+
+                        # Check each string value against injection patterns
+                        for string_val in string_vals_to_check:
+                            if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
+                                result.add_check(
+                                    name="Protobuf String Length Check",
+                                    passed=False,
+                                    message=f"Abnormally long string in node attribute (length: {len(string_val)})",
+                                    severity=IssueSeverity.INFO,
+                                    location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
+                                    details={
+                                        "node_name": node.name,
+                                        "attribute_name": attr_name,
+                                        "string_length": len(string_val),
+                                        "attack_type": "protobuf_string_bomb",
+                                    },
+                                )
+                                continue
+
+                            for pattern, attack_type, description in injection_patterns:
+                                matches = re.findall(pattern, string_val, re.IGNORECASE)
+                                if matches:
+                                    result.add_check(
+                                        name="Protobuf String Injection Check",
+                                        passed=False,
+                                        message=f"Potential {description} detected in protobuf string",
+                                        severity=IssueSeverity.CRITICAL
+                                        if attack_type in ["code_injection", "system_command"]
+                                        else IssueSeverity.WARNING,
+                                        location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
+                                        details={
+                                            "node_name": node.name,
+                                            "attribute_name": attr_name,
+                                            "pattern_matched": pattern,
+                                            "matches": matches[:5],  # Limit to first 5 matches
+                                            "attack_type": attack_type,
+                                            "description": description,
+                                            "total_matches": len(matches),
+                                        },
+                                    )
+                                    break  # Only report first match per string to avoid spam

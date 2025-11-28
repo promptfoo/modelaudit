@@ -4,8 +4,33 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+
+
+# ============================================================================
+# Framework availability detection (cached for performance)
+# ============================================================================
+def _check_framework(name: str) -> bool:
+    """Check if a framework is available."""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+# Cache framework availability at module load time
+HAS_TENSORFLOW = _check_framework("tensorflow")
+HAS_TORCH = _check_framework("torch")
+HAS_ONNX = _check_framework("onnx")
+HAS_H5PY = _check_framework("h5py")
+HAS_MSGPACK = _check_framework("msgpack")
+HAS_XGBOOST = _check_framework("xgboost")
+HAS_SAFETENSORS = _check_framework("safetensors")
+HAS_JOBLIB = _check_framework("joblib")
+HAS_DILL = _check_framework("dill")
 
 
 @pytest.fixture(autouse=True)
@@ -105,8 +130,8 @@ def mock_progress_callback():
         progress_percentages.append(percentage)
 
     # Add the recorded messages and percentages as attributes
-    progress_callback.messages = progress_messages
-    progress_callback.percentages = progress_percentages
+    progress_callback.messages = progress_messages  # type: ignore[attr-defined]
+    progress_callback.percentages = progress_percentages  # type: ignore[attr-defined]
 
     return progress_callback
 
@@ -141,6 +166,7 @@ def performance_markers():
 # Configure pytest to handle missing optional dependencies gracefully
 def pytest_configure(config):
     """Configure pytest with custom markers."""
+    # Test category markers
     config.addinivalue_line(
         "markers",
         "slow: mark test as slow (deselect with '-m \"not slow\"')",
@@ -150,6 +176,65 @@ def pytest_configure(config):
         "markers",
         "performance: mark test as performance benchmark",
     )
+
+    # Framework-specific markers (tests auto-skip if framework unavailable)
+    config.addinivalue_line(
+        "markers",
+        "tensorflow: mark test as requiring TensorFlow",
+    )
+    config.addinivalue_line(
+        "markers",
+        "pytorch: mark test as requiring PyTorch",
+    )
+    config.addinivalue_line(
+        "markers",
+        "onnx: mark test as requiring ONNX",
+    )
+    config.addinivalue_line(
+        "markers",
+        "h5py: mark test as requiring h5py",
+    )
+    config.addinivalue_line(
+        "markers",
+        "msgpack: mark test as requiring msgpack",
+    )
+    config.addinivalue_line(
+        "markers",
+        "xgboost: mark test as requiring XGBoost",
+    )
+    config.addinivalue_line(
+        "markers",
+        "safetensors: mark test as requiring safetensors",
+    )
+    config.addinivalue_line(
+        "markers",
+        "joblib: mark test as requiring joblib",
+    )
+    config.addinivalue_line(
+        "markers",
+        "dill: mark test as requiring dill",
+    )
+
+
+def pytest_runtest_setup(item):
+    """Auto-skip tests based on framework markers when framework is unavailable."""
+    # Map markers to availability flags
+    framework_markers = {
+        "tensorflow": HAS_TENSORFLOW,
+        "pytorch": HAS_TORCH,
+        "onnx": HAS_ONNX,
+        "h5py": HAS_H5PY,
+        "msgpack": HAS_MSGPACK,
+        "xgboost": HAS_XGBOOST,
+        "safetensors": HAS_SAFETENSORS,
+        "joblib": HAS_JOBLIB,
+        "dill": HAS_DILL,
+    }
+
+    for marker_name, is_available in framework_markers.items():
+        marker = item.get_closest_marker(marker_name)
+        if marker is not None and not is_available:
+            pytest.skip(f"{marker_name} is not installed")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -168,6 +253,88 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.slow)
 
 
+@pytest.fixture
+def mock_scanner_registry():
+    """Mock scanner registry to avoid loading heavy ML dependencies."""
+    with patch("modelaudit.scanners.SCANNER_REGISTRY") as mock_registry:
+        # Create lightweight mock scanners
+        mock_pickle_scanner = Mock()
+        mock_pickle_scanner.can_handle.return_value = True
+        mock_pickle_scanner.scan.return_value = Mock(issues=[], files_scanned=1)
+
+        mock_registry.__iter__.return_value = [mock_pickle_scanner]
+        yield mock_registry
+
+
+@pytest.fixture
+def mock_ml_dependencies():
+    """Mock heavy ML dependencies to prevent imports during unit tests."""
+    mocks = {}
+
+    # Mock TensorFlow
+    mock_tf = MagicMock()
+    mock_tf.__version__ = "2.13.0"
+    mocks["tensorflow"] = mock_tf
+
+    # Mock Keras
+    mock_keras = MagicMock()
+    mock_keras.__version__ = "2.13.0"
+    mocks["keras"] = mock_keras
+
+    # Mock PyTorch
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.6.0"
+    mocks["torch"] = mock_torch
+
+    # Mock pandas/pyarrow that causes the crash
+    mock_pandas = MagicMock()
+    mocks["pandas"] = mock_pandas
+
+    with patch.dict("sys.modules", mocks):
+        yield mocks
+
+
+@pytest.fixture
+def mock_cli_scan_command():
+    """Mock the CLI scan command to avoid heavy dependency loading."""
+    # Mock the core scan function that the CLI actually uses
+    # Create complete mock data matching ModelAuditResultModel structure
+    import time
+
+    current_time = time.time()
+
+    mock_result_dict = {
+        "files_scanned": 1,
+        "bytes_scanned": 1024,
+        "duration": 0.1,
+        "issues": [],  # Use empty list to avoid Issue object complications
+        "checks": [],  # Required field
+        "assets": [],  # Required field
+        "has_errors": False,
+        "scanner_names": ["test_scanner"],  # Required field
+        "file_metadata": {},  # Required field
+        "start_time": current_time,  # Required field
+        "total_checks": 1,  # Required field
+        "passed_checks": 1,  # Required field
+        "failed_checks": 0,  # Required field
+        "success": True,
+    }
+
+    with patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan:
+        # Create a mock ModelAuditResultModel that properly exposes attributes
+        mock_model = Mock()
+        mock_model.model_dump.return_value = mock_result_dict
+
+        # Ensure the mock exposes the attributes the CLI expects
+        mock_model.issues = mock_result_dict["issues"]
+        mock_model.files_scanned = mock_result_dict["files_scanned"]
+        mock_model.bytes_scanned = mock_result_dict["bytes_scanned"]
+        mock_model.has_errors = mock_result_dict["has_errors"]
+
+        mock_scan.return_value = mock_model
+        yield mock_scan
+
+
 @pytest.fixture(autouse=True)
 def cleanup_test_files():
     """Ensure test files are cleaned up after each test."""
@@ -182,3 +349,55 @@ def cleanup_test_files():
                     shutil.rmtree(file)
             except (OSError, PermissionError):
                 pass  # Ignore cleanup errors
+
+
+# =============================================================================
+# Common file creation fixtures
+# =============================================================================
+@pytest.fixture
+def safe_pickle_file(tmp_path):
+    """Create a safe pickle file for testing."""
+    path = tmp_path / "safe_model.pkl"
+    data = {"model": "test", "weights": [1.0, 2.0, 3.0]}
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    return path
+
+
+@pytest.fixture
+def malicious_pickle_file(tmp_path):
+    """Create a malicious pickle file for testing detection."""
+    path = tmp_path / "malicious.pkl"
+    # os.system payload
+    path.write_bytes(b"cos\nsystem\n(S'echo pwned'\ntR.")
+    return path
+
+
+@pytest.fixture
+def mock_pytorch_zip(tmp_path):
+    """Create a mock PyTorch ZIP model file."""
+    path = tmp_path / "model.pt"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("version", "3")
+        data = pickle.dumps({"model": "pytorch_test"})
+        zf.writestr("data.pkl", data)
+    return path
+
+
+@pytest.fixture
+def model_directory(tmp_path):
+    """Create a directory with various model files for comprehensive testing."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    # Create pickle file
+    pickle_path = model_dir / "model.pkl"
+    with open(pickle_path, "wb") as f:
+        pickle.dump({"weights": [1, 2, 3]}, f)
+
+    # Create a subdirectory
+    sub_dir = model_dir / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "config.json").write_text('{"name": "test"}')
+
+    return model_dir

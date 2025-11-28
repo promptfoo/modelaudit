@@ -277,5 +277,5 @@ class TestCacheEfficiency:
         assert len(list1) == len(list2)
 
         # The classes should be the same instances (cached)
-        for scanner1, scanner2 in zip(list1, list2):
+        for scanner1, scanner2 in zip(list1, list2, strict=False):
             assert scanner1 is scanner2

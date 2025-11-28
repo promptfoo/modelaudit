@@ -121,7 +121,7 @@ class GgufScanner(BaseScanner):
                         name="File Format Recognition",
                         passed=False,
                         message=f"Unrecognized file format: {magic!r}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"magic_bytes": magic.hex()},
                         rule_code="S903",
@@ -133,7 +133,7 @@ class GgufScanner(BaseScanner):
                 name="GGUF/GGML File Scan",
                 passed=False,
                 message=f"Error scanning GGUF/GGML file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
                 rule_code="S1005",  # Invalid signature/corrupted file
@@ -147,7 +147,18 @@ class GgufScanner(BaseScanner):
         return result
 
     def _read_string(self, f: BinaryIO, max_length: int = 1024 * 1024) -> str:
-        """Read a string with length checking for security."""
+        """Read a string with length checking for security.
+
+        Args:
+            f: Binary file to read from
+            max_length: Maximum allowed string length (default 1MB)
+
+        Returns:
+            Decoded UTF-8 string
+
+        Raises:
+            ValueError: String length exceeds limit, unexpected EOF, or other parsing error
+        """
         (length,) = struct.unpack("<Q", f.read(8))
         if length > max_length:
             raise ValueError(f"String length {length} exceeds maximum {max_length}")
@@ -172,35 +183,12 @@ class GgufScanner(BaseScanner):
             },
         )
 
-        # Security checks on header values
-        if n_kv > 1_000_000:
-            result.add_check(
-                name="GGUF Header KV Count Validation",
-                passed=False,
-                message=f"GGUF header appears invalid (declared {n_kv} KV entries)",
-                severity=IssueSeverity.CRITICAL,
-                location=self.current_file_path,
-                details={"kv_count": n_kv, "max_allowed": 1_000_000},
-            )
-            return
-
-        if n_tensors > 100_000:
-            result.add_check(
-                name="GGUF Header Tensor Count Validation",
-                passed=False,
-                message=f"GGUF header appears invalid (declared {n_tensors} tensors)",
-                severity=IssueSeverity.CRITICAL,
-                location=self.current_file_path,
-                details={"tensor_count": n_tensors, "max_allowed": 100_000},
-            )
-            return
-
         if file_size < 24:
             result.add_check(
                 name="GGUF File Size Validation",
                 passed=False,
                 message="File too small to contain GGUF metadata",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 24},
                 rule_code="S902",
@@ -210,7 +198,7 @@ class GgufScanner(BaseScanner):
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
         try:
-            for _i in range(min(n_kv, 10000)):  # Limit to prevent DoS
+            for _i in range(n_kv):
                 key = self._read_string(f)
 
                 # Security check for suspicious keys
@@ -243,45 +231,52 @@ class GgufScanner(BaseScanner):
 
             result.metadata["metadata"] = metadata
         except Exception as e:
+            # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
                 name="GGUF Metadata Parsing",
                 passed=False,
                 message=f"GGUF metadata parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
             return
 
-        # Validate alignment
-        alignment = metadata.get("general.alignment", 32)
-        if alignment < 8 or alignment % 8 != 0 or alignment > 1024:
-            result.add_check(
-                name="GGUF Alignment Validation",
-                passed=False,
-                message=f"Invalid alignment value: {alignment}",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={"alignment": alignment, "valid_range": "8-1024, multiple of 8"},
-                rule_code="S902",
-            )
-
         # Align to tensor data
-        current = f.tell()
-        pad = (alignment - (current % alignment)) % alignment
-        if pad:
-            f.seek(pad, os.SEEK_CUR)
+        # Note: general.alignment may be absent in files created by some tools (e.g., llama.cpp).
+        # Only apply alignment if explicitly specified in metadata.
+        metadata_end = f.tell()
+        alignment = metadata.get("general.alignment")
+
+        if alignment is not None:
+            # Accept only positive power-of-two integers
+            if isinstance(alignment, int) and alignment > 0 and (alignment & (alignment - 1)) == 0:
+                # Explicit alignment specified - apply it
+                pad = (alignment - (metadata_end % alignment)) % alignment
+                if pad:
+                    f.seek(pad, os.SEEK_CUR)
+            else:
+                result.add_check(
+                    name="GGUF Alignment Validation",
+                    passed=False,
+                    message=f"Invalid alignment value: {alignment}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={"alignment": alignment, "requirement": "power-of-two positive integer"},
+                    rule_code="S902",
+                )
+                alignment = None
 
         # Parse tensor information
         tensors = []
         try:
-            for _i in range(min(n_tensors, 10000)):  # Limit to prevent DoS
+            for _i in range(n_tensors):
                 t_name = self._read_string(f)
                 (nd,) = struct.unpack("<I", f.read(4))
 
                 # Hard limit on dimensions to prevent DoS attacks
-                if nd > 1000:  # Extremely large dimension count - skip this tensor
+                if nd > 1000:
                     result.add_check(
                         name="Tensor Dimension Validation",
                         passed=False,
@@ -295,7 +290,7 @@ class GgufScanner(BaseScanner):
                     f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
                     continue
 
-                if nd > 8:  # Reasonable limit for tensor dimensions
+                if nd > 8:
                     result.add_check(
                         name="Tensor Dimension Count Check",
                         passed=False,
@@ -320,15 +315,36 @@ class GgufScanner(BaseScanner):
                 )
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
+            result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
         except Exception as e:
+            # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
                 name="GGUF Tensor Parsing",
                 passed=False,
                 message=f"GGUF tensor parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
+            )
+            return
+
+        # Calculate tensor data section start (offsets in tensor info are relative to this)
+        # According to GGUF spec, tensor data is aligned after tensor info section
+        tensor_info_end = f.tell()
+        # Use default 32-byte alignment if not specified (GGUF spec default)
+        tensor_data_alignment = metadata.get("general.alignment", 32)
+        pad_to_tensor_data = (tensor_data_alignment - (tensor_info_end % tensor_data_alignment)) % tensor_data_alignment
+        tensor_data_start = tensor_info_end + pad_to_tensor_data
+        # Only check bounds if there are tensors (empty models don't have tensor data)
+        if n_tensors > 0 and tensor_data_start > file_size:
+            result.add_check(
+                name="Tensor Data Section Bounds",
+                passed=False,
+                message="Tensor data start exceeds file size",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"tensor_data_start": tensor_data_start, "file_size": file_size},
             )
             return
 
@@ -343,7 +359,7 @@ class GgufScanner(BaseScanner):
                             name="Tensor Dimension Value Validation",
                             passed=False,
                             message=f"Tensor {tensor['name']} has invalid dimension: {d}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "invalid_dimension": d},
                             rule_code="S902",
@@ -383,6 +399,7 @@ class GgufScanner(BaseScanner):
                     )
 
                 # Validate tensor type and size
+                # Note: tensor offsets are relative to tensor_data_start, not file start
                 info = _GGML_TYPE_INFO.get(tensor["type"])
                 if info:
                     blck, ts = info
@@ -398,17 +415,41 @@ class GgufScanner(BaseScanner):
                         )
 
                     expected = ((nelements + blck - 1) // blck) * ts
-                    next_offset = tensors[idx + 1]["offset"] if idx + 1 < len(tensors) else file_size
-                    actual = next_offset - tensor["offset"]
 
-                    if expected != actual:
+                    # Calculate actual size: use next tensor's offset, or file size for last tensor
+                    if idx + 1 < len(tensors):
+                        next_offset = tensors[idx + 1]["offset"]
+                        if next_offset < tensor["offset"]:
+                            result.add_check(
+                                name="Tensor Offset Order Validation",
+                                passed=False,
+                                message=f"Non-monotonic offsets for tensor {tensor['name']}",
+                                severity=IssueSeverity.WARNING,
+                                location=self.current_file_path,
+                                details={"current_offset": tensor["offset"], "next_offset": next_offset},
+                            )
+                            continue
+                        actual = next_offset - tensor["offset"]
+                    else:
+                        # Last tensor: calculate from absolute position to end of file
+                        tensor_abs_start = tensor_data_start + tensor["offset"]
+                        actual = file_size - tensor_abs_start
+
+                    # Allow for alignment padding (tensors may be aligned to 32 bytes)
+                    # Only flag if difference is more than alignment padding
+                    if abs(expected - actual) > tensor_data_alignment:
                         result.add_check(
                             name="Tensor Size Consistency Check",
                             passed=False,
                             message=f"Size mismatch for tensor {tensor['name']}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "expected": expected, "actual": actual},
+                            details={
+                                "tensor_name": tensor["name"],
+                                "expected": expected,
+                                "actual": actual,
+                                "alignment_tolerance": tensor_data_alignment,
+                            },
                             rule_code="S902",
                         )
             except (OverflowError, ValueError) as e:
@@ -416,7 +457,7 @@ class GgufScanner(BaseScanner):
                     name="Tensor Validation Error",
                     passed=False,
                     message=f"Error validating tensor {tensor['name']}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"tensor_name": tensor["name"], "error": str(e)},
                     rule_code="S703",
@@ -440,7 +481,7 @@ class GgufScanner(BaseScanner):
                 name="GGML File Size Validation",
                 passed=False,
                 message="File too small to be valid GGML",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={"file_size": file_size, "min_required": 32},
                 rule_code="S1005",  # Invalid signature/corrupted file
@@ -455,7 +496,7 @@ class GgufScanner(BaseScanner):
                     name="GGML Header Integrity Check",
                     passed=False,
                     message="Truncated GGML header",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"header_bytes_read": len(version_bytes), "expected": 4},
                     rule_code="S902",
@@ -511,8 +552,6 @@ class GgufScanner(BaseScanner):
         if vtype == 9:  # ARRAY
             subtype = struct.unpack("<I", f.read(4))[0]
             (count,) = struct.unpack("<Q", f.read(8))
-            if count > 10000:  # Prevent DoS
-                raise ValueError(f"Array too large: {count} elements")
             return [self._read_value(f, subtype) for _ in range(count)]
         if vtype == 10:  # UINT64
             return struct.unpack("<Q", f.read(8))[0]

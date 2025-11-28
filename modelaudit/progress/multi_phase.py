@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional  # noqa: UP035
+from typing import Any
 
 from .base import ProgressPhase, ProgressReporter, ProgressStats, ProgressTracker
 
@@ -17,11 +17,11 @@ class PhaseStats:
 
     phase: ProgressPhase
     start_time: float = field(default_factory=time.time)
-    end_time: Optional[float] = None
+    end_time: float | None = None
     bytes_processed: int = 0
     items_processed: int = 0
     estimated_duration: float = 0.0
-    actual_duration: Optional[float] = None
+    actual_duration: float | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -41,11 +41,11 @@ class MultiPhaseProgressTracker(ProgressTracker):
 
     def __init__(
         self,
-        phases: List[ProgressPhase],  # noqa: UP006
+        phases: list[ProgressPhase],
         total_bytes: int = 0,
         total_items: int = 0,
-        phase_weights: Optional[dict[ProgressPhase, float]] = None,
-        reporters: Optional[List[ProgressReporter]] = None,  # noqa: UP006
+        phase_weights: dict[ProgressPhase, float] | None = None,
+        reporters: list[ProgressReporter] | None = None,
         update_interval: float = 1.0,
     ):
         """Initialize multi-phase progress tracker.
@@ -67,7 +67,7 @@ class MultiPhaseProgressTracker(ProgressTracker):
         # Phase tracking
         self._current_phase_index = 0
         self._phase_stats: dict[ProgressPhase, PhaseStats] = {}
-        self._completed_phases: List[ProgressPhase] = []  # noqa: UP006
+        self._completed_phases: list[ProgressPhase] = []
 
         # Initialize phase stats
         for phase in phases:
@@ -156,7 +156,7 @@ class MultiPhaseProgressTracker(ProgressTracker):
         """Get statistics for all phases."""
         return self._phase_stats.copy()
 
-    def get_current_phase_stats(self) -> Optional[PhaseStats]:
+    def get_current_phase_stats(self) -> PhaseStats | None:
         """Get statistics for current phase."""
         return self._phase_stats.get(self.stats.current_phase)
 
@@ -291,7 +291,7 @@ class MultiPhaseProgressTracker(ProgressTracker):
 class CheckpointProgressTracker(MultiPhaseProgressTracker):
     """Progress tracker with checkpoint/resume capability."""
 
-    def __init__(self, phases: List[ProgressPhase], checkpoint_file: Optional[str] = None, **kwargs):  # noqa: UP006
+    def __init__(self, phases: list[ProgressPhase], checkpoint_file: str | None = None, **kwargs: Any):
         """Initialize checkpoint progress tracker.
 
         Args:

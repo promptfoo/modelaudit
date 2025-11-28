@@ -1,7 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import os
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 
@@ -12,7 +12,7 @@ class TextScanner(BaseScanner):
     name = "text"
     supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with optional configuration."""
         super().__init__(config)
 
@@ -43,7 +43,7 @@ class TextScanner(BaseScanner):
 
         return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
-    def scan(self, path: str, timeout: Optional[int] = None) -> ScanResult:
+    def scan(self, path: str, timeout: int | None = None) -> ScanResult:
         """Scan a text file for security issues."""
         result = ScanResult(scanner_name=self.name)
 

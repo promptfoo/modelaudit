@@ -10,9 +10,10 @@ import mmap
 import os
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..scanners.base import IssueSeverity, ScanResult
 
@@ -46,7 +47,7 @@ class ShardedModelDetector:
     ]
 
     @classmethod
-    def detect_shards(cls, file_path: str) -> Optional[dict[str, Any]]:
+    def detect_shards(cls, file_path: str) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
 
@@ -82,7 +83,7 @@ class ShardedModelDetector:
         return None
 
     @classmethod
-    def find_model_config(cls, file_path: str) -> Optional[str]:
+    def find_model_config(cls, file_path: str) -> str | None:
         """Find the configuration file for a sharded model."""
         dir_path = Path(file_path).parent
 
@@ -118,7 +119,7 @@ class MemoryMappedScanner:
         self.scanner = scanner
         self.file_size = os.path.getsize(file_path)
 
-    def scan_with_mmap(self, progress_callback: Optional[Callable[[str, float], None]] = None) -> ScanResult:
+    def scan_with_mmap(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         """
         Scan file using memory mapping.
 
@@ -166,8 +167,10 @@ class MemoryMappedScanner:
 
         except Exception as e:
             logger.error(f"Error during memory-mapped scanning: {e}")
-            result.add_issue(
-                f"Memory-mapped scan error: {e!s}",
+            result.add_check(
+                name="Memory-Mapped Scan",
+                passed=False,
+                message=f"Memory-mapped scan error: {e!s}",
                 severity=IssueSeverity.WARNING,
                 details={"error": str(e), "bytes_scanned": bytes_scanned},
             )
@@ -205,8 +208,10 @@ class MemoryMappedScanner:
 
             for pattern, message in suspicious_patterns:
                 if pattern in data:
-                    result.add_issue(
-                        message,
+                    result.add_check(
+                        name="Suspicious Pattern Detection",
+                        passed=False,
+                        message=message,
                         severity=IssueSeverity.CRITICAL,
                         location=f"offset {offset:,}",
                         details={"pattern": pattern.decode("utf-8", errors="ignore"), "offset": offset},
@@ -238,7 +243,7 @@ class ParallelShardScanner:
         self.shard_info = shard_info
         self.scanner_class = scanner_class
 
-    def scan_shards(self, progress_callback: Optional[Callable[[str, float], None]] = None) -> ScanResult:
+    def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         """
         Scan all shards in parallel.
 
@@ -254,8 +259,10 @@ class ParallelShardScanner:
         completed_shards = 0
 
         # Add info about sharded model
-        result.add_issue(
-            f"Scanning sharded model with {total_shards} parts",
+        result.add_check(
+            name="Sharded Model Detection",
+            passed=True,
+            message=f"Scanning sharded model with {total_shards} parts",
             severity=IssueSeverity.INFO,
             details={
                 "total_shards": total_shards,
@@ -283,8 +290,10 @@ class ParallelShardScanner:
 
                 except Exception as e:
                     logger.error(f"Error scanning shard {shard}: {e}")
-                    result.add_issue(
-                        f"Error scanning shard: {Path(shard).name}",
+                    result.add_check(
+                        name="Shard Scan",
+                        passed=False,
+                        message=f"Error scanning shard: {Path(shard).name}",
                         severity=IssueSeverity.WARNING,
                         location=shard,
                         details={"error": str(e)},
@@ -306,7 +315,7 @@ class AdvancedFileHandler:
         self,
         file_path: str,
         scanner: Any,
-        progress_callback: Optional[Callable[[str, float], None]] = None,
+        progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 7200,  # 2 hours for large models
     ):
         """
@@ -371,8 +380,10 @@ class AdvancedFileHandler:
                 with open(config_path) as f:
                     config_content = f.read(10240)  # Read first 10KB
                     if "torch_dtype" in config_content:
-                        result.add_issue(
-                            "PyTorch model configuration detected",
+                        result.add_check(
+                            name="PyTorch Configuration Detection",
+                            passed=True,
+                            message="PyTorch model configuration detected",
                             severity=IssueSeverity.INFO,
                             location=config_path,
                             details={"config_file": config_path},
@@ -395,12 +406,14 @@ class AdvancedFileHandler:
 
     def _scan_large_file_distributed(self) -> ScanResult:
         """Scan large files using memory-mapped approach with FULL security checks."""
-        logger.info(f"Scanning file ({self.total_size:,} bytes) with full security checks")
+        logger.debug(f"Scanning file ({self.total_size:,} bytes) with full security checks")
 
         # Add informational note about file size
         result = ScanResult(scanner_name=self.scanner.name)
-        result.add_issue(
-            f"Scanning file ({self.total_size:,} bytes) - processing may take additional time",
+        result.add_check(
+            name="Large File Detection",
+            passed=True,
+            message=f"Scanning file ({self.total_size:,} bytes) - processing may take additional time",
             severity=IssueSeverity.INFO,
             details={
                 "file_size": self.total_size,
@@ -489,11 +502,63 @@ def should_use_advanced_handler(file_path: str) -> bool:
 def scan_advanced_large_file(
     file_path: str,
     scanner: Any,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
 ) -> ScanResult:
     """
     Scan a large file with advanced handler.
+
+    Args:
+        file_path: Path to scan
+        scanner: Scanner instance
+        progress_callback: Progress callback
+        timeout: Maximum scan time
+
+    Returns:
+        ScanResult with findings
+    """
+    # Check if caching is enabled in scanner config
+    config = getattr(scanner, "config", {})
+    cache_enabled = config.get("cache_enabled", True)
+    cache_dir = config.get("cache_dir")
+
+    # If caching is disabled, proceed with direct scan
+    if not cache_enabled:
+        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+    # Use cache manager for advanced large file scans
+    try:
+        from ...cache import get_cache_manager
+
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+
+        # Create wrapper function for cache manager
+        def cached_advanced_scan_wrapper(fpath: str) -> dict:
+            result = _scan_advanced_large_file_internal(fpath, scanner, progress_callback, timeout)
+            return result.to_dict()
+
+        # Get cached result or perform scan
+        result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan_wrapper)
+
+        # Convert back to ScanResult
+        from .helpers.result_conversion import scan_result_from_dict
+
+        return scan_result_from_dict(result_dict)
+
+    except Exception as e:
+        # If cache system fails, fall back to direct scanning
+        logger.warning(f"Advanced file cache error for {file_path}: {e}. Falling back to direct scan.")
+        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+
+
+def _scan_advanced_large_file_internal(
+    file_path: str,
+    scanner: Any,
+    progress_callback: Callable[[str, float], None] | None = None,
+    timeout: int = 7200,
+) -> ScanResult:
+    """
+    Internal implementation of advanced large file scanning (cache-agnostic).
 
     Args:
         file_path: Path to scan

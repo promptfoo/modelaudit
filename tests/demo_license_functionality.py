@@ -177,7 +177,7 @@ def demonstrate_license_features():
     print(f"   ⚠️  License issues detected: {len(license_issues)}")
 
     # Categorize license issues
-    issue_types = {}
+    issue_types: dict[str, int] = {}
     for issue in license_issues:
         message = issue.get("message", "")
         if "AGPL" in message:
@@ -249,7 +249,7 @@ def show_usage_examples():
         },
         {
             "description": "Scan with custom file size limits",
-            "command": "modelaudit scan ./large_model --max-file-size 1073741824",
+            "command": "modelaudit scan ./large_model --max-size 1GB",
         },
     ]
 

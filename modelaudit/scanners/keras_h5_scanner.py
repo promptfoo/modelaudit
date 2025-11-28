@@ -1,17 +1,17 @@
 import json
 import os
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import (
+from modelaudit.detectors.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_LAYER_TYPES,
 )
-from modelaudit.utils.code_validation import (
+from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
 
-from ..explanations import get_pattern_explanation
+from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import h5py, but handle the case where it's not installed
@@ -30,7 +30,7 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
         self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
@@ -82,7 +82,7 @@ class KerasH5Scanner(BaseScanner):
                 name="H5PY Library Check",
                 passed=False,
                 message="h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "h5py"},
                 rule_code="S902",
@@ -148,7 +148,7 @@ class KerasH5Scanner(BaseScanner):
                         name="Model Config Type Validation",
                         passed=False,
                         message=f"Invalid model config type: expected dict, got {type(model_config).__name__}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
@@ -161,7 +161,7 @@ class KerasH5Scanner(BaseScanner):
                         name="Custom Objects Security Check",
                         passed=False,
                         message="Model contains custom objects which could contain arbitrary code",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{self.current_file_path} (model_config)",
                         rule_code="S302",
                         details={"custom_objects": custom_objects_list},
@@ -172,7 +172,7 @@ class KerasH5Scanner(BaseScanner):
                     training_config = json.loads(f.attrs["training_config"])
                     if "metrics" in training_config and training_config["metrics"] is not None:
                         metrics_list = training_config["metrics"]
-                        if not isinstance(metrics_list, (list, tuple)):
+                        if not isinstance(metrics_list, list | tuple):
                             metrics_list = []
                         for metric in metrics_list:
                             if isinstance(metric, dict) and metric.get(
@@ -231,7 +231,7 @@ class KerasH5Scanner(BaseScanner):
                     passed=False,
                     message=f"Invalid layers type: expected list, got {type(layers_value).__name__}",
                     rule_code="S902",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
                 )
@@ -247,7 +247,7 @@ class KerasH5Scanner(BaseScanner):
                     passed=False,
                     message=f"Invalid layer type: expected dict, got {type(layer).__name__}",
                     rule_code="S902",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"actual_type": type(layer).__name__, "expected_type": "dict"},
                 )

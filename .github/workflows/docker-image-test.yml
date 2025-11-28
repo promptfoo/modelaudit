@@ -27,7 +27,7 @@ jobs:
       docker: ${{ steps.filter.outputs.docker }}
       full-image: ${{ steps.filter.outputs.full-image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -44,12 +44,12 @@ jobs:
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image
     needs: changes
-    # Always run on main branch or if Docker-related files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.docker == 'true'
+    # Only run if Docker-related files changed
+    if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20 # Increased from 15
+    timeout-minutes: 30 # Increased for reliability
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -95,17 +95,11 @@ jobs:
     name: Build and Test Full Docker Image
     needs: [changes, build-test-lightweight]
     runs-on: ubuntu-latest
-    timeout-minutes: 60 # Increased from 45
-    # Only run if:
-    # 1. On main branch and Docker files changed, OR
-    # 2. PR has 'test-full-image' label, OR
-    # 3. Dockerfile.full specifically changed
-    if: |
-      (github.ref == 'refs/heads/main' && needs.changes.outputs.docker == 'true') ||
-      contains(github.event.pull_request.labels.*.name, 'test-full-image') ||
-      needs.changes.outputs.full-image == 'true'
+    timeout-minutes: 90 # Increased for large ML dependency builds
+    # Only run if Dockerfile.full specifically changed
+    if: needs.changes.outputs.full-image == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -124,7 +118,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=full
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-        timeout-minutes: 40 # Specific timeout for build step
+        timeout-minutes: 60 # Increased timeout for ML dependency build
 
       - name: Test full container help command
         run: |

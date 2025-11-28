@@ -2,14 +2,14 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from modelaudit.analysis.anomaly_detector import AnomalyDetector
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
+from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase, FrameworkType
 from modelaudit.analysis.semantic_analyzer import CodeRiskLevel, SemanticAnalyzer
-from modelaudit.context.unified_context import ModelArchitecture, UnifiedMLContext
-from modelaudit.knowledge.framework_patterns import FrameworkKnowledgeBase, FrameworkType
-from modelaudit.utils.code_validation import is_code_potentially_dangerous, validate_python_syntax
+from modelaudit.analysis.unified_context import ModelArchitecture, UnifiedMLContext
+from modelaudit.utils.helpers.code_validation import is_code_potentially_dangerous, validate_python_syntax
 
 
 class AnalysisConfidence(Enum):
@@ -59,8 +59,8 @@ class IntegratedAnalyzer:
         pattern: str,
         pattern_type: str,
         context: UnifiedMLContext,
-        raw_data: Optional[bytes] = None,
-        code_snippet: Optional[str] = None,
+        raw_data: bytes | None = None,
+        code_snippet: str | None = None,
     ) -> IntegratedAnalysisResult:
         """Perform integrated analysis on a suspicious pattern."""
 

@@ -5,26 +5,29 @@ WORKDIR /app
 # Copy source code first
 COPY . .
 
-# Install all dependencies from requirements.lock
-# The lock file includes the current project as editable, so we need the source first
-RUN pip install --no-cache-dir -r requirements.lock
+# Copy and make entrypoint script executable
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Install the application with all extras using pip
-RUN pip install --no-cache-dir .[all]
+# Install core dependencies first (lightweight)
+RUN pip install --no-cache-dir .
 
-# Create a non-root user
-ARG UID=10001
-RUN adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "/nonexistent" \
-    --shell "/sbin/nologin" \
-    --no-create-home \
-    --uid "${UID}" \
-    appuser
+# Install ML frameworks with minimal dependencies to avoid disk space issues
+# Skip CUDA/GPU dependencies that cause disk space problems in Docker
+RUN pip install --no-cache-dir \
+    "tensorflow-cpu>=2.13.0,<3.0" \
+    "h5py>=3.1,<4.0" \
+    "onnx>=1.12.0,<2.0" \
+    "scikit-learn>=1.0.0,<2.0" \
+    "coremltools>=8.0"
 
-USER appuser
+# Install PyTorch CPU-only from separate index to avoid CUDA dependencies
+RUN pip install --no-cache-dir \
+    "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
-# Set the entrypoint
-ENTRYPOINT ["modelaudit"]
+# For CI testing purposes, we'll run as root to avoid volume mount permission issues
+# In production, users can override with --user flag if needed
+
+# Set the flexible entrypoint
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--help"] 

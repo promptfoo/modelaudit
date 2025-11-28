@@ -8,7 +8,7 @@ import re
 import struct
 from typing import Any, ClassVar
 
-from modelaudit.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
+from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -46,7 +46,7 @@ class SafeTensorsScanner(BaseScanner):
             return True
 
         try:
-            from modelaudit.utils.filetype import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format
 
             return detect_file_format(path) == "safetensors"
         except Exception:
@@ -78,7 +78,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Size Check",
                         passed=False,
                         message="File too small to contain SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_len_bytes), "required": 8},
                     )
@@ -91,7 +91,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Length Validation",
                         passed=False,
                         message="Invalid SafeTensors header length",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"header_len": header_len, "max_allowed": file_size - 8},
                     )
@@ -112,7 +112,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors Header Read",
                         passed=False,
                         message="Failed to read SafeTensors header",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"bytes_read": len(header_bytes), "expected": header_len},
                     )
@@ -124,7 +124,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Header Format Validation",
                         passed=False,
                         message="SafeTensors header does not start with '{'",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                     )
                     result.finish(success=False)
@@ -144,7 +144,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="SafeTensors JSON Parse",
                         passed=False,
                         message=f"Invalid JSON header: {e!s}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
                         why="SafeTensors header contained invalid JSON.",
@@ -155,6 +155,9 @@ class SafeTensorsScanner(BaseScanner):
                 tensor_names = [k for k in header if k != "__metadata__"]
                 result.metadata["tensor_count"] = len(tensor_names)
                 result.metadata["tensors"] = tensor_names
+
+                # Enhanced SafeTensors metadata injection detection
+                self._detect_metadata_injection_attacks(header, result, path)
 
                 # Validate tensor offsets and sizes
                 tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
@@ -167,7 +170,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Entry Type Validation",
                             passed=False,
                             message=f"Invalid tensor entry for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"tensor": name, "actual_type": type(info).__name__, "expected_type": "dict"},
                         )
@@ -182,7 +185,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Tensor Offset Type Validation",
                             passed=False,
                             message=f"Invalid data_offsets for {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "tensor": name,
@@ -252,7 +255,7 @@ class SafeTensorsScanner(BaseScanner):
                             name="Offset Continuity Check",
                             passed=False,
                             message="Tensor data offsets have gaps or overlap",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"gap_at": begin, "expected": last_end},
                         )
@@ -274,7 +277,7 @@ class SafeTensorsScanner(BaseScanner):
                         name="Tensor Data Coverage Check",
                         passed=False,
                         message="Tensor data does not cover entire file",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"last_offset": last_end, "data_size": data_size},
                     )
@@ -361,3 +364,218 @@ class SafeTensorsScanner(BaseScanner):
                 return None
             total *= dim
         return total * size
+
+    def _detect_metadata_injection_attacks(self, header: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Detect metadata injection attacks in SafeTensors files"""
+
+        # Check if __metadata__ exists and analyze it
+        metadata = header.get("__metadata__", {})
+
+        if metadata:
+            # Analyze the metadata for injection patterns
+            self._analyze_metadata_content(metadata, result, path)
+
+        # Check tensor names for injection attempts
+        tensor_names = [k for k in header if k != "__metadata__"]
+        for tensor_name in tensor_names:
+            if self._is_suspicious_tensor_name(tensor_name):
+                result.add_check(
+                    name="SafeTensors Tensor Name Injection Check",
+                    passed=False,
+                    message=f"Suspicious tensor name detected: {tensor_name}",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={
+                        "tensor_name": tensor_name,
+                        "attack_type": "tensor_name_injection",
+                        "reason": "Contains path traversal or dangerous characters",
+                    },
+                )
+
+        # Check tensor metadata for injection
+        for tensor_name, tensor_info in header.items():
+            if tensor_name == "__metadata__":
+                continue
+
+            if isinstance(tensor_info, dict):
+                # Check for unusual keys in tensor metadata
+                expected_keys = {"dtype", "shape", "data_offsets"}
+                unexpected_keys = set(tensor_info.keys()) - expected_keys
+
+                if unexpected_keys:
+                    result.add_check(
+                        name="SafeTensors Tensor Metadata Injection Check",
+                        passed=False,
+                        message=f"Tensor {tensor_name} contains unexpected metadata keys: {list(unexpected_keys)}",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "tensor_name": tensor_name,
+                            "unexpected_keys": list(unexpected_keys),
+                            "attack_type": "tensor_metadata_injection",
+                        },
+                    )
+
+    def _analyze_metadata_content(self, metadata: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Analyze SafeTensors metadata content for injection attacks"""
+
+        # Convert metadata to string for pattern analysis
+        import json
+
+        metadata_str = json.dumps(metadata, indent=2)
+
+        # XSS/HTML injection patterns
+        html_patterns = [
+            r"<script[^>]*>.*?</script>",
+            r"javascript:",
+            r"on\w+\s*=",  # Event handlers like onclick, onload
+            r"<iframe[^>]*>",
+            r"<object[^>]*>",
+            r"<embed[^>]*>",
+            r"<form[^>]*>",
+            r"<img[^>]*onerror",
+            r"vbscript:",
+            r"data:text/html",
+        ]
+
+        for pattern in html_patterns:
+            matches = re.findall(pattern, metadata_str, re.IGNORECASE | re.DOTALL)
+            if matches:
+                result.add_check(
+                    name="SafeTensors XSS/HTML Injection Detection",
+                    passed=False,
+                    message="Potential XSS/HTML injection detected in metadata",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "pattern_matched": pattern,
+                        "matches": matches[:5],  # Limit to first 5 matches
+                        "attack_type": "xss_html_injection",
+                        "total_matches": len(matches),
+                    },
+                )
+
+        # Code injection patterns
+        code_patterns = [
+            r"eval\s*\(",
+            r"exec\s*\(",
+            r"__import__\s*\(",
+            r"compile\s*\(",
+            r"subprocess\.",
+            r"os\.system",
+            r"os\.popen",
+            r"\\x[0-9a-fA-F]{2}",  # Hex encoded data
+            r"\\u[0-9a-fA-F]{4}",  # Unicode escapes
+            r"base64\.",
+            r"pickle\.",
+            r"marshal\.",
+        ]
+
+        for pattern in code_patterns:
+            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
+            if matches:
+                result.add_check(
+                    name="SafeTensors Code Injection Detection",
+                    passed=False,
+                    message="Potential code injection detected in metadata",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "pattern_matched": pattern,
+                        "matches": matches[:5],
+                        "attack_type": "code_injection",
+                        "total_matches": len(matches),
+                    },
+                )
+
+        # Path traversal patterns
+        path_traversal_patterns = [
+            r"\.\./+",
+            r"\.\.\\+",
+            r"/etc/",
+            r"/proc/",
+            r"/root/",
+            r"/home/",
+            r"C:\\",
+            r"%[0-9a-fA-F]{2}",  # URL encoded characters
+            r"\\[a-zA-Z]:",  # Windows drive letters
+        ]
+
+        for pattern in path_traversal_patterns:
+            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
+            if matches:
+                result.add_check(
+                    name="SafeTensors Path Traversal Detection",
+                    passed=False,
+                    message="Potential path traversal detected in metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={
+                        "pattern_matched": pattern,
+                        "matches": matches[:5],
+                        "attack_type": "path_traversal",
+                        "total_matches": len(matches),
+                    },
+                )
+
+        # Check for embedded credentials or secrets
+        credential_patterns = [
+            r'password["\'\s]*[:=]["\'\s]*\w+',
+            r'api[_-]?key["\'\s]*[:=]["\'\s]*[\w-]+',
+            r'secret["\'\s]*[:=]["\'\s]*[\w-]+',
+            r'token["\'\s]*[:=]["\'\s]*[\w.-]+',
+            r"-----BEGIN [A-Z ]+-----",
+            r"sk-[a-zA-Z0-9]{32,}",  # OpenAI API keys
+            r"xox[boaprs]-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}",  # Slack tokens
+            r"ghp_[a-zA-Z0-9]{36}",  # GitHub personal access tokens
+        ]
+
+        for pattern in credential_patterns:
+            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
+            if matches:
+                result.add_check(
+                    name="SafeTensors Embedded Credentials Detection",
+                    passed=False,
+                    message="Potential embedded credentials detected in metadata",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "pattern_matched": pattern,
+                        "attack_type": "credential_exposure",
+                        "total_matches": len(matches),
+                    },
+                )
+
+    def _is_suspicious_tensor_name(self, name: str) -> bool:
+        """Check if a tensor name contains suspicious patterns"""
+        suspicious_patterns = [
+            "../",  # Path traversal
+            "..\\",  # Windows path traversal
+            "/etc/",  # System directories
+            "/proc/",
+            "/root/",
+            "\\x",  # Hex encoding
+            "\\u",  # Unicode escapes
+            "<script",  # HTML/XSS
+            "javascript:",
+            "eval(",
+            "exec(",
+        ]
+
+        name_lower = name.lower()
+        return any(pattern in name_lower for pattern in suspicious_patterns)
+
+    def _calculate_json_depth(self, obj: Any, current_depth: int = 0) -> int:
+        """Calculate maximum depth of JSON object"""
+        if isinstance(obj, dict):
+            if not obj:
+                return current_depth
+            return max(self._calculate_json_depth(v, current_depth + 1) for v in obj.values())
+
+        if isinstance(obj, list):
+            if not obj:
+                return current_depth
+            return max(self._calculate_json_depth(v, current_depth + 1) for v in obj)
+
+        # For primitive types (str, int, float, bool, None)
+        return current_depth

@@ -32,7 +32,7 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -95,14 +95,14 @@ jobs:
 
   type-check:
     name: Type Check
-    needs: [changes, lint]
-    # Only run if Python files changed and linting passed
+    needs: changes
+    # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -128,10 +128,57 @@ jobs:
         run: |
           rye run mypy modelaudit/ tests/
 
+      - name: Check for circular imports
+        run: |
+          set -euo pipefail
+          python scripts/minimal_circular_check.py
+
+  # Fast feedback job for immediate results
+  quick-feedback:
+    name: Quick Feedback (Python 3.12)
+    needs: changes
+    # Always run for fastest feedback
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Install Rye
+        uses: eifinger/setup-rye@v4
+        with:
+          enable-cache: true
+          version: latest
+
+      - name: Pin Python version
+        run: |
+          rye pin 3.12
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pip
+            ~/.cache/rye
+          key: ${{ runner.os }}-rye-py3.12-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rye-py3.12-
+            ${{ runner.os }}-rye-
+
+      - name: Sync dependencies
+        run: |
+          rye sync --features all-ci
+
+      - name: Run fast tests with fail-fast
+        run: |
+          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+
   test:
     name: Test Python ${{ matrix.python-version }}
-    needs: [changes, lint]
-    # Only run if Python files changed and linting passed
+    needs: changes
+    # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -139,10 +186,10 @@ jobs:
       matrix:
         # For PRs, only test min and max Python versions to save time
         # For main branch, test all versions
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -170,23 +217,43 @@ jobs:
         run: |
           rye sync --features all-ci
 
-      - name: Run fast tests (parallel execution)
+      - name: Run fast tests with fail-fast (no coverage on PRs)
+        if: github.event_name == 'pull_request'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short
+          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
-      - name: Run slow/integration tests (if main branch)
-        if: github.ref == 'refs/heads/main'
-        timeout-minutes: 15
+      - name: Run slow/integration tests on PR (if labeled)
+        # Run slow tests on PRs when the 'run-slow-tests' label is added
+        # This allows developers to validate slow tests before merging
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests') && matrix.python-version == '3.12'
+        timeout-minutes: 20
         run: |
-          # Only run tests explicitly marked with @pytest.mark.slow or @pytest.mark.integration
-          rye run pytest -n 1 --tb=short \
-            tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_stress_performance \
-            tests/test_file_type_validation_integration.py::TestFileTypeValidationIntegration::test_performance_with_large_directories \
-            tests/test_license_integration.py::TestLicenseIntegration::test_end_to_end_cli_integration
+          echo "Running slow/integration tests due to 'run-slow-tests' label"
+          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+
+      - name: Run fast tests with coverage (main branch only)
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
+
+      - name: Run fast tests without coverage (main branch, non-3.12)
+        if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
+        run: |
+          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+
+      - name: Run slow/integration tests (main branch only)
+        # Run ALL slow/integration/performance tests on main branch.
+        # Tests with missing dependencies auto-skip via pytest.importorskip() or framework markers.
+        # Runs on Python 3.12 only to keep CI time reasonable.
+        if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
+        timeout-minutes: 20
+        run: |
+          # Run all slow, integration, and performance tests
+          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
-    needs: [changes, lint]
+    needs: changes
     # Only run on main branch or if dependencies changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
@@ -194,11 +261,16 @@ jobs:
     strategy:
       matrix:
         # Reduced matrix for PRs
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.9", "3.11", "3.12"]') }}
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
         numpy-mode: ["1.x", "2.x"]
+        exclude:
+          # TensorFlow doesn't support Python 3.13 yet, so skip NumPy 1.x mode
+          # which requires TensorFlow installation
+          - python-version: "3.13"
+            numpy-mode: "1.x"
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -253,19 +325,19 @@ jobs:
 
       - name: Run NumPy compatibility tests
         run: |
-          rye run pytest tests/test_numpy_scanner.py -v
-          rye run pytest tests/test_scanner_registry.py -v -k "numpy"
+          rye run pytest tests/scanners/test_numpy_scanner.py -v
+          rye run pytest tests/scanners/test_scanner_registry.py -v -k "numpy"
 
   build:
     name: Build and Package
-    needs: [changes, lint, type-check]
+    needs: changes
     # Always build on main, otherwise only if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -292,7 +364,7 @@ jobs:
           rye build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/
@@ -300,7 +372,8 @@ jobs:
   # Summary job to ensure all required checks pass
   ci-success:
     name: CI Success
-    needs: [lint, type-check, test, test-numpy-compatibility, build]
+    needs:
+      [quick-feedback, lint, type-check, test, test-numpy-compatibility, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -308,6 +381,7 @@ jobs:
         run: |
           # A job is considered successful if it either succeeded or was skipped
           # (skipped means the job's conditions weren't met, which is fine)
+          QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           TEST_RESULT="${{ needs.test.result }}"
@@ -315,6 +389,7 @@ jobs:
           BUILD_RESULT="${{ needs.build.result }}"
 
           echo "Job results:"
+          echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  test: $TEST_RESULT"
@@ -322,7 +397,8 @@ jobs:
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
-          if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
+          if [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ||
+                "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
                 "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
                 "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
                 "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||

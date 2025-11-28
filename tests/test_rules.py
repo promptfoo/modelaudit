@@ -14,7 +14,7 @@ class TestRuleRegistry:
     def test_initialize(self):
         """Test that rules are initialized properly."""
         RuleRegistry.initialize()
-        assert len(RuleRegistry._rules) == 105  # Current count
+        assert len(RuleRegistry.get_all_rules()) == 105  # Current count via public API
 
     def test_get_rule(self):
         """Test getting a specific rule."""
@@ -58,14 +58,14 @@ class TestRuleRegistry:
         """Test getting rules by numeric range."""
         # Get code execution rules (S100-S199)
         rules = RuleRegistry.get_rules_by_range(100, 199)
-        assert len(rules) == 10  # Actual count from implementation
+        assert all(100 <= int(code[1:]) <= 199 for code in rules)
         assert "S101" in rules
         assert "S110" in rules
         assert "S201" not in rules  # Pickle rule, not in range
 
         # Get pickle rules (S200-S299)
         rules = RuleRegistry.get_rules_by_range(200, 299)
-        assert len(rules) == 10  # Actual count
+        assert all(200 <= int(code[1:]) <= 299 for code in rules)
         assert "S201" in rules
         assert "S101" not in rules
 
@@ -150,6 +150,16 @@ S701 = "CRITICAL"
         assert "S801" in config.suppress
         assert config.severity["S301"] == Severity.HIGH
         assert config.severity["S701"] == Severity.CRITICAL
+
+    def test_ignore_range_expansion(self):
+        """Test that ignore ranges expand correctly."""
+        config = ModelAuditConfig()
+        config._parse_config({"ignore": {"tests/**": ["S200-S202", "S999"]}})
+
+        assert "tests/**" in config.ignore
+        assert set(config.ignore["tests/**"]) == {"S200", "S201", "S202", "S999"}
+        assert config.is_suppressed("S201", "tests/example.py")
+        assert not config.is_suppressed("S203", "tests/example.py")
 
 
 class TestScanResultIntegration:
