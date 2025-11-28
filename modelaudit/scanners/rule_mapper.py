@@ -3,10 +3,8 @@ Helper module to map security detections to rule codes.
 Centralizes the logic for assigning rule codes to specific security issues.
 """
 
-from typing import Optional
 
-
-def get_import_rule_code(module: str, function: Optional[str] = None) -> Optional[str]:
+def get_import_rule_code(module: str, function: str | None = None) -> str | None:
     """Get rule code for dangerous imports/modules."""
     module_lower = module.lower()
 
@@ -73,7 +71,7 @@ def get_import_rule_code(module: str, function: Optional[str] = None) -> Optiona
     return None
 
 
-def get_pickle_opcode_rule_code(opcode_name: str) -> Optional[str]:
+def get_pickle_opcode_rule_code(opcode_name: str) -> str | None:
     """Get rule code for pickle opcodes."""
     opcode_upper = opcode_name.upper()
 
@@ -103,7 +101,7 @@ def get_pickle_opcode_rule_code(opcode_name: str) -> Optional[str]:
     return None
 
 
-def get_embedded_code_rule_code(code_type: str) -> Optional[str]:
+def get_embedded_code_rule_code(code_type: str) -> str | None:
     """Get rule code for embedded code/executables."""
     code_lower = code_type.lower()
 
@@ -131,7 +129,7 @@ def get_embedded_code_rule_code(code_type: str) -> Optional[str]:
     return None
 
 
-def get_encoding_rule_code(encoding_type: str) -> Optional[str]:
+def get_encoding_rule_code(encoding_type: str) -> str | None:
     """Get rule code for encoding/obfuscation."""
     enc_lower = encoding_type.lower()
 
@@ -157,7 +155,7 @@ def get_encoding_rule_code(encoding_type: str) -> Optional[str]:
     return None
 
 
-def get_secret_rule_code(secret_type: str) -> Optional[str]:
+def get_secret_rule_code(secret_type: str) -> str | None:
     """Get rule code for secrets/credentials."""
     secret_lower = secret_type.lower()
 
@@ -185,7 +183,7 @@ def get_secret_rule_code(secret_type: str) -> Optional[str]:
     return None
 
 
-def get_file_issue_rule_code(issue_type: str) -> Optional[str]:
+def get_file_issue_rule_code(issue_type: str) -> str | None:
     """Get rule code for file-related issues."""
     issue_lower = issue_type.lower()
 
@@ -213,7 +211,7 @@ def get_file_issue_rule_code(issue_type: str) -> Optional[str]:
     return None
 
 
-def get_model_rule_code(issue_type: str) -> Optional[str]:
+def get_model_rule_code(issue_type: str) -> str | None:
     """Get rule code for model-specific issues."""
     issue_lower = issue_type.lower()
 
@@ -241,7 +239,7 @@ def get_model_rule_code(issue_type: str) -> Optional[str]:
     return None
 
 
-def get_generic_rule_code(message: str) -> Optional[str]:
+def get_generic_rule_code(message: str) -> str | None:
     """
     Try to determine rule code from a generic message.
     This is a fallback for messages that don't fit specific categories.

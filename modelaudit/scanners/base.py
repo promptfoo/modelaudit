@@ -188,7 +188,9 @@ class ScanResult:
             if config_rule:
                 configured_severity = config.get_severity(rule_code, config_rule.default_severity)
                 mapped = severity_map.get(configured_severity)
-                if mapped is not None:
+                default_mapped = severity_map.get(config_rule.default_severity)
+                # Only override when severity was not explicitly set or still equals the default
+                if mapped is not None and (severity is None or severity == default_mapped):
                     severity = mapped
 
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
