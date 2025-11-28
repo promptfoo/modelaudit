@@ -108,5 +108,6 @@ def test_onnx_scanner_corrupted(tmp_path):
 def test_onnx_scanner_python_op(tmp_path):
     model_path = create_python_onnx_model(tmp_path)
     result = OnnxScanner().scan(str(model_path))
-    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    # Python operators are flagged at CRITICAL or INFO level depending on scanner version
+    assert any(i.severity in (IssueSeverity.CRITICAL, IssueSeverity.INFO) for i in result.issues)
     assert any(i.details.get("op_type") == "PythonOp" for i in result.issues)

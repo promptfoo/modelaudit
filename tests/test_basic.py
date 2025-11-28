@@ -184,14 +184,19 @@ def test_scan_result_class():
     # Create a scan result
     result = ScanResult(scanner_name="test_scanner")
 
-    # Add issues of different severities
+    # Add issues of different severities using the legacy _add_issue method
+    # Note: In the current API, DEBUG/INFO are treated as "passed" checks and don't
+    # create issues. Only WARNING/CRITICAL severity creates issues (failed checks).
     result._add_issue("Debug message", severity=IssueSeverity.DEBUG)
     result._add_issue("Info message", severity=IssueSeverity.INFO)
     result._add_issue("Warning message", severity=IssueSeverity.WARNING)
     result._add_issue("Error message", severity=IssueSeverity.CRITICAL)
 
-    # Test issue count
-    assert len(result.issues) == 4
+    # Test issue count - only WARNING and CRITICAL create issues
+    assert len(result.issues) == 2
+
+    # Verify the checks were all recorded (both passed and failed)
+    assert len(result.checks) == 4
 
     # Check if the ScanResult has a to_dict method
     assert hasattr(result, "to_dict"), "ScanResult should have a to_dict method"
@@ -202,7 +207,7 @@ def test_scan_result_class():
         # The scanner_name might not be included in the to_dict output
         # Let's check for the essential fields instead
         assert "issues" in result_dict
-        assert len(result_dict["issues"]) == 4
+        assert len(result_dict["issues"]) == 2  # Only WARNING and CRITICAL
 
     # Test finish method
     result.finish(success=True)

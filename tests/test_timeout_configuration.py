@@ -101,6 +101,7 @@ class TestTimeoutConfiguration:
         finally:
             os.unlink(temp_path)
 
+    @pytest.mark.slow
     def test_partial_results_on_timeout(self):
         """Test that partial results are returned when timeout occurs"""
         # Create a large test file

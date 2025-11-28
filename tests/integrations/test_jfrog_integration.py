@@ -10,7 +10,7 @@ from modelaudit.integrations.jfrog import scan_jfrog_artifact
 @patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_artifact")
-@patch("modelaudit.integrations.jfrog.scan_model_directory_or_file")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock_mkdtemp, mock_rmtree):
     """Test successful JFrog artifact scanning."""
     temp_dir = "/tmp/modelaudit_jfrog_test"
@@ -99,7 +99,7 @@ def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkd
 @patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_jfrog_folder")
-@patch("modelaudit.integrations.jfrog.scan_model_directory_or_file")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree):
     """Test successful JFrog folder scanning."""
     temp_dir = "/tmp/modelaudit_jfrog_test"

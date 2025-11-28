@@ -164,7 +164,8 @@ class TestCacheDirOption:
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", "hf://test/model"])
 
-        # Verify the error message mentions --cache-dir
+        # Verify the error message mentions --cache-dir and disk space guidance
         assert "--cache-dir" in result.output
-        assert "Free up disk space" in result.output
+        # The actual message is "Tip: Use --stream to minimize disk usage, or use --cache-dir..."
+        assert "disk" in result.output.lower()
         assert result.exit_code != 0

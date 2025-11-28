@@ -5,6 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+# Skip if safetensors is not available before importing it
+pytest.importorskip("safetensors")
+
 from safetensors.numpy import save_file
 
 from modelaudit.core import scan_model_directory_or_file

@@ -193,11 +193,22 @@ addopts = [
 ]
 testpaths = ["tests"]
 markers = [
+    # Test category markers
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "performance: marks tests as performance benchmarks",
     "unit: marks tests as unit tests (fast)",
     "asyncio: marks tests as asyncio tests",
+    # Framework-specific markers (tests auto-skip if framework unavailable)
+    "tensorflow: marks tests as requiring TensorFlow",
+    "pytorch: marks tests as requiring PyTorch",
+    "onnx: marks tests as requiring ONNX",
+    "h5py: marks tests as requiring h5py",
+    "msgpack: marks tests as requiring msgpack",
+    "xgboost: marks tests as requiring XGBoost",
+    "safetensors: marks tests as requiring safetensors",
+    "joblib: marks tests as requiring joblib",
+    "dill: marks tests as requiring dill",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
