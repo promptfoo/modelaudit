@@ -72,6 +72,26 @@ class PyTorchBinaryScanner(BaseScanner):
         try:
             self.current_file_path = path
 
+            # Check for suspiciously small files
+            if file_size < 100:
+                result.add_check(
+                    name="File Size Validation",
+                    passed=False,
+                    message=f"Suspiciously small binary file: {file_size} bytes",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"file_size": file_size},
+                    rule_code="S902",
+                )
+            else:
+                result.add_check(
+                    name="File Size Validation",
+                    passed=True,
+                    message="File size is reasonable",
+                    location=path,
+                    details={"file_size": file_size},
+                    rule_code=None,  # Passing check
+                )
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
             chunk_size = 1024 * 1024  # 1MB chunks
@@ -143,6 +163,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     name="Embedded Code Pattern Detection",
                     passed=False,
                     message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
+                    rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
@@ -158,6 +179,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 passed=True,
                 message="No suspicious code patterns detected",
                 location=self.current_file_path,
+                rule_code=None,  # Passing check
             )
 
     def _check_for_blacklist_patterns(
@@ -178,6 +200,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     message=f"Blacklisted pattern found: {pattern}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
+                    rule_code="S1001",
                     details={
                         "pattern": pattern,
                         "offset": offset + pos,
@@ -191,6 +214,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 passed=True,
                 message="No blacklisted patterns found",
                 location=self.current_file_path,
+                rule_code=None,  # Passing check
             )
 
     def _verify_shebang_context(self, data: bytes, offset_in_chunk: int) -> bool:
@@ -311,6 +335,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     message=f"Executable signature found: {description}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (offset: {pos})",
+                    rule_code="S501",
                     details={
                         "signature": sig.hex(),
                         "description": description,
@@ -319,6 +344,28 @@ class PyTorchBinaryScanner(BaseScanner):
                         "pattern_density_per_mb": round(pattern_density, 1),
                         "ml_context_confidence": ml_context.get("weight_confidence", 0),
                     },
+                )
+
+            # Add debug note about ignored patterns (only shown in verbose mode)
+            if ignored_count > 0 and len(positions) > 5:
+                from modelaudit.utils.ml_context import get_ml_context_explanation
+
+                explanation = get_ml_context_explanation(ml_context, len(positions))
+                result.add_check(
+                    name="False Positive Filter",
+                    passed=True,
+                    message=f"Ignored {ignored_count} likely false positive {description} patterns",
+                    severity=IssueSeverity.DEBUG,
+                    location=f"{self.current_file_path}",
+                    details={
+                        "signature": sig.hex(),
+                        "ignored_count": ignored_count,
+                        "total_found": len(positions),
+                        "pattern_density_per_mb": round(pattern_density, 1),
+                        "ml_context_explanation": explanation,
+                    },
+                    why=f"These patterns were likely false positives in ML weight data. {explanation}",
+                    rule_code=None,  # Passing check
                 )
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
@@ -337,6 +384,7 @@ class PyTorchBinaryScanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"header_size": len(header)},
+                        rule_code="S703",
                     )
                     return
 
@@ -359,6 +407,7 @@ class PyTorchBinaryScanner(BaseScanner):
                             "exception": str(e),
                             "exception_type": type(e).__name__,
                         },
+                        rule_code="S703",
                     )
 
         except Exception as e:
@@ -369,4 +418,5 @@ class PyTorchBinaryScanner(BaseScanner):
                 severity=IssueSeverity.DEBUG,
                 location=self.current_file_path,
                 details={"exception": str(e)},
+                rule_code="S703",
             )

@@ -88,6 +88,7 @@ class OnnxScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "onnx"},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -166,6 +167,7 @@ class OnnxScanner(BaseScanner):
                 severity=IssueSeverity.DEBUG,
                 location=path,
                 details={"exception": str(e)},
+                rule_code="S507",
             )
 
         self._check_custom_ops(model, path, result)
@@ -198,6 +200,7 @@ class OnnxScanner(BaseScanner):
                     ),
                     severity=IssueSeverity.INFO,
                     location=f"{path} (node: {node.name})",
+                    rule_code="S302",
                     details={
                         "op_type": node.op_type,
                         "domain": node.domain,
@@ -216,6 +219,7 @@ class OnnxScanner(BaseScanner):
                     message=f"Model uses Python operator '{node.op_type}'",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path} (node: {node.name})",
+                    rule_code="S902",
                     details={"op_type": node.op_type, "domain": node.domain},
                 )
             else:
@@ -229,6 +233,7 @@ class OnnxScanner(BaseScanner):
                 message="All operators use standard ONNX domains",
                 location=path,
                 details={"safe_nodes": safe_nodes},
+                rule_code=None,  # Passing check
             )
 
         if not python_ops_found:
@@ -261,6 +266,7 @@ class OnnxScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=path,
                         details={"tensor": tensor.name},
+                        rule_code="S703",
                     )
                     continue
                 external_path = (model_dir / location).resolve()
@@ -271,6 +277,7 @@ class OnnxScanner(BaseScanner):
                         message=f"External data file not found for tensor '{tensor.name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
+                        rule_code="S902",
                         details={"tensor": tensor.name, "file": location},
                     )
                 elif not str(external_path).startswith(str(model_dir)):
@@ -280,6 +287,7 @@ class OnnxScanner(BaseScanner):
                         message=f"External data file outside model directory for tensor '{tensor.name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
+                        rule_code="S902",
                         details={"tensor": tensor.name, "file": location},
                     )
                 else:
@@ -316,6 +324,7 @@ class OnnxScanner(BaseScanner):
                     message="External data file size mismatch",
                     severity=IssueSeverity.CRITICAL,
                     location=str(external_path),
+                    rule_code="S902",
                     details={
                         "tensor": tensor.name,
                         "expected_size": expected_size,
@@ -340,6 +349,7 @@ class OnnxScanner(BaseScanner):
                 message=f"Failed to validate external data size: {e}",
                 severity=IssueSeverity.DEBUG,
                 location=str(external_path),
+                rule_code="S902",
             )
 
     def _check_tensor_sizes(self, model: Any, path: str, result: ScanResult) -> None:
@@ -369,6 +379,7 @@ class OnnxScanner(BaseScanner):
                             message=f"Tensor '{tensor.name}' data appears truncated",
                             severity=IssueSeverity.INFO,
                             location=f"{path} (tensor: {tensor.name})",
+                            rule_code="S703",
                             details={
                                 "expected_size": expected_size,
                                 "actual_size": actual_size,
@@ -383,6 +394,7 @@ class OnnxScanner(BaseScanner):
                             details={
                                 "size": actual_size,
                             },
+                            rule_code=None,  # Passing check
                         )
                 except Exception as e:
                     result.add_check(
@@ -391,4 +403,5 @@ class OnnxScanner(BaseScanner):
                         message=f"Failed to validate tensor '{tensor.name}': {e}",
                         severity=IssueSeverity.DEBUG,
                         location=path,
+                        rule_code="S703",
                     )

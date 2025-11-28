@@ -47,6 +47,7 @@ class PaddleScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "paddlepaddle"},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -93,6 +94,7 @@ class PaddleScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=f"{path} (offset: {offset + pos})",
                     details={"pattern": pattern.decode("ascii", "ignore"), "offset": offset + pos},
+                    rule_code="S902",
                 )
 
         try:
@@ -108,4 +110,5 @@ class PaddleScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"pattern": regex},
+                    rule_code="S902",
                 )

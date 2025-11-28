@@ -232,6 +232,7 @@ class JoblibScanner(BaseScanner):
                                 "ratio": ratio,
                                 "max_ratio": self.max_decompression_ratio,
                             },
+                            rule_code=None,  # Passing check
                         )
                 except ValueError as e:
                     result.add_check(
@@ -241,6 +242,7 @@ class JoblibScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"security_check": "compression_bomb_detection"},
+                        rule_code="S902",
                     )
                     result.finish(success=False)
                     return result
@@ -251,7 +253,11 @@ class JoblibScanner(BaseScanner):
                         message=f"Error decompressing joblib file: {e}",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"exception": str(e), "exception_type": type(e).__name__},
+                        details={
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                        },
+                        rule_code="S902",
                     )
                     result.finish(success=False)
                     return result
@@ -273,7 +279,11 @@ class JoblibScanner(BaseScanner):
                 message=f"Error scanning joblib file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result

@@ -124,6 +124,7 @@ class WeightDistributionScanner(BaseScanner):
                         severity=IssueSeverity.DEBUG,
                         location=path,
                         details={"extension": ext},
+                        rule_code="S701",
                     )
                     result.finish(success=False)
                     return result
@@ -140,6 +141,7 @@ class WeightDistributionScanner(BaseScanner):
                     message=message,
                     severity=severity,
                     location=path,
+                    rule_code="S701",
                 )
                 result.finish(success=True)
                 return result
@@ -157,6 +159,7 @@ class WeightDistributionScanner(BaseScanner):
                     location=path,
                     details=anomaly["details"],
                     why=anomaly.get("why"),
+                    rule_code="S701",
                 )
 
             # Add metadata

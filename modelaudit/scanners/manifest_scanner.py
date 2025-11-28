@@ -196,6 +196,7 @@ class ManifestScanner(BaseScanner):
                     message=f"Unable to parse file as a manifest or configuration: {path}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
+                    rule_code="S902",
                 )
 
         except Exception as e:
@@ -238,6 +239,7 @@ class ManifestScanner(BaseScanner):
                             "identify models or configurations that violate security policies or contain known "
                             "malicious indicators."
                         ),
+                        rule_code="S1001",
                     )
                     found_blacklisted = True
 
@@ -257,7 +259,61 @@ class ManifestScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S1001",
             )
+
+        def check_dict(d: Any, prefix: str = "") -> None:
+            if not isinstance(d, dict):
+                return
+
+            for key, value in d.items():
+                key_lower = key.lower()
+                full_key = f"{prefix}.{key}" if prefix else key
+
+                # Check if this key might contain a model name
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value),
+                        self.blacklist_patterns,
+                    )
+                    if blocked:
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=False,
+                            message=f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": full_key,
+                            },
+                            why=(
+                                "This model name matches a blacklist pattern. Organizations use model name "
+                                "blacklists to prevent use of banned, malicious, or policy-violating models."
+                            ),
+                        )
+                    else:
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=True,
+                            message=f"Model name '{value}' passed policy check",
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "key": full_key,
+                            },
+                        )
+
+                # Recursively check nested structures
+                if isinstance(value, dict):
+                    check_dict(value, full_key)
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            check_dict(item, f"{full_key}[{i}]")
+
+        check_dict(content)
 
     def _parse_file(
         self,
@@ -303,6 +359,7 @@ class ManifestScanner(BaseScanner):
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
+                    rule_code="S902",
                 )
 
         return None
@@ -391,7 +448,8 @@ class ManifestScanner(BaseScanner):
                             },
                         )
 
-                # Recursively check nested structures
+                # ALWAYS recursively check nested structures,
+                # regardless of pattern matches
                 if isinstance(value, dict):
                     check_dict(value, full_key)
                 elif isinstance(value, list):

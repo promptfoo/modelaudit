@@ -88,6 +88,7 @@ class TarScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -116,6 +117,7 @@ class TarScanner(BaseScanner):
                 name="TAR Depth Bomb Protection",
                 passed=False,
                 message=f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
+                rule_code="S902",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
@@ -128,10 +130,31 @@ class TarScanner(BaseScanner):
                 message="TAR nesting depth is within safe limits",
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
+                rule_code=None,  # Passing check
             )
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
+            if len(members) > self.max_entries:
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=False,
+                    message=f"TAR file contains too many entries ({len(members)} > {self.max_entries})",
+                    rule_code="S902",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"entries": len(members), "max_entries": self.max_entries},
+                )
+                return result
+            else:
+                result.add_check(
+                    name="Entry Count Limit Check",
+                    passed=True,
+                    message=f"Entry count ({len(members)}) is within limits",
+                    location=path,
+                    details={"entries": len(members), "max_entries": self.max_entries},
+                    rule_code=None,  # Passing check
+                )
 
             for member in members:
                 name = member.name
@@ -145,6 +168,7 @@ class TarScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=f"{path}:{name}",
                         details={"entry": name},
+                        rule_code="S405",
                     )
                     continue
 
@@ -165,6 +189,7 @@ class TarScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"target": target},
+                            rule_code="S902",
                         )
                     elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
                         result.add_check(
@@ -174,6 +199,7 @@ class TarScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"target": target},
+                            rule_code="S406",
                         )
                     else:
                         result.add_check(
@@ -182,6 +208,7 @@ class TarScanner(BaseScanner):
                             message=f"Symlink {name} is safe",
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
+                            rule_code=None,  # Passing check
                         )
                     continue
 

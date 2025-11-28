@@ -65,6 +65,7 @@ class Check(BaseModel):
     location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
     why: str | None = Field(None, description="Explanation (mainly for failed checks)")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this check")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
 
     @field_serializer("status")
@@ -85,6 +86,8 @@ class Check(BaseModel):
         """String representation of the check"""
         status_symbol = "✓" if self.status == CheckStatus.PASSED else "✗"
         prefix = f"[{status_symbol}] {self.name}"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -105,6 +108,7 @@ class Issue(BaseModel):
     why: str | None = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
     type: str | None = Field(None, description="Type of issue for categorization")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this issue")
 
     @field_serializer("severity")
     def serialize_severity(self, severity: IssueSeverity) -> str:
@@ -119,6 +123,8 @@ class Issue(BaseModel):
         """String representation of the issue"""
         severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
         prefix = f"[{severity_str.upper()}]"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -147,8 +153,46 @@ class ScanResult:
         location: str | None = None,
         details: dict[str, Any] | None = None,
         why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
-        """Add a check result (passed or failed)"""
+        """Add a check result (passed or failed) with rule support and rule-based severity."""
+        from ..config import get_config
+        from ..rules import RuleRegistry, Severity
+
+        severity_map = {
+            Severity.CRITICAL: IssueSeverity.CRITICAL,
+            Severity.HIGH: IssueSeverity.CRITICAL,
+            Severity.MEDIUM: IssueSeverity.WARNING,
+            Severity.LOW: IssueSeverity.INFO,
+            Severity.INFO: IssueSeverity.INFO,
+        }
+
+        # Auto-detect rule code if not provided
+        if not rule_code and not passed:
+            match = RuleRegistry.find_matching_rule(message)
+            if match:
+                rule_code, rule = match
+                if severity is None:
+                    severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
+
+        config = get_config()
+
+        # Check if rule is suppressed
+        if rule_code and config.is_suppressed(rule_code, location):
+            logger.debug(f"Suppressed {rule_code}: {message}")
+            return
+
+        # Apply severity override from config if available
+        if rule_code:
+            config_rule = RuleRegistry.get_rule(rule_code)
+            if config_rule:
+                configured_severity = config.get_severity(rule_code, config_rule.default_severity)
+                mapped = severity_map.get(configured_severity)
+                default_mapped = severity_map.get(config_rule.default_severity)
+                # Only override when severity was not explicitly set or still equals the default
+                if mapped is not None and (severity is None or severity == default_mapped):
+                    severity = mapped
+
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
 
         # For failed checks, ensure we have a severity
@@ -156,7 +200,6 @@ class ScanResult:
             severity = IssueSeverity.WARNING
 
         # Apply whitelist downgrading logic for failed checks if scanner is available
-        # This must happen BEFORE creating the Check to ensure consistent severity
         if not passed and self.scanner:
             # At this point severity cannot be None due to the check above
             assert severity is not None
@@ -170,6 +213,7 @@ class ScanResult:
             location=location,
             details=details or {},
             why=why,
+            rule_code=rule_code,
         )
         self.checks.append(check)
 
@@ -191,6 +235,7 @@ class ScanResult:
                 details=details or {},
                 why=why,
                 type=f"{self.scanner_name}_check",
+                rule_code=rule_code,
             )
             self.issues.append(issue)
 
@@ -215,15 +260,11 @@ class ScanResult:
         location: str | None = None,
         details: dict[str, Any] | None = None,
         why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
-        """Private legacy method - use add_check() instead.
-
-        This method is deprecated and should not be used in new code.
-        It exists only for backward compatibility with unmigrated scanner code.
-        """
-        # INFO/DEBUG are informational (passed checks), WARNING/CRITICAL are failures
+        """Add an issue to the result with rule support"""
+        # For backward compatibility: INFO/DEBUG severities are treated as passing checks
         passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
-
         self.add_check(
             name="Legacy Security Check",
             passed=passed,
@@ -232,7 +273,22 @@ class ScanResult:
             location=location,
             details=details,
             why=why,
+            rule_code=rule_code,
         )
+        if passed:
+            return
+
+    def add_issue(
+        self,
+        message: str,
+        severity: IssueSeverity = IssueSeverity.WARNING,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
+        rule_code: str | None = None,
+    ) -> None:
+        """Backward-compatible public issue adder."""
+        self._add_issue(message, severity=severity, location=location, details=details, why=why, rule_code=rule_code)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -627,6 +683,7 @@ class BaseScanner(ABC):
                     name="Embedded Secrets Detection",
                     passed=False,
                     message=finding.get("message", "Secret detected"),
+                    rule_code="S609",
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -834,6 +891,7 @@ class BaseScanner(ABC):
                     name="JIT/Script Code Execution Detection",
                     passed=False,
                     message=message,
+                    rule_code="S507",
                     severity=severity,
                     location=location,
                     details=details,
@@ -1015,6 +1073,7 @@ class BaseScanner(ABC):
                     name="Network Communication Detection",
                     passed=False,
                     message=finding.get("message", "Network communication pattern detected"),
+                    rule_code="S610",
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -1117,6 +1176,7 @@ class BaseScanner(ABC):
                             "extension_format": ext_format,
                             "security_check": "file_type_validation",
                         },
+                        rule_code="S901",  # File type mismatch
                     )
                 else:
                     result.add_check(

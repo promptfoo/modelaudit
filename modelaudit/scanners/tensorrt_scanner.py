@@ -64,6 +64,7 @@ class TensorRTScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"pattern": pattern.decode("utf-8", "ignore")},
+                    rule_code="S902",
                 )
 
         result.finish(success=not result.has_errors)

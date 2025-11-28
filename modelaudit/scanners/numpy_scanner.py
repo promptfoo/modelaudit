@@ -131,6 +131,7 @@ class NumPyScanner(BaseScanner):
                 message="NumPy not available for scanning .npy files",
                 severity=IssueSeverity.WARNING,
                 location=path,
+                rule_code=None,  # Library availability, no rule
                 details={"numpy_version": NUMPY_VERSION},
             )
             result.finish(success=False)
@@ -144,6 +145,7 @@ class NumPyScanner(BaseScanner):
                 message=f"NumPy format module not available (NumPy {NUMPY_VERSION}). May be a compatibility issue.",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                rule_code=None,  # Library availability, no rule
                 details={"numpy_version": NUMPY_VERSION, "numpy_major": NUMPY_MAJOR_VERSION},
             )
             result.finish(success=False)
@@ -179,6 +181,7 @@ class NumPyScanner(BaseScanner):
                             message="Invalid NumPy file magic",
                             severity=IssueSeverity.INFO,
                             location=path,
+                            rule_code="S903",  # Invalid magic bytes
                             details={"expected": "\x93NUMPY", "found": magic.hex()},
                         )
                         result.finish(success=False)
@@ -189,6 +192,7 @@ class NumPyScanner(BaseScanner):
                             passed=True,
                             message="Valid NumPy file magic string found",
                             location=path,
+                            rule_code=None,  # Passing check
                             details={"magic": magic.hex()},
                         )
                     f.seek(0)
@@ -214,6 +218,7 @@ class NumPyScanner(BaseScanner):
                             message=f"Failed to read NumPy array header: {header_error}",
                             severity=IssueSeverity.INFO,
                             location=path,
+                            rule_code="S902",  # Corrupted structure
                             details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
                         )
                         result.finish(success=False)
@@ -229,6 +234,7 @@ class NumPyScanner(BaseScanner):
                             passed=True,
                             message="Array dimensions are within safe limits",
                             location=path,
+                            rule_code=None,  # Passing check
                             details={
                                 "shape": shape,
                                 "dimensions": len(shape),
@@ -242,6 +248,7 @@ class NumPyScanner(BaseScanner):
                             passed=True,
                             message=f"Data type '{dtype}' is safe",
                             location=path,
+                            rule_code=None,  # Passing check
                             details={
                                 "dtype": str(dtype),
                                 "dtype_kind": dtype.kind,
@@ -255,6 +262,7 @@ class NumPyScanner(BaseScanner):
                             passed=True,
                             message="Array size is within safe limits",
                             location=path,
+                            rule_code=None,  # Passing check
                             details={
                                 "calculated_size": expected_data_size,
                                 "max_size": self.max_array_bytes,
@@ -272,12 +280,25 @@ class NumPyScanner(BaseScanner):
                         else:
                             check_name = "Array Size Validation"
 
+                        # Determine rule code based on error
+                        validation_rule = None
+                        error_msg = str(e).lower()
+                        if "dimension" in error_msg or "excessive" in error_msg:
+                            validation_rule = "S804"  # Excessive dimensions
+                        elif "size" in error_msg:
+                            validation_rule = "S904"  # Excessive file size
+                        elif "dtype" in error_msg or "object" in error_msg:
+                            validation_rule = "S213"  # Pickle/serialization risk
+                        else:
+                            validation_rule = "S902"  # Generic corruption
+
                         result.add_check(
                             name=check_name,
                             passed=False,
                             message=f"Array validation failed: {e}",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
+                            rule_code=validation_rule,
                             details={
                                 "security_check": "array_validation",
                                 "shape": shape,
@@ -295,6 +316,7 @@ class NumPyScanner(BaseScanner):
                             message="File size does not match header information",
                             severity=IssueSeverity.INFO,
                             location=path,
+                            rule_code="S902",  # Corrupted structure
                             details={
                                 "expected_size": expected_size,
                                 "actual_size": file_size,
@@ -308,6 +330,7 @@ class NumPyScanner(BaseScanner):
                             passed=True,
                             message="File size matches header information",
                             location=path,
+                            rule_code=None,  # Passing check
                             details={
                                 "file_size": file_size,
                                 "shape": shape,
@@ -326,6 +349,7 @@ class NumPyScanner(BaseScanner):
                 message=f"Error scanning NumPy file: {e}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
+                rule_code="S902",  # Scan error/corruption
                 details={"exception": str(e), "exception_type": type(e).__name__, "numpy_version": NUMPY_VERSION},
             )
             result.finish(success=False)

@@ -148,6 +148,7 @@ class JaxCheckpointScanner(BaseScanner):
                         message=f"Invalid JSON in Orbax metadata: {e}",
                         severity=IssueSeverity.WARNING,
                         location=str(metadata_path),
+                        rule_code="S902",
                         details={"error": str(e), "file": metadata_file},
                     )
                 except Exception as e:
@@ -157,6 +158,7 @@ class JaxCheckpointScanner(BaseScanner):
                         message=f"Error reading Orbax metadata: {e}",
                         severity=IssueSeverity.WARNING,
                         location=str(metadata_path),
+                        rule_code="S902",
                     )
 
         # Scan checkpoint files
@@ -177,6 +179,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"restore_fn": str(metadata["restore_fn"])[:200]},
+                rule_code="S302",
             )
 
         # Check for code injection in metadata
@@ -190,6 +193,7 @@ class JaxCheckpointScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"pattern": pattern},
+                    rule_code="S902",
                 )
 
         # Extract useful metadata
@@ -215,8 +219,8 @@ class JaxCheckpointScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=path,
                     details={"file_size": file_size, "max_size": self.max_file_size},
+                    rule_code="S902",
                 )
-                return
 
             with open(path, "rb") as f:
                 header = f.read(1024)
@@ -235,6 +239,7 @@ class JaxCheckpointScanner(BaseScanner):
                     message=f"Unknown checkpoint file format: {path}",
                     location=path,
                     details={"format": "unknown"},
+                    rule_code=None,  # Passing check
                 )
 
         except Exception as e:
@@ -245,6 +250,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
             )
 
     def _scan_pickle_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -271,6 +277,7 @@ class JaxCheckpointScanner(BaseScanner):
                         name="Pickle Opcode Security Check",
                         passed=False,
                         message=f"Dangerous pickle opcode detected: {opcode.decode('ascii', errors='ignore')}",
+                        rule_code="S902",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"opcode": opcode.hex()},
@@ -288,6 +295,7 @@ class JaxCheckpointScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={"pattern": pattern},
+                            rule_code="S902",
                         )
             except Exception:
                 pass
@@ -300,6 +308,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
             )
 
     def _scan_numpy_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -312,6 +321,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_library": "numpy"},
+                rule_code="S902",
             )
             return
 
@@ -328,6 +338,7 @@ class JaxCheckpointScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"size": array.size, "shape": array.shape, "threshold": 100_000_000},
+                    rule_code="S904",
                 )
 
             # Validate array shape
@@ -339,6 +350,7 @@ class JaxCheckpointScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={"shape": array.shape},
+                    rule_code="S902",
                 )
 
         except Exception as e:
@@ -349,6 +361,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
             )
 
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -368,6 +381,7 @@ class JaxCheckpointScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={"pattern": pattern},
+                        rule_code="S902",
                     )
 
         except json.JSONDecodeError as e:
@@ -378,6 +392,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"error": str(e)},
+                rule_code="S902",
             )
         except Exception as e:
             result.add_check(
@@ -387,6 +402,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
             )
 
     def scan(self, path: str) -> ScanResult:
@@ -434,6 +450,7 @@ class JaxCheckpointScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
