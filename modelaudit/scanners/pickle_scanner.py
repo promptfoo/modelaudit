@@ -2053,6 +2053,7 @@ class PickleScanner(BaseScanner):
 
                 # Determine rule code based on the dangerous pattern
                 pattern_rule_code = None
+                pattern_str = attr.patterns_matched[0] if attr.patterns_matched else ""
                 if pattern_str == "posix":
                     pattern_rule_code = "S101"  # os/posix module
                 elif pattern_str == "system":
@@ -3004,6 +3005,9 @@ class PickleScanner(BaseScanner):
 
                 # SMART DETECTION: Only flag other dangerous opcodes
                 # if not clearly ML content
+                data_type: str | None = None
+                confidence: float | None = None
+
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
                     "is_ml_content",
                     False,

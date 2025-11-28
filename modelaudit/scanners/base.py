@@ -261,50 +261,30 @@ class ScanResult:
         rule_code: str | None = None,
     ) -> None:
         """Add an issue to the result with rule support"""
-        from ..config import get_config
-        from ..rules import RuleRegistry, Severity
-
-        severity_map = {
-            Severity.CRITICAL: IssueSeverity.CRITICAL,
-            Severity.HIGH: IssueSeverity.CRITICAL,
-            Severity.MEDIUM: IssueSeverity.WARNING,
-            Severity.LOW: IssueSeverity.INFO,
-            Severity.INFO: IssueSeverity.INFO,
-        }
-
-        # Auto-detect rule code if not provided
-        if not rule_code:
-            match = RuleRegistry.find_matching_rule(message)
-            if match:
-                rule_code, rule = match
-                if severity == IssueSeverity.WARNING:
-                    severity = severity_map.get(rule.default_severity, severity)
-
-        config = get_config()
-        if rule_code and config.is_suppressed(rule_code, location):
-            logger.debug(f"Suppressed {rule_code}: {message}")
-            return
-
-        if rule_code:
-            config_rule = RuleRegistry.get_rule(rule_code)
-            if config_rule:
-                configured_severity = config.get_severity(rule_code, config_rule.default_severity)
-                mapped = severity_map.get(configured_severity)
-                if mapped is not None:
-                    severity = mapped
-
-        if why is None:
-            why = get_message_explanation(message, context=self.scanner_name)
-
-        issue = Issue(
+        # For backward compatibility: INFO/DEBUG severities are treated as passing checks
+        passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
+        self.add_check(
+            name="Legacy Security Check",
+            passed=passed,
             message=message,
             severity=severity,
             location=location,
-            details=details or {},
+            details=details,
             why=why,
             rule_code=rule_code,
         )
-        self.issues.append(issue)
+
+    def add_issue(
+        self,
+        message: str,
+        severity: IssueSeverity = IssueSeverity.WARNING,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
+        rule_code: str | None = None,
+    ) -> None:
+        """Backward-compatible public issue adder."""
+        self._add_issue(message, severity=severity, location=location, details=details, why=why, rule_code=rule_code)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
