@@ -223,7 +223,15 @@ class TestScanResultIntegration:
 
     def test_issue_string_representation(self):
         """Test that issues display with rule codes."""
-        issue = Issue(message="import os", severity=IssueSeverity.CRITICAL, rule_code="S101")
+        issue = Issue(
+            message="import os",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="S101",
+            location=None,
+            details={},
+            why=None,
+            type=None,
+        )
 
         issue_str = str(issue)
         assert "[S101]" in issue_str

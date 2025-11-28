@@ -262,6 +262,59 @@ class ManifestScanner(BaseScanner):
                 rule_code="S1001",
             )
 
+        def check_dict(d: Any, prefix: str = "") -> None:
+            if not isinstance(d, dict):
+                return
+
+            for key, value in d.items():
+                key_lower = key.lower()
+                full_key = f"{prefix}.{key}" if prefix else key
+
+                # Check if this key might contain a model name
+                if key_lower in MODEL_NAME_KEYS_LOWER:
+                    blocked, reason = check_model_name_policies(
+                        str(value),
+                        self.blacklist_patterns,
+                    )
+                    if blocked:
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=False,
+                            message=f"Model name blocked by policy: {value}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "reason": reason,
+                                "key": full_key,
+                            },
+                            why=(
+                                "This model name matches a blacklist pattern. Organizations use model name "
+                                "blacklists to prevent use of banned, malicious, or policy-violating models."
+                            ),
+                        )
+                    else:
+                        result.add_check(
+                            name="Model Name Policy Check",
+                            passed=True,
+                            message=f"Model name '{value}' passed policy check",
+                            location=self.current_file_path,
+                            details={
+                                "model_name": str(value),
+                                "key": full_key,
+                            },
+                        )
+
+                # Recursively check nested structures
+                if isinstance(value, dict):
+                    check_dict(value, full_key)
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            check_dict(item, f"{full_key}[{i}]")
+
+        check_dict(content)
+
     def _parse_file(
         self,
         path: str,
@@ -356,10 +409,6 @@ class ManifestScanner(BaseScanner):
             if not isinstance(d, dict):
                 return
 
-            ml_context = {}
-            if isinstance(result.metadata.get("ml_context"), dict):
-                ml_context = result.metadata.get("ml_context", {})
-
             for key, value in d.items():
                 key_lower = key.lower()
                 full_key = f"{prefix}.{key}" if prefix else key
@@ -398,70 +447,6 @@ class ManifestScanner(BaseScanner):
                                 "key": full_key,
                             },
                         )
-
-                # STEP 2: Value-based analysis - check for actually dangerous content
-                if self._is_actually_dangerous_value(key, value):
-                    result.add_check(
-                        name="Dangerous Content Detection",
-                        passed=False,
-                        message=f"Dangerous configuration content: {full_key}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={
-                            "key": full_key,
-                            "analysis": "value_based",
-                            "danger": "executable_content",
-                            "value": self._format_value(value),
-                        },
-                    )
-                    # Don't continue here - still check for patterns and recurse
-
-                # STEP 3: Smart pattern matching
-                matches = self._find_suspicious_matches(key_lower)
-                if matches and not self._should_ignore_in_context(
-                    key,
-                    value,
-                    matches,
-                    ml_context,
-                    full_key,
-                ):
-                    # STEP 5: Report with context-aware severity
-                    severity = self._get_context_aware_severity(matches, ml_context)
-                    why = None
-                    if severity == IssueSeverity.INFO:
-                        if "file_access" in matches and "network_access" in matches:
-                            why = (
-                                "File and network access patterns in ML model configurations are common for loading "
-                                "datasets and downloading resources. They are flagged for awareness but are typically "
-                                "benign in ML contexts."
-                            )
-                        elif "file_access" in matches:
-                            why = (
-                                "File access patterns in ML model configurations often indicate dataset paths "
-                                "or model checkpoints. This is flagged for awareness but is typical in ML workflows."
-                            )
-                        elif "network_access" in matches:
-                            why = (
-                                "Network access patterns in ML model configurations may indicate remote model "
-                                "repositories or dataset URLs. This is common in ML pipelines but worth reviewing."
-                            )
-
-                    result.add_check(
-                        name="Suspicious Configuration Pattern Detection",
-                        passed=False,
-                        message=f"Suspicious configuration pattern: {full_key} (category: {', '.join(matches)})",
-                        rule_code="S905",
-                        severity=severity,
-                        location=self.current_file_path,
-                        details={
-                            "key": full_key,
-                            "value": self._format_value(value),
-                            "categories": matches,
-                            "ml_context": ml_context,
-                            "analysis": "pattern_based",
-                        },
-                        why=why,
-                    )
 
                 # ALWAYS recursively check nested structures,
                 # regardless of pattern matches

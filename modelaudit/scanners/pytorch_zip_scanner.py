@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 import zipfile
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
