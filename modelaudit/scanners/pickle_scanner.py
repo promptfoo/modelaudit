@@ -2040,6 +2040,27 @@ class PickleScanner(BaseScanner):
         # Use CVE pattern analysis
         cve_attributions = analyze_cve_patterns(content_str, data)
 
+        # Fallback heuristic for CVE-2020-13092 if analyzer missed it (e.g., partial pickle bytes)
+        content_lower = content_str.lower()
+        if not cve_attributions and "joblib" in content_lower and "__reduce__" in content_lower and (
+            "os.system" in content_lower or "subprocess" in content_lower
+        ):
+            from modelaudit.detectors.cve_patterns import CVEAttribution
+
+            cve_attributions.append(
+                CVEAttribution(
+                    cve_id="CVE-2020-13092",
+                    description="scikit-learn/joblib deserialization RCE via __reduce__ and os.system",
+                    severity="CRITICAL",
+                    cvss=9.8,
+                    cwe="CWE-502",
+                    affected_versions="sklearn <=0.23.0",
+                    remediation="Upgrade scikit-learn/joblib; avoid untrusted pickles",
+                    confidence=0.6,
+                    patterns_matched=["heuristic joblib + __reduce__ + os/system"],
+                )
+            )
+
         if cve_attributions:
             # Enhance scan result with CVE information
             enhance_scan_result_with_cve(result, [content_str], data)

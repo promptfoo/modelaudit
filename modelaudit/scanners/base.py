@@ -273,6 +273,8 @@ class ScanResult:
             why=why,
             rule_code=rule_code,
         )
+        if passed:
+            return
 
     def add_issue(
         self,
