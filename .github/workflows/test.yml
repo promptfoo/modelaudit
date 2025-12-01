@@ -32,7 +32,7 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -102,7 +102,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -143,7 +143,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -189,7 +189,7 @@ jobs:
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -270,7 +270,7 @@ jobs:
             numpy-mode: "1.x"
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
@@ -337,7 +337,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rye
         uses: eifinger/setup-rye@v4
