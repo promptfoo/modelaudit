@@ -311,7 +311,7 @@ def test_manifest_scanner_tunnel_service_flagged():
 
 
 def test_manifest_scanner_trusted_urls_not_flagged():
-    """Test that URLs from trusted domains (huggingface, github, etc.) are NOT flagged."""
+    """Test that URLs from trusted domains (huggingface, github, etc.) are NOT flagged as untrusted."""
     test_file = "config.json"
     config_with_trusted_urls = {
         "model_type": "bert",
@@ -331,10 +331,12 @@ def test_manifest_scanner_trusted_urls_not_flagged():
 
         assert result.success is True
 
-        # Should have NO URL checks that failed (all trusted domains)
-        url_checks = [check for check in result.checks if "URL" in check.name]
-        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
-        assert len(failed_url_checks) == 0, f"Unexpected failed checks: {failed_url_checks}"
+        # Should have NO "Untrusted URL Check" failures (all are trusted domains)
+        # Note: "Cloud Storage URL Detection" may still flag these as INFO for visibility
+        untrusted_url_checks = [
+            c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED
+        ]
+        assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
 
     finally:
         test_file_path = Path(test_file)
