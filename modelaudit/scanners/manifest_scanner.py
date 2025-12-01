@@ -133,23 +133,28 @@ class ManifestScanner(BaseScanner):
             "runtime_config.json",
         ]
 
-        # Check if filename matches any AI/ML specific pattern
-        if any(pattern in filename for pattern in aiml_specific_patterns):
+        # Check if filename matches any AI/ML specific pattern (exact match or suffix match)
+        # Exclude tokenizer configs - they don't contain security-relevant model info
+        if "tokenizer" in filename:
+            return False
+
+        # Exclude common web/JS framework configs that are unrelated to ML
+        web_configs = ["package.json", "tsconfig.json", "jsconfig.json", "webpack.config.json"]
+        if filename in web_configs:
+            return False
+
+        if any(filename == pattern or filename.endswith(pattern) for pattern in aiml_specific_patterns):
             return True
 
         # Additional check: files with "config" in name that are in ML model context
-        if (
-            "config" in filename
-            and "tokenizer" not in filename
-            and filename
-            not in [
-                "config.py",
-                "config.yaml",
-                "config.yml",
-                "config.ini",
-                "config.cfg",
-            ]
-        ):
+        # Note: tokenizer files are already excluded above
+        if "config" in filename and filename not in [
+            "config.py",
+            "config.yaml",
+            "config.yml",
+            "config.ini",
+            "config.cfg",
+        ]:
             # Only if it's likely an ML model config
             path_lower = path.lower()
             if any(

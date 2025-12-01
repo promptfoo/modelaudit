@@ -25,7 +25,7 @@ class TestDiskSpaceUtils:
         assert format_bytes(1536) == "1.5 KB"
         assert format_bytes(-1024) == "-1.0 KB"
 
-    @patch("modelaudit.utils.disk_space.shutil.disk_usage")
+    @patch("modelaudit.utils.helpers.disk_space.shutil.disk_usage")
     def test_get_free_space_bytes(self, mock_disk_usage):
         """Test getting free space."""
         mock_usage = Mock()
@@ -38,10 +38,12 @@ class TestDiskSpaceUtils:
             assert free_space == 1024 * 1024 * 1024
             mock_disk_usage.assert_called_once()
 
-    @patch("modelaudit.utils.disk_space.get_free_space_bytes")
-    def test_check_disk_space_sufficient(self, mock_get_free_space):
+    @patch("modelaudit.utils.helpers.disk_space.shutil.disk_usage")
+    def test_check_disk_space_sufficient(self, mock_disk_usage):
         """Test disk space check when space is sufficient."""
-        mock_get_free_space.return_value = 2 * 1024 * 1024 * 1024  # 2 GB
+        mock_usage = Mock()
+        mock_usage.free = 2 * 1024 * 1024 * 1024  # 2 GB
+        mock_disk_usage.return_value = mock_usage
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
@@ -52,10 +54,12 @@ class TestDiskSpaceUtils:
             assert "Sufficient disk space available" in message
             assert "2.0 GB" in message
 
-    @patch("modelaudit.utils.disk_space.get_free_space_bytes")
-    def test_check_disk_space_insufficient(self, mock_get_free_space):
+    @patch("modelaudit.utils.helpers.disk_space.shutil.disk_usage")
+    def test_check_disk_space_insufficient(self, mock_disk_usage):
         """Test disk space check when space is insufficient."""
-        mock_get_free_space.return_value = 1024 * 1024 * 1024  # 1 GB
+        mock_usage = Mock()
+        mock_usage.free = 1024 * 1024 * 1024  # 1 GB
+        mock_disk_usage.return_value = mock_usage
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
@@ -68,10 +72,12 @@ class TestDiskSpaceUtils:
             assert "Available: 1.0 GB" in message
             assert "safety margin" in message
 
-    @patch("modelaudit.utils.disk_space.get_free_space_bytes")
-    def test_check_disk_space_custom_margin(self, mock_get_free_space):
+    @patch("modelaudit.utils.helpers.disk_space.shutil.disk_usage")
+    def test_check_disk_space_custom_margin(self, mock_disk_usage):
         """Test disk space check with custom safety margin."""
-        mock_get_free_space.return_value = 1600 * 1024 * 1024  # 1.6 GB
+        mock_usage = Mock()
+        mock_usage.free = 1600 * 1024 * 1024  # 1.6 GB
+        mock_disk_usage.return_value = mock_usage
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)

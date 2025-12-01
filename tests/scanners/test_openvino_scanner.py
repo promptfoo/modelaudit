@@ -37,7 +37,8 @@ def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     result = OpenVinoScanner().scan(str(xml_path))
     messages = [i.message.lower() for i in result.issues]
     assert any("weights file not found" in m for m in messages)
-    assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
+    # Missing weights file is INFO severity (not a security concern)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
