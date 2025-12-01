@@ -64,9 +64,7 @@ def pytest_runtest_setup(item):
             pass  # Allow these tests to continue to framework check
         else:
             # Skip all other tests on Python 3.10/3.12/3.13 to prevent CI issues
-            pytest.skip(
-                f"Skipping test on Python {sys.version_info[:2]} - only core functionality tested"
-            )
+            pytest.skip(f"Skipping test on Python {sys.version_info[:2]} - only core functionality tested")
 
     # Auto-skip tests based on framework markers when framework is unavailable
     framework_markers = {
