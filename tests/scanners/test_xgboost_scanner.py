@@ -241,6 +241,7 @@ class TestXGBoostUBJScanning:
 
     def test_invalid_ubj_detected(self, temp_dir, xgboost_scanner):
         """Test detection of invalid UBJ content."""
+        pytest.importorskip("ubjson", reason="ubjson not installed")
         ubj_file = temp_dir / "invalid.ubj"
         ubj_file.write_bytes(b"\xff\xff\xff\xff")  # Invalid UBJ data
 

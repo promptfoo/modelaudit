@@ -37,7 +37,7 @@ class TestJFrogURLDetection:
 
 
 class TestJFrogDownload:
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_success(self, mock_get, tmp_path):
         # Mock successful response
         mock_response = mock_get.return_value
@@ -60,8 +60,8 @@ class TestJFrogDownload:
         with pytest.raises(ValueError):
             download_artifact("https://example.com/model")
 
-    @patch("modelaudit.utils.jfrog.requests.get")
-    @patch("modelaudit.utils.jfrog.shutil.rmtree")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.shutil.rmtree")
     def test_download_cleanup_on_failure(self, mock_rmtree, mock_get):
         # Mock request failure
         mock_get.side_effect = Exception("fail")
@@ -70,7 +70,7 @@ class TestJFrogDownload:
             download_artifact("https://company.jfrog.io/artifactory/repo/model.bin")
         mock_rmtree.assert_called()
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_authentication_methods(self, mock_get, tmp_path):
         """Test different authentication methods."""
         mock_response = mock_get.return_value
@@ -91,7 +91,7 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer test-access-token"
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_environment_variables(self, mock_get, tmp_path, monkeypatch):
         """Test authentication via environment variables."""
         mock_response = mock_get.return_value
@@ -111,14 +111,14 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer env-access-token"
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_no_authentication(self, mock_get, tmp_path, caplog):
         """Test anonymous access when no authentication is provided."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 
-        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.jfrog"):
+        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog"):
             download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
 
         assert "No JFrog authentication provided. Attempting anonymous access." in caplog.text
@@ -127,7 +127,7 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert not call_args[1]["headers"]  # Empty headers dict
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_dotenv_file_support(self, mock_get, tmp_path, monkeypatch):
         """Test that .env file variables are loaded via python-dotenv."""
         # This test verifies that dotenv is loaded, but since we can't easily mock
@@ -214,7 +214,7 @@ class TestJFrogStorageAPI:
 class TestJFrogFolderDetection:
     """Test JFrog folder detection and listing."""
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_detect_jfrog_target_type_file(self, mock_get, tmp_path):
         """Test detection of JFrog file targets."""
         # Mock response for a file
@@ -238,7 +238,7 @@ class TestJFrogFolderDetection:
         called_url = mock_get.call_args[0][0]
         assert "api/storage" in called_url
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_detect_jfrog_target_type_folder(self, mock_get):
         """Test detection of JFrog folder targets."""
         # Mock response for a folder with children
@@ -260,7 +260,7 @@ class TestJFrogFolderDetection:
         assert len(result["children"]) == 3
         assert result["repo"] == "my-repo"
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_detect_jfrog_target_type_auth_error(self, mock_get):
         """Test handling of authentication errors."""
         mock_response = mock_get.return_value
@@ -274,7 +274,7 @@ class TestJFrogFolderDetection:
         with pytest.raises(Exception, match="Authentication failed"):
             detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl")
 
-    @patch("modelaudit.utils.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_detect_jfrog_target_type_not_found(self, mock_get):
         """Test handling of 404 errors."""
         mock_response = mock_get.return_value
@@ -292,7 +292,7 @@ class TestJFrogFolderDetection:
 class TestJFrogFolderListing:
     """Test JFrog folder content listing."""
 
-    @patch("modelaudit.utils.jfrog.detect_jfrog_target_type")
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
     def test_list_jfrog_folder_contents_simple(self, mock_detect):
         """Test listing contents of a simple folder."""
         # Mock folder with files
@@ -322,7 +322,7 @@ class TestJFrogFolderListing:
         assert pkl_file["size"] == 1024
         assert pkl_file["human_size"] == "1.0 KB"
 
-    @patch("modelaudit.utils.jfrog.detect_jfrog_target_type")
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
     def test_list_jfrog_folder_contents_recursive(self, mock_detect):
         """Test recursive listing of nested folders."""
 
@@ -358,7 +358,7 @@ class TestJFrogFolderListing:
         # Should still find the same files since they are scannable model files
         assert len(filtered_files) == 2
 
-    @patch("modelaudit.utils.jfrog.detect_jfrog_target_type")
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
     def test_list_jfrog_folder_contents_not_folder(self, mock_detect):
         """Test error when trying to list contents of a file."""
         mock_detect.return_value = {"type": "file", "size": 1024}
@@ -370,8 +370,8 @@ class TestJFrogFolderListing:
 class TestJFrogFolderDownload:
     """Test JFrog folder download functionality."""
 
-    @patch("modelaudit.utils.jfrog.download_artifact")
-    @patch("modelaudit.utils.jfrog.list_jfrog_folder_contents")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_success(self, mock_list, mock_download, tmp_path):
         """Test successful folder download."""
         # Mock folder contents
@@ -406,7 +406,7 @@ class TestJFrogFolderDownload:
         assert result_dir == tmp_path
         assert len(list(tmp_path.glob("**/*"))) >= 2  # At least 2 files downloaded
 
-    @patch("modelaudit.utils.jfrog.list_jfrog_folder_contents")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_no_files(self, mock_list):
         """Test error when no scannable files found."""
         mock_list.return_value = []  # No files after filtering

@@ -77,10 +77,11 @@ class TestMetadataScanner:
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
+                # Use a 48-character key after sk- to match the OpenAI API key pattern
                 f.write(
-                    "# Model Setup\\n\\n"
-                    + "API Key: sk-1234567890abcdef1234567890abcdef12345678\\n"
-                    + "Token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n"
+                    "# Model Setup\n\n"
+                    + "API Key: sk-1234567890abcdef1234567890abcdef1234567890abcdef\n"
+                    + "Token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
                 )
 
             result = scanner.scan(str(readme_path))
@@ -109,7 +110,8 @@ class TestMetadataScanner:
         result = scanner.scan("/nonexistent/README.md")
 
         assert len(result.issues) == 1
-        assert result.issues[0].severity == IssueSeverity.INFO
+        # File access errors are WARNING severity (may indicate tampering)
+        assert result.issues[0].severity == IssueSeverity.WARNING
         assert "Error reading" in result.issues[0].message
 
     def test_bytes_scanned_reported(self):

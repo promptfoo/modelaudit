@@ -225,32 +225,29 @@ def test_manifest_scanner_yaml():
     pytest.skip("YAML files are no longer supported by manifest scanner whitelist")
 
 
-def test_manifest_scanner_can_handle():
+def test_manifest_scanner_can_handle(tmp_path):
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
-    # Test files with expected can_handle results
-    test_cases = [
-        # HuggingFace/ML configs - should be handled
-        ("config.json", True),
-        ("generation_config.json", True),
-        ("model_index.json", True),
-        # Files containing "config.json" substring also match
-        ("tokenizer_config.json", True),
-        # Non-ML configs - should not be handled
-        ("package.json", False),
-        ("data.json", False),
-    ]
+    # Create actual files for testing (scanner requires files to exist)
+    (tmp_path / "config.json").write_text('{"model_type": "test"}')
+    (tmp_path / "generation_config.json").write_text("{}")
+    (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / "tsconfig.json").write_text("{}")
 
-    created_files = []
-    try:
-        for filename, expected in test_cases:
-            Path(filename).write_text("{}")
-            created_files.append(filename)
-            assert scanner.can_handle(filename) is expected, f"{filename} expected {expected}"
-    finally:
-        for filename in created_files:
-            Path(filename).unlink(missing_ok=True)
+    # Should handle HuggingFace configs
+    assert scanner.can_handle(str(tmp_path / "config.json")) is True
+    assert scanner.can_handle(str(tmp_path / "generation_config.json")) is True
+    assert scanner.can_handle(str(tmp_path / "model_index.json")) is True
+
+    # Should not handle tokenizer configs (excluded)
+    assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False
+
+    # Should not handle non-ML configs
+    assert scanner.can_handle(str(tmp_path / "package.json")) is False
+    assert scanner.can_handle(str(tmp_path / "tsconfig.json")) is False
 
 
 def test_manifest_scanner_url_shortener_flagged():

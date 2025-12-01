@@ -134,11 +134,14 @@ class TestSBOMURLFixes:
         expected_names = {"local_model.onnx", "downloaded_model.safetensors"}
         assert component_names == expected_names
 
-    @pytest.mark.skip(reason="Temporarily skipping due to CI environment-specific issues - fix in progress")
+    @pytest.mark.integration
     @patch("modelaudit.cli.is_huggingface_file_url")
     @patch("modelaudit.cli.download_file_from_hf")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_huggingface_file_url(self, mock_scan, mock_download, mock_is_hf_file_url, tmp_path):
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    def test_cli_sbom_with_huggingface_file_url(
+        self, mock_spinner, mock_scan, mock_download, mock_is_hf_file_url, tmp_path
+    ):
         """Test CLI SBOM generation with HuggingFace file URL."""
         # Setup mocks
         mock_is_hf_file_url.return_value = True
@@ -156,6 +159,7 @@ class TestSBOMURLFixes:
             [
                 "scan",
                 "--no-cache",
+                "--quiet",
                 "--sbom",
                 str(sbom_output),
                 "https://huggingface.co/test/model/resolve/main/model.bin",
@@ -163,7 +167,7 @@ class TestSBOMURLFixes:
         )
 
         # Should succeed
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"CLI failed: {result.output}\n{result.exception}"
 
         # SBOM file should be created
         assert sbom_output.exists()
@@ -180,11 +184,15 @@ class TestSBOMURLFixes:
         # Verify scan was called with downloaded path, not URL
         assert mock_scan.call_args[0][0] == str(downloaded_file)
 
-    @pytest.mark.skip(reason="Temporarily skipping due to CI environment-specific issues - fix in progress")
+    @pytest.mark.integration
     @patch("modelaudit.cli.is_huggingface_url")
+    @patch("modelaudit.cli.is_huggingface_file_url", return_value=False)
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_huggingface_model_url(self, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    def test_cli_sbom_with_huggingface_model_url(
+        self, mock_spinner, mock_scan, mock_download, mock_is_hf_file_url, mock_is_hf_url, tmp_path
+    ):
         """Test CLI SBOM generation with HuggingFace model URL."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -199,10 +207,10 @@ class TestSBOMURLFixes:
         # Test CLI with SBOM output
         sbom_output = tmp_path / "model.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", "--no-cache", "--sbom", str(sbom_output), "hf://test/model"])
+        result = runner.invoke(cli, ["scan", "--no-cache", "--quiet", "--sbom", str(sbom_output), "hf://test/model"])
 
         # Should succeed
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"CLI failed: {result.output}\n{result.exception}"
         assert sbom_output.exists()
 
         # Verify SBOM content has components from directory
@@ -212,11 +220,16 @@ class TestSBOMURLFixes:
         assert "config.json" in component_names
         assert "model.bin" in component_names
 
-    @pytest.mark.skip(reason="Temporarily skipping due to CI environment-specific issues - fix in progress")
+    @pytest.mark.integration
     @patch("modelaudit.cli.is_cloud_url")
+    @patch("modelaudit.cli.is_huggingface_file_url", return_value=False)
+    @patch("modelaudit.cli.is_huggingface_url", return_value=False)
     @patch("modelaudit.cli.download_from_cloud")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_cloud_url(self, mock_scan, mock_download, mock_is_cloud_url, tmp_path):
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    def test_cli_sbom_with_cloud_url(
+        self, mock_spinner, mock_scan, mock_download, mock_is_hf_url, mock_is_hf_file_url, mock_is_cloud_url, tmp_path
+    ):
         """Test CLI SBOM generation with cloud storage URL."""
         # Setup mocks
         mock_is_cloud_url.return_value = True
@@ -229,9 +242,11 @@ class TestSBOMURLFixes:
         # Test CLI with SBOM
         sbom_output = tmp_path / "cloud.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", "--sbom", str(sbom_output), "s3://bucket/model.pkl"])
+        result = runner.invoke(
+            cli, ["scan", "--no-cache", "--quiet", "--sbom", str(sbom_output), "s3://bucket/model.pkl"]
+        )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"CLI failed: {result.output}\n{result.exception}"
         assert sbom_output.exists()
 
         sbom_data = json.loads(sbom_output.read_text())
@@ -274,11 +289,15 @@ class TestSBOMURLFixes:
             # If hashes field is present, it should be a list (may be empty)
             assert isinstance(component["hashes"], list)
 
-    @pytest.mark.skip(reason="Temporarily skipping due to CI environment-specific issues - fix in progress")
+    @pytest.mark.integration
     @patch("modelaudit.cli.is_huggingface_url")
+    @patch("modelaudit.cli.is_huggingface_file_url", return_value=False)
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_cli_sbom_with_download_failure(self, mock_scan, mock_download, mock_is_hf_url, tmp_path):
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    def test_cli_sbom_with_download_failure(
+        self, mock_spinner, mock_scan, mock_download, mock_is_hf_file_url, mock_is_hf_url, tmp_path
+    ):
         """Test CLI behavior when download fails but SBOM is requested."""
         # Setup mocks for download failure
         mock_is_hf_url.return_value = True
@@ -286,7 +305,9 @@ class TestSBOMURLFixes:
 
         sbom_output = tmp_path / "failed.sbom.json"
         runner = CliRunner()
-        result = runner.invoke(cli, ["scan", "--sbom", str(sbom_output), "hf://test/failing-model"])
+        result = runner.invoke(
+            cli, ["scan", "--no-cache", "--quiet", "--sbom", str(sbom_output), "hf://test/failing-model"]
+        )
 
         # Should handle the error gracefully
         assert result.exit_code != 0  # Should fail due to download error
