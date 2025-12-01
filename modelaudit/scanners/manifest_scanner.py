@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
@@ -55,6 +56,25 @@ MODEL_NAME_KEYS_LOWER = [
     "artifact_id",
     "package_name",
 ]
+
+# Keys that indicate hash/checksum values used for integrity verification
+# These are used to detect weak hash algorithms (MD5, SHA1)
+HASH_INTEGRITY_KEYS = [
+    "hash",
+    "checksum",
+    "digest",
+    "md5",
+    "sha1",
+    "sha256",
+    "sha512",
+    "file_hash",
+    "model_hash",
+    "weight_hash",
+    "integrity",
+]
+
+# Regex pattern for hexadecimal strings (used to detect hash values)
+HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
 
 
 class ManifestScanner(BaseScanner):
@@ -188,6 +208,9 @@ class ManifestScanner(BaseScanner):
 
                     # Check for blacklisted model names in config values
                     self._check_model_name_policies(content, result)
+
+                    # Check for weak hash algorithms used for integrity verification
+                    self._check_weak_hashes(content, result)
 
             else:
                 result.add_check(
@@ -400,3 +423,100 @@ class ManifestScanner(BaseScanner):
                             check_dict(item, f"{full_key}[{i}]")
 
         check_dict(content)
+
+    def _check_weak_hashes(self, content: dict[str, Any], result: ScanResult) -> None:
+        """Check for weak hash algorithms (MD5, SHA1) used for integrity verification.
+
+        MD5 and SHA1 are cryptographically broken and should not be used for
+        integrity verification of model files. This check detects when these
+        weak algorithms are used in config files.
+
+        CWE-328: Use of Weak Hash
+        """
+
+        def _is_hex_string(value: str) -> bool:
+            """Check if a string is a valid hexadecimal value."""
+            return bool(HEX_PATTERN.match(value))
+
+        def _detect_hash_algorithm(value: str) -> str | None:
+            """Detect hash algorithm based on string length."""
+            if not _is_hex_string(value):
+                return None
+
+            # Map hash length to algorithm name
+            length_to_algorithm = {
+                32: "MD5",
+                40: "SHA1",
+                64: "SHA256",
+                128: "SHA512",
+            }
+            return length_to_algorithm.get(len(value))
+
+        def check_value(key: str, value: Any, path: str) -> None:
+            """Check a single key-value pair for weak hash usage."""
+            if not isinstance(value, str):
+                return
+
+            key_lower = key.lower()
+
+            # Check if this key is likely a hash/checksum field
+            is_hash_key = any(h in key_lower for h in HASH_INTEGRITY_KEYS)
+
+            if not is_hash_key:
+                return
+
+            algorithm = _detect_hash_algorithm(value)
+
+            if algorithm in ("MD5", "SHA1"):
+                # Weak hash detected
+                result.add_check(
+                    name="Weak Hash Detection",
+                    passed=False,
+                    message=f"{algorithm} hash detected for integrity verification: {key}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "key": path,
+                        "algorithm": algorithm,
+                        "hash_preview": value[:16] + "..." if len(value) > 16 else value,
+                    },
+                    why=(
+                        f"{algorithm} is cryptographically broken and vulnerable to collision attacks. "
+                        "Use SHA256 or stronger for model integrity verification. "
+                        "See CWE-328: Use of Weak Hash."
+                    ),
+                )
+            elif algorithm in ("SHA256", "SHA512"):
+                # Strong hash - good!
+                result.add_check(
+                    name="Weak Hash Detection",
+                    passed=True,
+                    message=f"Strong hash algorithm ({algorithm}) used for: {key}",
+                    severity=IssueSeverity.DEBUG,
+                    location=self.current_file_path,
+                    details={
+                        "key": path,
+                        "algorithm": algorithm,
+                    },
+                )
+
+        def traverse_for_hashes(d: Any, prefix: str = "") -> None:
+            """Recursively check dictionary for weak hashes."""
+            if not isinstance(d, dict):
+                return
+
+            for key, value in d.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+
+                if isinstance(value, str):
+                    check_value(key, value, full_key)
+                elif isinstance(value, dict):
+                    traverse_for_hashes(value, full_key)
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            traverse_for_hashes(item, f"{full_key}[{i}]")
+                        elif isinstance(item, str):
+                            check_value(f"{key}[{i}]", item, f"{full_key}[{i}]")
+
+        traverse_for_hashes(content)
