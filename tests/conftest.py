@@ -57,6 +57,7 @@ def pytest_runtest_setup(item):
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
+            "test_cloud_url_detection.py",  # Cloud storage URL detection tests
         ]
 
         # Check if this is an allowed test file

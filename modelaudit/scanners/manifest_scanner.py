@@ -57,6 +57,64 @@ MODEL_NAME_KEYS_LOWER = [
     "package_name",
 ]
 
+# Cloud storage URL patterns for detecting external resource references
+# These patterns detect references to cloud storage that could indicate
+# external dependencies or potential data exfiltration vectors
+CLOUD_STORAGE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    # AWS S3
+    (re.compile(r"s3://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "AWS S3 URI", "s3"),
+    (
+        re.compile(r"https?://[a-zA-Z0-9.\-_]+\.s3\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 URL",
+        "s3",
+    ),
+    (
+        re.compile(r"https?://s3\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 URL",
+        "s3",
+    ),
+    (
+        re.compile(r"https?://s3\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 Regional URL",
+        "s3",
+    ),
+    # Google Cloud Storage
+    (re.compile(r"gs://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Google Cloud Storage URI", "gcs"),
+    (
+        re.compile(r"https?://storage\.googleapis\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "Google Cloud Storage URL",
+        "gcs",
+    ),
+    (
+        re.compile(r"https?://storage\.cloud\.google\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "Google Cloud Storage URL",
+        "gcs",
+    ),
+    # Azure Blob Storage
+    (
+        re.compile(r"https?://[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "Azure Blob Storage URL",
+        "azure",
+    ),
+    (re.compile(r"az://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Azure Storage URI", "azure"),
+    (
+        re.compile(r"wasbs?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "Azure WASB URI",
+        "azure",
+    ),
+    (
+        re.compile(r"abfss?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.dfs\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "Azure ADLS Gen2 URI",
+        "azure",
+    ),
+    # Hugging Face Hub (external model references)
+    (
+        re.compile(r"https?://huggingface\.co/[a-zA-Z0-9.\-_]+/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "HuggingFace Hub URL",
+        "huggingface",
+    ),
+]
+
 # Keys that indicate hash/checksum values used for integrity verification
 # These are used to detect weak hash algorithms (MD5, SHA1)
 HASH_INTEGRITY_KEYS = [
@@ -414,6 +472,9 @@ class ManifestScanner(BaseScanner):
             # Check the raw file content for blacklisted terms
             self._check_file_for_blacklist(path, result)
 
+            # Check for cloud storage URLs (external resource references)
+            self._check_cloud_storage_urls(path, result)
+
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
             content = self._parse_file(path, ext, result)
@@ -654,6 +715,61 @@ class ManifestScanner(BaseScanner):
                             check_dict(item, f"{full_key}[{i}]")
 
         check_dict(content)
+
+    def _check_cloud_storage_urls(self, path: str, result: ScanResult) -> None:
+        """Check for cloud storage URLs (external resource references).
+
+        Detects references to AWS S3, Google Cloud Storage, Azure Blob Storage,
+        and other external resources that could indicate:
+        - External model dependencies
+        - Potential data exfiltration vectors
+        - Supply chain risks from external resources
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+
+            seen_urls: set[str] = set()
+
+            for pattern, description, provider in CLOUD_STORAGE_PATTERNS:
+                for match in pattern.finditer(content):
+                    url = match.group()
+
+                    # Skip duplicates
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
+                    # Determine severity based on context
+                    # INFO for most cloud URLs (informational - may be legitimate)
+                    severity = IssueSeverity.INFO
+
+                    # Check for suspicious indicators that might elevate severity
+                    url_lower = url.lower()
+                    suspicious_indicators = ["malware", "exploit", "hack", "evil", "backdoor", "exfil"]
+                    if any(indicator in url_lower for indicator in suspicious_indicators):
+                        severity = IssueSeverity.WARNING
+
+                    result.add_check(
+                        name="Cloud Storage URL Detection",
+                        passed=False,  # Finding a cloud URL is informational, not a pass/fail
+                        message=f"{description} detected: {url[:150]}",
+                        severity=severity,
+                        location=self.current_file_path,
+                        details={
+                            "url": url,
+                            "provider": provider,
+                            "description": description,
+                        },
+                        why=(
+                            "External cloud storage references in model configs may indicate external "
+                            "dependencies or potential supply chain risks. Verify that these URLs point "
+                            "to trusted sources and are required for model operation."
+                        ),
+                    )
+
+        except Exception as e:
+            logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 
     def _check_suspicious_urls(self, content: dict[str, Any], result: ScanResult) -> None:
         """Check for untrusted URLs in config values using allowlist approach.
