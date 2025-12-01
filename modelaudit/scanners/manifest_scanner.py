@@ -71,7 +71,6 @@ HASH_INTEGRITY_KEYS = [
     "model_hash",
     "weight_hash",
     "integrity",
-    "etag",
 ]
 
 # Regex pattern for hexadecimal strings (used to detect hash values)
@@ -496,7 +495,7 @@ class ManifestScanner(BaseScanner):
                     },
                 )
 
-        def check_dict(d: Any, prefix: str = "") -> None:
+        def traverse_for_hashes(d: Any, prefix: str = "") -> None:
             """Recursively check dictionary for weak hashes."""
             if not isinstance(d, dict):
                 return
@@ -507,12 +506,12 @@ class ManifestScanner(BaseScanner):
                 if isinstance(value, str):
                     check_value(key, value, full_key)
                 elif isinstance(value, dict):
-                    check_dict(value, full_key)
+                    traverse_for_hashes(value, full_key)
                 elif isinstance(value, list):
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
-                            check_dict(item, f"{full_key}[{i}]")
+                            traverse_for_hashes(item, f"{full_key}[{i}]")
                         elif isinstance(item, str):
                             check_value(f"{key}[{i}]", item, f"{full_key}[{i}]")
 
-        check_dict(content)
+        traverse_for_hashes(content)
