@@ -18,6 +18,7 @@ from modelaudit.integrations.license_checker import (
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     detect_file_format,
@@ -1257,6 +1258,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
 
+    # Record telemetry for file type detection
+    detected_format = header_format if header_format != "unknown" else ext_format
+    record_file_type_detected(path, detected_format)
+
     # Validate file type consistency as a security check
     file_type_valid = validate_file_type(path)
     discrepancy_msg = None
@@ -1324,6 +1329,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         scanner = preferred_scanner(config=config)
 
         try:
+            # Record scanner usage telemetry
+            scan_start = time.time()
+
             if use_extreme_handler:
                 logger.debug(f"Large file optimization enabled: {path}")
                 result = scan_advanced_large_file(
@@ -1334,6 +1342,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
                 result = scanner.scan_with_cache(path)
+
+            # Record scanner usage telemetry
+            scan_duration = time.time() - scan_start
+            record_scanner_used(preferred_scanner.name, detected_format, scan_duration)
         except TimeoutError as e:
             # Handle timeout gracefully
             result = ScanResult(scanner_name=preferred_scanner.name)
@@ -1354,6 +1366,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner = scanner_class(config=config)
 
             try:
+                # Record scanner usage telemetry
+                scan_start = time.time()
+
                 if use_extreme_handler:
                     logger.debug(f"Large file optimization enabled: {path}")
                     result = scan_advanced_large_file(
@@ -1364,6 +1379,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
                     result = scanner.scan_with_cache(path)
+
+                # Record scanner usage telemetry
+                scan_duration = time.time() - scan_start
+                record_scanner_used(scanner_class.name, detected_format, scan_duration)
             except TimeoutError as e:
                 # Handle timeout gracefully
                 result = ScanResult(scanner_name=scanner_class.name)
@@ -1420,11 +1439,28 @@ def merge_scan_result(
         results: The existing ModelAuditResultModel
         scan_result: The ScanResult object or dict to merge
     """
-    # Use the new direct aggregation method for better performance and type safety
+    # Record telemetry for issues before aggregation
     if isinstance(scan_result, ScanResult):
+        file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
+        for issue in scan_result.issues:
+            record_issue_found(
+                issue.message,
+                issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
+                scan_result.scanner_name,
+                file_path=file_path,
+            )
+        # Use the new direct aggregation method for better performance and type safety
         results.aggregate_scan_result_direct(scan_result)
     else:
-        # Fallback to dict-based aggregation for backward compatibility
+        # Fallback to dict-based aggregation for backward compatibility with telemetry
+        file_path = scan_result.get("file_path")
+        for issue in scan_result.get("issues", []):
+            record_issue_found(
+                issue.get("message", "unknown_issue"),
+                issue.get("severity", "unknown"),
+                scan_result.get("scanner_name", "unknown"),
+                file_path=file_path,
+            )
         results.aggregate_scan_result(scan_result)
 
 

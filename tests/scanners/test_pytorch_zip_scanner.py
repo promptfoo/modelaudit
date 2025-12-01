@@ -3,12 +3,13 @@ import zipfile
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+from tests.helpers import create_mock_pytorch_zip
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
     """Test the can_handle method of PyTorchZipScanner."""
     # Test with actual PyTorch file
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     assert PyTorchZipScanner.can_handle(str(model_path)) is True
 
     # Test with non-existent file
@@ -20,39 +21,9 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
-def create_pytorch_zip(tmp_path, *, malicious=False):
-    """Create a mock PyTorch ZIP file for testing."""
-    # Create a ZIP file that mimics a PyTorch model
-    zip_path = tmp_path / "model.pt"
-
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        # Add a version file
-        zipf.writestr("version", "3")
-
-        # Add a data.pkl file
-        data = {"weights": [1, 2, 3], "bias": [0.1, 0.2]}
-
-        if malicious:
-            # Add a malicious class
-            class MaliciousClass:
-                def __reduce__(self):
-                    return (eval, ("print('malicious code')",))
-
-            data["malicious"] = MaliciousClass()
-
-        # Pickle the data
-        pickled_data = pickle.dumps(data)
-        zipf.writestr("data.pkl", pickled_data)
-
-        # Add some other files
-        zipf.writestr("model.json", '{"name": "test_model"}')
-
-    return zip_path
-
-
 def test_pytorch_zip_scanner_safe_model(tmp_path):
     """Test scanning a safe PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -67,7 +38,7 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
 
 def test_pytorch_zip_scanner_malicious_model(tmp_path):
     """Test scanning a malicious PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path, malicious=True)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -160,7 +131,7 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
 
     monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
 
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
     scanner.scan(str(model_path))
 
