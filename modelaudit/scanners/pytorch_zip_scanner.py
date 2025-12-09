@@ -14,11 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class PyTorchZipScanner(BaseScanner):
-    """Scanner for PyTorch Zip-based model files (.pt, .pth)"""
+    """Scanner for PyTorch Zip-based model files (.pt, .pth, .pkl, .bin)"""
 
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
-    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".bin"]
+    # Include .pkl since torch.save() uses ZIP format by default since PyTorch 1.6
+    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".pkl", ".bin"]
 
     # CVE-2025-32434 constants
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
@@ -51,8 +52,9 @@ class PyTorchZipScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
-        # For .bin files, only handle if they're ZIP format (torch.save() output)
-        if ext == ".bin":
+        # For .bin and .pkl files, only handle if they're ZIP format (torch.save() output)
+        # torch.save() uses ZIP format by default since PyTorch 1.6 (_use_new_zipfile_serialization=True)
+        if ext in [".bin", ".pkl"]:
             try:
                 from modelaudit.utils.file.detection import detect_file_format
 
