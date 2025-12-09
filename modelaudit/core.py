@@ -1290,7 +1290,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     preferred_scanner: type[BaseScanner] | None = None
 
     # Special handling for PyTorch files that are ZIP-based
-    if header_format == "zip" and ext in [".pt", ".pth"]:
+    # PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True)
+    # This applies to .pt, .pth, and .pkl files saved with torch.save()
+    if header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
         preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
