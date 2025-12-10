@@ -2235,39 +2235,26 @@ def _get_env_info() -> dict[str, Any]:
 
 
 def _get_dependency_versions() -> dict[str, Any]:
-    """Get versions of key dependencies for debug output."""
+    """Get versions of key dependencies for debug output.
 
-    def _get_version(module_name: str, version_attr: str = "__version__") -> str | None:
-        """Safely get version from a module."""
+    Uses importlib.metadata to get versions WITHOUT importing modules.
+    This avoids mutex/threading issues from ML framework initialization.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    def _get_version(package_name: str) -> str | None:
+        """Get package version from metadata without importing the module."""
         try:
-            module = __import__(module_name)
-            return str(getattr(module, version_attr, None))
-        except ImportError:
+            return version(package_name)
+        except PackageNotFoundError:
             return None
         except Exception:
-            return "error"
-
-    def _get_torch_cuda_info() -> dict[str, Any] | None:
-        """Get PyTorch CUDA information if available."""
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                return {
-                    "available": True,
-                    "version": torch.version.cuda,
-                    "deviceCount": torch.cuda.device_count(),
-                }
-            return {"available": False}
-        except ImportError:
             return None
-        except Exception:
-            return {"available": False, "error": "failed to detect"}
 
     # Core dependencies (should always be installed)
     core = {
         "click": _get_version("click"),
-        "pyyaml": _get_version("yaml", "__version__"),
+        "pyyaml": _get_version("pyyaml"),
         "requests": _get_version("requests"),
         "platformdirs": _get_version("platformdirs"),
     }
@@ -2292,8 +2279,8 @@ def _get_dependency_versions() -> dict[str, Any]:
 
     # Utility dependencies (optional)
     utilities = {
-        "huggingface_hub": _get_version("huggingface_hub"),
-        "posthog": _get_version("posthog", "VERSION"),
+        "huggingface_hub": _get_version("huggingface-hub"),
+        "posthog": _get_version("posthog"),
         "jinja2": _get_version("jinja2"),
         "py7zr": _get_version("py7zr"),
         "xgboost": _get_version("xgboost"),
@@ -2309,11 +2296,6 @@ def _get_dependency_versions() -> dict[str, Any]:
         "serialization": filter_installed(serialization),
         "utilities": filter_installed(utilities),
     }
-
-    # Add CUDA info if PyTorch is installed
-    cuda_info = _get_torch_cuda_info()
-    if cuda_info is not None:
-        result["cuda"] = cuda_info
 
     return result
 
@@ -2477,13 +2459,6 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
         lines.append(f"  ✅ ML frameworks: {', '.join(ml_installed)}")
     else:
         lines.append(style_text("  ⚠️  No ML frameworks installed (torch, tensorflow, onnx, jax)", fg="yellow"))
-
-    # CUDA status if available
-    cuda_info = deps_info.get("cuda", {})
-    if cuda_info and cuda_info.get("available"):
-        cuda_ver = cuda_info.get("version", "unknown")
-        device_count = cuda_info.get("deviceCount", 0)
-        lines.append(f"  ✅ CUDA {cuda_ver} ({device_count} device(s))")
 
     # Scanner status
     scanner_info = debug_info.get("scanners", {})
