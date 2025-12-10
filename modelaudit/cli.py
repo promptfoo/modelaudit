@@ -2227,17 +2227,20 @@ def _get_install_info() -> dict[str, Any]:
 
     # Check if editable install
     try:
-        from importlib.metadata import Distribution
+        from importlib.metadata import distribution
 
-        dist = Distribution.from_name("modelaudit")
+        dist = distribution("modelaudit")
 
-        # Get install location
-        if dist._path:  # type: ignore[attr-defined]
-            install_path = str(dist._path.parent)  # type: ignore[attr-defined]
+        # Get install location using public API (locate_file returns install root)
+        try:
+            install_root = dist.locate_file("")
+            install_path = str(install_root)
             home = str(Path.home())
             if install_path.startswith(home):
                 install_path = "~" + install_path[len(home) :]
             info["location"] = install_path
+        except Exception:
+            pass  # location is optional
 
         # Check for editable install via direct_url.json
         direct_url_text = dist.read_text("direct_url.json")

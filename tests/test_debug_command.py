@@ -10,11 +10,12 @@ from click.testing import CliRunner
 from modelaudit.cli import cli
 
 
+@pytest.mark.unit
 class TestDebugCommand:
     """Tests for the modelaudit debug command."""
 
     @pytest.fixture
-    def runner(self):
+    def runner(self) -> CliRunner:
         """Create a CLI runner."""
         return CliRunner()
 
