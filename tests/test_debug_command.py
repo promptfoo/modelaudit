@@ -43,10 +43,11 @@ class TestDebugCommand:
         # Check all required top-level fields
         assert "version" in parsed
         assert "platform" in parsed
+        assert "install" in parsed
+        assert "dependencies" in parsed
         assert "env" in parsed
         assert "auth" in parsed
         assert "scanners" in parsed
-        assert "numpy" in parsed
         assert "cache" in parsed
         assert "config" in parsed
 
@@ -60,6 +61,16 @@ class TestDebugCommand:
         assert "release" in platform_info
         assert "arch" in platform_info
         assert "pythonVersion" in platform_info
+        assert "pythonExecutable" in platform_info
+
+    def test_debug_install_info_structure(self, runner):
+        """Install info should have expected structure."""
+        result = runner.invoke(cli, ["debug", "--json"])
+        parsed = json.loads(result.output)
+
+        install_info = parsed["install"]
+        # editable should always be present
+        assert "editable" in install_info
 
     def test_debug_env_info_structure(self, runner):
         """Environment info should have expected structure."""
@@ -89,15 +100,16 @@ class TestDebugCommand:
         # Available should be <= total
         assert scanner_info["available"] <= scanner_info["total"]
 
-    def test_debug_numpy_info_structure(self, runner):
-        """NumPy info should have expected structure."""
+    def test_debug_scanner_has_available_list(self, runner):
+        """Scanner info should include list of available scanners."""
         result = runner.invoke(cli, ["debug", "--json"])
         parsed = json.loads(result.output)
 
-        numpy_info = parsed["numpy"]
-        assert "compatible" in numpy_info
-        assert "version" in numpy_info
-        assert "status" in numpy_info
+        scanner_info = parsed["scanners"]
+        assert "availableList" in scanner_info
+        assert isinstance(scanner_info["availableList"], list)
+        # Should have at least some scanners
+        assert len(scanner_info["availableList"]) > 0
 
     def test_debug_cache_info_structure(self, runner):
         """Cache info should have expected structure."""
@@ -119,10 +131,12 @@ class TestDebugCommand:
         parsed = json.loads(result.output)
 
         config_info = parsed["config"]
-        # Should have configPath and configExists at minimum
+        # Should have both shared and modelaudit config paths
         if "error" not in config_info:
-            assert "configPath" in config_info
-            assert "configExists" in config_info
+            assert "sharedConfigPath" in config_info
+            assert "sharedConfigExists" in config_info
+            assert "modelauditConfigPath" in config_info
+            assert "modelauditConfigExists" in config_info
 
     def test_debug_never_exposes_api_keys(self, runner):
         """Ensure no API keys or tokens appear in output."""
@@ -243,9 +257,9 @@ class TestDebugCommand:
 
         # Config path should use ~
         config_info = parsed.get("config", {})
-        config_path = config_info.get("configPath")
-        if config_path:
-            assert config_path.startswith("~") or "error" in config_info
+        shared_config_path = config_info.get("sharedConfigPath")
+        if shared_config_path:
+            assert shared_config_path.startswith("~") or "error" in config_info
 
         # Cache directory should use ~
         cache_info = parsed.get("cache", {})
@@ -272,8 +286,9 @@ class TestDebugCommand:
         auth_info = parsed["auth"]
         assert "authenticated" in auth_info
         assert "delegatedFromPromptfoo" in auth_info
-        assert "apiHost" in auth_info
-        assert "appUrl" in auth_info
+        # Should NOT expose internal URLs
+        assert "apiHost" not in auth_info
+        assert "appUrl" not in auth_info
 
     def test_debug_help_text(self, runner):
         """Debug command should have helpful description."""

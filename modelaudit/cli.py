@@ -2215,7 +2215,50 @@ def _get_platform_info() -> dict[str, Any]:
         "release": platform.release(),
         "arch": platform.machine(),
         "pythonVersion": platform.python_version(),
+        "pythonExecutable": sys.executable,
     }
+
+
+def _get_install_info() -> dict[str, Any]:
+    """Get ModelAudit installation information for debug output."""
+    from importlib.metadata import PackageNotFoundError
+
+    info: dict[str, Any] = {}
+
+    # Check if editable install
+    try:
+        from importlib.metadata import Distribution
+
+        dist = Distribution.from_name("modelaudit")
+
+        # Get install location
+        if dist._path:  # type: ignore[attr-defined]
+            install_path = str(dist._path.parent)  # type: ignore[attr-defined]
+            home = str(Path.home())
+            if install_path.startswith(home):
+                install_path = "~" + install_path[len(home) :]
+            info["location"] = install_path
+
+        # Check for editable install via direct_url.json
+        direct_url_text = dist.read_text("direct_url.json")
+        if direct_url_text:
+            import json as json_module
+
+            direct_url = json_module.loads(direct_url_text)
+            if direct_url.get("dir_info", {}).get("editable", False):
+                info["editable"] = True
+            else:
+                info["editable"] = False
+        else:
+            info["editable"] = False
+
+    except PackageNotFoundError:
+        info["editable"] = None
+        info["location"] = "not installed as package"
+    except Exception:
+        info["editable"] = None
+
+    return info
 
 
 def _get_env_info() -> dict[str, Any]:
@@ -2306,8 +2349,6 @@ def _get_auth_info() -> dict[str, Any]:
         "authenticated": config.is_authenticated(),
         "authSource": config.get_auth_source() if config.is_authenticated() else None,
         "delegatedFromPromptfoo": is_delegated_from_promptfoo(),
-        "apiHost": cloud_config.get_api_host(),
-        "appUrl": cloud_config.get_app_url(),
     }
 
 
@@ -2322,6 +2363,7 @@ def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
         "available": summary["loaded_scanners"],
         "failed": summary["failed_scanners"],
         "successRate": summary["success_rate"],
+        "availableList": summary.get("loaded_scanner_list", []),
     }
 
     # Only include failure details if there are failures
@@ -2337,27 +2379,6 @@ def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
 
     return info
 
-
-def _get_numpy_info() -> dict[str, Any]:
-    """Get NumPy information for debug output."""
-    from .scanners import _registry
-
-    compatible, status = _registry.get_numpy_status()
-
-    # Try to get numpy version
-    numpy_version: str | None = None
-    try:
-        import numpy as np
-
-        numpy_version = np.__version__
-    except ImportError:
-        pass
-
-    return {
-        "compatible": compatible,
-        "version": numpy_version,
-        "status": status,
-    }
 
 
 def _get_cache_info() -> dict[str, Any]:
@@ -2392,20 +2413,25 @@ def _get_cache_info() -> dict[str, Any]:
 
 def _get_config_info() -> dict[str, Any]:
     """Get configuration information for debug output."""
-    config_dir = get_config_directory_path()
-    config_path = os.path.join(config_dir, "promptfoo.yaml")
-
-    # Replace home directory with ~ for privacy
     home = str(Path.home())
-    display_path = config_path
-    if display_path.startswith(home):
-        display_path = "~" + display_path[len(home) :]
+
+    # Shared config with promptfoo
+    shared_config_dir = get_config_directory_path()
+    shared_config_path = os.path.join(shared_config_dir, "promptfoo.yaml")
+    shared_display_path = shared_config_path
+    if shared_display_path.startswith(home):
+        shared_display_path = "~" + shared_display_path[len(home) :]
+
+    # ModelAudit-specific config
+    modelaudit_config_path = os.path.join(home, ".modelaudit", "user_config.json")
+    modelaudit_display_path = "~/.modelaudit/user_config.json"
 
     return {
-        "configPath": display_path,
-        "configExists": os.path.exists(config_path),
+        "sharedConfigPath": shared_display_path,
+        "sharedConfigExists": os.path.exists(shared_config_path),
+        "modelauditConfigPath": modelaudit_display_path,
+        "modelauditConfigExists": os.path.exists(modelaudit_config_path),
         "userIdGenerated": bool(get_user_id()),
-        "useHfWhitelist": True,  # Default value, could be loaded from config
     }
 
 
@@ -2473,15 +2499,15 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
         if not verbose:
             lines.append(style_text("     Run with --verbose for failure details", dim=True))
 
-    # NumPy status
-    numpy_info = debug_info.get("numpy", {})
-    numpy_compatible = numpy_info.get("compatible", False)
-    numpy_version = numpy_info.get("version", "not installed")
-
-    if numpy_compatible:
-        lines.append(f"  ✅ NumPy {numpy_version} compatible")
-    elif numpy_version:
-        lines.append(style_text(f"  ⚠️  NumPy {numpy_version} may have compatibility issues", fg="yellow"))
+    # NumPy status (get from dependencies)
+    numpy_version = ml_frameworks.get("numpy")
+    if numpy_version:
+        # NumPy 2.x may have compatibility issues with some ML frameworks
+        major_version = int(numpy_version.split(".")[0]) if numpy_version else 0
+        if major_version >= 2:
+            lines.append(style_text(f"  ⚠️  NumPy {numpy_version} (v2 may have ML framework issues)", fg="yellow"))
+        else:
+            lines.append(f"  ✅ NumPy {numpy_version}")
     else:
         lines.append(style_text("  ⚠️  NumPy not installed", fg="yellow"))
 
@@ -2537,11 +2563,11 @@ def debug(output_json: bool, verbose: bool) -> None:
     debug_info: dict[str, Any] = {
         "version": __version__,
         "platform": _safe_get_section(_get_platform_info, "platform"),
+        "install": _safe_get_section(_get_install_info, "install"),
         "dependencies": _safe_get_section(_get_dependency_versions, "dependencies"),
         "env": _safe_get_section(_get_env_info, "env"),
         "auth": _safe_get_section(_get_auth_info, "auth"),
         "scanners": _safe_get_section(lambda: _get_scanner_info(verbose), "scanners"),
-        "numpy": _safe_get_section(_get_numpy_info, "numpy"),
         "cache": _safe_get_section(_get_cache_info, "cache"),
         "config": _safe_get_section(_get_config_info, "config"),
     }
