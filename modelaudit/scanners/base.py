@@ -1155,12 +1155,13 @@ class BaseScanner(ABC):
             # as zero rather than raising an exception.
             return 0
 
-    def calculate_file_hashes(self, path: str) -> dict[str, str]:
+    def calculate_file_hashes(self, path: str) -> dict[str, str | None]:
         """Calculate MD5, SHA256, and SHA512 hashes of a file.
 
-        Returns a dictionary with hash values or error messages.
+        Returns a dictionary with hash values or None if calculation fails.
+        Uses None instead of empty strings to satisfy Pydantic validation.
         """
-        hashes = {"md5": "", "sha256": "", "sha512": ""}
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
 
         if not os.path.isfile(path):
             return hashes
@@ -1184,7 +1185,7 @@ class BaseScanner(ABC):
 
         except Exception as e:
             logger.warning(f"Failed to calculate hashes for {path}: {e}")
-            # Return empty hashes on error rather than failing
+            # Return None hashes on error - Pydantic will accept None but not empty strings
 
         return hashes
 
