@@ -2234,6 +2234,90 @@ def _get_env_info() -> dict[str, Any]:
     }
 
 
+def _get_dependency_versions() -> dict[str, Any]:
+    """Get versions of key dependencies for debug output."""
+
+    def _get_version(module_name: str, version_attr: str = "__version__") -> str | None:
+        """Safely get version from a module."""
+        try:
+            module = __import__(module_name)
+            return str(getattr(module, version_attr, None))
+        except ImportError:
+            return None
+        except Exception:
+            return "error"
+
+    def _get_torch_cuda_info() -> dict[str, Any] | None:
+        """Get PyTorch CUDA information if available."""
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return {
+                    "available": True,
+                    "version": torch.version.cuda,
+                    "deviceCount": torch.cuda.device_count(),
+                }
+            return {"available": False}
+        except ImportError:
+            return None
+        except Exception:
+            return {"available": False, "error": "failed to detect"}
+
+    # Core dependencies (should always be installed)
+    core = {
+        "click": _get_version("click"),
+        "pyyaml": _get_version("yaml", "__version__"),
+        "requests": _get_version("requests"),
+        "platformdirs": _get_version("platformdirs"),
+    }
+
+    # ML framework dependencies (optional, scanner-specific)
+    ml_frameworks = {
+        "numpy": _get_version("numpy"),
+        "torch": _get_version("torch"),
+        "tensorflow": _get_version("tensorflow"),
+        "onnx": _get_version("onnx"),
+        "jax": _get_version("jax"),
+        "flax": _get_version("flax"),
+    }
+
+    # Format/serialization dependencies (optional)
+    serialization = {
+        "h5py": _get_version("h5py"),
+        "safetensors": _get_version("safetensors"),
+        "msgpack": _get_version("msgpack"),
+        "joblib": _get_version("joblib"),
+    }
+
+    # Utility dependencies (optional)
+    utilities = {
+        "huggingface_hub": _get_version("huggingface_hub"),
+        "posthog": _get_version("posthog", "VERSION"),
+        "jinja2": _get_version("jinja2"),
+        "py7zr": _get_version("py7zr"),
+        "xgboost": _get_version("xgboost"),
+    }
+
+    # Filter out None values for cleaner output
+    def filter_installed(deps: dict[str, str | None]) -> dict[str, str]:
+        return {k: v for k, v in deps.items() if v is not None}
+
+    result: dict[str, Any] = {
+        "core": filter_installed(core),
+        "mlFrameworks": filter_installed(ml_frameworks),
+        "serialization": filter_installed(serialization),
+        "utilities": filter_installed(utilities),
+    }
+
+    # Add CUDA info if PyTorch is installed
+    cuda_info = _get_torch_cuda_info()
+    if cuda_info is not None:
+        result["cuda"] = cuda_info
+
+    return result
+
+
 def _get_auth_info() -> dict[str, Any]:
     """Get authentication information for debug output."""
     return {
@@ -2385,6 +2469,22 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
     arch = platform_info.get("arch", "unknown")
     lines.append(f"  ✅ Python {python_ver} on {os_name} ({arch})")
 
+    # Dependencies summary
+    deps_info = debug_info.get("dependencies", {})
+    ml_frameworks = deps_info.get("mlFrameworks", {})
+    ml_installed = [k for k in ["torch", "tensorflow", "onnx", "jax"] if k in ml_frameworks]
+    if ml_installed:
+        lines.append(f"  ✅ ML frameworks: {', '.join(ml_installed)}")
+    else:
+        lines.append(style_text("  ⚠️  No ML frameworks installed (torch, tensorflow, onnx, jax)", fg="yellow"))
+
+    # CUDA status if available
+    cuda_info = deps_info.get("cuda", {})
+    if cuda_info and cuda_info.get("available"):
+        cuda_ver = cuda_info.get("version", "unknown")
+        device_count = cuda_info.get("deviceCount", 0)
+        lines.append(f"  ✅ CUDA {cuda_ver} ({device_count} device(s))")
+
     # Scanner status
     scanner_info = debug_info.get("scanners", {})
     available = scanner_info.get("available", 0)
@@ -2462,6 +2562,7 @@ def debug(output_json: bool, verbose: bool) -> None:
     debug_info: dict[str, Any] = {
         "version": __version__,
         "platform": _safe_get_section(_get_platform_info, "platform"),
+        "dependencies": _safe_get_section(_get_dependency_versions, "dependencies"),
         "env": _safe_get_section(_get_env_info, "env"),
         "auth": _safe_get_section(_get_auth_info, "auth"),
         "scanners": _safe_get_section(lambda: _get_scanner_info(verbose), "scanners"),

@@ -281,3 +281,43 @@ class TestDebugCommand:
         assert result.exit_code == 0
         assert "troubleshooting" in result.output.lower()
         assert "bug" in result.output.lower() or "issue" in result.output.lower()
+
+    def test_debug_dependencies_structure(self, runner):
+        """Dependencies info should have expected structure."""
+        result = runner.invoke(cli, ["debug", "--json"])
+        assert result.exit_code == 0
+
+        parsed = json.loads(result.output)
+
+        # Dependencies section should exist
+        assert "dependencies" in parsed
+        deps = parsed["dependencies"]
+
+        # Should have categorized dependencies
+        assert "core" in deps
+        assert "mlFrameworks" in deps
+        assert "serialization" in deps
+        assert "utilities" in deps
+
+        # Core dependencies should have at least click (always installed)
+        assert "click" in deps["core"]
+
+    def test_debug_dependencies_has_numpy(self, runner):
+        """Dependencies should include numpy version (since it's a core dependency)."""
+        result = runner.invoke(cli, ["debug", "--json"])
+        assert result.exit_code == 0
+
+        parsed = json.loads(result.output)
+        deps = parsed.get("dependencies", {})
+        ml_frameworks = deps.get("mlFrameworks", {})
+
+        # NumPy should be listed in ML frameworks
+        assert "numpy" in ml_frameworks
+
+    def test_debug_pretty_output_shows_ml_frameworks(self, runner):
+        """Pretty output should show ML framework summary."""
+        result = runner.invoke(cli, ["debug"])
+        assert result.exit_code == 0
+
+        # Should mention ML frameworks in quick diagnosis
+        assert "ML frameworks" in result.output or "No ML frameworks" in result.output
