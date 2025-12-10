@@ -18,7 +18,7 @@ When tasked with fixing bugs, adding features, or refactoring:
 3.  **Implement:** Use the available tools to act on the plan, adhering to project conventions.
 4.  **Verify (Tests):** This project has extensive tests. After any change, run the relevant tests to ensure correctness. The primary test command is `pytest`. You can run specific tests using `pytest tests/test_your_feature.py`.
 5.  **Verify (Standards):** After making code changes, run the project's linting and formatting commands.
-    - For Python: `rye run ruff format modelaudit/ tests/` and `rye run ruff check --fix modelaudit/ tests/`
+    - For Python: `uv run ruff format modelaudit/ tests/` and `uv run ruff check --fix modelaudit/ tests/`
     - For documentation: `npx prettier@latest --write "**/*.{md,yaml,yml,json}"`
       This ensures code quality and adherence to standards.
 
@@ -55,7 +55,7 @@ model:
 [uses Write tool to create 'modelaudit/scanners/newformat_scanner.py']
 [uses Write tool to create 'tests/test_newformat_scanner.py']
 Files created. Now, running verification...
-[uses Bash tool: 'rye run pytest tests/test_newformat_scanner.py && rye run ruff format . && npx prettier@latest --write "**/*.{md,yaml,yml,json}"']
+[uses Bash tool: 'uv run pytest tests/test_newformat_scanner.py && uv run ruff format . && npx prettier@latest --write "**/*.{md,yaml,yml,json}"']
 (After verification passes)
 All checks passed. Would you like me to commit these changes?
 </example>

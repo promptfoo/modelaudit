@@ -2,12 +2,12 @@
 
 Thank you for your interest in contributing to ModelAudit! This guide will help you get started with development and contributing to the project.
 
-## 🛠️ Development Setup
+## Development Setup
 
 ### Prerequisites
 
-- Python 3.9 or higher
-- Rye (recommended) or pip
+- Python 3.10 or higher
+- uv (recommended) or pip
 - Git
 
 ### Setup
@@ -17,8 +17,8 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Rye (recommended)
-rye sync --features all
+# Install with uv (recommended)
+uv sync --extra all
 
 # Or with pip
 pip install -e .[all]
@@ -35,14 +35,14 @@ pip install -e .[all]
 # Then test the CLI directly
 modelaudit scan test_model.pkl
 
-# Option 2: Use Rye (recommended)
-rye sync --features all
+# Option 2: Use uv (recommended)
+uv sync --extra all
 
-# Test with Rye run (no shell activation needed)
-rye run modelaudit scan test_model.pkl
+# Test with uv run (no shell activation needed)
+uv run modelaudit scan test_model.pkl
 
 # Test with Python import
-rye run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+uv run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
 ```
 
 **Create test models for development:**
@@ -55,40 +55,40 @@ python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', '
 modelaudit scan test_model.pkl
 ```
 
-### Running Tests - Fast & Efficient 🚀
+### Running Tests - Fast & Efficient
 
 This project uses optimized parallel test execution for faster development:
 
-#### 🎯 Quick Reference
+#### Quick Reference
 
-| Command                                                    | Use Case               | Speed              | Tests                            |
-| ---------------------------------------------------------- | ---------------------- | ------------------ | -------------------------------- |
-| `rye run pytest -n auto -m "not slow and not integration"` | **Development**        | ⚡ Fastest         | Unit tests only                  |
-| `rye run pytest -n auto -x --tb=short`                     | **Quick feedback**     | ⚡ Fast, fail-fast | All tests, stop on first failure |
-| `rye run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | 🐌 Complete        | All tests with coverage          |
-| `rye run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | ⚡ Targeted        | Pattern-matched tests            |
+| Command                                                   | Use Case               | Speed              | Tests                            |
+| --------------------------------------------------------- | ---------------------- | ------------------ | -------------------------------- |
+| `uv run pytest -n auto -m "not slow and not integration"` | **Development**        | Fast               | Unit tests only                  |
+| `uv run pytest -n auto -x --tb=short`                     | **Quick feedback**     | Fast, fail-fast    | All tests, stop on first failure |
+| `uv run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | Complete           | All tests with coverage          |
+| `uv run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | Targeted           | Pattern-matched tests            |
 
-#### 🚀 Common Test Commands
+#### Common Test Commands
 
 ```bash
-# 🚀 FAST - Development testing (excludes slow tests)
-rye run pytest -n auto -m "not slow and not integration"
+# FAST - Development testing (excludes slow tests)
+uv run pytest -n auto -m "not slow and not integration"
 
-# ⚡ QUICK FEEDBACK - Fail fast on first error
-rye run pytest -n auto -x --tb=short
+# QUICK FEEDBACK - Fail fast on first error
+uv run pytest -n auto -x --tb=short
 
-# 🧪 COMPLETE - Full test suite with coverage
-rye run pytest -n auto --cov=modelaudit
+# COMPLETE - Full test suite with coverage
+uv run pytest -n auto --cov=modelaudit
 
-# 🎯 SPECIFIC - Test individual files or patterns
-rye run pytest tests/test_pickle_scanner.py -n auto -v
-rye run pytest -k "test_scanner" -n auto
+# SPECIFIC - Test individual files or patterns
+uv run pytest tests/test_pickle_scanner.py -n auto -v
+uv run pytest -k "test_scanner" -n auto
 
-# 📊 PERFORMANCE - Profile slow tests
-rye run pytest --durations=10 --tb=no
+# PERFORMANCE - Profile slow tests
+uv run pytest --durations=10 --tb=no
 ```
 
-#### 🏃‍♂️ Speed Optimizations Implemented
+#### Speed Optimizations Implemented
 
 **Parallel Execution:**
 
@@ -121,22 +121,22 @@ rye run pytest --durations=10 --tb=no
 
 ```bash
 # Run linting and formatting with Ruff
-rye run ruff check .          # Check entire codebase (including tests)
-rye run ruff check --fix .    # Automatically fix lint issues
-rye run ruff format .         # Format code
+uv run ruff check .          # Check entire codebase (including tests)
+uv run ruff check --fix .    # Automatically fix lint issues
+uv run ruff format .         # Format code
 
 # Type checking
-rye run mypy modelaudit/
+uv run mypy modelaudit/
 
 # Build package
-rye build
+uv build
 
 # The generated distribution contains only the `modelaudit` code and metadata.
 # Unnecessary files like tests and Docker configurations are excluded via
 # `MANIFEST.in`.
 
 # Publish (maintainers only)
-rye publish
+uv publish
 ```
 
 **Code Quality Tools:**
@@ -157,7 +157,7 @@ npx prettier --write .
 npx prettier --check .
 ```
 
-## 🤝 Contributing Guidelines
+## Contributing Guidelines
 
 ### Getting Started
 
@@ -243,23 +243,23 @@ When adding a new scanner for a model format:
 - Include both unit tests and integration tests
 - Test with different model formats and edge cases
 
-## 📋 Development Tasks
+## Development Tasks
 
 ### Common Development Tasks
 
 ```bash
 # Run full test suite with coverage (optimized parallel execution)
-rye run pytest -n auto --cov=modelaudit --cov-report=html
+uv run pytest -n auto --cov=modelaudit --cov-report=html
 
 # Check for type errors
-rye run mypy modelaudit/
+uv run mypy modelaudit/
 
 # Format and lint code
-rye run ruff format .
-rye run ruff check --fix .
+uv run ruff format .
+uv run ruff check --fix .
 
 # Quick development test cycle
-rye run pytest -n auto -m "not slow and not integration" -x
+uv run pytest -n auto -m "not slow and not integration" -x
 
 # Build documentation (if applicable)
 # Add documentation build commands here
@@ -318,16 +318,16 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 
    ```bash
    # Build package (clean first)
-   rye build --clean
+   uv build --out-dir dist/
 
    # Verify only current version exists
    ls -la dist/
 
    # Publish to PyPI
-   rye publish --yes
+   uv publish
    ```
 
-## 🐛 Reporting Issues
+## Reporting Issues
 
 When reporting issues:
 
@@ -337,7 +337,7 @@ When reporting issues:
 - Include error messages and stack traces
 - Mention the model format and size if applicable
 
-## 💡 Feature Requests
+## Feature Requests
 
 For feature requests:
 
@@ -346,7 +346,7 @@ For feature requests:
 - Explain why it would benefit users
 - Consider proposing an implementation approach
 
-## 🐛 Known Issues & False Positives
+## Known Issues & False Positives
 
 When contributing scanner improvements, be aware of these known false positive patterns:
 
@@ -375,10 +375,10 @@ When contributing scanner improvements, be aware of these known false positive p
 
 When fixing scanner issues, ensure changes don't regress detection of actual malicious models listed in `models.md`.
 
-## 📞 Getting Help
+## Getting Help
 
 - GitHub Issues: For bugs and feature requests
 - GitHub Discussions: For questions and general discussion
 - Email: For security issues or private matters
 
-Thank you for contributing to ModelAudit! 🚀
+Thank you for contributing to ModelAudit!
