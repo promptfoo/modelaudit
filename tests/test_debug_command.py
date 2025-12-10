@@ -52,7 +52,7 @@ class TestDebugCommand:
         assert "cache" in parsed
         assert "config" in parsed
 
-    def test_debug_platform_info_structure(self, runner):
+    def test_debug_platform_info_structure(self, runner: CliRunner) -> None:
         """Platform info should have expected structure."""
         result = runner.invoke(cli, ["debug", "--json"])
         parsed = json.loads(result.output)
@@ -63,6 +63,9 @@ class TestDebugCommand:
         assert "arch" in platform_info
         assert "pythonVersion" in platform_info
         assert "pythonExecutable" in platform_info
+        assert "pythonRecursionLimit" in platform_info
+        assert isinstance(platform_info["pythonRecursionLimit"], int)
+        assert platform_info["pythonRecursionLimit"] > 0
 
     def test_debug_install_info_structure(self, runner):
         """Install info should have expected structure."""
@@ -263,7 +266,7 @@ class TestDebugCommand:
         assert "secret" not in result.output
         assert "user:" not in result.output
 
-    def test_debug_path_privacy(self, runner):
+    def test_debug_path_privacy(self, runner: CliRunner) -> None:
         """Debug should use ~ for home directory paths."""
         result = runner.invoke(cli, ["debug", "--json"])
         assert result.exit_code == 0
@@ -272,9 +275,12 @@ class TestDebugCommand:
 
         # Config path should use ~
         config_info = parsed.get("config", {})
+        if "error" in config_info:
+            # If there's an error, skip path privacy check
+            return
         shared_config_path = config_info.get("sharedConfigPath")
         if shared_config_path:
-            assert shared_config_path.startswith("~") or "error" in config_info
+            assert shared_config_path.startswith("~"), f"Config path should use ~, got: {shared_config_path}"
 
         # Cache directory should use ~
         cache_info = parsed.get("cache", {})

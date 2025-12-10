@@ -2216,6 +2216,7 @@ def _get_platform_info() -> dict[str, Any]:
         "arch": platform.machine(),
         "pythonVersion": platform.python_version(),
         "pythonExecutable": sys.executable,
+        "pythonRecursionLimit": sys.getrecursionlimit(),
     }
 
 
@@ -2245,9 +2246,7 @@ def _get_install_info() -> dict[str, Any]:
         # Check for editable install via direct_url.json
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
-            import json as json_module
-
-            direct_url = json_module.loads(direct_url_text)
+            direct_url = json.loads(direct_url_text)
             if direct_url.get("dir_info", {}).get("editable", False):
                 info["editable"] = True
             else:
