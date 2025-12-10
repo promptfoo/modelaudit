@@ -66,6 +66,10 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
         uses: actions/cache@v4
         with:
@@ -73,8 +77,9 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
             ${{ runner.os }}-uv-
 
       - name: Sync dependencies
@@ -109,6 +114,10 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
         uses: actions/cache@v4
         with:
@@ -116,8 +125,9 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
             ${{ runner.os }}-uv-
 
       - name: Sync dependencies
@@ -341,6 +351,10 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
         uses: actions/cache@v4
         with:
@@ -348,8 +362,9 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
+            ${{ runner.os }}-uv-py3.12-
             ${{ runner.os }}-uv-
 
       - name: Sync dependencies
