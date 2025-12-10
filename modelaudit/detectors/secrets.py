@@ -613,7 +613,7 @@ def detect_secrets_in_file(file_path: str, max_size: int = 500 * 1024 * 1024) ->
 
     file_size = os.path.getsize(file_path)
     if file_size > max_size:
-        return [{"type": "error", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
+        return [{"type": "info", "severity": "INFO", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
 
     detector = SecretsDetector()
 
