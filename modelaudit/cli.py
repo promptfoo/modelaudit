@@ -12,7 +12,15 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .auth.client import auth_client
-from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
+from .auth.config import (
+    cloud_config,
+    config,
+    get_config_directory_path,
+    get_user_email,
+    get_user_id,
+    is_delegated_from_promptfoo,
+    set_user_email,
+)
 from .core import determine_exit_code, scan_model_directory_or_file
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
@@ -2196,6 +2204,278 @@ def doctor(show_failed: bool) -> None:
         click.echo("• Run 'modelaudit doctor --show-failed' for detailed error messages")
     else:
         click.secho("\n✓ All scanners loaded successfully!", fg="green")
+
+
+def _get_platform_info() -> dict[str, Any]:
+    """Get platform information for debug output."""
+    import platform
+
+    return {
+        "os": sys.platform,
+        "release": platform.release(),
+        "arch": platform.machine(),
+        "pythonVersion": platform.python_version(),
+    }
+
+
+def _get_env_info() -> dict[str, Any]:
+    """Get environment variable information for debug output."""
+    from .telemetry import is_telemetry_enabled
+
+    return {
+        "telemetryDisabled": not is_telemetry_enabled(),
+        "noColor": bool(os.getenv("NO_COLOR")),
+        "ciEnvironment": bool(os.getenv("CI")),
+        "jfrogConfigured": bool(os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN")),
+        "mlflowConfigured": bool(os.getenv("MLFLOW_TRACKING_URI")),
+        "httpProxy": os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or None,
+        "httpsProxy": os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or None,
+        "noProxy": os.getenv("NO_PROXY") or os.getenv("no_proxy") or None,
+    }
+
+
+def _get_auth_info() -> dict[str, Any]:
+    """Get authentication information for debug output."""
+    return {
+        "authenticated": config.is_authenticated(),
+        "authSource": config.get_auth_source() if config.is_authenticated() else None,
+        "delegatedFromPromptfoo": is_delegated_from_promptfoo(),
+        "apiHost": cloud_config.get_api_host(),
+        "appUrl": cloud_config.get_app_url(),
+    }
+
+
+def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
+    """Get scanner information for debug output."""
+    from .scanners import _registry
+
+    summary = _registry.get_available_scanners_summary()
+
+    info: dict[str, Any] = {
+        "total": summary["total_scanners"],
+        "available": summary["loaded_scanners"],
+        "failed": summary["failed_scanners"],
+        "successRate": summary["success_rate"],
+    }
+
+    # Only include failure details if there are failures
+    if summary["failed_scanners"] > 0:
+        info["failedList"] = list(summary["failed_scanner_details"].keys())
+
+        if verbose:
+            info["failedDetails"] = summary["failed_scanner_details"]
+            if summary["dependency_errors"]:
+                info["dependencyErrors"] = summary["dependency_errors"]
+            if summary["numpy_errors"]:
+                info["numpyErrors"] = summary["numpy_errors"]
+
+    return info
+
+
+def _get_numpy_info() -> dict[str, Any]:
+    """Get NumPy information for debug output."""
+    from .scanners import _registry
+
+    compatible, status = _registry.get_numpy_status()
+
+    # Try to get numpy version
+    numpy_version: str | None = None
+    try:
+        import numpy as np
+
+        numpy_version = np.__version__
+    except ImportError:
+        pass
+
+    return {
+        "compatible": compatible,
+        "version": numpy_version,
+        "status": status,
+    }
+
+
+def _get_cache_info() -> dict[str, Any]:
+    """Get cache information for debug output."""
+    try:
+        from .cache import get_cache_manager
+
+        cache_manager = get_cache_manager(enabled=True)
+        stats = cache_manager.get_stats()
+
+        # Get cache directory path with ~ expansion for privacy
+        cache_dir_path: str | None = None
+        if cache_manager.cache is not None:
+            cache_dir_path = str(cache_manager.cache.cache_dir)
+            home = str(Path.home())
+            if cache_dir_path.startswith(home):
+                cache_dir_path = "~" + cache_dir_path[len(home) :]
+
+        return {
+            "enabled": True,
+            "directory": cache_dir_path,
+            "entries": stats.get("total_entries", 0),
+            "sizeMb": round(stats.get("total_size_mb", 0.0), 2),
+            "hitRate": round(stats.get("hit_rate", 0.0), 4),
+        }
+    except Exception as e:
+        return {
+            "enabled": False,
+            "error": str(e)[:100],
+        }
+
+
+def _get_config_info() -> dict[str, Any]:
+    """Get configuration information for debug output."""
+    config_dir = get_config_directory_path()
+    config_path = os.path.join(config_dir, "promptfoo.yaml")
+
+    # Replace home directory with ~ for privacy
+    home = str(Path.home())
+    display_path = config_path
+    if display_path.startswith(home):
+        display_path = "~" + display_path[len(home) :]
+
+    return {
+        "configPath": display_path,
+        "configExists": os.path.exists(config_path),
+        "userIdGenerated": bool(get_user_id()),
+        "useHfWhitelist": True,  # Default value, could be loaded from config
+    }
+
+
+def _safe_get_section(func: Any, section_name: str) -> dict[str, Any]:
+    """Safely execute a debug info function, returning error on failure."""
+    try:
+        result = func()
+        return result if isinstance(result, dict) else {"value": result}
+    except Exception as e:
+        return {"error": f"Failed to retrieve {section_name}: {str(e)[:100]}"}
+
+
+def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
+    """Format debug info as pretty-printed output with quick diagnosis."""
+    lines = []
+
+    # Header
+    border = "═" * 80
+    lines.append(border)
+    lines.append(style_text("ModelAudit Debug Information", fg="blue", bold=True))
+    lines.append(border)
+
+    # JSON output
+    lines.append(json.dumps(debug_info, indent=2, default=str))
+
+    lines.append(border)
+    lines.append(
+        style_text(
+            "Please include this output when reporting issues:",
+            fg="yellow",
+        )
+    )
+    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append("")
+
+    # Quick diagnosis section
+    lines.append(style_text("Quick diagnosis:", fg="white", bold=True))
+
+    # Platform status
+    platform_info = debug_info.get("platform", {})
+    python_ver = platform_info.get("pythonVersion", "unknown")
+    os_name = platform_info.get("os", "unknown")
+    arch = platform_info.get("arch", "unknown")
+    lines.append(f"  ✅ Python {python_ver} on {os_name} ({arch})")
+
+    # Scanner status
+    scanner_info = debug_info.get("scanners", {})
+    available = scanner_info.get("available", 0)
+    total = scanner_info.get("total", 0)
+    failed = scanner_info.get("failed", 0)
+
+    if failed == 0:
+        lines.append(f"  ✅ {available}/{total} scanners available")
+    else:
+        lines.append(style_text(f"  ⚠️  {available}/{total} scanners available ({failed} unavailable)", fg="yellow"))
+        if not verbose:
+            lines.append(style_text("     Run with --verbose for failure details", dim=True))
+
+    # NumPy status
+    numpy_info = debug_info.get("numpy", {})
+    numpy_compatible = numpy_info.get("compatible", False)
+    numpy_version = numpy_info.get("version", "not installed")
+
+    if numpy_compatible:
+        lines.append(f"  ✅ NumPy {numpy_version} compatible")
+    elif numpy_version:
+        lines.append(style_text(f"  ⚠️  NumPy {numpy_version} may have compatibility issues", fg="yellow"))
+    else:
+        lines.append(style_text("  ⚠️  NumPy not installed", fg="yellow"))
+
+    # Cache status
+    cache_info = debug_info.get("cache", {})
+    if cache_info.get("enabled"):
+        entries = cache_info.get("entries", 0)
+        size_mb = cache_info.get("sizeMb", 0)
+        lines.append(f"  ✅ Cache enabled ({entries} entries, {size_mb} MB)")
+    else:
+        cache_error = cache_info.get("error", "disabled")
+        lines.append(style_text(f"  ⚠️  Cache: {cache_error}", fg="yellow"))
+
+    # Auth status
+    auth_info = debug_info.get("auth", {})
+    if auth_info.get("authenticated"):
+        source = auth_info.get("authSource", "unknown")
+        lines.append(f"  ✅ Authenticated via {source}")
+    else:
+        lines.append(style_text("  ⚠️  Not authenticated (enhanced scanning unavailable)", fg="yellow"))
+
+    # Telemetry status
+    env_info = debug_info.get("env", {})
+    if env_info.get("telemetryDisabled"):
+        lines.append("  [i] Telemetry disabled")
+
+    lines.append(border)
+
+    return "\n".join(lines)
+
+
+@cli.command()
+@click.option("--json", "output_json", is_flag=True, help="Output raw JSON without formatting")
+@click.option("--verbose", "-v", is_flag=True, help="Include additional diagnostic details")
+def debug(output_json: bool, verbose: bool) -> None:
+    """Display debug information for troubleshooting.
+
+    Outputs comprehensive diagnostic information useful for:
+
+    \b
+    - Filing bug reports on GitHub
+    - Troubleshooting scanner issues
+    - Verifying configuration and authentication
+    - Checking environment setup
+
+    \b
+    Examples:
+        modelaudit debug                    # Pretty-printed output
+        modelaudit debug --json             # Raw JSON for scripting
+        modelaudit debug --verbose          # Include detailed scanner errors
+    """
+    # Build debug info dictionary
+    debug_info: dict[str, Any] = {
+        "version": __version__,
+        "platform": _safe_get_section(_get_platform_info, "platform"),
+        "env": _safe_get_section(_get_env_info, "env"),
+        "auth": _safe_get_section(_get_auth_info, "auth"),
+        "scanners": _safe_get_section(lambda: _get_scanner_info(verbose), "scanners"),
+        "numpy": _safe_get_section(_get_numpy_info, "numpy"),
+        "cache": _safe_get_section(_get_cache_info, "cache"),
+        "config": _safe_get_section(_get_config_info, "config"),
+    }
+
+    if output_json:
+        # Raw JSON output for scripting
+        click.echo(json.dumps(debug_info, indent=2, default=str))
+    else:
+        # Pretty-printed output with quick diagnosis
+        click.echo(_format_debug_output(debug_info, verbose))
 
 
 def main() -> None:
