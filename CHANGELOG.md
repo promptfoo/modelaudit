@@ -593,7 +593,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...HEAD
+[0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
+[0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20
+[0.2.19]: https://github.com/promptfoo/modelaudit/compare/v0.2.18...v0.2.19
+[0.2.18]: https://github.com/promptfoo/modelaudit/compare/v0.2.17...v0.2.18
+[0.2.17]: https://github.com/promptfoo/modelaudit/compare/v0.2.16...v0.2.17
+[0.2.16]: https://github.com/promptfoo/modelaudit/compare/v0.2.15...v0.2.16
+[0.2.15]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12

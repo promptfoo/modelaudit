@@ -48,15 +48,15 @@ modelaudit/
 
 ## 🔧 Development Conventions
 
-### Branching & Changelog
+### Branching & Commits
 
-- **Each feature branch should add exactly one entry to CHANGELOG.md** in the [Unreleased] section following Keep a Changelog format
 - Use conventional commit format (feat:, fix:, docs:, chore:, test:, refactor:)
 - Never commit directly to main branch
+- **Do NOT manually edit CHANGELOG.md** - release-please auto-generates it from commit messages
 
 ### Code Style & Standards
 
-**Python Version:** 3.9+ (supports 3.9, 3.10, 3.11, 3.12, 3.13)
+**Python Version:** 3.10+ (supports 3.10, 3.11, 3.12, 3.13)
 
 **Code Quality Tools:**
 
@@ -252,7 +252,7 @@ rye run pytest -k "test_my_function" -v                      # Run tests matchin
 rye run pytest --lf -v                                       # Run only last failed tests
 
 # 🐍 MULTI-PYTHON VERSION TESTING (matches CI matrix):
-rye pin 3.9    # Pin to specific version (3.9, 3.10, 3.11, 3.12)
+rye pin 3.10    # Pin to specific version (3.10, 3.11, 3.12, 3.13)
 rye sync --features all-ci
 rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short
 

@@ -272,34 +272,39 @@ ModelAudit includes telemetry to help improve the tool. **Telemetry is enabled b
 
 ## Additional Commands
 
-````bash
+```bash
 # Diagnose scanner compatibility
 rye run modelaudit doctor --show-failed
 
-# Build package
-rye build
-
-# Publishing (maintainers only)
-
-## Clean Publishing Process
-
-```bash
-# 1. Build package (clean first)
+# Build package locally (for testing)
 rye build --clean
+```
 
-# 2. Verify only current version artifacts exist
-ls -la dist/
+## Release Process
 
-# 3. Publish to PyPI
-rye publish --yes
-````
+Releases are automated via [release-please](https://github.com/googleapis/release-please). The process is:
 
-## Manual Publishing Steps
+1. **Write Conventional Commits** - Use `feat:`, `fix:`, `docs:`, etc. prefixes
+2. **Merge to main** - Release-please creates/updates a "Release PR" automatically
+3. **Review Release PR** - Contains auto-generated CHANGELOG and version bump
+4. **Merge Release PR** - Triggers GitHub Release and PyPI publish
 
-For interactive authentication (if --yes doesn't work):
+### How Versions Are Determined (0ver)
 
-```bash
-rye publish
+This project uses [0ver](https://0ver.org/) - we stay in 0.x.y indefinitely:
+
+- `fix:` commits bump **patch** (0.2.21 → 0.2.22)
+- `feat:` commits bump **patch** (0.2.21 → 0.2.22)
+- `feat!:` or `BREAKING CHANGE:` bumps **minor** (0.2.21 → 0.3.0)
+
+### Manual Version Override
+
+To force a specific version, add to your commit message:
+
+```
+feat: major new feature
+
+Release-As: 1.0.0
 ```
 
 ## Dependency Philosophy
@@ -329,7 +334,7 @@ docker run -v $(pwd):/data modelaudit /data/model.pkl
 
 - **NEVER commit directly to the main branch** - always create a feature branch
 - Use Conventional Commit format for ALL commit messages (e.g., `feat:`, `fix:`, `docs:`, `chore:`, `test:`, `refactor:`)
-- **Each feature branch should add exactly one entry to CHANGELOG.md** in the [Unreleased] section following Keep a Changelog format
+- **Do NOT manually edit CHANGELOG.md** - release-please auto-generates it from commit messages
 - Keep commit messages concise and descriptive
 - Examples:
   - `feat: add support for TensorFlow SavedModel scanning`
