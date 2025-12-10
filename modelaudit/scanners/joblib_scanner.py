@@ -26,8 +26,8 @@ class JoblibScanner(BaseScanner):
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
         self.max_decompressed_size = self.config.get(
             "max_decompressed_size",
-            100 * 1024 * 1024,
-        )  # 100MB
+            10 * 1024 * 1024 * 1024,
+        )  # 10GB for large ML models
         self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
     @classmethod
@@ -234,11 +234,13 @@ class JoblibScanner(BaseScanner):
                             },
                         )
                 except ValueError as e:
+                    # Size/ratio limit errors are informational - may indicate large legitimate models
+                    # Compression bombs are DoS concerns, not RCE vectors
                     result.add_check(
                         name="Compression Bomb Detection",
                         passed=False,
                         message=str(e),
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"security_check": "compression_bomb_detection"},
                     )

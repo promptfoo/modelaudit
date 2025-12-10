@@ -37,7 +37,8 @@ class TestJoblibScannerSecurity:
         assert result.success is False
         bomb_issues = [issue for issue in result.issues if "compression ratio" in issue.message.lower()]
         assert len(bomb_issues) > 0
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in bomb_issues)
+        # Compression bombs are INFO (DoS concern, not RCE vector)
+        assert any(issue.severity == IssueSeverity.INFO for issue in bomb_issues)
 
     def test_large_file_protection(self, tmp_path):
         """Test protection against reading very large files."""
