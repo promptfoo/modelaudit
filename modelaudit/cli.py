@@ -2261,6 +2261,31 @@ def _get_install_info() -> dict[str, Any]:
     return info
 
 
+def _redact_proxy_url(proxy_url: str | None) -> str | None:
+    """Redact credentials from proxy URLs while preserving host/port for debugging.
+
+    Proxy URLs often contain credentials (http://user:pass@host:port).
+    Since debug output is meant to be pasted in bug reports, we must redact
+    the credentials while keeping the scheme/host/port for troubleshooting.
+    """
+    if not proxy_url:
+        return None
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(proxy_url)
+        if parts.username or parts.password:
+            # Rebuild URL without credentials
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc += f":{parts.port}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        # If parsing fails, return a safe indicator rather than the raw URL
+        return "<proxy configured>"
+    return proxy_url
+
+
 def _get_env_info() -> dict[str, Any]:
     """Get environment variable information for debug output."""
     from .telemetry import is_telemetry_enabled
@@ -2271,8 +2296,8 @@ def _get_env_info() -> dict[str, Any]:
         "ciEnvironment": bool(os.getenv("CI")),
         "jfrogConfigured": bool(os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN")),
         "mlflowConfigured": bool(os.getenv("MLFLOW_TRACKING_URI")),
-        "httpProxy": os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or None,
-        "httpsProxy": os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or None,
+        "httpProxy": _redact_proxy_url(os.getenv("HTTP_PROXY") or os.getenv("http_proxy")),
+        "httpsProxy": _redact_proxy_url(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")),
         "noProxy": os.getenv("NO_PROXY") or os.getenv("no_proxy") or None,
     }
 
@@ -2380,7 +2405,6 @@ def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
     return info
 
 
-
 def _get_cache_info() -> dict[str, Any]:
     """Get cache information for debug output."""
     try:
@@ -2464,7 +2488,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
             fg="yellow",
         )
     )
-    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
     lines.append("")
 
     # Quick diagnosis section

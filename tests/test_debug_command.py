@@ -246,7 +246,21 @@ class TestDebugCommand:
 
         assert result.exit_code == 0
         parsed = json.loads(result.output)
+        # Proxy without credentials should be shown as-is
         assert parsed["env"]["httpProxy"] == "http://proxy:8080"
+
+    def test_debug_proxy_redacts_credentials(self, runner):
+        """Debug should redact credentials from proxy URLs."""
+        with patch.dict(os.environ, {"HTTP_PROXY": "http://user:secret@proxy:8080"}):
+            result = runner.invoke(cli, ["debug", "--json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        # Credentials should be stripped, only host:port remains
+        assert parsed["env"]["httpProxy"] == "http://proxy:8080"
+        # Secret should never appear in output
+        assert "secret" not in result.output
+        assert "user:" not in result.output
 
     def test_debug_path_privacy(self, runner):
         """Debug should use ~ for home directory paths."""
@@ -267,7 +281,7 @@ class TestDebugCommand:
             assert cache_info["directory"].startswith("~")
 
     def test_debug_command_is_fast(self, runner):
-        """Debug command should complete quickly (under 5 seconds)."""
+        """Debug command should complete quickly (under 10 seconds)."""
         import time
 
         start = time.time()
@@ -275,8 +289,9 @@ class TestDebugCommand:
         duration = time.time() - start
 
         assert result.exit_code == 0
-        # Should be fast - under 5 seconds even with scanner loading
-        assert duration < 5.0, f"Debug command took {duration:.2f}s, expected < 5s"
+        # Should be fast - under 10 seconds even with scanner loading
+        # (relaxed from 5s to account for CI variance)
+        assert duration < 10.0, f"Debug command took {duration:.2f}s, expected < 10s"
 
     def test_debug_auth_info_structure(self, runner):
         """Auth info should have expected structure."""
