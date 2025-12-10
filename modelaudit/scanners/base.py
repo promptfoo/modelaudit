@@ -1199,7 +1199,7 @@ class BaseScanner(ABC):
                 name="File Size Limit",
                 passed=False,
                 message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "file_size": file_size,

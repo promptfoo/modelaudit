@@ -265,18 +265,20 @@ class NumPyScanner(BaseScanner):
                         expected_size = data_offset + expected_data_size
                     except ValueError as e:
                         # Determine which validation failed based on error message
-                        if "dimensions" in str(e).lower():
+                        error_msg = str(e).lower()
+                        if "dimensions" in error_msg:
                             check_name = "Array Dimension Validation"
-                        elif "dtype" in str(e).lower():
+                        elif "dtype" in error_msg:
                             check_name = "Data Type Safety Check"
                         else:
                             check_name = "Array Size Validation"
 
+                        # Size/dimension limit errors are informational - may indicate large legitimate arrays
                         result.add_check(
                             name=check_name,
                             passed=False,
                             message=f"Array validation failed: {e}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "security_check": "array_validation",
