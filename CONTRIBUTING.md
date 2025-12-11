@@ -61,12 +61,12 @@ This project uses optimized parallel test execution for faster development:
 
 #### Quick Reference
 
-| Command                                                   | Use Case               | Speed              | Tests                            |
-| --------------------------------------------------------- | ---------------------- | ------------------ | -------------------------------- |
-| `uv run pytest -n auto -m "not slow and not integration"` | **Development**        | Fast               | Unit tests only                  |
-| `uv run pytest -n auto -x --tb=short`                     | **Quick feedback**     | Fast, fail-fast    | All tests, stop on first failure |
-| `uv run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | Complete           | All tests with coverage          |
-| `uv run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | Targeted           | Pattern-matched tests            |
+| Command                                                   | Use Case               | Speed           | Tests                            |
+| --------------------------------------------------------- | ---------------------- | --------------- | -------------------------------- |
+| `uv run pytest -n auto -m "not slow and not integration"` | **Development**        | Fast            | Unit tests only                  |
+| `uv run pytest -n auto -x --tb=short`                     | **Quick feedback**     | Fast, fail-fast | All tests, stop on first failure |
+| `uv run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | Complete        | All tests with coverage          |
+| `uv run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | Targeted        | Pattern-matched tests            |
 
 #### Common Test Commands
 
