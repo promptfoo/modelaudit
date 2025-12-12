@@ -54,6 +54,6 @@ chore: update dependencies to latest versions
 ```markdown
 ## Test Instructions
 
-rye run pytest tests/test_affected_component.py
-rye run modelaudit test-file.pkl
+uv run pytest tests/test_affected_component.py
+uv run modelaudit test-file.pkl
 ```
