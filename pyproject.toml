@@ -8,7 +8,8 @@ version = "0.2.22"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
-    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" }
+    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" },
+    { name = "Yash Chhabria", email = "yash@promptfoo.dev" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
