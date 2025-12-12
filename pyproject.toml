@@ -50,17 +50,17 @@ dependencies = [
 # Note: ML frameworks may require NumPy < 2.0 for compatibility
 # If you encounter NumPy compatibility issues, consider using:
 # pip install "numpy<2.0" tensorflow h5py torch onnx
-tensorflow = ["tensorflow>=2.13.0,<3.0"]
+tensorflow = ["tensorflow>=2.13.0,<3.0; python_version < '3.13'"]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
 yaml = ["pyyaml>=6.0,<7.0"]
 safetensors = ["safetensors>=0.4.0"]
-onnx = ["onnx>=1.12.0,<2.0"]
+onnx = ["onnx>=1.12.0,<2.0; python_version < '3.13'"]
 dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
-tensorrt = ["tensorrt>=8.6.0"]
+tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
 xgboost = ["xgboost>=1.6.0,<3.0", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
@@ -68,12 +68,12 @@ sevenzip = ["py7zr>=0.20.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
     "numpy>=1.19.0,<2.0",
-    "tensorflow>=2.13.0,<3.0",
+    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
@@ -83,12 +83,12 @@ numpy1 = [
 ]
 # All dependencies except platform-specific ones (for CI)
 all-ci = [
-    "tensorflow>=2.13.0,<3.0",
+    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
@@ -100,12 +100,12 @@ all-ci = [
     "huggingface-hub>=0.23.0",
 ]
 all = [
-    "tensorflow>=2.13.0,<3.0",
+    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
@@ -124,9 +124,8 @@ modelaudit = "modelaudit.cli:main"
 Repository = "https://github.com/promptfoo/modelaudit"
 Homepage = "https://github.com/promptfoo/modelaudit"
 
-[tool.rye]
-managed = true
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.4.0",
     "coverage>=7.9.0",
     "mypy>=1.16.0",
@@ -142,6 +141,11 @@ dev-dependencies = [
     "pyupgrade>=3.20.0",
     "ty>=0.0.1a20",
 ]
+
+[tool.uv]
+# Exclude platform-specific extras from universal lock file resolution
+# tensorrt only supports Linux and Windows
+default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 120

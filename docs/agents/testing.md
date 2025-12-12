@@ -57,19 +57,19 @@ def test_scanner_malicious_file(tmp_path: Path) -> None:
 
 ```bash
 # Fast tests (recommended for development)
-rye run pytest -n auto -m "not slow and not integration"
+uv run pytest -n auto -m "not slow and not integration"
 
 # Fast tests with coverage (CI only)
-rye run pytest -n auto -m "not slow and not integration" --cov=modelaudit
+uv run pytest -n auto -m "not slow and not integration" --cov=modelaudit
 
 # Specific scanner tests
-rye run pytest tests/test_pickle_scanner.py -v
+uv run pytest tests/test_pickle_scanner.py -v
 
 # Run only last failed tests
-rye run pytest --lf -v
+uv run pytest --lf -v
 
 # Fail-fast mode
-rye run pytest -x --maxfail=1 -n auto
+uv run pytest -x --maxfail=1 -n auto
 ```
 
 ## Smart Test Targeting
@@ -78,11 +78,11 @@ Target tests related to your changes:
 
 ```bash
 # Scanner changes
-rye run pytest tests/test_*scanner*.py -k "not slow" -v
+uv run pytest tests/test_*scanner*.py -k "not slow" -v
 
 # Filetype/core changes
-rye run pytest tests/test_filetype.py tests/test_core*.py -v
+uv run pytest tests/test_filetype.py tests/test_core*.py -v
 
 # Utility changes
-rye run pytest tests/test_utils/ -v
+uv run pytest tests/test_utils/ -v
 ```

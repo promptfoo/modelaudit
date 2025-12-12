@@ -31,11 +31,11 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 # With pip
 pip install modelaudit[tensorflow,pytorch,h5]
 
-# With rye (development)
-rye sync --features="tensorflow pytorch h5"
+# With uv (development)
+uv sync --extra tensorflow --extra pytorch --extra h5
 
 # All dependencies
-rye sync --features all
+uv sync --extra all
 ```
 
 ## Development Setup
@@ -45,9 +45,9 @@ rye sync --features all
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Rye (recommended)
-rye sync --features all    # All optional dependencies
-rye sync                   # Basic dependencies only
+# Install with uv (recommended)
+uv sync --extra all    # All optional dependencies
+uv sync                # Basic dependencies only
 
 # Or with pip
 pip install -e .[all]      # Development mode with all extras
