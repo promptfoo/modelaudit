@@ -114,12 +114,40 @@ modelaudit/
 
 Key docs: `docs/agents/commands.md`, `docs/agents/testing.md`, `docs/agents/security-checks.md`, `docs/agents/architecture.md`, `docs/agents/ci-workflow.md`, `docs/agents/release-process.md`, `docs/agents/dependencies.md`.
 
+## README.md Content Guidelines
+
+The README is published to PyPI and visible to the public. Follow these rules to maintain security while being user-friendly:
+
+**KEEP PUBLIC (user-facing):**
+
+- Product overview, badges, screenshot, documentation links
+- Quick start installation and usage examples
+- High-level benefits (what problems it solves)
+- Supported model formats table (extensions and risk levels)
+- CLI options and command examples
+- Output formats (text, JSON, SARIF)
+- Exit codes and troubleshooting
+- Authentication environment variables
+
+**KEEP PRIVATE (do NOT include in README):**
+
+- Internal project structure (file paths, module organization)
+- Detailed detection patterns (specific opcodes like `REDUCE`, `GLOBAL`, etc.)
+- Exact module/function names we detect (e.g., `os.system`, `subprocess`)
+- Whitelist internals (model counts, update scripts, mechanism details)
+- Scanner implementation details
+- Internal architecture documentation
+
+**Why this matters:** Detailed detection patterns help attackers craft evasion techniques. Keep implementation details in `docs/agents/` for contributors only.
+
 ## DO / DON'T Cheatsheet
 
 - **Do:** Keep responses short; surface only relevant details; prefer targeted tests; propose clear next steps; cite file paths when reporting.
 - **Do:** Use iterative refinement—small changes, verify, then proceed.
+- **Do:** Always work on a feature branch and create PRs; never commit directly to main.
 - **Don't:** Introduce new dependencies, weaken security checks, or bypass validation.
 - **Don't:** Leave formatting/lint failures or unaddressed test regressions.
+- **Don't:** Commit or push directly to main—always use branches and PRs.
 
 ## Exit Codes
 
