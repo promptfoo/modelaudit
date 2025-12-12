@@ -1,8 +1,24 @@
-# AGENTS.md - AI Agent Guide for ModelAudit
+# AGENTS.md — ModelAudit (Canonical Agent Guide)
 
-Guide for AI coding agents working with this security scanner for AI/ML model files.
+This is the single source of truth for all AI coding agents (Claude, Gemini, others) working on ModelAudit, a security scanner for AI/ML model files. Follow it exactly and keep instructions concise through progressive disclosure—share only the minimum needed context and iterate.
 
-## Quick Reference
+## Stateless Onboarding
+
+- Agents start with zero context; use this file to bootstrap each session with the essentials: what (stack/project map), why (security-focused scanner), and how (workflow + validation below).
+- Prefer pointers over payloads: read the specific docs in `docs/agents/` when needed instead of inlining here.
+- Keep instructions universal and minimal; lean on deterministic tools (ruff, mypy, pytest, prettier) rather than embedding style rules.
+- When unsure, ask or fetch targeted context instead of expanding instructions.
+
+## Mission & Principles
+
+- **Security first:** Never weaken detections or bypass safeguards.
+- **Match the codebase:** Follow existing patterns, architecture, and naming; never add dependencies without approval.
+- **Progressive disclosure:** Be concise, reveal details as needed, and prefer short, scoped messages.
+- **Iterative refinement:** Share a plan for non-trivial work, execute incrementally, and verify after each change.
+- **Ask when unclear:** Confirm scope before risky or ambiguous actions.
+- **Proactive completion:** Provide tests and follow-up steps without waiting to be asked.
+
+## Quick Start Commands
 
 ```bash
 # Setup
@@ -15,32 +31,43 @@ uv run mypy modelaudit/
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
-## Branch Workflow
+## Standard Workflow
+
+1. **Understand:** Read nearby code, tests, and docs (`docs/agents/*.md`) before editing.
+2. **Plan:** For anything non-trivial, present a short multi-step plan; refine iteratively.
+3. **Implement:** Preserve security focus, follow `BaseScanner` patterns (see `docs/agents/architecture.md`), handle missing deps gracefully, and update `SCANNER_REGISTRY` when adding scanners.
+4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate.
+5. **Report:** Summarize changes with file references and note residual risks or follow-ups.
+
+## Branch & Git Hygiene
 
 ```bash
-# 1. Start from clean main
-git fetch origin main && git checkout main && git merge --no-edit origin/main
+# Start clean
+git fetch origin main
+git checkout main
+git merge --no-edit origin/main
 
-# 2. Create feature branch
+# Work on a branch
 git checkout -b feat/your-feature-name  # or fix/, chore/, test/
 
-# 3. Make changes, run pre-commit checks
-
-# 4. Commit with conventional format
+# Commit (conventional)
 git commit -m "feat: add scanner for XYZ format
 
 Description here.
 
 Co-Authored-By: Claude <noreply@anthropic.com>"
 
-# 5. Push and create PR
+# PR (after validation)
 git push -u origin feat/your-feature-name
 gh pr create --title "feat: descriptive title" --body "Brief description"
 ```
 
-## CI Compliance Requirements
+- Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
+- If `.git/index.lock` exists and no git process is running, remove the lock file.
+- Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
+- Keep CHANGELOG entries in `[Unreleased]` when adding user-visible changes (Keep a Changelog format).
 
-**MUST pass before creating any PR:**
+## CI Compliance Requirements
 
 ```bash
 uv run ruff check modelaudit/ tests/          # Lint (no errors)
@@ -49,8 +76,6 @@ uv run mypy modelaudit/                       # Types (no errors)
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
-## Common CI Failure Fixes
-
 | Issue               | Fix                                                     |
 | ------------------- | ------------------------------------------------------- |
 | Import organization | `uv run ruff check --fix --select I modelaudit/ tests/` |
@@ -58,71 +83,50 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 | Type errors         | Fix manually, re-run `mypy`                             |
 | Test failures       | Check output, fix issues, re-run tests                  |
 
-## When Modifying Scanners
+## Coding & Style Guardrails
 
-1. **Preserve security focus** - Don't weaken detection
-2. **Test both safe and malicious samples**
-3. **Follow the `BaseScanner` pattern** - See `docs/agents/architecture.md`
-4. **Add comprehensive tests** - Include edge cases
-5. **Run full CI compliance** before committing
+- **Python:** 3.10–3.13 supported. Classes PascalCase, functions/vars snake_case, constants UPPER_SNAKE_CASE, always type hints.
+- **Comments:** Use sparingly to explain intent, not mechanics.
+- **Docs/Markdown:** Keep concise; when formatting markdown/json/yaml, use `npx --yes prettier@latest --write "**/*.{md,yaml,yml,json}"` if instructed or if formatting drifts.
+- **Dependencies:** Do not add new packages without explicit approval and updating `pyproject.toml`/locks.
+- **Performance & safety:** Prefer safe defaults; avoid destructive commands.
 
-## When Adding Features
+## Scanner/Feature Changes Checklist
 
-1. **Handle missing dependencies gracefully**
-2. **Update `SCANNER_REGISTRY`** if adding scanners
-3. **Follow existing code patterns**
-4. **Ensure tests pass across Python 3.10-3.13**
+- Preserve or strengthen detections; test both benign and malicious samples.
+- Follow existing scanner patterns and update registries, CLI wiring, and docs as needed.
+- Add comprehensive tests, including edge cases and regression coverage.
+- Ensure compatibility across Python 3.10–3.13 and handle missing optional deps gracefully.
 
-## Non-Interactive Commands
+## Project Map & References
 
-To keep automation reliable:
-
-- Use flags to avoid editors/prompts: `git merge --no-edit`, `git commit -m`
-- Run one command per invocation (avoid long `&&` chains)
-- If `.git/index.lock` appears and no git process is running, remove it
-- Only `git add` intended paths; avoid committing artifacts
-- Prefer `gh run rerun <run-id>` over force-pushing to trigger CI
-
-## Project Structure
-
-```
+```bash
 modelaudit/
 ├── modelaudit/           # Main package
-│   ├── scanners/        # Scanner implementations
-│   ├── utils/           # Utility modules
-│   ├── cli.py           # CLI interface
-│   └── core.py          # Core scanning logic
-├── tests/               # Test suite
-├── docs/agents/         # Detailed documentation
-└── CLAUDE.md            # Claude-specific guidance
+│   ├── scanners/         # Scanner implementations
+│   ├── utils/            # Utility modules
+│   ├── cli.py            # CLI interface
+│   └── core.py           # Core scanning logic
+├── tests/                # Test suite
+├── docs/agents/          # Detailed documentation
+└── CHANGELOG.md          # Keep a Changelog format
 ```
 
-## Detailed Documentation
+Key docs: `docs/agents/commands.md`, `docs/agents/testing.md`, `docs/agents/security-checks.md`, `docs/agents/architecture.md`, `docs/agents/ci-workflow.md`, `docs/agents/release-process.md`, `docs/agents/dependencies.md`.
 
-| Topic           | File                             |
-| --------------- | -------------------------------- |
-| Commands        | `docs/agents/commands.md`        |
-| Testing         | `docs/agents/testing.md`         |
-| Security Checks | `docs/agents/security-checks.md` |
-| Architecture    | `docs/agents/architecture.md`    |
-| CI/CD           | `docs/agents/ci-workflow.md`     |
-| Release Process | `docs/agents/release-process.md` |
-| Dependencies    | `docs/agents/dependencies.md`    |
+## DO / DON'T Cheatsheet
 
-## Code Style
-
-- **Python Version**: 3.10+ (supports 3.10-3.13)
-- **Classes**: PascalCase (`PickleScanner`)
-- **Functions/Variables**: snake_case (`scan_model`)
-- **Constants**: UPPER_SNAKE_CASE (`DANGEROUS_OPCODES`)
-- **Type hints**: Always use for function signatures
+- **Do:** Keep responses short; surface only relevant details; prefer targeted tests; propose clear next steps; cite file paths when reporting.
+- **Do:** Use iterative refinement—small changes, verify, then proceed.
+- **Don't:** Introduce new dependencies, weaken security checks, or bypass validation.
+- **Don't:** Leave formatting/lint failures or unaddressed test regressions.
 
 ## Exit Codes
 
-- 0: No security issues
-- 1: Security issues detected
-- 2: Scan errors
+- `0`: No security issues
+- `1`: Security issues detected
+- `2`: Scan errors
 
-## Key Principle
+## Persona Notes
 
-**Always run CI compliance checks before pushing.** Local validation takes ~30 seconds vs 3-5 minutes in CI.
+- **Claude / Gemini / others:** Follow this guide as canonical. Apply progressive disclosure, confirm ambiguities, and prioritize security.
