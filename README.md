@@ -76,62 +76,46 @@ Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2
 
 Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
 
-## 📊 Supported Model Formats
+## 📊 Supported Formats
 
-ModelAudit supports **29 specialized file format scanners** with comprehensive security analysis:
+ModelAudit includes **29 specialized file format scanners**:
 
-### 🔴 High Risk Formats (Pickle-based serialization)
+### Model Formats
 
-| Format             | Extensions                        | Security Focus                    |
-| ------------------ | --------------------------------- | --------------------------------- |
-| **Pickle**         | `.pkl`, `.pickle`, `.dill`        | Dangerous opcodes, code execution |
-| **PyTorch**        | `.pt`, `.pth`, `.ckpt`, `.bin`    | Pickle payloads, embedded malware |
-| **Joblib**         | `.joblib`                         | Pickled scikit-learn objects      |
-| **NumPy**          | `.npy`, `.npz`                    | Array metadata, pickle objects    |
-| **JAX Checkpoint** | `.ckpt`, `.checkpoint`, `.pickle` | Serialized transforms             |
+| Format              | Extensions                            | Risk Level | Security Focus                    |
+| ------------------- | ------------------------------------- | ---------- | --------------------------------- |
+| **Pickle**          | `.pkl`, `.pickle`, `.dill`            | 🔴 HIGH    | Code execution, dangerous opcodes |
+| **PyTorch**         | `.pt`, `.pth`, `.ckpt`, `.bin`        | 🔴 HIGH    | Pickle payloads, embedded malware |
+| **Joblib**          | `.joblib`                             | 🔴 HIGH    | Pickled scikit-learn objects      |
+| **NumPy**           | `.npy`, `.npz`                        | 🔴 HIGH    | Array metadata, pickle objects    |
+| **TensorFlow**      | `.pb`, SavedModel directories         | 🟠 MEDIUM  | PyFunc operations, custom ops     |
+| **Keras**           | `.h5`, `.hdf5`, `.keras`              | 🟠 MEDIUM  | Unsafe layers, custom objects     |
+| **ONNX**            | `.onnx`                               | 🟠 MEDIUM  | Custom operators, metadata        |
+| **XGBoost**         | `.bst`, `.model`, `.ubj`              | 🟠 MEDIUM  | Serialized boosting models        |
+| **SafeTensors**     | `.safetensors`                        | 🟢 LOW     | Header validation (recommended)   |
+| **GGUF/GGML**       | `.gguf`, `.ggml`                      | 🟢 LOW     | LLM standard format               |
+| **JAX/Flax**        | `.msgpack`, `.flax`, `.orbax`, `.jax` | 🟢 LOW     | Msgpack serialization             |
+| **JAX Checkpoint**  | `.ckpt`, `.checkpoint`, `.pickle`     | 🟢 LOW     | JAX checkpoint formats            |
+| **TensorFlow Lite** | `.tflite`                             | 🟢 LOW     | Mobile model validation           |
+| **ExecuTorch**      | `.ptl`, `.pte`                        | 🟢 LOW     | PyTorch mobile archives           |
+| **Core ML**         | `.mlmodel`                            | 🟢 LOW     | Apple custom layers               |
+| **TensorRT**        | `.engine`, `.plan`                    | 🟢 LOW     | NVIDIA inference engines          |
+| **PaddlePaddle**    | `.pdmodel`, `.pdiparams`              | 🟢 LOW     | Custom operations                 |
+| **OpenVINO**        | `.xml`                                | 🟢 LOW     | Intel IR format                   |
+| **PMML**            | `.pmml`                               | 🟢 LOW     | XML predictive models             |
 
-### 🟠 Medium Risk Formats (Complex with custom operations)
+### Archive & Configuration Formats
 
-| Format              | Extensions               | Security Focus                |
-| ------------------- | ------------------------ | ----------------------------- |
-| **TensorFlow**      | `.pb`, SavedModel dirs   | PyFunc operations, custom ops |
-| **Keras H5**        | `.h5`, `.hdf5`           | Unsafe Lambda layers          |
-| **Keras ZIP**       | `.keras`                 | ZIP-based Keras archives      |
-| **ONNX**            | `.onnx`                  | Custom operators, metadata    |
-| **TensorFlow Lite** | `.tflite`                | Mobile model validation       |
-| **PaddlePaddle**    | `.pdmodel`, `.pdiparams` | Custom operations             |
-| **XGBoost**         | `.bst`, `.model`, `.ubj` | Serialized boosting models    |
-| **Core ML**         | `.mlmodel`               | Apple custom layers           |
-
-### 🟡 Lower Risk Formats (Safer serialization)
-
-| Format               | Extensions                            | Security Focus                  |
-| -------------------- | ------------------------------------- | ------------------------------- |
-| **SafeTensors**      | `.safetensors`                        | Header validation (recommended) |
-| **GGUF/GGML**        | `.gguf`, `.ggml`                      | LLM standard format             |
-| **JAX/Flax Msgpack** | `.msgpack`, `.flax`, `.orbax`, `.jax` | Msgpack serialization           |
-| **ExecuTorch**       | `.ptl`, `.pte`                        | PyTorch mobile archives         |
-| **TensorRT**         | `.engine`, `.plan`                    | NVIDIA inference engines        |
-| **OpenVINO**         | `.xml`                                | Intel IR format                 |
-| **PMML**             | `.pmml`                               | XML predictive models           |
-| **OCI Layers**       | `.manifest`                           | Container layer analysis        |
-
-### 📦 Archive & Container Formats
-
-| Format    | Extensions                                                        | Security Focus                  |
-| --------- | ----------------------------------------------------------------- | ------------------------------- |
-| **ZIP**   | `.zip`                                                            | Path traversal, malicious files |
-| **TAR**   | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz` | Archive exploits                |
-| **7-Zip** | `.7z`                                                             | Archive security                |
-
-### 📄 Configuration & Metadata Formats
-
-| Format               | Extensions                                        | Security Focus            |
-| -------------------- | ------------------------------------------------- | ------------------------- |
-| **Metadata**         | `.json`, `.md`, `.yml`, `.yaml`, `.rst`           | Embedded secrets, URLs    |
-| **Manifest**         | `.json`, `.yaml`, `.xml`, `.toml`, `.ini`, `.cfg` | Config vulnerabilities    |
-| **Text**             | `.txt`, `.md`, `.markdown`, `.rst`                | ML-related text analysis  |
-| **Jinja2 Templates** | `.jinja`, `.j2`, `.template`                      | Template injection (SSTI) |
+| Format               | Extensions                                  | Security Focus                  |
+| -------------------- | ------------------------------------------- | ------------------------------- |
+| **ZIP**              | `.zip`                                      | Path traversal, malicious files |
+| **TAR**              | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, etc. | Archive exploits                |
+| **7-Zip**            | `.7z`                                       | Archive security                |
+| **OCI Layers**       | `.manifest`                                 | Container layer analysis        |
+| **Metadata**         | `.json`, `.md`, `.yml`, `.yaml`, `.rst`     | Embedded secrets, URLs          |
+| **Manifest**         | `.json`, `.yaml`, `.xml`, `.toml`, `.ini`   | Configuration vulnerabilities   |
+| **Text**             | `.txt`, `.md`, `.markdown`, `.rst`          | ML-related text analysis        |
+| **Jinja2 Templates** | `.jinja`, `.j2`, `.template`                | Template injection (SSTI)       |
 
 [View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
