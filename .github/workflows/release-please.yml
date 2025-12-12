@@ -58,20 +58,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Sync dependencies
-        run: rye sync --features all-ci
+        run: uv sync --extra all-ci
 
       - name: Run tests
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short
+          uv run pytest -n auto -m "not slow and not integration and not performance" --tb=short
 
       - name: Build package
-        run: rye build --clean
+        run: uv build
 
       - name: Verify package version matches release
         run: |
