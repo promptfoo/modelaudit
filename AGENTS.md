@@ -64,7 +64,6 @@ git push -u origin feat/your-feature-name
 gh pr create --title "feat: descriptive title" --body "Brief description"
 ```
 
-- **NEVER push to main.** Always create a feature branch and open a PR.
 - Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
@@ -116,6 +115,33 @@ modelaudit/
 ```
 
 Key docs: `docs/agents/commands.md`, `docs/agents/testing.md`, `docs/agents/security-checks.md`, `docs/agents/architecture.md`, `docs/agents/ci-workflow.md`, `docs/agents/release-process.md`, `docs/agents/dependencies.md`.
+
+## README.md Content Guidelines
+
+The README is published to PyPI and visible to the public. Follow these rules to maintain security while being user-friendly:
+
+**KEEP PUBLIC (user-facing):**
+
+- Product overview, badges, screenshot, documentation links
+- Quick start installation and usage examples
+- High-level benefits (what problems it solves)
+- Supported model formats table (extensions and risk levels)
+- Security checks: list WHAT formats/frameworks we analyze (e.g., "TensorFlow/Keras", "ZIP archives")
+- CLI options and command examples
+- Output formats (text, JSON, SARIF)
+- Exit codes and troubleshooting
+- Authentication environment variables
+
+**KEEP PRIVATE (do NOT include in README):**
+
+- Internal project structure (file paths, module organization)
+- Exact detection patterns (specific opcodes like `REDUCE`, `GLOBAL`, etc.)
+- Exact module/function names we detect (e.g., `os.system`, `subprocess`)
+- Whitelist system (do not mention false positives, model counts, or mechanism)
+- Scanner implementation details
+- Internal architecture documentation
+
+**Why this matters:** Exact detection patterns help attackers craft evasion techniques. For security checks, list WHAT we analyze (formats/frameworks) not HOW (detection mechanisms). Keep implementation details in `docs/agents/` for contributors only.
 
 ## DO / DON'T Cheatsheet
 
