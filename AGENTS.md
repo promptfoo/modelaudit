@@ -135,13 +135,13 @@ The README is published to PyPI and visible to the public. Follow these rules to
 **KEEP PRIVATE (do NOT include in README):**
 
 - Internal project structure (file paths, module organization)
-- Detailed detection patterns (specific opcodes like `REDUCE`, `GLOBAL`, etc.)
+- Exact detection patterns (specific opcodes like `REDUCE`, `GLOBAL`, etc.)
 - Exact module/function names we detect (e.g., `os.system`, `subprocess`)
 - Whitelist internals (model counts, update scripts, mechanism details)
 - Scanner implementation details
 - Internal architecture documentation
 
-**Why this matters:** Detailed detection patterns help attackers craft evasion techniques. Keep implementation details in `docs/agents/` for contributors only.
+**Why this matters:** Exact detection patterns help attackers craft evasion techniques. High-level categories (e.g., "dangerous Python imports") are fine; exact lists are not. Keep implementation details in `docs/agents/` for contributors only.
 
 ## DO / DON'T Cheatsheet
 

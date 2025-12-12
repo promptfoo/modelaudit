@@ -139,6 +139,37 @@ ModelAudit supports **29 specialized file format scanners** with comprehensive s
 
 [View complete format documentation →](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
+## 🔒 Security Checks
+
+### Code Execution Detection
+
+- Dangerous Python imports and system calls
+- Pickle deserialization exploits
+- Embedded executable files
+
+### Embedded Data Extraction
+
+- API keys, tokens, and credentials in model weights/metadata
+- URLs, IP addresses, and network endpoints
+- Suspicious configuration properties
+
+### Archive Security
+
+- Path traversal attacks in ZIP/TAR archives
+- Executable files within model packages
+- Malicious filenames and directory structures
+
+### ML Framework Analysis
+
+- Unsafe TensorFlow/Keras operations and layers
+- Custom operators with potential security risks
+- Template injection in model configurations
+
+### Context-Aware Analysis
+
+- Intelligently distinguishes between legitimate ML framework patterns and genuine threats
+- Reduces false positives in complex model files
+
 ## 🎯 Common Use Cases
 
 ### **Pre-Deployment Security Checks**
