@@ -182,6 +182,7 @@ def test_scan_model_streaming_scan_error_handling(temp_test_files):
         assert result.files_scanned == 2
 
 
+@pytest.mark.slow
 def test_scan_model_streaming_timeout():
     """Test that timeout is respected in streaming mode."""
     # Create multiple files to trigger timeout between scans

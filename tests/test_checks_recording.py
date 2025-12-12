@@ -78,11 +78,11 @@ def test_scan_result_with_checks():
 
 
 def test_backward_compatibility():
-    """Test that add_issue still works for backward compatibility."""
+    """Test that _add_issue still works for backward compatibility."""
     result = ScanResult(scanner_name="test_scanner")
 
-    # Use old add_issue method
-    result.add_issue(
+    # Use old _add_issue method
+    result._add_issue(
         message="Test issue",
         severity=IssueSeverity.WARNING,
         location="/test/file.pkl",

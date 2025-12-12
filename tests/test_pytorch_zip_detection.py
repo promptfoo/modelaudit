@@ -177,3 +177,115 @@ class TestPyTorchBinaryDetection:
         # Verify correct scanner is used
         result = scan_file(str(bin_file))
         assert result.scanner_name == "pickle"
+
+
+class TestPyTorchZipPklExtension:
+    """Test that .pkl files with ZIP format are handled by PyTorchZipScanner.
+
+    PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True).
+    This means .pkl files saved with torch.save() are actually ZIP files containing pickle data.
+    These tests verify the fix for the UnicodeDecodeError that occurred when ModelAudit tried
+    to parse ZIP-format .pkl files as raw pickle files.
+    """
+
+    def test_detect_zip_pkl_file(self, tmp_path):
+        """Test that .pkl files with ZIP format are detected correctly."""
+        # Create a .pkl file using torch.save (creates a ZIP by default)
+        model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+        pkl_file = tmp_path / "model.pkl"
+        torch.save(model_data, pkl_file)
+
+        # Verify file format detection
+        format_type = detect_file_format(str(pkl_file))
+        assert format_type == "zip", f"Expected 'zip' but got '{format_type}'"
+
+        # Verify the file can be scanned without UnicodeDecodeError
+        result = scan_file(str(pkl_file))
+        assert result is not None
+        assert result.scanner_name == "pytorch_zip"
+        assert result.bytes_scanned > 0
+
+    def test_detect_raw_pkl_file(self, tmp_path):
+        """Test that raw pickle .pkl files still work with PickleScanner."""
+        # Create a raw pickle .pkl file (using _use_new_zipfile_serialization=False)
+        model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+        pkl_file = tmp_path / "model.pkl"
+        torch.save(model_data, pkl_file, _use_new_zipfile_serialization=False)
+
+        # Verify file format detection
+        format_type = detect_file_format(str(pkl_file))
+        assert format_type == "pickle", f"Expected 'pickle' but got '{format_type}'"
+
+        # Verify the file can be scanned with pickle scanner
+        result = scan_file(str(pkl_file))
+        assert result is not None
+        assert result.scanner_name == "pickle"
+        assert result.bytes_scanned > 0
+
+    def test_scan_safe_zip_pkl(self, tmp_path):
+        """Test that safe ZIP-format .pkl files don't trigger false positives."""
+        # Create a safe PyTorch model with .pkl extension
+        model_data = {
+            "weights": torch.randn(10, 10),
+            "bias": torch.randn(10),
+        }
+        pkl_file = tmp_path / "safe_model.pkl"
+        torch.save(model_data, pkl_file)
+
+        # Scan the file
+        result = scan_file(str(pkl_file))
+
+        # Should not have critical issues
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) == 0, f"Unexpected critical issues: {[i.message for i in critical_issues]}"
+
+    def test_scan_malicious_zip_pkl(self, tmp_path):
+        """Test detection of malicious code in ZIP-format .pkl files."""
+        # Create a ZIP file with malicious pickle content, saved as .pkl
+        pkl_file = tmp_path / "malicious_model.pkl"
+        with zipfile.ZipFile(pkl_file, "w") as zf:
+            # Create a malicious pickle payload
+            class MaliciousClass:
+                def __reduce__(self):
+                    import os
+
+                    return (os.system, ("echo pwned",))
+
+            pickle_data = io.BytesIO()
+            pickle.dump({"model": MaliciousClass()}, pickle_data)
+            zf.writestr("data.pkl", pickle_data.getvalue())
+
+        # Scan the file
+        result = scan_file(str(pkl_file))
+
+        # Should detect the malicious pattern
+        assert result.scanner_name == "pytorch_zip"
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+            f"Expected CRITICAL issue but got: {[i.message for i in result.issues]}"
+        )
+
+    def test_zip_pkl_no_unicode_error(self, tmp_path):
+        """Regression test: ZIP-format .pkl files should not cause UnicodeDecodeError.
+
+        This is the specific bug that was reported. torch.save() creates ZIP files
+        by default, but ModelAudit was trying to parse them as raw pickle, causing
+        UnicodeDecodeError when encountering the binary ZIP header.
+        """
+        # Create a ZIP-format .pkl file
+        model_data = {"tensor": torch.tensor([1.0, 2.0, 3.0])}
+        pkl_file = tmp_path / "model.pkl"
+        torch.save(model_data, pkl_file)
+
+        # Verify it's a ZIP file
+        with open(pkl_file, "rb") as f:
+            header = f.read(4)
+        assert header == b"PK\x03\x04", f"Expected ZIP header but got {header.hex()}"
+
+        # This should NOT raise UnicodeDecodeError
+        result = scan_file(str(pkl_file))
+        assert result is not None
+        assert result.scanner_name == "pytorch_zip"
+
+        # Should not have any issues about UnicodeDecodeError
+        error_issues = [i for i in result.issues if "unicode" in i.message.lower()]
+        assert len(error_issues) == 0, f"Got UnicodeDecodeError issues: {[i.message for i in error_issues]}"

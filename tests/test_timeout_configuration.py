@@ -46,7 +46,7 @@ class SlowTestScanner(BaseScanner):
 
             # Add some fake issues
             if bytes_scanned % 5000 == 0:
-                result.add_issue(
+                result._add_issue(
                     f"Test issue at byte {bytes_scanned}",
                     severity=IssueSeverity.WARNING,
                     location=path,
@@ -101,6 +101,7 @@ class TestTimeoutConfiguration:
         finally:
             os.unlink(temp_path)
 
+    @pytest.mark.slow
     def test_partial_results_on_timeout(self):
         """Test that partial results are returned when timeout occurs"""
         # Create a large test file

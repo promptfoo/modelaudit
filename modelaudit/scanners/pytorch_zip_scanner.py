@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 import tempfile
 import zipfile
 from typing import Any, ClassVar
@@ -13,11 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class PyTorchZipScanner(BaseScanner):
-    """Scanner for PyTorch Zip-based model files (.pt, .pth)"""
+    """Scanner for PyTorch Zip-based model files (.pt, .pth, .pkl, .bin)"""
 
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
-    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".bin"]
+    # Include .pkl since torch.save() uses ZIP format by default since PyTorch 1.6
+    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".pkl", ".bin"]
 
     # CVE-2025-32434 constants
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
@@ -50,8 +52,9 @@ class PyTorchZipScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
-        # For .bin files, only handle if they're ZIP format (torch.save() output)
-        if ext == ".bin":
+        # For .bin and .pkl files, only handle if they're ZIP format (torch.save() output)
+        # torch.save() uses ZIP format by default since PyTorch 1.6 (_use_new_zipfile_serialization=True)
+        if ext in [".bin", ".pkl"]:
             try:
                 from modelaudit.utils.file.detection import detect_file_format
 
@@ -312,13 +315,10 @@ class PyTorchZipScanner(BaseScanner):
 
         for name in safe_entries:
             try:
-                # Skip numeric tensor data files in archive/data/ (e.g., archive/data/0, archive/data/1)
+                # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                # Still scan non-numeric files that could contain code (e.g., .py, .json, .pkl)
-                if name.startswith("archive/data/"):
-                    basename = os.path.basename(name)
-                    if basename.isdigit():
-                        continue
+                if re.match(r"^(?:.+/)?data/\d+$", name):
+                    continue
 
                 with zip_file.open(name, "r") as zf:
                     # Collect all data from this file for analysis
@@ -743,7 +743,7 @@ class PyTorchZipScanner(BaseScanner):
                     # Found a reference to torch version - try to get the value
                     # Look for subsequent opcodes that might contain the version string
                     for j in range(i + 1, min(i + 10, len(opcodes))):
-                        next_opcode, next_arg, next_pos = opcodes[j]
+                        next_opcode, next_arg, _next_pos = opcodes[j]
                         if (
                             next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
                             and next_arg

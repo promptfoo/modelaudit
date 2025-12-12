@@ -155,6 +155,13 @@ class ScanResult:
         if not passed and severity is None:
             severity = IssueSeverity.WARNING
 
+        # Apply whitelist downgrading logic for failed checks if scanner is available
+        # This must happen BEFORE creating the Check to ensure consistent severity
+        if not passed and self.scanner:
+            # At this point severity cannot be None due to the check above
+            assert severity is not None
+            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
         check = Check(
             name=name,
             status=status,
@@ -172,6 +179,11 @@ class ScanResult:
                 why = get_message_explanation(message, context=self.scanner_name)
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
+
+            # Apply whitelist downgrading logic if scanner is available
+            if self.scanner:
+                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+
             issue = Issue(
                 message=message,
                 severity=severity,
@@ -196,7 +208,7 @@ class ScanResult:
             # Log successful checks at DEBUG level
             logger.debug(f"Check passed: {name} - {message}")
 
-    def add_issue(
+    def _add_issue(
         self,
         message: str,
         severity: IssueSeverity = IssueSeverity.WARNING,
@@ -204,56 +216,23 @@ class ScanResult:
         details: dict[str, Any] | None = None,
         why: str | None = None,
     ) -> None:
-        """Add an issue to the result (for backward compatibility)"""
-        if why is None:
-            # Pass scanner name as context for more specific explanations
-            why = get_message_explanation(message, context=self.scanner_name)
+        """Private legacy method - use add_check() instead.
 
-        # Apply whitelist logic if enabled and scanner is available
-        original_severity = severity
-        if self.scanner and self.scanner._should_apply_whitelist(severity):
-            severity = IssueSeverity.INFO
-            # Add note about whitelisting to the details
-            if details is None:
-                details = {}
-            details["whitelist_downgrade"] = True
-            details["original_severity"] = original_severity.name
+        This method is deprecated and should not be used in new code.
+        It exists only for backward compatibility with unmigrated scanner code.
+        """
+        # INFO/DEBUG are informational (passed checks), WARNING/CRITICAL are failures
+        passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
 
-        issue = Issue(
+        self.add_check(
+            name="Legacy Security Check",
+            passed=passed,
             message=message,
             severity=severity,
             location=location,
-            details=details or {},
+            details=details,
             why=why,
-            type=f"{self.scanner_name}_issue",
         )
-        self.issues.append(issue)
-
-        # Only add as a failed check for WARNING/CRITICAL severity
-        # INFO and DEBUG are informational and should not appear as failed checks
-        if severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
-            check_name = details.get("check_name", "Security Check") if details else "Security Check"
-            check = Check(
-                name=check_name,
-                status=CheckStatus.FAILED,
-                message=message,
-                severity=severity,
-                location=location,
-                details=details or {},
-                why=why,
-            )
-            self.checks.append(check)
-
-        log_level = (
-            logging.CRITICAL
-            if severity == IssueSeverity.CRITICAL
-            else (
-                logging.WARNING
-                if severity == IssueSeverity.WARNING
-                else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
-            )
-        )
-        logger.log(log_level, str(issue))
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -420,6 +399,34 @@ class BaseScanner(ABC):
 
         return False
 
+    def _apply_whitelist_downgrade(
+        self,
+        severity: IssueSeverity,
+        details: dict[str, Any] | None,
+    ) -> tuple[IssueSeverity, dict[str, Any]]:
+        """
+        Apply whitelist downgrading logic to severity and details.
+
+        Args:
+            severity: The original severity
+            details: The details dictionary (may be None)
+
+        Returns:
+            Tuple of (potentially modified severity, details dict)
+        """
+        original_severity = severity
+        if self._should_apply_whitelist(severity):
+            severity = IssueSeverity.INFO
+            # Add note about whitelisting to the details
+            if details is None:
+                details = {}
+            details["whitelist_downgrade"] = True
+            details["original_severity"] = original_severity.name
+        elif details is None:
+            details = {}
+
+        return severity, details
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Return True if this scanner can handle the file at the given path"""
@@ -538,8 +545,13 @@ class BaseScanner(ABC):
             total_bytes: Total bytes in the file
         """
         percentage = (bytes_scanned / total_bytes * 100) if total_bytes > 0 else 0
-        result.add_issue(
-            f"Scan incomplete: Timeout after scanning {bytes_scanned:,} of {total_bytes:,} bytes ({percentage:.1f}%)",
+        result.add_check(
+            name="Scan Timeout Check",
+            passed=False,
+            message=(
+                f"Scan incomplete: Timeout after scanning {bytes_scanned:,} "
+                f"of {total_bytes:,} bytes ({percentage:.1f}%)"
+            ),
             severity=IssueSeverity.WARNING,
             location=self.current_file_path,
             details={
@@ -1098,7 +1110,7 @@ class BaseScanner(ABC):
                             f"indicate {header_format}. This could indicate file spoofing, corruption, or a "
                             f"security threat."
                         ),
-                        severity=IssueSeverity.WARNING,  # Warning level to allow scan to continue
+                        severity=IssueSeverity.INFO,  # Informational - format mismatch not necessarily a security issue
                         location=path,
                         details={
                             "header_format": header_format,
@@ -1143,12 +1155,13 @@ class BaseScanner(ABC):
             # as zero rather than raising an exception.
             return 0
 
-    def calculate_file_hashes(self, path: str) -> dict[str, str]:
+    def calculate_file_hashes(self, path: str) -> dict[str, str | None]:
         """Calculate MD5, SHA256, and SHA512 hashes of a file.
 
-        Returns a dictionary with hash values or error messages.
+        Returns a dictionary with hash values or None if calculation fails.
+        Uses None instead of empty strings to satisfy Pydantic validation.
         """
-        hashes = {"md5": "", "sha256": "", "sha512": ""}
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
 
         if not os.path.isfile(path):
             return hashes
@@ -1172,7 +1185,7 @@ class BaseScanner(ABC):
 
         except Exception as e:
             logger.warning(f"Failed to calculate hashes for {path}: {e}")
-            # Return empty hashes on error rather than failing
+            # Return None hashes on error - Pydantic will accept None but not empty strings
 
         return hashes
 
@@ -1187,7 +1200,7 @@ class BaseScanner(ABC):
                 name="File Size Limit",
                 passed=False,
                 message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "file_size": file_size,
@@ -1203,7 +1216,7 @@ class BaseScanner(ABC):
 
         if self.max_file_read_size and self.max_file_read_size > 0:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
             self._path_validation_result.add_check(
                 name="File Size Limit",
@@ -1217,7 +1230,7 @@ class BaseScanner(ABC):
             )
         else:
             if self._path_validation_result is None:
-                self._path_validation_result = ScanResult(scanner_name=self.name)
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = file_size
 
         return None

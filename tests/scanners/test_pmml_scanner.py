@@ -102,7 +102,8 @@ def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     result = PmmlScanner().scan(str(path))
     assert not result.success
     assert any("malformed xml" in i.message.lower() for i in result.issues)
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    # Malformed XML is INFO severity (not a security threat, just parsing issue)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_pmml_scanner_invalid_root_element(tmp_path: Path) -> None:
@@ -146,7 +147,8 @@ def test_pmml_scanner_non_utf8_content(tmp_path: Path) -> None:
     # XML with invalid bytes should fail parsing
     assert not result.success
     assert any("malformed xml" in i.message.lower() for i in result.issues)
-    assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+    # Malformed XML is INFO severity (not a security threat, just parsing issue)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_pmml_scanner_utf8_with_replacement(tmp_path: Path) -> None:

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.22] - 2025-12-10
+
+### Added
+
+- **feat**: add `modelaudit debug` command for troubleshooting - outputs comprehensive diagnostic information including version, platform, environment variables, authentication status, scanner availability, NumPy compatibility, cache status, and configuration in JSON or pretty-printed format; useful for bug reports and support interactions
+
+## [0.2.21] - 2025-12-09
+
+### Fixed
+
+- **fix**: resolve UnicodeDecodeError when scanning PyTorch .pkl files saved with default ZIP serialization - torch.save() uses ZIP format by default since PyTorch 1.6 (`_use_new_zipfile_serialization=True`), but ModelAudit was incorrectly routing these files to PickleScanner which failed to parse the ZIP header. Now correctly routes ZIP-format .pkl files to PyTorchZipScanner.
+
+## [0.2.20] - 2025-12-01
+
+### Added
+
+- **feat**: detect cloud storage URLs in model configs (AWS S3, GCS, Azure Blob, HuggingFace Hub) - identifies external resource references that could indicate supply chain risks or data exfiltration vectors (Requirement 19)
+- **feat**: add URL allowlist security scanning to manifest scanner - uses 164 trusted domains to flag untrusted URLs in model configs as potential supply chain risks
+- **feat**: detect weak hash algorithms (MD5, SHA1) in model config files - scans manifest files for hash/checksum fields using cryptographically broken algorithms and reports WARNING with CWE-328 reference; SHA256/SHA512 usage is confirmed as strong (addresses Requirement 28: Hash Collisions or Weak Hashes)
+- **feat**: add comprehensive analytics system with Promptfoo integration - opt-out telemetry for usage insights, respects `PROMPTFOO_DISABLE_TELEMETRY` and `NO_ANALYTICS` environment variables
+- **feat**: auto-enable progress display when output goes to file - shows spinner/progress when stdout is redirected to a file
+
+### Fixed
+
+- **fix**: resolve false positives in pickle and TFLite scanners - improved detection accuracy
+- **fix**: clean up tests for CI reliability - removed flaky tests and improved test isolation
+
+## [0.2.19] - 2025-11-24
+
+### Fixed
+
+- **fix**: resolve Jinja2 SSTI false positives from bracket notation - refined obfuscation pattern to only match dunder attributes (`["__class__"]`) instead of legitimate dict access (`["role"]`), and fixed regex bug where `|format\(` matched any pipe character
+- **fix**: remove overly broad secret detection pattern - replaced generic `[A-Za-z0-9]{20,}` pattern with specific well-known token formats (GitHub, OpenAI, AWS, Slack) to eliminate false positives on URLs and model IDs
+- **fix**: resolve msgpack file type validation false positive - unified format name inconsistency where functions returned different values (`"msgpack"` vs `"flax_msgpack"`), causing validation failures on legitimate MessagePack files
+- **fix**: add HuggingFace training utilities to pickle safe globals - added safe Transformers, Accelerate, and TRL classes (HubStrategy, SchedulerType, DistributedType, DeepSpeedPlugin, DPOConfig, etc.) to reduce false positives on training checkpoints
+
+## [0.2.18] - 2025-11-20
+
+### Fixed
+
+- **fix**: exclude INFO/DEBUG checks from success rate calculation - success rate now only includes security-relevant checks (WARNING/CRITICAL), with informational checks (INFO/DEBUG) shown separately in "Failed Checks (non-critical)" section
+- **fix**: missing whitelist logic in validation checks - whitelist downgrading now correctly applies to validation result instantiations
+- **fix**: resolve PyTorch ZIP scanner hang on large models - improved memory-mapped file handling and timeout configuration
+- **fix**: additional severity downgrades - further reduced false positives across multiple scanners
+
+### Changed
+
+- **chore**: standardize on `add_check()` API - migrated all internal code from legacy `add_issue()` method to modern `add_check()` method for structured check reporting with explicit pass/fail status
+
 ## [0.2.17] - 2025-11-19
 
 ### Fixed
@@ -546,7 +595,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...HEAD
+[0.2.22]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...v0.2.22
+[0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
+[0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20
+[0.2.19]: https://github.com/promptfoo/modelaudit/compare/v0.2.18...v0.2.19
+[0.2.18]: https://github.com/promptfoo/modelaudit/compare/v0.2.17...v0.2.18
+[0.2.17]: https://github.com/promptfoo/modelaudit/compare/v0.2.16...v0.2.17
+[0.2.16]: https://github.com/promptfoo/modelaudit/compare/v0.2.15...v0.2.16
+[0.2.15]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12

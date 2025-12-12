@@ -4,12 +4,13 @@ import zipfile
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+from tests.helpers import create_mock_pytorch_zip
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
     """Test the can_handle method of PyTorchZipScanner."""
     # Test with actual PyTorch file
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     assert PyTorchZipScanner.can_handle(str(model_path)) is True
 
     # Test with non-existent file
@@ -21,39 +22,9 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
-def create_pytorch_zip(tmp_path, *, malicious=False):
-    """Create a mock PyTorch ZIP file for testing."""
-    # Create a ZIP file that mimics a PyTorch model
-    zip_path = tmp_path / "model.pt"
-
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        # Add a version file
-        zipf.writestr("version", "3")
-
-        # Add a data.pkl file
-        data = {"weights": [1, 2, 3], "bias": [0.1, 0.2]}
-
-        if malicious:
-            # Add a malicious class
-            class MaliciousClass:
-                def __reduce__(self):
-                    return (eval, ("print('malicious code')",))
-
-            data["malicious"] = MaliciousClass()
-
-        # Pickle the data
-        pickled_data = pickle.dumps(data)
-        zipf.writestr("data.pkl", pickled_data)
-
-        # Add some other files
-        zipf.writestr("model.json", '{"name": "test_model"}')
-
-    return zip_path
-
-
 def test_pytorch_zip_scanner_safe_model(tmp_path):
     """Test scanning a safe PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -68,7 +39,7 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
 
 def test_pytorch_zip_scanner_malicious_model(tmp_path):
     """Test scanning a malicious PyTorch ZIP model."""
-    model_path = create_pytorch_zip(tmp_path, malicious=True)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -161,7 +132,7 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
 
     monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
 
-    model_path = create_pytorch_zip(tmp_path)
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
     scanner.scan(str(model_path))
 
@@ -259,3 +230,91 @@ def test_pytorch_zip_numeric_detection_edge_cases(tmp_path):
 
     # Should complete successfully without hanging
     assert result.success is True
+
+
+def test_pytorch_zip_scanner_can_handle_pkl_extension(tmp_path):
+    """Test that PyTorchZipScanner can_handle returns True for ZIP-format .pkl files.
+
+    PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True).
+    This test verifies that .pkl files with ZIP headers are correctly identified.
+    """
+    # Create a ZIP-format .pkl file (simulating torch.save() default behavior)
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = {"weights": [1, 2, 3]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("data.pkl", pickled_data)
+
+    assert PyTorchZipScanner.can_handle(str(pkl_path)) is True
+
+
+def test_pytorch_zip_scanner_cannot_handle_raw_pkl(tmp_path):
+    """Test that PyTorchZipScanner can_handle returns False for raw pickle .pkl files.
+
+    Raw pickle files (created with _use_new_zipfile_serialization=False) should not be
+    handled by PyTorchZipScanner - they should go to the PickleScanner instead.
+    """
+    # Create a raw pickle .pkl file (non-ZIP format)
+    pkl_path = tmp_path / "model.pkl"
+    data = {"weights": [1, 2, 3]}
+    with open(pkl_path, "wb") as f:
+        pickle.dump(data, f)
+
+    assert PyTorchZipScanner.can_handle(str(pkl_path)) is False
+
+
+def test_pytorch_zip_scanner_scans_zip_pkl_successfully(tmp_path):
+    """Test that PyTorchZipScanner successfully scans ZIP-format .pkl files.
+
+    This is the fix for the issue where torch.save() creates ZIP files with .pkl extension
+    by default, but ModelAudit was routing them to PickleScanner which failed with
+    UnicodeDecodeError.
+    """
+    # Create a ZIP-format .pkl file (simulating torch.save() default behavior)
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        # Standard PyTorch ZIP structure
+        zipf.writestr("version", "3")
+        zipf.writestr("byteorder", "little")
+        zipf.writestr(".format_version", "1")
+
+        # Create a proper pickle with torch-like structure
+        data = {"linear.weight": [1.0, 2.0], "linear.bias": [0.1]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("model/data.pkl", pickled_data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(pkl_path))
+
+    # Should succeed without errors
+    assert result.success is True
+    assert result.bytes_scanned > 0
+
+    # No critical issues
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert len(critical_issues) == 0
+
+
+def test_pytorch_zip_scanner_detects_malicious_zip_pkl(tmp_path):
+    """Test that PyTorchZipScanner detects malicious content in ZIP-format .pkl files."""
+    # Create a ZIP-format .pkl file with malicious pickle content
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        zipf.writestr("version", "3")
+
+        # Create a malicious pickle that would execute code
+        class MaliciousClass:
+            def __reduce__(self):
+                return (eval, ("print('pwned')",))
+
+        data = {"malicious": MaliciousClass()}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("data.pkl", pickled_data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(pkl_path))
+
+    # Should detect the eval function
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any("eval" in issue.message.lower() for issue in result.issues)

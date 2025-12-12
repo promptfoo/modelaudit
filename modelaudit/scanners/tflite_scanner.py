@@ -37,7 +37,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite Library Check",
                 passed=False,
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "tflite"},
             )
@@ -49,17 +49,18 @@ class TFLiteScanner(BaseScanner):
                 data = f.read()
                 result.bytes_scanned = len(data)
 
-            # Check for TFLite magic bytes "TFL3"
-            if not data.startswith(b"TFL3"):
+            # Check for TFLite magic bytes "TFL3" at offset 4
+            # TFLite uses FlatBuffer format: bytes 0-3 are root table offset, bytes 4-7 are file identifier
+            if len(data) < 8 or data[4:8] != b"TFL3":
                 result.add_check(
                     name="TFLite Magic Bytes Check",
                     passed=False,
-                    message="File does not have valid TFLite magic bytes (expected 'TFL3')",
-                    severity=IssueSeverity.CRITICAL,
+                    message="File does not have valid TFLite magic bytes (expected 'TFL3' at offset 4)",
+                    severity=IssueSeverity.INFO,
                     location=path,
-                    details={"magic_bytes": data[:4].hex()},
-                    why="Valid TFLite files must start with 'TFL3' magic bytes. "
-                    "Missing magic bytes may indicate file corruption or spoofing.",
+                    details={"magic_bytes_at_offset_4": data[4:8].hex() if len(data) >= 8 else "file_too_short"},
+                    why="Valid TFLite files use FlatBuffer format with 'TFL3' identifier at bytes 4-7. "
+                    "Missing or incorrect identifier may indicate file corruption or spoofing.",
                 )
                 result.finish(success=False)
                 return result
@@ -70,7 +71,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite File Parse",
                 passed=False,
                 message=f"Invalid TFLite file or parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )

@@ -132,7 +132,7 @@ class LargeFileHandler:
             with open(self.file_path, "rb") as f:
                 while True:
                     if self._check_timeout():
-                        result.add_issue(
+                        result._add_issue(
                             f"Scan timeout after {self.timeout} seconds",
                             severity=IssueSeverity.WARNING,
                             details={
@@ -168,7 +168,7 @@ class LargeFileHandler:
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")
-            result.add_issue(
+            result._add_issue(
                 f"Scanning error: {e!s}",
                 severity=IssueSeverity.WARNING,
                 details={"error": str(e)},

@@ -225,18 +225,224 @@ def test_manifest_scanner_yaml():
     pytest.skip("YAML files are no longer supported by manifest scanner whitelist")
 
 
-def test_manifest_scanner_can_handle():
+def test_manifest_scanner_can_handle(tmp_path):
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
+    # Create actual files for testing (scanner requires files to exist)
+    (tmp_path / "config.json").write_text('{"model_type": "test"}')
+    (tmp_path / "generation_config.json").write_text("{}")
+    (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / "tsconfig.json").write_text("{}")
+
     # Should handle HuggingFace configs
-    assert scanner.can_handle("config.json") is True
-    assert scanner.can_handle("generation_config.json") is True
-    assert scanner.can_handle("model_index.json") is True
+    assert scanner.can_handle(str(tmp_path / "config.json")) is True
+    assert scanner.can_handle(str(tmp_path / "generation_config.json")) is True
+    assert scanner.can_handle(str(tmp_path / "model_index.json")) is True
 
     # Should not handle tokenizer configs (excluded)
-    assert scanner.can_handle("tokenizer_config.json") is False
+    assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False
 
     # Should not handle non-ML configs
-    assert scanner.can_handle("package.json") is False
-    assert scanner.can_handle("tsconfig.json") is False
+    assert scanner.can_handle(str(tmp_path / "package.json")) is False
+    assert scanner.can_handle(str(tmp_path / "tsconfig.json")) is False
+
+
+def test_manifest_scanner_url_shortener_flagged():
+    """Test that URL shorteners are flagged (not in allowlist)."""
+    test_file = "config.json"
+    config_with_shortener = {
+        "model_type": "bert",
+        "download_url": "https://bit.ly/abc123",
+        "architectures": ["BertModel"],
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_shortener, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should flag URL shortener as untrusted domain
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 1
+        assert "bit.ly" in failed_url_checks[0].details.get("url", "")
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_tunnel_service_flagged():
+    """Test that tunnel services (ngrok, localtunnel) are flagged (not in allowlist)."""
+    test_file = "config.json"
+    config_with_tunnel = {
+        "model_type": "gpt2",
+        "callback_url": "https://abc123.ngrok.io/webhook",
+        "hidden_size": 768,
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_tunnel, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should flag tunnel service as untrusted domain
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 1
+        assert "ngrok.io" in failed_url_checks[0].details.get("url", "")
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_trusted_urls_not_flagged():
+    """Test that URLs from trusted domains (huggingface, github, etc.) are NOT flagged as untrusted."""
+    test_file = "config.json"
+    config_with_trusted_urls = {
+        "model_type": "bert",
+        "_name_or_path": "https://huggingface.co/bert-base-uncased",
+        "repository": "https://github.com/huggingface/transformers",
+        "homepage": "https://pytorch.org/models",
+        "weights": "https://s3.amazonaws.com/models/bert.bin",
+        "storage": "https://storage.googleapis.com/models/bert",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_trusted_urls, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should have NO "Untrusted URL Check" failures (all are trusted domains)
+        # Note: "Cloud Storage URL Detection" may still flag these as INFO for visibility
+        untrusted_url_checks = [
+            c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED
+        ]
+        assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_untrusted_domain_flagged():
+    """Test that URLs from untrusted/unknown domains ARE flagged."""
+    test_file = "config.json"
+    config_with_untrusted_url = {
+        "model_type": "bert",
+        "download_url": "https://totally-legit-models.com/model.bin",
+        "callback": "https://unknown-server.net/webhook",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_untrusted_url, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should flag untrusted domains
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 2, f"Expected 2 untrusted URLs, got {len(failed_url_checks)}"
+
+        # Verify URLs were detected
+        detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+        assert any("totally-legit-models.com" in url for url in detected_urls)
+        assert any("unknown-server.net" in url for url in detected_urls)
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_nested_untrusted_url():
+    """Test that untrusted URLs in nested config structures are detected."""
+    test_file = "config.json"
+    config_with_nested_url = {
+        "model_type": "bert",
+        "training": {
+            "callbacks": {
+                "webhook_url": "https://tinyurl.com/malicious",
+            }
+        },
+        "pipelines": [
+            {"name": "inference", "endpoint": "https://localtunnel.me/api"},
+        ],
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_nested_url, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should detect both untrusted URLs
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 2
+
+        # Verify both URLs were detected
+        detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+        assert any("tinyurl.com" in url for url in detected_urls)
+        assert any("localtunnel.me" in url for url in detected_urls)
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()
+
+
+def test_manifest_scanner_duplicate_urls_not_repeated():
+    """Test that the same untrusted URL appearing multiple times is only reported once."""
+    test_file = "config.json"
+    config_with_duplicate_urls = {
+        "model_type": "bert",
+        "primary_url": "https://bit.ly/same123",
+        "backup_url": "https://bit.ly/same123",
+        "fallback_url": "https://bit.ly/same123",
+    }
+
+    try:
+        with Path(test_file).open("w") as f:
+            json.dump(config_with_duplicate_urls, f)
+
+        scanner = ManifestScanner()
+        result = scanner.scan(test_file)
+
+        assert result.success is True
+
+        # Should only have ONE untrusted URL check (deduplication)
+        url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
+        failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
+        assert len(failed_url_checks) == 1
+
+    finally:
+        test_file_path = Path(test_file)
+        if test_file_path.exists():
+            test_file_path.unlink()

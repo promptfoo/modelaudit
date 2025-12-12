@@ -433,7 +433,6 @@ def download_model_streaming(
                     filename=filename,
                     cache_dir=str(cache_dir / "huggingface"),
                     local_dir=str(download_path),
-                    local_dir_use_symlinks=False,
                 )
             else:
                 # Use HF default cache

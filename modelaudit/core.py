@@ -18,6 +18,7 @@ from modelaudit.integrations.license_checker import (
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     detect_file_format,
@@ -354,10 +355,31 @@ def _update_result_counts(
         consolidated_checks: List of consolidated checks
         original_count: Original number of checks before consolidation
     """
-    total_checks = len(consolidated_checks)
-    passed_checks = sum(1 for c in consolidated_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in consolidated_checks if c.get("status") == "failed")
+    from .scanners.base import IssueSeverity
+
+    # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
+    # Exclude failed INFO/DEBUG checks from success rate (they're informational)
+    def is_failed_info_or_debug(check):
+        if check.get("status") != "failed":
+            return False
+        severity = check.get("severity", "")
+        # Check both string and enum values for compatibility
+        return severity in ("info", "debug", IssueSeverity.INFO.value, IssueSeverity.DEBUG.value)
+
+    # Exclude only failed INFO/DEBUG checks from success rate
+    security_checks = [c for c in consolidated_checks if not is_failed_info_or_debug(c)]
+
+    total_checks = len(security_checks)
+    passed_checks = sum(1 for c in security_checks if c.get("status") == "passed")
+    failed_checks = sum(1 for c in security_checks if c.get("status") == "failed")
     skipped_checks = total_checks - passed_checks - failed_checks
+
+    # Debug logging
+    info_debug_excluded = len(consolidated_checks) - len(security_checks)
+    logger.debug(
+        f"Check statistics: {total_checks} total ({info_debug_excluded} INFO/DEBUG excluded), "
+        f"{passed_checks} passed, {failed_checks} failed"
+    )
 
     # Validate counts make sense
     if passed_checks + failed_checks + skipped_checks != total_checks:
@@ -619,7 +641,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 "Broken symlink encountered",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"error": str(e)},
                             )
@@ -828,7 +850,7 @@ def scan_model_directory_or_file(
                                 results,
                                 f"Total scan size limit exceeded: {results.bytes_scanned} bytes "
                                 f"(max: {max_total_size})",
-                                severity=IssueSeverity.WARNING.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=representative_file,
                                 details={"max_total_size": max_total_size},
                             )
@@ -843,7 +865,7 @@ def scan_model_directory_or_file(
                             _add_issue_to_model(
                                 results,
                                 f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.CRITICAL.value,
+                                severity=IssueSeverity.INFO.value,
                                 location=file_path,
                                 details={"exception_type": type(e).__name__},
                             )
@@ -955,7 +977,7 @@ def scan_model_directory_or_file(
                     _add_issue_to_model(
                         results,
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
-                        severity=IssueSeverity.WARNING.value,
+                        severity=IssueSeverity.INFO.value,
                         location=target,
                         details={"max_total_size": max_total_size},
                     )
@@ -975,7 +997,7 @@ def scan_model_directory_or_file(
         _add_issue_to_model(
             results,
             f"Error during scan: {e!s}",
-            severity=IssueSeverity.CRITICAL.value,
+            severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
         _add_error_asset_to_results(results, path)
@@ -1197,9 +1219,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         file_size = os.path.getsize(path)
     except OSError as e:
         sr = ScanResult(scanner_name="error")
-        sr.add_issue(
-            f"Error checking file size: {e}",
-            severity=IssueSeverity.WARNING,
+        sr.add_check(
+            name="File Size Check",
+            passed=False,
+            message=f"Error checking file size: {e}",
+            severity=IssueSeverity.INFO,
             details={"error": str(e), "path": path},
         )
         sr.finish(success=False)
@@ -1213,9 +1237,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
     if not use_extreme_handler and max_file_size > 0 and file_size > max_file_size:
         sr = ScanResult(scanner_name="size_check")
-        sr.add_issue(
-            f"File too large to scan: {file_size} bytes (max: {max_file_size})",
-            severity=IssueSeverity.WARNING,
+        sr.add_check(
+            name="File Size Limit Check",
+            passed=False,
+            message=f"File too large to scan: {file_size} bytes (max: {max_file_size})",
+            severity=IssueSeverity.INFO,
             details={
                 "file_size": file_size,
                 "max_file_size": max_file_size,
@@ -1231,6 +1257,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+
+    # Record telemetry for file type detection
+    detected_format = header_format if header_format != "unknown" else ext_format
+    record_file_type_detected(path, detected_format)
 
     # Validate file type consistency as a security check
     file_type_valid = validate_file_type(path)
@@ -1260,7 +1290,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     preferred_scanner: type[BaseScanner] | None = None
 
     # Special handling for PyTorch files that are ZIP-based
-    if header_format == "zip" and ext in [".pt", ".pth"]:
+    # PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True)
+    # This applies to .pt, .pth, and .pkl files saved with torch.save()
+    if header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
         preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
@@ -1299,6 +1331,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         scanner = preferred_scanner(config=config)
 
         try:
+            # Record scanner usage telemetry
+            scan_start = time.time()
+
             if use_extreme_handler:
                 logger.debug(f"Large file optimization enabled: {path}")
                 result = scan_advanced_large_file(
@@ -1309,12 +1344,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 result = scan_large_file(path, scanner, progress_callback, timeout)
             else:
                 result = scanner.scan_with_cache(path)
+
+            # Record scanner usage telemetry
+            scan_duration = time.time() - scan_start
+            record_scanner_used(preferred_scanner.name, detected_format, scan_duration)
         except TimeoutError as e:
             # Handle timeout gracefully
             result = ScanResult(scanner_name=preferred_scanner.name)
-            result.add_issue(
-                f"Scan timeout: {e}",
-                severity=IssueSeverity.WARNING,
+            result.add_check(
+                name="Scan Timeout Check",
+                passed=False,
+                message=f"Scan timeout: {e}",
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"timeout": config.get("timeout", 3600), "error": str(e)},
             )
@@ -1327,6 +1368,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             scanner = scanner_class(config=config)
 
             try:
+                # Record scanner usage telemetry
+                scan_start = time.time()
+
                 if use_extreme_handler:
                     logger.debug(f"Large file optimization enabled: {path}")
                     result = scan_advanced_large_file(
@@ -1337,12 +1381,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = scan_large_file(path, scanner, progress_callback, timeout)
                 else:
                     result = scanner.scan_with_cache(path)
+
+                # Record scanner usage telemetry
+                scan_duration = time.time() - scan_start
+                record_scanner_used(scanner_class.name, detected_format, scan_duration)
             except TimeoutError as e:
                 # Handle timeout gracefully
                 result = ScanResult(scanner_name=scanner_class.name)
-                result.add_issue(
-                    f"Scan timeout: {e}",
-                    severity=IssueSeverity.WARNING,
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scan timeout: {e}",
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"timeout": config.get("timeout", 3600), "error": str(e)},
                 )
@@ -1350,8 +1400,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_issue(
-                f"Unknown or unhandled format: {format_}",
+            sr.add_check(
+                name="Format Detection",
+                passed=False,
+                message=f"Unknown or unhandled format: {format_}",
                 severity=IssueSeverity.DEBUG,
                 details={"format": format_, "path": path},
             )
@@ -1362,8 +1414,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
         # For validation failures, use the actual magic format
         detail_header_format = magic_format if not file_type_valid else header_format
-        result.add_issue(
-            discrepancy_msg + " Using header-based detection.",
+        result.add_check(
+            name="Format Validation",
+            passed=False,
+            message=discrepancy_msg + " Using header-based detection.",
             severity=severity,
             location=path,
             details={
@@ -1387,11 +1441,28 @@ def merge_scan_result(
         results: The existing ModelAuditResultModel
         scan_result: The ScanResult object or dict to merge
     """
-    # Use the new direct aggregation method for better performance and type safety
+    # Record telemetry for issues before aggregation
     if isinstance(scan_result, ScanResult):
+        file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
+        for issue in scan_result.issues:
+            record_issue_found(
+                issue.message,
+                issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
+                scan_result.scanner_name,
+                file_path=file_path,
+            )
+        # Use the new direct aggregation method for better performance and type safety
         results.aggregate_scan_result_direct(scan_result)
     else:
-        # Fallback to dict-based aggregation for backward compatibility
+        # Fallback to dict-based aggregation for backward compatibility with telemetry
+        file_path = scan_result.get("file_path")
+        for issue in scan_result.get("issues", []):
+            record_issue_found(
+                issue.get("message", "unknown_issue"),
+                issue.get("severity", "unknown"),
+                scan_result.get("scanner_name", "unknown"),
+                file_path=file_path,
+            )
         results.aggregate_scan_result(scan_result)
 
 

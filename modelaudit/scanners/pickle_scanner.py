@@ -317,6 +317,8 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "enable_grad",
         "set_grad_enabled",
         "inference_mode",
+        # PyTorch dtypes (safe built-in types)
+        "bfloat16",
     ],
     "torch.nn": [
         "Module",
@@ -514,6 +516,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "next",
     ],
     "collections": ["OrderedDict", "defaultdict", "namedtuple", "Counter", "deque"],
+    # _codecs is used by NumPy/PyTorch for binary data serialization (e.g., RNG states)
+    # encode() only transforms string encodings, it cannot execute code
+    "_codecs": ["encode"],
     "typing": [
         "Any",
         "Union",
@@ -673,6 +678,34 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "XGBRanker",
         "XGBRFClassifier",
         "XGBRFRegressor",
+    ],
+    # HuggingFace Transformers - Training utilities (Enums and config classes)
+    "transformers.trainer_utils": [
+        "HubStrategy",  # Enum for hub push strategy
+        "SchedulerType",  # Enum for learning rate schedulers
+        "IntervalStrategy",  # Enum for save/eval intervals
+    ],
+    "transformers.training_args": [
+        "OptimizerNames",  # Enum for optimizer selection
+    ],
+    "transformers.integrations.deepspeed": [
+        "HfDeepSpeedConfig",  # DeepSpeed config wrapper
+        "HfTrainerDeepSpeedConfig",  # Trainer-specific DeepSpeed config
+    ],
+    "transformers.trainer_pt_utils": [
+        "AcceleratorConfig",  # Dataclass for accelerator configuration
+    ],
+    # HuggingFace Accelerate - Distributed training utilities
+    "accelerate.utils.dataclasses": [
+        "DistributedType",  # Enum for distributed training types
+        "DeepSpeedPlugin",  # Dataclass for DeepSpeed plugin config
+    ],
+    "accelerate.state": [
+        "PartialState",  # Singleton class for distributed state
+    ],
+    # Alignment/TRL - Training config classes
+    "alignment.configs": [
+        "DPOConfig",  # Dataclass for DPO training configuration
     ],
 }
 
@@ -1447,7 +1480,7 @@ def check_opcode_sequence(
 
         if parsed and parsed[0] in {"base64", "codecs", "binascii"} and "decode" in parsed[1]:
             for j in range(i + 1, min(i + 6, len(opcodes))):
-                op2, arg2, pos2 = opcodes[j]
+                op2, arg2, _pos2 = opcodes[j]
                 if op2.name == "GLOBAL" and isinstance(arg2, str):
                     if " " in arg2:
                         m2, f2 = arg2.split(" ", 1)
@@ -3050,7 +3083,7 @@ class PickleScanner(BaseScanner):
                         max(0, i - 10),
                         -1,
                     ):  # Look back at most 10 opcodes
-                        prev_opcode, prev_arg, prev_pos = opcodes[j]
+                        prev_opcode, prev_arg, _prev_pos = opcodes[j]
                         if prev_opcode.name in [
                             "STRING",
                             "BINSTRING",
@@ -3767,7 +3800,7 @@ class PickleScanner(BaseScanner):
                 # Look for dangerous opcodes within next 30 positions
                 # Note: We check ALL torch operations since even legitimate ones can be part of attacks
                 for j in range(i + 1, min(i + 31, len(opcodes))):
-                    next_opcode, next_arg, next_pos = opcodes[j]
+                    next_opcode, _next_arg, next_pos = opcodes[j]
                     if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
                         # Only flag clearly suspicious torch operations
                         is_suspicious = (
@@ -3831,7 +3864,7 @@ class PickleScanner(BaseScanner):
 
                 # Look for subsequent REDUCE opcodes
                 for j in range(i + 1, min(i + 6, len(opcodes))):
-                    next_opcode, next_arg, next_pos = opcodes[j]
+                    next_opcode, _next_arg, next_pos = opcodes[j]
                     if next_opcode.name == "REDUCE":
                         reduce_sequence.append(next_opcode.name)
                         reduce_positions.append(next_pos)
@@ -3861,7 +3894,7 @@ class PickleScanner(BaseScanner):
             ):
                 # Look for data loading opcodes that could contain payload
                 for j in range(i + 1, min(i + 8, len(opcodes))):
-                    next_opcode, next_arg, next_pos = opcodes[j]
+                    next_opcode, _next_arg, next_pos = opcodes[j]
                     if next_opcode.name in ["UNICODE", "STRING", "BINUNICODE", "SHORT_BINSTRING"]:
                         patterns.append(
                             {
@@ -3878,7 +3911,7 @@ class PickleScanner(BaseScanner):
             if opcode.name == "BUILD" and i > 0:
                 # Look backwards for GLOBAL opcodes
                 for j in range(max(0, i - 5), i):
-                    prev_opcode, prev_arg, prev_pos = opcodes[j]
+                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
                     if (
                         prev_opcode.name in ["GLOBAL", "STACK_GLOBAL"]
                         and prev_arg
@@ -3902,7 +3935,7 @@ class PickleScanner(BaseScanner):
             if opcode.name in ["UNICODE", "STRING", "BINUNICODE"] and arg and "lambda" in str(arg).lower():
                 # Look for REDUCE opcodes following lambda
                 for j in range(i + 1, min(i + 8, len(opcodes))):
-                    next_opcode, next_arg, next_pos = opcodes[j]
+                    next_opcode, _next_arg, next_pos = opcodes[j]
                     if next_opcode.name == "REDUCE":
                         patterns.append(
                             {

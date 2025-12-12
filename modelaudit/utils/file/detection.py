@@ -256,7 +256,7 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext in (".pdmodel", ".pdiparams"):
         return "paddle"
-    if ext in (".msgpack", ".flax", ".orbax", ".jax"):
+    if ext == ".msgpack":
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
@@ -343,6 +343,7 @@ EXTENSION_FORMAT_MAP = {
     ".pdiparams": "paddle",
     ".engine": "tensorrt",
     ".plan": "tensorrt",
+    ".msgpack": "flax_msgpack",
 }
 
 
@@ -392,7 +393,7 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         case ".npy" | ".npz":
             return "numpy"
         case ".msgpack":
-            return "msgpack"
+            return "flax_msgpack"
         case ".7z":
             return "sevenzip"
         case _:

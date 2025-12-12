@@ -99,7 +99,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 name="TensorFlow Library Check",
                 passed=False,
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "tensorflow"},
             )
@@ -567,7 +567,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     found_patterns.append(pattern)
 
                             if found_patterns:
-                                result.add_issue(
+                                result.add_check(
+                                    name="Lambda Layer Security Check",
+                                    passed=False,
                                     message=f"Lambda layer contains dangerous code: {', '.join(found_patterns)}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=path,
