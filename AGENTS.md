@@ -127,6 +127,7 @@ The README is published to PyPI and visible to the public. Follow these rules to
 - Quick start installation and usage examples
 - High-level benefits (what problems it solves)
 - Supported model formats table (extensions and risk levels)
+- Security checks: list WHAT formats/frameworks we analyze (e.g., "TensorFlow/Keras", "ZIP archives")
 - CLI options and command examples
 - Output formats (text, JSON, SARIF)
 - Exit codes and troubleshooting
@@ -137,11 +138,11 @@ The README is published to PyPI and visible to the public. Follow these rules to
 - Internal project structure (file paths, module organization)
 - Exact detection patterns (specific opcodes like `REDUCE`, `GLOBAL`, etc.)
 - Exact module/function names we detect (e.g., `os.system`, `subprocess`)
-- Whitelist internals (model counts, update scripts, mechanism details)
+- Whitelist system (do not mention false positives, model counts, or mechanism)
 - Scanner implementation details
 - Internal architecture documentation
 
-**Why this matters:** Exact detection patterns help attackers craft evasion techniques. High-level categories (e.g., "dangerous Python imports") are fine; exact lists are not. Keep implementation details in `docs/agents/` for contributors only.
+**Why this matters:** Exact detection patterns help attackers craft evasion techniques. For security checks, list WHAT we analyze (formats/frameworks) not HOW (detection mechanisms). Keep implementation details in `docs/agents/` for contributors only.
 
 ## DO / DON'T Cheatsheet
 

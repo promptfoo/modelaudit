@@ -76,10 +76,6 @@ Identifies URLs, IPs, and socket usage that could enable data exfiltration or C2
 
 Scans TorchScript, ONNX, and other JIT-compiled code for dangerous operations
 
-### **Smart Whitelist System**
-
-Automatically reduces false positives for thousands of trusted models from verified organizations (Meta, Google, Microsoft, NVIDIA, etc.)
-
 ## 📊 Supported Model Formats
 
 ModelAudit supports **29 specialized file format scanners** with comprehensive security analysis:
@@ -143,9 +139,9 @@ ModelAudit supports **29 specialized file format scanners** with comprehensive s
 
 ### Code Execution Detection
 
-- Dangerous Python imports and system calls
-- Pickle deserialization exploits
-- Embedded executable files
+- **Pickle-based formats**: `.pkl`, `.pt`, `.pth`, `.ckpt`, `.joblib`, `.npy`, `.npz`
+- **NumPy arrays**: Pickle objects embedded in array metadata
+- **Embedded executables**: Hidden binaries in model files
 
 ### Embedded Data Extraction
 
@@ -155,20 +151,16 @@ ModelAudit supports **29 specialized file format scanners** with comprehensive s
 
 ### Archive Security
 
-- Path traversal attacks in ZIP/TAR archives
-- Executable files within model packages
-- Malicious filenames and directory structures
+- **ZIP archives**: Path traversal, malicious files, symlink attacks
+- **TAR archives**: Directory traversal, dangerous extractions
+- **7-Zip archives**: Compressed archive security validation
 
 ### ML Framework Analysis
 
-- Unsafe TensorFlow/Keras operations and layers
-- Custom operators with potential security risks
-- Template injection in model configurations
-
-### Context-Aware Analysis
-
-- Intelligently distinguishes between legitimate ML framework patterns and genuine threats
-- Reduces false positives in complex model files
+- **TensorFlow/Keras**: Unsafe operations, Lambda layers, custom objects
+- **ONNX**: Custom operators, external data references
+- **PyTorch TorchScript/JIT**: Script execution in serialized models
+- **Jinja2 templates**: Server-side template injection (SSTI)
 
 ## 🎯 Common Use Cases
 
