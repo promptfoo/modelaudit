@@ -6,13 +6,13 @@ Guide for AI coding agents working with this security scanner for AI/ML model fi
 
 ```bash
 # Setup
-rye sync --features all-ci
+uv sync --extra all-ci
 
 # Pre-commit workflow (MUST run before every commit)
-rye run ruff format modelaudit/ tests/
-rye run ruff check --fix modelaudit/ tests/
-rye run mypy modelaudit/
-rye run pytest -n auto -m "not slow and not integration" --maxfail=1
+uv run ruff format modelaudit/ tests/
+uv run ruff check --fix modelaudit/ tests/
+uv run mypy modelaudit/
+uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
 ## Branch Workflow
@@ -43,20 +43,20 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 **MUST pass before creating any PR:**
 
 ```bash
-rye run ruff check modelaudit/ tests/          # Lint (no errors)
-rye run ruff format --check modelaudit/ tests/ # Format (no changes)
-rye run mypy modelaudit/                       # Types (no errors)
-rye run pytest -n auto -m "not slow and not integration" --maxfail=1
+uv run ruff check modelaudit/ tests/          # Lint (no errors)
+uv run ruff format --check modelaudit/ tests/ # Format (no changes)
+uv run mypy modelaudit/                       # Types (no errors)
+uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
 ## Common CI Failure Fixes
 
-| Issue               | Fix                                                      |
-| ------------------- | -------------------------------------------------------- |
-| Import organization | `rye run ruff check --fix --select I modelaudit/ tests/` |
-| Format issues       | `rye run ruff format modelaudit/ tests/`                 |
-| Type errors         | Fix manually, re-run `mypy`                              |
-| Test failures       | Check output, fix issues, re-run tests                   |
+| Issue               | Fix                                                     |
+| ------------------- | ------------------------------------------------------- |
+| Import organization | `uv run ruff check --fix --select I modelaudit/ tests/` |
+| Format issues       | `uv run ruff format modelaudit/ tests/`                 |
+| Type errors         | Fix manually, re-run `mypy`                             |
+| Test failures       | Check output, fix issues, re-run tests                  |
 
 ## When Modifying Scanners
 

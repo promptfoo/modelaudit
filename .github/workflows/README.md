@@ -100,7 +100,7 @@ Ensures PR titles follow conventional commit format.
 
 - Python dependencies cached by OS and Python version
 - Docker layers cached using GitHub Actions cache
-- Rye package manager cache enabled
+- uv package manager cache enabled
 
 ## Running Workflows Locally
 

@@ -543,12 +543,12 @@ Below are 25 XGBoost models tested across different formats:
 **Command used**:
 
 ```bash
-rye run modelaudit hf://<model-name> --format json
+uv run modelaudit hf://<model-name> --format json
 ```
 
 **Environment Requirements**:
 
-- XGBoost support: Install with `rye sync --features xgboost`
+- XGBoost support: Install with `uv sync --extra xgboost`
 - Python version: 3.10+
 
 **Test Coverage**:
@@ -737,16 +737,16 @@ Skops is a secure serialization format for scikit-learn pipelines. **Multiple CV
 
 ```bash
 # Test high-risk model with posix.system
-rye run modelaudit hf://Ankush-Organization/safe-model --format json
+uv run modelaudit hf://Ankush-Organization/safe-model --format json
 
 # Test standard pickle model
-rye run modelaudit hf://Cristian9481/xgboost-pipeline-model --format json
+uv run modelaudit hf://Cristian9481/xgboost-pipeline-model --format json
 
 # Test model with builtins.bytearray
-rye run modelaudit hf://vishal-adithya/depth-estimator --format json
+uv run modelaudit hf://vishal-adithya/depth-estimator --format json
 
 # Test skops model with CVE-2025-54886 detection
-rye run modelaudit hf://py-feat/xgb_au --format json
+uv run modelaudit hf://py-feat/xgb_au --format json
 ```
 
 ### References
