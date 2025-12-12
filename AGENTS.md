@@ -64,7 +64,6 @@ git push -u origin feat/your-feature-name
 gh pr create --title "feat: descriptive title" --body "Brief description"
 ```
 
-- **NEVER push to main.** Always create a feature branch and open a PR.
 - Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
