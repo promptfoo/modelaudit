@@ -8,19 +8,19 @@
 set -e  # Exit on first error
 
 # 1. Format check
-rye run ruff format --check modelaudit/ tests/ || {
+uv run ruff format --check modelaudit/ tests/ || {
     echo "Format check failed - running formatter..."
-    rye run ruff format modelaudit/ tests/
+    uv run ruff format modelaudit/ tests/
 }
 
 # 2. Lint check
-rye run ruff check modelaudit/ tests/ || exit 1
+uv run ruff check modelaudit/ tests/ || exit 1
 
 # 3. Type checking
-rye run mypy modelaudit/ || exit 1
+uv run mypy modelaudit/ || exit 1
 
 # 4. Quick tests
-rye run pytest -n auto -m "not slow and not integration" --maxfail=1
+uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 
 # 5. Documentation formatting (if changed)
 npx prettier@latest --write "**/*.{md,yaml,yml,json}"

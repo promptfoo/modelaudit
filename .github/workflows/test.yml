@@ -40,7 +40,7 @@ jobs:
             python:
               - '**.py'
               - 'pyproject.toml'
-              - 'requirements*.lock'
+              - 'uv.lock'
             docker:
               - 'Dockerfile*'
               - '.dockerignore'
@@ -48,7 +48,7 @@ jobs:
               - '.github/workflows/**'
             dependencies:
               - 'pyproject.toml'
-              - 'requirements*.lock'
+              - 'uv.lock'
 
   lint:
     name: Lint and Format
@@ -61,37 +61,42 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Lint with Ruff
         run: |
-          rye run ruff check modelaudit/ tests/
+          uv run ruff check modelaudit/ tests/
 
       - name: Check import organization with Ruff
         run: |
-          rye run ruff check --select I modelaudit/ tests/
+          uv run ruff check --select I modelaudit/ tests/
 
       - name: Check formatting with Ruff
         run: |
-          rye run ruff format --check modelaudit/ tests/
+          uv run ruff format --check modelaudit/ tests/
 
   type-check:
     name: Type Check
@@ -104,29 +109,34 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Type checking
         run: |
-          rye run mypy modelaudit/ tests/
+          uv run mypy modelaudit/ tests/
 
       - name: Check for circular imports
         run: |
@@ -145,35 +155,34 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: latest
 
       - name: Pin Python version
         run: |
-          rye pin 3.12
+          uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-py3.12-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-py3.12-
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Run fast tests with fail-fast
         run: |
-          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
 
   test:
     name: Test Python ${{ matrix.python-version }}
@@ -191,36 +200,35 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: latest
 
       - name: Pin Python version
         run: |
-          rye pin ${{ matrix.python-version }}
+          uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py${{ matrix.python-version }}-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Run fast tests with fail-fast (no coverage on PRs)
         if: github.event_name == 'pull_request'
         run: |
-          rye run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests on PR (if labeled)
         # Run slow tests on PRs when the 'run-slow-tests' label is added
@@ -229,17 +237,17 @@ jobs:
         timeout-minutes: 20
         run: |
           echo "Running slow/integration tests due to 'run-slow-tests' label"
-          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
 
       - name: Run fast tests with coverage (main branch only)
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
+          uv run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
 
       - name: Run fast tests without coverage (main branch, non-3.12)
         if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
         run: |
-          rye run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests (main branch only)
         # Run ALL slow/integration/performance tests on main branch.
@@ -249,7 +257,7 @@ jobs:
         timeout-minutes: 20
         run: |
           # Run all slow, integration, and performance tests
-          rye run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
@@ -272,61 +280,60 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: latest
 
       - name: Pin Python version
         run: |
-          rye pin ${{ matrix.python-version }}
+          uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
-            ${{ runner.os }}-rye-py${{ matrix.python-version }}-
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-uv-py${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-
 
       - name: Install with NumPy 1.x compatibility mode
         if: matrix.numpy-mode == '1.x'
         run: |
-          rye sync --no-dev
-          rye add --optional numpy1 'numpy>=1.19.0,<2.0'
-          rye sync --features numpy1
+          uv sync --no-dev
+          uv add --optional numpy1 'numpy>=1.19.0,<2.0'
+          uv sync --extra numpy1
 
       - name: Install with NumPy 2.x (default)
         if: matrix.numpy-mode == '2.x'
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Check NumPy version
         run: |
-          rye run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+          uv run python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
 
       - name: Test scanner diagnostics
         run: |
-          rye run modelaudit doctor --show-failed
+          uv run modelaudit doctor --show-failed
 
       - name: Test basic scanning functionality
         run: |
           # Create a test file to scan
           echo "Testing basic scanning with NumPy ${{ matrix.numpy-mode }}"
-          rye run python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
-          rye run modelaudit scan test_model.pkl --format json --output test_results.json
+          uv run python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
+          uv run modelaudit scan test_model.pkl --format json --output test_results.json
           cat test_results.json
 
       - name: Run NumPy compatibility tests
         run: |
-          rye run pytest tests/scanners/test_numpy_scanner.py -v
-          rye run pytest tests/scanners/test_scanner_registry.py -v -k "numpy"
+          uv run pytest tests/scanners/test_numpy_scanner.py -v
+          uv run pytest tests/scanners/test_scanner_registry.py -v -k "numpy"
 
   build:
     name: Build and Package
@@ -339,29 +346,34 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
-      - name: Install Rye
-        uses: eifinger/setup-rye@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
             ~/.cache/pip
-            ~/.cache/rye
-          key: ${{ runner.os }}-rye-${{ hashFiles('**/requirements*.lock', '**/pyproject.toml') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-py3.12-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-rye-
+            ${{ runner.os }}-uv-py3.12-
+            ${{ runner.os }}-uv-
 
       - name: Sync dependencies
         run: |
-          rye sync --features all-ci
+          uv sync --extra all-ci
 
       - name: Build package
         run: |
-          rye build
+          uv build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
