@@ -71,7 +71,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
@@ -119,7 +119,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
@@ -165,7 +165,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
@@ -210,7 +210,7 @@ jobs:
           uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
@@ -290,7 +290,7 @@ jobs:
           uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
@@ -356,7 +356,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .venv
