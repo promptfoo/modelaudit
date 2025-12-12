@@ -41,13 +41,15 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 
 ## Branch & Git Hygiene
 
+**NEVER commit or push directly to `main`.** All changes must go through pull requests.
+
 ```bash
 # Start clean
 git fetch origin main
 git checkout main
 git merge --no-edit origin/main
 
-# Work on a branch
+# Work on a branch (REQUIRED - never commit to main)
 git checkout -b feat/your-feature-name  # or fix/, chore/, test/
 
 # Commit (conventional)
@@ -57,11 +59,12 @@ Description here.
 
 Co-Authored-By: Claude <noreply@anthropic.com>"
 
-# PR (after validation)
+# PR (after validation) - ALL changes go through PRs
 git push -u origin feat/your-feature-name
 gh pr create --title "feat: descriptive title" --body "Brief description"
 ```
 
+- **NEVER push to main.** Always create a feature branch and open a PR.
 - Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
@@ -144,10 +147,10 @@ The README is published to PyPI and visible to the public. Follow these rules to
 
 - **Do:** Keep responses short; surface only relevant details; prefer targeted tests; propose clear next steps; cite file paths when reporting.
 - **Do:** Use iterative refinement—small changes, verify, then proceed.
-- **Do:** Always work on a feature branch and create PRs; never commit directly to main.
+- **Do:** Always use feature branches and PRs for all changes.
+- **Don't:** Commit or push directly to `main`—always use a PR.
 - **Don't:** Introduce new dependencies, weaken security checks, or bypass validation.
 - **Don't:** Leave formatting/lint failures or unaddressed test regressions.
-- **Don't:** Commit or push directly to main—always use branches and PRs.
 
 ## Exit Codes
 

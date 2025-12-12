@@ -21,34 +21,49 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Format CHANGELOG.md after release-please creates/updates the PR
-      - uses: actions/checkout@v4
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
-        with:
-          fetch-depth: 0
-
-      - name: Format CHANGELOG.md
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+      # Format CHANGELOG.md immediately after release-please creates/updates a PR
+      # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
+      - name: Check if PR exists
+        id: check-pr
         run: |
-          PR_BRANCH=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')
-          echo "Formatting CHANGELOG.md on branch: $PR_BRANCH"
-          git fetch origin "$PR_BRANCH"
-          git checkout "$PR_BRANCH"
-          npx --yes prettier@latest --write CHANGELOG.md
-          if git diff --quiet CHANGELOG.md; then
-            echo "No formatting changes needed"
+          PR_OUTPUT='${{ steps.release.outputs.pr }}'
+          if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
+            echo "has_pr=true" >> $GITHUB_OUTPUT
+            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> $GITHUB_OUTPUT
           else
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check-pr.outputs.has_pr == 'true'
+        with:
+          ref: ${{ steps.check-pr.outputs.pr_branch }}
+          # Shallow clone for speed - we only need to format and push
+          fetch-depth: 1
+
+      - name: Format CHANGELOG.md with Prettier
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          echo "Formatting CHANGELOG.md on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          npx --yes prettier@latest --write CHANGELOG.md
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "✓ No formatting changes needed"
+          else
+            echo "→ Formatting changes detected, committing..."
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add CHANGELOG.md
             git commit -m "chore: format CHANGELOG.md with prettier"
-            git push origin "$PR_BRANCH"
+            git push
+            echo "✓ Formatting committed and pushed"
           fi
 
   build:
