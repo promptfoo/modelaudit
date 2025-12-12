@@ -316,6 +316,7 @@ class PyTorchZipScanner(BaseScanner):
         for name in safe_entries:
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
+                # These are binary weight files that cause performance issues when scanned
                 if re.match(r"^(?:.+/)?data/\d+$", name):
                     continue
 
@@ -345,7 +346,6 @@ class PyTorchZipScanner(BaseScanner):
             except Exception as e:
                 # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
-                pass
 
         # Create single aggregated checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
