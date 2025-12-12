@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "bootstrap-sha": "ace2a881a0fc512277696f3971e15cb665e45665",
+  "bootstrap-sha": "c17ad792f4a288918d3c2369b6f0f00082a20071",
   "include-component-in-tag": false,
   "include-v-in-tag": true,
   "packages": {

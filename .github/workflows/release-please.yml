@@ -1,6 +1,10 @@
 name: release-please
 run-name: modelaudit release by @${{ github.actor }}
 
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -36,7 +40,7 @@ jobs:
           echo "Formatting CHANGELOG.md on branch: $PR_BRANCH"
           git fetch origin "$PR_BRANCH"
           git checkout "$PR_BRANCH"
-          npx prettier --write CHANGELOG.md
+          npx --yes prettier@latest --write CHANGELOG.md
           if git diff --quiet CHANGELOG.md; then
             echo "No formatting changes needed"
           else
