@@ -134,3 +134,39 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           print-hash: true
+
+  # Rebuild the modelaudit-scanner Docker image after publishing to PyPI
+  # This ensures the Cloud Run scanner job always has the latest modelaudit version
+  trigger-scanner-rebuild:
+    if: needs.release-please.outputs.release_created == 'true'
+    needs: [publish-pypi, release-please]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Trigger scanner image rebuild
+        run: |
+          echo "Rebuilding scanner image with modelaudit ${{ needs.release-please.outputs.version }}..."
+
+          # Clone promptfoo-cloud repo
+          git clone --depth 1 https://github.com/promptfoo/promptfoo-cloud.git /tmp/promptfoo-cloud
+
+          # Build scanner image from the scanner directory
+          gcloud builds submit \
+            --tag=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:latest \
+            --project=promptfoo \
+            /tmp/promptfoo-cloud/workers/gcp/modelaudit-automation/scanner
+
+          # Update Cloud Run job to use new image
+          gcloud run jobs update modelaudit-scan-job \
+            --region=us-central1 \
+            --image=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:latest \
+            --project=promptfoo
+
+          echo "✓ Scanner rebuilt with modelaudit ${{ needs.release-please.outputs.version }}"
