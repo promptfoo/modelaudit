@@ -152,21 +152,31 @@ jobs:
 
       - name: Trigger scanner image rebuild
         run: |
-          echo "Rebuilding scanner image with modelaudit ${{ needs.release-please.outputs.version }}..."
+          set -euo pipefail
+          VERSION="${{ needs.release-please.outputs.version }}"
+          echo "Rebuilding scanner image with modelaudit ${VERSION}..."
 
           # Clone promptfoo-cloud repo
           git clone --depth 1 https://github.com/promptfoo/promptfoo-cloud.git /tmp/promptfoo-cloud
 
-          # Build scanner image from the scanner directory
+          # Verify the scanner directory exists
+          if [ ! -d "/tmp/promptfoo-cloud/workers/gcp/modelaudit-automation/scanner" ]; then
+            echo "ERROR: Scanner directory not found in promptfoo-cloud repository"
+            exit 1
+          fi
+
+          # Build scanner image with version tag and latest
           gcloud builds submit \
+            --tag=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:${VERSION} \
             --tag=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:latest \
+            --timeout=20m \
             --project=promptfoo \
             /tmp/promptfoo-cloud/workers/gcp/modelaudit-automation/scanner
 
-          # Update Cloud Run job to use new image
+          # Update Cloud Run job to use the versioned image
           gcloud run jobs update modelaudit-scan-job \
             --region=us-central1 \
-            --image=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:latest \
+            --image=us-central1-docker.pkg.dev/promptfoo/modelaudit-scanner/modelaudit-scanner:${VERSION} \
             --project=promptfoo
 
-          echo "✓ Scanner rebuilt with modelaudit ${{ needs.release-please.outputs.version }}"
+          echo "✓ Scanner rebuilt with modelaudit ${VERSION}"
