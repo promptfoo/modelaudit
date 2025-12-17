@@ -142,6 +142,15 @@ jobs:
     needs: [publish-pypi, release-please]
     runs-on: ubuntu-latest
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PROMPTFOO_APP_ID }}
+          private-key: ${{ secrets.PROMPTFOO_APP_PRIVATE_KEY }}
+          owner: promptfoo
+          repositories: promptfoo-cloud
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -151,13 +160,15 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Trigger scanner image rebuild
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           VERSION="${{ needs.release-please.outputs.version }}"
           echo "Rebuilding scanner image with modelaudit ${VERSION}..."
 
-          # Clone promptfoo-cloud repo
-          git clone --depth 1 https://github.com/promptfoo/promptfoo-cloud.git /tmp/promptfoo-cloud
+          # Clone promptfoo-cloud repo (private - using GitHub App token)
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/promptfoo/promptfoo-cloud.git /tmp/promptfoo-cloud
 
           # Verify the scanner directory exists
           if [ ! -d "/tmp/promptfoo-cloud/workers/gcp/modelaudit-automation/scanner" ]; then
