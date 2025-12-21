@@ -41,7 +41,7 @@ jobs:
             echo "has_pr=false" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.check-pr.outputs.has_pr == 'true'
         with:
           ref: ${{ steps.check-pr.outputs.pr_branch }}
@@ -75,7 +75,7 @@ jobs:
     outputs:
       artifact-name: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
