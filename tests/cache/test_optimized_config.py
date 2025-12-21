@@ -1,7 +1,5 @@
 """Tests for optimized cache configuration."""
 
-
-
 from modelaudit.cache.optimized_config import (
     CacheConfiguration,
     ConfigurationExtractor,

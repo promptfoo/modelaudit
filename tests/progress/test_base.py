@@ -123,10 +123,10 @@ class MockReporter(ProgressReporter):
 
     def __init__(self, update_interval: float = 0.0):
         super().__init__(update_interval)
-        self.progress_calls = []
-        self.phase_changes = []
-        self.completions = []
-        self.errors = []
+        self.progress_calls: list[ProgressStats] = []
+        self.phase_changes: list[tuple[ProgressPhase, ProgressPhase]] = []
+        self.completions: list[ProgressStats] = []
+        self.errors: list[tuple[Exception, ProgressStats]] = []
 
     def report_progress(self, stats: ProgressStats) -> None:
         self.progress_calls.append(stats)

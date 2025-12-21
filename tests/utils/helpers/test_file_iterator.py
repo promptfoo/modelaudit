@@ -1,7 +1,5 @@
 """Tests for file iterator utility."""
 
-
-
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 
 

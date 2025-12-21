@@ -1,6 +1,5 @@
 """Tests for config name blacklist module."""
 
-
 from modelaudit.config.name_blacklist import BLACKLIST_PATTERNS, check_model_name_policies
 
 
