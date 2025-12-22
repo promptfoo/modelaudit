@@ -283,13 +283,6 @@ disallow_untyped_defs = false
 check_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = "tests.*"
-# Tests can be less strict - ignore call-arg errors for test flexibility
-disallow_untyped_defs = false
-check_untyped_defs = false
-disable_error_code = ["call-arg", "arg-type"]
-
-[[tool.mypy.overrides]]
 module = "modelaudit.scanners.*"
 # Scanners use dynamic patterns that need Any
 warn_return_any = false
