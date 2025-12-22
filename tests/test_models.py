@@ -332,11 +332,15 @@ class TestFileHashesModel:
         """Test hash priority order."""
         # SHA512 is strongest
         hashes = FileHashesModel(sha512="b" * 128)
-        assert hashes.get_strongest_hash()[0] == "sha512"
+        result = hashes.get_strongest_hash()
+        assert result is not None
+        assert result[0] == "sha512"
 
         # SHA256 next
         hashes = FileHashesModel(sha256="a" * 64, sha1="c" * 40)
-        assert hashes.get_strongest_hash()[0] == "sha256"
+        result = hashes.get_strongest_hash()
+        assert result is not None
+        assert result[0] == "sha256"
 
     def test_get_strongest_hash_none(self):
         """Test get_strongest_hash returns None when empty."""
@@ -570,7 +574,7 @@ class TestNetworkPatternModel:
             description="test",
         )
         with pytest.raises(ValidationError):
-            pattern.pattern = "new_pattern"
+            pattern.pattern = "new_pattern"  # type: ignore[misc]
 
 
 class TestScannerCapabilities:

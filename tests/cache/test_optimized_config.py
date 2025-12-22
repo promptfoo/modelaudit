@@ -117,6 +117,7 @@ class TestConfigurationExtractor:
         extractor = ConfigurationExtractor()
         config_dict = {"cache_enabled": False}
         config, _path = extractor.extract_fast(("/test/file.pkl", config_dict), {})
+        assert config is not None
         assert config.enabled is False
 
     def test_extract_no_path(self):
