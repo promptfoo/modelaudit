@@ -225,8 +225,13 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run fast tests with fail-fast (no coverage on PRs)
-        if: github.event_name == 'pull_request'
+      - name: Run fast tests with fail-fast (PRs, Python 3.12 with coverage)
+        if: github.event_name == 'pull_request' && matrix.python-version == '3.12'
+        run: |
+          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
+
+      - name: Run fast tests with fail-fast (PRs, non-3.12)
+        if: github.event_name == 'pull_request' && matrix.python-version != '3.12'
         run: |
           uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
@@ -242,7 +247,7 @@ jobs:
       - name: Run fast tests with coverage (main branch only)
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
-          uv run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --tb=short --durations=15
+          uv run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
 
       - name: Run fast tests without coverage (main branch, non-3.12)
         if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
@@ -258,6 +263,14 @@ jobs:
         run: |
           # Run all slow, integration, and performance tests
           uv run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+          verbose: true
 
   test-numpy-compatibility:
     name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
