@@ -68,7 +68,7 @@ huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
 # Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
 numpy1 = [
-    "numpy>=1.19.0,<2.0",
+    "numpy>=2.4,<2.5",
     "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
