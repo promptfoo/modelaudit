@@ -38,6 +38,7 @@ TensorFlow: N/A (Python 3.14 not supported yet - expected)
 ## NumPy 2.4 Compatibility Testing
 
 ### Type Promotion (NEP 50) - Critical NumPy 2.0 Change
+
 ```python
 >>> f32 = np.float32(3.0)
 >>> result = f32 + 3.0
@@ -46,6 +47,7 @@ dtype('float32')  ✅ Correctly preserves float32 in NumPy 2.x
 ```
 
 ### NumPy/PyTorch Interoperability
+
 ```python
 >>> arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
 >>> torch_tensor = torch.from_numpy(arr)
@@ -54,6 +56,7 @@ dtype('float32')  ✅ Correctly preserves float32 in NumPy 2.x
 ```
 
 ### Core NumPy Operations Tested
+
 - ✅ Array creation: `np.array()`, `np.asarray()`
 - ✅ Statistics: `np.mean()`, `np.std()`, `np.min()`, `np.max()`, `np.percentile()`
 - ✅ Linear algebra: `np.linalg.norm()`, `np.dot()`, `np.correlate()`
@@ -65,6 +68,7 @@ dtype('float32')  ✅ Correctly preserves float32 in NumPy 2.x
 ## Test Suite Results
 
 ### Full Test Suite with Coverage
+
 ```
 Command: pytest -n auto --cov=modelaudit --cov-report=term --cov-report=html
 Results: 1792 passed, 43 skipped, 2 failed in 31.15s
@@ -72,6 +76,7 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 ```
 
 ### NumPy-Specific Tests (89 tests)
+
 ```
 ✅ tests/analysis/test_anomaly_detector.py - 35 passed
 ✅ tests/analysis/test_entropy_analyzer.py - 30 passed
@@ -80,28 +85,31 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 ```
 
 ### ML Framework Integration Tests (45 tests)
+
 ```
 ✅ PyTorch Binary Scanner - 10 passed
 ✅ XGBoost Scanner - 25 passed (2 skipped - ubjson not installed)
-✅ Joblib Scanner - 2 passed  
+✅ Joblib Scanner - 2 passed
 ✅ SafeTensors Scanner - 7 passed
 ✅ JAX/Flax Integration - 8 passed
 ```
 
 ### Integration Tests (33 tests)
+
 ```
 ✅ Real-world dill/joblib - 16 passed
 ✅ General integration - 10 passed, 2 skipped (TensorFlow), 1 failed*
 ✅ Asset inventory - 12 passed
 ```
 
-*Pre-existing failure, also fails on `main` branch
+\*Pre-existing failure, also fails on `main` branch
 
 ---
 
 ## Failure Analysis
 
 ### 1. Pre-Existing Test Failure (Not NumPy-Related)
+
 **Test**: `tests/test_integration.py::test_scan_directory_with_multiple_models`  
 **Status**: ❌ Also fails on `main` branch  
 **Cause**: Test assertion expects exit code 1, gets exit code 0  
@@ -109,7 +117,9 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 **Action**: Separate fix needed (tracked independently)
 
 ### 2. Flaky Performance Tests
-**Tests**: 
+
+**Tests**:
+
 - `test_smart_cache_key_performance`
 - `test_configuration_extraction_performance`
 
@@ -123,6 +133,7 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 ## Coverage Analysis
 
 ### High Coverage Modules (>85%)
+
 - `modelaudit/scanners/zip_scanner.py` - 84.62%
 - `modelaudit/utils/file/detection.py` - 87.42%
 - `modelaudit/utils/helpers/code_validation.py` - 89.52%
@@ -132,6 +143,7 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 - Multiple utility modules at 100%
 
 ### Modules with Lower Coverage (Note: Not NumPy-Related)
+
 - Cloud storage utilities - Expected (integration-heavy)
 - Advanced file handlers - Expected (edge cases)
 - Cache decorators - Not exercised in this test run
@@ -141,6 +153,7 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 ## Security & Breaking Change Validation
 
 ### NumPy 2.0 Breaking Changes Reviewed
+
 1. ✅ **Type Promotion (NEP 50)** - Verified float32 preservation
 2. ✅ **API Cleanup (NEP 52)** - Only using stable core APIs
 3. ✅ **ABI Break** - Handled by dependency resolution
@@ -148,15 +161,15 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 
 ### Dependency Compatibility Matrix
 
-| Package | Version | NumPy 2.4 | Python 3.11 | Python 3.14 | Status |
-|---------|---------|-----------|-------------|-------------|---------|
-| NumPy | 2.4.0 | ✅ | ✅ | ✅ | Pass |
-| PyTorch | 2.9.1 | ✅ | ✅ | ✅ | Pass |
-| XGBoost | 3.1.2 | ✅ | ✅ | ✅ | Pass |
-| scikit-learn | 1.8.0 | ✅ | ✅ | ✅ | Pass |
-| h5py | 3.15.1 | ✅ | ✅ | ✅ | Pass |
-| safetensors | 0.7.0 | ✅ | ✅ | ✅ | Pass |
-| TensorFlow | 2.17+ | ✅ | ✅ | ❌ | Expected (capped at 3.13) |
+| Package      | Version | NumPy 2.4 | Python 3.11 | Python 3.14 | Status                    |
+| ------------ | ------- | --------- | ----------- | ----------- | ------------------------- |
+| NumPy        | 2.4.0   | ✅        | ✅          | ✅          | Pass                      |
+| PyTorch      | 2.9.1   | ✅        | ✅          | ✅          | Pass                      |
+| XGBoost      | 3.1.2   | ✅        | ✅          | ✅          | Pass                      |
+| scikit-learn | 1.8.0   | ✅        | ✅          | ✅          | Pass                      |
+| h5py         | 3.15.1  | ✅        | ✅          | ✅          | Pass                      |
+| safetensors  | 0.7.0   | ✅        | ✅          | ✅          | Pass                      |
+| TensorFlow   | 2.17+   | ✅        | ✅          | ❌          | Expected (capped at 3.13) |
 
 ---
 
@@ -167,7 +180,7 @@ Coverage: 63.52% (19,171 total lines, 6,499 covered)
 - [x] Type checking: 135 source files validated
 - [x] Unit tests: 1,792 passed
 - [x] NumPy-specific tests: 89/89 passed
-- [x] ML framework integration: 45/45 passed  
+- [x] ML framework integration: 45/45 passed
 - [x] Integration tests: 32/33 passed (1 pre-existing failure)
 - [x] NumPy 2.4 operations verified
 - [x] PyTorch/NumPy interop verified
