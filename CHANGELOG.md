@@ -7,13 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.24](https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24) (2025-12-23)
 
-
 ### Bug Fixes
 
-* **deps:** update dependency contourpy to &lt;1.3.4 ([#463](https://github.com/promptfoo/modelaudit/issues/463)) ([16fb916](https://github.com/promptfoo/modelaudit/commit/16fb916a88020a7d96455edcbd8bddc0a4c4a58b))
-* **deps:** update dependency fickling to v0.1.6 [security] ([#462](https://github.com/promptfoo/modelaudit/issues/462)) ([9413ddc](https://github.com/promptfoo/modelaudit/commit/9413ddc95cb00fd068fd6ee39a3386a4f4db8016))
-* **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
-* resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
+- **deps:** update dependency contourpy to &lt;1.3.4 ([#463](https://github.com/promptfoo/modelaudit/issues/463)) ([16fb916](https://github.com/promptfoo/modelaudit/commit/16fb916a88020a7d96455edcbd8bddc0a4c4a58b))
+- **deps:** update dependency fickling to v0.1.6 [security] ([#462](https://github.com/promptfoo/modelaudit/issues/462)) ([9413ddc](https://github.com/promptfoo/modelaudit/commit/9413ddc95cb00fd068fd6ee39a3386a4f4db8016))
+- **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
+- resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
 
 ## [0.2.23](https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23) (2025-12-12)
 
