@@ -195,7 +195,8 @@ jobs:
       matrix:
         # For PRs, only test min and max Python versions to save time
         # For main branch, test all versions
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
+        # Note: Requires Python >=3.11 (see pyproject.toml)
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.13"]') || fromJSON('["3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -273,7 +274,7 @@ jobs:
           verbose: true
 
   test-numpy-compatibility:
-    name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    name: Test NumPy 2.x Compatibility - Python ${{ matrix.python-version }}
     needs: changes
     # Only run on main branch or if dependencies changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
@@ -281,14 +282,10 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        # Reduced matrix for PRs
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
-        numpy-mode: ["1.x", "2.x"]
-        exclude:
-          # TensorFlow doesn't support Python 3.13 yet, so skip NumPy 1.x mode
-          # which requires TensorFlow installation
-          - python-version: "3.13"
-            numpy-mode: "1.x"
+        # Note: Requires Python >=3.11, NumPy >=2.4 (see pyproject.toml)
+        # Reduced matrix for PRs (only test on Python 3.11)
+        # Full matrix for main branch (test on all supported Python versions)
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -309,21 +306,13 @@ jobs:
             .venv
             ~/.cache/pip
             ~/.cache/uv
-          key: ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
+          key: ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy2-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy${{ matrix.numpy-mode }}-
+            ${{ runner.os }}-uv-py${{ matrix.python-version }}-numpy2-
             ${{ runner.os }}-uv-py${{ matrix.python-version }}-
             ${{ runner.os }}-uv-
 
-      - name: Install with NumPy 1.x compatibility mode
-        if: matrix.numpy-mode == '1.x'
-        run: |
-          uv sync --no-dev
-          uv add --optional numpy1 'numpy>=1.19.0,<2.0'
-          uv sync --extra numpy1
-
-      - name: Install with NumPy 2.x (default)
-        if: matrix.numpy-mode == '2.x'
+      - name: Install with NumPy 2.x
         run: |
           uv sync --extra all-ci
 
