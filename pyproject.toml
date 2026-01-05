@@ -100,6 +100,12 @@ all-ci = [
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
 ]
+all-ci-windows = [
+    "dill>=0.3.0,<1.0",
+    "joblib>=1.0.0,<2.0",
+    "msgpack>=1.0.0,<2.0",
+    "safetensors>=0.4.0",
+]
 all = [
     "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
     "h5py>=3.1,<4.0",

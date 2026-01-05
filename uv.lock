@@ -2794,6 +2794,12 @@ all-ci = [
     { name = "torch" },
     { name = "xgboost" },
 ]
+all-ci-windows = [
+    { name = "dill" },
+    { name = "joblib" },
+    { name = "msgpack" },
+    { name = "safetensors" },
+]
 dill = [
     { name = "dill" },
 ]
@@ -2885,6 +2891,7 @@ requires-dist = [
     { name = "defusedxml", specifier = ">=0.7.1" },
     { name = "dill", marker = "extra == 'all'", specifier = ">=0.3.0,<1.0" },
     { name = "dill", marker = "extra == 'all-ci'", specifier = ">=0.3.0,<1.0" },
+    { name = "dill", marker = "extra == 'all-ci-windows'", specifier = ">=0.3.0,<1.0" },
     { name = "dill", marker = "extra == 'dill'", specifier = ">=0.3.0,<1.0" },
     { name = "dill", marker = "extra == 'numpy1'", specifier = ">=0.3.0,<1.0" },
     { name = "fickling", specifier = "==0.1.6" },
@@ -2901,6 +2908,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'numpy1'", specifier = ">=0.23.0" },
     { name = "joblib", marker = "extra == 'all'", specifier = ">=1.0.0,<2.0" },
     { name = "joblib", marker = "extra == 'all-ci'", specifier = ">=1.0.0,<2.0" },
+    { name = "joblib", marker = "extra == 'all-ci-windows'", specifier = ">=1.0.0,<2.0" },
     { name = "joblib", marker = "extra == 'joblib'", specifier = ">=1.0.0,<2.0" },
     { name = "joblib", marker = "extra == 'numpy1'", specifier = ">=1.0.0,<2.0" },
     { name = "mlflow", marker = "extra == 'all'", specifier = ">=2.12.0" },
@@ -2908,6 +2916,7 @@ requires-dist = [
     { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=2.12.0" },
     { name = "msgpack", marker = "extra == 'all'", specifier = ">=1.0.0,<2.0" },
     { name = "msgpack", marker = "extra == 'all-ci'", specifier = ">=1.0.0,<2.0" },
+    { name = "msgpack", marker = "extra == 'all-ci-windows'", specifier = ">=1.0.0,<2.0" },
     { name = "msgpack", marker = "extra == 'flax'", specifier = ">=1.0.0,<2.0" },
     { name = "msgpack", marker = "extra == 'numpy1'", specifier = ">=1.0.0,<2.0" },
     { name = "numpy", specifier = ">=1.19.0" },
@@ -2933,6 +2942,7 @@ requires-dist = [
     { name = "s3fs", specifier = ">=2025.5.1" },
     { name = "safetensors", marker = "extra == 'all'", specifier = ">=0.4.0" },
     { name = "safetensors", marker = "extra == 'all-ci'", specifier = ">=0.4.0" },
+    { name = "safetensors", marker = "extra == 'all-ci-windows'", specifier = ">=0.4.0" },
     { name = "safetensors", marker = "extra == 'numpy1'", specifier = ">=0.4.0" },
     { name = "safetensors", marker = "extra == 'safetensors'", specifier = ">=0.4.0" },
     { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.0.0,<2.0" },
@@ -2958,7 +2968,7 @@ requires-dist = [
     { name = "xgboost", marker = "extra == 'xgboost'", specifier = ">=1.6.0,<3.0" },
     { name = "yaspin", specifier = ">=2.5.0" },
 ]
-provides-extras = ["tensorflow", "h5", "pytorch", "yaml", "safetensors", "onnx", "dill", "joblib", "flax", "tflite", "tensorrt", "xgboost", "mlflow", "huggingface", "sevenzip", "numpy1", "all-ci", "all"]
+provides-extras = ["tensorflow", "h5", "pytorch", "yaml", "safetensors", "onnx", "dill", "joblib", "flax", "tflite", "tensorrt", "xgboost", "mlflow", "huggingface", "sevenzip", "numpy1", "all-ci", "all-ci-windows", "all"]
 
 [package.metadata.requires-dev]
 dev = [

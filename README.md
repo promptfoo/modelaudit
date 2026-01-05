@@ -338,7 +338,15 @@ pip install modelaudit[numpy1]
 
 # For CI/CD environments (omits dependencies like TensorRT that may not be available)
 pip install modelaudit[all-ci]
+
+# Windows CI (smaller set of optional dependencies)
+pip install modelaudit[all-ci-windows]
 ```
+
+**Windows notes:**
+
+- Hugging Face cache snapshots use symlinks; enable Developer Mode or use `--cache-dir` to avoid symlink restrictions.
+- Optional ML framework extras can be installed individually when needed.
 
 **Docker:**
 

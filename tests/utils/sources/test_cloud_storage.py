@@ -95,6 +95,24 @@ def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
     assert result.name == "model.pt"
 
 
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+    url = "s3://bucket/model.pt"
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.pt",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
+
+    assert result == f"stream://{url}"
+
+
 @patch("builtins.__import__")
 def test_download_missing_dependency(mock_import):
     def side_effect(name, *args, **kwargs):

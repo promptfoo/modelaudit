@@ -396,7 +396,7 @@ def download_from_cloud(
     show_progress: bool = True,
     selective: bool = True,
     stream_analyze: bool = False,
-) -> Path:
+) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
     Raises:
@@ -447,8 +447,8 @@ def download_from_cloud(
             click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
 
         # For streaming analysis, we don't need to download
-        # Return a special marker path
-        return Path(f"stream://{url}")
+        # Return a special marker path (string to preserve prefix)
+        return f"stream://{url}"
 
     # Check size limits
     size = metadata.get("total_size", metadata.get("size", 0))

@@ -184,6 +184,31 @@ jobs:
         run: |
           uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
 
+  windows-tests:
+    name: Windows Tests (Python 3.11)
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.11
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci-windows
+
+      - name: Run fast tests with fail-fast
+        run: |
+          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+
   test:
     name: Test Python ${{ matrix.python-version }}
     needs: changes
