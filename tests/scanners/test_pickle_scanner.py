@@ -117,6 +117,7 @@ class TestPickleScanner(unittest.TestCase):
                 suspicious_content = b"some_data" + pattern_import + b"more_data" + pattern_eval + b"end_data"
                 f.write(suspicious_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -161,6 +162,7 @@ class TestPickleScanner(unittest.TestCase):
                 f.write(sigs[1])  # Another signature
                 f.write(b"end_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -259,6 +261,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 simple_data = {"weights": [1.0, 2.0, 3.0]}
                 pickle.dump(simple_data, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -314,6 +317,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 )
                 f.write(suspicious_binary_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -378,6 +382,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"\x7fELF")  # Linux ELF executable signature
                 f.write(b"more_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -415,6 +420,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"MZ")  # PE signature but no DOS stub
                 f.write(b"random_data" * 50)  # Random data without DOS stub message
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -451,6 +457,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"This program cannot be run in DOS mode")  # DOS stub message
                 f.write(b"more_data" * 10)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -486,6 +493,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 }
                 pickle.dump(outer, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 result = scanner.scan(f.name)
 
