@@ -124,14 +124,16 @@ class TestSafeTensorsOptimization:
         scanner = WeightDistributionScanner()
 
         with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
-            try:
-                # Write some dummy data
-                tmp.write(b"dummy model data")
-                tmp.flush()
+            # Write some dummy data
+            tmp.write(b"dummy model data")
+            tmp.flush()
+            tmp_path = tmp.name
+            tmp.close()  # Close before cleanup (required on Windows)
 
+            try:
                 # Check if scanner would try to handle it (based on extension)
                 # Note: actual handling depends on having the right libraries installed
-                ext = os.path.splitext(tmp.name)[1].lower()
+                ext = os.path.splitext(tmp_path)[1].lower()
                 assert ext in scanner.supported_extensions, f"{extension} should be in supported extensions"
             finally:
-                os.unlink(tmp.name)
+                os.unlink(tmp_path)
