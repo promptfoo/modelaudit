@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import struct
 import tempfile
 
@@ -108,8 +109,8 @@ class TestSafeTensorsOptimization:
                 tmp.close()  # Close before renaming (required on Windows)
 
                 try:
-                    # Rename to get the exact filename we want
-                    os.rename(tmp_path, filename)
+                    # Move to get the exact filename we want (shutil.move works across drives on Windows)
+                    shutil.move(tmp_path, filename)
                     self.create_minimal_safetensors(filename)
 
                     assert not scanner.can_handle(filename), f"WeightDistributionScanner should not handle {filename}"
