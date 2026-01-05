@@ -198,6 +198,7 @@ class TestPickleScanner(unittest.TestCase):
                 clean_content = b"\x00" * 1000 + b"\x01" * 500 + b"\xff" * 200
                 f.write(clean_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
