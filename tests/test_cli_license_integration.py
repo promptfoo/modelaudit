@@ -219,12 +219,19 @@ class TestCLILicenseIntegration:
 
     def test_cli_help_includes_license_features(self, cli_command):
         """Test that CLI help mentions license-related features."""
+        import os
+
+        # Set UTF-8 encoding for subprocess on Windows
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         # Test main help
         result = subprocess.run(
             [*cli_command, "--help"],
             capture_output=True,
             text=True,
             encoding="utf-8",  # Required for Unicode characters on Windows
+            env=env,
         )
 
         assert result.returncode == 0, "Help should work"
@@ -235,6 +242,7 @@ class TestCLILicenseIntegration:
             capture_output=True,
             text=True,
             encoding="utf-8",  # Required for Unicode characters on Windows
+            env=env,
         )
 
         assert result.returncode == 0, "Scan help should work"
