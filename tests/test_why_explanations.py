@@ -96,6 +96,7 @@ def test_pickle_scanner_includes_why():
 
         pickle.dump(Evil(), f)
         temp_path = f.name
+        f.close()  # Close before scanning (required on Windows)
 
     try:
         # Scan the file
