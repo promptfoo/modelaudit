@@ -40,33 +40,39 @@ class TestSafeTensorsOptimization:
     def test_weight_distribution_scanner_skips_safetensors(self):
         """Test that WeightDistributionScanner does not handle SafeTensors files."""
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.close()  # Close before writing (required on Windows)
+
             try:
-                self.create_minimal_safetensors(tmp.name)
+                self.create_minimal_safetensors(tmp_path)
 
                 # WeightDistributionScanner should not handle SafeTensors
                 scanner = WeightDistributionScanner()
-                assert not scanner.can_handle(tmp.name), (
+                assert not scanner.can_handle(tmp_path), (
                     "WeightDistributionScanner should not handle .safetensors files"
                 )
             finally:
-                os.unlink(tmp.name)
+                os.unlink(tmp_path)
 
     def test_safetensors_scanner_still_handles_safetensors(self):
         """Test that SafeTensorsScanner still handles SafeTensors files."""
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.close()  # Close before writing (required on Windows)
+
             try:
-                self.create_minimal_safetensors(tmp.name)
+                self.create_minimal_safetensors(tmp_path)
 
                 # SafeTensorsScanner should still handle SafeTensors
                 scanner = SafeTensorsScanner()
-                assert scanner.can_handle(tmp.name), "SafeTensorsScanner should handle .safetensors files"
+                assert scanner.can_handle(tmp_path), "SafeTensorsScanner should handle .safetensors files"
 
                 # Should be able to scan successfully
-                result = scanner.scan(tmp.name)
+                result = scanner.scan(tmp_path)
                 assert result.success, "Scan should be successful"
                 assert not result.has_errors, "Scan should not have errors"
             finally:
-                os.unlink(tmp.name)
+                os.unlink(tmp_path)
 
     def test_safetensors_not_in_supported_extensions(self):
         """Test that .safetensors is not in WeightDistributionScanner's supported extensions."""
@@ -98,9 +104,12 @@ class TestSafeTensorsOptimization:
 
         for filename in test_cases:
             with tempfile.NamedTemporaryFile(suffix=filename[5:], delete=False) as tmp:
+                tmp_path = tmp.name
+                tmp.close()  # Close before renaming (required on Windows)
+
                 try:
                     # Rename to get the exact filename we want
-                    os.rename(tmp.name, filename)
+                    os.rename(tmp_path, filename)
                     self.create_minimal_safetensors(filename)
 
                     assert not scanner.can_handle(filename), f"WeightDistributionScanner should not handle {filename}"
