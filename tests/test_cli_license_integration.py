@@ -224,6 +224,7 @@ class TestCLILicenseIntegration:
             [*cli_command, "--help"],
             capture_output=True,
             text=True,
+            encoding="utf-8",  # Required for Unicode characters on Windows
         )
 
         assert result.returncode == 0, "Help should work"
@@ -233,6 +234,7 @@ class TestCLILicenseIntegration:
             [*cli_command, "scan", "--help"],
             capture_output=True,
             text=True,
+            encoding="utf-8",  # Required for Unicode characters on Windows
         )
 
         assert result.returncode == 0, "Scan help should work"

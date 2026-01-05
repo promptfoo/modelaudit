@@ -29,16 +29,18 @@ def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool,
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
             tmp.write(code)
             tmp.flush()
+            tmp_name = tmp.name
+            tmp.close()  # Close before py_compile (required on Windows)
 
-            try:
-                py_compile.compile(tmp.name, doraise=True)
-                return True, None
-            except py_compile.PyCompileError as e:
-                return False, str(e)
-            finally:
-                import os
+        try:
+            py_compile.compile(tmp_name, doraise=True)
+            return True, None
+        except py_compile.PyCompileError as e:
+            return False, str(e)
+        finally:
+            import os
 
-                os.unlink(tmp.name)
+            os.unlink(tmp_name)
 
     except SyntaxError as e:
         error_msg = f"Syntax error at line {e.lineno}: {e.msg}"
