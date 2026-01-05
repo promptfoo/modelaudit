@@ -95,6 +95,7 @@ def test_pickle_scanner_includes_why():
                 return (os.system, ("echo pwned",))
 
         pickle.dump(Evil(), f)
+        f.flush()  # Ensure data is written
         temp_path = f.name
         f.close()  # Close before scanning (required on Windows)
 
