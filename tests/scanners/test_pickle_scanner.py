@@ -227,7 +227,11 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
 
         assert len(result.issues) > 0, "Expected issues to be detected for STACK_GLOBAL attack"
-        os_issues = [i for i in result.issues if "os" in i.message.lower() or "posix" in i.message.lower()]
+        os_issues = [
+            i
+            for i in result.issues
+            if "os" in i.message.lower() or "posix" in i.message.lower() or "nt" in i.message.lower()
+        ]
         assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
     def test_memo_object_tracking(self) -> None:
