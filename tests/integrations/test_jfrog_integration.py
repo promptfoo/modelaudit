@@ -57,7 +57,8 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     )
     # Check that scan was called with adjusted timeout (should be slightly less than 200 due to download time)
     scan_call = mock_scan.call_args
-    assert scan_call[0][0] == os.path.join(temp_dir, "model.pt")
+    # Normalize paths for cross-platform comparison (Windows uses backslashes)
+    assert Path(scan_call[0][0]) == Path(temp_dir) / "model.pt"
     assert scan_call[1]["blacklist_patterns"] == ["bad"]
     assert 195 <= scan_call[1]["timeout"] <= 200  # Should be close to 200 but slightly reduced
     assert scan_call[1]["max_file_size"] == 1000
