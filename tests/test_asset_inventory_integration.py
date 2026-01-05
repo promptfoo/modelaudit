@@ -74,6 +74,7 @@ class TestAssetInventoryIntegration:
                 delete=False,
             ) as tmp:
                 save_file(inner_safetensors_data, tmp.name)
+                tmp.close()  # Close temp file before reopening (required on Windows)
                 with open(tmp.name, "rb") as f:
                     zf.writestr("optimizer.safetensors", f.read())
                 os.unlink(tmp.name)
