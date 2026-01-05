@@ -57,7 +57,7 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     # Check that scan was called with adjusted timeout (should be slightly less than 200 due to download time)
     scan_call = mock_scan.call_args
     # Normalize paths for cross-platform comparison (Windows uses backslashes)
-    assert Path(scan_call[0][0]) == Path(temp_dir) / "model.pt"
+    assert Path(scan_call[0][0]).as_posix() == Path(temp_dir, "model.pt").as_posix()
     assert scan_call[1]["blacklist_patterns"] == ["bad"]
     assert 195 <= scan_call[1]["timeout"] <= 200  # Should be close to 200 but slightly reduced
     assert scan_call[1]["max_file_size"] == 1000
@@ -152,7 +152,7 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
     # Verify scan was called on the folder with adjusted timeout
     scan_call = mock_scan.call_args
     # Normalize paths for cross-platform comparison (Windows uses backslashes)
-    assert Path(scan_call[0][0]) == Path(temp_dir) / "models"
+    assert Path(scan_call[0][0]).as_posix() == Path(temp_dir, "models").as_posix()
     assert scan_call[1]["blacklist_patterns"] == ["bad"]
     assert 195 <= scan_call[1]["timeout"] <= 200  # Should be close to 200 but slightly reduced
     assert scan_call[1]["max_file_size"] == 1000
