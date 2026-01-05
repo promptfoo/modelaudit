@@ -410,7 +410,15 @@ jobs:
   ci-success:
     name: CI Success
     needs:
-      [quick-feedback, lint, type-check, test, test-numpy-compatibility, build]
+      [
+        quick-feedback,
+        lint,
+        type-check,
+        test,
+        windows-tests,
+        test-numpy-compatibility,
+        build,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -422,6 +430,7 @@ jobs:
           LINT_RESULT="${{ needs.lint.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           TEST_RESULT="${{ needs.test.result }}"
+          WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
 
@@ -430,6 +439,7 @@ jobs:
           echo "  lint: $LINT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  test: $TEST_RESULT"
+          echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT"
           echo "  build: $BUILD_RESULT"
 
@@ -438,6 +448,7 @@ jobs:
                 "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
                 "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
                 "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
+                "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ||
                 "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||
                 "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]]; then
             echo "Some CI checks failed!"
