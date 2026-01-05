@@ -21,20 +21,24 @@ class TestCoreIntegration:
         _registry._loaded_scanners.clear()
 
         # Create a JSON file with ML-related content
-        with tempfile.NamedTemporaryFile(suffix="_config.json", mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix="_config.json", mode="w", delete=False) as f:
             f.write('{"model": "test", "tokenizer": "config"}')
             f.flush()
+            f.close()  # Close file before scanning (required on Windows to allow deletion)
 
-            # Scan the file
-            result = core.scan_file(f.name)
+            try:
+                # Scan the file
+                result = core.scan_file(f.name)
 
-            # Should have completed successfully
-            assert result is not None
-            assert result.scanner_name in ["manifest", "unknown"]
+                # Should have completed successfully
+                assert result is not None
+                assert result.scanner_name in ["manifest", "unknown"]
 
-            # Should have loaded minimal scanners
-            loaded_count = len(_registry._loaded_scanners)
-            assert loaded_count <= 5  # Should be minimal
+                # Should have loaded minimal scanners
+                loaded_count = len(_registry._loaded_scanners)
+                assert loaded_count <= 5  # Should be minimal
+            finally:
+                Path(f.name).unlink(missing_ok=True)
 
     def test_scan_directory_uses_lazy_loading(self):
         """Test that directory scanning uses lazy loading efficiently."""
@@ -191,17 +195,21 @@ class TestErrorRecovery:
     def test_scan_continues_with_available_scanners(self):
         """Test that scanning continues even if some scanners fail to load."""
         # Create a file that should be scannable by available scanners
-        with tempfile.NamedTemporaryFile(suffix="_config.json", mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix="_config.json", mode="w", delete=False) as f:
             f.write('{"model": "test", "config": "data"}')
             f.flush()
+            f.close()  # Close file before scanning (required on Windows to allow deletion)
 
-            # This should work even if some heavy dependency scanners fail
-            result = core.scan_file(f.name)
+            try:
+                # This should work even if some heavy dependency scanners fail
+                result = core.scan_file(f.name)
 
-            # Should complete successfully
-            assert result is not None
-            # Might be "unknown" if manifest scanner fails, but shouldn't crash
-            assert result.scanner_name in ["manifest", "unknown"]
+                # Should complete successfully
+                assert result is not None
+                # Might be "unknown" if manifest scanner fails, but shouldn't crash
+                assert result.scanner_name in ["manifest", "unknown"]
+            finally:
+                Path(f.name).unlink(missing_ok=True)
 
 
 class TestRegistryIntrospection:

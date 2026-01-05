@@ -241,6 +241,7 @@ class TestAssetInventoryIntegration:
                 delete=False,
             ) as tmp:
                 save_file(safetensors_data, tmp.name)
+                tmp.close()  # Close temp file before reopening (required on Windows)
                 with open(tmp.name, "rb") as f:
                     inner_zf.writestr("model.safetensors", f.read())
                 os.unlink(tmp.name)
