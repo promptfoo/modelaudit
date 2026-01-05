@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.23"
+version = "0.2.24"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -62,7 +62,7 @@ joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
 tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
-xgboost = ["xgboost>=1.6.0,<3.0", "py-ubjson>=0.16.0"]
+xgboost = ["xgboost>=3.1.2,<3.2", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
@@ -95,7 +95,7 @@ all-ci = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "xgboost>=1.6.0,<3.0",
+    "xgboost>=3.1.2,<3.2",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
@@ -118,7 +118,7 @@ all = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "xgboost>=1.6.0,<3.0",
+    "xgboost>=3.1.2,<3.2",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
@@ -226,8 +226,32 @@ filterwarnings = [
     "ignore::PendingDeprecationWarning",
 ]
 
+[tool.coverage.run]
+source = ["modelaudit"]
+branch = true
+parallel = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+precision = 2
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
 [tool.mypy]
 python_version = "3.10"
+plugins = ["pydantic.mypy"]
 
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions
