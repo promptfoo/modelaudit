@@ -1,6 +1,7 @@
 """Python code validation utilities using py_compile."""
 
 import ast
+import os
 import py_compile
 import tempfile
 
@@ -38,8 +39,6 @@ def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool,
         except py_compile.PyCompileError as e:
             return False, str(e)
         finally:
-            import os
-
             os.unlink(tmp_name)
 
     except SyntaxError as e:
