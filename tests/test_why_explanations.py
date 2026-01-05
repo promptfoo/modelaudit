@@ -109,11 +109,12 @@ def test_pickle_scanner_includes_why():
         # We should have at least one issue with a 'why' explanation
         assert len(issues_with_why) > 0
 
-        # Check that at least one issue mentions 'os' or 'posix' and has an explanation
+        # Check that at least one issue mentions 'os', 'posix', or 'nt' (Windows) and has an explanation
         system_issues = [
             issue
             for issue in result.issues
-            if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None
+            if ("os" in issue.message.lower() or "posix" in issue.message.lower() or "nt" in issue.message.lower())
+            and issue.why is not None
         ]
         assert len(system_issues) > 0
 
