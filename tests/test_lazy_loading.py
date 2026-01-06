@@ -342,6 +342,7 @@ class TestSpecificFileTypes:
         ) as f:
             f.write('{"model": "test", "tokenizer": "config"}')
             f.flush()
+            f.close()  # Close file before using it (required on Windows to allow deletion)
 
             try:
                 _ = _registry.get_scanner_for_path(f.name)

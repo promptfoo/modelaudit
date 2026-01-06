@@ -1,4 +1,5 @@
 import logging
+import os
 import pickle
 import shutil
 import sys
@@ -32,6 +33,24 @@ HAS_XGBOOST = _check_framework("xgboost")
 HAS_SAFETENSORS = _check_framework("safetensors")
 HAS_JOBLIB = _check_framework("joblib")
 HAS_DILL = _check_framework("dill")
+
+
+def _detect_symlink_support() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            target = temp_path / "target.txt"
+            target.write_text("data")
+            link = temp_path / "link.txt"
+            link.symlink_to(target)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+HAS_SYMLINKS = _detect_symlink_support()
 
 
 def pytest_runtest_setup(item):
@@ -100,6 +119,13 @@ def setup_logging():
 
     # Reset logging after test
     logging.getLogger("modelaudit").setLevel(logging.NOTSET)
+
+
+@pytest.fixture
+def requires_symlinks():
+    """Skip tests when symlink creation is not supported."""
+    if not HAS_SYMLINKS:
+        pytest.skip("Symlinks are not supported on this platform")
 
 
 @pytest.fixture

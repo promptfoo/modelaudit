@@ -1166,7 +1166,7 @@ def scan_command(
                             # Convert cache_dir string to Path if provided
                             cache_path = Path(final_cache_dir) if final_cache_dir else None
 
-                            download_path = download_from_cloud(
+                            download_path = download_from_cloud(  # type: ignore[assignment]
                                 path,
                                 cache_dir=cache_path,
                                 max_size=max_download_bytes,

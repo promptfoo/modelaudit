@@ -8,6 +8,8 @@ Organized into subcategories:
 """
 
 import os
+import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from .file.filtering import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
@@ -18,6 +20,13 @@ def is_within_directory(base_dir: str, target: str) -> bool:
     """Return True if the target path is within the given base directory."""
     base_path = Path(base_dir).resolve()
     target_path = Path(target).resolve()
+    if os.name == "nt":
+        base_norm = os.path.normcase(os.path.normpath(str(base_path)))
+        target_norm = os.path.normcase(os.path.normpath(str(target_path)))
+        try:
+            return os.path.commonpath([target_norm, base_norm]) == base_norm
+        except ValueError:
+            return False
     try:
         return target_path.is_relative_to(base_path)
     except AttributeError:  # Python < 3.9
@@ -25,6 +34,31 @@ def is_within_directory(base_dir: str, target: str) -> bool:
             return os.path.commonpath([target_path, base_path]) == str(base_path)
         except ValueError:
             return False
+
+
+def normalize_path_for_match(path: str) -> str:
+    """Normalize a path string for safe, cross-platform prefix comparisons."""
+    normalized = path.replace("\\", "/")
+    normalized = re.sub(r"/+", "/", normalized)
+    if normalized.startswith("/?/"):
+        normalized = normalized[3:]
+    return normalized.rstrip("/").lower()
+
+
+def is_absolute_archive_path(path: str) -> bool:
+    """Return True if the path is absolute in a platform-agnostic archive context."""
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("/") or bool(re.match(r"^[a-zA-Z]:", normalized))
+
+
+def is_critical_system_path(path: str, critical_paths: Iterable[str]) -> bool:
+    """Return True if path targets a critical system location (normalized match)."""
+    normalized_path = normalize_path_for_match(path)
+    for critical in critical_paths:
+        normalized_critical = normalize_path_for_match(critical)
+        if normalized_path == normalized_critical or normalized_path.startswith(f"{normalized_critical}/"):
+            return True
+    return False
 
 
 def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
