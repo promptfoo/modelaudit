@@ -24,12 +24,17 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.1.7",
     "yaspin>=2.5.0",
-    "numpy>=1.19.0",
+    # NumPy version depends on Python version for compatibility
+    # Python 3.10: NumPy 1.x (NumPy 2.x requires Python >=3.11)
+    # Python 3.11+: NumPy 2.x (better performance, modern ML framework support)
+    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=2.4,<2.5; python_version >= '3.11'",
     "scipy>=1.7.0",
     "cyclonedx-python-lib>=11.0.0",
     "defusedxml>=0.7.1",
@@ -48,10 +53,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Note: ML frameworks may require NumPy < 2.0 for compatibility
-# If you encounter NumPy compatibility issues, consider using:
-# pip install "numpy<2.0" tensorflow h5py torch onnx
-tensorflow = ["tensorflow>=2.13.0,<3.0; python_version < '3.13'"]
+# TensorFlow version depends on Python version:
+# - Python 3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
+# - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required)
+tensorflow = [
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
+]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
 yaml = ["pyyaml>=6.0,<7.0"]
@@ -66,10 +74,14 @@ xgboost = ["xgboost>=3.1.2,<3.2", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
-# Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
+# Full ML framework bundle with version-appropriate NumPy:
+# - Python 3.10: NumPy 1.x + TensorFlow 2.13+
+# - Python 3.11+: NumPy 2.x + TensorFlow 2.17+
 numpy1 = [
-    "numpy>=1.19.0,<2.0",
-    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
+    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=2.4,<2.5; python_version >= '3.11'",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
@@ -83,8 +95,10 @@ numpy1 = [
     "huggingface-hub>=0.23.0",
 ]
 # All dependencies except platform-specific ones (for CI)
+# TensorFlow version depends on Python version (see tensorflow extra above)
 all-ci = [
-    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
@@ -100,6 +114,7 @@ all-ci = [
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
 ]
+# Lightweight Windows CI dependencies (avoids heavy ML frameworks)
 all-ci-windows = [
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
@@ -107,7 +122,8 @@ all-ci-windows = [
     "safetensors>=0.4.0",
 ]
 all = [
-    "tensorflow>=2.13.0,<3.0; python_version < '3.13'",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
