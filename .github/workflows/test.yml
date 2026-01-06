@@ -454,9 +454,12 @@ jobs:
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
-          WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
+
+          # Check if numpy job should have run
+          ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
+          DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
 
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
@@ -464,11 +467,10 @@ jobs:
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
-          echo "  test-numpy-compatibility: $NUMPY_RESULT"
+          echo "  test-numpy-compatibility: $NUMPY_RESULT (should run: on_main=$ON_MAIN_BRANCH, deps_changed=$DEPENDENCIES_CHANGED)"
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
-          # Note: Jobs skipped due to 'if' conditions report as 'skipped' or empty, which is OK
           FAILED=false
 
           [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
@@ -478,12 +480,14 @@ jobs:
           [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
 
-          # NumPy compatibility job only runs on main or when dependencies change - treat skipped as OK
-          if [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]]; then
-            # Only fail if it actually ran and failed (not if it was skipped)
-            if [[ "$NUMPY_RESULT" == "failure" && "$NUMPY_RESULT" != "skipped" && -n "$NUMPY_RESULT" ]]; then
-              FAILED=true
-            fi
+          # NumPy compatibility job only runs on main or when dependencies change
+          # If it should have run, check for failure/cancellation
+          # If it shouldn't have run (skipped), don't fail
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            echo "NumPy job should have run - checking for failure"
+            [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
+          else
+            echo "NumPy job was not expected to run - treating as OK"
           fi
 
           if [[ "$FAILED" == "true" ]]; then
