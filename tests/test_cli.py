@@ -144,8 +144,13 @@ def test_scan_directory(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    # Verify that the scan produced results (text format uses "Files:" and "Size:")
-    assert "Files:" in result.output or "Size:" in result.output
+    # Verify that the scan produced results (works with both text and JSON formats)
+    assert (
+        "Files:" in result.output
+        or "Size:" in result.output
+        or "bytes_scanned" in result.output
+        or "files_scanned" in result.output
+    )
 
 
 def test_scan_multiple_paths(tmp_path):
@@ -162,8 +167,13 @@ def test_scan_multiple_paths(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    # Verify that the scan produced results (text format uses "Files:" and "Size:")
-    assert "Files:" in result.output or "Size:" in result.output
+    # Verify that the scan produced results (works with both text and JSON formats)
+    assert (
+        "Files:" in result.output
+        or "Size:" in result.output
+        or "bytes_scanned" in result.output
+        or "files_scanned" in result.output
+    )
 
 
 def test_scan_with_blacklist(tmp_path):
