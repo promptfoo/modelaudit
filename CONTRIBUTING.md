@@ -20,6 +20,9 @@ cd modelaudit
 # Install with uv (recommended)
 uv sync --extra all
 
+# Windows (lighter optional set)
+uv sync --extra all-ci-windows
+
 # Or with pip
 pip install -e .[all]
 ```

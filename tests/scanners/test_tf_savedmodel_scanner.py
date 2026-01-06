@@ -249,7 +249,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
 
 
 @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_unreadable_file(tmp_path):
+def test_tf_savedmodel_scanner_unreadable_file(tmp_path, requires_symlinks):
     """Scanner should report unreadable files instead of silently skipping."""
     model_dir = create_tf_savedmodel(tmp_path)
 

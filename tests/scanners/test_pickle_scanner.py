@@ -117,6 +117,7 @@ class TestPickleScanner(unittest.TestCase):
                 suspicious_content = b"some_data" + pattern_import + b"more_data" + pattern_eval + b"end_data"
                 f.write(suspicious_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -161,6 +162,7 @@ class TestPickleScanner(unittest.TestCase):
                 f.write(sigs[1])  # Another signature
                 f.write(b"end_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -198,6 +200,7 @@ class TestPickleScanner(unittest.TestCase):
                 clean_content = b"\x00" * 1000 + b"\x01" * 500 + b"\xff" * 200
                 f.write(clean_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -224,7 +227,11 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
 
         assert len(result.issues) > 0, "Expected issues to be detected for STACK_GLOBAL attack"
-        os_issues = [i for i in result.issues if "os" in i.message.lower() or "posix" in i.message.lower()]
+        os_issues = [
+            i
+            for i in result.issues
+            if "os" in i.message.lower() or "posix" in i.message.lower() or "nt" in i.message.lower()
+        ]
         assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
     def test_memo_object_tracking(self) -> None:
@@ -258,6 +265,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 simple_data = {"weights": [1.0, 2.0, 3.0]}
                 pickle.dump(simple_data, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -313,6 +321,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 )
                 f.write(suspicious_binary_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -377,6 +386,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"\x7fELF")  # Linux ELF executable signature
                 f.write(b"more_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -414,6 +424,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"MZ")  # PE signature but no DOS stub
                 f.write(b"random_data" * 50)  # Random data without DOS stub message
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -450,6 +461,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"This program cannot be run in DOS mode")  # DOS stub message
                 f.write(b"more_data" * 10)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -485,6 +497,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 }
                 pickle.dump(outer, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 result = scanner.scan(f.name)
 

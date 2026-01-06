@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from modelaudit.core import scan_model_streaming
+from modelaudit.core import scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanners.base import ScanResult
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -33,6 +33,30 @@ def create_mock_scan_result(bytes_scanned: int = 1024) -> ScanResult:
     result.bytes_scanned = bytes_scanned
     result.success = True
     return result
+
+
+def test_scan_model_directory_or_file_streaming_path():
+    """Ensure stream:// paths route to streaming analysis."""
+    stream_url = "s3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 123
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+        args, kwargs = mock_scanner.call_args
+        assert args[0] == stream_url
+        assert "config" in kwargs
+        mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+        assert result.bytes_scanned == 123
 
 
 def test_scan_model_streaming_basic(temp_test_files):
