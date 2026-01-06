@@ -19,8 +19,8 @@ Main testing workflow for Python code.
 - **Smart path filtering**: Only runs when Python files, dependencies, or workflows change
 - **Conditional job execution**: Jobs depend on what files changed
 - **Optimized matrix testing**:
-  - PRs: Test on Python 3.9 and 3.12 only (min/max versions)
-  - Main branch: Test on all supported versions (3.9, 3.10, 3.11, 3.12)
+  - PRs: Test on Python 3.11 and 3.13 only (min/max versions)
+  - Main branch: Test on all supported versions (3.11, 3.12, 3.13)
 - **Job dependencies**: Type checking only runs if linting passes
 - **NumPy compatibility testing**: Reduced matrix for PRs
 
@@ -78,7 +78,7 @@ Ensures PR titles follow conventional commit format.
 
 ### 2. Conditional Matrix Strategy
 
-- PRs test fewer Python versions (3.9, 3.12) to save time
+- PRs test fewer Python versions (3.11, 3.13) to save time
 - Main branch tests all versions for comprehensive coverage
 - NumPy tests use reduced matrix on PRs
 

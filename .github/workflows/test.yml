@@ -220,6 +220,8 @@ jobs:
       matrix:
         # For PRs, only test min and max Python versions to save time
         # For main branch, test all versions
+        # Note: Python 3.10+ supported (see pyproject.toml)
+        # Python 3.10 gets NumPy 1.x, Python 3.11+ gets NumPy 2.x
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
@@ -298,7 +300,7 @@ jobs:
           verbose: true
 
   test-numpy-compatibility:
-    name: Test NumPy Compatibility - Python ${{ matrix.python-version }}, NumPy ${{ matrix.numpy-mode }}
+    name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
     # Only run on main branch or if dependencies changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
@@ -306,14 +308,27 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        # Reduced matrix for PRs
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
-        numpy-mode: ["1.x", "2.x"]
-        exclude:
-          # TensorFlow doesn't support Python 3.13 yet, so skip NumPy 1.x mode
-          # which requires TensorFlow installation
-          - python-version: "3.13"
+        # Test both NumPy versions with appropriate Python versions:
+        # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
+        # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
+        # Reduced matrix for PRs, full matrix for main branch
+        include:
+          # NumPy 1.x tests (Python 3.10 only)
+          - python-version: "3.10"
             numpy-mode: "1.x"
+          # NumPy 2.x tests (Python 3.11+)
+          - python-version: "3.11"
+            numpy-mode: "2.x"
+          # Additional NumPy 2.x tests only on main branch
+          - python-version: "3.12"
+            numpy-mode: "2.x"
+            skip-on-pr: true
+          - python-version: "3.13"
+            numpy-mode: "2.x"
+            skip-on-pr: true
+        exclude:
+          # Skip additional tests on PRs to save time
+          - skip-on-pr: ${{ github.event_name == 'pull_request' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -340,16 +355,11 @@ jobs:
             ${{ runner.os }}-uv-py${{ matrix.python-version }}-
             ${{ runner.os }}-uv-
 
-      - name: Install with NumPy 1.x compatibility mode
-        if: matrix.numpy-mode == '1.x'
+      - name: Install dependencies
         run: |
-          uv sync --no-dev
-          uv add --optional numpy1 'numpy>=1.19.0,<2.0'
-          uv sync --extra numpy1
-
-      - name: Install with NumPy 2.x (default)
-        if: matrix.numpy-mode == '2.x'
-        run: |
+          # Dependencies are automatically version-matched based on Python version
+          # Python 3.10: NumPy 1.x + TensorFlow 2.13+
+          # Python 3.11+: NumPy 2.x + TensorFlow 2.17+
           uv sync --extra all-ci
 
       - name: Check NumPy version
@@ -427,8 +437,8 @@ jobs:
         quick-feedback,
         lint,
         type-check,
-        test,
         windows-tests,
+        test,
         test-numpy-compatibility,
         build,
       ]
@@ -442,28 +452,45 @@ jobs:
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
-          TEST_RESULT="${{ needs.test.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
+          TEST_RESULT="${{ needs.test.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
+
+          # Check if numpy job should have run
+          ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
+          DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
 
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
-          echo "  test: $TEST_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
-          echo "  test-numpy-compatibility: $NUMPY_RESULT"
+          echo "  test: $TEST_RESULT"
+          echo "  test-numpy-compatibility: $NUMPY_RESULT (should run: on_main=$ON_MAIN_BRANCH, deps_changed=$DEPENDENCIES_CHANGED)"
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
-          if [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ||
-                "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
-                "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
-                "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
-                "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ||
-                "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||
-                "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]]; then
+          FAILED=false
+
+          [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
+
+          # NumPy compatibility job only runs on main or when dependencies change
+          # If it should have run, check for failure/cancellation
+          # If it shouldn't have run (skipped), don't fail
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            echo "NumPy job should have run - checking for failure"
+            [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
+          else
+            echo "NumPy job was not expected to run - treating as OK"
+          fi
+
+          if [[ "$FAILED" == "true" ]]; then
             echo "Some CI checks failed!"
             exit 1
           else
