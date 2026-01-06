@@ -92,12 +92,14 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ModelAudit supports both NumPy 1.x and 2.x using conditional dependencies based on Python version:
 
 **Current Strategy (January 2025 → October 2026):**
+
 - **Python 3.10**: NumPy 1.x (1.19.0–1.26.x) + TensorFlow 2.13+
 - **Python 3.11+**: NumPy 2.x (2.4–2.5) + TensorFlow 2.17+
 
 **Why:** NumPy 2.4+ requires Python ≥3.11, but Python 3.10 is supported until October 2026. Dropping 3.10 support prematurely would be a breaking change.
 
 **Timeline:**
+
 - **Now → October 2026**: Support both configurations with automatic version selection via environment markers
 - **October 2026**: Python 3.10 reaches EOL, can drop 3.10 support and standardize on NumPy 2.x only
 - **Post-October 2026**: Simplify to single NumPy 2.x dependency with `requires-python = ">=3.11"`
@@ -119,12 +121,14 @@ tensorflow = [
 ```
 
 **CI Testing:** Both NumPy versions are tested in CI via matrix strategy (see `.github/workflows/test.yml`):
+
 - NumPy 1.x on Python 3.10
 - NumPy 2.x on Python 3.11, 3.12, 3.13
 
 **User Impact:** No code changes needed. Users get appropriate versions automatically based on their Python version. Natural migration path as users upgrade Python.
 
 **When Adding Dependencies:**
+
 - Check compatibility with both NumPy 1.x and 2.x
 - Add environment markers if dependency requires specific Python/NumPy versions
 - Update CI matrix if testing both versions is needed
