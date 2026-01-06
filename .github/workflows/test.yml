@@ -464,19 +464,29 @@ jobs:
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
-          echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT"
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
-          if [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ||
-                "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ||
-                "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ||
-                "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ||
-                "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ||
-                "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ||
-                "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ||
-                "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]]; then
+          # Note: Jobs skipped due to 'if' conditions report as 'skipped' or empty, which is OK
+          FAILED=false
+
+          [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
+
+          # NumPy compatibility job only runs on main or when dependencies change - treat skipped as OK
+          if [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]]; then
+            # Only fail if it actually ran and failed (not if it was skipped)
+            if [[ "$NUMPY_RESULT" == "failure" && "$NUMPY_RESULT" != "skipped" && -n "$NUMPY_RESULT" ]]; then
+              FAILED=true
+            fi
+          fi
+
+          if [[ "$FAILED" == "true" ]]; then
             echo "Some CI checks failed!"
             exit 1
           else
