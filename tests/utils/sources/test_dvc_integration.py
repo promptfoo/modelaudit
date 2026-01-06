@@ -143,7 +143,7 @@ class TestDvcSecurity:
         # This is allowed since it resolves to the same directory
         assert str(target) in resolved or resolved == []
 
-    def test_symlink_traversal_prevention(self, tmp_path):
+    def test_symlink_traversal_prevention(self, tmp_path, requires_symlinks):
         """Test prevention of symlink-based traversal."""
         # Create directories
         safe_dir = tmp_path / "safe"

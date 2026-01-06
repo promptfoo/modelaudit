@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
 - **docs**: consolidate agent guidance into a single canonical `AGENTS.md` and align `CLAUDE.md`/`GEMINI.md` to reference it
+- **ci**: add Windows test coverage and introduce a Windows-friendly dependency set for CI usage
+
+### Fixed
+
+- **windows**: normalize Hugging Face cache symlink handling and archive symlink critical-path checks across path separators
+- **windows**: preserve `stream://` paths for streaming scans to avoid path normalization issues
 
 ## [0.2.22] - 2025-12-10
 

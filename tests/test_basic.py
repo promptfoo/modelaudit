@@ -213,7 +213,8 @@ def test_scan_result_class():
     result.finish(success=True)
     assert result.success is True
     assert result.end_time is not None
-    assert result.duration > 0
+    # Duration might be 0 on fast systems/Windows, so check >= 0
+    assert result.duration >= 0
 
     # Test has_errors property - check if it exists or implement our own check
     if hasattr(result, "has_errors"):

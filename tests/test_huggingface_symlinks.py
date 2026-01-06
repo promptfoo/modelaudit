@@ -9,6 +9,7 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 
 
+@pytest.mark.usefixtures("requires_symlinks")
 class TestHuggingFaceSymlinks:
     """Test that HuggingFace cache symlinks are handled correctly."""
 

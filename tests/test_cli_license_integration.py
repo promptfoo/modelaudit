@@ -6,6 +6,7 @@ showing how users would interact with the license detection features.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,14 @@ class TestCLILicenseIntegration:
         """Return the CLI command to run modelaudit."""
         return [sys.executable, "-c", "from modelaudit.cli import main; main()"]
 
-    def test_cli_mit_model_clean_scan(self, test_data_dir, cli_command):
+    @pytest.fixture
+    def utf8_env(self):
+        """Return environment with UTF-8 encoding for subprocess calls on Windows."""
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
+
+    def test_cli_mit_model_clean_scan(self, test_data_dir, cli_command, utf8_env):
         """Test CLI scanning of MIT licensed model."""
         mit_dir = test_data_dir / "mit_model"
 
@@ -35,7 +43,8 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", str(mit_dir), "--format", "json", "--no-cache"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # Should succeed (exit code 0 = no issues found)
@@ -56,7 +65,7 @@ class TestCLILicenseIntegration:
         ]
         assert len(critical_issues) == 0, "MIT model should not have critical license issues"
 
-    def test_cli_agpl_component_warnings(self, test_data_dir, cli_command):
+    def test_cli_agpl_component_warnings(self, test_data_dir, cli_command, utf8_env):
         """Test CLI scanning of AGPL component triggers warnings."""
         agpl_dir = test_data_dir / "agpl_component"
 
@@ -64,7 +73,8 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", str(agpl_dir), "--format", "json", "--strict"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # Should succeed with warnings (exit code 1 = issues found)
@@ -87,7 +97,7 @@ class TestCLILicenseIntegration:
         assert agpl_issue["severity"] == "warning"
         assert "network use restrictions" in agpl_issue["message"]
 
-    def test_cli_unlicensed_dataset_warnings(self, test_data_dir, cli_command):
+    def test_cli_unlicensed_dataset_warnings(self, test_data_dir, cli_command, utf8_env):
         """Test CLI scanning of unlicensed datasets."""
         unlicensed_dir = test_data_dir / "unlicensed_dataset"
 
@@ -95,7 +105,8 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", str(unlicensed_dir), "--format", "json"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # INFO-level issues don't cause exit code 1
@@ -113,7 +124,7 @@ class TestCLILicenseIntegration:
         ]
         assert len(dataset_issues) > 0, "Should warn about unlicensed datasets"
 
-    def test_cli_sbom_generation(self, test_data_dir, cli_command):
+    def test_cli_sbom_generation(self, test_data_dir, cli_command, utf8_env):
         """Test CLI SBOM generation with license metadata."""
         mit_dir = test_data_dir / "mit_model"
 
@@ -125,7 +136,8 @@ class TestCLILicenseIntegration:
             result = subprocess.run(
                 [*cli_command, "scan", str(mit_dir), "--sbom", sbom_path],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                env=utf8_env,
             )
 
             # Should succeed
@@ -154,7 +166,7 @@ class TestCLILicenseIntegration:
             # Cleanup
             Path(sbom_path).unlink(missing_ok=True)
 
-    def test_cli_verbose_license_output(self, test_data_dir, cli_command):
+    def test_cli_verbose_license_output(self, test_data_dir, cli_command, utf8_env):
         """Test CLI verbose output includes license information."""
         agpl_dir = test_data_dir / "agpl_component"
 
@@ -162,7 +174,8 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", str(agpl_dir), "--verbose"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # Should have verbose output
@@ -175,7 +188,7 @@ class TestCLILicenseIntegration:
             "Verbose output should mention license-related information"
         )
 
-    def test_cli_mixed_licenses_comprehensive(self, test_data_dir, cli_command):
+    def test_cli_mixed_licenses_comprehensive(self, test_data_dir, cli_command, utf8_env):
         """Test CLI scanning of mixed license directory."""
         mixed_dir = test_data_dir / "mixed_licenses"
 
@@ -183,7 +196,8 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", str(mixed_dir), "--format", "json"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # Parse JSON output
@@ -202,13 +216,14 @@ class TestCLILicenseIntegration:
         for issue in license_issues:
             print(f"  - {issue.get('message', 'Unknown')}")
 
-    def test_cli_error_handling(self, cli_command):
+    def test_cli_error_handling(self, cli_command, utf8_env):
         """Test CLI error handling for invalid inputs."""
         # Test scanning non-existent directory
         result = subprocess.run(
             [*cli_command, "scan", "/nonexistent/directory"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         # Should fail with error code 2 (operational error)
@@ -217,13 +232,14 @@ class TestCLILicenseIntegration:
         # Should have error message
         assert len(result.stderr) > 0 or "Error" in result.stdout, "Should show error message"
 
-    def test_cli_help_includes_license_features(self, cli_command):
+    def test_cli_help_includes_license_features(self, cli_command, utf8_env):
         """Test that CLI help mentions license-related features."""
         # Test main help
         result = subprocess.run(
             [*cli_command, "--help"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         assert result.returncode == 0, "Help should work"
@@ -232,13 +248,14 @@ class TestCLILicenseIntegration:
         result = subprocess.run(
             [*cli_command, "scan", "--help"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            env=utf8_env,
         )
 
         assert result.returncode == 0, "Scan help should work"
         assert "--sbom" in result.stdout, "Help should mention SBOM option"
 
-    def test_cli_comprehensive_real_world_scenario(self, test_data_dir, cli_command):
+    def test_cli_comprehensive_real_world_scenario(self, test_data_dir, cli_command, utf8_env):
         """
         Test a comprehensive real-world scenario with all license types.
         This demonstrates the complete license detection workflow.
@@ -280,7 +297,8 @@ class TestCLILicenseIntegration:
             result = subprocess.run(
                 [*cli_command, "scan", str(temp_path), "--format", "json", "--sbom", str(sbom_path), "--verbose"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                env=utf8_env,
             )
 
             # Should complete (may have warnings)

@@ -193,6 +193,20 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     return dict(content_groups)
 
 
+def _path_has_part(path: Path, part: str) -> bool:
+    """Return True if any path segment matches part (case-insensitive)."""
+    part_lower = part.lower()
+    return any(segment.lower() == part_lower for segment in path.parts)
+
+
+def _find_hf_cache_root(path: Path) -> Path | None:
+    """Return the HuggingFace cache root containing models--* if present."""
+    for index, segment in enumerate(path.parts):
+        if segment.lower().startswith("models--"):
+            return Path(*path.parts[: index + 1])
+    return None
+
+
 def _extract_primary_asset_from_location(location: str) -> str:
     """Extract primary asset path from location string.
 
@@ -619,6 +633,12 @@ def scan_model_directory_or_file(
                 total_files = None
 
             base_dir = Path(path).resolve()
+            hf_cache_root = _find_hf_cache_root(base_dir)
+            is_hf_cache = (
+                hf_cache_root is not None
+                and _path_has_part(base_dir, "huggingface")
+                and _path_has_part(base_dir, "hub")
+            )
             scanned_paths: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -630,11 +650,7 @@ def scan_model_directory_or_file(
 
                     # Check if this is a HuggingFace cache symlink scenario
                     is_hf_cache_symlink = False
-                    if (
-                        os.path.islink(file_path)
-                        and ".cache/huggingface/hub" in str(base_dir)
-                        and "/snapshots/" in str(file_path)
-                    ):
+                    if os.path.islink(file_path) and is_hf_cache and _path_has_part(Path(file_path), "snapshots"):
                         try:
                             link_target = os.readlink(file_path)
                         except OSError as e:
@@ -650,18 +666,12 @@ def scan_model_directory_or_file(
                         # Resolve the relative link target
                         resolved_target = (Path(file_path).parent / link_target).resolve()
                         # Check if target is in the blobs directory of the same model cache
-                        if "/blobs/" in str(resolved_target):
-                            # Extract the model cache root (e.g., models--distilbert-base-uncased)
-                            cache_parts = str(base_dir).split("/")
-                            for i, part in enumerate(cache_parts):
-                                if part.startswith("models--") and i > 0:
-                                    cache_root = "/".join(cache_parts[: i + 1])
-                                    # Check if the target is within the same model's cache structure
-                                    if str(resolved_target).startswith(cache_root):
-                                        is_hf_cache_symlink = True
-                                        # Update the resolved_file to the actual target for scanning
-                                        resolved_file = resolved_target
-                                    break
+                        if hf_cache_root is not None:
+                            blobs_root = hf_cache_root / "blobs"
+                            if is_within_directory(str(blobs_root), str(resolved_target)):
+                                is_hf_cache_symlink = True
+                                # Update the resolved_file to the actual target for scanning
+                                resolved_file = resolved_target
 
                     if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
                         _add_issue_to_model(

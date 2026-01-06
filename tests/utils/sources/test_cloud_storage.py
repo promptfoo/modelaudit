@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +63,7 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert "model.pt" in call_args[1]
 
     # Result should be a path containing the filename
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
     assert result.exists() or True  # Mock doesn't create actual files
 
@@ -92,7 +94,26 @@ def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
 
     # With context managers, fs.get is called but then fs is closed
     # Just verify the result is correct since the mock behavior changes with context managers
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+    url = "s3://bucket/model.pt"
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.pt",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
+
+    assert result == f"stream://{url}"
 
 
 @patch("builtins.__import__")
@@ -253,6 +274,7 @@ class TestDiskSpaceCheckingForCloud:
 
         # Verify download proceeded - with context managers, fs.get is called but then fs is closed
         # Just verify the result is correct since the mock behavior changes with context managers
+        assert isinstance(result, Path)
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
 
