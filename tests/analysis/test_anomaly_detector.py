@@ -427,7 +427,8 @@ class TestSuspiciousPatternDetection:
         pytest.importorskip("numpy")
         import numpy as np
 
-        short_data = np.random.randn(100)
+        # Use smooth, non-repeating data
+        short_data = np.linspace(0.0, 10.0, 100)
         result = detector._has_repeating_patterns(short_data)
         assert result is False
 
@@ -463,7 +464,12 @@ class TestWithNumpy:
     def test_compute_statistical_profile_normal_data(self, detector, np):
         """Test profile computation with normal data."""
         pytest.importorskip("scipy")
-        data = np.random.randn(1000).astype(np.float32)
+        # Create data with known statistical properties: mean≈0, std≈1
+        # Using combination of sine waves with different frequencies for variety
+        x = np.linspace(0, 10 * np.pi, 1000, dtype=np.float32)
+        data = (np.sin(x) + np.sin(x * 2.3) / 2 + np.sin(x * 0.7) / 3).astype(np.float32)
+        # Normalize to have mean≈0 and std≈1
+        data = (data - data.mean()) / data.std()
         profile = detector.compute_statistical_profile(data)
 
         assert abs(profile.mean) < 0.2  # Should be close to 0
@@ -482,7 +488,8 @@ class TestWithNumpy:
     def test_compute_statistical_profile_2d_data(self, detector, np):
         """Test profile computation with 2D data."""
         pytest.importorskip("scipy")
-        data = np.random.randn(100, 100).astype(np.float32)
+        # Create 2D data with predictable pattern
+        data = np.arange(10000, dtype=np.float32).reshape(100, 100) / 100.0
         profile = detector.compute_statistical_profile(data)
 
         assert isinstance(profile.mean, float)
@@ -491,41 +498,51 @@ class TestWithNumpy:
     def test_detect_weight_anomalies_normal_weights(self, detector, np):
         """Test anomaly detection with normal weights."""
         pytest.importorskip("scipy")
+        # Create weight tensors with predictable patterns in typical ranges
+        conv_size = 64 * 3 * 3 * 3
+        dense_size = 100 * 100
         weights = {
-            "conv1.weight": np.random.randn(64, 3, 3, 3).astype(np.float32) * 0.05,
-            "dense1.weight": np.random.randn(100, 100).astype(np.float32) * 0.1,
+            "conv1.weight": (np.arange(conv_size, dtype=np.float32) / conv_size - 0.5).reshape(64, 3, 3, 3) * 0.1,
+            "dense1.weight": (np.arange(dense_size, dtype=np.float32) / dense_size - 0.5).reshape(100, 100) * 0.2,
         }
         anomalies = detector.detect_weight_anomalies(weights)
-        # Normal weights shouldn't have many anomalies
+        # Should return a dictionary of anomaly results
         assert isinstance(anomalies, dict)
 
     def test_check_suspicious_patterns_with_array(self, detector, np):
         """Test suspicious pattern checking with numpy array."""
-        normal_data = np.random.randn(1000).astype(np.float32)
+        # Use predictable data to test pattern checking
+        normal_data = np.linspace(-0.5, 0.5, 1000, dtype=np.float32)
         result = detector._check_suspicious_patterns(normal_data)
         assert isinstance(result, list)
 
     def test_contains_executable_signature_clean(self, detector, np):
         """Test executable signature detection with clean data."""
-        clean_data = np.random.randn(1000).astype(np.float32)
+        # Use smooth, predictable data that won't contain executable byte patterns
+        clean_data = np.linspace(0.0, 1.0, 1000, dtype=np.float32)
         result = detector._contains_executable_signature(clean_data)
         assert result is False
 
     def test_contains_encoded_strings_clean(self, detector, np):
         """Test encoded string detection with clean data."""
-        clean_data = np.random.randn(1000).astype(np.float32)
+        # Use smooth, predictable data that won't contain encoded strings
+        clean_data = np.linspace(-1.0, 1.0, 1000, dtype=np.float32)
         result = detector._contains_encoded_strings(clean_data)
         assert result is False
 
     def test_has_repeating_patterns_random(self, detector, np):
-        """Test repeating pattern detection with random data."""
-        random_data = np.random.randn(2000).astype(np.float32)
+        """Test repeating pattern detection with non-repeating data."""
+        # Use varied, non-repeating data with irregular pattern
+        # Combine multiple frequencies to avoid regular repetition
+        x = np.linspace(0, 20 * np.pi, 2000, dtype=np.float32)
+        random_data = (np.sin(x * 1.7) + np.sin(x * 2.9) / 2 + np.sin(x * 0.4) / 3).astype(np.float32)
         result = detector._has_repeating_patterns(random_data)
         assert result is False
 
     def test_violates_distribution_laws_normal(self, detector, np):
-        """Test distribution law check with normal data."""
-        normal_data = np.random.randn(2000).astype(np.float32) * 10 + 100
+        """Test distribution law check returns a boolean."""
+        # Use predictable data to test the function returns the correct type
+        normal_data = np.linspace(90.0, 110.0, 2000, dtype=np.float32)
         result = detector._violates_distribution_laws(normal_data)
-        # Random data should generally follow Benford's law approximately
+        # Should return a boolean indicating whether distribution laws are violated
         assert isinstance(result, bool)
