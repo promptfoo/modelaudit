@@ -303,7 +303,7 @@ jobs:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
     # Only run on main branch or if dependencies changed
-    if: (github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true') && (github.event_name != 'pull_request' || matrix['skip-on-pr'] != true)
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -312,20 +312,7 @@ jobs:
         # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
         # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
         # Reduced matrix for PRs, full matrix for main branch
-        include:
-          # NumPy 1.x tests (Python 3.10 only)
-          - python-version: "3.10"
-            numpy-mode: "1.x"
-          # NumPy 2.x tests (Python 3.11+)
-          - python-version: "3.11"
-            numpy-mode: "2.x"
-          # Additional NumPy 2.x tests only on main branch
-          - python-version: "3.12"
-            numpy-mode: "2.x"
-            skip-on-pr: true
-          - python-version: "3.13"
-            numpy-mode: "2.x"
-            skip-on-pr: true
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6

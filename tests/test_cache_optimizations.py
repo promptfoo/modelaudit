@@ -152,15 +152,15 @@ class TestCacheOptimizationPerformance:
 
             # Basic timing test (reduced iterations)
             iterations = 10
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 batch_result = batch_lookup()
-            batch_time = time.time() - start_time
+            batch_time = time.perf_counter() - start_time
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 individual_result = individual_lookup()
-            individual_time = time.time() - start_time
+            individual_time = time.perf_counter() - start_time
 
             print(f"\nBatch lookup: {batch_time:.4f}s")
             print(f"Individual lookup: {individual_time:.4f}s")
@@ -217,16 +217,16 @@ class TestCacheOptimizationPerformance:
 
         # Time optimized extraction
         iterations = 200
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             opt_result = optimized_extraction()
-        opt_time = time.time() - start_time
+        opt_time = time.perf_counter() - start_time
 
         # Time traditional approach for comparison
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             traditional_result = traditional_extraction()
-        traditional_time = time.time() - start_time
+        traditional_time = time.perf_counter() - start_time
 
         # Verify results are equivalent
         assert len(opt_result) == len(traditional_result)
@@ -274,16 +274,16 @@ class TestCacheOptimizationPerformance:
 
             # Time optimized approach
             iterations = 100
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 opt_result = optimized_fingerprints()
-            opt_time = time.time() - start_time
+            opt_time = time.perf_counter() - start_time
 
             # Time traditional approach
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 traditional_result = traditional_fingerprints()
-            traditional_time = time.time() - start_time
+            traditional_time = time.perf_counter() - start_time
 
             # Verify results are equivalent
             assert len(opt_result) == len(traditional_result)
@@ -327,10 +327,10 @@ class TestCacheOptimizationPerformance:
 
         # Time decision making (benefits from LRU cache)
         iterations = 500
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             result = make_cache_decisions()
-        decision_time = time.time() - start_time
+        decision_time = time.perf_counter() - start_time
 
         # Verify basic functionality - check the actual thresholds
         print(f"Actual decisions: {result}")
