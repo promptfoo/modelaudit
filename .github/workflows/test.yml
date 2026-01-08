@@ -303,7 +303,7 @@ jobs:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
     needs: changes
     # Only run on main branch or if dependencies changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    if: (github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true') && (github.event_name != 'pull_request' || matrix['skip-on-pr'] != true)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -326,9 +326,6 @@ jobs:
           - python-version: "3.13"
             numpy-mode: "2.x"
             skip-on-pr: true
-        exclude:
-          # Skip additional tests on PRs to save time
-          - skip-on-pr: ${{ github.event_name == 'pull_request' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
