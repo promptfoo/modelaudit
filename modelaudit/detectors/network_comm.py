@@ -17,6 +17,68 @@ class NetworkCommDetector:
         rb"(?:https?|ftp|ftps|ssh|telnet|ws|wss)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+", re.IGNORECASE
     )
 
+    # Cloud storage URL patterns for detecting external resource references
+    # These patterns detect references to cloud storage that could indicate
+    # external dependencies or potential data exfiltration vectors
+    CLOUD_STORAGE_PATTERNS: ClassVar[list[tuple[re.Pattern[bytes], str, str]]] = [
+        # AWS S3
+        (re.compile(rb"s3://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "AWS S3 URI", "s3"),
+        (
+            re.compile(rb"https?://[a-zA-Z0-9.\-_]+\.s3\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "AWS S3 URL",
+            "s3",
+        ),
+        (
+            re.compile(rb"https?://s3\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "AWS S3 URL",
+            "s3",
+        ),
+        (
+            re.compile(rb"https?://s3\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "AWS S3 Regional URL",
+            "s3",
+        ),
+        # Google Cloud Storage
+        (re.compile(rb"gs://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Google Cloud Storage URI", "gcs"),
+        (
+            re.compile(rb"https?://storage\.googleapis\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "Google Cloud Storage URL",
+            "gcs",
+        ),
+        (
+            re.compile(rb"https?://storage\.cloud\.google\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "Google Cloud Storage URL",
+            "gcs",
+        ),
+        # Azure Blob Storage
+        (
+            re.compile(rb"https?://[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "Azure Blob Storage URL",
+            "azure",
+        ),
+        (re.compile(rb"az://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Azure Storage URI", "azure"),
+        (
+            re.compile(
+                rb"wasbs?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE
+            ),
+            "Azure WASB URI",
+            "azure",
+        ),
+        (
+            re.compile(
+                rb"abfss?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.dfs\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE
+            ),
+            "Azure ADLS Gen2 URI",
+            "azure",
+        ),
+        # Hugging Face Hub (external model references)
+        (
+            re.compile(rb"https?://huggingface\.co/[a-zA-Z0-9.\-_]+/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+            "HuggingFace Hub URL",
+            "huggingface",
+        ),
+    ]
+
     # IP address patterns (v4 and v6)
     IPV4_PATTERN = re.compile(
         rb"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
@@ -191,6 +253,9 @@ class NetworkCommDetector:
         # Scan for URLs
         self._scan_urls(data, context)
 
+        # Scan for cloud storage URLs (external resource references)
+        self._scan_cloud_storage_urls(data, context)
+
         # Scan for IP addresses
         self._scan_ip_addresses(data, context)
 
@@ -239,6 +304,52 @@ class NetworkCommDetector:
                     "context": context,
                 }
             )
+
+    def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
+        """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).
+
+        These patterns detect references to external cloud storage that could indicate:
+        - External model dependencies
+        - Potential data exfiltration vectors
+        - Supply chain risks from external resources
+        """
+        seen_urls: set[str] = set()
+
+        for pattern, description, provider in self.CLOUD_STORAGE_PATTERNS:
+            for match in pattern.finditer(data):
+                url = match.group().decode("utf-8", errors="ignore")
+
+                # Skip duplicates
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                # Determine severity based on context
+                # INFO for HuggingFace (common and usually legitimate)
+                # INFO for other cloud URLs (informational - may be legitimate)
+                severity = "INFO"
+                confidence = 0.9  # High confidence - pattern is specific
+
+                # Check for suspicious indicators that might elevate severity
+                url_lower = url.lower()
+                suspicious_indicators = ["malware", "exploit", "hack", "evil", "backdoor", "exfil"]
+                if any(indicator in url_lower for indicator in suspicious_indicators):
+                    severity = "WARNING"
+                    confidence = 0.95
+
+                self.findings.append(
+                    {
+                        "type": "cloud_storage_url",
+                        "severity": severity,
+                        "confidence": confidence,
+                        "message": f"{description} detected: {url[:150]}",
+                        "url": url,
+                        "provider": provider,
+                        "description": description,
+                        "position": match.start(),
+                        "context": context,
+                    }
+                )
 
     def _scan_ip_addresses(self, data: bytes, context: str) -> None:
         """Scan for IP address patterns."""
@@ -540,9 +651,20 @@ class NetworkCommDetector:
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
-        is_ml_model = context and any(
-            ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx", ".safetensors"]
-        )
+        ml_extensions = [
+            ".bin",
+            ".pt",
+            ".pth",
+            ".ckpt",
+            ".h5",
+            ".pb",
+            ".onnx",
+            ".safetensors",
+            ".pkl",
+            ".pickle",
+            ".joblib",
+        ]
+        is_ml_model = context and any(ext in context.lower() for ext in ml_extensions)
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns

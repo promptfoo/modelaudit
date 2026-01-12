@@ -138,8 +138,10 @@ class LargeFileHandler:
             with open(self.file_path, "rb") as f:
                 while True:
                     if self._check_timeout():
-                        result.add_issue(
-                            f"Scan timeout after {self.timeout} seconds",
+                        result.add_check(
+                            name="Scan Timeout Check",
+                            passed=False,
+                            message=f"Scan timeout after {self.timeout} seconds",
                             severity=IssueSeverity.WARNING,
                             details={
                                 "bytes_processed": bytes_processed,
@@ -174,8 +176,10 @@ class LargeFileHandler:
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")
-            result.add_issue(
-                f"Scanning error: {e!s}",
+            result.add_check(
+                name="Chunked Scan",
+                passed=False,
+                message=f"Scanning error: {e!s}",
                 severity=IssueSeverity.WARNING,
                 details={"error": str(e)},
             )
@@ -244,7 +248,7 @@ def scan_large_file(
 
     # Use cache manager for large file scans
     try:
-        from ..cache import get_cache_manager
+        from ...cache import get_cache_manager
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
 

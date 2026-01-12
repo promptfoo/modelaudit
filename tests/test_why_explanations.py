@@ -95,7 +95,9 @@ def test_pickle_scanner_includes_why():
                 return (os.system, ("echo pwned",))
 
         pickle.dump(Evil(), f)
+        f.flush()  # Ensure data is written
         temp_path = f.name
+        f.close()  # Close before scanning (required on Windows)
 
     try:
         # Scan the file
@@ -107,11 +109,12 @@ def test_pickle_scanner_includes_why():
         # We should have at least one issue with a 'why' explanation
         assert len(issues_with_why) > 0
 
-        # Check that at least one issue mentions 'os' or 'posix' and has an explanation
+        # Check that at least one issue mentions 'os', 'posix', or 'nt' (Windows) and has an explanation
         system_issues = [
             issue
             for issue in result.issues
-            if ("os" in issue.message.lower() or "posix" in issue.message.lower()) and issue.why is not None
+            if ("os" in issue.message.lower() or "posix" in issue.message.lower() or "nt" in issue.message.lower())
+            and issue.why is not None
         ]
         assert len(system_issues) > 0
 
@@ -365,7 +368,7 @@ def test_scan_result_auto_explanation_integration():
     ]
 
     for message in test_messages:
-        result.add_issue(message, severity=IssueSeverity.WARNING)
+        result.add_check(name="Test Check", passed=False, message=message, severity=IssueSeverity.WARNING)
 
     # Check that the right issues got explanations
     issues_with_explanation = [issue for issue in result.issues if issue.why is not None]
@@ -384,8 +387,10 @@ def test_scan_result_explicit_why_overrides_auto():
     # Add an issue with a message that would normally get an auto-explanation,
     # but provide an explicit 'why' parameter
     explicit_why = "This is a custom explanation that should override the default"
-    result.add_issue(
-        "Maximum ZIP nesting depth exceeded",
+    result.add_check(
+        name="Test Check",
+        passed=False,
+        message="Maximum ZIP nesting depth exceeded",
         severity=IssueSeverity.WARNING,
         why=explicit_why,
     )
@@ -440,7 +445,9 @@ def test_common_message_explanations_security_focus():
 def test_message_explanation_serialization():
     """Test that issues with automatic explanations serialize correctly."""
     result = ScanResult("test_scanner")
-    result.add_issue("File too large: exceeds limit", severity=IssueSeverity.WARNING)
+    result.add_check(
+        name="Test Check", passed=False, message="File too large: exceeds limit", severity=IssueSeverity.WARNING
+    )
 
     # Test dictionary serialization
     result_dict = result.to_dict()
@@ -482,7 +489,7 @@ def test_context_aware_explanations():
 def test_scan_result_context_integration():
     """Test that ScanResult passes scanner context for enhanced explanations."""
     result = ScanResult("pickle_scanner")
-    result.add_issue("Custom objects found in model")
+    result.add_check(name="Test Check", passed=False, message="Custom objects found in model")
 
     # Should get the enhanced pickle-specific explanation
     assert len(result.issues) == 1

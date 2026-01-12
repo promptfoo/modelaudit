@@ -472,21 +472,24 @@ class SecretsDetector:
                 if self._is_whitelisted(secret_text):
                     continue
 
-                # Skip if likely false positive
                 if self._is_likely_false_positive(secret_text, context):
                     continue
 
-                # NEW: Skip password patterns in binary context (model weights)
-                # Check both the text context and if it's from a binary source
-                if description == "Hardcoded Password" and (
+                # Skip crypto/Azure patterns in binary model weights (random bytes match these patterns)
+                binary_false_positive_types = [
+                    "Hardcoded Password",
+                    "Bitcoin Address",
+                    "Ethereum Address",
+                    "Litecoin Address",
+                    "Azure Client Secret",
+                ]
+                if any(fp_type in description for fp_type in binary_false_positive_types) and (
                     is_binary_source or self._is_likely_binary_context(text, position)
                 ):
                     continue
 
-                # Calculate confidence
                 confidence = self._calculate_confidence(secret_text, description, context)
 
-                # Skip low confidence matches if high confidence is required
                 if self.require_high_confidence and confidence < 0.6:
                     continue
 
@@ -610,7 +613,7 @@ def detect_secrets_in_file(file_path: str, max_size: int = 500 * 1024 * 1024) ->
 
     file_size = os.path.getsize(file_path)
     if file_size > max_size:
-        return [{"type": "error", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
+        return [{"type": "info", "severity": "INFO", "message": f"File too large: {file_size} bytes (max: {max_size})"}]
 
     detector = SecretsDetector()
 

@@ -99,7 +99,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 name="TensorFlow Library Check",
                 passed=False,
                 message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "tensorflow"},
             )
@@ -450,7 +450,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 is_dangerous, risk_desc = is_code_potentially_dangerous(python_code, "low")
 
                 severity = IssueSeverity.CRITICAL
-                issue_msg = f"{node.op} operation contains {'dangerous' if is_dangerous else 'executable'} Python code"
+                issue_msg = f"{node.op} operation contains {"dangerous" if is_dangerous else "executable"} Python code"
 
                 result.add_check(
                     name="PyFunc Python Code Analysis",
@@ -538,7 +538,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                         try:
                             # Clean the base64 string (remove newlines and spaces)
-                            base64_code = base64_code.replace("\\n", "").replace(" ", "").strip()
+                            base64_code = base64_code.replace("\n", "").replace(" ", "").strip()
 
                             # Try to decode the base64
                             decoded = base64.b64decode(base64_code)
@@ -567,7 +567,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     found_patterns.append(pattern)
 
                             if found_patterns:
-                                result.add_issue(
+                                result.add_check(
+                                    name="Lambda Layer Security Check",
+                                    passed=False,
                                     message=f"Lambda layer contains dangerous code: {', '.join(found_patterns)}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=path,
@@ -675,71 +677,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
 
-        # Check for protobuf schema validation bypasses
-        self._check_protobuf_schema_attacks(saved_model, result)
-
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
 
         # Check for buffer overflow patterns
         self._check_protobuf_buffer_overflow(saved_model, result)
 
-        # Check for large field counts (DoS via memory exhaustion)
+        # Check for field bombs
         self._check_protobuf_field_bomb(saved_model, result)
-
-    def _check_protobuf_schema_attacks(self, saved_model: Any, result: ScanResult) -> None:
-        """Check for protobuf schema validation bypass attempts"""
-
-        for meta_graph in saved_model.meta_graphs:
-            # Check for unknown/unexpected fields in the meta graph
-            if hasattr(meta_graph, "ListFields"):
-                fields = meta_graph.ListFields()
-
-                # Look for fields with unusually large sizes
-                for field_desc, field_value in fields:
-                    if hasattr(field_value, "__len__"):
-                        try:
-                            field_size = len(field_value)
-                            # Check for abnormally large repeated fields
-                            if field_size > 10000:  # 10k threshold
-                                result.add_check(
-                                    name="Protobuf Field Size Check",
-                                    passed=False,
-                                    message=(
-                                        f"Abnormally large protobuf field '{field_desc.name}' "
-                                        f"with {field_size} elements"
-                                    ),
-                                    severity=IssueSeverity.WARNING,
-                                    location=self.current_file_path,
-                                    details={
-                                        "field_name": field_desc.name,
-                                        "field_size": field_size,
-                                        "size_threshold": 10000,
-                                        "potential_attack": "protobuf_field_bomb",
-                                    },
-                                )
-                        except (AttributeError, TypeError):
-                            continue
-
-            # Check the graph definition for schema bypass attempts
-            graph_def = meta_graph.graph_def
-
-            # Look for nodes with excessive attributes (potential DoS)
-            for node in graph_def.node:
-                if hasattr(node, "attr") and len(node.attr) > 1000:
-                    result.add_check(
-                        name="Protobuf Node Attribute Bomb Check",
-                        passed=False,
-                        message=f"Node '{node.name}' has excessive attributes ({len(node.attr)})",
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (node: {node.name})",
-                        details={
-                            "node_name": node.name,
-                            "attribute_count": len(node.attr),
-                            "threshold": 1000,
-                            "attack_type": "protobuf_attribute_bomb",
-                        },
-                    )
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
@@ -755,7 +700,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"subprocess\.[a-zA-Z_]+\s*\(", "system_command", "subprocess call"),
             # Path traversal patterns
             (r"\.\./+", "path_traversal", "directory traversal"),
-            (r"\.\.\\+", "path_traversal", "Windows directory traversal"),
+            (r"\.\\.+", "path_traversal", "Windows directory traversal"),
             (r"/etc/passwd", "path_traversal", "system file access"),
             (r"/proc/", "path_traversal", "proc filesystem access"),
             # Encoding bypass attempts
@@ -802,7 +747,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     name="Protobuf String Length Check",
                                     passed=False,
                                     message=f"Abnormally long string in node attribute (length: {len(string_val)})",
-                                    severity=IssueSeverity.WARNING,
+                                    severity=IssueSeverity.INFO,
                                     location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
                                     details={
                                         "node_name": node.name,

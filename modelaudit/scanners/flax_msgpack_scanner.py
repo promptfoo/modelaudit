@@ -363,7 +363,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             name="Tensor Shape Validation",
                             passed=False,
                             message="Invalid tensor shape with negative dimensions",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"shape": shape},
                         )
@@ -434,7 +434,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="Recursion Depth Check",
                 passed=False,
                 message=f"Maximum recursion depth exceeded: {depth}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=location,
                 details={"depth": depth, "max_allowed": self.max_recursion_depth},
             )
@@ -759,7 +759,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="ML Model Pattern Validation",
                 passed=False,
                 message="Suspicious data structure - does not match known ML model patterns",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location="root",
                 details={
                     "analysis": ml_analysis,
@@ -819,7 +819,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="msgpack Library Check",
                 passed=False,
                 message="msgpack library not installed - cannot analyze Flax checkpoints",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "msgpack"},
             )
@@ -879,7 +879,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         name="Msgpack Format Validation",
                         passed=False,
                         message=f"Invalid msgpack format: {e!s}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"msgpack_error": str(e)},
                     )
@@ -910,7 +910,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 name="File Size Safety Check",
                 passed=False,
                 message="File too large to process safely - potential memory exhaustion attack",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
             )
             result.finish(success=False)

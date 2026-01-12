@@ -292,17 +292,18 @@ CVE_COMBINED_PATTERNS = {
 }
 
 # Binary patterns for CVE detection in raw file content
+# NOTE: Overly broad patterns like b"sklearn", b"NumpyArrayWrapper", b"numpy_pickle" were removed
+# because they flagged ALL legitimate sklearn/joblib models (100% false positive rate).
+# The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS) correctly detect
+# actual exploits by requiring COMBINATIONS (e.g., "sklearn.*joblib.*os.system"), not individual keywords.
 CVE_BINARY_PATTERNS = [
     # CVE-2020-13092 binary signatures
     b"joblib.load",
-    b"sklearn",
     b"__reduce__",
     b"os.system",
     b"Pipeline",
     # CVE-2024-34997 binary signatures
-    b"NumpyArrayWrapper",
     b"read_array",
-    b"numpy_pickle",
     b"pickle.load",
     b"joblib.cache",
 ]
@@ -576,11 +577,11 @@ JINJA2_SSTI_PATTERNS = {
         r"['\"]\.join\(",  # String joining: ''.join([chr(x) for x in ...])
         # Attribute access bypasses
         r"\|attr\(",  # Jinja2 filter: |attr('__class__')
-        r"\[['\"]\w+['\"]\]",  # Bracket notation: ['__class__']
+        r"\[['\"]__\w+__['\"]\]",  # Bracket notation for dunder attrs: ['__class__'], ['__init__']
         r"getattr\s*\(",  # getattr(obj, '__class__')
         # String construction bypasses
         r"format\s*\(",  # String formatting
-        r"|format\(",  # Template string formatting
+        r"\|format\(",  # Template string formatting (Jinja2 pipe filter)
         r"f['\"].*\{",  # f-string formatting
         # Base64 and other encoding
         r"base64\.",  # Base64 encoding/decoding

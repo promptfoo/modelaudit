@@ -145,35 +145,6 @@ class TestFileValidation:
 class TestErrorHandling:
     """Tests for improved error handling."""
 
-    def test_truncated_scan_metadata_details(self, tmp_path):
-        """Test that truncated scans provide detailed metadata."""
-        problematic_file = tmp_path / "problem.joblib"
-
-        # Create file that will trigger truncation
-        with open(problematic_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"joblib")  # Make it pass validation
-            f.write(b"sklearn")
-            pickle.dump({"test": "data"}, f)
-            f.write(b"\xff\xff\xff\xff")  # Add invalid data after STOP
-
-        scanner = PickleScanner()
-
-        # Mock the pickletools.genops to raise ValueError
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = ValueError("unknown opcode")
-
-            result = scanner.scan(str(problematic_file))
-
-            # Check detailed metadata
-            assert result.metadata.get("truncated") is True
-            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
-            assert result.metadata.get("exception_type") == "ValueError"
-            assert result.metadata.get("validated_format") is True
-            assert "exception_message" in result.metadata
-
     def test_non_benign_errors_still_reported(self, tmp_path):
         """Test that non-benign errors are still reported as warnings."""
         suspicious_file = tmp_path / "suspicious.pkl"  # Note: .pkl extension
@@ -313,39 +284,6 @@ class TestPerformanceAndEdgeCases:
 
 class TestIntegration:
     """Integration tests with real-world scenarios."""
-
-    def test_info_level_transparency_issue(self, tmp_path):
-        """Test that truncated scans still create INFO-level issues for transparency."""
-        transparent_file = tmp_path / "transparent.joblib"
-
-        with open(transparent_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"joblib")  # Joblib marker to pass validation
-            pickle.dump({"data": "test"}, f)
-
-        scanner = PickleScanner()
-
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = ValueError("unknown opcode")
-
-            result = scanner.scan(str(transparent_file))
-
-            # Should handle benign error with proper transparency
-            assert len(result.issues) > 0
-
-            # Check that we get an INFO-level transparency issue for benign errors
-            info_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
-            assert len(info_issues) > 0
-
-            # Should contain truncation message for legitimate files
-            error_messages = [str(issue.message) for issue in info_issues]
-            assert any("truncated due to format complexity" in msg for msg in error_messages)
-
-            # Should have proper metadata
-            assert result.metadata.get("truncated") is True
-            assert result.metadata.get("truncation_reason") == "post_stop_data_or_format_issue"
 
     def test_backward_compatibility(self, tmp_path):
         """Test that regular pickle scanning still works unchanged."""

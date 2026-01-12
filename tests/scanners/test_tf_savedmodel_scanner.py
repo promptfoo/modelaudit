@@ -155,8 +155,9 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(invalid_dir))
 
-    # Should have errors about invalid protobuf format or TensorFlow not installed
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    # Should have issues about invalid protobuf format or TensorFlow not installed
+    # Note: Missing dependencies are WARNING (not security issue), errors in parsing are CRITICAL
+    assert len(result.issues) > 0
     assert any(
         "error" in issue.message.lower()
         or "parsing" in issue.message.lower()
@@ -236,8 +237,9 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(test_file))
 
-    # Should have an error about invalid protobuf format or TensorFlow not installed
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    # Should have an issue about invalid protobuf format or TensorFlow not installed
+    # Note: Missing dependencies are WARNING (not security issue), errors in parsing are CRITICAL
+    assert len(result.issues) > 0
     assert any(
         "error" in issue.message.lower()
         or "parsing" in issue.message.lower()
@@ -247,7 +249,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
 
 
 @pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_unreadable_file(tmp_path):
+def test_tf_savedmodel_scanner_unreadable_file(tmp_path, requires_symlinks):
     """Scanner should report unreadable files instead of silently skipping."""
     model_dir = create_tf_savedmodel(tmp_path)
 

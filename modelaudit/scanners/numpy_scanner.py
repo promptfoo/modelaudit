@@ -129,7 +129,7 @@ class NumPyScanner(BaseScanner):
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for scanning .npy files",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"numpy_version": NUMPY_VERSION},
             )
@@ -177,7 +177,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Magic String Validation",
                             passed=False,
                             message="Invalid NumPy file magic",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"expected": "\x93NUMPY", "found": magic.hex()},
                         )
@@ -212,7 +212,7 @@ class NumPyScanner(BaseScanner):
                             name="NumPy Header Read",
                             passed=False,
                             message=f"Failed to read NumPy array header: {header_error}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={"numpy_version": NUMPY_VERSION, "header_error": str(header_error)},
                         )
@@ -265,18 +265,20 @@ class NumPyScanner(BaseScanner):
                         expected_size = data_offset + expected_data_size
                     except ValueError as e:
                         # Determine which validation failed based on error message
-                        if "dimensions" in str(e).lower():
+                        error_msg = str(e).lower()
+                        if "dimensions" in error_msg:
                             check_name = "Array Dimension Validation"
-                        elif "dtype" in str(e).lower():
+                        elif "dtype" in error_msg:
                             check_name = "Data Type Safety Check"
                         else:
                             check_name = "Array Size Validation"
 
+                        # Size/dimension limit errors are informational - may indicate large legitimate arrays
                         result.add_check(
                             name=check_name,
                             passed=False,
                             message=f"Array validation failed: {e}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "security_check": "array_validation",
@@ -293,7 +295,7 @@ class NumPyScanner(BaseScanner):
                             name="File Integrity Check",
                             passed=False,
                             message="File size does not match header information",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             details={
                                 "expected_size": expected_size,

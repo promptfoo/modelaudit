@@ -15,7 +15,7 @@ def test_scan_mlflow_model_import_error(monkeypatch):
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-@patch("modelaudit.integrations.mlflow.scan_model_directory_or_file")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     """Test successful MLflow model scanning."""
     # Mock MLflow
@@ -73,7 +73,7 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-@patch("modelaudit.integrations.mlflow.scan_model_directory_or_file")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
     """Test MLflow model scanning when download returns a file path."""
     # Mock MLflow
@@ -97,7 +97,7 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
 
         # Verify scan was called with the directory path, not the file path
         mock_scan.assert_called_once()
-        args, kwargs = mock_scan.call_args
+        args, _kwargs = mock_scan.call_args
         assert args[0] == temp_dir  # Should be directory, not file
 
 
@@ -130,7 +130,7 @@ def test_scan_mlflow_model_no_registry_uri():
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
         patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value="/tmp/test"),
-        patch("modelaudit.integrations.mlflow.scan_model_directory_or_file", return_value={}),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value={}),
         patch("modelaudit.integrations.mlflow.shutil.rmtree"),
     ):
         scan_mlflow_model("models:/TestModel/1")

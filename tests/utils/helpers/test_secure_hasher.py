@@ -2,6 +2,7 @@
 
 import builtins
 import contextlib
+import os
 
 import pytest
 
@@ -249,6 +250,7 @@ class TestBenchmarking:
 class TestErrorHandling:
     """Test error handling scenarios."""
 
+    @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Unix-like file permissions required")
     def test_hash_permission_denied(self, tmp_path):
         """Test handling of permission denied errors."""
         # This test is platform-specific and may not work on all systems

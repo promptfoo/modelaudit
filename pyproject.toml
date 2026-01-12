@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.6"
+version = "0.2.24"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
-    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" }
+    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" },
+    { name = "Yash Chhabria", email = "yash@promptfoo.dev" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
@@ -23,12 +24,17 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.1.7",
     "yaspin>=2.5.0",
-    "numpy>=1.19.0",
+    # NumPy version depends on Python version for compatibility
+    # Python 3.10: NumPy 1.x (NumPy 2.x requires Python >=3.11)
+    # Python 3.11+: NumPy 2.x (better performance, modern ML framework support)
+    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=2.4,<2.5; python_version >= '3.11'",
     "scipy>=1.7.0",
     "cyclonedx-python-lib>=11.0.0",
     "defusedxml>=0.7.1",
@@ -38,93 +44,99 @@ dependencies = [
     "platformdirs>=3.0.0",
     "pyyaml>=6.0,<7.0",
     "pydantic>=2.11.0,<3.0",
-    "fickling==0.1.4",
-    "contourpy<1.3.3",
+    "contourpy<1.3.4",
+    "fsspec>=2025.5.1",
+    "s3fs>=2025.5.1",
+    "gcsfs>=2025.5.1",
+    "posthog>=7.0.0",
 ]
 
 [project.optional-dependencies]
-# Note: ML frameworks may require NumPy < 2.0 for compatibility
-# If you encounter NumPy compatibility issues, consider using:
-# pip install "numpy<2.0" tensorflow h5py torch onnx
-tensorflow = ["tensorflow>=2.13.0,<3.0"]
+# TensorFlow version depends on Python version:
+# - Python 3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
+# - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required)
+tensorflow = [
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
+]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
 yaml = ["pyyaml>=6.0,<7.0"]
 safetensors = ["safetensors>=0.4.0"]
-onnx = ["onnx>=1.12.0,<2.0"]
+onnx = ["onnx>=1.12.0,<2.0; python_version < '3.13'"]
 dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
-coreml = ["coremltools>=8.0"]
-tensorrt = ["tensorrt>=8.6.0"]
-xgboost = ["xgboost>=1.6.0,<3.0", "py-ubjson>=0.16.0"]
+tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
+xgboost = ["xgboost>=3.1.2,<3.2", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
-cloud = ["fsspec>=2025.5.1", "s3fs>=2025.5.1", "gcsfs>=2025.5.1"]
 sevenzip = ["py7zr>=0.20.0"]
-# Full NumPy 1.x compatibility mode - use this if you need all ML frameworks to work
+# Full ML framework bundle with version-appropriate NumPy:
+# - Python 3.10: NumPy 1.x + TensorFlow 2.13+
+# - Python 3.11+: NumPy 2.x + TensorFlow 2.17+
 numpy1 = [
-    "numpy>=1.19.0,<2.0",
-    "tensorflow>=2.13.0,<3.0",
+    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=2.4,<2.5; python_version >= '3.11'",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
 ]
 # All dependencies except platform-specific ones (for CI)
+# TensorFlow version depends on Python version (see tensorflow extra above)
 all-ci = [
-    "tensorflow>=2.13.0,<3.0",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
-    "xgboost>=1.6.0,<3.0",
+    "xgboost>=3.1.2,<3.2",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
+]
+# Lightweight Windows CI dependencies (avoids heavy ML frameworks)
+all-ci-windows = [
+    "dill>=0.3.0,<1.0",
+    "joblib>=1.0.0,<2.0",
+    "msgpack>=1.0.0,<2.0",
+    "safetensors>=0.4.0",
 ]
 all = [
-    "tensorflow>=2.13.0,<3.0",
+    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
-    "onnx>=1.12.0,<2.0",
+    "onnx>=1.12.0,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "coremltools>=8.0",
-    "xgboost>=1.6.0,<3.0",
+    "xgboost>=3.1.2,<3.2",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
-    "fsspec>=2025.5.1",
-    "s3fs>=2025.5.1",
-    "gcsfs>=2025.5.1",
 ]
 
 [project.scripts]
@@ -134,9 +146,8 @@ modelaudit = "modelaudit.cli:main"
 Repository = "https://github.com/promptfoo/modelaudit"
 Homepage = "https://github.com/promptfoo/modelaudit"
 
-[tool.rye]
-managed = true
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.4.0",
     "coverage>=7.9.0",
     "mypy>=1.16.0",
@@ -152,6 +163,11 @@ dev-dependencies = [
     "pyupgrade>=3.20.0",
     "ty>=0.0.1a20",
 ]
+
+[tool.uv]
+# Exclude platform-specific extras from universal lock file resolution
+# tensorrt only supports Linux and Windows
+default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 120
@@ -203,19 +219,54 @@ addopts = [
 ]
 testpaths = ["tests"]
 markers = [
+    # Test category markers
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "performance: marks tests as performance benchmarks",
     "unit: marks tests as unit tests (fast)",
     "asyncio: marks tests as asyncio tests",
+    # Framework-specific markers (tests auto-skip if framework unavailable)
+    "tensorflow: marks tests as requiring TensorFlow",
+    "pytorch: marks tests as requiring PyTorch",
+    "onnx: marks tests as requiring ONNX",
+    "h5py: marks tests as requiring h5py",
+    "msgpack: marks tests as requiring msgpack",
+    "xgboost: marks tests as requiring XGBoost",
+    "safetensors: marks tests as requiring safetensors",
+    "joblib: marks tests as requiring joblib",
+    "dill: marks tests as requiring dill",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
 
+[tool.coverage.run]
+source = ["modelaudit"]
+branch = true
+parallel = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+precision = 2
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
 [tool.mypy]
 python_version = "3.10"
+plugins = ["pydantic.mypy"]
 
 # Phase 1: Immediate improvements to catch real bugs
 warn_return_any = true         # Warn when returning Any from typed functions

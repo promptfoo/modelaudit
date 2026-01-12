@@ -148,15 +148,6 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
-            "coreml": {
-                "module": "modelaudit.scanners.coreml_scanner",
-                "class": "CoreMLScanner",
-                "description": "Scans Apple Core ML model files",
-                "extensions": [".mlmodel"],
-                "priority": 6,
-                "dependencies": ["coreml"],  # Heavy dependency
-                "numpy_sensitive": True,
-            },
             "openvino": {
                 "module": "modelaudit.scanners.openvino_scanner",
                 "class": "OpenVinoScanner",
@@ -200,6 +191,15 @@ class ScannerRegistry:
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "skops": {
+                "module": "modelaudit.scanners.skops_scanner",
+                "class": "SkopsScanner",
+                "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+                "extensions": [".skops"],
+                "priority": 8,  # Same priority as joblib
+                "dependencies": [],  # No heavy dependencies (uses standard zipfile)
                 "numpy_sensitive": False,
             },
             "numpy": {
@@ -662,12 +662,12 @@ def __getattr__(name: str) -> Any:
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
-        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
         "ManifestScanner": "manifest",

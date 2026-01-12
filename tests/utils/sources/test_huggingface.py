@@ -222,8 +222,8 @@ class TestModelSizeAndDiskSpace:
         size = get_model_size("test/model")
         assert size is None
 
-    @patch("modelaudit.utils.huggingface.get_model_size")
-    @patch("modelaudit.utils.huggingface.check_disk_space")
+    @patch("modelaudit.utils.sources.huggingface.get_model_size")
+    @patch("modelaudit.utils.sources.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_insufficient_disk_space(
         self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
@@ -237,14 +237,14 @@ class TestModelSizeAndDiskSpace:
 
         # Test download failure with custom cache directory (this enables disk space checking)
         cache_dir = tmp_path / "custom_cache"
-        with pytest.raises(Exception, match="Cannot download model.*Insufficient disk space"):
+        with pytest.raises(Exception, match=r"Cannot download model.*Insufficient disk space"):
             download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         # Verify snapshot_download was not called
         mock_snapshot_download.assert_not_called()
 
-    @patch("modelaudit.utils.huggingface.get_model_size")
-    @patch("modelaudit.utils.huggingface.check_disk_space")
+    @patch("modelaudit.utils.sources.huggingface.get_model_size")
+    @patch("modelaudit.utils.sources.huggingface.check_disk_space")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_disk_space_check(
         self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
@@ -282,14 +282,17 @@ class TestGetModelInfo:
         mock_hf_api_class.return_value = mock_api
 
         model_info = SimpleNamespace(
-            siblings=[
-                SimpleNamespace(rfilename="config.json", size=100),
-                SimpleNamespace(rfilename="README.md", size=50),
-            ],
             modelId="test/model",
             author="test-author",
         )
         mock_api.model_info.return_value = model_info
+
+        # Mock list_repo_tree which is used to get accurate file sizes
+        # (implementation skips .gitattributes and README.md)
+        mock_api.list_repo_tree.return_value = [
+            SimpleNamespace(path="config.json", size=100),
+            SimpleNamespace(path="README.md", size=50),  # This will be skipped
+        ]
 
         info = get_model_info("https://huggingface.co/test/model")
 

@@ -114,6 +114,16 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
+            # Check for XML-based formats (OpenVINO and PMML)
+            if magic16.startswith(b"<?xml"):
+                # Read first 64 bytes to check for format-specific tags
+                f.seek(0)
+                xml_header = f.read(64)
+                if b"<net" in xml_header:
+                    return "openvino"
+                if b"<PMML" in xml_header:
+                    return "pmml"
+
             # SafeTensors format check: 8-byte length header + JSON metadata
             if size >= 12:  # Minimum: 8 bytes length + some JSON
                 try:
@@ -246,7 +256,7 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
     if ext in (".pdmodel", ".pdiparams"):
         return "paddle"
-    if ext in (".msgpack", ".flax", ".orbax", ".jax"):
+    if ext == ".msgpack":
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
@@ -267,8 +277,6 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
-    if ext == ".mlmodel":
-        return "coreml"
     if ext in (
         ".tar",
         ".tar.gz",
@@ -331,11 +339,11 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
-    ".mlmodel": "coreml",
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
     ".engine": "tensorrt",
     ".plan": "tensorrt",
+    ".msgpack": "flax_msgpack",
 }
 
 
@@ -374,8 +382,6 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "protobuf"
         case ".tflite":
             return "tflite"
-        case ".mlmodel":
-            return "coreml"
         case ".engine":
             return "tensorrt"
         case ".pdmodel":
@@ -387,7 +393,7 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         case ".npy" | ".npz":
             return "numpy"
         case ".msgpack":
-            return "msgpack"
+            return "flax_msgpack"
         case ".7z":
             return "sevenzip"
         case _:
@@ -441,6 +447,10 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
+        # PMML files are XML-based with <PMML> tag detection
+        if ext_format == "pmml" and header_format == "pmml":
+            return True
+
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
         if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
             return True
@@ -469,8 +479,14 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "onnx":
             return header_format in {"onnx", "unknown"}
 
-        # NumPy files should match
+        # NumPy files (.npy should match, .npz is ZIP by design)
         if ext_format == "numpy":
+            # .npz files are ZIP archives containing multiple .npy files
+            # This is the standard NumPy compressed format, not spoofing
+            # Use case-insensitive suffix check to handle MODEL.NPZ, model.Npz, etc.
+            file_path = Path(path)
+            if file_path.suffix.lower() == ".npz":
+                return header_format in {"zip", "numpy"}
             return header_format == "numpy"
 
         # Flax msgpack files (less strict validation)
@@ -484,9 +500,6 @@ def validate_file_type(path: str) -> bool:
         # TensorFlow Lite files
         if ext_format == "tflite":
             return True  # TFLite format can be complex to validate
-
-        if ext_format == "coreml":
-            return True  # Core ML files are protobuf and lack clear magic bytes
 
         if ext_format == "tensorrt":
             return True  # TensorRT engine files have complex binary format

@@ -55,6 +55,7 @@ def test_interrupt_check():
 
 @pytest.mark.integration
 @pytest.mark.slow
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT handling differs on Windows")
 def test_interrupt_during_scan():
     """Test interrupting a scan in progress."""
     import pickle

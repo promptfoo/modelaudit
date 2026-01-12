@@ -26,7 +26,6 @@ def test_scanner_registry_contains_all_scanners():
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
         "TFLiteScanner": "tflite",
-        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",

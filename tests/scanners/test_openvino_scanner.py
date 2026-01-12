@@ -24,10 +24,10 @@ def test_openvino_scanner_basic(tmp_path: Path) -> None:
     assert result.metadata["xml_size"] == xml_path.stat().st_size
     assert result.metadata.get("bin_size") == (tmp_path / "model.bin").stat().st_size
 
-    # Should have file type validation warning for minimal XML
+    # Should have file type validation info for minimal XML
     file_type_issues = [i for i in result.issues if "File type validation failed" in i.message]
     assert len(file_type_issues) == 1
-    assert file_type_issues[0].severity.value == "warning"
+    assert file_type_issues[0].severity.value == "info"
 
 
 def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
@@ -37,7 +37,8 @@ def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     result = OpenVinoScanner().scan(str(xml_path))
     messages = [i.message.lower() for i in result.issues]
     assert any("weights file not found" in m for m in messages)
-    assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
+    # Missing weights file is INFO severity (not a security concern)
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
 def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:

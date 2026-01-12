@@ -65,7 +65,6 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
-        ".mlmodel": "coreml",
         ".unknown": "unknown",
     }
 
@@ -249,6 +248,17 @@ def test_validate_file_type(tmp_path):
     bad_gguf.write_bytes(b"FAKE" + b"\x00" * 20)
     assert validate_file_type(str(bad_gguf)) is False
 
+    # NumPy .npz file (ZIP archive by design)
+    npz_path = tmp_path / "arrays.npz"
+    # .npz files are ZIP archives - this is correct, not spoofing
+    npz_path.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+    assert validate_file_type(str(npz_path)) is True
+
+    # NumPy .npy file should have numpy magic
+    npy_path = tmp_path / "array.npy"
+    npy_path.write_bytes(b"\x93NUMPY" + b"\x00" * 20)
+    assert validate_file_type(str(npy_path)) is True
+
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"
     small_file.write_bytes(b"hi")
@@ -286,3 +296,203 @@ def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "open", open_raise)
     assert detect_file_format_from_magic(str(file_path)) == "unknown"
+
+
+def test_detect_openvino_xml_format(tmp_path):
+    """Test detecting OpenVINO XML files by magic bytes."""
+    # Create an OpenVINO XML file with standard XML header
+    xml_path = tmp_path / "openvino_model.xml"
+    xml_content = b'<?xml version="1.0"?>\n<net name="Model0" version="11">\n</net>'
+    xml_path.write_bytes(xml_content)
+
+    # Test magic byte detection
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+    # Test extension detection
+    assert detect_format_from_extension(str(xml_path)) == "openvino"
+
+    # Test file type validation should pass (no mismatch)
+    assert validate_file_type(str(xml_path)) is True
+
+
+def test_detect_pmml_xml_format(tmp_path):
+    """Test detecting PMML XML files by magic bytes."""
+    # Create a PMML XML file with standard XML header
+    pmml_path = tmp_path / "model.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML version="4.4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Test magic byte detection should now recognize PMML
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+    # Test extension detection
+    assert detect_format_from_extension(str(pmml_path)) == "pmml"
+
+    # Test file type validation should pass (no mismatch)
+    assert validate_file_type(str(pmml_path)) is True
+
+
+def test_msgpack_validation_valid_format(tmp_path):
+    """Test that valid MessagePack files pass validation (regression test for false positive)."""
+    # Create a valid MessagePack file with real Flax model header
+    # 0x81 = fixmap with 1 element
+    # 0xab = fixstr with 11 characters
+    # Following bytes spell "transformer"
+    msgpack_path = tmp_path / "model.msgpack"
+    msgpack_content = (
+        bytes(
+            [
+                0x81,
+                0xAB,  # fixmap(1), fixstr(11)
+                0x74,
+                0x72,
+                0x61,
+                0x6E,
+                0x73,
+                0x66,
+                0x6F,
+                0x72,
+                0x6D,
+                0x65,
+                0x72,  # "transformer"
+                0x84,  # fixmap(4) for nested data
+            ]
+        )
+        + b"\x00" * 100
+    )  # Additional data
+
+    msgpack_path.write_bytes(msgpack_content)
+
+    # Test that extension detection returns flax_msgpack
+    assert detect_format_from_extension(str(msgpack_path)) == "flax_msgpack"
+
+    # Test that validation passes (this was the bug - it was failing before)
+    assert validate_file_type(str(msgpack_path)) is True
+
+
+def test_detect_generic_xml_format(tmp_path):
+    """Test that generic XML files don't get misdetected as OpenVINO."""
+    # Create a generic XML file (SVG, config, etc.)
+    xml_path = tmp_path / "config.xml"
+    xml_content = b'<?xml version="1.0"?>\n<configuration>\n<setting>value</setting>\n</configuration>'
+    xml_path.write_bytes(xml_content)
+
+    # Magic detection should return unknown (no <net> tag)
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+
+
+def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
+    """Test that <net> tag beyond 64 bytes is not detected as OpenVINO."""
+    # Create XML where <net> appears after 64 bytes
+    xml_path = tmp_path / "late_net.xml"
+    # Padding to push <net> beyond 64 bytes
+    padding = b" " * 50
+    xml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<net name="Model0">\n</net>'
+    xml_path.write_bytes(xml_content)
+
+    # Should return unknown since <net> is beyond the 64-byte read limit
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+
+
+def test_detect_openvino_xml_short_file(tmp_path):
+    """Test OpenVINO detection with file smaller than 64 bytes."""
+    # Create a short OpenVINO XML file
+    xml_path = tmp_path / "short.xml"
+    xml_content = b'<?xml version="1.0"?>\n<net/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as openvino (file is small but contains <net>)
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_detect_xml_with_net_in_comment(tmp_path):
+    """Test that <net> in XML comment doesn't trigger false positive."""
+    # Create XML with <net> inside a comment
+    xml_path = tmp_path / "commented.xml"
+    xml_content = b'<?xml version="1.0"?>\n<!-- <net> -->\n<root/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as openvino because we're doing simple byte matching
+    # This is acceptable - the actual OpenVINO scanner will validate properly
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_xml_detection_boundary_conditions(tmp_path):
+    """Test XML detection at exact 64-byte boundary."""
+    # Create XML where <net> is at exactly byte 60 (within 64 bytes)
+    xml_path = tmp_path / "boundary.xml"
+    # Position <net> to be just within the 64-byte limit
+    xml_content = b'<?xml version="1.0"?>' + (b" " * 17) + b'<net name="M"/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should detect as openvino
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+
+
+def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
+    """Test that <PMML> tag beyond 64 bytes is not detected as PMML."""
+    # Create XML where <PMML> appears after 64 bytes
+    pmml_path = tmp_path / "late_pmml.pmml"
+    # Padding to push <PMML> beyond 64 bytes
+    padding = b" " * 50
+    pmml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<PMML version="4.4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should return unknown since <PMML> is beyond the 64-byte read limit
+    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
+
+
+def test_detect_pmml_xml_short_file(tmp_path):
+    """Test PMML detection with file smaller than 64 bytes."""
+    # Create a short PMML XML file
+    pmml_path = tmp_path / "short.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML/>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should still detect as pmml (file is small but contains <PMML>)
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_detect_xml_with_pmml_in_comment(tmp_path):
+    """Test that <PMML> in XML comment still triggers detection."""
+    # Create XML with <PMML> inside a comment
+    xml_path = tmp_path / "commented.pmml"
+    xml_content = b'<?xml version="1.0"?>\n<!-- <PMML> -->\n<root/>'
+    xml_path.write_bytes(xml_content)
+
+    # Should still detect as pmml because we're doing simple byte matching
+    # This is acceptable - the actual PMML scanner will validate properly
+    assert detect_file_format_from_magic(str(xml_path)) == "pmml"
+
+
+def test_pmml_detection_boundary_conditions(tmp_path):
+    """Test PMML detection at exact 64-byte boundary."""
+    # Create XML where <PMML> is just within the 64-byte limit
+    pmml_path = tmp_path / "boundary.pmml"
+    # Position <PMML> to be just within the 64-byte limit
+    pmml_content = b'<?xml version="1.0"?>' + (b" " * 16) + b'<PMML version="4"/>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Should detect as pmml
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_openvino_vs_pmml_detection(tmp_path):
+    """Test that OpenVINO and PMML formats are detected independently."""
+    # OpenVINO file
+    openvino_path = tmp_path / "model.xml"
+    openvino_content = b'<?xml version="1.0"?>\n<net name="Model0" version="11">\n</net>'
+    openvino_path.write_bytes(openvino_content)
+
+    # PMML file
+    pmml_path = tmp_path / "model.pmml"
+    pmml_content = b'<?xml version="1.0"?>\n<PMML version="4.4" xmlns="http://www.dmg.org/PMML-4_4">\n</PMML>'
+    pmml_path.write_bytes(pmml_content)
+
+    # Each should be detected correctly
+    assert detect_file_format_from_magic(str(openvino_path)) == "openvino"
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+    # Validation should pass for both
+    assert validate_file_type(str(openvino_path)) is True
+    assert validate_file_type(str(pmml_path)) is True

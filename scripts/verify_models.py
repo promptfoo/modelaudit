@@ -8,7 +8,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import requests
 
@@ -46,7 +45,7 @@ def check_local_file(file_path: str) -> bool:
     return Path(file_path).exists()
 
 
-def parse_model_table_row(line: str) -> Optional[tuple[str, str, str, str, str]]:
+def parse_model_table_row(line: str) -> tuple[str, str, str, str, str] | None:
     """Parse a markdown table row to extract model info."""
     if not line.strip() or not line.strip().startswith("|"):
         return None

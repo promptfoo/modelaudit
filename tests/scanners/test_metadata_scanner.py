@@ -66,7 +66,7 @@ class TestMetadataScanner:
             result = scanner.scan(str(readme_path))
 
         assert len(result.issues) == 2
-        assert all(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("bit.ly" in issue.message for issue in result.issues)
         assert any("ngrok.io" in issue.message for issue in result.issues)
 
@@ -77,16 +77,17 @@ class TestMetadataScanner:
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
+                # Use a 48-character key after sk- to match the OpenAI API key pattern
                 f.write(
-                    "# Model Setup\\n\\n"
-                    + "API Key: sk-1234567890abcdef1234567890abcdef12345678\\n"
-                    + "Token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n"
+                    "# Model Setup\n\n"
+                    + "API Key: sk-1234567890abcdef1234567890abcdef1234567890abcdef\n"
+                    + "Token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
                 )
 
             result = scanner.scan(str(readme_path))
 
         assert len(result.issues) >= 1  # Should detect at least one potential secret
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
     def test_scan_ignores_placeholder_secrets(self):
         """Test that obvious placeholders are not flagged as secrets."""
@@ -109,6 +110,7 @@ class TestMetadataScanner:
         result = scanner.scan("/nonexistent/README.md")
 
         assert len(result.issues) == 1
+        # File access errors are WARNING severity (may indicate tampering)
         assert result.issues[0].severity == IssueSeverity.WARNING
         assert "Error reading" in result.issues[0].message
 
