@@ -287,6 +287,13 @@ class JoblibScanner(BaseScanner):
         """Extract joblib metadata."""
         metadata = super().extract_metadata(file_path)
 
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
         try:
             import joblib
 

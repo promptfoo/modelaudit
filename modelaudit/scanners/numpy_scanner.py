@@ -84,8 +84,8 @@ class NumPyScanner(BaseScanner):
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
-        dangerous_names = ["object"]
-        dangerous_kinds = ["O"]  # Python object kind only
+        dangerous_names = ["object", "void"]
+        dangerous_kinds = ["O", "V"]  # Python object and raw void kinds
 
         if dtype.name in dangerous_names or dtype.kind in dangerous_kinds or getattr(dtype, "hasobject", False):
             raise ValueError(

@@ -450,7 +450,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 is_dangerous, risk_desc = is_code_potentially_dangerous(python_code, "low")
 
                 severity = IssueSeverity.CRITICAL
-                issue_msg = f"{node.op} operation contains {"dangerous" if is_dangerous else "executable"} Python code"
+                issue_msg = f"{node.op} operation contains {'dangerous' if is_dangerous else 'executable'} Python code"
 
                 result.add_check(
                     name="PyFunc Python Code Analysis",
@@ -872,6 +872,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract TensorFlow SavedModel metadata."""
         metadata = super().extract_metadata(file_path)
+
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
 
         if not _check_tensorflow():
             metadata["error"] = "TensorFlow library not available"

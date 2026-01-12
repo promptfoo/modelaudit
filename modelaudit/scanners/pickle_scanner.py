@@ -4152,6 +4152,8 @@ class PickleScanner(BaseScanner):
         """Extract pickle file metadata."""
         metadata = super().extract_metadata(file_path)
 
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
         try:
             import pickle
             import pickletools
@@ -4198,44 +4200,49 @@ class PickleScanner(BaseScanner):
             except Exception:
                 pass
 
-            # Try to load and analyze content (safely)
-            try:
-                # Only try to load if it looks safe (no dangerous opcodes)
-                if not metadata.get("dangerous_opcodes"):
-                    with open(file_path, "rb") as f:
-                        try:
-                            obj = pickle.load(f)
-                            metadata.update(
-                                {
-                                    "object_type": type(obj).__name__,
-                                    "object_module": getattr(type(obj), "__module__", "unknown"),
-                                }
-                            )
-
-                            # Analyze object structure
-                            if isinstance(obj, dict):
+            # Try to load and analyze content (safely) only if explicitly allowed
+            if allow_deserialization:
+                try:
+                    # Only try to load if it looks safe (no dangerous opcodes)
+                    if not metadata.get("dangerous_opcodes"):
+                        with open(file_path, "rb") as f:
+                            try:
+                                obj = pickle.load(f)
                                 metadata.update(
                                     {
-                                        "dict_keys": list(obj.keys())[:10],  # First 10 keys
-                                        "dict_size": len(obj),
-                                    }
-                                )
-                            elif hasattr(obj, "__dict__"):
-                                attrs = list(obj.__dict__.keys())[:10]
-                                metadata.update(
-                                    {
-                                        "object_attributes": attrs,
-                                        "attribute_count": len(obj.__dict__),
+                                        "object_type": type(obj).__name__,
+                                        "object_module": getattr(type(obj), "__module__", "unknown"),
                                     }
                                 )
 
-                        except Exception:
-                            metadata["safe_loading"] = False
-                else:
+                                # Analyze object structure
+                                if isinstance(obj, dict):
+                                    metadata.update(
+                                        {
+                                            "dict_keys": list(obj.keys())[:10],  # First 10 keys
+                                            "dict_size": len(obj),
+                                        }
+                                    )
+                                elif hasattr(obj, "__dict__"):
+                                    attrs = list(obj.__dict__.keys())[:10]
+                                    metadata.update(
+                                        {
+                                            "object_attributes": attrs,
+                                            "attribute_count": len(obj.__dict__),
+                                        }
+                                    )
+
+                            except Exception:
+                                metadata["safe_loading"] = False
+                    else:
+                        metadata["safe_loading"] = False
+
+                except Exception:
                     metadata["safe_loading"] = False
-
-            except Exception:
-                pass
+            else:
+                metadata["safe_loading"] = False
+                metadata["deserialization_skipped"] = True
+                metadata["reason"] = "Deserialization disabled for metadata extraction"
 
         except Exception as e:
             metadata["extraction_error"] = str(e)
