@@ -12,16 +12,18 @@ from .scanners import SCANNER_REGISTRY
 class ModelMetadataExtractor:
     """Extract metadata from ML model files using existing scanner infrastructure."""
 
-    def extract(self, path: str, security_only: bool = False) -> dict[str, Any]:
+    def extract(self, path: str, security_only: bool = False, allow_deserialization: bool = False) -> dict[str, Any]:
         """Extract metadata from a model file or directory."""
         path_obj = Path(path)
 
         if path_obj.is_dir():
-            return self._extract_directory_metadata(path, security_only)
+            return self._extract_directory_metadata(path, security_only, allow_deserialization)
         else:
-            return self._extract_file_metadata(path, security_only)
+            return self._extract_file_metadata(path, security_only, allow_deserialization)
 
-    def _extract_file_metadata(self, file_path: str, security_only: bool = False) -> dict[str, Any]:
+    def _extract_file_metadata(
+        self, file_path: str, security_only: bool = False, allow_deserialization: bool = False
+    ) -> dict[str, Any]:
         """Extract metadata from a single model file."""
         # Find appropriate scanner for this file
         scanner_class = None
@@ -39,7 +41,7 @@ class ModelMetadataExtractor:
             }
 
         # Create scanner instance and extract metadata
-        scanner = scanner_class()
+        scanner = scanner_class({"allow_metadata_deserialization": allow_deserialization})
 
         # Get basic metadata
         metadata = {
@@ -65,7 +67,9 @@ class ModelMetadataExtractor:
 
         return metadata
 
-    def _extract_directory_metadata(self, directory: str, security_only: bool = False) -> dict[str, Any]:
+    def _extract_directory_metadata(
+        self, directory: str, security_only: bool = False, allow_deserialization: bool = False
+    ) -> dict[str, Any]:
         """Extract metadata from all model files in a directory."""
         results: dict[str, Any] = {"directory": directory, "files": [], "summary": {"total_files": 0, "formats": {}}}
 
@@ -73,7 +77,7 @@ class ModelMetadataExtractor:
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
-                    file_metadata = self._extract_file_metadata(file_path, security_only)
+                    file_metadata = self._extract_file_metadata(file_path, security_only, allow_deserialization)
                     if file_metadata.get("format") != "unknown":
                         results["files"].append(file_metadata)
 

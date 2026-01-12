@@ -6,6 +6,8 @@ import struct
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.metadata_extractor import ModelMetadataExtractor
 
 
@@ -156,3 +158,64 @@ class TestModelMetadataExtractor:
         assert "pickle: 1" in output
         assert "model1.safetensors (safetensors)" in output
         assert "model2.pkl (pickle)" in output
+
+    def test_pickle_metadata_no_deserialization(self, monkeypatch, tmp_path):
+        """Ensure pickle metadata extraction does not deserialize by default."""
+        extractor = ModelMetadataExtractor()
+
+        import pickle
+
+        pkl_file = tmp_path / "test.pkl"
+        with open(pkl_file, "wb") as f:
+            pickle.dump({"a": 1}, f)
+
+        import pickle as std_pickle
+
+        def fail_load(*_args, **_kwargs):
+            raise AssertionError("pickle.load should not be called during metadata extraction")
+
+        monkeypatch.setattr(std_pickle, "load", fail_load, raising=True)
+
+        metadata = extractor.extract(str(pkl_file))
+
+        assert metadata.get("deserialization_skipped") is True
+        assert metadata.get("safe_loading") is False
+
+    def test_joblib_metadata_no_deserialization(self, monkeypatch, tmp_path):
+        """Ensure joblib metadata extraction does not deserialize by default."""
+        joblib = pytest.importorskip("joblib")
+        extractor = ModelMetadataExtractor()
+
+        joblib_file = tmp_path / "model.joblib"
+        joblib.dump({"x": 1}, joblib_file)
+
+        import joblib
+
+        def fail_load(*_args, **_kwargs):
+            raise AssertionError("joblib.load should not be called during metadata extraction")
+
+        monkeypatch.setattr(joblib, "load", fail_load, raising=True)
+
+        metadata = extractor.extract(str(joblib_file))
+
+        assert metadata.get("deserialization_skipped") is True
+        assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
+
+    def test_tf_savedmodel_metadata_no_deserialization(self, monkeypatch, tmp_path):
+        """Ensure TensorFlow SavedModel metadata extraction does not deserialize by default."""
+        tf = pytest.importorskip("tensorflow")
+        extractor = ModelMetadataExtractor()
+
+        saved_model_dir = tmp_path / "saved_model"
+        saved_model_dir.mkdir()
+        (saved_model_dir / "saved_model.pb").write_bytes(b"")  # Minimal placeholder
+
+        def fail_tf_load(*_args, **_kwargs):
+            raise AssertionError("tf.saved_model.load should not be called during metadata extraction")
+
+        monkeypatch.setattr("tensorflow.saved_model.load", fail_tf_load)
+
+        metadata = extractor.extract(str(saved_model_dir))
+
+        assert metadata.get("deserialization_skipped") is True
+        assert metadata.get("reason") == "Deserialization disabled for metadata extraction"

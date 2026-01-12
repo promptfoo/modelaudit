@@ -2185,13 +2185,18 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
 )
 @click.option("--output", type=click.Path(), help="Output file path")
 @click.option("--security-only", is_flag=True, help="Show only security-relevant metadata")
-def metadata(path: str, output_format: str, output: str | None, security_only: bool) -> None:
+@click.option(
+    "--trust-loaders",
+    is_flag=True,
+    help="Allow metadata extraction to deserialize models (unsafe on untrusted inputs; defaults to off)",
+)
+def metadata(path: str, output_format: str, output: str | None, security_only: bool, trust_loaders: bool) -> None:
     """Extract and display model metadata."""
     from .metadata_extractor import ModelMetadataExtractor
 
     try:
         extractor = ModelMetadataExtractor()
-        metadata = extractor.extract(path, security_only=security_only)
+        metadata = extractor.extract(path, security_only=security_only, allow_deserialization=trust_loaders)
 
         if output_format == "json":
             output_text = json.dumps(metadata, indent=2)

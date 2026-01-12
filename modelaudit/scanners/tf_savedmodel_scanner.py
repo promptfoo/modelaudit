@@ -923,6 +923,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Extract TensorFlow SavedModel metadata."""
         metadata = super().extract_metadata(file_path)
 
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
         if not _check_tensorflow():
             metadata["error"] = "TensorFlow library not available"
             return metadata
